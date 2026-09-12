@@ -1,0 +1,17 @@
+{
+  "title": "Load test",
+  "story": "N synthetic units on random walks around the AO center, each reporting every few seconds with a short stale. For T&E, Guard Dog CoT-database validation, and sizing. Entity count, report interval and the per-lane rate cap are run parameters.",
+  "version": 1,
+  "duration_s": 600,
+  "loop": true,
+  "default_tempo": 1,
+  "warn": "Every report is a row in TAK's CoT database: 500 units every 2 s is about 250 rows per second, 900,000 rows per hour. Retention will reap them on its normal schedule. The rate cap you set applies to this run only.",
+  "defaults": {"interval_s": 2, "stale_s": 30, "team": "Cyan", "role": "Team Member", "lane": "1"},
+  "generate": {"count": 500, "count_min": 50, "count_max": 2000, "callsign_prefix": "LOAD", "type": "a-f-G-U-C", "team": "Cyan", "role": "Team Member", "lane": "1", "radius_m": 5000, "interval_s": 2, "stale_s": 30, "speed_mps": 2},
+  "entities": [
+    {"id": "loadmaster", "callsign": "LOADMASTER", "type": "a-f-G-U-C", "team": "White", "role": "HQ", "interval_s": 10, "stale_s": 60, "path": {"kind": "static", "at": [0, 0]}}
+  ],
+  "events": [
+    {"at_s": 5, "kind": "chat", "from": "loadmaster", "text": "Load test running. EXERCISE EXERCISE EXERCISE."}
+  ]
+}

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.58-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.58-alpha)**
+**Current release: [v10.1.67-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.67-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -250,6 +250,10 @@ Full codebase map — how the code is organized, why it's a single service, the
 platform-abstraction seams, and where the decomposition is headed:
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
+Building a Marketplace module (descriptor contract, generated API, the `ctx`
+seams, privilege model, SSO patterns, review bar):
+**[docs/MODULE-DEVELOPMENT.md](docs/MODULE-DEVELOPMENT.md)**.
+
 ## Ports
 
 > **v0.9.12 hardening:** Every host port is classified by exposure tier. **Tier 1 (Public)** is reachable from the internet, **Tier 3 (Caddy-loopback)** binds to `127.0.0.1` and is reached only via Caddy on 443, **Tier 4 (Docker-internal)** has no host port at all, **Tier 5 (Source-scoped)** is allowed only from a specific peer IP.
@@ -417,6 +421,114 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.67-alpha — 2026-09-12 — A failing certificate renewal can no longer take TAK Server down
+
+**Headline: if you run TAK Server in a container with a Let's Encrypt certificate, this closes a fault that could stop TAK from starting at all — and repairs boxes it has already affected.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.67-alpha
+
+**What was wrong.** The nightly certificate-renewal job deleted TAK's existing keystore *before* rebuilding it. If the rebuild then failed for any reason, the server was left with no keystore — and because TAK's configuration points one of its secure listeners at that file, **TAK Server would refuse to start at the next restart**. Nothing warned you in the meantime: the running server carried on using the copy already in memory, so the fault stayed invisible until something restarted, which could be days later.
+
+On hardened TAK images the rebuild failed every time, because the job assumed the wrong user account owned the certificate files.
+
+**What changes.**
+
+- **The renewal never destroys a working keystore again.** It builds the new one alongside the old and only swaps it in once the rebuild has succeeded. A failed renewal now leaves your server exactly as it was.
+- **The correct user is detected rather than assumed**, so renewals work on hardened images as well as standard ones.
+- **Boxes already affected repair themselves on update.** If your TAK Server is currently failing to start because its keystore is missing, updating rebuilds it and brings TAK back — no shell access required.
+- Boxes carrying the old renewal job have it corrected automatically at startup.
+
+**Upgrading.** Update from the console as usual. If TAK Server has been failing to start, the repair runs on its own during startup; give it a couple of minutes and check TAK again.
+
+### v10.1.66-alpha — 2026-09-12 — Fixes a regression in v10.1.65
+
+**Headline: if you took v10.1.65 and have MediaMTX installed, take this one too.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.66-alpha
+
+**What happened.** v10.1.65 changed how the MediaMTX editor checks whether the infra-TAK privilege broker is available. The new check asked the broker a question it does not answer, so it always concluded "no broker" and fell back to `sudo` — which on a hardened box does not exist. The practical effect is that **Install GStreamer stops working on a hardened box**, which is the very thing v10.1.65 set out to fix.
+
+This only affects a box that took v10.1.65 **and** subsequently deployed or repaired MediaMTX. If you have not touched MediaMTX since updating, you were never exposed.
+
+**What changes.** The availability check now asks the broker something it permits and treats any reply as "broker present" — which is what the original code did, minus the log noise that started all this. This release also **repairs editors that v10.1.65 already modified**; you do not need to reinstall anything, just update and re-run the MediaMTX repair action if Install GStreamer was failing.
+
+**Our mistake, plainly.** The broker operation used in v10.1.65 was verified by reading the broker's source rather than by calling it. It exists in the code and is permitted — it simply is not served on the channel the editor uses. Testing confirmed the change had been applied, not that it worked. That gap is what this release closes.
+
+### v10.1.65-alpha — 2026-09-11 — CloudTAK updates unblocked, and GStreamer installs on a hardened box
+
+**Headline: if you run the CloudTAK Dispatcher plugin, CloudTAK updates were failing — that is fixed, and a failed build now tells you why instead of just an exit code.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.65-alpha
+
+**Why it matters.** CloudTAK 13.85.0 changed a type in its plugin interface: a user who has been provisioned but has never logged in now holds no certificate. Our Dispatcher/TAK-CAD server routes assumed one always existed, so the CloudTAK image would not build and every update stopped at the rebuild step. It failed safely — your running CloudTAK kept serving throughout — but no update could complete, and the reason was buried two hundred lines deep in build output.
+
+**What changes.**
+
+- **CloudTAK updates complete again** on any box with the Dispatcher or TAK-CAD plugin installed. The fix travels with the plugin, so it arrives the next time the plugin is installed or updated.
+- **A failed CloudTAK build now names its own cause.** Instead of `Build/restart failed with exit code 1`, the log ends with a short "Likely cause" summary — which plugin broke the build, what to do about it, and a reminder that your running CloudTAK was never touched. It also recognises a full disk, a Docker Hub rate limit, and failed package or npm steps.
+- **Install GStreamer works on a hardened box** (GitHub #67). On a box where the console runs unprivileged behind the privilege broker, the MediaMTX editor's dependency installer was being refused in three separate places and then falling back to a `sudo` that cannot exist there — leaving GStreamer uninstallable, KLV metadata silently dropped from RTSP pushes, and a steady trickle of authentication failures in the system journal. The installer now speaks to the broker correctly. **No security policy was relaxed to do this** — the broker's allow-list is unchanged.
+
+**Upgrading.** Update from the console as usual. If a CloudTAK update failed for you previously, re-run it after this release; reinstall the Dispatcher plugin first if it was installed before today.
+
+### v10.1.64-alpha — 2026-09-11 — Guard Dog stops crying wolf
+
+**Headline: three health checks that raised alarms about healthy systems — or stayed quiet about a broken one — now tell the truth.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.64-alpha
+
+**Why it matters.** A monitor that cries wolf is worse than no monitor: people learn to ignore it, and the next alert is the real one. Two of these emailed alarms about systems that were working perfectly. The third did the opposite — it reported success after a repair that had not actually worked.
+
+**What changes.**
+- **Split deployments stop being told their database is down.** If your TAK Server and PostgreSQL run on separate machines, Guard Dog was emailing "PostgreSQL service is not running" — listing "Data loss" among the consequences — about a database that was running fine on the other machine, with a suggested fix you would have run on the wrong host. It now reads where the database actually lives from TAK Server's own configuration, checks it there, names that machine in any alert, and never suggests restarting something that is not on the box you are reading about. The console's TAK Server page had the same blind spot and showed a healthy remote database as "stopped".
+- **Video restreamers and other server-side services are no longer counted as clients "connected to nothing".** That check is about a user's device sitting on no channel and therefore transmitting to nobody. A server-side service that deliberately carries no channel is a different thing, is not a fault, and no longer triggers the alert. A real device on no channel still does.
+- **A repaired identity service is now verified, not assumed.** When Guard Dog restarts the Authentik LDAP outpost, it now confirms the outpost can actually resolve channel membership before declaring success — the same real check that was added at boot time in v10.1.55, which the automatic repair paths never performed. Previously a restart could report "restarted successfully" while clients connected, stayed connected, and transmitted to nobody. If it cannot resolve after the repair, it now says so loudly instead.
+
+### v10.1.63-alpha — 2026-09-10 — Container installs work again, TAK keeps its own Java, and the Simulator reaches everyone
+
+**Headline: a fresh container TAK Server install had stopped working for everyone, on every platform — that is fixed — and TAK Server is now pinned to the Java it actually needs, so an unrelated package install can no longer break client enrollment days later.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.63-alpha
+
+**Why it matters.** Two of these were silent failures: the kind where everything looks healthy and one specific thing is quietly dead. A container install failed at the image build with an apt error that named a Debian mirror, not TAK. And a TAK Server could run perfectly for days after someone installed an unrelated tool, then come back from a routine reboot unable to enroll a single new client — while the map, existing clients, federation and CloudTAK all kept working normally.
+
+**What changes.**
+- **Container TAK Server installs build again.** The base image TAK Server's database is built from reached end of life, and its package sources moved; the build began failing partway through for every new install, on x86 and ARM alike. infra-TAK now repairs the bundle's package sources before building. Affects 5.7 and 5.8 bundles equally — it was never a TAK version problem.
+- **TAK Server is pinned to Java 17.** TAK reaches into internals that Java 21 removed, so on any other Java version new client enrollments fail with an HTTP 500 while everything else looks fine. Installing an unrelated tool that pulls in a newer Java could hand it over silently, and the breakage only appeared at the next restart — potentially days later. TAK now keeps its own Java regardless of what else is installed, the console shows which Java it is running on, and Guard Dog alerts if it is ever wrong.
+- **The TAK Simulator is available to everyone.** It shipped last release but only appeared for consoles on the dev update channel. It is now on the marketplace for everyone, greyed out with an explanation until CloudTAK is deployed, since the director panel lives inside CloudTAK.
+- **TAK Portal shows the right version in Beta Mode**, and the console now says which channel that version came from instead of showing a bare number that looked out of date.
+
+### v10.1.62-alpha — 2026-09-09 — TAK Simulator: a scripted traffic engine, a CloudTAK director panel, and sensors that detect
+
+**Headline: a new TAK Simulator module puts moving, scripted units on your map for training, demos and load tests — driven live from a panel inside CloudTAK — and its sensors now *detect*: a target that is not transmitting becomes a track the moment a radar's footprint sees it.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.62-alpha
+
+**Why it matters.** Rehearsing "the sensor sees something that is not on AIS" used to need real assets in the field. Now a trainer can lay out radars, cameras, aircraft, vessels and ground units on the CloudTAK map, steer them, drop hidden targets, watch each sensor pick them up as its own track, and save the whole thing to run again in ATAK, WinTAK, iTAK or CloudTAK.
+
+**What changes.**
+- **TAK Simulator module (console).** Deploy it from the console like any other module. It logs into your TAK Server as its own identity in an isolated `simulation` channel, so fake traffic only reaches people who join that channel; sending on a real channel requires typing the channel's name to confirm, and every unit is then marked EXERCISE. Eight ready-made scenarios ship with it (wildfire, disaster EOC, drone patrol, law-enforcement perimeter, wilderness SAR, a sensor showcase, a demo, a 500-unit load test). Stopping a simulation deletes everything it put on the map.
+- **Director panel in CloudTAK.** Once the module is deployed, the console's CloudTAK plugin area offers a TAK Simulator panel. From the map: start a live session, add a unit by type, click where it goes, steer it (go to, route, orbit, course and altitude, hold, lost link), send chat, 911 and CASEVAC, draw markers, circles, polygons and routes, save the layout as a scenario, or open a saved scenario for editing. The panel can be popped out as a floating window over the map.
+- **Sensors that detect.** A unit can be marked *hidden*: it moves on its path but never reports itself. A sensor with detection on sees hidden targets inside its footprint (range, field of view, altitude band, a per-look hit probability and a position error) and reports each as an unknown-domain contact named by that sensor — "RADAR 1 T1". Two sensors seeing the same target produce two tracks, on purpose; tracks disappear when the target leaves.
+- **Ships, aircraft and sensors draw as their MIL-STD-2525 symbols.** Simulated units that are not people no longer carry the team-member tag, so TAK clients render a merchant ship as a ship and a radar site as a sensor, while simulated personnel keep their team markers.
+- **Installing a CloudTAK plugin no longer waits ten minutes for nothing.** The post-rebuild "is the API up" check accepted only one answer and could never see the healthy API; every plugin install and update sat out a ten-minute timer and then printed a false warning. It now finishes seconds after the API starts.
+- **Updating the console no longer disconnects every CloudTAK user.** The CloudTAK hardening step that runs after a console update recreated the entire CloudTAK stack every time, even when nothing had changed. It now leaves a hardened stack alone, and only recreates when the compose files changed or the API is not bound to loopback.
+- **Linking CloudTAK to the simulator is guarded against the icon crash loop.** Recreating the CloudTAK API container can trigger a known CloudTAK crash on a corrupt icon; the simulator's link step now arms the same self-heal the other paths already use.
+- **An upload named in upper case is found (#66, first half).** A TAK Server bundle uploaded as `….ZIP` or `….DEB` is now recognized; the different layout of the hardened 5.8 bundle is a separate, open item.
+
+**Availability.** The TAK Simulator tile and its CloudTAK panel appear on consoles set to the **dev** update channel in this release. Real AIS traffic as detectable targets, a harbor-watch preset and the MediaMTX editor's live-log fix are planned for the next release.
+
+**Upgrading.** Update the console as usual. Deploy the Simulator from its tile, then install the CloudTAK panel from the Simulator page (a CloudTAK rebuild of five to ten minutes, during which CloudTAK users are signed out once).
+
+### v10.1.60-alpha — 2026-09-06 — updating TAK Portal no longer interrupts its own first start
+
+**Headline: the console used to restart TAK Portal a few seconds after building it — which, on the new database-backed TAK Portal, landed in the middle of its first data migration. It no longer restarts what it just built, it never restarts TAK Portal's database, Guard Dog watches every part of TAK Portal, and the console stops raising a Guard Dog alert about a restart it asked for itself.**
+
+**Why it matters.** TAK Portal's development branch now runs as three containers: the web interface, a background worker, and its own database. On its first start it migrates the portal's existing data into that database. The console's **Update** button wrote TAK Portal's settings after the build and then restarted the whole application to pick them up. On the new layout that restart arrived about three seconds into the first start, stopped the database underneath the web process, and interrupted the migration. Nothing was lost — TAK Portal resumes an interrupted migration exactly where it stopped — but the first start of a database is the one moment that must not be interrupted, and the restart was never needed in the first place.
+
+**What changes.**
+- **Update writes settings first and does not restart.** TAK Portal's settings and SSH keys are placed on its data volume *before* the build, so the new containers start with them. After the build the console reads them back and only rewrites and restarts if something is missing.
+- **The database is never bounced.** Every console-driven TAK Portal restart — Update Config, certificate sync, the SSH user change, the post-upgrade reconfigure — now restarts only the application containers. Docker Compose restarts a service's dependencies by default, which is how a routine restart had begun taking the database down with it. The **Restart** button on the TAK Portal card no longer tears the whole application down either.
+- **Guard Dog watches all of TAK Portal.** Its health check used to look only at the web container, so a stopped worker or database left the console showing green while TAK Portal served its "stack down" page. It now checks every service the application declares, recovers whatever is missing, and names it in the alert.
+- **No false Guard Dog alert after an upgrade.** Restarting TAK Portal keeps its web container down for ten to fifteen seconds. If the console's health refresh happened to land in that window, the "Guard Dog has an active alert" banner appeared after every upgrade. The console now knows when it is the one restarting TAK Portal and does not alarm about it; a real outage still raises the banner within half a minute.
+- **Hardened Posture logout goes to the right address (#65).** When the console is served on a custom hostname rather than the default `infratak.` subdomain, the 30-minute idle lock signed the browser out against a hostname that did not exist. The sign-out and login redirects now use the console's real public hostname.
+
+**Upgrading.** Update the console as usual. No TAK Portal action is needed; the next TAK Portal update or restart uses the new behavior automatically.
+
+### v10.1.59-alpha — 2026-09-04 — TAK Portal keeps working as it grows into multiple containers
+
+**Headline: the console now manages TAK Portal as a whole application, not a single container — so when TAK Portal adds its own background worker and database, every button keeps starting, stopping, updating and health-checking all of them together.**
+
+**Why it matters.** TAK Portal is moving from one container to several — a web interface, a background worker, and its own database. The console used to assume TAK Portal was exactly one container. On the new layout that assumption would have quietly started only the web interface on an update and left the worker and database stopped, while the dashboard still showed green — because a health check that matches container names by substring is satisfied by any one of them. Start, Stop, Restart, Update, Update Config, the certificate sync, Guard Dog's auto-recovery, and the boot-time startup order now all act on the complete TAK Portal application. The database's data is left untouched across application rebuilds. This is a compatibility release: on today's single-container TAK Portal nothing changes, and the console is ready for the split whenever it lands.
+
 
 ### v10.1.58-alpha — 2026-09-02 — the console now tells you when your server restarted, and why
 

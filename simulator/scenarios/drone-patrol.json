@@ -1,0 +1,20 @@
+{
+  "title": "Drone patrol with live video",
+  "story": "One UAS on a racetrack over the site with a sensor cone that follows its heading and a video link to the box's MediaMTX stream named uas1. Proves the MediaMTX to ATAK / CloudTAK video path.",
+  "version": 1,
+  "duration_s": 600,
+  "loop": true,
+  "default_tempo": 1,
+  "defaults": {"interval_s": 2, "stale_s": 30, "team": "Purple", "role": "Team Member", "lane": "1"},
+  "entities": [
+    {"id": "gcs", "callsign": "UAS GCS", "type": "a-f-G-E-S", "team": "White", "role": "Team Lead", "interval_s": 20, "stale_s": 120, "path": {"kind": "static", "at": [0, -700]}},
+    {"id": "uas1", "callsign": "UAS 1", "type": "a-f-A-M-H-Q", "team": "Purple", "hae_m": 120, "interval_s": 1,
+     "sensor": {"fov": 45, "range_m": 700, "vfov": 30, "elevation": -30}, "video": {"stream": "uas1"},
+     "path": {"kind": "waypoints", "speed_mps": 14, "loop": true, "points": [[-600, 300], [600, 300], [700, 200], [700, -200], [600, -300], [-600, -300], [-700, -200], [-700, 200]]}}
+  ],
+  "events": [
+    {"at_s": 0, "kind": "polygon", "id": "site", "callsign": "PATROL AREA", "stroke": "#bf5af2", "fill": "#bf5af2", "fill_alpha": 25, "points": [[-750, -350], [750, -350], [750, 350], [-750, 350]]},
+    {"at_s": 5, "kind": "chat", "from": "gcs", "text": "UAS 1 airborne on the patrol racetrack. Video on stream uas1."},
+    {"at_s": 300, "kind": "chat", "from": "gcs", "text": "UAS 1 halfway through the patrol, all quiet. EXERCISE EXERCISE EXERCISE."}
+  ]
+}

@@ -110,6 +110,33 @@ _ak_compose_locked() {
   return $_rc
 }
 
+# v10.1.64 W3 (GH #64): after ANY cold start of the LDAP outpost, verify it can actually
+# RESOLVE GROUPS — do not declare success on the container coming up.
+#
+# v10.1.55 fixed the BOOT path this way and the reporter confirmed it with measurements.
+# What was left undone is exactly here: both of this watcher's recreate paths bring the
+# outpost up cold, with no provider tree, and then judge it by a TCP/port health check. The
+# entire point of #64 is that binds succeed while group searches fail — so that check cannot
+# tell a working outpost from a broken one, and TAK clients end up connected-but-invisible
+# while everything reports green.
+#
+# gd_ldap_groups_ok is tri-state ON PURPOSE: 0 = resolving, 1 = proven broken
+# ("Operations error"), 2 = cannot determine (no ldapsearch, unreadable .env). A 2 must
+# NEVER be reported as broken; we say so and move on.
+_ak_verify_ldap_groups() {
+  local _what="$1" _t=0 _rc=2
+  # The outpost legitimately needs time to receive its provider tree — the boot path
+  # measured 17s on a real box, so poll rather than asking once and calling it broken.
+  while [ $_t -lt 90 ]; do
+    gd_ldap_groups_ok "$AK_DIR"; _rc=$?
+    [ "$_rc" -eq 0 ] && { _log "$_what | LDAP outpost resolving groups (${_t}s)"; return 0; }
+    [ "$_rc" -eq 2 ] && { _log "$_what | cannot verify group resolution (no ldapsearch or unreadable .env) — NOT treating as broken"; return 2; }
+    sleep 10; _t=$((_t + 10))
+  done
+  _log "$_what | *** LDAP outpost is UP but cannot resolve groups after ${_t}s"
+  return 1
+}
+
 # Full restart under a SINGLE lock hold. A lock taken per-command would release
 # between the `down` and the `up`, and the console slipping in at that instant is
 # the worst possible moment — it is the window that left postgresql created and
@@ -177,6 +204,8 @@ Action: Full restart (docker compose down + up -d).
     _alert "$SUBJ" "$BODY"
     # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
   cd "$AK_DIR" && _ak_compose_restart_locked
+  # v10.1.64 W3 (GH #64): a full stack restart starts the outpost COLD too — same blind spot.
+  _ak_verify_ldap_groups "stack-restart" || true
     echo 0 > "$FAIL_HTTP"
     echo 0 > "$FAIL_LDAP"
     date +%s > "$COOLDOWN_HTTP"
@@ -215,6 +244,32 @@ Action: Force-recreating LDAP container only (docker compose up -d --force-recre
 "
       _alert "$SUBJ" "$BODY"
       cd "$AK_DIR" && _ak_compose_locked "ldap-recreate" up -d --force-recreate ldap   # v10.1.55 W3
+      # v10.1.64 W3 (GH #64): the recreate alert above reads as "we fixed it". Verify that
+      # before leaving it standing — a recreated outpost that still cannot resolve groups is
+      # the exact silent failure this issue is about, and it must be said out loud.
+      _ak_verify_ldap_groups "ldap-recreate"
+      case $? in
+        1) _alert "Guard Dog: Authentik LDAP restarted but CANNOT RESOLVE GROUPS on $SERVER_IDENTIFIER" \
+"The LDAP outpost was recreated and is accepting connections, but it still cannot resolve groups.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(_ts)
+
+WHAT THIS MEANS: TAK Server routes strictly by channel. Clients will connect, stay connected,
+and transmit to NOBODY — while the server, the containers and the client all report healthy.
+A fast way to see it: the TAK Client Dashboard shows a higher total client count than the
+number of rows it lists.
+
+This does NOT self-correct on its own timetable and the earlier 'LDAP restarted' message
+should not be read as a fix.
+
+Try, in order:
+  docker restart authentik-server-1   # republishes the provider tree
+  docker restart authentik-ldap-1     # then the outpost picks it up
+  systemctl restart takserver         # TAK holds a long-lived directory context and will
+                                      # not re-establish on its own
+" ;;
+      esac
       echo 0 > "$FAIL_LDAP"
       date +%s > "$COOLDOWN_LDAP"
     fi

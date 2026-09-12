@@ -34,7 +34,35 @@ if ! gd_db_running; then
       TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       
       SUBJ="TAK Server Database Alert on $SERVER_IDENTIFIER"
-      BODY="PostgreSQL service is not running.
+      # The remedy has to be runnable on the machine the reader is looking at. On a split
+      # deployment the database is on ANOTHER host, and telling someone to
+      # `systemctl restart postgresql` here sends them chasing a fault on the wrong machine
+      # (GH report, John Stefanini 2026-09-10). Name the host, and say plainly that nothing
+      # was restarted from here.
+      if gd_db_is_remote; then
+        _DBH="$(gd_db_host)"
+        BODY="TAK Server cannot reach its database.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS
+Database host: $_DBH (port 5432) — a SEPARATE machine, not this one.
+
+This will cause:
+- TAK Server failure to start
+- Service interruption
+
+The database does NOT run on this host, so nothing was restarted from here and there is
+nothing to restart here. Check the database machine:
+
+  ssh $_DBH
+  pg_lsclusters                 # or: systemctl status postgresql
+  ss -ltn | grep 5432           # is it listening?
+
+Also worth checking from this host, since this alert fires on reachability:
+  network path / firewall between here and $_DBH on 5432
+"
+      else
+        BODY="PostgreSQL service is not running.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
@@ -50,6 +78,7 @@ Check PostgreSQL status:
 Restart PostgreSQL:
   systemctl restart postgresql
 "
+      fi
 
       echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
       if [ -f /opt/tak-guarddog/sms_send.sh ]; then
@@ -70,7 +99,15 @@ Restart PostgreSQL:
         sleep 5
       done
       if $_db_back; then
-        echo "$(date): PostgreSQL was down, restarted successfully" >> /var/log/takguard/restarts.log
+        if gd_db_is_remote; then
+          echo "$(date): remote database $(gd_db_host) was unreachable, now reachable again (nothing restarted from here)" >> /var/log/takguard/restarts.log
+        else
+          echo "$(date): PostgreSQL was down, restarted successfully" >> /var/log/takguard/restarts.log
+        fi
+      elif gd_db_is_remote; then
+        # Not a failed restart — we never attempted one, and saying "restart FAILED" about a
+        # machine we did not touch is the same wrong-machine confusion as the alert body.
+        echo "$(date): remote database $(gd_db_host) still unreachable — no local restart attempted (database is on another host)" >> /var/log/takguard/restarts.log
       else
         echo "$(date): PostgreSQL was down, restart FAILED" >> /var/log/takguard/restarts.log
       fi

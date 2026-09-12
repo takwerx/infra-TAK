@@ -78,6 +78,7 @@ import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, sh
 import hmac
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
@@ -964,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.59-alpha"
+VERSION = "10.1.68-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1847,6 +1848,110 @@ def _tak_install_method():
     except Exception:
         pass
     return 'container' if _host_arch() == 'arm64' else 'native'
+
+def _tak_db_host_from_coreconfig():
+    """The database host TAK Server itself is configured to use, or '' if unreadable.
+
+    Ground truth, deliberately: a split deployment set up by hand looks single-server to
+    infra-TAK's own settings while CoreConfig points at another machine. Keying the console's
+    PostgreSQL status off our settings flag is why a healthy remote database rendered as
+    "stopped" (GH report, John Stefanini 2026-09-10). Same source the Guard Dog lib and the
+    boot sequencer read.
+    """
+    try:
+        xml = _read_priv('/opt/tak/CoreConfig.xml')
+    except Exception:
+        return ''
+    m = re.search(r'jdbc:postgresql://([^:/"]+)', xml or '')
+    return m.group(1).strip() if m else ''
+
+
+def _tak_db_is_remote(host=None):
+    """True when TAK's database lives on another machine."""
+    h = (host if host is not None else _tak_db_host_from_coreconfig()).strip()
+    if not h or h in ('127.0.0.1', 'localhost', '::1'):
+        return False
+    try:
+        if h in (socket.gethostname(), socket.getfqdn()):
+            return False
+        if h in _list_local_ipv4s():
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
+    """Make BBN's takserver-db image buildable again on an EOL Debian base. Idempotent.
+
+    GH #69 (dh2-io, 2026-09-10). `postgres:15.1` is Debian bullseye, which is EOL: its security
+    Release file expired, AND its package pool moved off deb.debian.org to archive.debian.org.
+    BBN's Dockerfile.takserver-db runs
+
+        RUN apt-get update && apt install -y postgresql-15-postgis-3 openjdk-17-jdk
+
+    which now exits 100 at Step 3/9 and takes every container TAK deploy with it. The issue was
+    filed as ARM64 and is NOT arch-specific — reproduced identically on x86_64 and aarch64 the
+    day it was reported. Every fresh container install was broken on every platform.
+
+    **Two obvious fixes are wrong, and both were measured to be wrong before this one was
+    written.** (1) `-o Acquire::Check-Valid-Until=false` alone clears the expiry and then every
+    package 404s, because the pool is gone from the live mirror. (2) Repointing every
+    deb.debian.org URL at archive.debian.org then fails on `bullseye-security`: measured
+    2026-09-10, `archive.debian.org/debian-security/dists/bullseye-security/Release` is **404**
+    while `debian/dists/bullseye` and `bullseye-updates` are both 200. The security suite is not
+    on the archive at all, so the line has to be DELETED rather than rewritten — and because
+    BBN chains `apt-get update && apt install`, a single unreachable source is fatal rather than
+    a warning.
+
+    Deliberately conservative:
+      * BBN's package list is carried over from their own RUN line, never hardcoded, so a
+        bundle that installs something else still gets what it asked for;
+      * a Dockerfile whose RUN line we do not recognise is left EXACTLY as shipped and the
+        deploy continues — we do not fail a build over a bundle we cannot parse;
+      * the sed is a no-op on any base that is not deb.debian.org/bullseye, so a future bundle
+        on a newer postgres is untouched;
+      * Acquire::Check-Valid-Until=false is scoped to this one RUN inside a pinned EOL base
+        image. archive.debian.org Release files are frozen and therefore permanently "expired"
+        by design, so the flag is what makes the archive usable at all. It is NOT a host apt
+        setting and must not be generalised into one.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    df = os.path.join(build_ctx, 'docker', 'Dockerfile.takserver-db')
+    if not os.path.isfile(df):
+        return False
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
+        return False
+    if 'archive.debian.org' in src:
+        return False                      # already patched (re-deploy / upgrade re-run)
+    m = re.search(r'(?m)^RUN\s+apt-get\s+update\s*&&\s*apt(?:-get)?\s+install\s+-y\s+(.+)$', src)
+    if not m:
+        _log("  (Dockerfile.takserver-db has an unrecognised install line — building as shipped)")
+        return False
+    pkgs = m.group(1).strip()
+    # Delete the security suite FIRST (it does not exist on the archive), then repoint what
+    # does. Order matters: repointing first would leave an archive.debian.org/debian-security
+    # line that 404s and kills the &&-chain.
+    fixed = (
+        "RUN sed -i -e '/debian-security/d'"
+        " -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list"
+        " && apt-get -o Acquire::Check-Valid-Until=false update"
+        f" && apt-get -o Acquire::Check-Valid-Until=false install -y {pkgs}"
+    )
+    try:
+        with open(df, 'w') as f:
+            f.write(src[:m.start()] + fixed + src[m.end():])
+    except Exception as e:
+        _log(f"  (could not patch Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
+        return False
+    _log("  Patched Dockerfile.takserver-db for EOL Debian bullseye (GH #69): apt sources → "
+         "archive.debian.org. Without this the db image build fails on every platform.")
+    return True
+
 
 def _tak_is_container():
     """True when TAK Server runs as a container (vs native systemd service).
@@ -2910,12 +3015,15 @@ def detect_modules():
     # v10.0.5 non-root: a root-era TAK-Portal lives in /root/TAK-Portal, invisible to the
     # takwerx console — union the home-dir check with the tak-portal container (broker shims).
     _tp_home = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
-    _tpc = _run('docker ps -a --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-    portal_installed = _tp_home or bool((_tpc.stdout or '').strip())
-    portal_running = False
-    if portal_installed:
-        r = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        portal_running = 'Up' in (r.stdout or '')
+    # v10.1.59: the portal is a compose PROJECT. "installed" = compose file or a web
+    # container in any state; "running" = the WEB service is running — a worker or
+    # Postgres being up must not make a dead web UI look healthy (PLAN-v10.1.59).
+    try:
+        _tp_web = _takportal_web_container(all_states=True)
+    except Exception:
+        _tp_web = None
+    portal_installed = _tp_home or _tp_web is not None
+    portal_running = bool(_tp_web and _tp_web.get('running'))
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
     # MediaMTX (local or remote deployment)
@@ -3110,6 +3218,25 @@ def detect_modules():
             'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV', 'icon': '\U0001F3A5',
             'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
+
+    # TAK Simulator — registry-resident (modules/simulator.py, v10.1.61). v10.1.63 W1: the
+    # dev-channel gate is gone. v10.1.62 shipped the module to the main *git branch*, which is
+    # a different thing from the main *update channel* — the two were conflated when the gate
+    # was written, so every customer on the main channel saw no tile at all. What gates the
+    # tile now is a dependency, not a channel (W2): the Director panel the module drives lives
+    # inside CloudTAK, so the card greys out until CloudTAK is deployed. The deploy route
+    # enforces the same rule server-side (modules/__init__.py) — a greyed card is presentation.
+    _sim_desc = mod_registry.MODULES.get('simulator')
+    if _sim_desc:
+        try:
+            _sim_state = _sim_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _sim_state = {}
+        modules['simulator'] = {'name': _sim_desc['name'],
+            'installed': bool(_sim_state.get('installed')), 'running': bool(_sim_state.get('running')),
+            'description': _sim_desc['description'], 'icon': _sim_desc['icon'],
+            'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
@@ -3542,6 +3669,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+    simm = modules.get('simulator', {})
+    if simm.get('installed'):
+        parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -4758,11 +4888,11 @@ def forward_auth():
     if session.get('authenticated'):
         return '', 200
     # Redirect to console login so user can log in and retry (Caddy passes this response to the client)
-    settings = load_settings()
-    fqdn = (settings.get('fqdn') or '').split(':')[0]
-    if fqdn:
-        login_url = f"https://infratak.{fqdn}/login"
-        return redirect(login_url, code=302)
+    # v10.1.60 (W5, GH #65): the console's PUBLIC host, honouring `infratak_domain` — not a
+    # hardcoded infratak.<fqdn>.
+    host = _console_public_host(load_settings())
+    if host:
+        return redirect(f"https://{host}/login", code=302)
     return '', 401
 
 @app.route('/console')
@@ -4850,6 +4980,35 @@ WIDLE_STATE_KEY = 'WIDLE_sso'
 # (Confirm the exact path on a live forward_auth box before declaring the gap closed.)
 AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
 
+
+def _console_public_host(settings=None):
+    """The console's PUBLIC hostname — the per-box `infratak_domain` override when the
+    operator set one, else `infratak.<fqdn>`. '' when no FQDN is configured.
+
+    v10.1.60 (W5, GH #65): three places built this by hand as `infratak.<fqdn>` — the
+    forward_auth login redirect, the idle-lock sign-out fallback, and the W-IDLE apply
+    step (which also picked the Authentik proxy provider by the substring 'infratak'
+    in its external host). An operator whose console is served at `infra.<domain>`
+    matched none of them, so the Hardened Posture idle lock signed the browser out
+    against a host that does not exist. Caddy and the certificate check already derive
+    the host from the service-domain map (`_get_service_domain`); this is the same
+    answer, in one place."""
+    try:
+        s = settings if settings is not None else (load_settings() or {})
+        host = (_get_service_domain(s, 'infratak') or '').strip().split(':')[0]
+        if host:
+            return host
+        fqdn = (s.get('fqdn') or '').strip().split(':')[0]
+        return f'infratak.{fqdn}' if fqdn else ''
+    except Exception:
+        return ''
+
+
+def _console_signout_url(settings=None):
+    """Absolute forward_auth sign-out URL on the console's public host, or ''."""
+    host = _console_public_host(settings)
+    return f'https://{host}{AK_FORWARD_AUTH_SIGNOUT}' if host else ''
+
 def _widle_sso_logout_active(h):
     """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
     browser out of the forward_auth outpost (not merely clearing the Flask session). Requires:
@@ -4902,15 +5061,16 @@ def _enforce_session_idle_lock():
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
             session.clear()  # local lock always holds, regardless of what follows
             if _widle_sso_logout_active(h):
-                # Sign out of the forward_auth outpost so the next request re-prompts. Use the
-                # ABSOLUTE SSO URL captured at apply time — request.host/host_url are the loopback
-                # upstream Caddy proxies to (127.0.0.1:5001), not the SSO vhost. Lazily fall back to
-                # https://infratak.<fqdn> for sessions armed before this URL was stored.
-                surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
+                # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
+                # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
+                # Caddy proxies to (127.0.0.1:5001). v10.1.60 (W5, GH #65): resolve it LIVE from
+                # the console's public host (honours `infratak_domain`); the value captured at
+                # W-IDLE apply time is only a fallback, because on a box armed before this fix it
+                # holds the hardcoded infratak.<fqdn> that sent an operator with a custom console
+                # hostname to a host that does not exist.
+                surl = _console_signout_url()
                 if not surl:
-                    fqdn = (load_settings() or {}).get('fqdn')
-                    if fqdn:
-                        surl = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+                    surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
                 if surl:
                     return redirect(surl)
             return redirect(url_for('login'))
@@ -4958,20 +5118,24 @@ def _hardening_control_widle():
         # request.host_url are the loopback origin, not the SSO vhost. Derive it from the
         # infra-TAK proxy provider's external_host (fallback: https://infratak.<fqdn>).
         ak_url, ak_headers, settings = _w1_ak_ctx()
-        signout_url = None
+        # v10.1.60 (W5, GH #65): the console's public host is the source of truth (it honours
+        # `infratak_domain`); the Authentik proxy provider is matched by that exact host, not
+        # by the substring 'infratak' — which an operator serving the console at
+        # infra.<domain> never matched, so they got the hardcoded fallback and a dead host.
+        console_host = _console_public_host(settings)
+        signout_url = _console_signout_url(settings) or None
         try:
-            if ak_url:
+            if ak_url and console_host:
                 for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
                     eh = (p.get('external_host') or '').rstrip('/')
-                    if eh and 'infratak' in eh:
+                    if eh and eh.lower() == ('https://' + console_host).lower():
                         signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
                         break
+                else:
+                    log('W-IDLE: no Authentik proxy provider on https://%s — using it anyway '
+                        '(the proxy chain healer converges the provider to this host)' % console_host)
         except Exception as e:
             log('W-IDLE: proxy lookup failed (%s)' % str(e)[:80])
-        if not signout_url:
-            fqdn = (settings or {}).get('fqdn')
-            if fqdn:
-                signout_url = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
         h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
             'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT, 'signout_url': signout_url}
         log('W-IDLE: SSO idle-lock re-prompt armed (sign-out → %s)'
@@ -6743,6 +6907,16 @@ def marketplace_page():
             if all_modules.get(conflict_key, {}).get('installed'):
                 mod['_conflict_with'] = all_modules[conflict_key].get('name', conflict_key)
                 break
+    # v10.1.63 W2: the symmetric edge — an uninstalled module whose REQUIRED module is not
+    # deployed is blocked the same way, with the reason (and the next action) on the card.
+    # This is presentation only; the deploy route refuses with 409 independently, because the
+    # card is reachable by direct URL and the route by curl (modules/__init__.py).
+    for key, mod in modules.items():
+        for req_key in (mod.get('requires_modules') or []):
+            req = all_modules.get(req_key) or {}
+            if not req.get('installed'):
+                mod['_requires_missing'] = req.get('name') or req_key
+                break
     resp = render_template('marketplace.html',
         settings=settings, modules=modules, metrics=get_system_metrics(), version=VERSION)
     from flask import make_response
@@ -7890,6 +8064,7 @@ def takserver_page():
     if tak.get('installed') and tak.get('running') and not deploy_status.get('running', False):
         deploy_status.update({'complete': False, 'error': False})
     tak_version = _get_takserver_version_info().get('version', '') if tak.get('installed') else ''
+    _tak_jvm = _running_tak_jvm_version() if tak.get('installed') else ''
     _settings = load_settings()
     _tak_cfg = _get_tak_deployment_config(_settings)
     _is_two_server = _tak_cfg.get('mode') == 'two_server'
@@ -7913,6 +8088,7 @@ def takserver_page():
     return render_template('takserver.html',
         tak58=_tak58,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
+        tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
@@ -14433,6 +14609,7 @@ def guarddog_page():
         {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 85%+ it reclaims ALL unused cache to rescue a filling disk. Never touches images, containers, or volumes.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
+        {'name': 'JVM', 'id': 'jvm', 'interval': '15 min', 'desc': 'Reads the JVM the running TAK Server API process is actually on. TAK reaches into a JDK-internal class that Java 21 removed, so on any JVM but 17 every NEW client enrollment fails with HTTP 500 while everything else — 8089, federation, existing clients, the map — stays green. Grey means the JVM could not be read, never a silent pass.'},
     ])
     guarddog_services = [
         {'id': 'takserver', 'name': 'TAK Server', 'monitored': gd.get('installed'), 'monitors': guarddog_monitors_tak},
@@ -14463,6 +14640,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
@@ -19147,8 +19325,7 @@ def _guarddog_health_check(service_id):
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return resp.status in (200, 302, 301)
         if service_id == 'takportal':
-            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-            return bool(r.stdout and 'Up' in r.stdout)
+            return _takportal_web_running()  # v10.1.59: the WEB service, exact — not a substring
         if service_id == 'mediamtx':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -19162,6 +19339,11 @@ def _guarddog_health_check(service_id):
                 _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-video-restreamer']),
                 capture_output=True, text=True, timeout=5)
             return r.stdout.strip() == 'true'
+        if service_id == 'simulator':
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-simulator']),
+                capture_output=True, text=True, timeout=5)
+            return (r.stdout or '').strip() == 'true'
         if service_id == 'nodered':
             settings = load_settings()
             nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
@@ -19228,7 +19410,7 @@ def _guarddog_service_monitor_ids(settings):
     takserver_ids = ['port8089', 'process', 'network']
     if not is_two_server:
         takserver_ids.extend(['postgresql', 'cotdb'])
-    takserver_ids.extend(['oom', 'disk', 'cert', 'intca'])
+    takserver_ids.extend(['oom', 'disk', 'cert', 'intca', 'jvm'])
     multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
@@ -19237,6 +19419,7 @@ def _guarddog_service_monitor_ids(settings):
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
+        'simulator': ['simulator_ctr'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
         'updates': ['updates_check'],
@@ -19266,6 +19449,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('mediamtx')
     if modules.get('tak_video_restreamer', {}).get('installed'):
         ids.append('tak_video_restreamer')
+    if modules.get('simulator', {}).get('installed'):
+        ids.append('simulator')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -19275,6 +19460,51 @@ def _guarddog_monitored_service_ids(settings):
     if (settings.get('connectivity_anchor') or {}).get('anchor_ip'):
         ids.append('relay')
     return ids
+
+
+# --- Guard Dog maintenance windows (v10.1.60 W4) ---------------------------------
+# A restart the console itself asked for is not an outage. The in-memory health cache
+# (rebuilt every _GD_PAGE_CACHE_TTL seconds) used to read "web container not running"
+# during the 10-15 s a TAK Portal Update / Restart / Update Config / post-upgrade
+# reconfigure keeps the container down, and the console then wore the "Guard Dog has an
+# active alert" banner after every upgrade (field report, test12, 2026-09-06). The shell
+# guards under /opt/tak-guarddog already debounce (three consecutive one-minute misses)
+# and are untouched — this is only the console's own picture of itself.
+#
+# Inside a window a NON-ok probe result is replaced by the service's previous cached
+# verdict: a healthy portal being restarted stays green; a portal that was already red
+# stays red until a probe actually reads ok. It never fails open on a box that was down,
+# and a window never outlives its deadline — a build that hangs still surfaces.
+_gd_maintenance = {}
+_gd_maintenance_lock = threading.Lock()
+
+
+def _gd_maintenance_begin(service_id, seconds=180):
+    """Declare `service_id` under console-driven maintenance for `seconds` from now.
+    Replaces any earlier deadline, so a caller that opened a long window for a build
+    shrinks it to a short grace once the build is over."""
+    try:
+        with _gd_maintenance_lock:
+            _gd_maintenance[service_id] = time.time() + max(0, int(seconds))
+    except Exception:
+        pass
+
+
+def _gd_in_maintenance(service_id):
+    try:
+        with _gd_maintenance_lock:
+            return time.time() < _gd_maintenance.get(service_id, 0)
+    except Exception:
+        return False
+
+
+def _gd_maintenance_verdict(service_id, fresh):
+    """`fresh` is the verdict just computed ('ok'|'fail'|'caution'|None). Inside a
+    maintenance window a non-ok result yields the previous cached verdict instead."""
+    if fresh == 'ok' or fresh is None or not _gd_in_maintenance(service_id):
+        return fresh
+    prev = (_guarddog_page_cache.get('health') or {}).get(service_id)
+    return prev if prev is not None else fresh
 
 
 def _guarddog_run_one_service(sid, monitor_ids):
@@ -19290,11 +19520,11 @@ def _guarddog_run_one_service(sid, monitor_ids):
         if all(vals):
             return (sid, 'ok')
         if not any(vals):
-            return (sid, 'fail')
-        return (sid, 'caution')
+            return (sid, _gd_maintenance_verdict(sid, 'fail'))
+        return (sid, _gd_maintenance_verdict(sid, 'caution'))
     val = _guarddog_health_check(sid)
     if val is not None:
-        return (sid, 'ok' if val else 'fail')
+        return (sid, 'ok' if val else _gd_maintenance_verdict(sid, 'fail'))
     return (sid, None)
 
 
@@ -19554,11 +19784,12 @@ def _compute_guarddog_overall():
                     vals.append(v)
             if not vals:
                 continue
-            result[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
+            result[sid] = _gd_maintenance_verdict(
+                sid, 'ok' if all(vals) else ('fail' if not any(vals) else 'caution'))
         else:
             val = _guarddog_health_check(sid)
             if val is not None:
-                result[sid] = 'ok' if val else 'fail'
+                result[sid] = _gd_maintenance_verdict(sid, 'ok' if val else 'fail')
     return _guarddog_overall_from_result(result)
 
 
@@ -19729,6 +19960,31 @@ def _monitor_health_check(monitor_id):
                 return None
             r = subprocess.run(f'openssl x509 -in {cert_path} -checkend 3456000 2>/dev/null', shell=True, capture_output=True, timeout=3)
             return r.returncode == 0
+        if monitor_id == 'jvm':
+            # v10.1.63 W4. Read the RUNNING process's JVM (/proc/<pid>/exe), not `java
+            # -version` — the process may have been started with a different JVM than the
+            # one on today's PATH, and the running one is the only one that matters.
+            # Container TAK carries its JVM in the image and cannot be moved by the host's
+            # alternatives, so there is nothing to check.
+            if _tak_is_container():
+                return None
+            # The API JVM's own flag — `takserver-api` matches TAK's launcher SHELL
+            # (/usr/bin/dash), which would have made this monitor red on every healthy box.
+            _pid = _tak_api_pid()
+            if not _pid:
+                return None          # TAK not running — the process monitor owns that
+            _exe = _trusted_java_exe(_pid)   # argv is attacker-chosen — see the helper
+            if _exe:
+                _jr = subprocess.run([_exe, '-version'], capture_output=True, text=True, timeout=20)
+                _jv = (_jr.stderr or '') + (_jr.stdout or '')
+            else:
+                # Non-root console cannot read /proc/<tak pid>/exe — take the root watcher's
+                # reading rather than reporting unknown forever on most of the fleet.
+                _kv = _jvm_status_from_guarddog(_pid)
+                _jv = (_kv or {}).get('version', '')
+            if not _jv.strip():
+                return None          # unknown is grey, never a false red
+            return ('version "17.' in _jv) or ('version "17"' in _jv)
         if monitor_id == 'intca':
             for name in ('ca.pem', 'ca-do-not-delete.pem', 'intermediate-ca.pem'):
                 p = f'/opt/tak/certs/files/{name}'
@@ -19857,9 +20113,13 @@ def _monitor_health_check(monitor_id):
                     return resp.status == 200
             except Exception:
                 return False
+        if monitor_id == 'simulator_ctr':
+            # v10.1.61: container liveness only — a stopped scenario is normal (PLAN §4.5)
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Running}}', 'tak-simulator']),
+                               capture_output=True, text=True, timeout=5)
+            return (r.stdout or '').strip() == 'true'
         if monitor_id == 'takportal_ctr':
-            r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-            return bool(r.stdout and 'Up' in r.stdout)
+            return _takportal_web_running()  # v10.1.59: the WEB service, exact — not a substring
         if monitor_id == 'cloudtak_ctr':
             settings = load_settings()
             cfg = _get_cloudtak_deployment_config(settings)
@@ -21483,6 +21743,10 @@ def run_guarddog_deploy(alert_email):
             'tak-restart-watch.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
+            # v10.1.63 W4: the JVM the TAK API is ACTUALLY running on. Every other monitor
+            # stays green while enrollment is dead on a JDK 21 — this is the only one that
+            # would have caught Tom Endress's three-day outage on day one.
+            'tak-jvm-watch.sh',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
             'tak-buildcache-reclaim.sh',
             # v10.1.0 Leg 7: relay tunnel health. Installed fleet-wide — the script
@@ -21612,6 +21876,7 @@ def run_guarddog_deploy(alert_email):
             ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
             ('takcertguard.timer', '[Unit]\nDescription=Run TAK cert monitor daily\n\n[Timer]\nOnBootSec=1h\nOnUnitActiveSec=1d\nUnit=takcertguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            _TAK_JVM_GUARD_UNITS[0], _TAK_JVM_GUARD_UNITS[1],
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
@@ -21740,6 +22005,12 @@ def run_guarddog_deploy(alert_email):
             # is a no-op there. This has been broken on RHEL since 10.1.44.
             _write_priv(tak_dropin, '[Unit]\nAfter=network-online.target ' + _PG_SVC_AFTER + '\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=+-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
             plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
+            # v10.1.63 W3: pin TAK to its own JDK 17 in the same breath. Also re-applied on
+            # every console startup — see _pin_takserver_jvm().
+            try:
+                _pin_takserver_jvm(plog)
+            except Exception as _je:
+                plog(f"\u26a0 JVM pin skipped: {_je}")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(_sudo_wrap(['swapon', '--show']), capture_output=True, text=True, timeout=5)
@@ -21791,7 +22062,8 @@ def run_guarddog_deploy(alert_email):
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'takswapreclaim.timer', 'takbuildcachereclaim.timer',
                   'taknetguard.timer', 'takrelayguard.timer', 'takwerxsetupapwatch.timer',
-                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
+                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
+                  'takjvmguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
             timers.append('takcotdbguard.timer')
@@ -25591,6 +25863,122 @@ def _mtx_patch_within_load_external_sources(src, patcher):
     return src[:start] + new_block + src[end:]
 
 
+_V2_PING_HELPER = (
+    "def _mtx_broker_ping():  # _MTX_PROBE_V2\n"
+    "    # Is the infra-TAK broker there? Ask it something it ALLOWS, and treat any\n"
+    "    # answer at all as 'broker present' -- the return code is irrelevant, only\n"
+    "    # whether the daemon replied.\n"
+    "    #\n"
+    "    # Two earlier forms were wrong. ['true'] is not in EXEC_ALLOW, so it answered\n"
+    "    # but logged a DENY on every status poll. The broker's own {'op':'ping'} looks\n"
+    "    # right in the source but is NOT served on the socket -- it never replies, so\n"
+    "    # the probe timed out, the editor concluded 'no broker' and fell back to a\n"
+    "    # sudo that cannot exist on a hardened box. `systemctl is-active` is\n"
+    "    # allowlisted, answers in ~10ms, and audits as ALLOW on both distro families.\n"
+    "    return _mtx_broker_exec(['systemctl', 'is-active', 'takwerx-broker'], timeout=5) is not None\n"
+    "\n"
+    "\n"
+)
+
+
+def _mediamtx_editor_broker_deps_patch(src):
+    """GH #67: make the editor's /api/deps/* path broker-compatible on hardened boxes.
+
+    v10.1.65 W3. On a box where the editor runs as `takwerx` with no sudo, Install
+    GStreamer failed and the broker audit log showed THREE independent allowlist
+    mismatches -- fixing only the one the UI reported would not have made the button
+    work:
+
+      1. the capability probe ran `true`, which is not in EXEC_ALLOW, so every
+         /api/deps/status poll logged a DENY and the editor concluded "no broker",
+         then fell back to sudo -- producing a continuous stream of
+         `pam_unix(sudo:auth): auth could not identify password for [takwerx]`;
+      2. the install was prefixed with `env DEBIAN_FRONTEND=noninteractive`, and
+         `env` is in the broker's EXEC_DENY as an exec wrapper -- redundant anyway,
+         since the broker injects DEBIAN_FRONTEND/NEEDRESTART_MODE for apt itself;
+      3. the retry carried `-o Dpkg::Options::=`, rejected by _check_pkgmgr() as the
+         hook-command escalation vector (and a second check rejects any argument
+         containing `::`, so reshaping the flag cannot work).
+
+    The fix is entirely caller-side. We do NOT widen the broker allowlist: that was
+    already ruled out for this exact denial (app.py ~3737), and the reporter
+    explicitly asked us not to. The probe becomes the broker's own `ping` op, which
+    needs no exec entry and audits as ALLOW.
+
+    Idempotent, and each sub-patch is independent: the editor tracks its own repo at
+    REF=main, so an anchor that has moved is skipped rather than failing the deploy.
+    """
+    if '_MTX_PROBE_V2' in src:
+        return src
+
+    # An editor patched by v10.1.65 carries a _mtx_broker_ping() that asks the broker
+    # {'op':'ping'} -- an op the socket does not serve, so it timed out and the probe
+    # always said "no broker". Repair that in place before doing anything else; the
+    # plain "already has the function" guard below would otherwise skip these boxes
+    # forever and leave them falling back to sudo.
+    _v1_start = src.find('def _mtx_broker_ping():')
+    if _v1_start != -1:
+        _v1_end = src.find('def _mtx_broker_exec(', _v1_start)
+        if _v1_end > _v1_start:
+            src = src[:_v1_start] + _V2_PING_HELPER + src[_v1_end:]
+        # deliberately NOT returning here: fall through so the env / -o Dpkg fixes below
+        # are re-asserted too. They are already applied on a v10.1.65 box, and each is
+        # guarded by its own `in src` test, so re-running them is a no-op.
+
+    # 1) a real capability probe: the broker's ping op, not an exec of `true`
+    anchor = 'def _mtx_broker_exec(argv, timeout=90):'
+    helper = _V2_PING_HELPER
+    if 'def _mtx_broker_ping():' in src:
+        anchor = None   # already present (just upgraded above) - do not insert a second copy
+    if anchor and anchor in src:
+        src = src.replace(anchor, helper + anchor, 1)
+    src = src.replace("_mtx_broker_exec(['true'], timeout=5) is not None", '_mtx_broker_ping()')
+
+    # 2) apt install: drop the denied `env` wrapper and the denied -o overrides.
+    # The broker supplies DEBIAN_FRONTEND=noninteractive and NEEDRESTART_MODE=l for
+    # apt/apt-get itself, so behaviour is unchanged and the command passes as-is.
+    old_apt = (
+        "                apt_args = ['apt-get', 'install', '-y', '-q',\n"
+        "                            '-o', 'Dpkg::Options::=--force-confdef',\n"
+        "                            '-o', 'Dpkg::Options::=--force-confold'] + pkgs\n"
+        "                br = _mtx_broker_exec(['env', 'DEBIAN_FRONTEND=noninteractive'] + apt_args, timeout=600)\n"
+        "                if br is None or br[0] != 0:\n"
+        "                    br = _mtx_broker_exec(apt_args, timeout=600)\n"
+    )
+    new_apt = (
+        "                # The broker injects DEBIAN_FRONTEND/NEEDRESTART_MODE for apt itself,\n"
+        "                # so no `env` wrapper (EXEC_DENY) and no -o overrides (_check_pkgmgr).\n"
+        "                apt_args = ['apt-get', 'install', '-y', '-q'] + pkgs\n"
+        "                br = _mtx_broker_exec(apt_args, timeout=600)\n"
+    )
+    if old_apt in src:
+        src = src.replace(old_apt, new_apt, 1)
+
+    # 3) the refresh in _pkg_update_available() used sudo unconditionally, so on a
+    # hardened box it could never succeed -- meaning the "up to date" verdict was
+    # unverified, and each poll added another PAM failure to the journal.
+    for _old, _new in (
+        ("            if refresh:\n"
+         "                _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)\n",
+         "            if refresh:\n"
+         "                if _mtx_broker_ping():\n"
+         "                    _mtx_broker_exec(['apt-get', 'update', '-qq'], timeout=120)\n"
+         "                else:\n"
+         "                    _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)\n"),
+        ("            if refresh:\n"
+         "                _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)\n",
+         "            if refresh:\n"
+         "                if _mtx_broker_ping():\n"
+         "                    _mtx_broker_exec(['dnf', '-q', 'makecache'], timeout=120)\n"
+         "                else:\n"
+         "                    _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)\n"),
+    ):
+        if _old in src:
+            src = src.replace(_old, _new, 1)
+
+    return src
+
+
 def _mediamtx_editor_external_sources_clear_patch(src):
     """Clear external-sources container before fill; scoped to loadExternalSources only."""
     def _patch(block):
@@ -26613,9 +27001,229 @@ def _ensure_infratak_network_for_authentik():
     _connect_container_to_infratak_network('authentik-server-1')
 
 
+# --- TAK Portal is a Compose PROJECT, not one container (v10.1.59) -------------------
+#
+# Upstream TAK Portal is splitting its compose file into web + worker (+ Postgres, + maybe
+# a map runtime). Every console path therefore drives the project through `docker compose`
+# in ~/TAK-Portal, and finds the WEB UI container by its compose SERVICE label — never by
+# `docker ps --filter name=tak-portal`, which is a SUBSTRING match that `tak-portal-worker`
+# satisfies while the web container is down, and never with `docker restart tak-portal`,
+# which leaves the worker and Postgres exactly where they were. PLAN-v10.1.59.
+
+TAKPORTAL_WEB_SERVICE = 'tak-portal'   # upstream's SERVICE_NAME in ./takportal
+
+
+def _takportal_dir():
+    return os.path.expanduser('~/TAK-Portal')
+
+
+def _takportal_project_name(portal_dir=None):
+    """The compose project name: COMPOSE_PROJECT_NAME from the project .env when set,
+    else the directory basename normalized the way Compose does it (lowercase, only
+    [a-z0-9_-], leading junk stripped) — 'TAK-Portal' -> 'tak-portal'."""
+    portal_dir = portal_dir or _takportal_dir()
+    try:
+        env_path = os.path.join(portal_dir, '.env')
+        if os.path.exists(env_path):
+            for line in (_read_priv(env_path) or '').splitlines():
+                if line.strip().startswith('COMPOSE_PROJECT_NAME='):
+                    v = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+    except Exception:
+        pass
+    base = os.path.basename(portal_dir.rstrip('/')).lower()
+    base = re.sub(r'[^a-z0-9_-]', '', base).lstrip('_-')
+    return base or 'tak-portal'
+
+
+def _takportal_compose(args, timeout=120, portal_dir=None, **kw):
+    """`docker compose <args>` against the WHOLE TAK Portal project (cwd = ~/TAK-Portal)."""
+    portal_dir = portal_dir or _takportal_dir()
+    if 'stdout' not in kw and 'stderr' not in kw:
+        kw.setdefault('capture_output', True)
+    kw.setdefault('text', True)
+    return subprocess.run(_sudo_wrap(['docker', 'compose'] + list(args)), cwd=portal_dir,
+                          timeout=timeout, **kw)
+
+
+def _takportal_project_containers(all_states=True):
+    """Every container in the project: [{id, name, service, status, running}], from the
+    compose labels Docker stamps on each container (`com.docker.compose.project` /
+    `.service`) — exact matches, one cheap `docker ps`, no compose file parse, so it also
+    works when .env is missing. Falls back to an EXACT-name `docker ps` (`^tak-portal$`)
+    for a pre-compose or foreign checkout — never a substring match."""
+    out = []
+    fmt = '{{.ID}}|||{{.Names}}|||{{.Status}}|||{{.State}}|||{{.Label "com.docker.compose.service"}}'
+    try:
+        cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
+              ['--filter', f'label=com.docker.compose.project={_takportal_project_name()}', '--format', fmt]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or '').splitlines():
+            parts = line.strip().split('|||')
+            if len(parts) < 2 or not parts[1]:
+                continue
+            out.append({'id': parts[0] or parts[1], 'name': parts[1],
+                        'status': parts[2] if len(parts) > 2 else '',
+                        'running': (parts[3].strip().lower() == 'running') if len(parts) > 3 else False,
+                        'service': parts[4].strip() if len(parts) > 4 else ''})
+    except Exception:
+        out = []
+    if out:
+        return out
+    try:
+        cmd = ['docker', 'ps'] + (['-a'] if all_states else []) + \
+              ['--filter', 'name=^tak-portal$', '--format', fmt]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=10)
+        for line in (r.stdout or '').splitlines():
+            parts = line.strip().split('|||')
+            if len(parts) >= 2 and parts[1] == 'tak-portal':
+                out.append({'id': parts[0] or parts[1], 'name': parts[1],
+                            'status': parts[2] if len(parts) > 2 else '',
+                            'running': (parts[3].strip().lower() == 'running') if len(parts) > 3 else False,
+                            'service': (parts[4].strip() if len(parts) > 4 else '') or TAKPORTAL_WEB_SERVICE})
+    except Exception:
+        pass
+    return out
+
+
+def _takportal_web_container(all_states=False):
+    """The WEB UI service's container record, or None. Resolved by compose service label
+    (falling back to the exact container name), never by substring. all_states=False
+    means "running only"."""
+    for c in _takportal_project_containers(all_states=True):
+        if c['service'] == TAKPORTAL_WEB_SERVICE or (not c['service'] and c['name'] == 'tak-portal'):
+            if all_states or c['running']:
+                return c
+    return None
+
+
+def _takportal_web_running():
+    return _takportal_web_container() is not None
+
+
+def _takportal_web_status():
+    return (_takportal_web_container(all_states=True) or {}).get('status', '')
+
+
+def _takportal_ref(all_states=True):
+    """What `docker exec/cp/inspect/logs` get handed: the web container's ID. Returns the
+    literal 'tak-portal' when nothing exists so the caller's error reads sensibly."""
+    return (_takportal_web_container(all_states=all_states) or {}).get('id') or 'tak-portal'
+
+
+def _takportal_restart(timeout=120):
+    """Restart the TAK Portal APP services (web + worker + anything else built from the
+    portal image) so they pick up a new settings.json / cert / SSH key. NEVER the database.
+
+    v10.1.59 restarted the whole project. v10.1.60 (W2) scopes it to
+    _takportal_app_services() with `--no-deps`, because upstream's main now carries a
+    Postgres service and `docker compose restart <service>` follows depends_on by default
+    ("--no-deps: Don't restart dependent services",
+    https://docs.docker.com/reference/cli/docker/compose/restart/). A bare restart of the
+    web service therefore SIGTERMs Postgres underneath it — on nuc (2026-09-06) that killed
+    the web process 3 s into the new stack's first boot with an uncaught
+    `terminating connection due to administrator command`, mid JSON->Postgres import.
+    Nothing we push is read by Postgres, so it never needs the bounce; upstream's own
+    updater deliberately leaves it running for the same reason
+    ([[takportal-main-postgres-three-container]]).
+
+    Never `docker restart tak-portal` by name. Fallback when compose cannot run (no compose
+    file) or rejects the flag (plugin older than v2.20): plain `docker restart` of every APP
+    container by ID — `docker restart` never follows dependencies. True on success."""
+    svcs = []
+    _gd_maintenance_begin('takportal', 120)  # v10.1.60 W4: a restart we asked for is not an outage
+    try:
+        if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
+            svcs = _takportal_app_services()
+            r = _takportal_compose(['restart', '--no-deps'] + svcs, timeout=timeout)
+            if r.returncode == 0:
+                return True
+            print(f"[takportal] compose restart --no-deps {' '.join(svcs)} rc={r.returncode}: "
+                  f"{((r.stderr or r.stdout) or '').strip()[:200]}", flush=True)
+    except Exception as e:
+        print(f"[takportal] compose restart error: {str(e)[:200]}", flush=True)
+    app_svcs = set(svcs or [TAKPORTAL_WEB_SERVICE])
+    cids = [c['id'] for c in _takportal_project_containers(all_states=True)
+            if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal')]
+    if not cids:
+        return False
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'restart'] + cids), capture_output=True, text=True,
+                           timeout=max(30, timeout // 2))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _takportal_up(extra=None, timeout=180, **kw):
+    """`docker compose up -d [extra...]` for the whole project."""
+    _gd_maintenance_begin('takportal', max(180, int(timeout) + 60))  # v10.1.60 W4
+    return _takportal_compose(['up', '-d'] + list(extra or []), timeout=timeout, **kw)
+
+
+def _takportal_app_services(portal_dir=None):
+    """Compose services that run the TAK Portal APP image — the ones that need our
+    extra_hosts / infratak network: any service with a `build:`, plus any service whose
+    `image:` is the tag a build service publishes. Third-party images (Postgres, ...) are
+    excluded on purpose: they have no business on the shared network. Web first.
+    ['tak-portal'] whenever the file cannot be parsed."""
+    portal_dir = portal_dir or _takportal_dir()
+    try:
+        import yaml as _yaml
+        with open(os.path.join(portal_dir, 'docker-compose.yml')) as f:
+            doc = _yaml.safe_load(f) or {}
+        svcs = doc.get('services') or {}
+        if not isinstance(svcs, dict) or not svcs:
+            return [TAKPORTAL_WEB_SERVICE]
+        built_images = {str(s.get('image')) for s in svcs.values()
+                        if isinstance(s, dict) and 'build' in s and s.get('image')}
+        names = [str(n) for n, s in svcs.items()
+                 if isinstance(s, dict) and ('build' in s or (s.get('image') and str(s.get('image')) in built_images))]
+        if not names:
+            return [TAKPORTAL_WEB_SERVICE]
+        names.sort(key=lambda n: (n != TAKPORTAL_WEB_SERVICE, n))
+        return names
+    except Exception:
+        return [TAKPORTAL_WEB_SERVICE]
+
+
+def _takportal_compose_exposed_ports(portal_dir=None):
+    """Published ports in docker-compose.yml NOT bound to 127.0.0.1 (call AFTER
+    _patch_takportal_compose_ports). Long-syntax `published:` entries are reported here,
+    not rewritten. [] when clean or unreadable."""
+    portal_dir = portal_dir or _takportal_dir()
+    found = []
+    try:
+        import yaml as _yaml
+        with open(os.path.join(portal_dir, 'docker-compose.yml')) as f:
+            doc = _yaml.safe_load(f) or {}
+        for n, s in (doc.get('services') or {}).items():
+            if not isinstance(s, dict):
+                continue
+            for p in (s.get('ports') or []):
+                if isinstance(p, dict):
+                    if p.get('published') not in (None, '') and str(p.get('host_ip') or '') != '127.0.0.1':
+                        found.append(f"{n}: published {p.get('published')} (host_ip={p.get('host_ip') or 'unset = all interfaces'})")
+                else:
+                    ps = str(p)
+                    if not ps.startswith('127.0.0.1:'):
+                        found.append(f"{n}: {ps}")
+    except Exception:
+        return []
+    return found
+
+
 def _ensure_infratak_network_for_portal():
-    """Connect TAK Portal container to the infratak network."""
-    _connect_container_to_infratak_network('tak-portal')
+    """Connect every TAK Portal APP container (web, worker, ...) to the infratak network."""
+    app_svcs = set(_takportal_app_services())
+    connected = 0
+    for c in _takportal_project_containers(all_states=False):
+        if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal'):
+            _connect_container_to_infratak_network(c['id'])
+            connected += 1
+    if not connected:
+        _connect_container_to_infratak_network('tak-portal')
 
 
 def _write_takportal_override():
@@ -26659,17 +27267,26 @@ def _write_takportal_override():
         _extra_hosts = "      - \"host.docker.internal:host-gateway\"\n"
         if settings.get('fqdn') and tak_dns and os.path.isdir('/opt/tak'):
             _extra_hosts += f"      - \"{tak_dns}:host-gateway\"\n"
+        # v10.1.59: one block per APP service (web, worker, ...) — a worker on the app image
+        # needs the same host aliases and the infratak network as the web UI. Postgres and
+        # other third-party images are left out (_takportal_app_services). Byte-identical
+        # to the old output for the single-service upstream file, so no fleet recreate.
+        _svc_blocks = ''
+        for _svc in _takportal_app_services(portal_dir):
+            _svc_blocks += (
+                f"  {_svc}:\n"
+                "    extra_hosts:\n"
+                f"{_extra_hosts}"
+                "    networks:\n"
+                "      - default\n"
+                f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            )
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
             "# Port hardening is applied directly to docker-compose.yml by\n"
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
-            "  tak-portal:\n"
-            "    extra_hosts:\n"
-            f"{_extra_hosts}"
-            "    networks:\n"
-            "      - default\n"
-            f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            f"{_svc_blocks}"
             "\n"
             "networks:\n"
             "  default: {}\n"
@@ -26753,6 +27370,19 @@ def _patch_takportal_compose_ports(portal_dir=None):
         content = _re.sub(
             r'(\s+- ")(\$\{WEB_UI_PORT:-3000\}:\$\{WEB_UI_PORT:-3000\})"',
             r'\g<1>127.0.0.1:\g<2>"',
+            content
+        )
+        # v10.1.59: upstream's compose is growing extra services (worker, Postgres, ...).
+        # ANY short-syntax "HOST:CONTAINER" published port without a host IP is a 0.0.0.0
+        # bind in front of UFW, past the Caddy/Authentik boundary — e.g. a future
+        # `5432:5432` on the portal's Postgres. Prefix every such entry with 127.0.0.1.
+        # The ${WEB_UI_PORT} rule above is unchanged (it already ran); this catches the
+        # rest. A line that already carries a host IP has three colon-separated parts and
+        # does not match. Long-syntax `published:` is reported by
+        # _takportal_compose_exposed_ports(), not rewritten.
+        content = _re.sub(
+            r'(?m)^(\s+-\s+"?)((?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::-\d+)?\}|\d+):(?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::-\d+)?\}|\d+)(?:/(?:tcp|udp))?)("?)[ \t]*$',
+            r'\g<1>127.0.0.1:\g<2>\g<3>',
             content
         )
         if content != orig:
@@ -28703,6 +29333,30 @@ def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
     return local_crt, local_key
 
 
+def _tak_container_ids():
+    """(uid, gid) the TAK container actually runs as, as strings.
+
+    v10.1.67. The stock takserver image runs as uid 1000; the HARDENED image runs as
+    1001 (tak:0). Hardcoding 1000 left takserver-le.p12 owned by a uid the container is
+    not, so keytool could not read it — and combined with an import that deleted the live
+    keystore first, that destroyed TAK's 8446 keystore and stopped its API from starting.
+    Falls back to the historical 1000:0 only if the container cannot be asked.
+    """
+    uid, gid = '1000', '0'
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-u']),
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            uid = r.stdout.strip()
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-g']),
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
+            gid = r.stdout.strip()
+    except Exception:
+        pass
+    return uid, gid
+
+
 def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
     """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
     the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
@@ -28753,34 +29407,36 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # and the deploy silently falls back to the self-signed cert on 8446 - the port
     # ATAK ENROLLS against. Measured on a fresh hardened container deploy, dev-4
     # 2026-09-03: 8446 served CN=INT-CA-01 instead of the ACME cert.
-    # Group 0 + 0640 is the same model _container_own_tree() uses for the bundle, and
-    # it is what the container's gid already is; on the host, group 0 is root, so the
-    # server's private key gains no new readers. _container_own_tree() cannot cover
-    # this file - it runs during deploy, and this cert is installed afterwards.
-    subprocess.run(_sudo_wrap(['chown', ':0', p12]), capture_output=True)
-    subprocess.run(_sudo_wrap(['chmod', '640', p12]), capture_output=True)
+    # _container_own_tree() cannot cover this file: it runs during the deploy, and this
+    # cert is installed afterwards. The ownership is set from the container's real ids
+    # just below, which supersedes the group-0 model this lane originally used.
     try:
         os.remove(_tmp_p12)
     except Exception:
         pass
     # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
+    # The container must be able to READ the p12, so set ownership from the container's real
+    # uid FIRST — 1000 is only correct for the stock image; the hardened one runs as 1001.
+    _tuid, _tgid = _tak_container_ids()
+    subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', p12]), capture_output=True)
+    subprocess.run(_sudo_wrap(['chmod', '0640', p12]), capture_output=True)
+    # Import into a TEMP keystore and swap it in only on success. Never delete the live one
+    # first: CoreConfig's 8446 connector references it, so a failed import used to leave TAK
+    # with no keystore and its whole API refusing to start at the next restart.
     r = subprocess.run(
-        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks && '
+        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks.new && '
                   f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} '
-                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks '
-                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt') + ' 2>&1',
+                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks.new '
+                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt && '
+                  'mv -f takserver-le.jks.new takserver-le.jks') + ' 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ JKS conversion failed: {(r.stderr or r.stdout).strip()[:200]}"); return False
-    # NOT `chown 1000:1000`. That was the PRE-hardened image's uid; the hardened 5.8
-    # image runs as tak:0 = uid 1001, gid 0 (`docker exec takserver id`, dev-4
-    # 2026-09-03), so the hardcoded uid re-locked both files away from the very
-    # process that reads them. It survived only because the JKS landed 0644 - i.e.
-    # the server's private key was world-readable on the host, which is its own
-    # problem on a box that may hold CJI.
-    # Group 0 + 0640 is uid-independent: it is the container user's gid on both
-    # image eras, and on the host group 0 is root.
-    subprocess.run(_sudo_wrap(['chown', ':0', jks, p12]), capture_output=True)
+        log_fn(f"  ⚠ JKS conversion failed (existing keystore left intact): "
+               f"{(r.stderr or r.stdout).strip()[:200]}"); return False
+    subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', jks, p12]))
+    # 0640, not whatever keytool left. The JKS holds the server's TLS private key and
+    # used to land 0644 — world-readable on the host, on a box that may hold CJI. The
+    # p12 is already moded above; this is the same treatment for the keystore itself.
     subprocess.run(_sudo_wrap(['chmod', '640', jks, p12]), capture_output=True)
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
     # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
@@ -28831,9 +29487,22 @@ TAK_FP=$(docker exec {TAK_CONTAINER} keytool -list -rfc -keystore "$JKS" -storep
 [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ] && {{ log "TAK keystore already current."; exit 0; }}
 log "Refreshing TAK keystore from Caddy's current cert..."
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" -out "$P12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
-docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt"
-chown :0 "$JKS" "$P12" 2>/dev/null || true
-chmod 640 "$JKS" "$P12" 2>/dev/null || true
+# The container must be able to READ the p12 before keytool runs, so set ownership FIRST and
+# take the uid/gid from the container rather than assuming 1000. The hardened TAK image runs as
+# uid 1001 (tak:0); a hardcoded 1000 left the p12 at mode 0640 owned by a uid the container is
+# not, and keytool died with "takserver-le.p12 (Permission denied)".
+TAK_UID=$(docker exec {TAK_CONTAINER} id -u 2>/dev/null || echo 1000)
+TAK_GID=$(docker exec {TAK_CONTAINER} id -g 2>/dev/null || echo 0)
+chown "$TAK_UID:$TAK_GID" "$P12" 2>/dev/null || true
+chmod 0640 "$P12" 2>/dev/null || true
+# Import into a TEMP keystore and swap it in only on success. NEVER delete the live keystore
+# first: CoreConfig's 8446 connector references takserver-le.jks, so when the import failed the
+# box was left with no keystore at all and TAK's entire API refused to start at the next restart
+# ("APPLICATION FAILED TO START / connector ... port 8446 failed to start"). set -e means a
+# failed import exits here with the working keystore still in place and TAK untouched.
+docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks.new && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks.new -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt && mv -f takserver-le.jks.new takserver-le.jks"
+chown "$TAK_UID:$TAK_GID" "$JKS" 2>/dev/null || true
+chmod 0640 "$JKS" 2>/dev/null || true
 docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
@@ -29495,10 +30164,28 @@ def _fetch_takportal_latest(*, fresh=False):
 
 
 def _get_takportal_version_info(fresh=False):
-    """Return {version: str, update_available: bool, latest: str|None} for TAK Portal.
+    """Return {version, beta_version, channel, update_available, latest} for TAK Portal.
 
     Installed version comes from package.json. The update decision comes from the
     upstream GitHub release — NOT from the container's own log.
+
+    **On the beta channel, `version` is NOT the version TAK Portal shows.** Upstream
+    added a separate `beta-version` key to package.json so its own UI reports the right
+    number while Beta Mode is on; `version` keeps carrying the last published release
+    (Justin Davis, 2026-09-10). Measured on test12 the same day: `version` 1.4.9,
+    `beta-version` 2.0.0, `BETA_MODE` true — so the console said 1.4.9 while TAK Portal
+    said 2.0.0, out of one file, and the update had worked perfectly. Anyone diagnosing
+    that as a stale checkout or a failed pull is chasing the wrong thing.
+
+    We read `beta-version` ONLY on the beta channel and fall back to `version` whenever
+    it is absent — which is exactly what happens the moment upstream publishes 2.0.0 as
+    a real release, and that has to be a non-event. It is upstream's key: we read it,
+    we never write it (see the third-party-config hard stop in CLAUDE.md).
+
+    `channel` ('beta' | 'release' | 'unknown') travels WITH the version so every surface
+    can say which one it is looking at. Before v10.1.63 only /takportal computed it, so
+    the dashboard card and every other consumer of /api/takportal/version rendered a
+    bare number with no way to tell a main-branch build from a release.
 
     Until v10.1.54 the only signal was an `[update-check]` line scraped out of
     `docker logs tak-portal --tail 200`, which made the badge depend on how chatty
@@ -29514,7 +30201,18 @@ def _get_takportal_version_info(fresh=False):
     """
     import re as _re
     portal_dir = os.path.expanduser('~/TAK-Portal')
-    out = {'version': '', 'update_available': False, 'latest': None}
+    out = {'version': '', 'beta_version': '', 'channel': 'unknown',
+           'update_available': False, 'latest': None}
+    # Which channel this box is on. Tri-state on purpose — 'unknown' must never render as
+    # a confident 'release' (see _takportal_beta_channel_state). Read ONLY when the web
+    # container is up: the reader's docker-cp fallback can spend 15s on a stopped one, and
+    # this helper runs inline in a page render and in the dashboard's version sweep.
+    _web = _takportal_web_container()
+    if _web:
+        try:
+            out['channel'] = _takportal_beta_channel_state()
+        except Exception:
+            out['channel'] = 'unknown'
     # Prefer package.json version (semantic version)
     pkg_path = os.path.join(portal_dir, 'package.json')
     if os.path.isfile(pkg_path):
@@ -29522,8 +30220,13 @@ def _get_takportal_version_info(fresh=False):
             with open(pkg_path) as f:
                 data = json.load(f)
             out['version'] = (data.get('version') or '').strip()
+            out['beta_version'] = str(data.get('beta-version') or '').strip()
         except Exception:
             pass
+    # On beta, report what TAK Portal itself reports. Only when the key is actually
+    # there — never invent a number, and never override a release-channel box.
+    if out['channel'] == 'beta' and out['beta_version']:
+        out['version'] = out['beta_version']
     if not out['version'] and os.path.isdir(os.path.join(portal_dir, '.git')):
         rv = subprocess.run(f'cd {portal_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
@@ -29532,9 +30235,9 @@ def _get_takportal_version_info(fresh=False):
     # tail window. Widened from 200 to 2000 lines — it is cheap, and at 200 the line
     # had already scrolled away on every busy box we looked at.
     log_latest, log_update = None, False
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '-q']), capture_output=True, text=True, timeout=5)
-    if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    _web_cid = (_web or {}).get('id')
+    if _web_cid:
+        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', _web_cid, '--tail', '2000']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
@@ -30576,6 +31279,9 @@ def get_all_module_versions():
     if modules.get('tak_video_restreamer', {}).get('installed'):
         # registry-resident since v10.1.24 — modules/tvr.py owns the SHA compare
         _set('tak_video_restreamer', lambda: mod_registry.tvr.get_version_info(mod_registry.get_ctx()))
+    if modules.get('simulator', {}).get('installed'):
+        # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
+        _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -30622,15 +31328,14 @@ def takportal_page():
     # Get container info if running
     container_info = {}
     if portal.get('running'):
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Names}}|||{{.Status}}']), capture_output=True, text=True)
-        if r.stdout.strip():
-            containers = []
-            for line in r.stdout.strip().split('\n'):
-                if line.strip():
-                    parts = line.strip().split('|||')
-                    containers.append({'name': parts[0] if len(parts) > 0 else 'tak-portal', 'status': parts[1] if len(parts) > 1 else ''})
+        # v10.1.59: every container in the compose project (web, worker, Postgres, ...),
+        # web first; the headline status is the WEB service's.
+        containers = [{'name': c['name'], 'service': c['service'] or c['name'], 'status': c['status']}
+                      for c in _takportal_project_containers(all_states=True)]
+        containers.sort(key=lambda c: (c['service'] != TAKPORTAL_WEB_SERVICE, c['name']))
+        if containers:
             container_info['containers'] = containers
-            container_info['status'] = containers[0]['status'] if containers else ''
+            container_info['status'] = _takportal_web_status() or containers[0]['status']
     # Get portal port from .env if exists.
     # _read_priv, not open(): v10.1.9 W7 hardened module .env files to 600 and they are
     # root-owned, so a non-root console gets PermissionError and this whole page 500s
@@ -30659,9 +31364,11 @@ def takportal_page():
     # and this is an inline page render. Stable is also the correct answer when we cannot
     # look — the same fail-closed default _takportal_beta_mode() uses.
     portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
-    # Separate from the fail-closed value above: the badge must be able to say
-    # "unknown" instead of silently implying "release". See _takportal_beta_channel_state.
-    portal_channel = _takportal_beta_channel_state() if portal.get('running') else 'unknown'
+    # v10.1.63: the DISPLAY channel now travels with the version info, so this page and the
+    # dashboard card cannot disagree and we do not pay for two docker execs per render.
+    # Still tri-state — the badge must be able to say "unknown" rather than silently imply
+    # "release". See _takportal_beta_channel_state.
+    portal_channel = vinfo.get('channel') or 'unknown'
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
@@ -30718,7 +31425,7 @@ def _takportal_get_existing_settings():
     the whole file from our defaults, clobbering operator values on any redeploy."""
     try:
         r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
         if r.returncode == 0 and (r.stdout or '').strip():
             return json.loads(r.stdout.strip())
     except Exception:
@@ -30730,7 +31437,7 @@ def _takportal_get_existing_settings():
         import io as _io
         import tarfile as _tarfile
         cp = subprocess.run(
-            _sudo_wrap(['docker', 'cp', 'tak-portal:/usr/src/app/data/settings.json', '-']),
+            _sudo_wrap(['docker', 'cp', f'{_takportal_ref()}:/usr/src/app/data/settings.json', '-']),
             capture_output=True, timeout=15)
         if cp.returncode != 0 or not cp.stdout:
             return {}
@@ -31253,7 +31960,7 @@ def _takportal_write_settings_json(settings_json, plog=None):
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(settings_json)
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{_takportal_ref()}:/usr/src/app/data/settings.json']),
                                 capture_output=True, text=True, timeout=20)
         finally:
             try:
@@ -31277,9 +31984,7 @@ def _takportal_push_settings(plog=None, restart=True):
     portal isn't running or the push failed. Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
-                           capture_output=True, text=True, timeout=8)
-        if (r.stdout or '').strip() != 'true':
+        if not _takportal_web_running():
             return False
         settings = load_settings()
         ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings), plog=_log)
@@ -31287,10 +31992,9 @@ def _takportal_push_settings(plog=None, restart=True):
             _log(f"  takportal settings push: docker cp failed: {err}")
             return False
         if restart:
-            rs = subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
-                                capture_output=True, text=True, timeout=30)
-            if rs.returncode != 0:
-                _log(f"  takportal settings push: restart returned {rs.returncode}")
+            # v10.1.59: the whole project, so a worker picks the new settings up too.
+            if not _takportal_restart():
+                _log("  takportal settings push: project restart failed")
         return True
     except Exception as e:
         _log(f"  takportal settings push error (non-fatal): {e}")
@@ -31311,9 +32015,7 @@ def _heal_takportal_authentik_token(plog=None):
     token can be read. Best-effort; never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'tak-portal']),
-                           capture_output=True, text=True, timeout=8)
-        if (r.stdout or '').strip() != 'true':
+        if not _takportal_web_running():
             return False  # container not running — nothing to heal / can't push
         existing = _takportal_get_existing_settings()
         if not isinstance(existing, dict):
@@ -31542,15 +32244,16 @@ def _takportal_setup_ssh(log_fn=None):
                 log_fn("  ✓ Public key already in authorized_keys")
 
         # Copy keypair into running container
+        _web = _takportal_ref()  # v10.1.59: the WEB service's container, resolved — not a name guess
         subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/ssh']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _web, 'mkdir', '-p', '/usr/src/app/data/ssh']), capture_output=True, text=True, timeout=10)
         subprocess.run(
-            _sudo_wrap(['docker', 'cp', priv_key, 'tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'cp', priv_key, f'{_web}:/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
         subprocess.run(
-            _sudo_wrap(['docker', 'cp', pub_key, 'tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519.pub']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'cp', pub_key, f'{_web}:/usr/src/app/data/ssh/tak_ssh_ed25519.pub']), capture_output=True, text=True, timeout=10)
         # Ensure correct permissions inside container
         subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'chmod', '600', '/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
+            _sudo_wrap(['docker', 'exec', _web, 'chmod', '600', '/usr/src/app/data/ssh/tak_ssh_ed25519']), capture_output=True, text=True, timeout=10)
         if log_fn:
             log_fn("  ✓ SSH keys copied into TAK Portal container")
 
@@ -31614,6 +32317,7 @@ def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
@@ -31622,9 +32326,16 @@ def takportal_control():
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=portal_dir, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
+        # v10.1.60 (W2): this was `compose down` + `compose up -d` — a full teardown that
+        # took the portal's Postgres with it every time the operator pressed Restart.
+        # `up -d` alone recreates only the services whose config changed (so the network
+        # and port patches below still converge) and leaves a healthy Postgres running;
+        # the app services are then restarted explicitly, never their database.
+        _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
-        _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=portal_dir)
+        _takportal_up(timeout=120)
+        _takportal_restart()
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
@@ -31672,7 +32383,7 @@ def takportal_control():
                     warnings.append(f'client cert / CA not refreshed: {certs_msg}. '
                                     'TAK Portal will report "Client P12 Certificate: Not Installed" '
                                     'and Marti stats will fail.')
-            subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+            _takportal_restart()  # v10.1.59: whole project (web + worker + ...)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
         # v0.9.31: run the full Authentik proxy chain heal for all deployed
@@ -31691,8 +32402,7 @@ def takportal_control():
         except Exception:
             pass
         time.sleep(2)
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
+        running = _takportal_web_running()
         tp_state = (chain_summary or {}).get('takportal', {})
         ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
               and tp_state.get('app') in ('ok', 'created', 'fixed'))
@@ -31742,6 +32452,43 @@ def takportal_control():
         # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
+        for _ep in _takportal_compose_exposed_ports(portal_dir):
+            print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+        # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
+        # build, not after. Both live under /usr/src/app/data, which is the project's named
+        # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
+        # the CURRENT container is exactly what the NEW containers read on their first boot,
+        # and nothing has to be restarted afterwards. The old order (build, cp, then a
+        # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
+        # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
+        # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
+        # one boot that must not be interrupted. Verified after the build (below), never
+        # assumed. [[takportal-main-postgres-three-container]]
+        settings_synced = False
+        settings_sync_error = ''
+        cloudtak_url = ''
+        settings_json = ''
+        try:
+            settings = load_settings()
+            settings_json = _takportal_merged_settings_json(settings)
+            try:
+                cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
+            except Exception:
+                pass
+            # `docker cp` works on a stopped container; it needs SOME container to exist.
+            if _takportal_project_containers(all_states=True):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    _takportal_setup_ssh()
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
+        except Exception as e:
+            settings_sync_error = str(e)[:300]
+        # v10.1.60 (W4): the recreate at the end of this build takes the web container
+        # down for 10-15 s. Open a window that outlives the build's own timeout; it is
+        # shrunk to a short grace as soon as the route knows the outcome (below).
+        _gd_maintenance_begin('takportal', 900 + 180)
         # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
         # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
         # time out here on a slower box, and TimeoutExpired was not caught, so it
@@ -31752,6 +32499,7 @@ def takportal_control():
         except subprocess.TimeoutExpired:
             plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
             print(f'[takportal] update: {plog_msg}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False, 'error': plog_msg}), 500
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -31763,38 +32511,50 @@ def takportal_control():
             # the build to see it. Report what the build actually said, and journal it.
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
             print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
             return jsonify({'success': False,
                             'error': f'Build failed: {err}',
                             'hint': 'The previous container may still be running the old version. '
                                     'Check the container logs, fix the cause, and press Update again.'}), 500
-        settings_synced = False
-        settings_sync_error = ''
-        cloudtak_url = ''
+        # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
+        # them back from the new web container and compare every authoritative key we set.
+        # A miss (no container existed before the build, or a checkout whose data dir is a
+        # bind mount rather than the named volume) is the ONLY case that writes again and
+        # restarts — and that restart is app-services-only (W2): Postgres is never touched.
         try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            cloudtak_url = ''
-            try:
-                import json as json_mod
-                portal_settings = json_mod.loads(settings_json)
-                cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
-            except Exception:
-                pass
-            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-            if cp_ok:
-                _takportal_setup_ssh()
-                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
-                settings_synced = True
-            else:
-                settings_sync_error = cp_err or 'docker cp failed'
+            _want = json.loads(settings_json) if settings_json else {}
+            _have = _takportal_get_existing_settings() or {}
+            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
+            # An unreadable file after a successful pre-build write is a read failure, not
+            # evidence the write was lost — do not restart a booting stack over it.
+            _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
+                      if _have else ([] if settings_synced else list(_keys)))
+            if settings_json and _have == {} and settings_synced:
+                print('[takportal] update: could not read settings.json back from the new web '
+                      'container — leaving the stack alone (pre-build write succeeded)', flush=True)
+            if settings_json and (not settings_synced or _stale):
+                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+                if cp_ok:
+                    settings_synced = True
+                    settings_sync_error = ''
+                    _takportal_setup_ssh()
+                    _takportal_restart()  # app services only — never Postgres (W2)
+                    print('[takportal] update: settings were not on the data volume after the build '
+                          f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
+                          'and restarted the app services', flush=True)
+                else:
+                    settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
-            settings_sync_error = str(e)[:300]
+            settings_sync_error = settings_sync_error or str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
+        _update_boot_stagger_service()  # v10.1.59: the project may have gained services
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
+        running = _takportal_web_running()
+        # W4: the build is over — shrink the window to a boot grace (the app itself takes
+        # a few seconds to answer), then Guard Dog's own verdict rules again.
+        _gd_maintenance_begin('takportal', 90 if running else 15)
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
@@ -31805,8 +32565,7 @@ def takportal_control():
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-    running = 'Up' in r.stdout
+    running = _takportal_web_running()
     return jsonify({'success': True, 'running': running, 'action': action})
 
 @app.route('/api/takportal/deploy', methods=['POST'])
@@ -31831,8 +32590,21 @@ def takportal_deploy_log_api():
 @login_required
 def takportal_container_logs():
     """Get recent container logs"""
-    lines = request.args.get('lines', 50, type=int)
-    r = subprocess.run(_sudo_wrap(['docker', 'logs', 'tak-portal', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    lines = max(1, min(request.args.get('lines', 50, type=int) or 50, 2000))
+    # v10.1.59: the whole compose project (service-prefixed lines), or one service via
+    # ?service=. Falls back to the web container's own log when compose cannot run.
+    service = (request.args.get('service') or '').strip()
+    if service and not re.match(r'^[A-Za-z0-9_.-]{1,64}$', service):
+        return jsonify({'error': 'invalid service'}), 400
+    r = None
+    if os.path.exists(os.path.join(_takportal_dir(), 'docker-compose.yml')):
+        try:
+            r = _takportal_compose(['logs', '--no-color', '--tail', str(lines)] + ([service] if service else []),
+                                   timeout=15, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except Exception:
+            r = None
+    if r is None or r.returncode != 0 or not (r.stdout or '').strip():
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', _takportal_ref(), '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
     entries = []
     skip_lines = {'npm error', 'npm ERR', 'signal SIGTERM', 'command failed', 'A complete log of this run'}
     for line in (r.stdout.strip().split('\n') if r.stdout.strip() else []):
@@ -31905,7 +32677,7 @@ def takportal_ssh_status():
 
     in_container = False
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'test', '-f',
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'test', '-f',
                                        '/usr/src/app/data/ssh/tak_ssh_ed25519']),
                            capture_output=True, text=True, timeout=10)
         in_container = (r.returncode == 0)
@@ -32014,8 +32786,7 @@ def takportal_ssh_set_user():
     ok, err = _takportal_write_settings_json(json.dumps(merged, indent=2))
     if not ok:
         return jsonify({'success': False, 'error': err}), 500
-    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
-                   capture_output=True, text=True, timeout=30)
+    _takportal_restart()  # v10.1.59: whole project
     return jsonify({'success': True, 'user': console_user})
 
 
@@ -32238,6 +33009,14 @@ def run_takportal_deploy():
 
         if _patch_takportal_compose_network():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
+        # v10.1.59: loopback-bind every published port BEFORE the first build. Deploy never
+        # called this — only the startup migration and the post-update hook did — so a fresh
+        # install ran on 0.0.0.0:3000 (in front of UFW; Docker writes its own iptables rules)
+        # until the next console restart.
+        if _patch_takportal_compose_ports(portal_dir):
+            plog("  ✓ Published ports bound to 127.0.0.1 in docker-compose.yml (Caddy is the only way in)")
+        for _ep in _takportal_compose_exposed_ports(portal_dir):
+            plog(f"  ⚠ published port NOT bound to loopback: {_ep}")
 
         plog("  Building image (this may take a minute)...")
         # Build + create the container WITHOUT starting it. The first boot otherwise
@@ -32247,6 +33026,7 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
+        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
@@ -32287,8 +33067,7 @@ def run_takportal_deploy():
         # Wait for container to be healthy
         plog("  Waiting for container...")
         time.sleep(5)
-        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True)
-        if 'Up' in r.stdout:
+        if _takportal_web_running():
             plog("\u2713 TAK Portal is running")
         else:
             plog("\u26a0 Container may not be fully started yet")
@@ -32363,8 +33142,8 @@ def run_takportal_deploy():
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
-        # Restart container to pick up settings
-        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        # Restart the whole project to pick up settings (v10.1.59: web + worker + ...)
+        _takportal_restart()
         time.sleep(3)
         plog("\u2713 TAK Portal restarted with new settings")
 
@@ -32727,6 +33506,7 @@ def mediamtx_recovery():
                 src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
                 if src:
                     src = _mediamtx_editor_endpoint_patch(src)
+                    src = _mediamtx_editor_broker_deps_patch(src)   # v10.1.65 W3 (GH #67)
                     _write_priv(editor_path, src)
             except Exception:
                 pass
@@ -34015,6 +34795,7 @@ WantedBy=multi-user.target
                         with open(_editor_path, 'r') as ef:
                             esrc = ef.read()
                         patched = _mediamtx_editor_endpoint_patch(esrc)
+                        patched = _mediamtx_editor_broker_deps_patch(patched)   # v10.1.65 W3 (GH #67)
                         if patched != esrc:
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
@@ -34472,6 +35253,35 @@ CLOUDTAK_PLUGINS = [
         'requires': 'CloudTAK 13.45+',
         'author': 'takwerx',
         'license': 'Proprietary',
+    },
+    {
+        'key': 'taksim',
+        'name': 'TAK Simulator',
+        'description': (
+            'Design and direct a simulation on the CloudTAK map: drop a sweeping radar, '
+            'aircraft, vessels and ground units, steer them live (go to, orbit, hold, course, '
+            'altitude, lost link), fire chat / CASEVAC / 911, draw shapes, save the layout as a '
+            'scenario, and clear everything with one button. Drives the TAK Simulator engine on '
+            'this box — everything stays on the simulation channel unless a real channel is '
+            'deliberately confirmed. Requires the TAK Simulator module.'
+        ),
+        # v10.1.61 W11: ships in this repo (local_path → copied, never symlinked, into
+        # web/plugins/taksim; server_path → api/stateless/routes/plugin-taksim.ts). Not
+        # auto-installed by the simulator deploy — a CloudTAK rebuild is 5–10 min — the
+        # Simulator page offers an "Install CloudTAK panel" button that calls the plugin
+        # action route.
+        'local_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'plugin'),
+        'server_path': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloudtak-plugins', 'taksim', 'server'),
+        'install_dir': 'taksim',
+        'requires': 'CloudTAK 13.45+',
+        'author': 'TAKWERX',
+        'license': 'AGPL-3.0-or-later',
+        # v10.1.63 W1: the dev-channel gate is gone (the module's tile lost the same gate —
+        # see detect_modules). The `dev_only` mechanism itself stays in _detect_cloudtak_plugins
+        # for the next dev-gated plugin; only the Simulator's use of it goes.
+        # v10.1.62: listed only once the TAK Simulator module is deployed on this box — the panel
+        # is a remote control for that engine and does nothing without it (operator, 2026-09-10).
+        'requires_module': 'simulator',
     },
 ]
 
@@ -35628,9 +36438,16 @@ def _detect_cloudtak_plugins():
     ct_dir = os.path.expanduser('~/CloudTAK')
     plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
     result = []
+    _settings = load_settings()
+    _dev_box = (_settings.get('update_channel') or 'main').strip().lower() == 'dev'
+    _modules_on = {'simulator': bool(_settings.get('simulator_enabled'))}
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
         installed = os.path.isdir(install_path) or os.path.islink(install_path)
+        if p.get('dev_only') and not _dev_box and not installed:
+            continue        # v10.1.61: dev-only plugins stay out of a main-channel catalog
+        if p.get('requires_module') and not installed and not _modules_on.get(p['requires_module']):
+            continue        # v10.1.62: a plugin that only drives a module is listed once that module is deployed
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
@@ -35937,9 +36754,18 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             try:
                 _req = urllib.request.Request('http://127.0.0.1:5000/api/server', method='GET')
                 with urllib.request.urlopen(_req, timeout=5) as _resp:
-                    if _resp.status == 200:
+                    if _resp.status < 500:
                         _api_up = True
                         break
+            except urllib.error.HTTPError as _he:
+                # /api/server answers 401 "No Auth Present" to an anonymous probe — that IS
+                # the API up and bound. Requiring a 200 here meant this loop could never
+                # succeed: every plugin install/update sat out the full 10 minutes and then
+                # printed the "not confirmed up" warning on a healthy box (test6, 2026-09-09).
+                # Same rule as the deploy-time probe: anything below 500 is alive.
+                if _he.code < 500:
+                    _api_up = True
+                    break
             except Exception:
                 pass
             if _i >= 3:  # give a healthy start ~60s of grace before probing for the loop
@@ -35994,8 +36820,17 @@ def cloudtak_plugin_action():
     action = (data.get('action') or '').strip()
     if not plugin_key or action not in ('install', 'update', 'remove'):
         return jsonify({'error': 'Invalid request — provide plugin key and action (install/update/remove)'}), 400
-    if not any(p['key'] == plugin_key for p in CLOUDTAK_PLUGINS):
+    _plugin = next((p for p in CLOUDTAK_PLUGINS if p['key'] == plugin_key), None)
+    if _plugin is None:
         return jsonify({'error': f'Unknown plugin: {plugin_key}'}), 400
+    # v10.1.63 W2: enforce `requires_module` on the ACTION, not just the catalog listing.
+    # _detect_cloudtak_plugins() hides a plugin whose module is not deployed, but hiding is
+    # presentation — this route is reachable by curl with only the key. Install only; update
+    # and remove must keep working on an already-installed plugin if the module goes away.
+    _req_mod = _plugin.get('requires_module')
+    if action == 'install' and _req_mod and not load_settings().get(f'{_req_mod}_enabled'):
+        _req_name = (mod_registry.MODULES.get(_req_mod) or {}).get('name', _req_mod)
+        return jsonify({'error': f'Requires the {_req_name} module — deploy it first, then return here.'}), 409
     t = threading.Thread(target=_run_cloudtak_plugin_action, args=(plugin_key, action), daemon=True)
     t.start()
     return jsonify({'ok': True})
@@ -36172,6 +37007,36 @@ def _cloudtak_build_override_yml(settings):
                             and bool(settings.get('console_cert_docker_san'))
                             and os.path.isfile(console_cert_src))
 
+    # v10.1.61 W10: when the TAK Simulator is deployed on this box, the api container joins
+    # the private `infratak` network (the one Portal <-> Authentik already use) and learns
+    # where the engine is plus its bearer token, so the CloudTAK plugin's server route
+    # (plugin-taksim.ts) can drive the engine. The browser never sees the token. Local
+    # CloudTAK only: a remote CloudTAK has neither the network nor the engine. The network
+    # is declared external, so make sure it exists before compose reads this file.
+    _sim_env_block = ''
+    _sim_net_block = ''
+    _sim_networks_top = ''
+    if settings.get('simulator_enabled') and not _ct_is_remote:
+        _ensure_infratak_docker_network()
+        _sim_tok = ''.join(c for c in (settings.get('simulator_control_token') or '') if c.isalnum() or c in '_-')
+        _sim_env_block = (
+            '      # v10.1.61 W10: TAK Simulator engine — reachable on the private infratak\n'
+            '      # network only, bearer-gated; consumed by the CloudTAK plugin server route.\n'
+            '      TAKSIM_ENGINE_URL: "http://tak-simulator:5090"\n'
+            f'      TAKSIM_ENGINE_TOKEN: "{_sim_tok}"\n'
+        )
+        _sim_net_block = (
+            '    networks:\n'
+            '      - default\n'
+            f'      - {INFRATAK_DOCKER_NETWORK}\n'
+        )
+        _sim_networks_top = (
+            '\nnetworks:\n'
+            '  default: {}\n'
+            f'  {INFRATAK_DOCKER_NETWORK}:\n'
+            '    external: true\n'
+        )
+
     # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
     media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
                    if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
@@ -36208,7 +37073,7 @@ services:
     extra_hosts:
 {hosts_block}
     environment:
-{tls_env_block}{cert_vol_block}
+{tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
   events:
     extra_hosts:
 {hosts_block}
@@ -36237,7 +37102,67 @@ services:
   postgis:
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
-"""
+{_sim_networks_top}"""
+
+
+def _cloudtak_refresh_override(plog=None):
+    """v10.1.61 W10: rewrite CloudTAK's compose override from current settings and, when
+    it changed, recreate ONLY the api service (`up -d --no-deps api`). The simulator module
+    calls this on deploy and uninstall so the api container joins / leaves the infratak
+    network and gets / loses the engine URL + token. Local CloudTAK only; a no-op when it
+    is not installed here. Returns (changed, message)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    if not (os.path.exists(os.path.join(ct_dir, 'docker-compose.yml'))
+            or os.path.exists(os.path.join(ct_dir, 'compose.yaml'))):
+        return False, 'CloudTAK is not installed on this box'
+    settings = load_settings()
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return False, 'CloudTAK runs on a remote host — nothing to link'
+    except Exception:
+        pass
+    override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
+    new = _cloudtak_build_override_yml(settings)
+    old = ''
+    if os.path.exists(override_path):
+        with open(override_path) as f:
+            old = f.read()
+    if settings.get('simulator_enabled'):
+        try:
+            os.chmod(override_path, 0o600)  # carries the engine token — also when another
+        except OSError:                     # writer (startup migration) left it at 644
+            pass
+    if old.strip() == new.strip():
+        return False, 'CloudTAK override already current'
+    with open(override_path, 'w') as f:
+        f.write(new)
+    try:
+        os.chmod(override_path, 0o600)
+    except OSError:
+        pass
+    _log('  CloudTAK override rewritten — recreating the api container (no other service touched)...')
+    r = _broker_compose(ct_dir, 'up -d --no-deps api', timeout=240)
+    if r.returncode != 0:
+        return True, f'override written but the api recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+    # v10.1.62 T&E finding (nuc, 2026-09-09): recreating the api container from its image
+    # wipes the sprite-regen guard the icon self-heal patches in, and a box carrying one
+    # undecodable icon then crash-loops on `vipspng: libpng read error` at API boot
+    # (dfpc-coe/CloudTAK#1623) — RestartCount 20 within 18 min, nothing watching, because
+    # only the console boot, the CloudTAK update and the plugin-rebuild paths armed the
+    # watch. This is the third recreate path; it arms the same self-gating 8-check /
+    # ~15-min watch (a docker inspect every 2 min on a healthy box).
+    def _simlink_icon_watch():
+        for _i in range(8):
+            time.sleep(90 if _i == 0 else 120)
+            try:
+                _selfheal_cloudtak_corrupt_icons(
+                    plog=lambda m: print(f"[simlink-iconheal] {m}", flush=True))
+            except Exception:
+                pass
+    threading.Thread(target=_simlink_icon_watch, daemon=True, name='cloudtak-simlink-icon-heal').start()
+    _log('  (sprite-regen self-heal armed for the next ~15 min — dfpc-coe/CloudTAK#1623)')
+    return True, 'CloudTAK api container recreated with the new override'
 
 
 # --- CloudTAK embedded-MediaMTX (cloudtak-media) self-heal scripts (v0.9.48) ----
@@ -36728,6 +37653,105 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
         pass
 
 
+def _cloudtak_plugin_owning_route(route_filename, cloudtak_dir=None):
+    """Which installed CloudTAK plugin shipped this api/stateless/routes/<file>?
+
+    Resolved from the .plugin-src staging dirs the installer copies server routes from,
+    so it stays correct for plugins whose route filename does not match their key
+    (tak-dispatcher ships both plugin-dispatcher.ts and plugin-takcad.ts)."""
+    try:
+        base = cloudtak_dir or os.path.expanduser('~/CloudTAK')
+        src = os.path.join(base, '.plugin-src')
+        if os.path.isdir(src):
+            for d in sorted(os.listdir(src)):
+                if os.path.exists(os.path.join(src, d, 'server', route_filename)):
+                    for _p in CLOUDTAK_PLUGINS:
+                        if _p.get('install_dir') == d or _p.get('key') == d:
+                            return _p.get('name') or d
+                    return d
+    except Exception:
+        pass
+    return None
+
+
+def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
+    """Turn captured CloudTAK build output into one operator-facing "Likely cause" block.
+
+    v10.1.65 W2. A failed build used to report only "Build/restart failed with exit code 1"
+    while the decisive lines sat ~200 lines up inside buildkit output. On a production box
+    (2026-09-11) that was five TS18047 errors in plugin-takcad.ts / plugin-dispatcher.ts --
+    files infra-TAK itself had copied into the tree eight log lines earlier -- and it cost
+    20 minutes of log forensics to find. Returns a list of lines to append AFTER the
+    exit-code line (never replacing it, never truncating the log), or [] if nothing
+    decisive matched.
+
+    Never raises: a hint is a convenience, and must not turn a build failure into a
+    traceback that hides the failure it was meant to explain."""
+    try:
+        ts_plugin = {}
+        ts_other = None
+        npm_err = None
+        apt_fail = None
+        disk_full = False
+        rate_limited = False
+
+        for ln in lines:
+            if 'error TS' in ln:
+                m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
+                if m:
+                    ts_plugin.setdefault(m.group(2), ln.strip())
+                elif ts_other is None:
+                    ts_other = ln.strip()
+            elif npm_err is None and 'npm ERR!' in ln:
+                npm_err = ln.strip()
+            elif apt_fail is None and 'exit code: 100' in ln:
+                apt_fail = ln.strip()
+            elif 'no space left on device' in ln:
+                disk_full = True
+            elif 'toomanyrequests' in ln or 'pull rate limit' in ln:
+                rate_limited = True
+
+        out = []
+        if ts_plugin:
+            owners = []
+            for _n in sorted(ts_plugin):
+                _o = _cloudtak_plugin_owning_route('plugin-%s.ts' % _n, cloudtak_dir)
+                if _o and _o not in owners:
+                    owners.append(_o)
+            out.append('')
+            out.append('Likely cause: a CloudTAK PLUGIN server route failed the TypeScript check,')
+            out.append('so the api image was never built. CloudTAK itself is not the problem.')
+            for _n in sorted(ts_plugin):
+                out.append('  %s' % ts_plugin[_n][:220])
+            if owners:
+                out.append('  Plugin(s) to fix: %s' % ', '.join(owners))
+            out.append('  Fix: update (or remove) that plugin on the CloudTAK page, then retry.')
+            out.append('  Your running CloudTAK was NOT touched - the old containers kept serving.')
+        elif ts_other:
+            out.append('')
+            out.append('Likely cause: the CloudTAK TypeScript check failed.')
+            out.append('  %s' % ts_other[:220])
+        elif disk_full:
+            out.append('')
+            out.append('Likely cause: the disk filled up during the build.')
+            out.append('  Free space and retry - see the Disk card on the dashboard.')
+        elif rate_limited:
+            out.append('')
+            out.append('Likely cause: Docker Hub pull rate limit.')
+            out.append('  Wait and retry; this is per-IP and clears on its own.')
+        elif apt_fail:
+            out.append('')
+            out.append('Likely cause: a package install inside the build failed.')
+            out.append('  %s' % apt_fail[:220])
+        elif npm_err:
+            out.append('')
+            out.append('Likely cause: an npm step failed inside the build.')
+            out.append('  %s' % npm_err[:220])
+        return out
+    except Exception:
+        return []
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -37214,6 +38238,9 @@ def run_cloudtak_deploy(cfg=None):
         RETRY_WAIT = 60  # 1 min between retries
 
         build_success = False
+        # v10.1.65 W2: bounded copy of the LAST attempt's output, so a final failure can
+        # name its own cause instead of only an exit code.
+        _build_tail = deque(maxlen=4000)
         for build_attempt in range(MAX_BUILD_ATTEMPTS):
             if build_attempt > 0:
                 plog("")
@@ -37240,10 +38267,12 @@ def run_cloudtak_deploy(cfg=None):
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(BUILD_TIMEOUT)}
             )
 
+            _build_tail.clear()
             def _read_build():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"    {line}")
 
             reader = threading.Thread(target=_read_build, daemon=True)
@@ -37273,6 +38302,9 @@ def run_cloudtak_deploy(cfg=None):
         if not build_success:
             plog("")
             plog("✗ Docker build failed after all retry attempts")
+            plog("")
+            for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                plog(_hint)
             plog("")
             plog("RECOVERY STEPS:")
             plog("1. Check system resources:")
@@ -38035,10 +39067,14 @@ def run_cloudtak_update():
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
             )
+            # v10.1.65 W2: keep a bounded copy of the build output so a failure can name
+            # its own cause. Bounded because a --no-cache CloudTAK build is ~10k lines.
+            _build_tail = deque(maxlen=4000)
             def _read_update_output():
                 for line in iter(proc.stdout.readline, ''):
                     line = line.rstrip()
                     if line:
+                        _build_tail.append(line)
                         plog(f"  {line}")
             reader = threading.Thread(target=_read_update_output, daemon=True)
             reader.start()
@@ -38047,6 +39083,8 @@ def run_cloudtak_update():
                 reader.join(timeout=5)
                 if proc.returncode != 0:
                     plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                        plog(_hint)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
@@ -39294,6 +40332,61 @@ def tvr_page():
     return r
 
 
+@app.route('/simulator')
+@login_required
+def simulator_page():
+    """TAK Simulator page (v10.1.61). v10.1.63 W1: the dev-channel gate is gone here too —
+    the tile lost it in detect_modules, which made this condition dead anyway. The page is
+    reachable on any box that has the module registered; what gates DEPLOY is the CloudTAK
+    dependency (W2) — a preflight row below, and a 409 from the registry's deploy route."""
+    from flask import make_response, abort
+    settings = load_settings()
+    modules = detect_modules()
+    sim = modules.get('simulator', {})
+    if not mod_registry.MODULES.get('simulator'):
+        abort(404)
+    sim_vinfo = mod_registry.simulator.get_version_info(mod_registry.get_ctx()) if sim.get('installed') else {}
+    _job = mod_registry.job_state('simulator')
+    preflight = []
+    if not sim.get('installed'):
+        import socket as _sock
+
+        def _tcp(port):
+            try:
+                with _sock.create_connection(('127.0.0.1', port), timeout=2):
+                    return True
+            except OSError:
+                return False
+        _ak_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                   or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        _drc, _dv = _docker_probe()
+        preflight = [
+            # v10.1.63 W2: the CloudTAK dependency, stated where the operator can act on it.
+            # The deploy route refuses with 409 on this same condition — this row is why.
+            {'label': 'CloudTAK deployed (it hosts the Simulator Director panel)',
+             'ok': bool(modules.get('cloudtak', {}).get('installed')),
+             'detail': 'deploy CloudTAK first, then return here'},
+            {'label': 'TAK Server installed on this box', 'ok': bool(modules.get('takserver', {}).get('installed')), 'detail': ''},
+            {'label': 'Authentik installed (lane identities are LDAP users)', 'ok': bool(_ak_tok), 'detail': ''},
+            {'label': 'TAK Server streaming port 8089 reachable', 'ok': _tcp(8089), 'detail': '127.0.0.1:8089'},
+            {'label': 'TAK Server enrollment port 8446 reachable', 'ok': _tcp(8446), 'detail': '127.0.0.1:8446'},
+            {'label': 'Docker present', 'ok': _drc == 0, 'detail': _dv if _drc == 0 else 'installed during deploy if missing'},
+        ]
+    preflight_ok = all(p['ok'] for p in preflight if not p['label'].startswith('Docker')) if preflight else True
+    _tp_host = _get_service_domain(settings, 'takportal') if modules.get('takportal', {}).get('installed') else ''
+    r = make_response(render_template('simulator.html',
+        settings=settings, modules=modules, sim=sim, sim_vinfo=sim_vinfo,
+        sim_lanes=list(settings.get('simulator_lanes') or []),
+        default_channel=settings.get('simulator_default_channel') or 'tak_simulation',
+        takportal_url=f'https://{_tp_host}' if _tp_host else '',
+        preflight=preflight, preflight_ok=preflight_ok,
+        fqdn=settings.get('fqdn', ''), server_ip=settings.get('server_ip', ''),
+        deploying=_job.get('running', False), deploy_log=_job.get('log', []), deploy_error=_job.get('error', False),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
 # TAK Video Restreamer API routes (deploy/deploy-status/control/logs/uninstall/
 # set-password/update/update-status) are registry-registered at the SAME URLs
 # by modules/tvr.py since v10.1.24 — only the page route above remains here.
@@ -40082,11 +41175,22 @@ def _update_boot_stagger_service():
     Called after any module deploy or uninstall so it always reflects current state.
     Startup order: Authentik DB -> Authentik -> TAK Portal -> CloudTAK."""
     try:
+        # v10.1.59: TAK Portal is a compose PROJECT (web + worker + Postgres ...). Stop and
+        # start every container it has, and start it with `docker compose up -d` in the
+        # project dir so services come up in dependency order — `docker start tak-portal`
+        # started the web container alone and left a worker/Postgres to chance.
+        _tp_dir = _takportal_dir()
+        try:
+            _tp_names = [c['name'] for c in _takportal_project_containers(all_states=True)] or ['tak-portal']
+        except Exception:
+            _tp_names = ['tak-portal']
+        _tp_compose = (os.path.exists(os.path.join(_tp_dir, 'docker-compose.yml'))
+                       and "'" not in _tp_dir and ' ' not in _tp_dir)
         BOOT_ORDER = [
             ('Authentik DB', ['authentik-postgresql-1'], 5),
             ('Authentik', ['authentik-server-1', 'authentik-worker-1'], 10),
             ('Authentik LDAP', ['authentik-ldap-1'], 5),
-            ('TAK Portal', ['tak-portal'], 5),
+            ('TAK Portal', _tp_names, 5),
             ('CloudTAK DB', ['cloudtak-postgis-1'], 5),
             ('CloudTAK', ['cloudtak-api-1', 'cloudtak-tiles-1', 'cloudtak-events-1', 'cloudtak-store-1', 'cloudtak-media-1'], 0),
         ]
@@ -40098,7 +41202,10 @@ def _update_boot_stagger_service():
         for label, containers, sleep_after in BOOT_ORDER:
             present = [c for c in containers if c in existing]
             if present:
-                steps.append(f'echo "Starting {label}..." && docker start {" ".join(present)}')
+                if label == 'TAK Portal' and _tp_compose:
+                    steps.append(f'echo "Starting {label}..." && ((cd {_tp_dir} && docker compose up -d) || docker start {" ".join(present)})')
+                else:
+                    steps.append(f'echo "Starting {label}..." && docker start {" ".join(present)}')
                 if sleep_after > 0:
                     steps.append(f'sleep {sleep_after}')
         if not steps:
@@ -45556,7 +46663,7 @@ def _idp_bridge_portal_file(path):
     absent/unreadable (the caller decides whether that's a skip or an error)."""
     try:
         r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', path]),
+            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', path]),
             capture_output=True, text=True, timeout=15)
         if r.returncode != 0 or not (r.stdout or '').strip():
             return None
@@ -53711,10 +54818,7 @@ def _takportal_admin_guardrail(plog_fn=None):
         _portal_dir = os.path.expanduser('~/TAK-Portal')
         if not os.path.isdir(_portal_dir):
             return
-        _ps = subprocess.run(
-            _sudo_wrap(['docker', 'ps', '--filter', 'name=^tak-portal$', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10
-        )
-        if 'tak-portal' not in (_ps.stdout or ''):
+        if not _takportal_web_running():
             return
 
         _existing = _takportal_get_existing_settings()
@@ -62817,7 +63921,7 @@ def takserver_rotate_rootca():
             log("  TAK Server restarting...")
 
             # Copy new certs to TAK Portal if it's running
-            portal_running = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0
+            portal_running = _takportal_web_running()
             if portal_running:
                 log("  Updating TAK Portal certificates...")
                 # v10.0.1: delegate to _takportal_sync_certs — temp-file re-encode
@@ -63130,10 +64234,23 @@ def takserver_services():
                     'status': pg_status
                 })
             else:
+                # v10.1.64 W1: two_server with no recorded host — ask TAK's own config
+                # rather than rendering a hardcoded "stopped" for a database that may be
+                # perfectly healthy on another machine.
+                _h = _tak_db_host_from_coreconfig()
+                _st = 'unknown'
+                if _h:
+                    import socket as _sk
+                    try:
+                        _sk.create_connection((_h, 5432), timeout=5).close()
+                        _st = 'running'
+                    except Exception:
+                        _st = 'stopped'
                 services.append({
-                    'name': 'PostgreSQL (remote)', 'icon': '🐘', 'pid': '',
+                    'name': f'PostgreSQL ({_h})' if _h else 'PostgreSQL (remote)',
+                    'icon': '🐘', 'pid': '',
                     'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                    'status': 'stopped'
+                    'status': _st
                 })
         elif _tak_is_container():
             # v10.0.1: single-server container deploy — PostgreSQL runs in the
@@ -63150,13 +64267,30 @@ def takserver_services():
             # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
             # native box ("PostgreSQL stopped") even though postgresql-<major> is serving
             # cot fine — same EL/Debian split already handled at the deploy probe.
-            pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql'] + list(_PG_SVC_UNITS)), capture_output=True, text=True, timeout=5)
-            pg_active = 'active' in (pg.stdout or '').split()
-            services.append({
-                'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
-                'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                'status': 'running' if pg_active else 'stopped'
-            })
+            # v10.1.64 W1: before trusting a local probe, ask TAK where its database
+            # actually is. A box split by hand (CoreConfig pointing elsewhere) is NOT in
+            # two_server mode as far as our settings know, and this branch then reported a
+            # healthy remote database as "stopped".
+            _dbh = _tak_db_host_from_coreconfig()
+            if _tak_db_is_remote(_dbh):
+                import socket as _sk
+                try:
+                    _sk.create_connection((_dbh, 5432), timeout=5).close()
+                    _pgst = 'running'
+                except Exception:
+                    _pgst = 'stopped'
+                services.append({
+                    'name': f'PostgreSQL ({_dbh})', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '', 'status': _pgst
+                })
+            else:
+                pg = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql'] + list(_PG_SVC_UNITS)), capture_output=True, text=True, timeout=5)
+                pg_active = 'active' in (pg.stdout or '').split()
+                services.append({
+                    'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                    'status': 'running' if pg_active else 'stopped'
+                })
     except Exception as e:
         services.append({'name': 'Error', 'icon': '❌', 'status': str(e)[:200]})
     return jsonify({'services': services, 'count': len([s for s in services if s['status'] == 'running'])})
@@ -63385,6 +64519,23 @@ def upload_takserver_package():
         fn = secure_filename(raw_name)
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        # Normalize the EXTENSION to lower case before anything looks at it.
+        #
+        # Every classifier here, and ~25 `endswith('.deb')` sites downstream in the
+        # deploy/update routes, are case-sensitive. A file that arrives as
+        # TAKSERVER-DOCKER-HARDENED-5.8-RELEASE-75.ZIP therefore matched none of them:
+        # it uploaded, sat in the uploads directory, and was invisible to every path
+        # that goes looking for a bundle — "infra-TAK seems to not find it, because it
+        # is named differently" (GH #66, 2026-09-08). tak.gov hands out mixed-case
+        # names, and an operator renaming a file should not be a prerequisite.
+        #
+        # Doing it once, here, fixes the classifiers below AND every downstream reader,
+        # because what lands on disk now ends in a lower-case extension. The base name
+        # is left alone: it is what the version parser reads, and that regex is already
+        # case-insensitive.
+        _stem, _ext = os.path.splitext(fn)
+        if _ext and _ext != _ext.lower():
+            fn = _stem + _ext.lower()
         fp = os.path.join(UPLOAD_DIR, fn)
         f.save(fp)
         sz = round(os.path.getsize(fp) / (1024*1024), 1)
@@ -63488,6 +64639,11 @@ def upload_fedhub_package():
         fn = secure_filename(raw_name)
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        # Same lower-casing as the TAK Server upload: a `.DEB` from tak.gov would
+        # otherwise be rejected outright as "must be a .deb file" (GH #66).
+        _stem, _ext = os.path.splitext(fn)
+        if _ext and _ext != _ext.lower():
+            fn = _stem + _ext.lower()
         if not fn.endswith('.deb'):
             return jsonify({'error': 'Federation Hub upload must be a .deb file'}), 400
         fp = os.path.join(UPLOAD_DIR, fn)
@@ -66025,9 +67181,10 @@ def _tak_rollback(label, plog=None):
         try:
             subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
+            # v10.1.67: ask the container for its uid — the hardened image is 1001, not 1000.
+            _ru, _rg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
             subprocess.run(
-                _sudo_wrap(['chown', (':0' if _tak_is_container() else 'tak:tak'),
-                            '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
+                _sudo_wrap(['chown', f'{_ru}:{_rg}', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
             )
             if _tak_is_container():
                 subprocess.run(_sudo_wrap(['chmod', '640', '/opt/tak/UserAuthenticationFile.xml']),
@@ -66055,9 +67212,11 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             # Restore ownership (tak:tak) on certs
+            # v10.1.67: same — a recursive chown to a hardcoded 1000 would leave the LE p12
+            # (mode 0640) unreadable by a hardened container and break the next renewal.
+            _cu, _cg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
             subprocess.run(
-                _sudo_wrap(['chown', '-R', (':0' if _tak_is_container() else 'tak:tak'),
-                            '/opt/tak/certs/files']), capture_output=True, timeout=15
+                _sudo_wrap(['chown', '-R', f'{_cu}:{_cg}', '/opt/tak/certs/files']), capture_output=True, timeout=15
             )
             if _tak_is_container():
                 subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', '/opt/tak/certs/files']),
@@ -67027,6 +68186,11 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
             return _fail('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
+        # Both, and in this order: the resolver picks WHICH Dockerfile (5.8 hardened renamed
+        # them — GH #66), the patcher fixes the stock one's EOL bullseye sources (GH #69). The
+        # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
+        # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
+        _patch_tak_db_dockerfile(new_ctx, ulog)
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -67075,8 +68239,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
         # webadmin/enrollment via the Portal breaks. Same helper, same as the native rotation.
         try:
-            _pr = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=10)
-            if 'tak-portal' in (_pr.stdout or ''):
+            if _takportal_web_running():  # v10.1.59: exact web-service check, not a substring
                 ulog("Re-syncing TAK Portal certs + reconnecting to the upgraded TAK Server...")
                 _tp_ok, _tp_msg = _takportal_sync_certs(plog=ulog, restart=True)
                 ulog(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
@@ -68766,6 +69929,7 @@ def _deploy_takserver_container(config):
         log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
         log_step("  (first build pulls the bundle's base images — minutes on arm64)")
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
+        _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
@@ -68889,12 +70053,12 @@ def _deploy_takserver_container(config):
             log_step(f"  ✗ cert-metadata.sh patch failed: {_e}")
         _patch_openssl_string_mask(log_step)
         _patch_cert_metadata_password(cert_pass)
-        # chown so makeCert (run as the image's user inside the container) can write
-        # the cert files on the shared mount. NB the uid is NOT stable across image
-        # eras — the pre-hardened image ran cert-gen as root, the hardened 5.8 image
-        # runs as tak:0 (uid 1001, gid 0). Group 0 covers both; a hardcoded 1000 covers
-        # neither, and is what broke the 8446 keystore (see _install_le_cert_on_8446_container).
-        run_cmd('chown -R :0 /opt/tak/certs 2>/dev/null; chmod -R g+rwX /opt/tak/certs 2>/dev/null; true', check=False)
+        # chown so makeCert (run as the TAK user inside the container) can write the cert
+        # files on the shared mount. v10.1.67: ask the container rather than assuming 1000 —
+        # that is only true of the stock image; the hardened one runs as 1001. Falls back to
+        # 1000 when the container cannot be asked, which is the historical behaviour.
+        _mu, _mg = _tak_container_ids()
+        run_cmd(f'chown -R {_mu}:{_mg} /opt/tak/certs 2>/dev/null; true', check=False)
         # v10.0.1/v10.0.5 (ARM container): generate certs in a ONE-SHOT `docker run` container
         # that mounts the shared bundle — NOT `docker exec` into the init-pass service container.
         # The init container crash-loops until certs exist (TAK's entrypoint exits with no
@@ -69103,7 +70267,7 @@ def _deploy_takserver_container(config):
         # cleanly if TAK Portal isn't installed. See memory
         # takportal-stale-client-cert-on-redeploy.
         try:
-            if _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode == 0:
+            if _takportal_web_running():
                 log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
                 _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
                 log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
@@ -70241,7 +71405,7 @@ def _takportal_sync_map_channels(plog=None):
     if not os.path.exists(uaf):
         return
     # Portal must be installed (container present, running or not) — else nothing to sync for.
-    if _priv_pipe(['docker', 'ps', '-a', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode != 0:
+    if _takportal_web_container(all_states=True) is None:
         return
     # 1. Live channel list from Marti (REST; DB-agnostic).
     data, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
@@ -70309,7 +71473,7 @@ def _takportal_sync_map_channels(plog=None):
     ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
     _write_priv(uaf, _buf.getvalue())
     _log(f"admin bridge (+bootstrap cert) channel membership {old_count} -> {len(target)}; restarting tak-portal")
-    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
+    _takportal_restart(timeout=120)  # v10.1.59: whole project
 
 
 def _tak_sync_admin_group_cache(plog=None):
@@ -70414,11 +71578,12 @@ def _takportal_sync_certs(plog=None, restart=False):
     def _log(m):
         if plog:
             plog(m)
-    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
-    if r.returncode != 0:
+    _webc = _takportal_web_container()  # v10.1.59: the WEB service, resolved by compose label
+    if _webc is None:
         return (False, 'TAK Portal container is not running')
+    _web = _webc['id']
     cert_dir = '/opt/tak/certs/files'
-    subprocess.run(_sudo_wrap(['docker', 'exec', 'tak-portal', 'mkdir', '-p', '/usr/src/app/data/certs']), capture_output=True, text=True)
+    subprocess.run(_sudo_wrap(['docker', 'exec', _web, 'mkdir', '-p', '/usr/src/app/data/certs']), capture_output=True, text=True)
     cert_pass = _get_tak_cert_password(load_settings())
     # --- client cert: admin.p12 -> modern PKCS12 -> tak-client.p12 ---
     ok_client = False
@@ -70469,11 +71634,11 @@ def _takportal_sync_certs(plog=None, restart=False):
         except OSError:
             pass
         if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-            subprocess.run(_sudo_wrap(['docker', 'cp', modern_p12, 'tak-portal:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
+            subprocess.run(_sudo_wrap(['docker', 'cp', modern_p12, f'{_web}:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
             _log("  ✓ tak-client.p12 refreshed (admin.p12 re-encoded to modern PKCS12)")
             ok_client = True
         else:
-            subprocess.run(_sudo_wrap(['docker', 'cp', admin_p12, 'tak-portal:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
+            subprocess.run(_sudo_wrap(['docker', 'cp', admin_p12, f'{_web}:/usr/src/app/data/certs/tak-client.p12']), capture_output=True, text=True)
             _log("  ⚠ tak-client.p12 copied in LEGACY format (re-encode failed — portal may not read it)")
             ok_client = True
         try:
@@ -70510,7 +71675,7 @@ def _takportal_sync_certs(plog=None, restart=False):
                 f.write('\n'.join(bundle_parts) + '\n')
             tak_ca_src = ca_bundle_path
     if tak_ca_src:
-        subprocess.run(_sudo_wrap(['docker', 'cp', tak_ca_src, 'tak-portal:/usr/src/app/data/certs/tak-ca.pem']), capture_output=True, text=True, timeout=10)
+        subprocess.run(_sudo_wrap(['docker', 'cp', tak_ca_src, f'{_web}:/usr/src/app/data/certs/tak-ca.pem']), capture_output=True, text=True, timeout=10)
         _log("  ✓ tak-ca.pem refreshed (server CA chain)")
         ok_ca = True
         if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
@@ -70521,7 +71686,7 @@ def _takportal_sync_certs(plog=None, restart=False):
     else:
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
     if restart and (ok_client or ok_ca):
-        subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        _takportal_restart()  # v10.1.59: whole project
         # v10.1.x (PLAN-v10.1.4 item 5): a restart-intent cert resync can follow a TAK
         # redeploy that regenerated UserAuthenticationFile.xml (admin reset to __ANON__).
         # Re-assert the map bridge's channel membership so /map isn't empty until the
@@ -70551,8 +71716,7 @@ def takserver_sync_portal_ca():
     (data/certs/tak-client.p12) and the CA (data/certs/tak-ca.pem), then restart.
     v10.0.1: previously copied ONLY the CA, which left a stale/legacy client cert
     after a CA change → Marti stats 503. Now delegates to _takportal_sync_certs."""
-    r = _priv_pipe(['docker', 'ps', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal'])
-    if r.returncode != 0:
+    if not _takportal_web_running():
         return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
     ok, msg = _takportal_sync_certs(restart=True)
     if not ok:
@@ -71447,6 +72611,14 @@ def run_full_uninstall():
             plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
         plog("✓ TAK Video Restreamer removed")
 
+        # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
+        plog("━━━ TAK Simulator ━━━")
+        try:
+            mod_registry.uninstall_module('simulator', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ TAK Simulator removal error (non-fatal): {e}")
+        plog("✓ TAK Simulator removed")
+
         # 2. TAK Portal
         plog("━━━ TAK Portal ━━━")
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -71817,6 +72989,323 @@ def _auto_harden_guarddog_8080(settings=None, plog=None):
 
 
 # === Auto-update Guard Dog scripts on console startup ===
+
+# ── TAK Server JVM pin (v10.1.63 W3) ─────────────────────────────────────────
+
+_TAK_JVM_DROPIN_DIR = '/etc/systemd/system/takserver.service.d'
+_TAK_JVM_DROPIN = os.path.join(_TAK_JVM_DROPIN_DIR, 'jvm-pin.conf')
+_TAK_SETENV = '/opt/tak/setenv.sh'
+_TAK_SETENV_JVM_A = '# >>> infra-TAK managed JVM >>>'
+_TAK_SETENV_JVM_B = '# <<< infra-TAK managed JVM <<<'
+
+
+# Defined once: the deploy path and the startup migration below both install these, and
+# a second copy is how a watcher ends up installed-but-never-enabled (v10.1.34, test12).
+# OnBootSec is late — TAK takes 5-7 minutes to come up and we read its RUNNING process.
+_TAK_JVM_GUARD_UNITS = [
+    ('takjvmguard.service', '[Unit]\nDescription=TAK Server JVM Monitor (enrollment breaks on any JVM but 17)\nAfter=takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-jvm-watch.sh\n'),
+    ('takjvmguard.timer', '[Unit]\nDescription=Check the TAK Server JVM every 15 minutes\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=15min\nUnit=takjvmguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+]
+
+
+def _resolve_java17_home():
+    """(java_home, java_binary) for a JDK 17 that is ACTUALLY on this box, else (None, None).
+
+    Globs what exists and verifies `java -version` really reports 17 — never constructs a
+    path and trusts it. A drop-in pointing at a nonexistent JVM would keep TAK from starting
+    at all, which is far worse than the bug it is fencing off.
+    """
+    import glob as _glob
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    # Debian carries the arch suffix, RHEL does not; the trailing globs cover both plus
+    # Temurin/Corretto-style layouts, and duplicates are skipped below.
+    cands = ([f'/usr/lib/jvm/java-17-openjdk-{_arch}'] +
+             sorted(_glob.glob('/usr/lib/jvm/java-17-openjdk*')) +
+             sorted(_glob.glob('/usr/lib/jvm/*-17-*')) +
+             sorted(_glob.glob('/usr/lib/jvm/*17*')))
+    seen = set()
+    for home in cands:
+        if home in seen or not os.path.isdir(home):
+            continue
+        seen.add(home)
+        jbin = os.path.join(home, 'bin', 'java')
+        if not os.path.isfile(jbin):
+            continue
+        try:
+            r = subprocess.run([jbin, '-version'], capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        out = (r.stderr or '') + (r.stdout or '')      # java -version writes to stderr
+        if 'version "17.' in out or 'version "17"' in out:
+            return home, jbin
+    return None, None
+
+
+def _trusted_java_exe(pid):
+    """Resolve a PID's executable and return it ONLY if it is safe to run. Else None.
+
+    We locate the TAK JVM with `pgrep -f`, which matches on ARGV — and argv
+    is attacker-chosen. Any local user can run `exec -a takserver-api /tmp/evil`, and on a
+    root-era console (still the majority of the fleet) this function would then execute
+    that binary AS ROOT to read its version. That is a local privilege escalation, and it
+    is introduced by the version check, not by anything TAK does.
+
+    So the resolved path must clear three gates before we run it:
+      * owned by root — an unprivileged attacker cannot produce a root-owned file;
+      * not group- or world-writable — otherwise root ownership means nothing;
+      * under a system JVM/binary prefix — defense in depth, and it keeps a compromised
+        root-owned binary somewhere odd (a container bind, /tmp) out of scope.
+    Anything that fails is reported as UNKNOWN, never as a wrong JVM: a false red here
+    would page someone about an outage that is not happening.
+    """
+    try:
+        exe = os.path.realpath(f'/proc/{pid}/exe')
+    except OSError:
+        return None
+    if not exe or not os.path.isfile(exe):
+        return None      # unreadable /proc entry on a non-root console — unknown, not bad
+    if os.path.basename(exe) != 'java':
+        # Measured on test6/test12 2026-09-10: TAK's launcher is a shell script, so the
+        # obvious `pgrep -f takserver-api` resolves to /usr/bin/dash, not the JVM. Running
+        # `dash -version` yields no "17" and would have emailed a WRONG-JVM alert on every
+        # healthy box in the fleet. Match the API JVM by its own flag (see the callers) and
+        # refuse anything that is not a java launcher.
+        return None
+    if not exe.startswith(('/usr/lib/jvm/', '/usr/lib64/jvm/', '/usr/local/lib/jvm/',
+                           '/usr/bin/', '/usr/local/bin/', '/opt/')):
+        return None
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    if st.st_uid != 0 or (st.st_mode & 0o022):
+        return None
+    return exe
+
+
+def _tak_api_pid():
+    """PID of the TAK API JVM, or None. `pgrep` works as any user — only reading
+    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles."""
+    try:
+        r = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
+                           capture_output=True, text=True, timeout=5)
+        pids = (r.stdout or '').split()
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
+def _jvm_status_from_guarddog(api_pid):
+    """The Guard Dog watcher's view of the running JVM, or None.
+
+    The console runs as `takwerx` on every hardened box while TAK's JVMs run as `tak`, so
+    os.path.realpath('/proc/<pid>/exe') raises PermissionError here — measured on test12
+    during the v10.1.63 T&E, where the TAK Server card showed no JVM at all and the Guard Dog
+    dot could never leave grey. Degrading to "unknown" was correct (a false red would be
+    worse) but it made the whole thing invisible on most of the fleet.
+
+    tak-jvm-watch.sh runs as root from systemd and already writes /var/lib/takguard/jvm_status
+    world-readable, so the console reads that instead of re-deriving what it cannot see.
+
+    Trusted only when it describes the JVM running RIGHT NOW: the recorded pid must match the
+    live API pid, and the file must be fresh. A stale file after the timer dies would otherwise
+    keep displaying a JVM that is no longer running, which is the confidently-wrong output this
+    whole work item exists to prevent.
+    """
+    path = '/var/lib/takguard/jvm_status'
+    try:
+        if not os.path.isfile(path) or (time.time() - os.path.getmtime(path)) > 2700:
+            return None                      # missing, or older than 45 min (timer is 15 min)
+        with open(path) as f:
+            kv = dict(l.split('=', 1) for l in f.read().splitlines() if '=' in l)
+    except Exception:
+        return None
+    if not api_pid or kv.get('pid') != str(api_pid):
+        return None                          # describes a JVM that is no longer the live one
+    return kv
+
+
+def _running_tak_jvm_version():
+    """Short JVM version for the TAK Server card (e.g. '17.0.11'), or '' if unknown.
+
+    v10.1.63 W4 — cheap visibility: the failure this release fences off is invisible on a
+    box that otherwise looks perfectly healthy, so put the number where an admin already
+    looks instead of waiting for an alert to fire. Reads the RUNNING process, not PATH.
+    """
+    try:
+        if _tak_is_container():
+            return ''
+        # -Dspring.profiles.active=api is the API JVM's own flag. `takserver-api` matches
+        # the launcher shell (/usr/bin/dash) instead — verified on test6 and test12.
+        pid = _tak_api_pid()
+        if not pid:
+            return ''
+        exe = _trusted_java_exe(pid)         # argv is attacker-chosen — see the helper
+        if exe:                              # console is root: read it directly
+            r = subprocess.run([exe, '-version'], capture_output=True, text=True, timeout=20)
+            m = re.search(r'version "([^"]+)"', (r.stderr or '') + (r.stdout or ''))
+            return m.group(1) if m else ''
+        kv = _jvm_status_from_guarddog(pid)  # non-root console: use the watcher's reading
+        if kv:
+            m = re.search(r'version "([^"]+)"', kv.get('version', ''))
+            if m:
+                return m.group(1)
+        return ''
+    except Exception:
+        return ''
+
+
+def _pin_takserver_jvm(plog=None):
+    """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
+
+    Field report (Tom Endress, 2026-09-09) — a three-day enrollment outage. He installed
+    `openjdk-21-jre-headless` for an unrelated tool; `update-alternatives` was in auto mode, so
+    JDK 21 won `/usr/bin/java` on priority (2111 vs 1711). TAK kept running on its already
+    loaded JVM 17. FIVE DAYS LATER a routine reboot restarted TAK, it came up on 21, and every
+    QR enrollment began returning HTTP 500:
+
+        NoSuchMethodError: sun.security.x509.X509CertInfo.set(String, Object)
+
+    TAK 5.7 reaches into JDK-internal `sun.security.x509`; JDK 21 refactored it and dropped that
+    generic setter. That is BBN's fragility, not ours — but it is ours to fence off, and it is
+    genuinely nasty for two reasons: the `apt install` and the outage are days apart so nothing
+    correlates them, and NOTHING ELSE in TAK touches that code path. 8089, federation, existing
+    clients, CloudTAK and the whole map keep working perfectly. The only symptom is that NEW
+    enrollments die — the one thing an admin does not exercise daily. Tom ran three days blind.
+
+    Our exposure was worst where the fleet is biggest: RHEL already pinned the alternative twice
+    (the takserver deploy paths), Debian/Ubuntu did nothing at all — no `--set`, no hold, no
+    JAVA_HOME — and Ubuntu 22.04 is our documented baseline and Tom's platform.
+
+    **What actually does the pinning: `/opt/tak/setenv.sh`.** TAK's launchers run
+    `. ./setenv.sh` and then invoke a bare `java`, so an `export PATH=<jdk17>/bin:$PATH` in
+    that file decides the JVM. The systemd drop-in cannot: `takserver.service` merely runs
+    /etc/init.d/takserver, which starts separate sysv-generated units, whose init scripts
+    `su tak -c ./takserver-api.sh` — and `su` resets PATH. Verified on test6, 2026-09-10.
+
+    Container TAK is immune (the JVM is inside the image) and is skipped: there is no host
+    takserver.service to hang a drop-in on.
+
+    Re-applied on every console startup, not only at TAK deploy time — every box in the fleet
+    already has TAK installed, so a deploy-time-only fix protects nobody.
+    """
+    def _log(msg):
+        if plog:
+            plog(msg)
+        else:
+            print(f"[jvm-pin] {msg}", flush=True)
+    if not os.path.exists('/opt/tak'):
+        return {'skipped': 'no native TAK on this host'}
+    if _tak_is_container():
+        return {'skipped': 'container TAK — JVM lives in the image'}
+
+    home, jbin = _resolve_java17_home()
+    if not home:
+        # Never write a drop-in pointing at a JVM that is not there.
+        _log("\u26a0 JDK 17 not found under /usr/lib/jvm — JVM pin skipped (no change made)")
+        return {'skipped': 'no JDK 17 found'}
+
+    changed = []
+    fam = _distro_family()
+
+    # 1. systemd drop-in on takserver.service. BELT, NOT BRACES — measured on test6 during
+    #    the v10.1.63 T&E: this does NOT reach the JVMs. `takserver.service` only runs
+    #    /etc/init.d/takserver, which calls `service takserver-api start` etc. — those are
+    #    SEPARATE sysv-generated units that inherit nothing from it, and their init scripts
+    #    then `su tak -c ./takserver-api.sh`, which resets PATH anyway. A drop-in on the
+    #    generated units would be defeated by the same `su`. Step 2 (setenv.sh) is what
+    #    actually pins the JVM. This stays because it is correct for anything that ever runs
+    #    java directly under takserver.service, and it costs nothing — but do not mistake it
+    #    for the fix, and do not delete step 2 believing this covers it.
+    dropin = ('[Service]\n'
+              f'Environment=JAVA_HOME={home}\n'
+              f'Environment=PATH={home}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n')
+    try:
+        cur = _read_priv(_TAK_JVM_DROPIN) if os.path.isfile(_TAK_JVM_DROPIN) else ''
+    except Exception:
+        cur = ''
+    if cur != dropin:
+        _makedirs_priv(_TAK_JVM_DROPIN_DIR)
+        _write_priv(_TAK_JVM_DROPIN, dropin)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+        changed.append('drop-in')
+
+    # 2. /opt/tak/setenv.sh — third-party config, so a DELIMITED managed block that is replaced
+    #    in place, never a rewrite of the file and never a blind append that duplicates on the
+    #    next startup. Operator edits outside the markers are preserved untouched
+    #    (CLAUDE.md, third-party app config is operator-owned).
+    try:
+        setenv_cur = _read_priv(_TAK_SETENV) if os.path.isfile(_TAK_SETENV) else None
+    except Exception:
+        setenv_cur = None
+    if setenv_cur:
+        block = (f"{_TAK_SETENV_JVM_A}\n"
+                 f"# TAK 5.7 reaches into JDK-internal sun.security.x509, which JDK 21 removed —\n"
+                 f"# enrollment breaks on any JVM but 17. Delete this block to unpin.\n"
+                 f"export JAVA_HOME={home}\n"
+                 f"export PATH={home}/bin:$PATH\n"
+                 f"{_TAK_SETENV_JVM_B}\n")
+        stripped = re.sub(rf'{re.escape(_TAK_SETENV_JVM_A)}.*?{re.escape(_TAK_SETENV_JVM_B)}\n?',
+                          '', setenv_cur, flags=re.DOTALL)
+        # APPEND, never prepend. Two reasons, both found on test6 during the v10.1.63 T&E:
+        # prepending pushed BBN's `#!/bin/sh` off line 1, and — worse — anything setenv.sh
+        # sets later would then override our PATH. Upstream happens not to set PATH today,
+        # so prepending worked by luck; appending wins by construction. The file is sourced
+        # (`. ./setenv.sh` from takserver-api.sh), so last writer wins.
+        if stripped and not stripped.endswith('\n'):
+            stripped += '\n'
+        new_setenv = stripped + block
+        if new_setenv != setenv_cur:
+            _write_priv(_TAK_SETENV, new_setenv)
+            changed.append('setenv.sh')
+
+    # 3. The BOX-WIDE alternative into manual mode. Defense in depth only — TAK itself is
+    #    already pinned by step 1 regardless of what /usr/bin/java points at, because the
+    #    drop-in gives takserver.service its own JAVA_HOME and prepends JDK 17 to its PATH.
+    #
+    #    This step is BEST EFFORT and is expected to fail on a hardened box: the privilege
+    #    broker denies `update-alternatives` (not on its allow-list), which is most of the
+    #    fleet going forward. Measured on test6 during the v10.1.63 T&E. We do NOT widen the
+    #    broker allow-list for it — `update-alternatives --set java <path>` would let anything
+    #    that could reach the console repoint the system java, which is a far worse primitive
+    #    than the problem it solves. So: try, verify, and report honestly. A warning here must
+    #    never read as "the JVM pin failed", because it did not.
+    alt = 'update-alternatives' if fam == 'debian' else 'alternatives'
+    alt_err = ''
+    try:
+        r = subprocess.run(_sudo_wrap([alt, '--set', 'java', jbin]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 and fam == 'rhel':
+            # RHEL's jpackage registers the family name rather than the path on some builds —
+            # the form the takserver deploy paths already use.
+            _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            r = subprocess.run(_sudo_wrap([alt, '--set', 'java', f'java-17-openjdk.{_pg_arch}']),
+                               capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            changed.append('alternative')
+        else:
+            alt_err = ((r.stderr or r.stdout) or '').strip()[:160]
+    except Exception as e:
+        alt_err = str(e)[:160]
+    if alt_err:
+        _log(f"\u2139 box-wide java alternative left as-is ({alt_err}). TAK Server is still "
+             f"pinned to JDK 17 by its /opt/tak/setenv.sh entry, which its launchers source "
+             f"before invoking java — so this does not depend on /usr/bin/java.")
+
+    # 4. NOT held. `apt-mark hold` / `dnf versionlock` on the JDK 17 packages was in the
+    #    plan (Tom's item 2) and it is deliberately not done: a hold also freezes JDK 17's
+    #    own SECURITY updates until a human runs an unhold, and on a CJIS-class box that
+    #    trade is not worth what it buys. Step 3 above — the alternative in MANUAL mode — is
+    #    the half that actually prevents Tom's outage; the hold would only have added
+    #    protection against JDK 17 being autoremoved, which nothing in the field report did.
+    #    (Operator decision, 2026-09-09. Recorded in PLAN-v10.1.63 §4 W3.)
+
+    if changed:
+        _log(f"\u2713 TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+             f"Takes effect on the next TAK Server restart.")
+    return {'java_home': home, 'changed': changed}
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -71852,8 +73341,13 @@ def _auto_update_guarddog():
                 continue
             if not is_two_server and 'remotedb' in name:
                 continue
-            if is_two_server and name == 'tak-db-watch.sh':
-                continue
+            # v10.1.64 W1: tak-db-watch.sh used to be skipped on two-server boxes because it
+            # was local-only — a watcher for a database that is not on this host. It is now
+            # remote-aware (gd_db_is_remote), and the skip had become actively harmful: a box
+            # carrying takdbguard.timer from before it was split kept running the OLD script
+            # forever, so the very boxes with the false-alert bug were the ones that could
+            # never receive the fix. Measured on test8, 2026-09-11. Copy it everywhere; whether
+            # the TIMER runs is a separate decision made at deploy.
             if name == 'tak-fedhub-watch.sh':
                 _au_fh_cfg = _get_fedhub_deployment_config(settings)
                 if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
@@ -71922,6 +73416,24 @@ def _auto_update_guarddog():
             if _bc_reload:
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
                 subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takbuildcachereclaim.timer']), capture_output=True, timeout=10)
+        # v10.1.63 W4: same treatment for the JVM watcher — a fix that needed someone to
+        # click "Update Guard Dog" would protect nobody (memory feedback-console-path-delivery).
+        if os.path.isfile('/opt/tak-guarddog/tak-jvm-watch.sh'):
+            _jv_reload = False
+            for _un, _body in _TAK_JVM_GUARD_UNITS:
+                _up = os.path.join('/etc/systemd/system', _un)
+                try:
+                    if os.path.isfile(_up) and _read_priv(_up) == _body:
+                        continue
+                except Exception:
+                    pass
+                _write_priv(_up, _body)
+                _jv_reload = True
+            if _jv_reload:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takjvmguard.timer']),
+                               capture_output=True, timeout=15)
+                print("Guard Dog: installed takjvmguard units on startup.")
         # v10.1.46 (W1/W2): install the client-gate backstop and the session watcher
         # on a plain pull+restart. Fixes ride the console update — an operator must
         # never have to click "Update Guard Dog" to get the safety net under a gate
@@ -71989,6 +73501,14 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+
+# v10.1.63 W3: re-assert the TAK JVM pin on every console startup. Deliberately NOT inside
+# _auto_update_guarddog() — that returns early when /opt/tak-guarddog is absent, and a box
+# without Guard Dog is exactly as exposed to the JDK-21 enrollment outage as one with it.
+try:
+    _pin_takserver_jvm()
+except Exception as _e:
+    print(f"[jvm-pin] startup pin skipped: {_e}", flush=True)
 
 
 def _start_guarddog_background_at_boot():
@@ -73770,7 +75290,7 @@ def _startup_harden_tak_portal_ports():
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
-                    _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
+                    _sudo_wrap(['docker', 'inspect', _takportal_ref(), '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
                 _bindings = json.loads(_ins.stdout.strip() or '{}')
                 if not _bindings.get('3000/tcp'):
@@ -73813,6 +75333,8 @@ def _startup_harden_cloudtak_ports():
                     _of.write(_new_override)
                 _override_changed = True
                 print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+            if _settings.get('simulator_enabled'):
+                os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
         except Exception:
             pass
         _changed = _patch_cloudtak_compose_ports(_ct_dir)
@@ -73824,10 +75346,10 @@ def _startup_harden_cloudtak_ports():
                 _ins = subprocess.run(
                     _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                 )
-                _bindings = json.loads(_ins.stdout.strip() or '{}')
-                if not _bindings.get('5000/tcp'):
+                _b = (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp') or []
+                if not _b or any((x or {}).get('HostIp') not in ('127.0.0.1', '::1') for x in _b):
                     _needs_recreate = True
-                    print("Startup migration: CloudTAK 127.0.0.1:5000 binding absent — recreating")
+                    print("Startup migration: CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
             except Exception:
                 pass
         if _needs_recreate:
@@ -75415,6 +76937,137 @@ def _heal_takserver_coreconfig_step8():
         return f'Step-8 CoreConfig heal error (non-fatal): {e}'
 
 
+def _startup_heal_le_renewal_script():
+    """Repair an installed LE renewal script that can destroy TAK's keystore.
+
+    v10.1.67. The container-flavored script we generated before this release did:
+
+        docker exec <c> bash -c "cd .../files && rm -f takserver-le.jks && keytool -importkeystore ..."
+        chown 1000:1000 "$JKS" "$P12"
+
+    Two defects. The chown hardcodes uid 1000, but the HARDENED TAK image runs as uid
+    1001, so keytool cannot read the p12 -- and it runs AFTER the import, too late to
+    help. Worse, the import deletes the live keystore BEFORE an operation that can fail:
+    when it failed the box was left with no keystore at all, and because CoreConfig's
+    8446 connector references it, TAK's entire API refused to start at the next restart
+    ("APPLICATION FAILED TO START"). On a real box that stayed latent for two days and
+    surfaced as a total outage at reboot.
+
+    Regenerating the script properly needs the cert paths and password, which only the
+    cert-setup path has. So patch the installed file in place instead -- console-path
+    delivery ([[feedback-console-path-delivery]]): existing boxes must not have to re-run
+    cert setup to stop carrying a latent outage. Idempotent and non-fatal.
+    """
+    path = '/opt/tak/renew-letsencrypt.sh'
+    try:
+        if not os.path.exists(path):
+            return
+        src = _read_priv(path) or ''
+        if not src or 'rm -f takserver-le.jks &&' not in src:
+            return   # already healed, or a shape we do not recognise - leave it alone
+
+        out = src
+        # 1) import into a temp keystore and swap in only on success
+        out = out.replace(
+            'rm -f takserver-le.jks && keytool -importkeystore',
+            'rm -f takserver-le.jks.new && keytool -importkeystore', 1)
+        out = out.replace(
+            '-destkeystore takserver-le.jks ',
+            '-destkeystore takserver-le.jks.new ', 1)
+        out = out.replace(
+            '-srcstoretype pkcs12 -noprompt"',
+            '-srcstoretype pkcs12 -noprompt && mv -f takserver-le.jks.new takserver-le.jks"', 1)
+
+        # 2) derive the uid from the container, and set it on the p12 BEFORE the import
+        pre = ('TAK_UID=$(docker exec ' + TAK_CONTAINER + ' id -u 2>/dev/null || echo 1000)\n'
+               'TAK_GID=$(docker exec ' + TAK_CONTAINER + ' id -g 2>/dev/null || echo 0)\n'
+               'chown "$TAK_UID:$TAK_GID" "$P12" 2>/dev/null || true\n'
+               'chmod 0640 "$P12" 2>/dev/null || true\n')
+        marker = 'docker exec ' + TAK_CONTAINER + ' bash -c "cd /opt/tak/certs/files'
+        if marker in out and 'TAK_UID=' not in out:
+            out = out.replace(marker, pre + marker, 1)
+        out = out.replace('chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true',
+                          'chown "$TAK_UID:$TAK_GID" "$JKS" 2>/dev/null || true', 1)
+
+        if out == src:
+            return
+        _write_priv(path, out)
+        subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
+        print('Startup migration: LE renewal script healed — imports to a temp keystore and '
+              'no longer deletes the live one before a fallible import', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: LE renewal heal error (non-fatal): {_e}', flush=True)
+
+
+def _startup_heal_missing_le_keystore():
+    """Revive a box whose TAK keystore was already destroyed before the fix landed.
+
+    v10.1.67. Healing the renewal script stops the bleeding, but it does nothing for a
+    box the old script already emptied: CoreConfig's 8446 connector references
+    certs/files/takserver-le.jks, and when that file is gone TAK's entire API refuses to
+    start ("APPLICATION FAILED TO START"). Those boxes are DOWN -- no webadmin, no API --
+    and without this they would stay down until someone SSHed in and ran keytool by hand,
+    which is exactly the outcome infra-TAK exists to prevent.
+
+    The repair is simply to run the (already healed) renewal script once: with no keystore
+    its fingerprint check finds nothing to compare, so it exports a fresh p12 from Caddy's
+    current cert, imports it, and restarts TAK. Reusing that path means the recovery is the
+    same code the nightly timer exercises, not a second implementation.
+
+    Fires ONLY when the keystore is genuinely missing, so it is a no-op on every healthy
+    box. Threaded, because it restarts TAK and must not hold up console startup.
+    """
+    try:
+        script = '/opt/tak/renew-letsencrypt.sh'
+        jks = '/opt/tak/certs/files/takserver-le.jks'
+        core = '/opt/tak/CoreConfig.xml'
+        if not (os.path.exists(script) and os.path.exists(core)):
+            return
+        if os.path.exists(jks):
+            return                      # keystore present - nothing to revive
+        cfg = _read_priv(core) or ''
+        if 'takserver-le.jks' not in cfg:
+            return                      # CoreConfig does not use it; its absence is fine
+        body = _read_priv(script) or ''
+        if 'TAK_UID=' not in body:
+            # the script has not been healed yet, so running it would delete nothing but
+            # could still fail on the old permission bug - let the heal migration go first
+            print('Startup migration: TAK LE keystore is MISSING but the renewal script is '
+                  'not healed yet; skipping revive this boot', flush=True)
+            return
+
+        print('Startup migration: TAK LE keystore is MISSING (CoreConfig references it) — '
+              'TAK\'s API cannot start; rebuilding it from Caddy\'s current cert…', flush=True)
+
+        def _revive():
+            try:
+                # Start the systemd UNIT, do not exec the script path. The broker refuses an
+                # arbitrary exec path ("DENIED: exec path not on trusted PATH") and rightly so
+                # -- widening that allow-list to run one repair would punch a hole in a CJIS
+                # control. `systemctl start` is already permitted, runs the same unit the
+                # nightly timer runs, and works identically on root and non-root consoles.
+                r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver-cert-renewal.service']),
+                                   capture_output=True, text=True, timeout=600)
+                if os.path.exists(jks):
+                    print('Startup migration: ✓ TAK LE keystore rebuilt — TAK restarted and its '
+                          'API can start again', flush=True)
+                else:
+                    _err = ((r.stderr or '') + (r.stdout or '')).strip()[-300:]
+                    if not _err:
+                        _j = subprocess.run(_sudo_wrap(['journalctl', '-u', 'takserver-cert-renewal.service',
+                                                        '-n', '5', '--no-pager']),
+                                            capture_output=True, text=True, timeout=30)
+                        _err = (_j.stdout or '').strip()[-300:]
+                    print(f'Startup migration: ✗ TAK LE keystore rebuild failed (rc={r.returncode}): '
+                          f'{_err}', flush=True)
+            except Exception as _re:
+                print(f'Startup migration: TAK LE keystore rebuild error (non-fatal): {_re}', flush=True)
+
+        threading.Thread(target=_revive, daemon=True, name='le-keystore-revive').start()
+    except Exception as _e:
+        print(f'Startup migration: LE keystore revive error (non-fatal): {_e}', flush=True)
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -76124,9 +77777,9 @@ def _startup_migrations():
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
         try:
-            portal_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=tak-portal']), capture_output=True, text=True, timeout=5)
+            portal_up = _takportal_web_running()
             ak_up = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=authentik-server-1']), capture_output=True, text=True, timeout=5)
-            if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
+            if portal_up and (ak_up.stdout or '').strip():
                 _patch_takportal_compose_network()
                 _patch_authentik_compose_network()
                 _ensure_infratak_network_for_authentik()
@@ -76960,6 +78613,20 @@ def _startup_migrations():
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
 
+        # v10.1.67: heal an LE renewal script that deletes TAK's keystore before a
+        # fallible import (latent total outage until the next restart).
+        try:
+            _startup_heal_le_renewal_script()
+        except Exception as _lr_err:
+            print(f"Startup migration: LE renewal heal error (non-fatal): {_lr_err}", flush=True)
+
+        # v10.1.67: and revive a box the OLD script already emptied — healing the script
+        # does nothing for a keystore that is already gone, and those boxes are down hard.
+        try:
+            _startup_heal_missing_le_keystore()
+        except Exception as _lk_err:
+            print(f"Startup migration: LE keystore revive error (non-fatal): {_lk_err}", flush=True)
+
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to
         # SSH). Threaded: an unreachable relay must not delay startup. No-op once
@@ -77555,8 +79222,7 @@ def _post_update_auto_deploy():
                 portal_dir = os.path.expanduser('~/TAK-Portal')
                 if os.path.exists(portal_dir):
                     try:
-                        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=tak-portal', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
-                        if 'Up' in (r.stdout or ''):
+                        if _takportal_web_running():
                             print("Post-update: auto-reconfiguring TAK Portal")
                             _auto_deploy_active['takportal'] = True
                             try:
@@ -77566,8 +79232,12 @@ def _post_update_auto_deploy():
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
                                 _ensure_infratak_network_for_portal()
-                                subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+                                _takportal_restart()  # v10.1.59: whole project
                                 _sync_authentik_takportal_provider_url(settings)
+                                # v10.1.59: the boot sequencer used to be regenerated only by a
+                                # deploy/uninstall, so an existing box would keep `docker start
+                                # tak-portal` (web only) until its next deploy. Converge it here.
+                                _update_boot_stagger_service()
                                 print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
                                 _auto_deploy_active.pop('takportal', None)
@@ -78585,6 +80255,7 @@ def _post_update_auto_deploy():
                             pass
 
                     # 4. Write hardened override (always, idempotent)
+                    _override_written = False
                     try:
                         _override_path = os.path.join(_cloudtak_dir, 'docker-compose.override.yml')
                         _settings = load_settings()
@@ -78599,6 +80270,11 @@ def _post_update_auto_deploy():
                         if _existing.strip() != _new_override.strip():
                             with open(_override_path, 'w') as _of:
                                 _of.write(_new_override)
+                            _override_written = True
+                            try:
+                                os.chmod(_override_path, 0o600)   # carries TAKSIM_ENGINE_TOKEN when the simulator is on
+                            except OSError:
+                                pass
                             print("  CloudTAK override updated (postgis/store host ports locked down)")
                     except Exception as _ove:
                         print(f"  WARNING: override write failed: {_ove}")
@@ -78607,6 +80283,7 @@ def _post_update_auto_deploy():
                     # `ports: !reset` in the override is NOT used because Docker
                     # Compose v5.x (shipped with Docker Engine 27+) resolves that
                     # YAML tag to null, dropping ALL port bindings silently.
+                    _base_patched = False
                     try:
                         _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir)
                         if _base_patched:
@@ -78647,22 +80324,47 @@ def _post_update_auto_deploy():
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
-                    # 7. Recreate the stack only if clean. Compromised installs
-                    #    stay STOPPED until operator does Remove + Reinstall.
-                    if not _compromised:
+                    # 7. Recreate the stack only if clean AND something above changed.
+                    #    Compromised installs stay STOPPED until operator does Remove + Reinstall.
+                    #    Until 2026-09-09 this recreated the WHOLE stack (api, postgis, store,
+                    #    media, …) unconditionally on every post-update run — a ~40 s CloudTAK
+                    #    outage plus the media re-heal for every console update on every box,
+                    #    even when the override and the base compose were already hardened
+                    #    (test6: three console restarts in an hour, three recreates, nothing
+                    #    had changed). The startup migration that covers the same ground
+                    #    already gates on "changed, or the 127.0.0.1:5000 binding is absent";
+                    #    this is the same gate.
+                    _needs_recreate = _override_written or _base_patched
+                    if not _compromised and not _needs_recreate:
                         try:
-                            _rec = subprocess.run(
-                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+                            _ins = subprocess.run(
+                                _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
-                            if _rec.returncode == 0:
-                                print("  CloudTAK recreated with hardened port bindings")
-                                # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
-                                # to image default — re-apply self-heal (HLS + ephemeral reaper).
-                                _cloudtak_media_hls_heal(wait=True)
-                            else:
-                                print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
-                        except Exception as _re:
-                            print(f"  WARNING: CloudTAK recreate failed: {_re}")
+                            _b = (json.loads(_ins.stdout.strip() or '{}')).get('5000/tcp') or []
+                            # present is not enough: a HostIp of "" or 0.0.0.0 is published on every
+                            # interface (security review 2026-09-09, finding 1) — recreate that too
+                            if not _b or any((x or {}).get('HostIp') not in ('127.0.0.1', '::1') for x in _b):
+                                _needs_recreate = True
+                                print("  CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
+                        except Exception:
+                            _needs_recreate = True      # cannot tell: keep the old behavior
+                    if not _compromised:
+                        if not _needs_recreate:
+                            print("  CloudTAK already hardened — stack left running (no recreate)")
+                        else:
+                            try:
+                                _rec = subprocess.run(
+                                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+                                )
+                                if _rec.returncode == 0:
+                                    print("  CloudTAK recreated with hardened port bindings")
+                                    # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
+                                    # to image default — re-apply self-heal (HLS + ephemeral reaper).
+                                    _cloudtak_media_hls_heal(wait=True)
+                                else:
+                                    print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
+                            except Exception as _re:
+                                print(f"  WARNING: CloudTAK recreate failed: {_re}")
                     else:
                         print("  CloudTAK left STOPPED pending operator Remove + Reinstall")
 
@@ -78724,7 +80426,7 @@ def _post_update_auto_deploy():
                     if not _needs_recreate:
                         try:
                             _ins = subprocess.run(
-                                _sudo_wrap(['docker', 'inspect', 'tak-portal', '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
+                                _sudo_wrap(['docker', 'inspect', _takportal_ref(), '--format', '{{json .HostConfig.PortBindings}}']), capture_output=True, text=True, timeout=5
                             )
                             _bindings = json.loads(_ins.stdout.strip() or '{}')
                             if not _bindings.get('3000/tcp'):
@@ -79452,6 +81154,13 @@ _MODULE_CTX = {
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
+    # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
+    # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
+    '_get_tak_deployment_config': _get_tak_deployment_config,
+    '_get_authentik_api_url': _get_authentik_api_url,
+    '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
+    '_cloudtak_refresh_override': _cloudtak_refresh_override,
+    'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
 # import with a clear message (smoke.py py_compiles modules/*.py pre-pull), not

@@ -91,7 +91,12 @@ count of seam bypasses only ever goes down.
 
 ## Extending infra-TAK today
 
-The supported extension point is **CloudTAK plugins**: a catalog entry in
+There are two extension points. **Marketplace modules** (`modules/<key>.py` +
+`templates/<key>.html`, registered through the module registry in
+`modules/__init__.py`) deploy and manage a whole application; the contract is
+written up in [docs/MODULE-DEVELOPMENT.md](docs/MODULE-DEVELOPMENT.md).
+
+The other is **CloudTAK plugins**: a catalog entry in
 `app.py` (`CLOUDTAK_PLUGINS`) pointing at a repo with a `plugin/` (Vue, bundled
 into CloudTAK's web UI) and optionally a `server/` proxy route. Install,
 detection, update, and rebuild are handled generically by the console.

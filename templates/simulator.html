@@ -1,0 +1,292 @@
+{% extends 'base.html' %}
+{% block title %}TAK Simulator — infra-TAK{% endblock %}
+{% block page_css %}<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}.btn-danger:disabled{opacity:.4;cursor:not-allowed}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}.btn-secondary:disabled{opacity:.4;cursor:not-allowed}
+.mono{font-family:'JetBrains Mono',monospace}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:300px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8}
+.pf{display:flex;gap:10px;align-items:flex-start;padding:6px 0;font-size:13px;border-bottom:1px solid var(--border)}.pf:last-child{border-bottom:none}
+.pf .ok{color:var(--green)}.pf .bad{color:var(--red)}.pf .det{color:var(--text-dim);font-size:12px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input,.form-select{width:100%;padding:9px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.scen{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-bottom:16px}
+.scen-card{border:1px solid var(--border);border-radius:10px;padding:14px;cursor:pointer;background:#0a0e1a;position:relative}
+.scen-card.sel{border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan) inset}
+.scen-card.bad{opacity:.55;cursor:not-allowed}
+.scen-card h4{font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:4px}
+.scen-card p{font-size:12px;color:var(--text-secondary);line-height:1.45}
+.scen-card .meta{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:8px}
+.scen-card .del{position:absolute;top:8px;right:10px;background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:11px}
+.ex-panel{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.4);border-radius:10px;padding:14px 16px;margin:14px 0;color:var(--red);font-size:13px;display:none}
+.ex-panel.open{display:block}
+.stat{display:flex;flex-direction:column;gap:2px}.stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-dim)}.stat .v{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:var(--text-primary)}
+table.lanes{width:100%;border-collapse:collapse;font-size:12px}table.lanes th{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-dim);text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}table.lanes td{padding:7px 8px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:16px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+.note{font-size:12px;color:var(--text-dim);line-height:1.5}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.pill-run{background:rgba(16,185,129,.15);color:var(--green)}.pill-pause{background:rgba(234,179,8,.15);color:var(--yellow)}.pill-idle{background:var(--border);color:var(--text-dim)}.pill-stop{background:rgba(239,68,68,.15);color:var(--red)}
+</style>{% endblock %}
+{% block body_attrs %}{% endblock %}
+{% block content %}<div class="main">
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <span style="font-size:44px;line-height:1">🎯</span>
+  <div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">TAK SIMULATOR</div>
+    <div class="note">Scripted exercises, technology demos and load tests, streamed into a TAK channel you pick. Nothing reaches anyone who did not join the channel.</div>
+  </div>
+</div>
+
+{% if not sim.get('installed') %}
+<div class="card">
+  <div class="card-title">Deploy TAK Simulator</div>
+  <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">Creates the <span class="mono">simulation</span> channel, one enrolled simulator identity, and the <span class="mono">tak-simulator</span> container (standard-library Python, non-root, no public port). Viewers opt in by joining the channel; a dispatcher who never joined never sees a simulated beacon.</p>
+  <div style="margin-bottom:16px">
+    {% for p in preflight %}
+    <div class="pf"><span class="{% if p.ok %}ok{% else %}bad{% endif %}">{% if p.ok %}✓{% else %}✗{% endif %}</span><div><div>{{ p.label|e }}</div>{% if p.detail %}<div class="det">{{ p.detail|e }}</div>{% endif %}</div></div>
+    {% endfor %}
+  </div>
+  <span class="note" style="display:block;margin-bottom:14px;color:var(--yellow)">⏳ First deploy pulls a pinned python:3.12-slim base image and enrolls the lane certificate — allow 1–3 minutes.</span>
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if not preflight_ok %}disabled{% endif %}><span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy</button>
+</div>
+<div class="card" id="logCard" style="display:none">
+  <div class="card-title">Deploy Log</div>
+  <div class="log-box" id="logBox"></div>
+  <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>
+</div>
+{% if deploy_log %}
+<div class="card">
+  <div class="card-title">Previous Deploy Log</div>
+  <div class="log-box">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  {% if deploy_error %}<div style="margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see log above.</div>{% endif %}
+</div>
+{% endif %}
+
+{% else %}
+
+{% if sim_vinfo.get('update_available') %}
+<div style="background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.3);border-radius:10px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
+  <span style="color:var(--cyan);font-size:13px;font-weight:600">⬆ Engine built by v{{ sim_vinfo.get('version')|e }} — console is v{{ sim_vinfo.get('latest')|e }}. Rebuild to update the simulator engine and presets.</span>
+  <button class="btn btn-primary" style="font-size:11px;margin-left:auto" id="rebuildBtn" onclick="startRebuild()">Rebuild Now</button>
+</div>
+<div id="rebuildCard" style="display:none" class="card"><div class="card-title">Rebuild Log</div><div class="log-box" id="rebuildLogBox"></div></div>
+{% endif %}
+
+<div class="grid2" style="margin-bottom:16px">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Status</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <span class="dot" style="background:{% if sim.get('running') %}var(--green){% else %}var(--red){% endif %}"></span>
+      <span style="font-weight:600">{% if sim.get('running') %}Engine running{% else %}Engine stopped{% endif %}</span>
+      <span id="runPill" class="pill pill-idle" style="margin-left:6px">idle</span>
+      <span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)">engine v{{ sim_vinfo.get('version')|e }}</span>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-primary" style="font-size:11px" onclick="control('start')">Start</button>
+      <button class="btn btn-danger" style="font-size:11px" onclick="control('stop')">Stop</button>
+      <button class="btn btn-secondary" style="font-size:11px" onclick="control('restart')">Restart</button>
+      <button class="btn btn-danger" style="font-size:11px;margin-left:auto" onclick="openUninstall()">Remove</button>
+    </div>
+    <div class="note" style="margin-top:10px">Container controls. A stopped container sends deletes for everything it emitted before it exits.</div>
+  </div>
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">How to watch</div>
+    <div style="font-size:13px;color:var(--text-secondary);line-height:1.6">
+      1. In <a href="{{ takportal_url or '#' }}" target="_blank" style="color:var(--cyan)">TAK Portal</a>, add the viewers to the <span class="mono" style="color:var(--text-primary)">{{ default_channel[4:]|e }}</span> channel.<br>
+      2. In ATAK / iTAK / WinTAK, open Channels and toggle <span class="mono" style="color:var(--text-primary)">{{ default_channel[4:]|e }}</span> on to see the exercise — off to get the real picture back.<br>
+      3. WebTAK, CloudTAK and the Portal map follow the same membership.<br>
+      4. Direct it from the CloudTAK map — drop a radar, aircraft, vessels and ground units, steer them live: <span id="ctakRow" class="note">checking CloudTAK…</span>
+    </div>
+    <div id="ctakLogWrap" style="display:none;margin-top:8px"><div class="log-box" id="ctakLog" style="max-height:140px"></div></div>
+    <div class="note" style="margin-top:10px">Every simulated object carries <span class="mono">EXERCISE EXERCISE EXERCISE</span> in its remarks. Units on a real channel are prefixed <span class="mono">EX-</span>.</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Run a scenario</div>
+  <div id="scenList" class="scen"><div class="note">Loading scenarios…</div></div>
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:18px">
+    <label class="btn btn-secondary" style="font-size:11px;cursor:pointer">Upload scenario JSON<input type="file" id="uploadFile" accept=".json,application/json" style="display:none" onchange="uploadScenario(this)"></label>
+    <span id="uploadMsg" class="note"></span>
+    <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/SIMULATOR.md" target="_blank" rel="noopener" class="note" style="margin-left:auto;color:var(--cyan)">Scenario format ↗</a>
+  </div>
+  <div class="grid3" style="margin-bottom:14px">
+    <div>
+      <label class="form-label">Area of operations</label>
+      <select class="form-select" id="cityPick" onchange="pickCity()"></select>
+    </div>
+    <div><label class="form-label">Center latitude</label><input class="form-input" id="lat" placeholder="36.16"></div>
+    <div><label class="form-label">Center longitude</label><input class="form-input" id="lon" placeholder="-86.78"></div>
+  </div>
+  <div class="grid3" style="margin-bottom:14px">
+    <div>
+      <label class="form-label">Tempo</label>
+      <select class="form-select" id="tempo"><option value="1">1× real time</option><option value="2">2×</option><option value="4">4×</option><option value="10">10×</option></select>
+    </div>
+    <div>
+      <label class="form-label">Loop</label>
+      <select class="form-select" id="loop"><option value="">Scenario default</option><option value="true">Loop until stopped</option><option value="false">Run once</option></select>
+    </div>
+    <div id="loadParams" style="display:none">
+      <label class="form-label">Load: entities / report interval (s)</label>
+      <div style="display:flex;gap:8px"><input class="form-input" id="genCount" placeholder="500"><input class="form-input" id="genInterval" placeholder="2"><input class="form-input" id="genRate" placeholder="200 msg/s" title="Rate governor per lane (default 200 msg/s). Raised for this run only."></div>
+    </div>
+  </div>
+  <div id="laneRows"></div>
+  <div id="warnBox" class="note" style="display:none;color:var(--yellow);margin:8px 0 12px"></div>
+  <div id="exPanel" class="ex-panel">
+    <strong>EXERCISE on a real channel.</strong> Units on <span id="exNames" class="mono"></span> will be seen by every real user in that channel. Every callsign gets an <span class="mono">EX-</span> prefix and every object carries the EXERCISE remark. Type the channel name(s) exactly to confirm:
+    <input class="form-input" id="exConfirm" style="margin-top:8px" placeholder="">
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+    <button class="btn btn-primary" id="btnStart" onclick="runStart()"><span class="material-symbols-outlined" style="font-size:16px">play_arrow</span>Start</button>
+    <button class="btn btn-secondary" id="btnPause" onclick="runCtl('pause')" disabled>Pause</button>
+    <button class="btn btn-secondary" id="btnResume" onclick="runCtl('resume')" disabled>Resume</button>
+    <button class="btn btn-danger" id="btnStop" onclick="runCtl('stop')" disabled>Stop</button>
+    <span id="runMsg" class="note" style="margin-left:8px"></span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Live</div>
+  <div class="grid3" style="margin-bottom:14px;grid-template-columns:repeat(6,1fr)">
+    <div class="stat"><span class="k">Scenario</span><span class="v" id="stScen" style="font-size:13px">—</span></div>
+    <div class="stat"><span class="k">Sim clock</span><span class="v" id="stClock">—</span></div>
+    <div class="stat"><span class="k">Elapsed</span><span class="v" id="stElapsed">—</span></div>
+    <div class="stat"><span class="k">Entities</span><span class="v" id="stEnt">—</span></div>
+    <div class="stat"><span class="k">Events</span><span class="v" id="stEv">—</span></div>
+    <div class="stat"><span class="k">Loops</span><span class="v" id="stLoops">—</span></div>
+  </div>
+  <table class="lanes"><thead><tr><th>Lane</th><th>Channel</th><th>Link</th><th>Sent</th><th>msg/s</th><th>Dropped</th><th>Last error</th></tr></thead><tbody id="laneTable"><tr><td colspan="7" class="note">No lanes yet.</td></tr></tbody></table>
+  <div style="margin:14px 0 8px;display:flex;gap:10px;align-items:center"><span class="card-title" style="margin:0">Engine log</span><button class="btn btn-secondary" style="font-size:11px" onclick="fetchLogs()">Refresh</button></div>
+  <div class="log-box" id="engLog">Loading…</div>
+</div>
+
+<div class="modal-overlay" id="sim-uninstall-modal">
+<div class="modal">
+<h3>⚠ Remove TAK Simulator?</h3>
+<p>Stops any running scenario (deletes go out), removes the container and image, deletes the simulator identities from Authentik, and removes the install directory including uploaded scenarios.</p>
+<label style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--text-secondary);margin-bottom:12px"><input type="checkbox" id="sim-remove-channel"> Also remove the <span class="mono">{{ default_channel|e }}</span> channel (viewers lose their membership)</label>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="sim-uninstall-password" type="password" placeholder="Confirm your password" autocomplete="off">
+<div class="modal-actions">
+<button type="button" class="btn btn-secondary" id="sim-uninstall-cancel" onclick="document.getElementById('sim-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="btn btn-danger" id="sim-uninstall-confirm" onclick="doUninstall()">Remove</button>
+</div>
+<div id="sim-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+<div id="sim-uninstall-progress" style="display:none;margin-top:10px;font-size:13px;color:var(--text-secondary)"></div>
+</div>
+</div>
+{% endif %}
+</div>
+<script>
+const DEFAULT_CHANNEL = {{ default_channel|tojson }};
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function api(path, opts){ opts = opts||{}; opts.credentials='same-origin'; if(opts.body && !(opts.body instanceof FormData)){ opts.headers=Object.assign({'Content-Type':'application/json'}, opts.headers||{}); } return fetch(path, opts).then(r=>r.json().then(d=>({ok:r.ok,status:r.status,d:d})).catch(()=>({ok:false,status:r.status,d:{error:'bad response'}}))); }
+{% if not sim.get('installed') %}
+let polling=false;
+function startDeploy(){
+  document.getElementById('deployBtn').disabled=true; document.getElementById('logCard').style.display='';
+  api('/api/simulator/deploy',{method:'POST',body:'{}'}).then(r=>{ if(r.d.success){ polling=true; poll(); } else alert('Deploy failed: '+(r.d.error||'unknown')); });
+}
+function poll(){
+  if(!polling) return;
+  api('/api/simulator/log').then(r=>{ const d=r.d; const box=document.getElementById('logBox');
+    if(box){ box.innerHTML=(d.entries||[]).map(l=>'<div>'+esc(l)+'</div>').join(''); box.scrollTop=box.scrollHeight; }
+    if(d.complete){ polling=false; setTimeout(()=>location.reload(),2500); }
+    else if(d.error&&!d.running){ polling=false; document.getElementById('deployError').style.display=''; }
+    else setTimeout(poll,1500);
+  }).catch(()=>setTimeout(poll,3000));
+}
+{% else %}
+const CITIES=[['Nashville, TN',36.16,-86.78],['Denver, CO',39.74,-104.99],['Phoenix, AZ',33.45,-112.07],['Washington, DC',38.89,-77.03],['Los Angeles, CA',34.05,-118.24],['Chicago, IL',41.88,-87.63],['Houston, TX',29.76,-95.37],['Seattle, WA',47.61,-122.33],['Miami, FL',25.77,-80.19],['Anchorage, AK',61.22,-149.90],['Honolulu, HI',21.31,-157.86],['Stockholm, SE',59.33,18.07],['London, UK',51.51,-0.13],['Sydney, AU',-33.87,151.21]];
+let scenarios=[], channels=[], selected=null, statusTimer=null, lastState='idle';
+function pickCity(){ const v=document.getElementById('cityPick').value; if(v==='custom') return; const c=CITIES[+v]; document.getElementById('lat').value=c[1]; document.getElementById('lon').value=c[2]; }
+function initCities(){ const s=document.getElementById('cityPick'); s.innerHTML=CITIES.map((c,i)=>'<option value="'+i+'">'+esc(c[0])+'</option>').join('')+'<option value="custom">Custom (type coordinates)</option>';
+  try{ const saved=JSON.parse(localStorage.getItem('sim.center')||'null'); if(saved){ s.value='custom'; document.getElementById('lat').value=saved.lat; document.getElementById('lon').value=saved.lon; return; } }catch(e){}
+  pickCity(); }
+function loadScenarios(){ return api('/api/simulator/scenarios').then(r=>{ scenarios=(r.d.scenarios||[]); renderScenarios(); }); }
+function loadChannels(){ return api('/api/simulator/channels').then(r=>{ channels=(r.d.channels||[]); if(!channels.length) channels=[{name:DEFAULT_CHANNEL,channel:DEFAULT_CHANNEL.slice(4),is_simulation:true}]; renderLanes(); }); }
+function renderScenarios(){ const box=document.getElementById('scenList'); if(!scenarios.length){ box.innerHTML='<div class="note">No scenarios found. Rebuild the engine or upload one.</div>'; return; }
+  box.innerHTML=scenarios.map(s=>{ const bad=!s.valid; return '<div class="scen-card'+(selected===s.name?' sel':'')+(bad?' bad':'')+'" onclick="'+(bad?'':'selectScen(\''+esc(s.name)+'\')')+'">'+
+    (s.upload?'<button class="del" title="Delete upload" onclick="event.stopPropagation();deleteScenario(\''+esc(s.name)+'\')">✕</button>':'')+
+    '<h4>'+esc(s.title||s.name)+'</h4><p>'+esc(bad?('Invalid: '+(s.errors||[]).slice(0,2).join('; ')):(s.story||''))+'</p>'+
+    (bad?'':'<div class="meta">'+esc(s.entities)+' entities · '+esc(s.events)+' events · '+Math.round(s.duration_s/60)+' min'+(s.loop?' · loop':'')+(s.video?' · video':'')+(s.sensors_detecting?' · '+esc(s.sensors_detecting)+' detecting':'')+(s.silent?' · '+esc(s.silent)+' silent':'')+(s.upload?' · upload':' · preset')+'</div>')+'</div>'; }).join('');
+}
+function selectScen(name){ selected=name; renderScenarios(); const s=scenarios.find(x=>x.name===name)||{}; document.getElementById('tempo').value=String(s.default_tempo||1);
+  const lp=document.getElementById('loadParams'); if(s.generate){ lp.style.display=''; document.getElementById('genCount').value=s.generate.count; document.getElementById('genCount').placeholder=s.generate.count_min+'–'+s.generate.count_max; } else lp.style.display='none';
+  const w=document.getElementById('warnBox'); if(s.warn){ w.style.display=''; w.textContent='⚠ '+s.warn; } else w.style.display='none';
+  renderLanes(); }
+function renderLanes(){ const s=scenarios.find(x=>x.name===selected); const box=document.getElementById('laneRows'); if(!s){ box.innerHTML='<div class="note" style="margin-bottom:10px">Pick a scenario to assign its lane(s) to channels.</div>'; updateExercise(); return; }
+  const opts=channels.map(c=>'<option value="'+esc(c.name)+'"'+(c.is_simulation?' selected':'')+'>'+esc(c.channel)+(c.is_simulation?' (simulation — safe default)':'')+'</option>').join('');
+  box.innerHTML='<div class="grid3" style="margin-bottom:10px">'+(s.lanes||['1']).map(l=>'<div><label class="form-label">Lane '+esc(l)+' → channel</label><select class="form-select lane-sel" data-lane="'+esc(l)+'" onchange="updateExercise()">'+opts+'</select></div>').join('')+'</div>';
+  updateExercise(); }
+function laneMap(){ const m={}; document.querySelectorAll('.lane-sel').forEach(el=>{ m[el.dataset.lane]=el.value; }); return m; }
+function updateExercise(){ const real=[...new Set(Object.values(laneMap()).filter(c=>c!==DEFAULT_CHANNEL))].sort(); const p=document.getElementById('exPanel'); if(real.length){ p.classList.add('open'); document.getElementById('exNames').textContent=real.join(', '); document.getElementById('exConfirm').placeholder=real.join(', '); } else { p.classList.remove('open'); document.getElementById('exConfirm').value=''; } }
+function runStart(){ const msg=document.getElementById('runMsg'); if(!selected){ msg.textContent='Pick a scenario first.'; return; }
+  const lat=parseFloat(document.getElementById('lat').value), lon=parseFloat(document.getElementById('lon').value); if(isNaN(lat)||isNaN(lon)){ msg.textContent='Enter an AO center.'; return; }
+  try{ localStorage.setItem('sim.center', JSON.stringify({lat:lat,lon:lon})); }catch(e){}
+  const body={scenario:selected, center:{lat:lat,lon:lon}, tempo:parseInt(document.getElementById('tempo').value,10), lanes:laneMap(), params:{}};
+  const lv=document.getElementById('loop').value; if(lv) body.loop=(lv==='true');
+  const s=scenarios.find(x=>x.name===selected)||{}; if(s.generate){ const c=parseInt(document.getElementById('genCount').value,10); if(c) body.params.count=c; const i=parseFloat(document.getElementById('genInterval').value); if(i) body.params.interval_s=i; const r=parseInt(document.getElementById('genRate').value,10); if(r) body.params.max_msgs_per_sec=r; }
+  const real=Object.values(body.lanes).some(c=>c!==DEFAULT_CHANNEL); if(real) body.confirm_exercise=document.getElementById('exConfirm').value.trim();
+  msg.textContent='Starting… (enrolling / connecting lanes)'; document.getElementById('btnStart').disabled=true;
+  api('/api/simulator/run',{method:'POST',body:JSON.stringify(body)}).then(r=>{ if(r.ok&&r.d.started){ msg.textContent='Running '+r.d.scenario+' — '+r.d.entities+' entities on '+Object.keys(r.d.lanes||{}).length+' lane(s).'; } else { msg.textContent='✗ '+(r.d.error||'failed')+(r.d.errors?': '+r.d.errors.slice(0,3).join('; '):''); document.getElementById('btnStart').disabled=false; } refreshStatus(); });
+}
+function runCtl(verb){ api('/api/simulator/'+verb,{method:'POST',body:'{}'}).then(r=>{ document.getElementById('runMsg').textContent=r.ok?(verb+' → '+r.d.state):('✗ '+(r.d.error||'failed')); refreshStatus(); }); }
+function fmt(s){ s=Math.round(s||0); const m=Math.floor(s/60), r=s%60; return m+':'+String(r).padStart(2,'0'); }
+function refreshStatus(){ api('/api/simulator/status').then(r=>{ const e=r.d.engine; const run=e&&e.run; const state=e?e.state:'down';
+  const pill=document.getElementById('runPill'); pill.textContent=e?state:'engine down'; pill.className='pill '+(state==='running'?'pill-run':state==='paused'?'pill-pause':state==='stopping'?'pill-stop':'pill-idle');
+  const live=state==='running'||state==='paused'; document.getElementById('btnStart').disabled=live||state==='stopping'; document.getElementById('btnPause').disabled=state!=='running'; document.getElementById('btnResume').disabled=state!=='paused'; document.getElementById('btnStop').disabled=!live;
+  if(run){ document.getElementById('stScen').textContent=run.title||run.scenario; document.getElementById('stClock').textContent='t+'+fmt(run.sim_t)+' / '+fmt(run.duration_s)+' @'+run.tempo+'×'; document.getElementById('stElapsed').textContent=fmt(run.uptime_s); document.getElementById('stEnt').textContent=run.entities_alive+' / '+run.entities_total; document.getElementById('stEv').textContent=run.events_fired+' / '+run.events_total; document.getElementById('stLoops').textContent=run.loops_done; }
+  const lanes=(run&&run.lanes)||[]; const tb=document.getElementById('laneTable');
+  const rows=lanes.length?lanes:(r.d.lanes||[]).map(l=>({id:l.id,channel:l.channel,connected:null,sent:'—',msgs_per_s:'—',dropped:'—',last_error:''}));
+  tb.innerHTML=rows.length?rows.map(l=>'<tr><td>'+esc(l.id)+'</td><td>'+esc(l.channel)+(l.exercise?' <span class="pill pill-stop">exercise</span>':'')+'</td><td>'+(l.connected===null?'<span class="note">idle</span>':(l.connected?'<span style="color:var(--green)">● connected</span>':'<span style="color:var(--red)">● down</span>'))+'</td><td>'+esc(l.sent)+'</td><td>'+esc(l.msgs_per_s)+'</td><td>'+esc(l.dropped)+'</td><td class="note">'+esc(l.last_error||'')+'</td></tr>').join(''):'<tr><td colspan="7" class="note">No lanes yet.</td></tr>';
+  if(r.d.engine_error) document.getElementById('runMsg').textContent='✗ '+r.d.engine_error;
+  renderCloudtak(r.d.cloudtak);
+  if(live!==(lastState==='running'||lastState==='paused')) fetchLogs(); lastState=state;
+  clearTimeout(statusTimer); statusTimer=setTimeout(refreshStatus, live?2000:8000); }).catch(()=>{ clearTimeout(statusTimer); statusTimer=setTimeout(refreshStatus,8000); }); }
+let ctakInstalling=false;
+function renderCloudtak(c){ const row=document.getElementById('ctakRow'); if(!row||ctakInstalling) return;
+  if(!c||!c.installed){ row.innerHTML='CloudTAK is not installed on this box.'; return; }
+  if(c.plugin_installed){ row.innerHTML='<a href="'+esc(c.panel_url)+'" target="_blank" rel="noopener" style="color:var(--cyan)">Open in CloudTAK ↗</a> <span class="note">(menu → TAK Simulator; hard-refresh CloudTAK after an install)</span>'; return; }
+  row.innerHTML='<button class="btn btn-primary" style="font-size:11px" id="ctakInstallBtn" onclick="installPanel()">Install CloudTAK panel</button> <span class="note">rebuilds the CloudTAK API image, 5–10 min</span>'; }
+function installPanel(){ const b=document.getElementById('ctakInstallBtn'); if(b) b.disabled=true; ctakInstalling=true;
+  document.getElementById('ctakRow').innerHTML='<span class="note">Installing the TAK Simulator panel into CloudTAK…</span>'; document.getElementById('ctakLogWrap').style.display='';
+  api('/api/cloudtak/plugins/action',{method:'POST',body:JSON.stringify({plugin:'taksim',action:'install'})}).then(r=>{ if(!r.ok||!r.d.ok){ ctakInstalling=false; document.getElementById('ctakRow').innerHTML='✗ '+esc(r.d.error||'could not start the install'); return; } pollPanel(); }); }
+function pollPanel(){ api('/api/cloudtak/plugins/log?index=0').then(r=>{ const d=r.d; const box=document.getElementById('ctakLog'); box.innerHTML=(d.entries||[]).map(l=>'<div>'+esc(l)+'</div>').join(''); box.scrollTop=box.scrollHeight;
+  if(d.running){ setTimeout(pollPanel,4000); return; } ctakInstalling=false;
+  if(d.complete&&!d.error){ document.getElementById('ctakRow').innerHTML='<span style="color:var(--green)">✓ installed</span> — close every CloudTAK tab and reopen it (its service worker caches the old bundle).'; refreshStatus(); }
+  else document.getElementById('ctakRow').innerHTML='✗ install failed — see the log above (the plugin catalog on the CloudTAK page has the same log).'; }).catch(()=>setTimeout(pollPanel,5000)); }
+function fetchLogs(){ api('/api/simulator/logs').then(r=>{ const box=document.getElementById('engLog'); box.innerHTML=(r.d.lines||[]).map(l=>'<div>'+esc(l)+'</div>').join('')||'<div class="note">(no log lines yet)</div>'; box.scrollTop=box.scrollHeight; }); }
+function uploadScenario(inp){ const f=inp.files[0]; if(!f) return; const msg=document.getElementById('uploadMsg'); if(f.size>1000000){ msg.textContent='✗ larger than 1 MB'; return; } const fd=new FormData(); fd.append('file',f); msg.textContent='Validating…';
+  api('/api/simulator/scenarios/upload',{method:'POST',body:fd}).then(r=>{ if(r.ok){ msg.textContent='✓ saved as '+r.d.saved; loadScenarios().then(()=>selectScen(r.d.saved)); } else msg.textContent='✗ '+(r.d.error||'rejected')+(r.d.errors?': '+r.d.errors.slice(0,3).join('; '):''); inp.value=''; }); }
+function deleteScenario(name){ if(!confirm('Delete uploaded scenario '+name+'?')) return; api('/api/simulator/scenarios/'+encodeURIComponent(name),{method:'DELETE'}).then(()=>{ if(selected===name) selected=null; loadScenarios(); }); }
+function control(action){ api('/api/simulator/control',{method:'POST',body:JSON.stringify({action:action})}).then(r=>{ if(r.d.success) setTimeout(()=>location.reload(),1500); else alert(r.d.error||'Failed'); }); }
+function openUninstall(){ document.getElementById('sim-uninstall-msg').textContent=''; document.getElementById('sim-uninstall-password').value=''; document.getElementById('sim-uninstall-modal').classList.add('open'); }
+async function doUninstall(){ const pw=document.getElementById('sim-uninstall-password').value; const msgEl=document.getElementById('sim-uninstall-msg'); if(!pw){ msgEl.textContent='Please enter your password'; return; }
+  const prog=document.getElementById('sim-uninstall-progress'), c=document.getElementById('sim-uninstall-cancel'), ok=document.getElementById('sim-uninstall-confirm'); msgEl.textContent=''; prog.style.display='block'; prog.innerHTML='<span class="uninstall-spinner"></span>Removing…'; c.disabled=true; ok.disabled=true;
+  try{ const r=await api('/api/simulator/uninstall',{method:'POST',body:JSON.stringify({password:pw, remove_channel:document.getElementById('sim-remove-channel').checked})});
+    if(r.d.success){ prog.innerHTML='<span class="uninstall-spinner"></span>Done. Redirecting…'; setTimeout(()=>{window.location.href='/marketplace';},800); }
+    else { msgEl.textContent=r.d.error||'Remove failed'; prog.style.display='none'; c.disabled=false; ok.disabled=false; } }
+  catch(e){ msgEl.textContent='Request failed: '+e.message; prog.style.display='none'; c.disabled=false; ok.disabled=false; } }
+let rebuildPolling=false;
+function startRebuild(){ const b=document.getElementById('rebuildBtn'); if(b) b.disabled=true; document.getElementById('rebuildCard').style.display='';
+  api('/api/simulator/rebuild',{method:'POST',body:'{}'}).then(r=>{ if(r.d.started){ rebuildPolling=true; pollRebuild(); } else alert('Rebuild failed: '+(r.d.error||'unknown')); }); }
+function pollRebuild(){ if(!rebuildPolling) return; api('/api/simulator/rebuild-status').then(r=>{ const d=r.d; const box=document.getElementById('rebuildLogBox'); box.innerHTML=(d.log||[]).map(l=>'<div>'+esc(l)+'</div>').join(''); box.scrollTop=box.scrollHeight;
+  if(d.complete){ rebuildPolling=false; setTimeout(()=>location.reload(),2000); } else if(d.error&&!d.running){ rebuildPolling=false; } else setTimeout(pollRebuild,2000); }).catch(()=>setTimeout(pollRebuild,3000)); }
+initCities(); Promise.all([loadScenarios(), loadChannels()]).then(()=>{ if(scenarios.length&&scenarios[0].valid) selectScen(scenarios[0].name); }); refreshStatus(); fetchLogs();
+{% endif %}
+</script>
+{% endblock %}
