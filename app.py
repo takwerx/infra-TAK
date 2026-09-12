@@ -15731,6 +15731,144 @@ def fail2ban_page():
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
+# --- Split-deployment (two-server) brute-force protection -------------------
+# v10.1.68. The Marketplace fail2ban install only ever ran on the host the console
+# runs on. On a two-server build the DATABASE node got nothing — internet-exposed
+# sshd with no protection from the day it was built, and no indication anywhere that
+# it was unprotected. Field report (John Stefanini, 2026-09-12): his app node had
+# 2,321 failures / 367 bans over four weeks while the database node had zero
+# coverage since 15 August; a multi-source brute force forked ~5,000 sshd processes
+# in 26 minutes, exhausted SSH, locked him out of his own machine, and — because
+# the management path was gone — surfaced to him as "PostgreSQL is not running".
+#
+# Our own fleet says this is the baseline on that provider, not an event: three
+# SSD Nodes boxes measured 2026-09-12 carried 41,937 / 27,820 / 3,677 recorded auth
+# failures.
+#
+# Note the constraint his report surfaced: the console's key to Server One may be
+# bound to a forced command, and there is often no out-of-band console, so an
+# operator cannot simply close port 22 on the database node. fail2ban (plus
+# `ufw limit`) is the right lever; `deny` would lock them out.
+
+def _f2b_db_node_cfg():
+    """Server One's host config when this is a two-server deployment, else None."""
+    try:
+        cfg = _get_tak_deployment_config(load_settings())
+        if (cfg or {}).get('mode') != 'two_server':
+            return None
+        s1 = dict((cfg.get('server_one') or {}))
+        if not (s1.get('host') or '').strip():
+            return None
+        if s1.get('use_localhost') or (s1.get('host') or '').strip() in ('127.0.0.1', 'localhost', '::1'):
+            return None          # not actually a separate machine
+        return s1
+    except Exception:
+        return None
+
+
+def _f2b_db_node_state():
+    """Is the split-deployment database node protected? Read-only, never installs.
+
+    Returns a dict the console can surface, so an unprotected node is visible instead
+    of silent. `applicable` is False on single-box builds.
+    """
+    s1 = _f2b_db_node_cfg()
+    if not s1:
+        return {'applicable': False}
+    out = {'applicable': True, 'host': (s1.get('host') or '').strip(),
+           'reachable': False, 'installed': False, 'daemon_active': False,
+           'sshd_jail_active': False, 'banned': None, 'error': ''}
+    ok, res = _ssh_probe(s1, "command -v fail2ban-client >/dev/null 2>&1 && echo YES || echo NO", timeout=20)
+    if not ok:
+        out['error'] = (res or 'ssh probe failed')[:200]
+        return out
+    out['reachable'] = True
+    out['installed'] = 'YES' in (res or '')
+    if not out['installed']:
+        return out
+    ok, res = _ssh_probe(s1, "systemctl is-active fail2ban 2>/dev/null || true", timeout=20)
+    out['daemon_active'] = ok and (res or '').strip() == 'active'
+    ok, res = _ssh_probe(s1, "sudo fail2ban-client status sshd 2>/dev/null || fail2ban-client status sshd 2>/dev/null || true", timeout=25)
+    if ok and 'Banned IP list' in (res or ''):
+        out['sshd_jail_active'] = True
+        m = re.search(r'Currently banned:\s*(\d+)', res or '')
+        if m:
+            out['banned'] = int(m.group(1))
+    return out
+
+
+_F2B_REMOTE_JAIL = """[sshd]
+enabled  = true
+port     = ssh
+backend  = systemd
+maxretry = 5
+findtime = 600
+bantime  = 3600
+"""
+
+
+def _f2b_install_db_node(plog):
+    """Install fail2ban + an sshd jail on the split-deployment database node.
+
+    Deliberately NOT the local installer: that one exists to protect Authentik and
+    requires ~/authentik/.env, which does not exist on a database node. What that
+    machine needs is sshd brute-force protection.
+
+    `backend = systemd` rather than a log path, because the journal is present on both
+    distro families and the auth-log path is not (auth.log on Debian, secure on RHEL).
+    Idempotent: re-running on a protected node reports and changes nothing.
+    """
+    s1 = _f2b_db_node_cfg()
+    if not s1:
+        plog("db node: not a two-server deployment — nothing to do")
+        return True, 'not applicable'
+    host = (s1.get('host') or '').strip()
+    plog(f"db node ({host}): checking current state")
+
+    st = _f2b_db_node_state()
+    if not st.get('reachable'):
+        plog(f"db node ({host}): UNREACHABLE over SSH — {st.get('error','')}")
+        return False, 'unreachable'
+    if st.get('installed') and st.get('sshd_jail_active'):
+        plog(f"db node ({host}): already protected (sshd jail active) — no change")
+        return True, 'already-protected'
+
+    if not st.get('installed'):
+        plog(f"db node ({host}): installing fail2ban")
+        ok, res = _ssh_probe(
+            s1,
+            "if command -v apt-get >/dev/null 2>&1; then "
+            "  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+            "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban; "
+            "elif command -v dnf >/dev/null 2>&1; then "
+            "  sudo dnf install -y fail2ban || { sudo dnf install -y epel-release && sudo dnf install -y fail2ban; }; "
+            "else echo NO_PKG_MGR; exit 1; fi",
+            timeout=300)
+        if not ok:
+            plog(f"db node ({host}): install FAILED — {(res or '')[-300:]}")
+            return False, 'install-failed'
+        plog(f"db node ({host}): fail2ban installed")
+
+    plog(f"db node ({host}): enabling the sshd jail")
+    _jail = _F2B_REMOTE_JAIL.replace('"', '\\"')
+    ok, res = _ssh_probe(
+        s1,
+        "sudo mkdir -p /etc/fail2ban/jail.d && "
+        f"printf '%s' \"{_jail}\" | sudo tee /etc/fail2ban/jail.d/infratak-sshd.conf >/dev/null && "
+        "sudo systemctl enable --now fail2ban >/dev/null 2>&1; "
+        "sudo systemctl restart fail2ban >/dev/null 2>&1; sleep 2; "
+        "sudo fail2ban-client status sshd 2>/dev/null | head -20",
+        timeout=120)
+    if not ok or 'Banned IP list' not in (res or ''):
+        plog(f"db node ({host}): jail did not come up — {(res or '')[-300:]}")
+        return False, 'jail-failed'
+
+    m = re.search(r'Currently banned:\s*(\d+)', res or '')
+    _banned = m.group(1) if m else '0'
+    plog(f"db node ({host}): sshd jail ACTIVE (currently banned: {_banned})")
+    return True, 'installed'
+
+
 def _f2b_is_available():
     """Return True if fail2ban is actually installed. v10.0.5: `which fail2ban-client` is
     POISONED by the broker shim — a fail2ban-client shim sits on the console PATH even when
@@ -17676,6 +17814,13 @@ def fail2ban_status_api():
         # exactly how Authentik went a month with no brute-force protection.
         status['dead_jails'] = [{'jail': j, 'filter': f, 'reason': r}
                                 for j, f, r in _f2b_dead_jails()]
+        # v10.1.68: on a two-server build the DATABASE node is a separate machine that
+        # this install never touched. Report its state so an unprotected node is visible
+        # here instead of being discovered during a brute-force incident.
+        try:
+            status['db_node'] = _f2b_db_node_state()
+        except Exception as _dbe:
+            status['db_node'] = {'applicable': True, 'error': str(_dbe)[:200]}
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -18932,6 +19077,46 @@ def fail2ban_recidive_unban_api():
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
+def _fail2ban_install_db_node_step(plog):
+    """Wrapper so the install route and the dedicated route share one implementation."""
+    if not _f2b_db_node_cfg():
+        return True
+    ok, _why = _f2b_install_db_node(plog)
+    return ok
+
+
+@app.route('/api/fail2ban/db-node/install', methods=['POST'])
+@login_required
+def fail2ban_db_node_install_api():
+    """Protect the database node of a two-server deployment.
+
+    Separate from /api/fail2ban/install on purpose: that route refuses with 400 once
+    the CONSOLE host has fail2ban, which is exactly the state every existing split
+    build is in — so there was no way to reach the database node at all. This is the
+    one-click fix for a box that has been exposed since it was built.
+    """
+    if not _f2b_db_node_cfg():
+        return jsonify({'ok': False, 'error': 'Not a two-server deployment'}), 400
+    log = []
+    def _plog(msg):
+        log.append(msg)
+        print(f"fail2ban db-node: {msg}", flush=True)
+    try:
+        ok, why = _f2b_install_db_node(_plog)
+        return jsonify({'ok': ok, 'result': why, 'log': log,
+                        'state': _f2b_db_node_state()})
+    except Exception as e:
+        log.append(f"ERROR: {e}")
+        return jsonify({'ok': False, 'error': str(e)[:300], 'log': log}), 500
+
+
+@app.route('/api/fail2ban/db-node/status')
+@login_required
+def fail2ban_db_node_status_api():
+    """Read-only state of the split-deployment database node's brute-force protection."""
+    return jsonify(_f2b_db_node_state())
+
+
 @app.route('/api/fail2ban/install', methods=['POST'])
 @login_required
 def fail2ban_install_api():
@@ -18957,6 +19142,12 @@ def fail2ban_install_api():
                 return
             _fail2ban_add_guarddog_hook(_plog)
             _fail2ban_takserver_filter(_plog)
+            # v10.1.68: a two-server build has a SECOND machine. Protect it in the same
+            # action rather than leaving it exposed with nothing saying so.
+            try:
+                _fail2ban_install_db_node_step(_plog)
+            except Exception as _dbx:
+                _plog(f"db node: error (non-fatal, console host is protected): {_dbx}")
             _f2b_install_status.update({'running': False, 'done': True, 'ok': True})
         except Exception as e:
             _plog(f"ERROR: {e}")
