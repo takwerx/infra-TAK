@@ -215,8 +215,17 @@ VPS provider.
       rm -f "$TMPF"
     fi
   fi
-else
-  rm -f "$ALERT_SENT_FILE"
 fi
+# NOTE: there is deliberately NO `else rm -f "$ALERT_SENT_FILE"` here.
+# Clearing the sentinel on a single good reading defeats the 6h debounce entirely:
+# this timer fires every 15 minutes, so a disk that flaps degraded -> OK -> degraded
+# alerted on EVERY degraded reading. Field evidence (Charles Laird/NC, 2026-09-12):
+# three alerts for one server in 6h31m against a documented 6h floor.
+# That is worst precisely when the alert matters most -- noisy-neighbor VPS
+# contention, the condition this check exists to detect, is intermittent by nature.
+# The `-mmin +360` age gate above is the whole debounce: the sentinel is touched only
+# when an alert is actually sent, so a sustained problem re-alerts every 6h and a
+# genuinely new incident alerts at most 6h later. Do not "fix" this by resetting on
+# recovery. (v10.1.70 W2)
 
 exit 0

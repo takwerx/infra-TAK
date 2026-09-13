@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.70-alpha"
+VERSION = "10.1.71-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -16404,6 +16404,73 @@ def _f2b_trusted_ignoreip(extra=''):
             parts.append(c)
     return ' '.join(parts)
 
+def _f2b_seed_console_client_ignore(client_ip, why=''):
+    """v10.1.70 W1.1: seed the operator's own console address into the never-ban list.
+
+    SEED-ONCE, APPEND-ONLY, NEVER OVERWRITE. This is operator-owned config; the same
+    discipline as TAK Portal's settings.json (CLAUDE.md, third-party config): we may
+    seed a key that has never been set, we may never clobber or re-derive one a human
+    has touched. Once `fail2ban_ignore_seeded` is recorded we never seed again, so an
+    operator who deliberately REMOVES the address does not get it healed back in.
+
+    Why this exists: every jail's ignoreip is built from _f2b_trusted_ignoreip(), which
+    knows localhost, attached subnets, management tunnels, container bridges and the
+    box's own addresses — but NOT the address the operator actually reaches the console
+    from. So the one address that must never be banned was the one address nobody
+    seeded, and it drifted per box: on 2026-09-12 the workstation IP was in test6's and
+    test8's list and absent from test12's, in BOTH the recidive and authentik jails.
+    Three sshd bans in 24h then escalates to recidive, which bans ALL ports — including
+    :5001, the console you would use to unban yourself.
+
+    Seeding here fixes it at the source rather than easing recovery: fail2ban_ignore_cidrs
+    feeds sshd as well as recidive, so the ban never happens in the first place.
+
+    Deliberately NOT called from arbitrary page loads. Callers are the two authenticated,
+    deliberate acts of turning on the thing that can cause the lockout (installing
+    fail2ban, enabling the recidive jail) plus the explicit one-click control. A silent
+    seed on any authenticated request would permanently exempt whatever shared-NAT
+    address the operator happened to visit from once.
+
+    Returns (seeded: bool, reason: str). Never raises.
+    """
+    try:
+        ip = (client_ip or '').strip()
+        if not ip:
+            return False, 'no client address observed'
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False, f'not an IP address: {ip[:40]}'
+
+        s_cfg = load_settings()
+        if s_cfg.get('fail2ban_ignore_seeded'):
+            return False, 'already seeded once (never re-seeds)'
+
+        # Already protected by a computed group? Then there is nothing to add, but still
+        # record the marker so we do not reconsider this on every future install.
+        for tok in _f2b_trusted_ignoreip().split():
+            try:
+                if addr in ipaddress.ip_network(tok, strict=False):
+                    s_cfg['fail2ban_ignore_seeded'] = True
+                    save_settings(s_cfg)
+                    return False, f'already covered by {tok}'
+            except (ValueError, TypeError):
+                continue      # v4/v6 mismatch or a malformed stored entry
+
+        existing = _f2b_fleet_ignore_cidrs()
+        if ip not in existing:
+            existing.append(ip)
+        s_cfg['fail2ban_ignore_cidrs'] = ' '.join(existing)
+        s_cfg['fail2ban_ignore_seeded'] = True
+        save_settings(s_cfg)
+        print(f"fail2ban: seeded console client {ip} into the never-ban list "
+              f"({why or 'seed'}) — it feeds sshd AND recidive, so the ban never happens",
+              flush=True)
+        return True, ip
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def _f2b_operator_extra(stored):
     """Strip the fleet-computed tokens (localhost + attached private subnets + fleet CIDRs)
     from a jail's stored ignoreip, leaving ONLY the per-jail operator entries. Lets a
@@ -19222,6 +19289,23 @@ def _f2b_read_recidive_config():
         pass
     return cfg
 
+# v10.1.70 W1.4: recidive ban duration — FLEET CONSTANT, deliberately finite.
+#
+# This jail bans on ALL ports (see _f2b_banaction), so a banned address loses :5001 —
+# the console you would use to unban yourself — as well as :22. At bantime = -1 that
+# state was PERMANENT and, for a customer who cannot SSH in from another address, it
+# had no recovery path at all: the product could put a box beyond its owner's reach
+# and keep it there. Three sshd bans inside findtime is ordinary NAT behavior (an
+# office where three people mistype a password), not proof of an attacker.
+#
+# 7 days is still severe for a genuine repeat offender and it bounds the damage when
+# we are wrong. Operator decision, 2026-09-12. Existing permanent bans are NOT
+# rewritten — fail2ban stores bantime per ban — so they stay until unbanned from the
+# console; only new bans take this. A fleet CONSTANT, never operator-tunable, per the
+# fleet-uniform rule: the recovery floor is not something that should drift per box.
+_F2B_RECIDIVE_BANTIME = 604800   # 7 days, in seconds
+
+
 def _f2b_write_recidive_config(maxretry, findtime):
     """Write infratak-recidive jail and ensure fail2ban persistence."""
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
@@ -19230,7 +19314,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "enabled  = true\n"
         "filter   = recidive\n"
         "logpath  = /var/log/fail2ban.log\n"
-        "bantime  = -1\n"
+        f"bantime  = {_F2B_RECIDIVE_BANTIME}\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
         # v10.1.30: never escalate a MEDIA ban into an all-ports one. recidive matches
@@ -19273,6 +19357,53 @@ def _f2b_write_recidive_config(maxretry, findtime):
         pass
 
 
+@app.route('/api/fail2ban/trusted-cidrs/add-mine', methods=['POST'])
+@login_required
+def fail2ban_add_my_ip_api():
+    """v10.1.70 W1.1: one-click 'never ban the address I am reaching the console from'.
+
+    The fail2ban page has warned for releases that the caller's address is not on the
+    never-ban list and that a ban there costs them every port on the box — but the only
+    way to act on that warning was to retype the address into the trusted-CIDR field.
+    That is why the workstation IP was present on two boxes and missing on a third.
+
+    Deliberately separate from the trusted-cidrs POST, which REPLACES the whole list: a
+    one-click control must not be able to drop entries the operator added. This only
+    ever appends, and it takes no IP from the request body — the address comes from the
+    connection itself, so a caller cannot use it to whitelist somebody else.
+    """
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    ip = _f2b_console_client_ip()
+    if not ip:
+        return jsonify({'ok': False, 'error': 'Could not determine your address'}), 400
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({'ok': False, 'error': f'Not a usable address: {ip[:40]}'}), 400
+
+    cidrs = _f2b_fleet_ignore_cidrs()
+    if ip in cidrs:
+        return jsonify({'ok': True, 'ip': ip, 'already': True,
+                        'cidrs': cidrs, 'effective': _f2b_trusted_ignoreip()})
+    cidrs.append(ip)
+    s_cfg = load_settings()
+    s_cfg['fail2ban_ignore_cidrs'] = ' '.join(cidrs)
+    # An explicit click counts as the seed — do not let an automatic seed add a second,
+    # different address later (e.g. one visit from another network).
+    s_cfg['fail2ban_ignore_seeded'] = True
+    save_settings(s_cfg)
+    rewritten = _f2b_rewrite_all_jails()
+    try:
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
+    except Exception:
+        pass
+    print(f"fail2ban: {ip} added to the never-ban list by operator click; "
+          f"rewrote {rewritten}", flush=True)
+    return jsonify({'ok': True, 'ip': ip, 'already': False, 'cidrs': cidrs,
+                    'rewritten': rewritten, 'effective': _f2b_trusted_ignoreip()})
+
+
 @app.route('/api/fail2ban/recidive/status')
 @login_required
 def fail2ban_recidive_status_api():
@@ -19283,6 +19414,10 @@ def fail2ban_recidive_status_api():
         'available': True,
         'jail_enabled': enabled,
         'jail_config': _f2b_read_recidive_config(),
+        # v10.1.70 W1.3: the UI called every recidive ban "Permanent" and drew it as an
+        # infinity badge. Report the real duration so the card cannot drift from the jail.
+        'bantime': _F2B_RECIDIVE_BANTIME,
+        'bantime_label': '%d days' % (_F2B_RECIDIVE_BANTIME // 86400),
         'currently_banned': 0, 'total_banned': 0, 'banned_ips': [],
     }
     if enabled:
@@ -19311,10 +19446,23 @@ def fail2ban_recidive_config_api():
         findtime = max(3600, min(2592000, int(data.get('findtime', 86400))))
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    # v10.1.70 W1.1: enabling recidive is the moment the operator turns on the jail that
+    # bans every port — seed their own address before it can catch them. Seed-once, so
+    # toggling the jail off and on does not re-add an address they removed on purpose.
+    _seeded, _seed_why = _f2b_seed_console_client_ignore(
+        _f2b_console_client_ip(), 'recidive jail enabled')
     try:
         _f2b_write_recidive_config(maxretry, findtime)
+        # If we just seeded, the address has to reach EVERY jail, not only this one.
+        # The lockout chain starts at sshd: three sshd bans inside findtime are what
+        # promote an address to recidive in the first place. Seeding recidive alone
+        # would leave the escalation path fully intact and only soften the last step.
+        if _seeded:
+            _f2b_rewrite_all_jails()
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
-        return jsonify({'ok': True, 'enabled': True, 'maxretry': maxretry, 'findtime': findtime})
+        return jsonify({'ok': True, 'enabled': True, 'maxretry': maxretry, 'findtime': findtime,
+                        'bantime': _F2B_RECIDIVE_BANTIME,
+                        'seeded_client': _seeded, 'seed_detail': _seed_why})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
@@ -19393,6 +19541,11 @@ def fail2ban_install_api():
 
     _f2b_install_status = {'running': True, 'log': [], 'done': False, 'ok': False}
 
+    # v10.1.70 W1.1: read the operator's address HERE, in the request context. `request`
+    # does not exist inside the worker thread below, so deferring this would silently
+    # seed nothing.
+    _client_for_seed = _f2b_console_client_ip()
+
     def _plog(msg):
         _f2b_install_status['log'].append(msg)
         print(f"fail2ban install: {msg}", flush=True)
@@ -19400,6 +19553,12 @@ def fail2ban_install_api():
     def _run():
         global _f2b_install_status
         try:
+            # Seed BEFORE the jails are written — _fail2ban_install_and_configure() bakes
+            # ignoreip into every jail it creates, so seeding afterwards would not take
+            # effect until something else happened to rewrite them.
+            _seeded, _why = _f2b_seed_console_client_ignore(_client_for_seed, 'fail2ban install')
+            _plog(f"never-ban list: seeded your address {_why}" if _seeded
+                  else f"never-ban list: not seeded ({_why})")
             ok1 = _fail2ban_install_and_configure(_plog)
             if not ok1 and not _f2b_is_available():
                 _f2b_install_status.update({'running': False, 'done': True, 'ok': False})
@@ -75590,6 +75749,46 @@ def _startup_converge_recidive_media_exempt():
     except Exception as _e:
         print('Startup migration: recidive media-exempt converge warning (non-fatal): %s' % _e)
 
+def _startup_converge_recidive_bantime():
+    """v10.1.70 W1.4: retire `bantime = -1` on boxes that already have the recidive jail.
+
+    This CANNOT ride _startup_converge_recidive_media_exempt(): that one returns early
+    the moment `mediamtx-rtsp` is present, which is every box that took v10.1.30 — so
+    piggy-backing would have shipped this change dormant on the entire installed fleet
+    and left exactly the customers most at risk (long-running boxes) on permanent bans.
+    That is the [[feedback-console-path-delivery]] failure mode, and the same one that
+    nearly shipped v10.1.69 W5 in a route handler.
+
+    Narrow and idempotent: rewrite only while the jail still carries the permanent
+    bantime, and go through _f2b_write_recidive_config() so stored thresholds survive.
+    Existing bans keep the bantime they were created with (fail2ban stores it per ban);
+    this governs new ones. Unbanning a still-permanent ban is the console's job.
+    """
+    try:
+        if not _f2b_recidive_enabled():
+            return
+        path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+        try:
+            with open(path) as _rf:
+                cur = _rf.read()
+        except OSError:
+            return
+        # Match the written form exactly; anything else is already converged.
+        if 'bantime  = -1' not in cur:
+            return
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: \u2713 recidive ban duration is now %d days, was PERMANENT '
+              '— an all-ports ban with no expiry could put a box beyond its owner\'s reach '
+              'with no recovery path (v10.1.70)' % (_F2B_RECIDIVE_BANTIME // 86400))
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: recidive bantime converge warning (non-fatal): %s' % _e)
+
+
 # NOT invoked here. This function is broker-dependent (_f2b_write_mediamtx_jail writes
 # under /etc), and module level runs before the broker-ready gate in _startup_migrations().
 # It is called from the fail2ban self-heal block there instead — see the note at that call.
@@ -77614,6 +77813,12 @@ def _startup_migrations():
             _startup_converge_recidive_media_exempt()
         except Exception as _f2b_e3c:
             print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
+        # v10.1.70 W1.4: separate from the above ON PURPOSE — that one early-returns on
+        # every box that took v10.1.30, so this would never run if it rode along.
+        try:
+            _startup_converge_recidive_bantime()
+        except Exception as _f2b_e3d:
+            print(f"Startup migration: recidive bantime converge error (non-fatal): {_f2b_e3d}", flush=True)
 
         # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
         # _startup_migrations() rather than at import time: it writes a privileged path and

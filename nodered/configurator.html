@@ -3623,10 +3623,16 @@ async function loadSavedConfigs() {
         try {
           var _ar = await _fetchT('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: _src }) });
           _ad = await _ar.json();
-          if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) { _ad.restored_from = _src; break; }
+          // v10.1.70: pp_count was missing from BOTH tests, so a box whose only configs
+          // are PulsePoint restored correctly server-side and then reported nothing --
+          // the source was rejected, the list never refreshed, and the page still showed
+          // an empty state over a healthy restore. fn_cfg_restore has always returned
+          // pp_count; the old TC/PP code carried the comment "pp_configs aren't counted
+          // in the response", which was simply false. Same wrong premise, two places.
+          if (_ad.ok && _restoreYieldedConfigs(_ad)) { _ad.restored_from = _src; break; }
         } catch (_se) { /* try next source */ }
       }
-      if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) {
+      if (_ad.ok && _restoreYieldedConfigs(_ad)) {
         console.log('Auto-restored from ' + (_ad.restored_from || 'backup') + ':', _ad);
         _savedConfigs = []; _extraCounts = 0;
         await Promise.allSettled([
@@ -4135,11 +4141,13 @@ async function savePpConfig(activate) {
     var lr = await fetch('/pp/config/load');
     var ld = await lr.json();
     _ppConfigs = Array.isArray(ld.configs) ? ld.configs : [];
+    var _ctxOk = true;
     if (activate && cfg.configName) {
       if (st) { st.textContent = 'Creating flow…'; st.style.color = '#94a3b8'; }
-      await ensurePPEngineTab(cfg.configName, cfg.cotStreamPort);
+      _ctxOk = await ensurePPEngineTab(cfg.configName, cfg.cotStreamPort);
     }
-    if (st) { st.textContent = '✓ Saved' + (activate ? ' & activated' : ''); st.style.color = '#4ade80'; }
+    // v10.1.70 W3: see saveTcConfig — never overwrite the guard's context-loss warning.
+    if (st && _ctxOk !== false) { st.textContent = '✓ Saved' + (activate ? ' & activated' : ''); st.style.color = '#4ade80'; }
     await renderConfigList();
     setTimeout(function(){ hideSteps(); }, 800);
   } catch(e) {
@@ -4158,16 +4166,18 @@ async function deletePpConfig(id) {
   } catch(e) { alert('Delete failed: ' + e.message); }
 }
 
+// Returns false ONLY when the full deploy lost configs and no backup restored them
+// (v10.1.70 W3). Callers must not report success in that case.
 async function ensurePPEngineTab(configName, cotStreamPort) {
-  if (!configName || !configName.trim()) return;
+  if (!configName || !configName.trim()) return true;
   var feedId = feedIdFromName(configName);
   var tabId = 'flow_pp_' + feedId;
   var tabLabel = 'PP: ' + configName;
-  try { var ck = await fetch('/flow/' + tabId); if (ck.ok) return; } catch(e) {}
+  try { var ck = await fetch('/flow/' + tabId); if (ck.ok) return true; } catch(e) {}
   try {
     var allFlows = await fetch('/flows').then(function(r){ return r.json(); });
     var existing = allFlows.find(function(n){ return n.type === 'tab' && n.label === tabLabel; });
-    if (existing) return;
+    if (existing) return true;
   } catch(e) {}
   var safeName = configName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   var raw = PP_ENGINE_TAB_TEMPLATE;
@@ -4181,19 +4191,18 @@ async function ensurePPEngineTab(configName, cotStreamPort) {
   try {
     var res = await fetch('/flow', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'flows' }, body: JSON.stringify({ id: tabId, label: tabLabel, disabled: false, info: tab ? tab.info : '', nodes: tabNodes }) });
     if (res.ok) {
+      // v10.1.70 W3: snapshot live counts BEFORE the full deploy (see _restoreContextIfWiped).
+      var _expected = await _liveConfigCounts();
       var allFlows2 = await fetch('/flows').then(function(r){ return r.json(); });
       await fetch('/flows', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'full' }, body: JSON.stringify(allFlows2) });
-      await new Promise(function(r){ setTimeout(r, 4000); });
-      // ctx:0 first (freshest in-memory snapshot from this save); latest.json fallback.
-      for (var _rs of ['ctx:0', 'latest.json']) {
-        try {
-          var _rr = await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: _rs }) });
-          var _rd = await _rr.json();
-          if (_rd.ok) break; // pp_configs aren't counted in the response; ok is enough
-        } catch(e3) {}
-      }
+      // Was: restore unconditionally and `break` on bare `ok`, under the comment "pp_configs
+      // aren't counted in the response". They are — fn_cfg_restore returns pp_count — and
+      // `ok:true` is also what an EMPTY snapshot returns, so that loop could wipe every live
+      // config and swallow it silently (no logging at all: `catch(e3) {}`).
+      return await _restoreContextIfWiped(_expected, 'ppDeployStatus');
     }
   } catch(e) { console.warn('PP engine tab creation failed:', e.message); }
+  return true;
 }
 
 function _ppBuildConfig(activated) {
@@ -4588,11 +4597,17 @@ async function saveTcConfig(activate) {
     await fetch('/tc/config/save', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
     await fetch('/tc/units/save',  { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: cfg.id, units: units }) });
     _tcActiveCfg = cfg;
+    var _ctxOk = true;
     if (activate) {
       status.textContent = 'Saving & creating flow…'; status.style.color = '#94a3b8';
-      await ensureTCEngineTab(cfg.configName, cfg.cotStreamPort);
+      _ctxOk = await ensureTCEngineTab(cfg.configName, cfg.cotStreamPort);
     }
-    status.textContent = '✓ Saved' + (activate ? ' & activated' : ''); status.style.color = '#4ade80';
+    // v10.1.70 W3: do NOT paint "Saved" over a context-loss warning. The guard writes the
+    // failure into this same element; this function used to overwrite it a line later, so a
+    // wipe looked like a clean save.
+    if (_ctxOk !== false) {
+      status.textContent = '✓ Saved' + (activate ? ' & activated' : ''); status.style.color = '#4ade80';
+    }
     await renderConfigList();
     setTimeout(function(){ hideSteps(); }, 800);
   } catch(e) {
@@ -4600,22 +4615,24 @@ async function saveTcConfig(activate) {
   }
 }
 
+// Returns false ONLY when the full deploy lost configs and no backup restored them
+// (v10.1.70 W3). Callers must not report success in that case.
 async function ensureTCEngineTab(configName, cotStreamPort) {
-  if (!configName || !configName.trim()) return;
+  if (!configName || !configName.trim()) return true;
   var feedId = feedIdFromName(configName);
   var tabId = 'flow_tc_' + feedId;
   var tabLabel = 'TC: ' + configName;
 
   try {
     var check = await fetch('/flow/' + tabId);
-    if (check.ok) return;
+    if (check.ok) return true;          // tab exists — no deploy, nothing at risk
   } catch(e) {}
 
   // Also check if a tab with this label already exists
   try {
     var allFlows = await fetch('/flows').then(function(r) { return r.json(); });
     var existing = allFlows.find(function(n) { return n.type === 'tab' && n.label === tabLabel; });
-    if (existing) return;
+    if (existing) return true;
   } catch(e) {}
 
   var safeName = configName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -4653,6 +4670,11 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
     if (res.ok) {
       console.log('TC engine tab created: ' + tabLabel);
       try {
+        // v10.1.70 W3: snapshot live counts BEFORE the full deploy so the guard below can
+        // tell "context survived" from "context was wiped". Without this the old code
+        // restored unconditionally, overwriting healthy live context with whatever snapshot
+        // it found.
+        var _expected = await _liveConfigCounts();
         var allFlows2 = await fetch('/flows').then(function(r) { return r.json(); });
         await fetch('/flows', {
           method: 'POST',
@@ -4660,24 +4682,11 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
           body: JSON.stringify(allFlows2)
         });
         console.log('Full re-deploy triggered for TC tab');
-        // Full deploy may reinitialize context before the last global.set() landed. Restore
-        // ctx:0 first (freshest, in-memory snapshot from this save — present whenever context
-        // survived the redeploy); fall back to the on-disk latest.json only if ctx:0 is gone
-        // (context was actually reset). This never regresses the old ctx:0-only behavior.
-        await new Promise(function(r){ setTimeout(r, 4000); }); // wait for NR to settle after full deploy
-        try {
-          var restoreData = { ok:false };
-          for (var _rs of ['ctx:0', 'latest.json']) {
-            var restoreRes = await fetch('/config/restore', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ filename: _rs })
-            });
-            restoreData = await restoreRes.json();
-            if (restoreData.ok && (restoreData.arcgis_count > 0 || restoreData.tc_count > 0)) break;
-          }
-          console.log('Context re-pushed after flow deploy:', restoreData);
-        } catch(e3) { console.warn('Context re-push failed: ' + e3.message); }
+        // v10.1.70 W3: restore ONLY if context actually shrank, and only from a source that
+        // brings every kind back to at least what we had. Replaces an unconditional restore
+        // that accepted `ok && (arcgis_count > 0 || tc_count > 0)` — which would happily
+        // overwrite 6 live configs with a 1-config snapshot and log success.
+        return await _restoreContextIfWiped(_expected, 'tcSaveStatus');
       } catch(e2) { console.warn('TC re-deploy failed: ' + e2.message); }
     } else {
       console.warn('TC engine tab creation returned ' + res.status);
@@ -4685,6 +4694,7 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
   } catch(e) {
     console.warn('TC engine tab creation failed: ' + e.message);
   }
+  return true;
 }
 
 async function testTcConnection() {
@@ -5809,30 +5819,99 @@ function feedIdFromName(configName) {
   return configName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 }
 
-// ── v10.1.69 W1: context-loss guard for the engine-tab full redeploy ────────────────
+// ── v10.1.69 W1 / v10.1.70 W3: context-loss guard for the engine-tab full redeploy ──
 // Configurator configs live ONLY in Node-RED's volatile global context. Creating an engine
-// tab forces a FULL deploy, which can reinitialize that context. ensureTCEngineTab() and
-// ensurePPEngineTab() guard this by calling /config/restore unconditionally afterwards — we
-// deliberately do NOT copy that shape. fn_cfg_restore (build-flows.js) OVERWRITES live
-// context rather than unioning with it, and returns ok:true even when the snapshot it read
-// was empty, so an unconditional "restore then break on ok" can wipe live configs and report
-// success. Instead: restore ONLY when context actually shrank, and reject any source that
-// would leave us with fewer configs than we had. A restore yielding fewer configs than live
-// is a failure to surface, never a success.
-async function _liveConfigCount() {
-  try {
-    var d = await _fetchT('/arcgis-tak/config/load').then(function(r) { return r.json(); });
-    return Array.isArray(d.configs) ? d.configs.length : -1;
-  } catch(e) { return -1; }
+// tab forces a FULL deploy, which can reinitialize that context.
+//
+// v10.1.69 shipped this guard on the ArcGIS path only. v10.1.70 W3 extends it to TC and
+// PulsePoint, which until now called /config/restore UNCONDITIONALLY after every deploy and
+// accepted the result on `ok` alone. That shape is actively dangerous: fn_cfg_restore
+// (build-flows.js) OVERWRITES live context rather than unioning with it, and returns ok:true
+// even when the snapshot it read held nothing — so a restore from a stale or empty snapshot
+// wipes live configs and reports success. PP's was the worst of the three, breaking on bare
+// `ok` under the comment "pp_configs aren't counted in the response"; they are — fn_cfg_restore
+// returns pp_count alongside arcgis_count and tc_count.
+//
+// The rule, per the SACRED persistence invariants: restore ONLY when context actually shrank,
+// reject any source that would leave us with fewer configs than we had (of ANY kind), and
+// treat "no source qualified" as a failure to surface, never a success.
+//
+// Counts are tracked per kind because a single full deploy can wipe all three at once, and an
+// ArcGIS save is just as capable of dropping tc_configs as a TC save is.
+// A hoisted FUNCTION, not a `var`. loadSavedConfigs() is invoked at top level far above
+// this point, and its auto-restore path now needs these: a `var` would still be
+// `undefined` there, and only an incidental `await` earlier in that function let the rest
+// of the script initialise it in time. That is not something the persistence path should
+// depend on -- a future early-return or one removed `await` would turn it into a
+// TypeError in the exact code that rescues a wiped context. Function declarations hoist
+// completely, so this is correct no matter who calls first.
+function _cfgKinds() {
+  return [
+    { key: 'arcgis', url: '/arcgis-tak/config/load', restoreField: 'arcgis_count', label: 'ArcGIS/TFR/KML' },
+    { key: 'tc',     url: '/tc/config/load',         restoreField: 'tc_count',     label: 'Tablet Command' },
+    { key: 'pp',     url: '/pp/config/load',         restoreField: 'pp_count',     label: 'PulsePoint' }
+  ];
 }
 
+// Live count per kind. -1 means "unreadable" — never treat that as zero, or an endpoint
+// hiccup would look like a wipe and trigger a destructive restore.
+async function _liveConfigCounts() {
+  var out = {};
+  var kinds = _cfgKinds();
+  for (var i = 0; i < kinds.length; i++) {
+    var k = kinds[i];
+    out[k.key] = -1;
+    try {
+      var d = await _fetchT(k.url).then(function(r) { return r.json(); });
+      if (Array.isArray(d.configs)) out[k.key] = d.configs.length;
+    } catch(e) {}
+  }
+  return out;
+}
+
+// Did a restore yield ANY config of any kind? Used by the page-load auto-restore, which
+// runs only when live context looks completely empty -- so there is nothing to shrink and
+// "any configs at all" is the right bar. (The post-deploy guard below has a stricter one:
+// it must not LOSE anything.) Counting all three kinds here is the point: see the v10.1.70
+// note at the call site.
+function _restoreYieldedConfigs(rd) {
+  if (!rd) return false;
+  return _cfgKinds().some(function(k) { return Number(rd[k.restoreField]) > 0; });
+}
+
+// Does this restore result bring every kind back to at least what we had?
+function _restoreCoversExpected(rd, expected) {
+  var kinds = _cfgKinds();
+  for (var i = 0; i < kinds.length; i++) {
+    var k = kinds[i];
+    if (!(expected[k.key] > 0)) continue;          // nothing of this kind to protect
+    if (!(Number(rd[k.restoreField]) >= expected[k.key])) return false;
+  }
+  return true;
+}
+
+// Returns true when the context is safe (survived, or fully restored), false when configs
+// were lost and no source could bring them back. Callers MUST NOT overwrite the status line
+// with a success message when this returns false.
 async function _restoreContextIfWiped(expected, statusId) {
-  if (!(expected > 0)) return;                                  // nothing to protect
-  await new Promise(function(r) { setTimeout(r, 4000); });       // let Node-RED settle
-  var live = await _liveConfigCount();
-  if (live < 0) { console.warn('[ctx] live config count unreadable - skipping restore'); return; }
-  if (live >= expected) { console.log('[ctx] context survived redeploy (' + live + ' configs)'); return; }
-  console.warn('[ctx] context shrank after redeploy: ' + live + ' < ' + expected + ' - restoring');
+  if (typeof expected === 'number') expected = { arcgis: expected };   // legacy call shape
+  expected = expected || {};
+  var protecting = _cfgKinds().some(function(k) { return expected[k.key] > 0; });
+  if (!protecting) return true;                                  // nothing to protect
+  await new Promise(function(r) { setTimeout(r, 4000); });        // let Node-RED settle
+
+  var live = await _liveConfigCounts();
+  var shrank = _cfgKinds().filter(function(k) {
+    return expected[k.key] > 0 && live[k.key] >= 0 && live[k.key] < expected[k.key];
+  });
+  if (!shrank.length) {
+    console.log('[ctx] context survived redeploy', live);
+    return true;
+  }
+  console.warn('[ctx] context shrank after redeploy: '
+    + shrank.map(function(k) { return k.key + ' ' + live[k.key] + '<' + expected[k.key]; }).join(', ')
+    + ' - restoring');
+
   var sources = ['ctx:0', 'latest.json'];
   for (var i = 0; i < sources.length; i++) {
     var src = sources[i];
@@ -5843,17 +5922,20 @@ async function _restoreContextIfWiped(expected, statusId) {
         body: JSON.stringify({ filename: src })
       }).then(function(r) { return r.json(); });
       // ok:true alone is NOT acceptance - an empty snapshot also returns ok:true.
-      if (rd && rd.ok && !rd.empty && rd.arcgis_count >= expected) {
-        console.log('[ctx] restored ' + rd.arcgis_count + ' configs from ' + src);
-        return;
+      if (rd && rd.ok && !rd.empty && _restoreCoversExpected(rd, expected)) {
+        console.log('[ctx] restored from ' + src, rd);
+        return true;
       }
       console.warn('[ctx] ' + src + ' rejected: ' + JSON.stringify(rd));
     } catch(e) { console.warn('[ctx] ' + src + ' failed: ' + e.message); }
   }
-  var m = 'Config context was lost during deploy and no backup restored all ' + expected
-        + ' configs. Do NOT save again - open Emergency Restore first.';
+
+  var lost = shrank.map(function(k) { return k.label; }).join(' + ');
+  var m = 'Config context was lost during deploy (' + lost + ') and no backup restored it. '
+        + 'Do NOT save again - open Emergency Restore first.';
   console.error('[ctx] ' + m);
   try { if (statusId) status(statusId, m, false); } catch(e) {}
+  return false;
 }
 
 async function ensureEngineTab(configName, templateStr, statusId) {
@@ -5900,11 +5982,12 @@ async function ensureEngineTab(configName, templateStr, statusId) {
       console.log('Engine tab created: ' + configName);
       // Force a full re-deploy so inject timers initialize
       try {
-        // v10.1.69 W1: snapshot the live config count BEFORE the full deploy. The deploy can
-        // reinitialize global context before the last global.set() from this save has landed,
-        // and until now this path had no guard at all (ensureTCEngineTab/ensurePPEngineTab
-        // both did). Configs live ONLY in volatile context — see the SACRED rules.
-        var _expected = await _liveConfigCount();
+        // v10.1.69 W1: snapshot the live config counts BEFORE the full deploy. The deploy can
+        // reinitialize global context before the last global.set() from this save has landed.
+        // v10.1.70 W3: counts are now per-kind — an ArcGIS save's full deploy can drop
+        // tc_configs/pp_configs too, and that was never guarded.
+        // Configs live ONLY in volatile context — see the SACRED rules.
+        var _expected = await _liveConfigCounts();
         var allFlows = await fetch('/flows').then(function(r) { return r.json(); });
         await fetch('/flows', {
           method: 'POST',

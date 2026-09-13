@@ -4,7 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 CONTAINER="nodered"
-NEW_FLOWS="$SCRIPT_DIR/flows.json"
+# v10.1.70 W4: the freshly-built flows are a BUILD ARTIFACT, staged on the host only
+# to be copied straight back into the container for the merge below. Writing them to
+# the in-tree nodered/flows.json dirtied a TRACKED file on every deploy, so a plain
+# `git checkout -B dev origin/dev` -- exactly what TEST-AND-EVALUATION-PROCEDURE.md
+# Step 2 specifies -- aborted with "Your local changes would be overwritten" on every
+# box that had ever deployed Node-RED. Customers never saw it (the console update path
+# uses `checkout --force`, app.py:7480); it cost the dev fleet a manual reset every
+# release. Same /tmp convention as NR_CTX_GLOBAL below.
+NEW_FLOWS="/tmp/nr_flows_new.json"
 
 # v10.0.5 non-root: the console runs as the unprivileged `takwerx` user, which has
 # NO docker access (docker is mediated by the root broker). When run unprivileged
@@ -134,6 +142,7 @@ if [ -d "$SCRIPT_DIR/static" ]; then
   echo "    Static assets: copied nodered/static/ → /data/public/"
 fi
 docker exec "$CONTAINER" node /tmp/build-flows.js
+rm -f "$NEW_FLOWS"
 _cp_outof /tmp/flows.json "$NEW_FLOWS"
 _cp_outof /tmp/template-functions.json /tmp/template-functions.json || true
 # Copy template-injected configurator.html to the public directory Node-RED serves

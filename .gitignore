@@ -41,6 +41,13 @@ TESTING.md
 ssdnodes-firewall-request.md
 pull-dev-and-restart.sh
 
+# Node-RED flows.json is a BUILD ARTIFACT, regenerated in-container by
+# nodered/deploy.sh on every deploy — nothing reads the committed copy. It was
+# tracked, and the deploy wrote into it, so every box that had ever deployed
+# Node-RED had a permanently dirty tree and a plain `git checkout` refused to
+# run. Untracked in v10.1.70 W4; the deploy now stages to /tmp instead.
+nodered/flows.json
+
 # Local operator credentials and secrets — never commit
 .local/
 .local/eud-remote-assist-upstream-handoff.md

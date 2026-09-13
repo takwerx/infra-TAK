@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.69-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.69-alpha)**
+**Current release: [v10.1.70-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.70-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,23 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.70-alpha — 2026-09-13 — The safety nets stop hurting the operator
+
+**Headline: intrusion protection could permanently lock you out of the console you would use to fix it, and the disk-health alert spammed hardest exactly when the disk was genuinely struggling. Both are fixed, along with two quieter data-safety bugs.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.70-alpha
+
+**Locked out of your own server by your own firewall.** The Repeat Offender jail bans an address on **every port** — including `:5001`, the console. It did so **permanently**. Three failed SSH logins in a day is ordinary life in an office behind one shared IP where a few people mistype a password; it does not mean an attacker. If that address was yours and you could not reach the box from somewhere else, there was no way back in at all.
+
+Three changes. Your own address is now added to the never-ban list **from the console, in one click** — the page has warned for several releases that you were not protected, and now there is a button next to the warning that fixes it. The ban is no longer permanent: repeat offenders are blocked for **7 days**. And the card says plainly what a ban costs you — every port, including this console — instead of quietly implying it is SSH-only.
+
+One thing worth knowing if you have used the Whitelist box on the SSH card: that field only covers the SSH jail. It never reached the Repeat Offender jail, so an address you whitelisted there could still be banned on every port. The one-click button writes to the server-wide list and reaches **every** jail, which is the difference.
+
+**The disk alert that got noisier the worse things got.** Guard Dog's Disk I/O Degradation email is meant to arrive at most once every six hours. In practice a server with an intermittently slow disk could get one every fifteen minutes. A single good reading reset the timer, so a disk flipping between degraded and fine re-alerted on every check — and intermittent slowness is exactly what noisy-neighbor contention on shared hosting looks like. The alert was quietest for a steadily bad disk and loudest for the case it exists to catch. The six-hour floor now holds.
+
+**Also in this release.** The map-data Configurator's Tablet Command and PulsePoint panels could overwrite your saved feed configurations with an older snapshot while reporting success — the same protection added for ArcGIS feeds last release now covers all three, and it will not restore anything that would lose configurations. And a Node-RED deploy no longer leaves the installation directory in a modified state.
+
+**Upgrading.** Update Now from the console. Existing permanent bans stay until you lift them from the fail2ban page; new bans use the 7-day duration.
+
 
 ### v10.1.69-alpha — 2026-09-12 — A saved feed either runs or tells you why, and one update email instead of two
 

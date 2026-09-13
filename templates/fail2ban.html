@@ -30,6 +30,9 @@
 .btn-primary:hover{opacity:.85}
 .btn-danger-sm{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-family:'JetBrains Mono',monospace}
 .btn-danger-sm:hover{background:rgba(239,68,68,.2)}
+.btn-warn-sm{background:rgba(234,179,8,.12);color:#eab308;border:1px solid rgba(234,179,8,.45);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600}
+.btn-warn-sm:hover{background:rgba(234,179,8,.22)}
+.btn-warn-sm:disabled{opacity:.6;cursor:default}
 .ban-table{width:100%;border-collapse:collapse;font-size:13px}
 .ban-table th{text-align:left;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid var(--border)}
 .ban-table td{padding:10px 12px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:12px}
@@ -131,13 +134,20 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Escalates repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked on <strong>every port</strong> — including <code>:5001</code>, this console — for <span id="recidive-bantime-desc">7 days</span>, or until you unban it here. Bans survive reboots.</div>
 
 <div id="recidive-enabled-section" style="display:none">
-<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
-<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
+<!-- v10.1.70 W1.3: say plainly what a recidive ban costs. It blocks EVERY port, not just
+     the one that earned it, so a banned address also loses :5001 - the console you would
+     use to unban it. The card previously said only "Permanently Banned". -->
+<div id="recidive-scope-note" style="margin-top:14px;padding:10px 12px;background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.28);border-radius:8px;font-size:12px;color:var(--text-secondary);line-height:1.5">
+  ⚠ A repeat-offender ban blocks <b>every port</b> from that address for <b><span id="recidive-bantime-label">7 days</span></b> — including <code>:5001</code>, this console.
+  Anything on the never-ban list above is exempt.
+</div>
+<div class="stat-grid" style="margin-top:16px;margin-bottom:8px">
+<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
 <div class="stat-value red" id="recidive-stat-banned">0</div>
-<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
 </div>
 <div class="stat-card" title="Since the fail2ban service was last started or restarted">
 <div class="stat-value cyan" id="recidive-stat-total">0</div>
@@ -146,18 +156,18 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </div>
 
 <div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
-<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">all ports</span></div>
 <input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none">
 <div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
-<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
 <div class="form-row" style="margin-bottom:0">
-<label class="form-label">Strikes before permanent ban</label>
+<label class="form-label">Strikes before all-ports ban</label>
 <input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
-<div class="form-hint">Bans in any jail that trigger a permanent block</div>
+<div class="form-hint">Bans in any jail that trigger an all-ports block</div>
 </div>
 <div class="form-row" style="margin-bottom:0">
 <label class="form-label">Watch window (hours)</label>
@@ -357,7 +367,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp), so it does not cut the banned IP off from TAK Server or this console. Repeat offenders keep earning media-scoped bans — the <em>Repeat Offenders</em> jail below is set to skip this one, because a permanent all-ports ban is exactly what this scoping exists to prevent.</span></div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp), so it does not cut the banned IP off from TAK Server or this console. Repeat offenders keep earning media-scoped bans — the <em>Repeat Offenders</em> jail below is set to skip this one, because an all-ports ban is exactly what this scoping exists to prevent.</span></div>
 
 <div id="mediamtx-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -1145,13 +1155,41 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       banner.style.background = 'rgba(234,179,8,0.10)';
       banner.style.border = '1px solid rgba(234,179,8,0.45)';
       banner.style.color = 'var(--text-secondary)';
+      // v10.1.70 W1.1: the warning was correct for releases and the only way to act on it
+      // was to retype the address into the field below — which is why it was set on two
+      // fleet boxes and missing on a third. Make it one click.
       banner.innerHTML = '\u26a0 You are connected from <code>' + esc(info.client_ip) + '</code>, which is <b>not</b> on the never-ban list. '
                        + 'If fail2ban bans it, <b>every port</b> from that address is blocked and you lose access to this box. '
-                       + 'Add it below if this is how you normally reach it.';
+                       + '<div style="margin-top:8px"><button class="btn-warn-sm" id="btn-add-my-ip" onclick="addMyIpToNeverBan()">Add my IP to the never-ban list</button>'
+                       + '<span id="add-my-ip-status" style="margin-left:10px;font-size:12px"></span></div>';
     } else {
       banner.style.display = 'none';
     }
   }
+
+  window.addMyIpToNeverBan = function() {
+    var btn = document.getElementById('btn-add-my-ip');
+    var st  = document.getElementById('add-my-ip-status');
+    if (btn) { btn.disabled = true; btn.textContent = 'Adding\u2026'; }
+    // No IP in the body on purpose — the server takes it from the connection, so this
+    // control can never be used to whitelist some other address.
+    fetch('/api/fail2ban/trusted-cidrs/add-mine', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) {
+          if (st) { st.style.color = 'var(--green)'; st.textContent = d.already ? 'Already on the list.' : '\u2713 ' + d.ip + ' added \u2014 every jail rewritten.'; }
+          if (typeof loadTrustedCidrs === 'function') loadTrustedCidrs();
+          if (typeof loadRecidiveStatus === 'function') loadRecidiveStatus();
+        } else {
+          if (st) { st.style.color = 'var(--red)'; st.textContent = d.error || 'Failed'; }
+          if (btn) { btn.disabled = false; btn.textContent = 'Add my IP to the never-ban list'; }
+        }
+      })
+      .catch(function() {
+        if (st) { st.style.color = 'var(--red)'; st.textContent = 'Network error'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Add my IP to the never-ban list'; }
+      });
+  };
 
   function loadSshStatus() {
     fetch('/api/fail2ban/ssh/status').then(function(r){ return r.json(); }).then(function(d){
@@ -1721,18 +1759,18 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   window.renderRecidiveBanList=function(ips){
     var c=document.getElementById('recidive-ban-list-container');if(!c)return;
-    if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>';return;}
+    if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';return;}
     var sorted=ips.slice().sort(function(a,b){var d=_recIpToNum(a)-_recIpToNum(b);return window._recidiveSortAsc?d:-d;});
     var arrow=window._recidiveSortAsc?' ▲':' ▼';
     var rows=sorted.map(function(ip){
       return '<tr style="border-bottom:1px solid var(--border)">'+
         '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:center"><span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">&#8734;</span></td>'+
+        '<td style="padding:5px 8px;text-align:center"><span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">all ports</span></td>'+
         '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP(\''+ip+'\')">Unban</button></td></tr>';
     }).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
       '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleRecidiveSort()">IP Address'+arrow+'</th>'+
-      '<th style="padding:4px 8px;text-align:center">Duration</th>'+
+      '<th style="padding:4px 8px;text-align:center">Scope</th>'+
       '<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
 
@@ -1765,6 +1803,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       if(toggle)toggle.checked=d.jail_enabled;
       if(sec)sec.style.display=d.jail_enabled?'':'none';
       if(d.jail_enabled){
+        var _bl=document.getElementById('recidive-bantime-label');
+        if(_bl&&d.bantime_label)_bl.textContent=d.bantime_label;
+        var _bd=document.getElementById('recidive-bantime-desc');
+        if(_bd&&d.bantime_label)_bd.textContent=d.bantime_label;
         document.getElementById('recidive-stat-banned').textContent=d.currently_banned||0;
         document.getElementById('recidive-stat-total').textContent=d.total_banned||0;
         var cfg=d.jail_config||{};
@@ -1804,10 +1846,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   };
 
   window.unbanRecidiveIP=function(ip){
-    if(!confirm('Permanently unban '+ip+' from Repeat Offender Protection?\n\nThis IP will be able to attempt connections again.'))return;
+    if(!confirm('Unban '+ip+' from Repeat Offender Protection?\n\nThis IP will be able to attempt connections again on all ports.'))return;
     fetch('/api/fail2ban/recidive/unban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:ip})})
       .then(function(r){return r.json();}).then(function(d){
-        if(d.ok){showToast(ip+' permanently unbanned.','success');loadRecidiveStatus();}
+        if(d.ok){showToast(ip+' unbanned.','success');loadRecidiveStatus();}
         else showToast(d.error||'Unban failed','error');
       }).catch(function(){showToast('Network error','error');});
   };
