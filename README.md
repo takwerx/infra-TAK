@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.67-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.67-alpha)**
+**Current release: [v10.1.69-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.69-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,41 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.69-alpha — 2026-09-12 — A saved feed either runs or tells you why, and one update email instead of two
+
+**Headline: the map-data Configurator could save a feed that silently never ran, and every server has been sending two emails about the same pending updates. Both are fixed.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.69-alpha
+
+**The feed that saved successfully and did nothing.** In the Vector → TAK Configurator, unchecking **Data Sync Mission** offered "broadcast-only / channel streaming". Choosing it produced a saved configuration that reported success, appeared in your saved list with a port number next to it — and never ran. No flow was created, nothing was streamed, and nothing anywhere said so. That mode was never actually implemented, so the checkbox was offering something the engine could not do. This was found and reported from the field, with a write-up thorough enough to turn it into a ten-minute diagnosis.
+
+Now a feed without a TAK Mission name is **refused at save time with the reason**, broadcast-only says plainly that it is not supported yet, and an older configuration saved in that state shows **"not running — no TAK Mission name"** on its card instead of a port that means nothing.
+
+**Two emails about the same updates.** Reported from the field: several update emails a day, arriving in pairs. Two separate update-notification systems were both shipping, each on a six-hour cycle, and each only checked whether *it* had already told you — so neither could see the other's email. The older one is retired; you now get one email per new update, as intended. The Guard Dog **Update check** monitor keeps working and turns green as before.
+
+**Also in this release.**
+
+- **Control how long map data stays valid on the device.** CoT stale time is now its own field, separate from the time window that filters which features are fetched. Previously the two were welded together, so a feed that updated slowly could have its markers expire between polls — ATAK keeps showing stale items, TAKAware drops them. Leave it blank for the previous behavior.
+- **See how big a feed is before you commit to it.** The Configurator now shows the feature count for each selected layer, updating as you change the filter, and asks for confirmation before saving a feed above 1,000 features. Nothing limited this before: a layer with tens of thousands of features would be pushed in full to everyone receiving the feed.
+- **Configurator saves are safer.** Creating a feed triggers an internal redeploy that could, in the wrong moment, clear the saved configurations held in memory. That path now checks whether anything was lost and restores it, and refuses to accept a backup that would leave you with fewer configurations than you had.
+
+**Upgrade:** applied automatically on update. The duplicate-email fix takes effect at the next console restart; the Configurator changes appear after the update finishes.
+
+### v10.1.68-alpha — 2026-09-12 — Protect the second machine, and stop monitoring that misleads you
+
+**Headline: on a two-server build the database machine was never given brute-force protection, and several alerts have been pointing at the wrong problem. Both are fixed.** Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.68-alpha
+
+**The security gap.** Installing fail2ban from the Marketplace only ever protected the machine the console runs on. On a two-server build the database machine got nothing — an internet-facing SSH service with no brute-force protection from the day it was built, and nothing in the console said so. Worse, once the console machine was protected the installer reported "already installed", so there was no way to reach the database machine even if you knew to look.
+
+This was reported from the field, and testing it found the same hole on one of our own two-server systems: its database machine was taking **16,633 failed SSH attempts in 24 hours from 297 different addresses** with no protection at all. Applying the fix banned the first address within seconds.
+
+**What changes.**
+
+- **The database machine is protected too.** A new build protects both machines; an existing build gets a one-click fix for the database machine, and the console now shows that machine's protection status so an unprotected one is visible instead of discovered during an incident.
+- **An SSH outage is no longer reported as a database credential problem.** The credential check ran *through* SSH, so when SSH was unreachable it looked identical to a wrong password — and reported "credential drift" about a database that was perfectly healthy. It now recognises the difference and stays quiet, since unreachability is already reported separately and correctly.
+- **A failing certificate renewal now tells you.** Monitoring watched the certificate's expiry date and nothing else, so a renewal that had been failing for days stayed silent — the certificate was still valid — until a restart turned it into an outage. A failing renewal, and a missing keystore, are now reported as what they are: an outage that has not happened yet.
+- **Streaming fixes arrive on update.** Two fixes to the MediaMTX editor — GStreamer installation on hardened systems, and the Live Logs view showing "Connection lost" forever — previously only applied if you happened to click a repair button. They now apply automatically when the console updates.
+
+**Upgrading.** Update from the console as usual. If you run a two-server build, check the fail2ban page afterwards and apply the database-machine protection if it reports the machine unprotected.
 
 ### v10.1.67-alpha — 2026-09-12 — A failing certificate renewal can no longer take TAK Server down
 

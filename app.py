@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.68-alpha"
+VERSION = "10.1.70-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -14643,7 +14643,7 @@ def guarddog_page():
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
+        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. Runs inside the console process, so if this monitor is red, restart the console (Console \u2192 Restart) rather than reinstalling Guard Dog.'}]},
     ])
     # v10.1.0 Leg 7: relay (connectivity anchor) health — only shown once a relay is
     # configured. When up, the relay IS the box's ingress; a stale tunnel = clients
@@ -15987,6 +15987,151 @@ def fail2ban_page():
         setup=settings.get('fail2ban_setup', {})))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+# --- Split-deployment (two-server) brute-force protection -------------------
+# v10.1.68. The Marketplace fail2ban install only ever ran on the host the console
+# runs on. On a two-server build the DATABASE node got nothing — internet-exposed
+# sshd with no protection from the day it was built, and no indication anywhere that
+# it was unprotected. Field report (John Stefanini, 2026-09-12): his app node had
+# 2,321 failures / 367 bans over four weeks while the database node had zero
+# coverage since 15 August; a multi-source brute force forked ~5,000 sshd processes
+# in 26 minutes, exhausted SSH, locked him out of his own machine, and — because
+# the management path was gone — surfaced to him as "PostgreSQL is not running".
+#
+# Our own fleet says this is the baseline on that provider, not an event: three
+# SSD Nodes boxes measured 2026-09-12 carried 41,937 / 27,820 / 3,677 recorded auth
+# failures.
+#
+# Note the constraint his report surfaced: the console's key to Server One may be
+# bound to a forced command, and there is often no out-of-band console, so an
+# operator cannot simply close port 22 on the database node. fail2ban (plus
+# `ufw limit`) is the right lever; `deny` would lock them out.
+
+def _f2b_db_node_cfg():
+    """Server One's host config when this is a two-server deployment, else None."""
+    try:
+        cfg = _get_tak_deployment_config(load_settings())
+        if (cfg or {}).get('mode') != 'two_server':
+            return None
+        s1 = dict((cfg.get('server_one') or {}))
+        if not (s1.get('host') or '').strip():
+            return None
+        if s1.get('use_localhost') or (s1.get('host') or '').strip() in ('127.0.0.1', 'localhost', '::1'):
+            return None          # not actually a separate machine
+        return s1
+    except Exception:
+        return None
+
+
+def _f2b_db_node_state():
+    """Is the split-deployment database node protected? Read-only, never installs.
+
+    Returns a dict the console can surface, so an unprotected node is visible instead
+    of silent. `applicable` is False on single-box builds.
+    """
+    s1 = _f2b_db_node_cfg()
+    if not s1:
+        return {'applicable': False}
+    out = {'applicable': True, 'host': (s1.get('host') or '').strip(),
+           'reachable': False, 'installed': False, 'daemon_active': False,
+           'sshd_jail_active': False, 'banned': None, 'error': ''}
+    ok, res = _ssh_probe(s1, "command -v fail2ban-client >/dev/null 2>&1 && echo YES || echo NO", timeout=20)
+    if not ok:
+        out['error'] = (res or 'ssh probe failed')[:200]
+        return out
+    out['reachable'] = True
+    out['installed'] = 'YES' in (res or '')
+    if not out['installed']:
+        return out
+    ok, res = _ssh_probe(s1, "systemctl is-active fail2ban 2>/dev/null || true", timeout=20)
+    out['daemon_active'] = ok and (res or '').strip() == 'active'
+    ok, res = _ssh_probe(s1, "sudo fail2ban-client status sshd 2>/dev/null || fail2ban-client status sshd 2>/dev/null || true", timeout=25)
+    if ok and 'Banned IP list' in (res or ''):
+        out['sshd_jail_active'] = True
+        m = re.search(r'Currently banned:\s*(\d+)', res or '')
+        if m:
+            out['banned'] = int(m.group(1))
+    return out
+
+
+_F2B_REMOTE_JAIL = """[sshd]
+enabled  = true
+port     = ssh
+backend  = systemd
+maxretry = 5
+findtime = 600
+bantime  = 3600
+"""
+
+
+def _f2b_install_db_node(plog):
+    """Install fail2ban + an sshd jail on the split-deployment database node.
+
+    Deliberately NOT the local installer: that one exists to protect Authentik and
+    requires ~/authentik/.env, which does not exist on a database node. What that
+    machine needs is sshd brute-force protection.
+
+    `backend = systemd` rather than a log path, because the journal is present on both
+    distro families and the auth-log path is not (auth.log on Debian, secure on RHEL).
+    Idempotent: re-running on a protected node reports and changes nothing.
+    """
+    s1 = _f2b_db_node_cfg()
+    if not s1:
+        plog("db node: not a two-server deployment — nothing to do")
+        return True, 'not applicable'
+    host = (s1.get('host') or '').strip()
+    plog(f"db node ({host}): checking current state")
+
+    st = _f2b_db_node_state()
+    if not st.get('reachable'):
+        plog(f"db node ({host}): UNREACHABLE over SSH — {st.get('error','')}")
+        return False, 'unreachable'
+    if st.get('installed') and st.get('sshd_jail_active'):
+        plog(f"db node ({host}): already protected (sshd jail active) — no change")
+        return True, 'already-protected'
+
+    if not st.get('installed'):
+        plog(f"db node ({host}): installing fail2ban")
+        # NOTE for the pkg-manager audit: this deliberately does NOT use _pkg_install.
+        # That shim is local-only — it picks the family with _pkg_mgr() (the CONSOLE
+        # host's) and shells out with subprocess on THIS machine. The database node is a
+        # different machine and may be a different distro family, so the shim would pick
+        # the wrong package manager. The family is therefore detected ON THE REMOTE HOST,
+        # and both apt and dnf are handled explicitly (with the EPEL fallback fail2ban
+        # needs on EL9) — which is what the multiplatform rule is actually protecting.
+        ok, res = _ssh_probe(
+            s1,
+            "if command -v apt-get >/dev/null 2>&1; then "
+            "  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+            "  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban; "
+            "elif command -v dnf >/dev/null 2>&1; then "
+            "  sudo dnf install -y fail2ban || { sudo dnf install -y epel-release && sudo dnf install -y fail2ban; }; "
+            "else echo NO_PKG_MGR; exit 1; fi",
+            timeout=300)
+        if not ok:
+            plog(f"db node ({host}): install FAILED — {(res or '')[-300:]}")
+            return False, 'install-failed'
+        plog(f"db node ({host}): fail2ban installed")
+
+    plog(f"db node ({host}): enabling the sshd jail")
+    _jail = _F2B_REMOTE_JAIL.replace('"', '\\"')
+    ok, res = _ssh_probe(
+        s1,
+        "sudo mkdir -p /etc/fail2ban/jail.d && "
+        f"printf '%s' \"{_jail}\" | sudo tee /etc/fail2ban/jail.d/infratak-sshd.conf >/dev/null && "
+        "sudo systemctl enable --now fail2ban >/dev/null 2>&1; "
+        "sudo systemctl restart fail2ban >/dev/null 2>&1; sleep 2; "
+        "sudo fail2ban-client status sshd 2>/dev/null | head -20",
+        timeout=120)
+    if not ok or 'Banned IP list' not in (res or ''):
+        plog(f"db node ({host}): jail did not come up — {(res or '')[-300:]}")
+        return False, 'jail-failed'
+
+    m = re.search(r'Currently banned:\s*(\d+)', res or '')
+    _banned = m.group(1) if m else '0'
+    plog(f"db node ({host}): sshd jail ACTIVE (currently banned: {_banned})")
+    return True, 'installed'
+
 
 def _f2b_is_available():
     """Return True if fail2ban is actually installed. v10.0.5: `which fail2ban-client` is
@@ -17933,6 +18078,13 @@ def fail2ban_status_api():
         # exactly how Authentik went a month with no brute-force protection.
         status['dead_jails'] = [{'jail': j, 'filter': f, 'reason': r}
                                 for j, f, r in _f2b_dead_jails()]
+        # v10.1.68: on a two-server build the DATABASE node is a separate machine that
+        # this install never touched. Report its state so an unprotected node is visible
+        # here instead of being discovered during a brute-force incident.
+        try:
+            status['db_node'] = _f2b_db_node_state()
+        except Exception as _dbe:
+            status['db_node'] = {'applicable': True, 'error': str(_dbe)[:200]}
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -19189,6 +19341,46 @@ def fail2ban_recidive_unban_api():
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
+def _fail2ban_install_db_node_step(plog):
+    """Wrapper so the install route and the dedicated route share one implementation."""
+    if not _f2b_db_node_cfg():
+        return True
+    ok, _why = _f2b_install_db_node(plog)
+    return ok
+
+
+@app.route('/api/fail2ban/db-node/install', methods=['POST'])
+@login_required
+def fail2ban_db_node_install_api():
+    """Protect the database node of a two-server deployment.
+
+    Separate from /api/fail2ban/install on purpose: that route refuses with 400 once
+    the CONSOLE host has fail2ban, which is exactly the state every existing split
+    build is in — so there was no way to reach the database node at all. This is the
+    one-click fix for a box that has been exposed since it was built.
+    """
+    if not _f2b_db_node_cfg():
+        return jsonify({'ok': False, 'error': 'Not a two-server deployment'}), 400
+    log = []
+    def _plog(msg):
+        log.append(msg)
+        print(f"fail2ban db-node: {msg}", flush=True)
+    try:
+        ok, why = _f2b_install_db_node(_plog)
+        return jsonify({'ok': ok, 'result': why, 'log': log,
+                        'state': _f2b_db_node_state()})
+    except Exception as e:
+        log.append(f"ERROR: {e}")
+        return jsonify({'ok': False, 'error': str(e)[:300], 'log': log}), 500
+
+
+@app.route('/api/fail2ban/db-node/status')
+@login_required
+def fail2ban_db_node_status_api():
+    """Read-only state of the split-deployment database node's brute-force protection."""
+    return jsonify(_f2b_db_node_state())
+
+
 @app.route('/api/fail2ban/install', methods=['POST'])
 @login_required
 def fail2ban_install_api():
@@ -19214,6 +19406,12 @@ def fail2ban_install_api():
                 return
             _fail2ban_add_guarddog_hook(_plog)
             _fail2ban_takserver_filter(_plog)
+            # v10.1.68: a two-server build has a SECOND machine. Protect it in the same
+            # action rather than leaving it exposed with nothing saying so.
+            try:
+                _fail2ban_install_db_node_step(_plog)
+            except Exception as _dbx:
+                _plog(f"db node: error (non-fatal, console host is protected): {_dbx}")
             _f2b_install_status.update({'running': False, 'done': True, 'ok': True})
         except Exception as e:
             _plog(f"ERROR: {e}")
@@ -20132,8 +20330,17 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api', '--format', '{{.Status}}']), capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'updates_check':
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'takupdatesguard.timer']), capture_output=True, text=True, timeout=3)
-            return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
+            # v10.1.69 W5: was `systemctl is-enabled takupdatesguard.timer`. That timer ran
+            # tak-updates-watch.sh, a SECOND update-notification path that mailed the same
+            # pending updates as _update_notify_loop() on its own 6h cycle — each deduping
+            # only against itself, so customers got two emails per update set (field report,
+            # Charles Laird/NC 2026-09-12). The timer is retired; check the liveness of the
+            # thread that actually sends the mail now, so this monitor still means something.
+            try:
+                return any(t.name == 'update-notify' and t.is_alive()
+                           for t in threading.enumerate())
+            except Exception:
+                return None
         # Federation Hub monitors (all remote via SSH)
         if monitor_id.startswith('fedhub_'):
             settings = load_settings()
@@ -20690,30 +20897,14 @@ def guarddog_update():
     try:
         _auto_update_guarddog()
         # Ensure update-check units exist and are enabled.
-        # Older installs may have scripts but miss takupdatesguard.timer, which keeps Updates monitor red.
-        service_path = '/etc/systemd/system/takupdatesguard.service'
-        timer_path = '/etc/systemd/system/takupdatesguard.timer'
-        _updates_home = os.path.expanduser('~')
-        service_content = (
-            '[Unit]\n'
-            'Description=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n'
-            '[Service]\n'
-            'Type=oneshot\n'
-            f'Environment=HOME={_updates_home}\n'
-            'ExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'
-        )
-        timer_content = (
-            '[Unit]\n'
-            'Description=Check for updates every 6 hours\n\n'
-            '[Timer]\n'
-            'OnBootSec=30min\n'
-            'OnUnitActiveSec=6h\n'
-            'Unit=takupdatesguard.service\n\n'
-            '[Install]\n'
-            'WantedBy=timers.target\n'
-        )
-        _write_priv(service_path, service_content)
-        _write_priv(timer_path, timer_content)
+        # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer. It now
+        # removes them — see _startup_retire_updates_timer(), which is the primary path
+        # (startup, so it rides the console update). Called here too so a Guard Dog deploy
+        # cannot silently reinstate what startup removed.
+        try:
+            _startup_retire_updates_timer()
+        except Exception as _rt_err:
+            print(f'[guarddog] retire updates timer failed (non-fatal): {_rt_err}', flush=True)
         # Auto-vacuum timer (daily 3am) — install if script exists but timer doesn't
         av_script = '/opt/tak-guarddog/tak-auto-vacuum.sh'
         av_svc_path = '/etc/systemd/system/takautovacuum.service'
@@ -20785,7 +20976,7 @@ def guarddog_update():
             _write_priv(_ak_tl_svc_path, '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
             _write_priv(_ak_tl_tmr_path, '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
-        new_timers = ['takupdatesguard.timer']
+        new_timers = []   # v10.1.69 W5: takupdatesguard.timer retired (duplicate emails)
         if os.path.isfile(av_tmr_path):
             new_timers.append('takautovacuum.timer')
         if os.path.isfile(cotdb_tmr_path):
@@ -21080,6 +21271,41 @@ def _update_notify_check_once():
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
     return {'pending': pending, 'emailed': emailed}
+
+
+def _startup_retire_updates_timer():
+    """v10.1.69 W5: remove the legacy takupdatesguard timer/service.
+
+    It ran tak-updates-watch.sh, a SECOND update-notification path that mailed the same
+    pending updates as _update_notify_loop() on its own 6 h cycle. Each deduped only
+    against itself, so neither could see the other's mail and customers got two emails
+    per update set (field report, Charles Laird/NC 2026-09-12 — two subjects 75 min apart
+    on two 6 h cycles).
+
+    Runs at STARTUP, not from the Guard Dog deploy route: fixes ride the console update
+    ([[feedback-console-path-delivery]]). Idempotent — silent no-op once the units are gone."""
+    service_path = '/etc/systemd/system/takupdatesguard.service'
+    timer_path = '/etc/systemd/system/takupdatesguard.timer'
+    if not (os.path.exists(service_path) or os.path.exists(timer_path)):
+        return False
+    # mode='seq': disable/stop legitimately fail when a unit is already masked or stopped,
+    # and that must not stop the rm — this has to converge on every box.
+    _run_priv_chain([
+        ['systemctl', 'disable', '--now', 'takupdatesguard.timer'],
+        ['systemctl', 'stop', 'takupdatesguard.service'],
+        ['rm', '-f', timer_path],
+        ['rm', '-f', service_path],
+        ['systemctl', 'daemon-reload'],
+    ], 'seq', timeout=30)
+    # Verify rather than assume — a removal that silently did nothing is exactly how this
+    # customer got two emails a day for months.
+    if os.path.exists(service_path) or os.path.exists(timer_path):
+        print('Startup migration: WARNING legacy takupdatesguard units still present after '
+              'removal attempt', flush=True)
+        return False
+    print('Startup migration: removed legacy takupdatesguard timer/service '
+          '(duplicate update emails - v10.1.69 W5)', flush=True)
+    return True
 
 
 def _update_notify_loop():
@@ -21970,11 +22196,11 @@ def run_guarddog_deploy(alert_email):
         # boot, 15 minutes in, and releases whether or not a gate is present.
         # v10.1.46 (W2) — session visibility watcher: read-only, alerts only.
         units.extend(_CLIENT_GATE_UNITS)
-        _updates_home = os.path.expanduser('~')
-        units.extend([
-            ('takupdatesguard.service', f'[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nEnvironment=HOME={_updates_home}\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
-            ('takupdatesguard.timer', '[Unit]\nDescription=Check for updates every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takupdatesguard.service\n\n[Install]\nWantedBy=timers.target\n'),
-        ])
+        # v10.1.69 W5: takupdatesguard.service/.timer are NOT written any more. They ran
+        # tak-updates-watch.sh, which mailed the same pending updates as the in-process
+        # _update_notify_loop() notifier on a separate 6h cycle — two emails per update set.
+        # The Python notifier wins: per-identity dedup, a console toggle, and it names each
+        # item installed -> target. Existing units are removed by the migration above.
         for name, content in units:
             path = os.path.join('/etc/systemd/system', name)
             _write_priv(path, content)
@@ -22089,7 +22315,7 @@ def run_guarddog_deploy(alert_email):
             timers.append('taktakportalguard.timer')
         if 'tak-fedhub-watch.sh' in script_files:
             timers.append('takfedhubguard.timer')
-        timers.append('takupdatesguard.timer')
+        # v10.1.69 W5: takupdatesguard.timer deliberately NOT enabled — retired.
         # v10.1.46: the gate backstop and the session watcher. A timer written but
         # not enabled is the exact bug called out above for takfeedsourceguard —
         # and for the gate backstop it would be the difference between a released
@@ -25879,6 +26105,107 @@ _V2_PING_HELPER = (
     "\n"
     "\n"
 )
+
+
+def _mediamtx_editor_logstream_patch(src):
+    """Live Logs: make the SSE stream survive a proxy, and say why it is empty.
+
+    v10.1.68. Two defects, both ours, diagnosed on a customer box 2026-08-24 and left
+    unfixed until now:
+
+      1. /stream_logs shells out to `journalctl -u mediamtx -f`. The editor runs as
+         takwerx which, since the non-root flip, is in no group but its own — so
+         journalctl prints a permissions hint to STDERR and nothing to stdout. The
+         generator only ever read stdout, so it yielded ZERO bytes: a blank pane with
+         no explanation. (The unit-side half of this is a systemd drop-in adding
+         SupplementaryGroups=systemd-journal — see _startup_heal_mediamtx_editor_probe.)
+      2. The generator sent no keepalive. A reverse proxy with a short idle timeout
+         (the reporting box: Azure App Gateway, requestTimeout=20) kills a response
+         that has sent nothing, EventSource fires onerror, the page reopens, and the
+         user sees "Connection lost. Reconnecting..." forever. MediaMTX itself logs
+         only every ~30s, so even WITH journal access the stream would idle out.
+
+    So: emit an immediate comment so the connection is never silent from the start, a
+    `: ping` comment every 10s while idle, and surface journalctl's own stderr as log
+    lines so a permissions failure explains itself instead of showing an empty box.
+    """
+    if '_INFRATAK_SSE_HEARTBEAT' in src:
+        return src
+
+    old = r"""    def generate():
+        # Start journalctl process
+        process = subprocess.Popen(
+            ['journalctl', '-u', SERVICE_NAME, '-f', '-n', '50'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        try:
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    # Send log line as Server-Sent Event
+                    yield f"data: {line.strip()}\n\n"
+        finally:
+            process.terminate()
+            process.wait()
+"""
+    new = r"""    def generate():  # _INFRATAK_SSE_HEARTBEAT
+        import select as _sel, time as _t
+        process = subprocess.Popen(
+            ['journalctl', '-u', SERVICE_NAME, '-f', '-n', '50'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        # Say something immediately: a response that sends nothing is what a proxy
+        # kills, and what leaves the pane blank with no explanation.
+        yield ": open\n\n"
+        _open = [process.stdout, process.stderr]
+        _last = _t.monotonic()
+        try:
+            while True:
+                # NOTE: a closed pipe stays permanently "ready" in select(), so a stream
+                # that has hit EOF must be dropped from the set -- otherwise the loop
+                # spins at 100% CPU, never idles, and therefore never heartbeats.
+                _ready = _sel.select(_open, [], [], 1.0)[0] if _open else []
+                _got = False
+                for _fh in list(_ready):
+                    _line = _fh.readline()
+                    if _line == '':
+                        _open.remove(_fh)
+                        continue
+                    _txt = _line.strip()
+                    if not _txt:
+                        continue
+                    if _fh is process.stderr:
+                        yield f"data: [log viewer] {_txt}\n\n"
+                    else:
+                        yield f"data: {_txt}\n\n"
+                    _got = True
+                    _last = _t.monotonic()
+                if _got:
+                    continue
+                if not _open and process.poll() is not None:
+                    yield "data: [log viewer] journalctl exited; stream closed.\n\n"
+                    break
+                if not _open:
+                    _t.sleep(1.0)
+                if _t.monotonic() - _last >= 10:
+                    yield ": ping\n\n"   # keep proxies from idling us out
+                    _last = _t.monotonic()
+        finally:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+"""
+    if old in src:
+        src = src.replace(old, new, 1)
+    return src
 
 
 def _mediamtx_editor_broker_deps_patch(src):
@@ -33507,6 +33834,7 @@ def mediamtx_recovery():
                 if src:
                     src = _mediamtx_editor_endpoint_patch(src)
                     src = _mediamtx_editor_broker_deps_patch(src)   # v10.1.65 W3 (GH #67)
+                    src = _mediamtx_editor_logstream_patch(src)     # v10.1.68 Live Logs
                     _write_priv(editor_path, src)
             except Exception:
                 pass
@@ -34796,6 +35124,7 @@ WantedBy=multi-user.target
                             esrc = ef.read()
                         patched = _mediamtx_editor_endpoint_patch(esrc)
                         patched = _mediamtx_editor_broker_deps_patch(patched)   # v10.1.65 W3 (GH #67)
+                        patched = _mediamtx_editor_logstream_patch(patched)     # v10.1.68 Live Logs
                         if patched != esrc:
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
@@ -77068,6 +77397,101 @@ def _startup_heal_missing_le_keystore():
         print(f'Startup migration: LE keystore revive error (non-fatal): {_e}', flush=True)
 
 
+def _mediamtx_editor_grant_journal_access():
+    """Let the editor read the journal, so Live Logs is not a blank pane.
+
+    v10.1.68. The editor runs as takwerx. Since the non-root flip that account is in no
+    group but its own, so `journalctl -u mediamtx -f` returns nothing and the Live Logs
+    pane is empty — which, behind a proxy with a short idle timeout, presents as
+    "Connection lost. Reconnecting..." forever. Diagnosed on a customer box 2026-08-24;
+    the fix was written down and never shipped, so it is delivered here on console update
+    rather than waiting for a reinstall.
+
+    A systemd DROP-IN rather than editing the vendor unit: the installer owns that file
+    and would overwrite an edit on its next run. Returns True when it changed something.
+    """
+    try:
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        if not os.path.exists(unit):
+            return False
+        d = '/etc/systemd/system/mediamtx-webeditor.service.d'
+        conf = os.path.join(d, '10-infratak-journal.conf')
+        want = ('# infra-TAK v10.1.68: Live Logs reads the journal as the editor user.\n'
+                '[Service]\nSupplementaryGroups=systemd-journal\n')
+        if os.path.exists(conf) and (_read_priv(conf) or '') == want:
+            return False
+        subprocess.run(_sudo_wrap(['mkdir', '-p', d]), capture_output=True, timeout=20)
+        _write_priv(conf, want)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        return True
+    except Exception as _e:
+        print(f'Startup migration: journal-access drop-in error (non-fatal): {_e}', flush=True)
+        return False
+
+
+def _startup_heal_mediamtx_editor_probe():
+    """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
+
+    v10.1.68. The editor patch only ever ran inside mediamtx_recovery() and
+    run_mediamtx_deploy(). So:
+
+      - a box that took v10.1.65 and then ran either of those carries the BROKEN v1
+        probe (it asked the broker {'op':'ping'}, an op the socket does not serve, so
+        the editor concluded "no broker" and fell back to a sudo that cannot exist on a
+        hardened box) — and taking v10.1.66 did NOT fix it, because nothing re-ran the
+        patch;
+      - a box that never ran either still has no fix at all.
+
+    Both states persist until a human happens to click "Patch web editor". That is the
+    same delivery gap as the LE renewal script in v10.1.67, and the same answer applies:
+    heal it on console update ([[feedback-console-path-delivery]]), because a fix nobody
+    triggers is not a fix.
+
+    Idempotent — `_MTX_PROBE_V2` short-circuits. Only restarts the editor when the file
+    actually changed. Non-fatal.
+    """
+    path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    try:
+        if not os.path.exists(path):
+            return
+        src = _read_priv(path) or ''
+        if not src:
+            return
+        if '_MTX_PROBE_V2' in src and '_INFRATAK_SSE_HEARTBEAT' in src:
+            # source is current; the UNIT may still lack journal access, so check that
+            if _mediamtx_editor_grant_journal_access():
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+                print('Startup migration: MediaMTX editor granted systemd-journal access — '
+                      'Live Logs can read the journal again', flush=True)
+            return
+        out = _mediamtx_editor_logstream_patch(_mediamtx_editor_broker_deps_patch(src))
+        _journal = _mediamtx_editor_grant_journal_access()
+        if out == src:
+            if _journal:
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+                print('Startup migration: MediaMTX editor granted systemd-journal access — '
+                      'Live Logs can read the journal again', flush=True)
+            return
+        try:
+            import ast as _ast
+            _ast.parse(out)             # never write a file that will not import
+        except Exception as _pe:
+            print(f'Startup migration: MediaMTX editor heal SKIPPED — patched source does '
+                  f'not parse ({_pe}); leaving the file untouched', flush=True)
+            return
+        _write_priv(path, out)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                       capture_output=True, timeout=60)
+        _was_broken = "{'op': 'ping'}" in src
+        print('Startup migration: MediaMTX editor broker probe healed '
+              f'({"replaced the broken v10.1.65 probe" if _was_broken else "GH #67 fix applied"}) '
+              '— Install GStreamer works on a hardened box again', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: MediaMTX editor heal error (non-fatal): {_e}', flush=True)
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -78604,6 +79028,11 @@ def _startup_migrations():
         # on a Caddyfile that parses — which is nearly every box — so hanging this off it
         # would have healed almost nothing.
         try:
+            _startup_retire_updates_timer()
+        except Exception as _rt_err:
+            print(f"Startup migration: retire updates timer error (non-fatal): {_rt_err}",
+                  flush=True)
+        try:
             _startup_caddy_grace_period_converge()
         except Exception as _gp_err:
             print(f"Startup migration: grace_period converge error (non-fatal): {_gp_err}",
@@ -78626,6 +79055,14 @@ def _startup_migrations():
             _startup_heal_missing_le_keystore()
         except Exception as _lk_err:
             print(f"Startup migration: LE keystore revive error (non-fatal): {_lk_err}", flush=True)
+
+        # v10.1.68 (GH #67): the editor fix only landed when someone clicked "Patch web
+        # editor". Deliver it on console update instead — including replacing the broken
+        # probe v10.1.65 left behind.
+        try:
+            _startup_heal_mediamtx_editor_probe()
+        except Exception as _mx_err:
+            print(f"Startup migration: MediaMTX editor heal error (non-fatal): {_mx_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to

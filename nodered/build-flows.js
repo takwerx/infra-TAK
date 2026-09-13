@@ -679,6 +679,65 @@ const configFlows = [
     x: 1000, y: 440, wires: []
   },
 
+  // ── v10.1.69 W3: feature count, so a feed's blast radius is known BEFORE it is saved ──
+  // There is no cap anywhere on the poll: whatever the layer returns is turned into CoT and
+  // pushed. Pointing this at a large layer with no filter floods every consumer of the feed.
+  // returnCountOnly is one cheap server-side call — no geometry, no attributes.
+  {
+    id: 'hi_cnt', type: 'http in', z: CFG_TAB,
+    name: 'POST /arcgis-tak/arcgis/count',
+    url: '/arcgis-tak/arcgis/count', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 490, wires: [['fn_cnt']]
+  },
+  {
+    id: 'fn_cnt', type: 'function', z: CFG_TAB,
+    name: 'Build count query URL',
+    func: [
+      "const base = String(msg.payload.url || '').replace(/\\/+$/, '');",
+      "const lid  = msg.payload.layerId;",
+      "// Honor the operator's WHERE clause so the number shown is the number that will actually",
+      "// be streamed, not the size of the whole layer.",
+      "const where = String(msg.payload.filter || '').trim() || '1=1';",
+      "msg._where = where;",
+      "msg.url = base + '/' + lid + '/query?where=' + encodeURIComponent(where)",
+      "  + '&returnCountOnly=true&returnGeometry=false&f=json';",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 490, wires: [['hr_cnt']]
+  },
+  {
+    id: 'hr_cnt', type: 'http request', z: CFG_TAB,
+    name: 'GET feature count',
+    method: 'GET', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, timeout: 30000, headers: [],
+    x: 620, y: 490, wires: [['fn_cnt_parse']]
+  },
+  {
+    id: 'fn_cnt_parse', type: 'function', z: CFG_TAB,
+    name: 'Parse count',
+    func: [
+      "var p = msg.payload || {};",
+      "if (p.error) { msg.payload = { error: p.error.message || 'ArcGIS error' }; }",
+      "else if (typeof p.count === 'number') { msg.payload = { count: p.count, where: msg._where }; }",
+      "// Some services refuse returnCountOnly; say so rather than reporting 0 features.",
+      "else { msg.payload = { error: 'count unavailable for this layer' }; }",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 810, y: 490, wires: [['ho_cnt']]
+  },
+  {
+    id: 'ho_cnt', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '', headers: {},
+    x: 1000, y: 490, wires: []
+  },
+
   {
     id: 'hi_dist', type: 'http in', z: CFG_TAB,
     name: 'POST /arcgis-tak/arcgis/distinct',
