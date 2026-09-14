@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.70-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.70-alpha)**
+**Current release: [v10.1.71-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.71-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.71-alpha — 2026-09-14 — A slow connection is not a broken install
+
+**Headline: deploying Node-RED could fail after exactly two minutes on a slower internet connection — and trying again could never fix it. Reported from Australia, and it would have affected anyone far from a fast link.**
+
+**Why it failed.** Deploying Node-RED downloads a ~200 MB program image. That download was given a two-minute budget shared with everything else the step had to do, which needs roughly 13 Mbit/s sustained just to break even. Under that, the download was cut off partway and the deploy reported an error — even though nothing was actually wrong with your server. The message said the command "timed out", which read like a fault on your machine rather than a limit we had set.
+
+**Why retrying did not help.** Downloads keep the pieces that finished, but a piece that was interrupted starts over from the beginning. Well over half of this image arrives as one single 120 MB piece. On a slower connection that piece cannot finish inside a two-minute window, so every retry threw it away and began again. The deploy could never succeed, no matter how many times you pressed the button.
+
+**What changed.** The download is now its own step with a thirty-minute budget, and it reports progress as it goes — so a slow connection looks like a slow connection instead of a silent two-minute wait ending in failure. If it does run out of time, the message now tells you that finished pieces are kept and that trying again picks up from there. Starting the program afterwards no longer reports failure when it actually worked.
+
+**Also fixed: uninstalling Node-RED could say it failed when it had succeeded.** The removal was given sixty seconds; when it took longer, you saw "Uninstall failed" even though the container and its data had been removed — and because the error stopped the process early, a leftover folder made the console keep listing Node-RED as installed. The console and your server disagreed, and anyone retrying found a half-removed install. Removal now gets the time it needs and reports based on what was actually removed, not on whether the command answered in time.
+
+**Upgrade note.** Update from the console as usual. If a Node-RED deploy has been failing for you, retry it after updating — and if you are on a slower link, expect the new download step to take a while and show progress while it does.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.71-alpha
 
 ### v10.1.70-alpha — 2026-09-13 — The safety nets stop hurting the operator
 
