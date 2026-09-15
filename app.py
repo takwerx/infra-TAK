@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.73-alpha"
+VERSION = "10.1.74-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -37862,6 +37862,60 @@ def _compose_cmd(remote_cfg=None):
     return None
 
 
+def _patch_cloudtak_minio_registry(cloudtak_dir=None):
+    """Repoint CloudTAK's minio image at quay.io. Returns True if a file changed.
+
+    **Why this exists (found by the v10.1.72 T&E, 2026-09-15).** `minio/minio` is no longer
+    anonymously pullable from Docker Hub:
+
+        pull access denied for minio/minio, repository does not exist or may require
+        'docker login'
+
+    — on CloudTAK's pinned tag AND on `:latest`, confirmed from two boxes on different networks.
+    CloudTAK's own `docker-compose.yml` pins that image for `cloudtak-store` (its S3-compatible
+    object store), so **a fresh CloudTAK deploy cannot obtain it**. Existing boxes are unaffected
+    because the image is already in their local cache, which is exactly why this stayed invisible:
+    it breaks only NEW installs. Same shape as the `postgres:15.1` bullseye break in GH #69.
+
+    **Why a registry swap is safe rather than a version change.** The quay.io copy at the SAME
+    tag is byte-identical to the Docker Hub image — verified by comparing image IDs, not by
+    trusting the tag:
+
+        quay.io    sha256:6f23072e3e222e64fe6f86b31a7f7aca971e5129e55cbccef649b109b8e651a1
+        docker.io  sha256:6f23072e3e222e64fe6f86b31a7f7aca971e5129e55cbccef649b109b8e651a1
+
+    Same Id, same Created timestamp, and quay publishes both linux/amd64 and linux/arm64 for it,
+    so the ARM path is covered too.
+
+    The pin lives in CloudTAK's file, not ours, so this is patch-the-upstream-file work — the
+    same treatment `_patch_cloudtak_compose_ports()` and the TAK bundle Dockerfile already get.
+    The TAG is deliberately preserved, so a future CloudTAK version bump still works and we are
+    not silently freezing anyone on an old minio.
+    """
+    import re as _re
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    changed = False
+    # Idempotent: an image already qualified with a registry host (quay.io/..., ghcr.io/...)
+    # is left alone — only the bare `minio/minio` and the explicit `docker.io/` form match.
+    _pat = _re.compile(r'(^[ 	]*image:[ 	]*)(?:docker\.io/)?minio/minio:', _re.MULTILINE)
+    for _fname in ('compose.yaml', 'docker-compose.yml'):
+        _path = os.path.join(cloudtak_dir, _fname)
+        if not os.path.exists(_path):
+            continue
+        try:
+            with open(_path) as f:
+                _ct = f.read()
+            _new = _pat.sub(r'\g<1>quay.io/minio/minio:', _ct)
+            if _new != _ct:
+                with open(_path, 'w') as f:
+                    f.write(_new)
+                changed = True
+        except Exception:
+            continue
+    return changed
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -38651,6 +38705,9 @@ def run_cloudtak_deploy(cfg=None):
         # are no-ops. Previously only ran on console startup/update, not deploy — a box deployed long
         # after the last console restart (CORAZ) stayed broken until hand-fixed.
         try:
+            # minio/minio is no longer anonymously pullable from Docker Hub and the pin is in
+            # CloudTAK's own compose — repoint it before anything tries to pull.
+            _patch_cloudtak_minio_registry(cloudtak_dir)
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -39575,6 +39632,7 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
         else:
             try:
+                _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
@@ -76237,7 +76295,8 @@ def _startup_harden_cloudtak_ports():
                 os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
         except Exception:
             pass
-        _changed = _patch_cloudtak_compose_ports(_ct_dir)
+        _minio_repointed = _patch_cloudtak_minio_registry(_ct_dir)
+        _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
         _needs_recreate = _changed or _override_changed
@@ -81299,7 +81358,8 @@ def _post_update_auto_deploy():
                     # YAML tag to null, dropping ALL port bindings silently.
                     _base_patched = False
                     try:
-                        _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir)
+                        _minio_repointed = _patch_cloudtak_minio_registry(_cloudtak_dir)
+                        _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir) or _minio_repointed
                         if _base_patched:
                             print("  CloudTAK base compose: port bindings patched (loopback/removed)")
                     except Exception as _bpe:

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.72-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.72-alpha)**
+**Current release: [v10.1.73-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.73-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.73-alpha — 2026-09-15 — New CloudTAK installs work again
+
+**Headline: installing CloudTAK on a new machine had started failing, because one of the images it depends on was withdrawn from Docker Hub. Existing installs were never affected, which is exactly why this was hard to spot.**
+
+**What was happening.** CloudTAK uses MinIO for its internal file storage, and the image it asks for is no longer available from Docker Hub — it now refuses the download outright. Any machine that already had CloudTAK kept working perfectly, because the image was already stored locally and never needed fetching again. So the problem was invisible right up until someone built a new box, and then it failed every time.
+
+**This was not caused by an infra-TAK change**, and going back to an older version did not help — every version asks for the same image, and what changed was outside all of them. If you spent time rolling back, that is why it made no difference, and we are sorry for the detour.
+
+**What changed.** infra-TAK now points that image at a different registry that still carries it. It is the *same image* — we compared the underlying fingerprints rather than trusting the label, and they match exactly, on both Intel and ARM machines. The version is unchanged; only where it is fetched from is different. The correction is re-applied automatically after every install and update, so a future refresh cannot quietly undo it.
+
+Thanks to the people who reported this and diagnosed it independently — the fix is the one they identified.
+
+**Upgrade note.** Update from the console as usual. If a CloudTAK install has been failing for you, retry it after updating. Existing CloudTAK deployments need no action.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.73-alpha
 
 ### v10.1.72-alpha — 2026-09-15 — An uninstall that says "done" has to actually be done
 
