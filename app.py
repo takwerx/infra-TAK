@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.74-alpha"
+VERSION = "10.1.75-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -8604,6 +8604,47 @@ def takserver_external_db_test_connection():
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
 
 
+def _ensure_ssh_pubkey(key_path):
+    """Make <key_path>.pub exist whenever the PRIVATE key already does. Returns (ok, error).
+
+    An operator-supplied private key arrives WITHOUT its public half: the uploaded AWS/Azure
+    .pem path (`/upload-ssh-key`) only ever wrote the private key, and an operator can point
+    ssh_key_path at a key they made themselves. Every "Setup SSH key" button then fell through
+    to `ssh-keygen -t ed25519 -f <path that already exists>`, which asks "Overwrite (y/n)?" on
+    a stdin that is not a TTY under gunicorn -- it dies, and the operator has no way to answer
+    it. Worse, the next step ("Copy key to host") hard-fails on a missing .pub, so the wizard
+    dead-ends with no way forward. Field report: EC2 two-server DB migration, 2026-09-15.
+
+    Derive the public half with `ssh-keygen -y` instead of regenerating. Never regenerate over
+    an existing private key, and never overwrite an existing .pub. The derived key loses the
+    original -C comment; ssh-copy-id does not care.
+    """
+    key_path = os.path.expanduser((key_path or '').strip())
+    if not key_path or not os.path.exists(key_path):
+        return False, 'private key not found'
+    pub_path = key_path + '.pub'
+    if os.path.exists(pub_path):
+        return True, ''
+    try:
+        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path],
+                           capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, str(e)[:200]
+    if r.returncode != 0 or not (r.stdout or '').strip():
+        err = (r.stderr or r.stdout or 'ssh-keygen -y failed').strip()
+        if 'passphrase' in err.lower():
+            err = 'the private key is passphrase-protected - re-export it without a passphrase'
+        return False, err[:200]
+    try:
+        fd = os.open(pub_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, 'w') as f:
+            f.write((r.stdout or '').strip() + '\n')
+    except Exception as e:
+        return False, f'could not write {pub_path}: {str(e)[:160]}'
+    return True, ''
+
+
 @app.route('/api/takserver/two-server/ensure-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_ensure_ssh_key():
@@ -8617,7 +8658,18 @@ def takserver_two_server_ensure_ssh_key():
     key_path = (s1.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/id_rsa')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
-    if os.path.exists(key_path) and os.path.exists(pub_path):
+    if os.path.exists(key_path):
+        # The .pub may be absent even though the private key is here (uploaded .pem, or an
+        # operator-supplied ssh_key_path). Derive it -- do NOT fall through to ssh-keygen,
+        # which would prompt "Overwrite (y/n)?" on a non-TTY stdin and dead-end step 3.
+        derived = not os.path.exists(pub_path)
+        pub_ok, pub_err = _ensure_ssh_pubkey(key_path)
+        if not pub_ok:
+            return jsonify({
+                'success': False,
+                'error': f'A private key already exists at {key_path}, but its public half '
+                         f'could not be derived: {pub_err}',
+            }), 400
         try:
             r = subprocess.run(
                 ['ssh-keygen', '-l', '-f', pub_path],
@@ -8637,7 +8689,7 @@ def takserver_two_server_ensure_ssh_key():
             'key_path': key_path,
             'public_key_path': pub_path,
             'fingerprint': fingerprint,
-            'message': 'Key already exists',
+            'message': 'Public key derived from your existing private key' if derived else 'Key already exists',
         })
     key_dir = os.path.dirname(key_path)
     if key_dir and not os.path.isdir(key_dir):
@@ -8649,7 +8701,7 @@ def takserver_two_server_ensure_ssh_key():
         subprocess.run(
             ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path, '-C', 'infra-tak-server-one'],
             capture_output=True, text=True, timeout=30,
-            check=True,
+            stdin=subprocess.DEVNULL, check=True,
         )
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': (e.stderr or e.stdout or str(e))[:400]}), 400
@@ -8709,7 +8761,10 @@ def takserver_two_server_upload_ssh_key():
         return jsonify({'success': False, 'error': f'Could not write key: {str(e)[:160]}'}), 500
     # Validate it's a usable, passphrase-free private key by deriving its public half.
     try:
-        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path], capture_output=True, text=True, timeout=10)
+        # stdin=DEVNULL: without it a passphrase-protected key makes ssh-keygen PROMPT and
+        # hang until the timeout, so the passphrase hint below never fires. EOF = fail fast.
+        r = subprocess.run(['ssh-keygen', '-y', '-f', key_path], capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
     except Exception as e:
         try: os.remove(key_path)
         except Exception: pass
@@ -8722,6 +8777,16 @@ def takserver_two_server_upload_ssh_key():
                 if 'passphrase' in _err or 'incorrect passphrase' in _err
                 else 'invalid or unsupported private key format')
         return jsonify({'success': False, 'error': f'Key rejected: {hint}.'}), 400
+    # Persist the PUBLIC half too. `ssh-keygen -y` above already produced it and we used to
+    # throw it away, so an uploaded .pem left <key>.pub absent -- which broke "Setup SSH key"
+    # and permanently blocked "Copy key to host". Non-fatal: the private key alone is enough
+    # for every deploy/migration path, the .pub only feeds ssh-copy-id.
+    try:
+        _pub_fd = os.open(key_path + '.pub', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(_pub_fd, 'w') as _pub_f:
+            _pub_f.write((r.stdout or '').strip() + '\n')
+    except Exception:
+        pass
     fingerprint = ''
     try:
         fr = subprocess.run(['ssh-keygen', '-l', '-f', key_path], capture_output=True, text=True, timeout=5)
@@ -8785,7 +8850,11 @@ def takserver_two_server_install_ssh_key():
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
     if not os.path.exists(pub_path):
-        return jsonify({'success': False, 'error': f'Public key not found at {pub_path}. Run "Setup SSH key" first.'}), 400
+        # Self-heal rather than send the operator back to a step that cannot help them:
+        # if the private key is here, derive its public half (uploaded .pem case).
+        _ok, _perr = _ensure_ssh_pubkey(key_path)
+        if not _ok:
+            return jsonify({'success': False, 'error': f'Public key not found at {pub_path} and could not be derived from {key_path}: {_perr}. Run "Setup SSH key" first.'}), 400
     if shutil.which('sshpass') is None:
         return jsonify({'success': False, 'error': 'sshpass not installed. Run: apt install sshpass (or use manual ssh-copy-id)'}), 400
     try:
@@ -11981,7 +12050,8 @@ def _conn_write_anchor_key(key_text):
         return False, 'Could not store key: %s' % str(e)[:160]
     try:
         r = subprocess.run(['ssh-keygen', '-y', '-f', _CONN_ANCHOR_KEY_PATH],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
     except Exception as e:
         try:
             os.remove(_CONN_ANCHOR_KEY_PATH)
@@ -26079,7 +26149,13 @@ def _register_module_remote_routes(module_name, settings_key, get_config_fn=None
             if kdir and not os.path.isdir(kdir):
                 os.makedirs(kdir, mode=0o700, exist_ok=True)
             subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', key_label],
-                           capture_output=True, text=True, timeout=30, check=True)
+                           capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, check=True)
+        else:
+            # Private key already here but possibly no .pub (operator-supplied key): derive it,
+            # otherwise this returns success with an empty public_key and install-ssh-key below
+            # refuses with "No public key found. Generate one first." -- an unescapable loop.
+            _ensure_ssh_pubkey(kp)
         fp = ''
         try:
             r = subprocess.run(['ssh-keygen', '-l', '-f', pub], capture_output=True, text=True, timeout=5)
@@ -32700,7 +32776,7 @@ def _takportal_setup_ssh(log_fn=None):
         if not os.path.exists(priv_key):
             r = subprocess.run(
                 ['ssh-keygen', '-t', 'ed25519', '-f', priv_key, '-N', '', '-C', 'tak-portal-auto'],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
             if r.returncode != 0 or not os.path.exists(pub_key):
                 if log_fn:
                     log_fn(f"  ✗ SSH keygen failed: {(r.stderr or '').strip()[:200]}")
@@ -35809,7 +35885,18 @@ def cloudtak_remote_ensure_ssh_key():
     key_path = (rcfg.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/infra-tak-cloudtak')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
-    if os.path.exists(key_path) and os.path.exists(pub_path):
+    if os.path.exists(key_path):
+        # Derive a missing .pub instead of falling through to ssh-keygen over an existing
+        # private key (interactive "Overwrite (y/n)?" on a non-TTY stdin). Same trap as the
+        # TAK two-server path -- see _ensure_ssh_pubkey.
+        _derived = not os.path.exists(pub_path)
+        _pub_ok, _pub_err = _ensure_ssh_pubkey(key_path)
+        if not _pub_ok:
+            return jsonify({
+                'success': False,
+                'error': f'A private key already exists at {key_path}, but its public half '
+                         f'could not be derived: {_pub_err}',
+            }), 400
         try:
             fr = subprocess.run(['ssh-keygen', '-l', '-f', pub_path], capture_output=True, text=True, timeout=5)
             fingerprint = (fr.stdout or '').strip() if fr.returncode == 0 else ''
@@ -35827,7 +35914,7 @@ def cloudtak_remote_ensure_ssh_key():
         save_settings(settings)
         return jsonify({
             'success': True,
-            'message': 'Key already exists',
+            'message': 'Public key derived from your existing private key' if _derived else 'Key already exists',
             'key_path': key_path,
             'public_key_path': pub_path,
             'public_key': public_key,
@@ -35843,7 +35930,7 @@ def cloudtak_remote_ensure_ssh_key():
     try:
         subprocess.run(
             ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path, '-C', 'infra-tak-cloudtak-remote'],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL, check=True,
         )
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': (e.stderr or e.stdout or str(e))[:400]}), 400
@@ -35897,7 +35984,9 @@ def cloudtak_remote_install_ssh_key():
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
     if not os.path.exists(pub_path):
-        return jsonify({'success': False, 'error': f'Public key not found at {pub_path}. Click "Generate SSH key" first.'}), 400
+        _ok, _perr = _ensure_ssh_pubkey(key_path)
+        if not _ok:
+            return jsonify({'success': False, 'error': f'Public key not found at {pub_path} and could not be derived from {key_path}: {_perr}. Click "Generate SSH key" first.'}), 400
     if shutil.which('sshpass') is None:
         return jsonify({'success': False, 'error': 'sshpass is not installed on infra-TAK host. Install it first (apt install sshpass).'}), 400
     try:

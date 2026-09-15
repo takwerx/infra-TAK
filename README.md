@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.73-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.73-alpha)**
+**Current release: [v10.1.74-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.74-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.74-alpha — 2026-09-15 — "Setup SSH key" no longer gets stuck on a question you cannot answer
+
+**Headline: if you gave infra-TAK your own SSH key — an AWS or Azure `.pem`, or a key you made yourself — the "Setup SSH key" button could stop with `Overwrite (y/n)?` and no way to answer it. The step after that then refused to run, leaving no way forward. Both are fixed.**
+
+**What was happening.** When you upload your own private key, infra-TAK checks it is valid by working out its matching public key — and then threw that public half away, saving only the private one. Later, "Setup SSH key" looked for both halves, found only one, and assumed it needed to make a new key from scratch. It then asked whether to overwrite the key you had just given it. That question is asked in a place nobody can see or reply to, so the step simply failed.
+
+It got worse from there: the next step, "Copy key to host", refuses to run without that missing public half — and tells you to go back and run "Setup SSH key" first. Which could not succeed. There was no way out of that loop from the browser.
+
+**What changed.** Uploading a key now keeps both halves, so the problem does not arise in the first place. And if you already have a key in this state, infra-TAK now works the missing public half out from the private key you gave it, instead of trying to replace your key — it will never overwrite a key you supplied. "Copy key to host" repairs the same thing on its own rather than sending you back a step. This applies everywhere the console sets up SSH keys: split-server TAK, CloudTAK, and the remote-host options for Node-RED, MediaMTX, Authentik, WebODM, TAK Portal and Federation Hub.
+
+**One related fix:** a password-protected private key used to make the upload sit for ten seconds and then report a timeout, instead of telling you the real problem. It now says straight away that the key has a passphrase and needs re-exporting without one.
+
+**Worth knowing:** the console still stores a single SSH key for a split-server database host. If you are moving your database to a new machine, launch it with the *same* key pair as the current one — support for a second, different key is on the roadmap. And the SSH user field is optional: it shows a greyed-out `root` as a placeholder, but any account with sudo works — on AWS, type `ubuntu`.
 
 ### v10.1.73-alpha — 2026-09-15 — New CloudTAK installs work again
 
