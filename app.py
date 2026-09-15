@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.72-alpha"
+VERSION = "10.1.73-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -38815,6 +38815,67 @@ def run_cloudtak_deploy(cfg=None):
         # Step 5: Start containers including media on remapped ports
         plog("")
         plog("━━━ Step 5/7: Starting Containers ━━━")
+        # v10.1.72 W1: pull the registry images as their own step before `up -d`.
+        # The pull runs BEFORE the stale-container sweep below, not after it. The
+        # sweep removes every cloudtak-* container, so on a redeploy the stack is
+        # down from that point until `up -d` returns — putting a download in that
+        # window would add its whole duration to the outage. Pull first, then tear
+        # down and start back-to-back exactly as before.
+        # This was the last deploy path without a pre-pull. `up -d` below is capped
+        # at 600 s, and on a cold box that budget had to cover the postgis + minio +
+        # media downloads AND container start; when it doesn't, compose is killed
+        # mid-pull and the deploy reports a failure on a box whose only problem is
+        # the link (same class as the Node-RED report fixed in v10.1.71). Splitting
+        # it out also streams progress, so a slow link and a stalled registry stop
+        # producing byte-identical logs.
+        #
+        # compose_yml=None on purpose: a bare `docker compose pull` in cloudtak_dir
+        # loads docker-compose.yml AND docker-compose.override.yml, exactly like the
+        # `up -d` below. The override re-pins media-infra (v9.7.0 on amd64) over the
+        # base file's v9.10.0, so an explicit `-f docker-compose.yml` would download
+        # a tag that never starts and skip the one that does.
+        #
+        # api/tiles/events/retention are built locally in Step 4 and carry no
+        # `image:` key, so compose skips them by itself ("Skipped - No image to be
+        # pulled") — verified on compose v5.5.0. They cost nothing here.
+        _pull_services = None  # None = the whole project
+        if _host_arch() == 'arm64':
+            # media-infra is built FROM SOURCE and tagged as the pinned ref a few
+            # steps above (_cloudtak_build_arm64_media) because dfpc-coe publishes
+            # no arm64 image. `up -d` leaves that local tag alone — compose's default
+            # pull_policy is 'missing' — but `compose pull` ALWAYS contacts the
+            # registry, and v9.1.1/v9.7.0 are single-arch amd64 manifests rather than
+            # multi-arch indexes, so the pull would succeed and overwrite the arm64
+            # build with an amd64 image. media would then crash-loop on "exec format
+            # error" — the exact failure that local build exists to prevent. Name the
+            # registry-only services instead of pulling the project.
+            _pull_services = ['postgis', 'store']
+        # ignore_failures: compose aborts every remaining pull on the first failure,
+        # so ONE unreachable image makes this step cache nothing and hand the whole
+        # download back to `up -d` — exactly the situation W1 exists to prevent. This
+        # is not hypothetical on CloudTAK's project: minio/minio is no longer
+        # anonymously pullable from Docker Hub (401 on the pinned tag AND on :latest,
+        # confirmed from two networks, so it is a gated repo rather than a rate limit),
+        # and a plain pull exits 1 with "postgis ... Interrupted" — postgis and
+        # media-infra both cache fine once failures are tolerated.
+        plog("  Pulling images CloudTAK does not build locally...")
+        plog("  On a cold box this is the long part of the deploy — progress is")
+        plog("  reported below, so a stalled pull looks different from a slow one.")
+        if _docker_compose_pull(None, cloudtak_dir, plog, timeout=1800,
+                                label='CloudTAK images', services=_pull_services,
+                                ignore_failures=True):
+            # Deliberately NOT "all images pulled". --ignore-pull-failures makes the
+            # exit code mean "the step ran", not "every image arrived"; any image that
+            # failed printed an Error line above. Claiming success here would be the
+            # same false-reassurance bug as a probe that never fires.
+            plog("  ✓ Pull step complete — any image that errored above is retried by `up -d`")
+        else:
+            # NON-FATAL by design. Every module's pre-pull is advisory: `up -d` pulls
+            # anything still missing on its own, so a pull that warns must not abort a
+            # deploy that would otherwise complete. This path already worked before the
+            # pre-pull existed and must keep working when the pull fails.
+            plog("  ⚠ Pull did not complete — continuing; `up -d` will fetch what is missing.")
+        plog("")
         # v10.1.13: unconditional pre-up sweep (field report pwtak/Josh — 4 consecutive
         # deploys failed at this step on "container name /cloudtak-media-1 already in
         # use"). A container left by a prior failed run doesn't carry the labels this
@@ -41888,6 +41949,27 @@ def nodered_uninstall():
                     return jsonify({'error': 'Node-RED is still running after teardown — nothing was '
                                              'removed. Retry the uninstall; if it persists, the Docker '
                                              'daemon is not responding.'}), 500
+            # F2b/F2c (v10.1.72): everything above is gated on the compose file existing. With no
+            # compose file the teardown was skipped ENTIRELY, the directory was deleted, and the
+            # route still returned {"success": true, "steps": ["Node-RED container and data
+            # removed"]} — while the container kept running. Proven on dev-4, 2026-09-14.
+            #
+            # And the running-only guard above cannot close it: container names are unique across
+            # every state, so an EXITED `nodered` container still owns the name and still blocks
+            # the next `compose up -d` with a name conflict, while `docker ps` shows nothing.
+            # That is how a box ends up in a loop where uninstall claims success and deploy keeps
+            # failing — which is exactly the loop a user hit in the field.
+            #
+            # So: regardless of the compose file, if the name is still taken, remove it by name.
+            if _nodered_container_exists():
+                _rm = subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                                     capture_output=True, text=True, timeout=60)
+                if _nodered_container_exists():
+                    return jsonify({'error': 'A container named "nodered" could not be removed '
+                                             f'({(_rm.stderr or _rm.stdout or "").strip()[-200:]}). '
+                                             'Nothing was deleted. Retry; if it persists, the '
+                                             'Docker daemon is not responding.'}), 500
+                steps.append('Removed a leftover "nodered" container that was holding the name')
             if os.path.exists(nr_dir):
                 # List argv, not shell=True: same broker routing via _sudo_wrap (the shim
                 # PATH intercepted the bare `rm` before), minus a shell interpolating a
@@ -44572,6 +44654,61 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         return False
 
 
+def _nodered_container_exists():
+    """True if a container named `nodered` exists in ANY state (running, exited, created).
+
+    Deliberately distinct from _nodered_container_running(), and the distinction IS the bug
+    (field report, Richard/AUS-NSW, 2026-09-14). Docker container names are unique across every
+    state, so an **exited** `nodered` container still owns the name and still makes
+    `docker compose up -d` fail with `Conflict. The container name "/nodered" is already in
+    use`. A running-only check sees nothing there, so the uninstall reported "Node-RED container
+    and data removed" while a dead container quietly held the name and blocked every later
+    deploy. Both halves reproduced on dev-4.
+
+    Use _nodered_container_running() for "is it live" (don't strand a working container);
+    use THIS for "is the name free" / "did the teardown actually remove it".
+    """
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=nodered', '--format', '{{.Names}}']),
+            capture_output=True, text=True, timeout=20)
+        return any(n.strip() == 'nodered' for n in (r.stdout or '').splitlines())
+    except Exception:
+        return False
+
+
+_COMPOSE_PROGRESS_RE = re.compile(
+    r'^\s*(?:Network|Volume|Container|Image|Service)?\s*\S*\s*'
+    r'(?:Creating|Created|Starting|Started|Running|Waiting|Pulling|Pulled|Removing|Removed'
+    r'|Stopping|Stopped|Recreate|Recreating|Recreated)\s*$'
+)
+
+
+def _compose_error_tail(out, limit=700):
+    """Return the ACTIONABLE part of a `docker compose` failure, not the progress ledger.
+
+    compose writes its progress ledger FIRST and the error LAST, and without a TTY it
+    re-renders each progress line — so the ledger is about twice as long as expected. Slicing
+    the HEAD of that (`[:300]`) shows nothing but "Network … Creating / Created" and cuts the
+    error off mid-sentence.
+
+    Not hypothetical: that is what v10.1.71 shipped at the Node-RED deploy's Step 3/4, and it
+    cost a full round trip with a user in Australia who had already waited seven minutes for a
+    pull — his log carried eight lines of network/volume progress and not one character of the
+    reason. `app.py:39997` had the right idiom (`[-300:]`) all along.
+
+    Drop the pure-progress lines, then return the TAIL of what is left. Falls back to the raw
+    tail when filtering leaves nothing, because showing something beats showing nothing.
+    """
+    text = (out or '').strip()
+    if not text:
+        return 'no output'
+    meaningful = [ln for ln in text.splitlines()
+                  if ln.strip() and not _COMPOSE_PROGRESS_RE.match(ln)]
+    body = '\n'.join(meaningful).strip() or text
+    return body[-limit:].strip()
+
+
 def _nodered_container_running():
     """True if the nodered container is up. Used to keep a slow `up -d` from being
     reported as a deploy failure when the container actually started."""
@@ -44584,9 +44721,38 @@ def _nodered_container_running():
         return False
 
 
-def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image'):
+def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
+                         ignore_failures=False):
     """`docker compose pull` as its own step, with streamed progress and a
     generous timeout. Returns True on success, False on failure (never raises).
+
+    `compose_yml=None` means "let compose discover its own files in `cwd`", i.e.
+    exactly what a bare `docker compose up -d` in that directory would load —
+    base file PLUS `docker-compose.override.yml`. Pass None wherever the caller's
+    `up` is itself overrideless, or the pull and the start disagree about which
+    image is meant: CloudTAK's override re-pins media-infra (v9.7.0/v9.1.1) over
+    the base file's v9.10.0, so pulling with an explicit `-f docker-compose.yml`
+    would fetch a tag that never gets started and skip the one that does.
+
+    `services` restricts the pull to named services. Build-only services are
+    already skipped by compose itself ("Skipped - No image to be pulled"), so
+    this is not needed to avoid them; it is for services whose image is present
+    locally ON PURPOSE and must not be re-fetched from a registry.
+
+    `ignore_failures=True` adds `--ignore-pull-failures`. Compose pulls images
+    concurrently but aborts the whole run on the first failure — the others
+    report "Interrupted" and cache nothing. For a pre-pull whose only job is to
+    warm the cache that is the worst outcome: one unreachable image and the step
+    delivers zero benefit, leaving the entire download to `up -d` again. Measured
+    on a live box against CloudTAK's project: plain `pull` exits 1 with
+    `postgis ... Interrupted`, while `--ignore-pull-failures` exits 0 having
+    actually pulled postgis and media-infra. NOTE the cost — the exit code stops
+    distinguishing "all good" from "some failed", so a caller that passes this
+    must NOT report unqualified success. The per-image `Error` lines are streamed
+    either way (they match the terminal-state regex below), so the operator still
+    sees exactly which image failed. Default off: callers that treat a False
+    return as fatal (Node-RED) or report it verbatim (Authentik) depend on the
+    strict exit code.
 
     Why the pull is split out of `up -d` (field report, Richard/AUS-NSW,
     2026-09-13 — Node-RED deploy failed at "Step 2/3" with
@@ -44610,13 +44776,21 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image'):
         logs. Streaming the pull is what makes those two distinguishable
         without SSH.
 
-    Pulling via `docker compose -f <file> pull` rather than `docker pull <image>`
+    Pulling via `docker compose ... pull` rather than `docker pull <image>`
     on purpose: the image tag then comes from the compose file we just wrote, so
     the pulled image and the started image cannot drift apart.
     """
     try:
+        _argv = ['docker', 'compose']
+        if compose_yml:
+            _argv += ['-f', compose_yml]
+        _argv.append('pull')
+        if ignore_failures:
+            _argv.append('--ignore-pull-failures')
+        if services:
+            _argv += list(services)
         proc = subprocess.Popen(
-            _sudo_wrap(['docker', 'compose', '-f', compose_yml, 'pull']),
+            _sudo_wrap(_argv),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             # stdin MUST be closed, not inherited. On a non-root box _sudo_wrap routes
             # this through brokerctl, whose exec path does `if not sys.stdin.isatty():
@@ -45030,9 +45204,34 @@ volumes:
             _up_rc, _up_out = None, ''
             plog("  ⚠ `docker compose up -d` did not return within 3 minutes — checking whether")
             plog("    the container came up anyway before calling this a failure.")
+        # F2a (v10.1.72): a leftover container holding the fixed `container_name: nodered`
+        # makes compose fail instantly with a name conflict — and because container names are
+        # unique across EVERY state, an *exited* leftover does it just as effectively as a
+        # running one. This is a self-heal on the failure path only: the normal deploy is
+        # untouched, so a working box cannot regress through this branch.
+        if _up_rc != 0 and 'already in use' in (_up_out or '') and _nodered_container_exists():
+            plog("  A leftover 'nodered' container is holding the name and blocking the start.")
+            plog("  Removing it and retrying — the named volume is NOT touched, so Configurator")
+            plog("  configs survive (they live in node_red_data, not in the container).")
+            try:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
+                               capture_output=True, text=True, timeout=60)
+                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    timeout=180, cwd=nr_dir)
+                _up_rc, _up_out = r2.returncode, (r2.stdout or '')
+                if _up_rc == 0:
+                    plog("  ✓ Leftover cleared — container started.")
+            except subprocess.TimeoutExpired:
+                plog("  ⚠ Retry after clearing the leftover did not return within 3 minutes.")
+            except Exception as _e_retry:
+                plog(f"  ⚠ Could not clear the leftover: {str(_e_retry)[:150]}")
         if _up_rc != 0:
             if not _nodered_container_running():
-                plog(f"✗ docker compose up failed: {(_up_out or 'timed out').strip()[:300]}")
+                # F1 (v10.1.72): the TAIL, filtered. `[:300]` showed the operator 300 characters
+                # of "Network … Creating / Created" and cut the actual error off mid-sentence —
+                # see _compose_error_tail().
+                plog(f"✗ docker compose up failed: {_compose_error_tail(_up_out or 'timed out')}")
                 nodered_deploy_status.update({'running': False, 'error': True})
                 return
             plog("  ✓ Container is running — continuing.")
@@ -57651,12 +57850,21 @@ entries:
                     plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
         except Exception as e:
             plog(f"  \u26a0 Swap setup skipped: {e}")
+        # v10.1.72 W2a: same pull, but streamed. The Authentik stack is the largest
+        # download infra-TAK ships (server 309 MB + postgres 111 MB + ldap 65 MB +
+        # redis 36 MB + pgbouncer 7 MB on disk), and the old form printed this one
+        # line and then NOTHING for up to 600 s — so a slow link and a blackholed
+        # registry produced byte-identical logs, which is the wall that made the
+        # v10.1.71 Node-RED field report necessary. Budget is unchanged at 600 s.
+        # compose_yml=None keeps compose's own file discovery in ak_dir, exactly
+        # what the bare `docker compose pull` here did before.
         plog("  Pulling images (this may take a few minutes)...")
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'pull']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
-        if r.returncode != 0:
-            plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-        else:
+        if _docker_compose_pull(None, ak_dir, plog, timeout=600, label='Authentik images'):
             plog("  \u2713 Images pulled")
+        else:
+            # Still non-fatal, exactly as before: the deploy continues to `up -d`,
+            # which fetches anything the pull did not get.
+            plog("  \u26a0 Pull had issues \u2014 continuing; `up -d` will fetch what is missing.")
         plog("  Starting PostgreSQL...")
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         if r.returncode != 0:

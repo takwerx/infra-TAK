@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.71-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.71-alpha)**
+**Current release: [v10.1.72-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.72-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.72-alpha — 2026-09-15 — An uninstall that says "done" has to actually be done
+
+**Headline: removing Node-RED could report success while leaving it in place — and the next install would then fail with an error message that hid its own cause. Both fixed, along with two improvements to how downloads are reported.**
+
+**The uninstall could claim success without removing anything.** If the compose file was already gone, the removal step was skipped entirely — yet the console still reported "Node-RED container and data removed" and deleted the folder. The container kept running. Nothing told you, because the console genuinely believed it had cleaned up.
+
+**A leftover then blocked the next install, invisibly.** Container names have to be unique, and a *stopped* container holds its name just as firmly as a running one. Our check only looked for running containers, so a stopped leftover was invisible to us while still blocking every new install. The deploy would fail instantly with a name conflict — and the error message showed the first part of the output, which is progress text, cutting the actual reason off mid-sentence. So the one line that explained the failure was the one line you could not see.
+
+Three changes. The uninstall now removes the container by name whether or not a compose file exists, and refuses to claim success if it cannot. The install clears a leftover by itself and retries, so a stuck box unsticks itself — your Configurator settings are never at risk, they live in a separate volume that none of this touches. And failure messages now show the *error* rather than the progress that preceded it.
+
+**Also: two deploys stop going quiet during downloads.** CloudTAK's install now downloads its images as a visible step rather than folding it into startup, and Authentik's download reports progress instead of printing one line and going silent for several minutes. Same reasoning as the v10.1.71 Node-RED fix: a slow connection and a stalled download should not look identical.
+
+**Upgrade note.** Update from the console as usual. If a Node-RED install has been failing after a removal, retry it — it should now clear the leftover on its own.
+
+Release: https://github.com/takwerx/infra-TAK/releases/tag/v10.1.72-alpha
 
 ### v10.1.71-alpha — 2026-09-14 — A slow connection is not a broken install
 
