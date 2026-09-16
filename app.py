@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.75-alpha"
+VERSION = "10.1.76-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -55837,6 +55837,46 @@ def _takportal_admin_guardrail(plog_fn=None):
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
 
+# v10.1.75 fleet constants (CLAUDE.md fleet-uniform rule — no operator knob, no
+# per-customer tier): after this many consecutive FAILED heals the SA-bind
+# watchdog stops re-running the heal on every 5-minute tick and retries on this
+# interval instead. Each heal force-recreates authentik-ldap-1, so an unhealable
+# cause used to churn the LDAP outpost every 5 minutes indefinitely.
+LDAP_SA_HEAL_BACKOFF_AFTER = 3
+LDAP_SA_HEAL_BACKOFF_SECS = 3600
+
+# How long a just-applied ldap-authentication-flow policy repair suppresses the
+# "heal INCOMPLETE" alarm. Authentik caches flow plans and policy results for
+# 600s (cache.timeout_flows / cache.timeout_policies — confirmed with
+# `ak dump_config` on test6, 2026-09-15), so the bind does NOT recover the moment
+# the binding is corrected: measured 2.7 min and 6.1 min on two runs. Without
+# this grace the watchdog reports a hard failure, and burns backoff strikes, on a
+# repair that is working — and could back off to hourly right as it recovers.
+LDAP_SA_POLICY_REPAIR_GRACE_SECS = 900
+
+
+def _record_ldap_sa_heal_failure(msg):
+    """v10.1.75: persist a FAILED heal.
+
+    `authentik_ldap_sa_repair_count` only ever incremented on SUCCESS, so the
+    counter whose stated purpose was to let operators "grep for repeated-repair
+    patterns" was blind to the one case that actually matters: a heal that runs
+    every 5 minutes and never works. Also drives the watchdog's backoff.
+    """
+    try:
+        _s = load_settings()
+        _n = int(_s.get('authentik_ldap_sa_heal_failures') or 0) + 1
+        from datetime import datetime as _dt
+        _s['authentik_ldap_sa_heal_failures'] = _n
+        _s['authentik_ldap_sa_heal_last_error'] = (msg or '')[:400]
+        _s['authentik_ldap_sa_heal_last_failure'] = _dt.utcnow().isoformat() + 'Z'
+        if _n >= LDAP_SA_HEAL_BACKOFF_AFTER:
+            _s['authentik_ldap_sa_heal_next_attempt'] = time.time() + LDAP_SA_HEAL_BACKOFF_SECS
+        save_settings(_s)
+    except Exception:
+        pass
+
+
 def _authentik_ldap_sa_bind_watchdog_loop():
     """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
     LDAP SA bind verification + webadmin admin-role drift heal.
@@ -55905,36 +55945,80 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             _role_healed = False
 
             if _verdict == 'fail':
-                print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
-                try:
-                    _ok, _msg = _ensure_authentik_ldap_service_account()
-                    if _ok:
-                        print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
-                        _sa_healed = True
-                        try:
-                            _s2 = load_settings()
-                            from datetime import datetime as _dt_now
-                            _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
-                            _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
-                            save_settings(_s2)
-                        except Exception:
-                            pass
-                        # Belt + braces — also resync CoreConfig credential while we
-                        # know the env_pass is authoritative.
-                        try:
-                            _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
-                            if _cc_changed:
-                                print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
-                        except Exception:
-                            pass
-                    else:
-                        print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
-                except Exception as _se:
-                    print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+                # v10.1.75 backoff. Every heal calls `docker compose up -d
+                # --force-recreate ldap`, so a cause the heal cannot repair used to
+                # destroy and rebuild authentik-ldap-1 every 5 minutes, forever — the
+                # same harm v10.1.35 removed the LDAP-49 auto-flush for (one recreate
+                # dropped a live EUD session on test8, 2026-08-14). The customer sees
+                # it as "authentik-ldap-1 is sometimes red" (mg1921, v10.1.74-alpha).
+                _heal_fails = int(_settings.get('authentik_ldap_sa_heal_failures') or 0)
+                _next_try = float(_settings.get('authentik_ldap_sa_heal_next_attempt') or 0)
+                if _heal_fails >= LDAP_SA_HEAL_BACKOFF_AFTER and _wt.time() < _next_try:
+                    print(f"[ldap-sa-watchdog] adm_ldapservice bind still failing — "
+                          f"{_heal_fails} consecutive failed heals, holding off "
+                          f"{int(_next_try - _wt.time())}s before the next attempt "
+                          f"(LDAP outpost left alone meanwhile). Last cause: "
+                          f"{(_settings.get('authentik_ldap_sa_heal_last_error') or 'unknown')[:200]}",
+                          flush=True)
+                else:
+                    print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
+                    try:
+                        _ok, _msg = _ensure_authentik_ldap_service_account()
+                        if _ok:
+                            print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
+                            _sa_healed = True
+                            try:
+                                _s2 = load_settings()
+                                from datetime import datetime as _dt_now
+                                _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                                _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
+                                _s2['authentik_ldap_sa_heal_failures'] = 0
+                                _s2['authentik_ldap_sa_heal_next_attempt'] = 0
+                                _s2['authentik_ldap_sa_heal_last_error'] = ''
+                                _s2['authentik_ldap_sa_policy_repair_at'] = 0
+                                save_settings(_s2)
+                            except Exception:
+                                pass
+                            # Belt + braces — also resync CoreConfig credential while we
+                            # know the env_pass is authoritative.
+                            try:
+                                _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
+                                if _cc_changed:
+                                    print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
+                            except Exception:
+                                pass
+                        else:
+                            # Re-read settings: the repair marker is written by the heal
+                            # we just called, so the tick-start copy is stale.
+                            try:
+                                _pr_at = float(load_settings().get('authentik_ldap_sa_policy_repair_at') or 0)
+                            except Exception:
+                                _pr_at = 0
+                            if _wt.time() - _pr_at < LDAP_SA_POLICY_REPAIR_GRACE_SECS:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice recovery PENDING: {_msg}", flush=True)
+                            else:
+                                print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
+                                _record_ldap_sa_heal_failure(_msg)
+                    except Exception as _se:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+                        _record_ldap_sa_heal_failure(f'heal error: {str(_se)[:160]}')
             elif _verdict == 'inconclusive':
                 # Don't take action — could be transient (outpost restarting after
                 # operator-driven sync). The next tick will reassess.
                 pass
+
+            if _verdict == 'ok' and int(_settings.get('authentik_ldap_sa_heal_failures') or 0):
+                # Bind recovered — by our own heal, an operator Resync, or a console
+                # restart running _startup_fix_reputation_policy_drift. Clear the
+                # backoff so the next genuine drift gets an immediate heal again.
+                try:
+                    _s3 = load_settings()
+                    _s3['authentik_ldap_sa_heal_failures'] = 0
+                    _s3['authentik_ldap_sa_heal_next_attempt'] = 0
+                    save_settings(_s3)
+                    print("[ldap-sa-watchdog] SA bind recovered — heal backoff cleared", flush=True)
+                except Exception:
+                    pass
 
             try:
                 _role_healed = _authentik_webadmin_role_check_and_heal(
@@ -60021,6 +60105,58 @@ def _ensure_ldap_flow_authentication_none():
     time.sleep(5)
     return True, None
 
+def _authentik_ldap_flow_policy_report():
+    """v10.1.75: name the policy bindings on ldap-authentication-flow.
+
+    When the SA bind is confirmed failing, the outpost logs
+    `"error":"Flow does not apply to current user."` and every bind returns LDAP
+    49 with the CORRECT password — some policy bound to that flow is denying it.
+    Until now the console only ever printed the category ("check
+    ldap-authentication-flow policy bindings") and left the operator, or the
+    customer, to go read `docker logs authentik-ldap-1` by hand. Worse: the
+    v0.9.12 drift migration only inspects bindings whose policy is
+    `infratak-brute-force`, so a denial from ANY other policy was invisible to us
+    by construction. Report every binding so the journal line names the culprit.
+
+    Returns a one-line summary, or '' when it can't be determined.
+    """
+    try:
+        import urllib.request as _req
+        settings = load_settings()
+        ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not ak_token:
+            return ''
+        url = _get_authentik_api_url(settings)
+        headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+        def _get(path):
+            return json.loads(_req.urlopen(
+                _req.Request(f'{url}/api/v3/{path}', headers=headers), timeout=10).read().decode())
+
+        flows = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
+        flow = next((f for f in flows if f.get('slug') == 'ldap-authentication-flow'), None)
+        if not flow:
+            return 'ldap-authentication-flow NOT FOUND'
+        # Authentik stores PolicyBinding.target as the flow's policybindingmodel_ptr_id,
+        # NOT the flow's own pk — querying by flow pk silently returns zero bindings.
+        # Same trap documented in _authentik_setup_reputation_policy.
+        target = flow.get('policybindingmodel_ptr_id') or flow.get('pk')
+        bindings = _get(f'policies/bindings/?target={target}').get('results', [])
+        if not bindings:
+            return 'ldap-authentication-flow has NO policy bindings (denial is not policy-bound)'
+        bits = []
+        for b in bindings:
+            _name = ((b.get('policy_obj') or {}).get('name')
+                     or (b.get('group_obj') or {}).get('name')
+                     or b.get('policy') or 'unknown')
+            bits.append(f"{_name}(negate={b.get('negate')}, enabled={b.get('enabled')}, "
+                        f"failure_result={b.get('failure_result')})")
+        return 'ldap-authentication-flow bindings: ' + '; '.join(bits)
+    except Exception as _e:
+        return f'policy-binding report unavailable ({str(_e)[:60]})'
+
+
 def _ensure_authentik_ldap_service_account():
     """Ensure adm_ldapservice exists, has password set, is in authentik Admins, and VERIFY the bind works.
     Runs before Connect TAK Server to LDAP so LDAP bind works regardless of deploy order."""
@@ -60105,14 +60241,52 @@ def _ensure_authentik_ldap_service_account():
                 return True, f'LDAP bind verified (attempt {attempt + 1})'
             last_verdict = v
         if last_verdict == 'fail':
-            # Confirmed failure after the API set_password — almost always means
-            # the reputation policy on ldap-authentication-flow is still denying
-            # the flow (FlowNonApplicableException). The v0.9.12 startup migration
-            # _startup_fix_reputation_policy_drift handles this; this call site
-            # may be running before that migration completed (e.g. during the
-            # console's first deploy on a fresh box). Operator next action:
-            # re-run deploy or trigger Update Now.
-            return False, 'LDAP bind confirmed failing after API password set — check ldap-authentication-flow policy bindings'
+            # Confirmed failure after the API set_password. The password is NOT the
+            # problem — we just wrote it and the outpost was recreated to pick it up.
+            # This is a policy denial on ldap-authentication-flow: the outpost logs
+            # "Flow does not apply to current user" (FlowNonApplicableException) and
+            # every bind returns 49. Reproduced on test6 2026-09-15 by flipping the
+            # reputation binding to negate=False; it walks this exact path.
+            #
+            # v10.1.75: REPAIR it instead of naming it. This used to return an error
+            # string telling the operator to "check ldap-authentication-flow policy
+            # bindings" while _startup_fix_reputation_policy_drift() — the function
+            # that fixes precisely that — sat in the same file and ran only at console
+            # boot. So the 5-minute watchdog rediscovered the same break every tick,
+            # force-recreated the LDAP outpost each time, and never once ran the
+            # repair. Field report: mg1921 on v10.1.74-alpha, LDAP dead all day
+            # between two 04:00 console restarts.
+            _rep_fixed = False
+            try:
+                _rep_fixed = bool(_startup_fix_reputation_policy_drift())
+            except Exception as _rep_e:
+                print(f"  LDAP SA: reputation-binding repair error: {str(_rep_e)[:120]}", flush=True)
+            if _rep_fixed:
+                for _ra in range(5):
+                    time.sleep(6)
+                    if _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass) == 'ok':
+                        return True, ('LDAP bind verified after repairing the '
+                                      f'ldap-authentication-flow policy binding (attempt {_ra + 1})')
+            # Name the live bindings either way, so the next field report does not
+            # depend on the customer reading docker logs on our behalf.
+            _report = _authentik_ldap_flow_policy_report()
+            if _rep_fixed:
+                # The repair landed; the bind just hasn't caught up (600s policy/flow
+                # cache — see LDAP_SA_POLICY_REPAIR_GRACE_SECS). Mark it so the
+                # watchdog reports "recovery pending" rather than a hard failure.
+                try:
+                    _sp = load_settings()
+                    _sp['authentik_ldap_sa_policy_repair_at'] = time.time()
+                    save_settings(_sp)
+                except Exception:
+                    pass
+                return False, ('ldap-authentication-flow policy binding REPAIRED; bind not back '
+                               'yet — Authentik caches policy/flow results for 600s, so recovery '
+                               'lags the fix by minutes. Re-verifying next tick'
+                               + (f' — {_report}' if _report else ''))
+            return False, ('LDAP bind confirmed failing after API password set, and no repairable '
+                           'policy-binding drift was found'
+                           + (f' — {_report}' if _report else ''))
         # Inconclusive across all attempts. _ensure_ldapsearch() ran above, so this
         # is usually NOT a missing client — it's the outpost being mid-recreate/spiral
         # while we probe (e.g. the webadmin-sync tail recreates the LDAP container right

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.74-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.74-alpha)**
+**Current release: [v10.1.75-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.75-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.75-alpha — 2026-09-15 — The console now fixes the LDAP fault it could only describe
+
+**Headline: if the login link between Authentik and TAK Server broke in one particular way, the console noticed every five minutes, tried to fix it by resetting a password that was never the problem, failed, and told you to go and check something it could have checked itself. It now repairs the real cause. If you have been watching the Authentik LDAP container flicker red every few minutes, that was this.**
+
+**What was happening.** Authentik decides whether to allow an LDAP login by running it through a set of rules. One of those rules can drift into a state where it quietly rejects *everyone* — including the service account TAK Server uses to look up users and groups. When that happens, every login is refused as "invalid credentials" even though the password is perfectly correct.
+
+The console has a watchdog that checks this connection every five minutes. It correctly spotted the breakage. But its only repair was to reset the service account's password, which was never what was wrong — so it failed, logged a message telling you to go and check the rules yourself, and tried the exact same thing again five minutes later. Forever.
+
+Two things made that worse. The repair rebuilt Authentik's LDAP container on every attempt, so on an affected machine that container was being torn down and recreated every five minutes — which is what you would see as it flickering red on the Authentik page, and which could interrupt connected devices. And the console *already contained* the code to fix the real cause; it just only ever ran when the console restarted. Since that happens once a day in the small hours, a fault that appeared just after it could leave logins broken for the best part of a day.
+
+**What changed.** The watchdog now performs the actual repair itself instead of describing it, and confirms with a real login attempt that it worked. If something it cannot repair is blocking the connection, it now names the specific rule responsible in the log rather than pointing you at a general area to search. And if it genuinely cannot fix something, it stops retrying every five minutes and backs off to hourly, leaving the LDAP container alone instead of rebuilding it endlessly.
+
+**Worth knowing:** recovery is not instant. Authentik remembers its access decisions for about ten minutes, so after the fault is repaired there is a short wait before logins start working again. The console understands this and will tell you it is waiting rather than reporting a failure. If you are affected right now, updating is enough — it repairs itself without you doing anything.
 
 ### v10.1.74-alpha — 2026-09-15 — "Setup SSH key" no longer gets stuck on a question you cannot answer
 
