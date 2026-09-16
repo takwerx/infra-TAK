@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.75-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.75-alpha)**
+**Current release: [v10.1.76-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.76-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.76-alpha — 2026-09-16 — The console can finally repair a broken LDAP connection instead of reporting it fixed
+
+**Headline: if the credential the Authentik LDAP service uses to identify itself went stale, nothing in infra-TAK could replace it — while the console told you it had. Logins stayed broken with no way forward from the browser. This release makes that credential repairable, adds the button to fix it by hand, and lets the console fix it on its own.**
+
+**What was happening.** The component that answers TAK Server's user and group lookups holds its own credential for talking to Authentik. If that credential is replaced on the Authentik side, the copy infra-TAK keeps goes stale — and the component is then refused, never loads its settings, and every login fails no matter how correct anyone's password is.
+
+infra-TAK had code to write a fresh credential. It only ever worked the very first time, on a brand-new install: it looked for the specific word left in place before the first credential was written, and after that it silently matched nothing. It then reported **"token injected"** and rebuilt the component with the same dead credential. So the one operation meant to fix this always claimed success and never did anything.
+
+Two more gaps closed on top of it. The repair button existed, but only appeared if your Authentik ran on a separate machine — so the common setup, everything on one box, had no way to reach it. And nothing noticed the problem automatically: the health check that runs every five minutes saw only "logins are failing" and kept retrying two repairs that could not possibly help.
+
+**What changed.** The credential is now replaced whatever state it is in, and the console reports honestly when it changes nothing instead of claiming success. The **Fix LDAP token** button is available on every installation. And the five-minute health check now works out *which* fault it is looking at before choosing a repair — when it sees this one, it renews the credential itself. On our test machines a deliberately broken installation recovered on its own in **about twelve seconds**, with no one touching it.
+
+**Worth knowing:** if you are affected, updating is enough — the console repairs it without you doing anything. This is a different fault from the one fixed in v10.1.75, though it looked identical in the logs; if that release did not help you, this one should.
 
 ### v10.1.75-alpha — 2026-09-15 — The console now fixes the LDAP fault it could only describe
 

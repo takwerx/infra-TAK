@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.76-alpha"
+VERSION = "10.1.77-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -46841,8 +46841,12 @@ import re as _re
 safe = key.replace("'", "''")
 if "AUTHENTIK_TOKEN: placeholder" in content:
     content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
-elif _re.search(r"AUTHENTIK_TOKEN: '.*'", content):
-    content = _re.sub(r"AUTHENTIK_TOKEN: '.*'", "AUTHENTIK_TOKEN: '" + safe + "'", content)
+elif _re.search(r"(?m)^[ \t]+AUTHENTIK_TOKEN:[ \t]*.+$", content):
+    # v10.1.76: the old pattern matched only a QUOTED token, but the deploy path
+    # writes them UNQUOTED \u2014 so a stale unquoted token slipped through both
+    # branches and fell to the "no AUTHENTIK_TOKEN line" error below.
+    content = _re.sub(r"(?m)^([ \t]+)AUTHENTIK_TOKEN:[ \t]*.+$",
+                      lambda m: m.group(1) + "AUTHENTIK_TOKEN: '" + safe + "'", content)
 else:
     print("ERROR: docker-compose.yml has no AUTHENTIK_TOKEN line to patch", file=sys.stderr)
     sys.exit(6)
@@ -46882,59 +46886,15 @@ def authentik_fix_ldap_token():
             return jsonify({'success': True, 'message': 'LDAP token injected and container recreated. LDAP may take 30–60s to show healthy.'})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
-    # Local: same logic as deploy token injection
-    ak_dir = os.path.expanduser('~/authentik')
-    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if not os.path.isfile(compose_path):
-        return jsonify({'success': False, 'error': 'docker-compose.yml not found'}), 400
-    ak_url = 'http://127.0.0.1:9090'
-    try:
-        env_path = os.path.join(ak_dir, '.env')
-        bootstrap_token = None
-        if os.path.isfile(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                        bootstrap_token = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
-                        break
-                    if line.strip().startswith('AUTHENTIK_TOKEN=') and bootstrap_token is None:
-                        bootstrap_token = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
-        if not bootstrap_token:
-            return jsonify({'success': False, 'error': 'No AUTHENTIK_BOOTSTRAP_TOKEN in .env'}), 400
-        headers = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
-        req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP', headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            results = json.loads(resp.read().decode()).get('results', [])
-        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-        if not ldap_outpost:
-            return jsonify({'success': False, 'error': 'LDAP outpost not found'}), 400
-        outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-        if not outpost_token_id:
-            req2 = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=headers)
-            with urllib.request.urlopen(req2, timeout=10) as r2:
-                detail = json.loads(r2.read().decode())
-            outpost_token_id = detail.get('token_identifier') or detail.get('token')
-        if not outpost_token_id:
-            return jsonify({'success': False, 'error': 'No token_identifier on outpost'}), 400
-        req3 = urllib.request.Request(f'{ak_url}/api/v3/core/tokens/{outpost_token_id}/view_key/', headers=headers, method='GET')
-        with urllib.request.urlopen(req3, timeout=10) as r3:
-            ldap_token_key = json.loads(r3.read().decode()).get('key', '')
-        if not ldap_token_key:
-            return jsonify({'success': False, 'error': 'No key from view_key'}), 400
-        with open(compose_path, 'r') as f:
-            compose_text = f.read()
-        if 'AUTHENTIK_TOKEN: placeholder' not in compose_text:
-            return jsonify({'success': False, 'error': 'Compose already has token or no placeholder'}), 400
-        compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
-        with open(compose_path, 'w') as f:
-            f.write(compose_text)
-        subprocess.run('cd {} && docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap'.format(ak_dir), shell=True, capture_output=True, timeout=90)
-        return jsonify({'success': True, 'message': 'LDAP token injected and container recreated. LDAP may take 30–60s to show healthy.'})
-    except urllib.error.HTTPError as e:
-        return jsonify({'success': False, 'error': 'API {}: {}'.format(e.code, e.read().decode()[:200])}), 500
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]}), 500
-
+    # Local: v10.1.76 — goes through the SAME helper the watchdog uses, so the
+    # manual button and the automatic repair cannot drift apart. The old inline
+    # copy refused unless compose still held the literal string 'placeholder',
+    # so a STALE token (the actual field case) had no repair path at all.
+    ok, msg = _repair_ldap_outpost_token(plog_fn=lambda m: None)
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True,
+                    'message': msg + '. LDAP may take 30–60s to show healthy.'})
 
 @app.route('/api/authentik/compose-heal', methods=['POST'])
 @login_required
@@ -49006,8 +48966,12 @@ networks:
             plog("  ⚠ LDAP outpost not found after 5 min — token injection skipped")
     if ldap_token_key:
         try:
-            safe_key = ldap_token_key.replace("'", "''")
-            patched_compose = compose_content.replace('AUTHENTIK_TOKEN: placeholder', f"AUTHENTIK_TOKEN: '{safe_key}'")
+            # v10.1.76: replace whatever token is there, not only the literal
+            # 'placeholder' — see _set_ldap_outpost_token_in_compose.
+            patched_compose, _rtok_changed, _rtok_detail = \
+                _set_ldap_outpost_token_in_compose(compose_content, ldap_token_key)
+            if not _rtok_changed:
+                plog(f"  ℹ LDAP token unchanged on remote ({_rtok_detail})")
             with open('/tmp/authentik_remote_compose.yml', 'w') as f:
                 f.write(patched_compose)
             ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -55960,6 +55924,34 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                           f"(LDAP outpost left alone meanwhile). Last cause: "
                           f"{(_settings.get('authentik_ldap_sa_heal_last_error') or 'unknown')[:200]}",
                           flush=True)
+                elif _ldap_outpost_token_rejected():
+                    # v10.1.76: identify the CAUSE before picking a repair. A 403'd
+                    # outpost never loads its provider config, so every bind fails and
+                    # neither of the other repairs can possibly help — they reset a
+                    # password that was never wrong and rebuild the outpost onto the
+                    # same dead token, every 5 minutes, forever. That is exactly what
+                    # v10.1.75 did on mg1921's box while reporting the policy bindings
+                    # were fine (they were).
+                    print("[ldap-sa-watchdog] LDAP outpost REFUSED by the Authentik API "
+                          "(403 Token invalid/expired) — repairing the outpost token, "
+                          "not the service-account password", flush=True)
+                    try:
+                        _tok_ok, _tok_msg = _repair_ldap_outpost_token(
+                            plog_fn=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True))
+                    except Exception as _te:
+                        _tok_ok, _tok_msg = False, str(_te)[:160]
+                    if _tok_ok:
+                        print(f"[ldap-sa-watchdog] {_tok_msg} — re-verifying next tick", flush=True)
+                        try:
+                            _s4 = load_settings()
+                            _s4['authentik_ldap_sa_heal_failures'] = 0
+                            _s4['authentik_ldap_sa_heal_next_attempt'] = 0
+                            save_settings(_s4)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"[ldap-sa-watchdog] LDAP outpost token repair FAILED: {_tok_msg}", flush=True)
+                        _record_ldap_sa_heal_failure(f'outpost token repair failed: {_tok_msg}')
                 else:
                     print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
                     try:
@@ -58559,10 +58551,18 @@ entries:
                                         if ldap_token_key:
                                             with open(compose_path, 'r') as f:
                                                 compose_text = f.read()
-                                            compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
-                                            with open(compose_path, 'w') as f:
-                                                f.write(compose_text)
-                                            plog(f"  ✓ LDAP outpost token injected into docker-compose.yml")
+                                            compose_text, _tok_changed, _tok_detail = \
+                                                _set_ldap_outpost_token_in_compose(compose_text, ldap_token_key, quote=False)
+                                            # v10.1.76: report the TRUTH. This used to str.replace a literal
+                                            # 'placeholder' and log success unconditionally — a no-op on any box
+                                            # whose token had rotated, which then rebuilt the outpost onto the
+                                            # same dead token and reported it as done.
+                                            if _tok_changed:
+                                                with open(compose_path, 'w') as f:
+                                                    f.write(compose_text)
+                                                plog(f"  ✓ LDAP outpost token injected into docker-compose.yml ({_tok_detail})")
+                                            else:
+                                                plog(f"  ℹ LDAP outpost token unchanged ({_tok_detail})")
                                             plog(f"  Recreating LDAP container with new token...")
                                             _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
                                             plog(f"  ✓ LDAP container recreated with injected token")
@@ -60105,6 +60105,162 @@ def _ensure_ldap_flow_authentication_none():
     time.sleep(5)
     return True, None
 
+_LDAP_TOKEN_LINE_RE = re.compile(r'^(?P<indent>[ \t]+)AUTHENTIK_TOKEN:[ \t]*(?P<val>.*?)[ \t]*$')
+
+
+def _set_ldap_outpost_token_in_compose(compose_text, token, quote=True):
+    """v10.1.76: write the LDAP outpost's API token into docker-compose.yml,
+    replacing WHATEVER value is there now.
+
+    Every injection site used to do
+
+        compose_text.replace('AUTHENTIK_TOKEN: placeholder', ...)
+
+    which is a SILENT NO-OP the moment compose holds any real-looking value —
+    `str.replace` on a non-matching needle returns the original string. The
+    caller then logged "\u2713 LDAP outpost token injected" and recreated the
+    container with the same dead token. So a token that had been revoked or
+    rotated in Authentik (an outpost recreated by a blueprint reconcile, say)
+    could never be repaired by anything we ship: the outpost sits on
+    `403 Forbidden (Token invalid/expired)`, never loads its provider config,
+    and EVERY LDAP bind fails \u2014 while the console reports success.
+    Field report: mg1921, v10.1.75-alpha, 2026-09-16.
+
+    Scoped to the `ldap:` service block so it can never touch another service's
+    token. Returns (new_text, changed, detail) \u2014 `changed` is the truth the
+    callers must log, instead of asserting success unconditionally.
+    """
+    if not token:
+        return compose_text, False, 'no token supplied'
+    lines = compose_text.splitlines(keepends=True)
+    start = end = None
+    for i, ln in enumerate(lines):
+        if start is None:
+            if re.match(r'^  ldap:\s*$', ln):
+                start = i
+            continue
+        if re.match(r'^  \S', ln):
+            end = i
+            break
+    if start is None:
+        return compose_text, False, 'no ldap service block in compose'
+    if end is None:
+        end = len(lines)
+    new_val = ("'" + str(token).replace("'", "''") + "'") if quote else str(token)
+    for i in range(start, end):
+        _raw = lines[i].rstrip('\n').rstrip('\r')
+        m = _LDAP_TOKEN_LINE_RE.match(_raw)
+        if not m:
+            continue
+        old = (m.group('val') or '').strip()
+        if old.strip('\'"') == str(token):
+            return compose_text, False, 'token already current'
+        _nl = '\n' if lines[i].endswith('\n') else ''
+        lines[i] = f"{m.group('indent')}AUTHENTIK_TOKEN: {new_val}{_nl}"
+        _shown = old.strip('\'"')
+        _was = 'placeholder' if _shown == 'placeholder' else ((_shown[:8] + '\u2026') if _shown else '(empty)')
+        return ''.join(lines), True, f'replaced {_was}'
+    return compose_text, False, 'no AUTHENTIK_TOKEN line in the ldap service block'
+
+
+def _ldap_outpost_token_rejected(since='180s'):
+    """v10.1.76: is the LDAP outpost being REFUSED by the Authentik API?
+
+    Signature \u2014 field-confirmed on a customer box 2026-09-16 and reproduced on
+    test6 the same day:
+
+        {"error":"403 Forbidden  (Token invalid/expired)",
+         "event":"Failed to fetch outpost configuration, retrying in 3 seconds",
+         "logger":"authentik.outpost.ak-api-controller"}
+
+    An outpost in this state never loads its provider config, so every bind
+    fails no matter how correct the service-account password or the flow's
+    policy bindings are. The SA-bind watchdog used to see only "the bind
+    failed" and kept running two repairs that cannot possibly help \u2014 resetting a
+    password that was never wrong and rebuilding the outpost onto the same dead
+    token. Read-only; returns True ONLY on the explicit signature, never a guess.
+    """
+    try:
+        settings = load_settings()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+                                 f'docker logs authentik-ldap-1 --since {since} 2>&1', timeout=20)
+            log = (out or '') if ok else ''
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', since]),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+            log = r.stdout or ''
+    except Exception:
+        return False
+    low = log.lower()
+    return ('failed to fetch outpost configuration' in low
+            and ('token invalid' in low or '403 forbidden' in low))
+
+
+def _repair_ldap_outpost_token(plog_fn=None):
+    """v10.1.76: re-read the LDAP outpost's real token from Authentik, write it
+    into docker-compose.yml, and recreate the outpost container.
+
+    Shared by the operator's "Fix LDAP token" button and the SA-bind watchdog so
+    the manual and automatic paths cannot drift apart. Local installs only \u2014 a
+    remote Authentik is repaired by _AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT, and this
+    says so rather than pretending. Returns (ok, msg).
+    """
+    _log = plog_fn or (lambda m: None)
+    import urllib.request as _req
+    import urllib.error as _uerr
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+        return False, 'Authentik is remote \u2014 use the Fix LDAP token button (runs the remote repair script)'
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.isfile(compose_path):
+        return False, 'docker-compose.yml not found'
+    bootstrap = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not bootstrap:
+        return False, 'no AUTHENTIK_BOOTSTRAP_TOKEN in .env'
+    url = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {bootstrap}', 'Content-Type': 'application/json'}
+
+    def _get(path):
+        return json.loads(_req.urlopen(
+            _req.Request(f'{url}/api/v3/{path}', headers=headers), timeout=15).read().decode())
+
+    try:
+        results = _get('outposts/instances/?search=LDAP').get('results', [])
+        outpost = next((o for o in results
+                        if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+        if not outpost:
+            return False, 'LDAP outpost not found in Authentik'
+        tok_id = outpost.get('token_identifier') or outpost.get('token')
+        if not tok_id:
+            tok_id = (_get(f"outposts/instances/{outpost['pk']}/").get('token_identifier')
+                      or _get(f"outposts/instances/{outpost['pk']}/").get('token'))
+        if not tok_id:
+            return False, 'outpost has no token_identifier'
+        key = _get(f'core/tokens/{tok_id}/view_key/').get('key', '')
+        if not key:
+            return False, 'view_key returned no key'
+        with open(compose_path) as _f:
+            compose_text = _f.read()
+        new_text, changed, detail = _set_ldap_outpost_token_in_compose(compose_text, key)
+        if not changed:
+            return False, f'compose not updated ({detail})'
+        with open(compose_path, 'w') as _f:
+            _f.write(new_text)
+        _log(f'LDAP outpost token rewritten in compose ({detail})')
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']),
+                       cwd=ak_dir, capture_output=True, timeout=90)
+        return True, f'LDAP outpost token repaired ({detail}); container recreated'
+    except _uerr.HTTPError as e:
+        return False, f'Authentik API {e.code}'
+    except Exception as e:
+        return False, str(e)[:160]
+
+
 def _authentik_ldap_flow_policy_report():
     """v10.1.75: name the policy bindings on ldap-authentication-flow.
 
@@ -60269,6 +60425,14 @@ def _ensure_authentik_ldap_service_account():
                                       f'ldap-authentication-flow policy binding (attempt {_ra + 1})')
             # Name the live bindings either way, so the next field report does not
             # depend on the customer reading docker logs on our behalf.
+            # v10.1.76: if the outpost cannot authenticate to the API at all, say so
+            # — the policy bindings are irrelevant in that state and reporting them
+            # sends the reader down the wrong path (it did, on 2026-09-16).
+            if _ldap_outpost_token_rejected():
+                return False, ('LDAP outpost is being REFUSED by the Authentik API '
+                               '(403 Token invalid/expired) — its token is stale, so it never '
+                               'loads its provider config and no bind can succeed. Fix LDAP token '
+                               'on the Authentik page repairs this; the watchdog also retries it.')
             _report = _authentik_ldap_flow_policy_report()
             if _rep_fixed:
                 # The repair landed; the bind just hasn't caught up (600s policy/flow
