@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.77-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.77-alpha)**
+**Current release: [v10.1.78-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.78-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.78-alpha — 2026-09-18 — TAK Client Feed now works when your database lives somewhere else
+
+**Headline: the TAK Client Feed released yesterday could not see your channels if your TAK Server's database is on another machine or in a managed cloud database. It reported "No TAK channels found" while the server was fine. That is fixed, and the feed now tells you the real reason on the rare occasion it cannot reach the database.**
+
+**What was happening.** The feed asked the database the way a single-server install does: through the PostgreSQL service on the same box. On a split deployment (TAK Server on one machine, PostgreSQL on another) or a managed database (Amazon RDS, Azure Database for PostgreSQL), there is no local PostgreSQL to ask. The query failed, the feed treated a failure as an empty list, and the console blamed TAK Server.
+
+**The fix.** The feed now reaches the database the same way TAK Server itself does. It reads the connection TAK Server is configured with and, when that points somewhere else, connects there over the network with the same credentials, encrypted. Single-server and container installs are unchanged.
+
+**Honest errors.** If the database genuinely cannot be reached, the console shows the actual error instead of guessing, and a partner agency pulling the feed gets a clear "unavailable" response rather than an empty map that looks like nobody is on shift.
+
+> **Upgrade note.** Nothing to do beyond updating. If you removed the feed because it showed no channels, deploy it again and your channels will be there.
 
 ### v10.1.77-alpha — 2026-09-18 — Hand another agency your live ATAK picture, and take it back whenever you want
 

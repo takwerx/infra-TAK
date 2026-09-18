@@ -320,12 +320,19 @@ def _objectid(client_id):
 # ── TAK channel resolution ────────────────────────────────────────────────────
 
 def list_channels(ctx):
-    """[{name, bitpos}] from TAK's groups table. Fixed SQL, no interpolation."""
-    r = ctx['_pg_exec'](['psql', 'cot', '-tAF', '\t', '-c',
-                         "SELECT name, bitpos FROM groups WHERE type = 1 ORDER BY name;"],
-                        timeout=15)
+    """[{name, bitpos}] from TAK's groups table. Fixed SQL, no interpolation.
+
+    Raises RuntimeError when the database cannot be queried. v10.1.77 returned []
+    on any failure, so a split box or a managed-DB box (RDS / Azure) rendered
+    "No TAK channels found - is TAK Server running?" while TAK Server was up and
+    serving from a database this module simply could not reach (CORAZ, 2026-09-18).
+    An empty list now means exactly one thing: the groups table has no channels."""
+    r = ctx['_cot_pg_exec'](['psql', 'cot', '-tAF', '\t', '-c',
+                             "SELECT name, bitpos FROM groups WHERE type = 1 ORDER BY name;"],
+                            timeout=15)
     if r.returncode != 0:
-        return []
+        raise RuntimeError(((r.stderr or r.stdout or '').strip()
+                            or 'psql exited %s' % r.returncode)[:300])
     out = []
     for line in (r.stdout or '').strip().splitlines():
         if '\t' not in line:
@@ -387,7 +394,7 @@ def _is_eud(platform):
 def snapshot(ctx, bitpos_list, stale_minutes, channel_names=None):
     """Latest position per connected ATAK client in the given channels.
 
-    SECURITY: _pg_exec's invariant is that no attacker-controlled SQL reaches it.
+    SECURITY: _cot_pg_exec's invariant is that no attacker-controlled SQL reaches it.
     Everything interpolated below is an int() we produced — bit positions read
     from TAK's own groups table, and a clamped stale window. Channel NAMES are
     resolved to integers in Python and never touch the SQL string.
@@ -420,9 +427,10 @@ def snapshot(ctx, bitpos_list, stale_minutes, channel_names=None):
             "  ORDER BY uid, servertime DESC"
             ") t;" % (mins, pred)
         )
-        r = ctx['_pg_exec'](['psql', 'cot', '-tA', '-c', sql], timeout=20)
+        r = ctx['_cot_pg_exec'](['psql', 'cot', '-tA', '-c', sql], timeout=20)
         if r.returncode != 0:
-            return []
+            raise RuntimeError(((r.stderr or r.stdout or '').strip()
+                                or 'psql exited %s' % r.returncode)[:300])
         try:
             rows = json.loads((r.stdout or '').strip() or '[]')
         except Exception:
@@ -756,7 +764,7 @@ def detect(ctx):
         except Exception:
             tokens = 0
         try:
-            r = ctx['_pg_exec'](['psql', 'cot', '-tAc', 'SELECT 1'], timeout=8)
+            r = ctx['_cot_pg_exec'](['psql', 'cot', '-tAc', 'SELECT 1'], timeout=8)
             running = (r.returncode == 0)
         except Exception:
             running = False
@@ -775,7 +783,7 @@ def deploy(ctx, job, params):
         if not os.path.isdir('/opt/tak') and not os.path.exists('/opt/tak'):
             plog('⚠ TAK Server not detected on this host — the feed will return '
                  'no features until TAK Server is installed.')
-        r = ctx['_pg_exec'](['psql', 'cot', '-tAc', 'SELECT count(*) FROM groups'], timeout=10)
+        r = ctx['_cot_pg_exec'](['psql', 'cot', '-tAc', 'SELECT count(*) FROM groups'], timeout=10)
         if r.returncode == 0:
             plog('   ✓ cot DB reachable — %s channels visible' % (r.stdout or '').strip())
         else:
@@ -861,10 +869,14 @@ def register(ctx):
 
     def tokens_view():
         store = _load_store(ctx)
-        known = {c['name'] for c in list_channels(ctx)}
+        try:
+            known = {c['name'] for c in list_channels(ctx)}
+        except RuntimeError:
+            known = None    # DB unreachable: unknown is not the same as vanished
         out = []
         for t in store['tokens']:
-            missing = [c for c in (t.get('channels') or []) if c not in known]
+            missing = [c for c in (t.get('channels') or [])
+                       if known is not None and c not in known]
             _lp_ts, _lp_ip, _lp_n = merge_pull_stats(t)
             out.append({
                 'id': t.get('id'), 'label': t.get('label'),
@@ -954,9 +966,13 @@ def register(ctx):
         entry = next((t for t in _load_store(ctx)['tokens'] if t.get('id') == tid), None)
         if not entry:
             return jsonify({'success': False, 'error': 'No such token'}), 404
-        bits, missing = _resolve_bitpos(ctx, entry.get('channels'))
-        feats = snapshot(ctx, bits, entry.get('stale_minutes') or DEFAULT_STALE_MINUTES,
-                         entry.get('channels'))
+        try:
+            bits, missing = _resolve_bitpos(ctx, entry.get('channels'))
+            feats = snapshot(ctx, bits, entry.get('stale_minutes') or DEFAULT_STALE_MINUTES,
+                             entry.get('channels'))
+        except RuntimeError as e:
+            return jsonify({'success': False,
+                            'error': 'cot database unavailable: %s' % str(e)[:200]}), 503
         return jsonify({'success': True, 'count': len(feats),
                         'missing_channels': missing,
                         'sample': query_json(entry, feats[:5], {})})

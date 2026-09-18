@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.78-alpha"
+VERSION = "10.1.79-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -15166,6 +15166,135 @@ def _read_martiuser_password_from_local_coreconfig():
     except Exception:
         pass
     return '', 'martiuser password not found in local CoreConfig.xml'
+
+
+def _psql_client_bin():
+    """A REAL psql client binary for TCP connections to a remote cot database.
+
+    Versioned binaries first, the bare `psql` on PATH last. On Debian/Ubuntu
+    /usr/bin/psql is pg_wrapper: it picks the version from the default LOCAL
+    cluster and dies with "Invalid data directory for cluster 15 main" on a box
+    whose database lives somewhere else (CORAZ, Azure managed PG, 2026-09-18).
+    On RHEL the PGDG client is /usr/pgsql-<v>/bin/psql and is not on PATH at
+    all ([[rhel-pgdg-binaries-not-on-path]]). Newest version wins; '' if none.
+    """
+    import glob as _glob
+    cands = [c for pat in ('/usr/lib/postgresql/*/bin/psql', '/usr/pgsql-*/bin/psql')
+             for c in _glob.glob(pat) if os.access(c, os.X_OK)]
+
+    def _ver(p):
+        m = re.search(r'(\d+)', p.split('/')[-3])
+        return int(m.group(1)) if m else 0
+    if cands:
+        return max(cands, key=_ver)
+    return shutil.which('psql') or ''
+
+
+_COT_CONN_CACHE = {'ts': 0.0, 'val': None}
+
+
+def _cot_conn_params():
+    """(host, port, dbname, user, password) TAK Server itself uses for its CoT
+    database: the <connection> element of the live CoreConfig.xml, which is what
+    the JVM authenticates with, so it is right on a split box AND on a managed
+    endpoint (RDS / Azure) that has no local postgres at all. Saved tak_deployment
+    settings fill any gap. Password is XML-unescaped (TAK's JDBC decodes &amp;).
+    Cached 30 s because the feed path resolves channels on every consumer pull."""
+    now = time.time()
+    c = _COT_CONN_CACHE
+    if c['val'] is not None and (now - c['ts']) < 30:
+        return c['val']
+    host = port = db = user = pw = ''
+    try:
+        cc = _read_coreconfig() or ''
+    except Exception:
+        cc = ''
+    m = re.search(r'<connection\b[^>]*\burl\s*=\s*["\']jdbc:postgresql://[^"\']*["\'][^>]*>', cc)
+    if m:
+        elem = m.group(0)
+        u = re.search(r'jdbc:postgresql://([^:/"\'?]+)(?::(\d+))?/([A-Za-z0-9_]+)', elem)
+        if u:
+            host, port, db = u.group(1), (u.group(2) or ''), u.group(3)
+        un = re.search(r'\busername\s*=\s*["\']([^"\']*)["\']', elem)
+        pm = re.search(r'\bpassword\s*=\s*["\']([^"\']*)["\']', elem)
+        user = html.unescape(un.group(1)) if un else ''
+        pw = html.unescape(pm.group(1)) if pm else ''
+    try:
+        cfg = _get_tak_deployment_config(load_settings())
+    except Exception:
+        cfg = {}
+    if cfg.get('mode') == 'external_db':
+        edb = cfg.get('external_db') or {}
+        host = host or (edb.get('host') or '')
+        port = port or str(edb.get('port') or '')
+        db = db or (edb.get('name') or '')
+        user = user or (edb.get('user') or '')
+        pw = pw or (edb.get('password') or '')
+    elif cfg.get('mode') == 'two_server':
+        host = host or ((cfg.get('server_one') or {}).get('host') or '')
+        port = port or str((cfg.get('database') or {}).get('port') or '')
+        pw = pw or ((cfg.get('database') or {}).get('password') or '')
+    try:
+        port_i = int(port or 5432)
+    except (TypeError, ValueError):
+        port_i = 5432
+    val = (host.strip(), port_i, (db or 'cot').strip(), (user or 'martiuser').strip(), pw)
+    c['ts'], c['val'] = now, val
+    return val
+
+
+def _cot_pg_exec(args, timeout=30):
+    """Run psql against TAK's CoT database WHEREVER it lives: the ONE seam module
+    code may use for cot SQL. Same argv shape as _pg_exec: ['psql', 'cot', <flags>].
+
+    Topologies (v10.1.78, field report from CORAZ 2026-09-18):
+      local      native single-server: peer auth as the postgres OS user (_pg_exec)
+      container  the cot DB lives in the takserver-db container (_pg_exec -> docker exec)
+      remote     split/two-server DB on Server One, or a managed RDS / Azure endpoint:
+                 TCP with the credentials TAK itself uses, password via the environment
+                 (never argv), TLS negotiated by psql's default sslmode=prefer, which
+                 every managed provider requires.
+    The TAK Client Feed queried peer-auth unconditionally, so every remote-DB box
+    answered "No TAK channels found - is TAK Server running?" for a database that was
+    up and serving TAK Server the whole time. Returns a CompletedProcess in every
+    case; a non-zero returncode carries a human-readable stderr.
+
+    SECURITY INVARIANT (inherited from _pg_exec): console-authored, fixed SQL only.
+    The remote branch runs psql directly, so the broker's SQL blocklist is NOT in the
+    path; nothing request-derived may reach this function.
+    """
+    mode, _host, _port = _tak_db_topology()
+    if mode != 'remote':
+        return _pg_exec(args, timeout=timeout)
+    args = list(args)
+    tool = args[0] if args else 'psql'
+    rest = args[1:]
+    if rest and rest[0] == 'cot':
+        rest = rest[1:]
+
+    def _fail(code, msg):
+        return subprocess.CompletedProcess(args, code, stdout='', stderr=msg)
+    if tool != 'psql':
+        return _fail(2, f'{tool}: only psql is supported against a remote cot database')
+    host, port, db, user, pw = _cot_conn_params()
+    if not host:
+        return _fail(2, 'remote cot database: no <connection url="jdbc:postgresql://..."> in '
+                        'CoreConfig.xml and no saved endpoint in TAK deployment settings')
+    if not pw:
+        return _fail(2, f'remote cot database {host}:{port}: no password for {user} in '
+                        'CoreConfig.xml or TAK deployment settings')
+    psql = _psql_client_bin()
+    if not psql:
+        return _fail(127, 'no PostgreSQL client on this box: install postgresql-client '
+                          '(Debian/Ubuntu) or postgresql (RHEL/Rocky) and retry')
+    env = dict(os.environ, PGPASSWORD=pw, PGCONNECT_TIMEOUT=str(max(2, min(int(timeout), 10))))
+    argv = [psql, '-X', '-h', host, '-p', str(port), '-U', user, '-d', db] + rest
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return _fail(124, f'timed out after {timeout}s talking to {host}:{port}')
+    except OSError as e:
+        return _fail(127, f'could not run {psql}: {e}')
 
 
 @app.route('/api/guarddog/deploy-health-agent', methods=['POST'])
@@ -82838,6 +82967,7 @@ _MODULE_CTX = {
     # clientfeed seams (v10.1.76) — the cot DB reader, the private config dir the
     # token store lives in (0600), and the audit writer for mint/revoke events.
     '_pg_exec': _pg_exec,
+    '_cot_pg_exec': _cot_pg_exec,   # v10.1.78: local / container / split / managed (RDS, Azure)
     'CONFIG_DIR': CONFIG_DIR,
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
@@ -82944,10 +83074,17 @@ def feed_token_required(fn):
 def _feed_features(mod, entry):
     """Channel NAMES -> int bit positions -> snapshot. A channel that no longer
     resolves contributes nothing; it never widens scope to 'all channels'."""
-    bits, _missing = mod._resolve_bitpos(_MODULE_CTX, entry.get('channels'))
-    return mod.snapshot(_MODULE_CTX, bits,
-                        entry.get('stale_minutes') or mod.DEFAULT_STALE_MINUTES,
-                        entry.get('channels'))
+    from flask import abort as _abort
+    try:
+        bits, _missing = mod._resolve_bitpos(_MODULE_CTX, entry.get('channels'))
+        return mod.snapshot(_MODULE_CTX, bits,
+                            entry.get('stale_minutes') or mod.DEFAULT_STALE_MINUTES,
+                            entry.get('channels'))
+    except RuntimeError as e:
+        # v10.1.78: the cot database is unreachable. Say so (503) rather than serve
+        # an empty layer: "no units on the map" is a lie an agency would act on.
+        print(f'[clientfeed] cot database unavailable: {e}', flush=True)
+        _abort(503, description='TAK database unavailable')
 
 
 # ArcGIS clients do not just fetch the service — they first classify it from the URL

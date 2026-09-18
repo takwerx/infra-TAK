@@ -194,14 +194,19 @@ async function startDeploy(){
 }
 {% else %}
 let CHANNELS = [];
+let CHANNELS_ERR = '';       // why the channel list is empty, when it is a failure and not "none yet"
 let TOKENS = [];
 let EDIT_ID = null;          // null = minting a new token; otherwise editing this one
 
 function tok(id){ return TOKENS.find(t => t.id === id); }
 
 async function loadChannels(){
-  try{ const r = await fetch('/api/clientfeed/channels'); CHANNELS = (await r.json()).channels || []; }
-  catch(e){ CHANNELS = []; }
+  CHANNELS_ERR = '';
+  try{
+    const d = await (await fetch('/api/clientfeed/channels')).json();
+    CHANNELS = d.channels || [];
+    if(d.success === false) CHANNELS_ERR = d.error || 'unknown error';
+  }catch(e){ CHANNELS = []; CHANNELS_ERR = 'console request failed: ' + (e && e.message ? e.message : e); }
 }
 
 async function loadTokens(){
@@ -264,7 +269,9 @@ function renderChannels(selected){
   pick.innerHTML = CHANNELS.length
     ? CHANNELS.map(c => '<label><input type="checkbox" value="'+esc(c.name)+'"'
         + ((selected||[]).includes(c.name) ? ' checked' : '') + '>' + esc(c.name) + '</label>').join('')
-    : '<span style="color:var(--red);font-size:12px;padding:8px;display:block">No TAK channels found — is TAK Server running on this box?</span>';
+    : '<span style="color:var(--red);font-size:12px;padding:8px;display:block">' + (CHANNELS_ERR
+        ? 'Could not read TAK channels from the cot database: ' + esc(CHANNELS_ERR)
+        : 'No TAK channels found — TAK Server has not created any channels yet.') + '</span>';
 }
 
 async function openMint(){
