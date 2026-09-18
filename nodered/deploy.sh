@@ -827,6 +827,25 @@ PYEOF
       echo "    settings.js: contextStorage already present ✓"
     fi
   fi
+  # Ensure crypto + url are exposed to function nodes. A function node cannot call
+  # require() unless the module is in functionGlobalContext, and the PulsePoint
+  # "Fetch + decode" node needs crypto (AES-256-CBC + MD5 key derivation) and url.
+  # Without these it threw "require is not defined" on every poll, on every box.
+  if ! grep -q 'nodeCrypto' "$NR_SETTINGS_HOST" 2>/dev/null; then
+    python3 - "$NR_SETTINGS_HOST" << 'PYEOF' 2>/dev/null || true
+import sys, re
+f = sys.argv[1]
+src = open(f).read()
+src2 = re.sub(r'(functionGlobalContext\s*:\s*\{)',
+              r'\1\n    nodeCrypto: require("crypto"),\n    nodeUrl: require("url"),', src)
+if src2 != src:
+    open(f, 'w').write(src2)
+    print('    nodeCrypto + nodeUrl added to functionGlobalContext')
+PYEOF
+    echo "    settings.js: crypto + url in functionGlobalContext OK"
+  else
+    echo "    settings.js: crypto + url in functionGlobalContext already present OK"
+  fi
   # Ensure fs is exposed to function nodes (patch host file directly — it's volume-mounted)
   if ! grep -q 'fs: require' "$NR_SETTINGS_HOST" 2>/dev/null && ! grep -q 'fs:require' "$NR_SETTINGS_HOST" 2>/dev/null; then
     python3 - "$NR_SETTINGS_HOST" << 'PYEOF' 2>/dev/null || true

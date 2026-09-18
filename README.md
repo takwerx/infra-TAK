@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.76-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.76-alpha)**
+**Current release: [v10.1.77-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.77-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.77-alpha — 2026-09-18 — Hand another agency your live ATAK picture, and take it back whenever you want
+
+**Headline: a new TAK Client Feed module publishes the ATAK clients connected to your server as a standard REST feed that any mapping system can pull — scoped to the channels you choose, with a separate revocable key per agency. Plus a round of PulsePoint fixes, including one that was quietly polling at half the rate you asked for.**
+
+**TAK Client Feed.** Mutual-aid partners and CAD vendors routinely ask for your unit positions, and until now the answer involved building something bespoke. This module gives you a URL. You pick which of your TAK channels it exposes, mint a key for each agency, and hand it over — it works in ArcGIS Online, ArcGIS Pro, QGIS, or anything that speaks REST or GeoJSON, with no account or software needed on their side.
+
+Every key is independent. Revoke one agency and the others keep working, instantly, with nothing to restart. You can re-issue a key if someone needs a fresh one without tearing down their integration, and you can see how many times each key has been used and from where.
+
+What goes out is deliberately narrow: callsign, team, role, position, and a device identifier that is scrambled per installation. No usernames, no raw device IDs. What goes out is **only** the channels you selected — a key cannot see anything else on your server, and a channel you later remove stops appearing.
+
+The feed is protected the same way the rest of the console is. Keys are stored only as fingerprints, never in readable form. Repeated bad keys get the requesting address banned automatically. A wrong key and an unknown address get the same answer, so the feed gives nothing away to someone guessing.
+
+**PulsePoint: the poll rate was half what you configured.** If you set a feed to check every 15 seconds, it checked every 30. The check that stops a feed polling too fast was measuring from the wrong moment and threw away every other attempt. Worse, the marker's expiry time was calculated from the rate you *asked for* while the feed actually ran at half that — so an incident could expire on your device at the exact moment its refresh arrived, making calls flicker or vanish mid-incident. Both are fixed; a feed set to 15 seconds now checks every 15 seconds.
+
+A feed that never had a poll interval set was also polling every two minutes while marking its incidents stale after 75 seconds — permanently expired between checks. Those two numbers now agree.
+
+**PulsePoint: the incident icon shows the icon.** The configurator displayed the *filename* of your chosen icon instead of the picture whenever you reopened a saved feed. It now shows the icon, and clears it properly when you switch to a feed that has none.
+
+> **Upgrade note — re-activate your PulsePoint feeds.** The poll-rate fix does not apply itself to feeds you have already created. After updating, open each PulsePoint feed in the configurator and press **Save & Activate**. Until you do, that feed keeps running at its old rate and looks perfectly healthy while doing it.
 
 ### v10.1.76-alpha — 2026-09-16 — The console can finally repair a broken LDAP connection instead of reporting it fixed
 

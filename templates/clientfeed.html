@@ -1,0 +1,394 @@
+{% extends 'base.html' %}
+{% block title %}TAK Client Feed — infra-TAK{% endblock %}
+{% block page_css %}<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+/* The header row holds a BUTTON, so it must not inherit card-title's uppercase:
+   Material Symbols ligatures are case-sensitive and "ADD" renders as literal text. */
+.card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px}
+.card-head .card-title{margin-bottom:0}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-transform:none;letter-spacing:normal}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.btn-sm{padding:6px 12px;font-size:11px}
+.mono{font-family:'JetBrains Mono',monospace}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:300px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:560px;max-width:92vw;max-height:88vh;overflow-y:auto}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--text-primary)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:18px;line-height:1.6}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+.tok-card{background:#0a0e1a;border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:12px}
+.tok-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.tok-name{font-size:14px;font-weight:700;color:var(--text-primary)}
+.tok-meta{font-size:11px;color:var(--text-dim);margin-top:4px;font-family:'JetBrains Mono',monospace;line-height:1.7}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+.pill-on{background:rgba(34,197,94,.12);color:#22c55e;border:1px solid rgba(34,197,94,.25)}
+.pill-off{background:rgba(148,163,184,.12);color:#94a3b8;border:1px solid rgba(148,163,184,.25)}
+.pill-warn{background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.25)}
+.chan-chip{display:inline-block;padding:3px 10px;margin:3px 4px 0 0;border-radius:6px;background:rgba(46,196,182,.1);border:1px solid rgba(46,196,182,.25);color:#2ec4b6;font-size:11px;font-family:'JetBrains Mono',monospace}
+/* One channel per line — a wrapped flex grid of variable-width names reads as scatter. */
+.chan-pick{max-height:260px;overflow-y:auto;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:6px}
+.chan-pick label{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-secondary);cursor:pointer;padding:7px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;border-bottom:1px solid rgba(255,255,255,.04)}
+.chan-pick label:last-child{border-bottom:none}
+.chan-pick label:hover{background:var(--border);color:var(--text-primary)}
+.chan-pick input{flex-shrink:0;margin:0}
+.url-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);word-break:break-all;line-height:1.6}
+.warn-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:12px 14px;font-size:12px;color:#f59e0b;line-height:1.6;margin-bottom:16px}
+.tok-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.fmt-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.fmt{padding:3px 10px;border-radius:6px;background:rgba(148,163,184,.08);border:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary)}
+</style>{% endblock %}
+{% block content %}<div class="main">
+
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <img src="/static/logos/tak-client-skittle.png" alt="" style="width:40px;height:40px;object-fit:contain">
+  <div>
+    <div class="mono" style="font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">TAK CLIENT FEED</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Publish connected TAK clients to outside agencies as a map feed</div>
+  </div>
+</div>
+
+{% if not clientfeed.get('installed') %}
+<div class="card">
+  <div class="card-title">Enable the feed</div>
+  <p style="color:var(--text-secondary);font-size:13px;line-height:1.7;margin-bottom:18px">
+    Publishes the ATAK/iTAK/WinTAK clients currently connected to this TAK Server as a
+    <strong>read-only map feed</strong>. Each agency gets its own URL, scoped to the TAK channels you
+    choose, and any one can be revoked without affecting the others.<br><br>
+    <span style="color:var(--text-dim);font-size:12px">
+    Speaks the ArcGIS REST FeatureServer spec and GeoJSON, so it works with mapping and CAD
+    clients generally — no Esri account required, yours or theirs. No new port is opened.
+    Only end-user devices are published, never the AVL, ADS-B or TFR feeds this server ingests.</span>
+  </p>
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()">
+    <span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Enable
+  </button>
+</div>
+<div class="card" id="logCard" style="display:none">
+  <div class="card-title">Log</div>
+  <div class="log-box" id="logBox"></div>
+</div>
+
+{% else %}
+
+<div class="card">
+  <div class="card-title">Service</div>
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+    <span class="pill {{ 'pill-on' if clientfeed.get('running') else 'pill-warn' }}">
+      {{ 'Live' if clientfeed.get('running') else 'TAK DB unreachable' }}</span>
+    <span style="font-size:12px;color:var(--text-dim)" id="tokCount"></span>
+  </div>
+  <div style="font-size:12px;color:var(--text-secondary);line-height:1.7">
+    Each agency gets its own URL:
+    <div class="url-box" style="margin-top:8px">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer</div>
+    <div class="fmt-row">
+      <span class="fmt">/FeatureServer/0/query?where=1=1&amp;outFields=*&amp;f=json &nbsp;— ArcGIS REST</span>
+      <span class="fmt">&amp;f=geojson &nbsp;— GeoJSON</span>
+    </div>
+    <div style="margin-top:10px;color:var(--text-dim);font-size:11px">
+      Positions refresh when the consumer polls. Most CAD and mapping clients poll once a minute.
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <span class="card-title">Agency tokens</span>
+    <button class="btn btn-primary btn-sm" onclick="openMint()">
+      <span style="font-size:16px;line-height:1;font-weight:700">+</span>New token
+    </button>
+  </div>
+  <div id="tokList"><div style="color:var(--text-dim);font-size:12px">Loading…</div></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Remove</div>
+  <p style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+    Deletes the token store and stops serving <span class="mono">/feed/*</span>. Every agency URL stops working immediately.</p>
+  <button class="btn btn-danger btn-sm" onclick="doUninstall()">Uninstall feed</button>
+</div>
+
+<!-- mint / edit -->
+<div class="modal-overlay" id="mintModal">
+  <div class="modal">
+    <h3 id="mintTitle">New agency token</h3>
+    <p id="mintBlurb">The URL is shown once and cannot be recovered afterwards — only a hash is stored. If it is lost, use <strong>New URL</strong> on the token rather than tearing it down.</p>
+    <label class="form-label">Nickname <span style="color:var(--text-dim);font-weight:400">— how this consumer appears in this list</span></label>
+    <input class="form-input" id="mintLabel" placeholder="e.g. Corona FD" style="margin-bottom:16px">
+    <label class="form-label">TAK channels this token may see</label>
+    <div class="chan-pick" id="chanPick" style="margin-bottom:16px"><span style="color:var(--text-dim);font-size:12px;padding:8px;display:block">Loading channels…</span></div>
+    <label class="form-label">Drop clients not heard from for</label>
+    <select class="form-input" id="mintStale" style="margin-bottom:4px">
+      <option value="3">3 minutes</option>
+      <option value="5" selected>5 minutes</option>
+      <option value="10">10 minutes</option>
+      <option value="15">15 minutes</option>
+    </select>
+    <div id="mintErr" style="display:none;color:var(--red);font-size:12px;margin-top:10px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('mintModal')">Cancel</button>
+      <button class="btn btn-primary" id="mintBtn" onclick="doMintOrSave()">Create token</button>
+    </div>
+  </div>
+</div>
+
+<!-- url shown once -->
+<div class="modal-overlay" id="urlModal">
+  <div class="modal">
+    <h3 id="urlTitle">Send this URL to the agency</h3>
+    <div class="warn-box">This is the only time this URL is shown. Copy it now.</div>
+    <div class="url-box" id="urlOut"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="copyUrl()" id="copyBtn">Copy</button>
+      <button class="btn btn-primary" onclick="closeModal('urlModal');loadTokens()">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- preview -->
+<div class="modal-overlay" id="prevModal">
+  <div class="modal">
+    <h3>What this token returns right now</h3>
+    <p id="prevSummary" style="margin-bottom:12px"></p>
+    <div class="log-box" id="prevBox" style="height:320px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('prevModal')">Close</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<script>
+const FEED_HOST = {{ feed_host|tojson }};
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function ago(iso){
+  if(!iso) return 'never';
+  const secs = Math.max(0, (Date.now() - Date.parse(iso))/1000);
+  if(secs < 90) return Math.round(secs)+'s ago';
+  if(secs < 5400) return Math.round(secs/60)+'m ago';
+  if(secs < 172800) return Math.round(secs/3600)+'h ago';
+  return Math.round(secs/86400)+'d ago';
+}
+
+{% if not clientfeed.get('installed') %}
+async function startDeploy(){
+  const btn = document.getElementById('deployBtn');
+  btn.disabled = true; btn.textContent = 'Enabling…';
+  document.getElementById('logCard').style.display = 'block';
+  await fetch('/api/clientfeed/deploy', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const box = document.getElementById('logBox');
+  const t = setInterval(async () => {
+    const r = await fetch('/api/clientfeed/log'); const d = await r.json();
+    box.textContent = (d.entries||[]).join('\n');
+    box.scrollTop = box.scrollHeight;
+    if(d.complete){ clearInterval(t); setTimeout(()=>location.reload(), 1200); }
+  }, 1000);
+}
+{% else %}
+let CHANNELS = [];
+let TOKENS = [];
+let EDIT_ID = null;          // null = minting a new token; otherwise editing this one
+
+function tok(id){ return TOKENS.find(t => t.id === id); }
+
+async function loadChannels(){
+  try{ const r = await fetch('/api/clientfeed/channels'); CHANNELS = (await r.json()).channels || []; }
+  catch(e){ CHANNELS = []; }
+}
+
+async function loadTokens(){
+  const el = document.getElementById('tokList');
+  try{
+    const d = await (await fetch('/api/clientfeed/tokens')).json();
+    TOKENS = d.tokens || [];
+    document.getElementById('tokCount').textContent =
+      TOKENS.length ? (TOKENS.length + ' token' + (TOKENS.length===1?'':'s')) : 'no tokens yet';
+    if(!TOKENS.length){
+      el.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px 0">'
+        + 'No tokens yet. Create one to hand an agency a URL.</div>';
+      return;
+    }
+    el.innerHTML = TOKENS.map(t => {
+      const chips = (t.channels||[]).map(c => '<span class="chan-chip">'+esc(c)+'</span>').join('');
+      const miss = (t.missing_channels||[]).length
+        ? '<div style="margin-top:8px"><span class="pill pill-warn">channel missing</span>'
+          + '<span style="font-size:11px;color:#f59e0b;margin-left:8px">'
+          + esc((t.missing_channels||[]).join(', '))
+          + ' no longer exists on this TAK Server — returning nothing for it.</span></div>'
+        : '';
+      const rot = t.rotations ? ' · URL reissued ' + t.rotations + '× (' + ago(t.rotated_ts) + ')' : '';
+      return '<div class="tok-card">'
+        + '<div class="tok-head"><div>'
+        + '<div class="tok-name">' + esc(t.label) + '</div>'
+        + '<div class="tok-meta">' + esc(t.id) + ' · created ' + esc((t.created_ts||'').slice(0,10))
+        + ' · stale after ' + t.stale_minutes + 'm' + rot + '<br>'
+        + 'last pull ' + ago(t.last_pull_ts)
+        + (t.last_pull_ip ? ' from ' + esc(t.last_pull_ip) : '')
+        + ' · ' + (t.pull_count||0) + ' pulls</div></div>'
+        + '<span class="pill ' + (t.enabled ? 'pill-on' : 'pill-off') + '">'
+        + (t.enabled ? 'Active' : 'Disabled') + '</span></div>'
+        + '<div style="margin-top:10px">' + chips + '</div>' + miss
+        + '<div class="tok-actions">'
+        + '<button class="btn btn-secondary btn-sm" data-act="preview" data-id="'+t.id+'">Preview</button>'
+        + '<button class="btn btn-secondary btn-sm" data-act="edit" data-id="'+t.id+'">Edit</button>'
+        + '<button class="btn btn-secondary btn-sm" data-act="rotate" data-id="'+t.id+'">New URL</button>'
+        + '<button class="btn btn-secondary btn-sm" data-act="toggle" data-id="'+t.id+'">'
+        + (t.enabled ? 'Disable' : 'Enable') + '</button>'
+        + '<button class="btn btn-danger btn-sm" data-act="revoke" data-id="'+t.id+'">Revoke</button>'
+        + '</div></div>';
+    }).join('');
+  }catch(e){
+    el.innerHTML = '<div style="color:var(--red);font-size:12px">Could not load tokens.</div>';
+  }
+}
+
+// Event delegation — no user text is ever interpolated into an onclick attribute.
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-act]');
+  if(!b) return;
+  const id = b.dataset.id;
+  ({preview: doPreview, edit: openEdit, rotate: doRotate,
+    toggle: doToggle, revoke: doRevoke})[b.dataset.act](id);
+});
+
+function renderChannels(selected){
+  const pick = document.getElementById('chanPick');
+  pick.innerHTML = CHANNELS.length
+    ? CHANNELS.map(c => '<label><input type="checkbox" value="'+esc(c.name)+'"'
+        + ((selected||[]).includes(c.name) ? ' checked' : '') + '>' + esc(c.name) + '</label>').join('')
+    : '<span style="color:var(--red);font-size:12px;padding:8px;display:block">No TAK channels found — is TAK Server running on this box?</span>';
+}
+
+async function openMint(){
+  EDIT_ID = null;
+  document.getElementById('mintTitle').textContent = 'New agency token';
+  document.getElementById('mintBlurb').innerHTML = 'The URL is shown once and cannot be recovered afterwards — only a hash is stored. If it is lost, use <strong>New URL</strong> on the token rather than tearing it down.';
+  document.getElementById('mintBtn').textContent = 'Create token';
+  document.getElementById('mintLabel').value = '';
+  document.getElementById('mintStale').value = '5';
+  document.getElementById('mintErr').style.display = 'none';
+  if(!CHANNELS.length) await loadChannels();
+  renderChannels([]);
+  document.getElementById('mintModal').classList.add('open');
+}
+
+async function openEdit(id){
+  const t = tok(id); if(!t) return;
+  EDIT_ID = id;
+  document.getElementById('mintTitle').textContent = 'Edit ' + t.label;
+  document.getElementById('mintBlurb').textContent = 'Changes apply immediately. The agency’s existing URL keeps working — use New URL only if they need a fresh credential.';
+  document.getElementById('mintBtn').textContent = 'Save changes';
+  document.getElementById('mintLabel').value = t.label || '';
+  document.getElementById('mintStale').value = String(t.stale_minutes || 5);
+  document.getElementById('mintErr').style.display = 'none';
+  if(!CHANNELS.length) await loadChannels();
+  renderChannels(t.channels || []);
+  document.getElementById('mintModal').classList.add('open');
+}
+
+async function doMintOrSave(){
+  const label = document.getElementById('mintLabel').value.trim();
+  const channels = Array.from(document.querySelectorAll('#chanPick input:checked')).map(i => i.value);
+  const stale = parseInt(document.getElementById('mintStale').value, 10);
+  const err = document.getElementById('mintErr');
+  if(!label){ err.textContent = 'Give this consumer a nickname.'; err.style.display='block'; return; }
+  if(!channels.length){ err.textContent = 'Pick at least one channel.'; err.style.display='block'; return; }
+  const btn = document.getElementById('mintBtn');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try{
+    const url = EDIT_ID ? '/api/clientfeed/tokens/edit' : '/api/clientfeed/tokens/mint';
+    const body = EDIT_ID ? {id: EDIT_ID, label, channels, stale_minutes: stale}
+                         : {label, channels, stale_minutes: stale};
+    const d = await (await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                                       body: JSON.stringify(body)})).json();
+    if(!d.success){ err.textContent = d.error || 'Failed.'; err.style.display='block'; return; }
+    closeModal('mintModal');
+    if(EDIT_ID){ loadTokens(); }
+    else { showUrl('Send this URL to the agency', d.path); }
+  }catch(e){ err.textContent = 'Request failed.'; err.style.display='block'; }
+  finally{ btn.disabled = false; btn.textContent = orig; }
+}
+
+function showUrl(title, path){
+  document.getElementById('urlTitle').textContent = title;
+  document.getElementById('urlOut').textContent = 'https://' + FEED_HOST + path;
+  document.getElementById('copyBtn').textContent = 'Copy';
+  document.getElementById('urlModal').classList.add('open');
+}
+
+function copyUrl(){
+  const t = document.getElementById('urlOut').textContent;
+  navigator.clipboard.writeText(t).then(
+    () => { document.getElementById('copyBtn').textContent = 'Copied'; }, () => {});
+}
+
+async function doRotate(id){
+  const t = tok(id); if(!t) return;
+  if(!confirm('Issue a new URL for "' + t.label + '"?\n\n'
+    + 'Their current URL stops working immediately and they will need the new one.\n'
+    + 'Channels, nickname and settings are kept.')) return;
+  const d = await (await fetch('/api/clientfeed/tokens/rotate', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})})).json();
+  if(!d.success){ alert(d.error || 'Failed to reissue.'); return; }
+  showUrl('New URL for ' + t.label, d.path);
+}
+
+async function doToggle(id){
+  const t = tok(id); if(!t) return;
+  await fetch('/api/clientfeed/tokens/toggle', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({id, enabled: !t.enabled})});
+  loadTokens();
+}
+
+async function doRevoke(id){
+  const t = tok(id); if(!t) return;
+  if(!confirm('Revoke the token for "' + t.label + '"?\n\nTheir URL stops working immediately and cannot be restored. No other agency is affected.')) return;
+  await fetch('/api/clientfeed/tokens/revoke', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+  loadTokens();
+}
+
+async function doPreview(id){
+  const box = document.getElementById('prevBox'), sum = document.getElementById('prevSummary');
+  box.textContent = 'Querying…'; sum.textContent = '';
+  document.getElementById('prevModal').classList.add('open');
+  try{
+    const d = await (await fetch('/api/clientfeed/preview', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})})).json();
+    if(!d.success){ box.textContent = d.error || 'Preview failed.'; return; }
+    sum.innerHTML = '<strong>' + d.count + '</strong> client' + (d.count===1?'':'s')
+      + ' would be published right now'
+      + ((d.missing_channels||[]).length ? ' — <span style="color:#f59e0b">missing channel(s): '
+        + esc(d.missing_channels.join(', ')) + '</span>' : '')
+      + (d.count === 0 ? '<br><span style="color:var(--text-dim);font-size:12px">No end-user devices have reported a position in this token’s channels inside its stale window. Feeds this server ingests (AVL, ADS-B, TFR) are deliberately never published.</span>' : '');
+    box.textContent = JSON.stringify(d.sample, null, 2);
+  }catch(e){ box.textContent = 'Preview failed.'; }
+}
+
+async function doUninstall(){
+  if(!confirm('Uninstall the TAK Client Feed?\n\nEvery agency URL stops working immediately and every token is destroyed.')) return;
+  // The registry gates every uninstall on the admin password and there is deliberately
+  // no opt-out, so the UI must collect it — posting {} just returns "Invalid admin password".
+  const pw = prompt('Confirm with your infra-TAK admin password:');
+  if(!pw) return;
+  const d = await (await fetch('/api/clientfeed/uninstall', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({password: pw})})).json().catch(() => ({}));
+  if(d && d.error){ alert(d.error); return; }
+  setTimeout(()=>location.reload(), 1500);
+}
+
+loadChannels().then(loadTokens);
+setInterval(loadTokens, 30000);
+{% endif %}
+</script>
+</div>{% endblock %}

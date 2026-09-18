@@ -169,6 +169,38 @@ def _missing_requirement(desc, ctx):
     return None
 
 
+def _active_conflict(desc, ctx):
+    """Display name of the first INSTALLED module this one conflicts with, else None.
+
+    Same shape and same reasoning as _missing_requirement: the marketplace greys the card
+    (marketplace_page) and the module page carries its own banner, but both are
+    presentation — the tile is reachable by direct URL and the deploy route by curl, so
+    the route refuses independently.
+
+    This edge is not cosmetic. TVR and MediaMTX both default to the `stream` subdomain
+    (SERVICE_DOMAIN_DEFAULTS), so a box with both installed makes generate_caddyfile emit
+    two identical site blocks and Caddy rejects the WHOLE file — every vhost on the box
+    goes down, not just streaming. MediaMTX is not a registry module and carries the
+    symmetric guard on its own route (mediamtx_deploy_api in app.py).
+
+    Deploy ONLY — a box that somehow has both must still be able to see, stop and
+    uninstall either one. Fails OPEN on a detection error: this is a collision hint, not
+    an authorization gate, and a transient probe failure must never brick a deploy."""
+    conflicts = desc.get('conflicts') or []
+    if not conflicts:
+        return None
+    try:
+        all_mods = ctx['detect_modules']() or {}
+    except Exception as e:
+        print(f"[{desc.get('key')}] conflict-check skipped: {str(e)[:200]}", flush=True)
+        return None
+    for conflict_key in conflicts:
+        mod = all_mods.get(conflict_key) or {}
+        if mod.get('installed'):
+            return mod.get('name') or conflict_key
+    return None
+
+
 # ── Generic route registrar ───────────────────────────────────────────────────
 
 def _make_views(desc, ctx):
@@ -187,6 +219,11 @@ def _make_views(desc, ctx):
         if missing:
             return jsonify({'success': False,
                             'error': f'Requires {missing} — deploy {missing} first, then return here.'}), 409
+        clash = _active_conflict(desc, ctx)
+        if clash:
+            return jsonify({'success': False,
+                            'error': f'Conflicts with {clash}, which is already installed — '
+                                     f'uninstall {clash} first, then return here.'}), 409
         data = request.get_json(silent=True) or {}
         validate = desc.get('deploy_validate')
         params = data

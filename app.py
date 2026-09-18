@@ -965,7 +965,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.77-alpha"
+VERSION = "10.1.78-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -3238,6 +3238,22 @@ def detect_modules():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
+    # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
+    # Tile identity + probes come from the descriptor, not an inline block.
+    _ef_desc = mod_registry.MODULES.get('clientfeed')
+    if _ef_desc:
+        try:
+            _ef_state = _ef_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _ef_state = {}
+        modules['clientfeed'] = {'name': _ef_desc['name'],
+            'installed': bool(_ef_state.get('installed')),
+            'running': bool(_ef_state.get('running')),
+            'description': _ef_desc['description'], 'icon': _ef_desc['icon'],
+            'icon_url': _ef_desc.get('icon_url'),
+            'route': _ef_desc['route'], 'priority': _ef_desc['priority'],
+            'tokens': int(_ef_state.get('tokens') or 0)}
+
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
     netbird_running = False
@@ -3672,6 +3688,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
+    cf = modules.get('clientfeed', {})
+    if cf.get('installed'):
+        parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -16721,6 +16740,21 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
+    'clientfeed': (
+        "[Definition]\n"
+        "# v10.1.77 — TAK Client Feed. The producer is _clientfeed_log_failure() in app.py,\n"
+        "# which writes exactly one shape:\n"
+        "#     2026-09-17 19:54:43 clientfeed: rejected token from 1.2.3.4 (unknown or disabled token)\n"
+        "# The token itself is NEVER written to this log — only that an attempt was rejected\n"
+        "# and the source. The IP is the REAL client: the feed is reached through Caddy, and\n"
+        "# _client_ip() unwraps X-Forwarded-For when remote_addr is loopback.\n"
+        "#\n"
+        "# The date prefix may or may not be stripped before failregex is applied depending\n"
+        "# on datepattern detection, so the leading timestamp is optional in the pattern.\n"
+        "failregex = ^\\s*(?:\\S+ \\S+ )?clientfeed: rejected token from <HOST> \\(\n"
+        "ignoreregex =\n"
+        "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
+    ),
     'authentik': (
         "[Definition]\n"
         "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
@@ -18828,6 +18862,108 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     _write_priv(jail_path, jail_conf)
+
+
+# Fleet-uniform thresholds for the Esri feed jail. Deliberately NOT a UI knob:
+# per-customer tuning of a security control is the anti-pattern CLAUDE.md names.
+CLIENTFEED_F2B_MAXRETRY = 10
+CLIENTFEED_F2B_FINDTIME = 600
+CLIENTFEED_F2B_BANTIME = 3600
+
+
+def _f2b_arm_clientfeed_jail(log_fn=None):
+    """Write the clientfeed filter + jail and reload fail2ban. Returns (ok, message).
+
+    Called from the TAK Client Feed module's deploy through a ctx seam — every
+    other jail writer lives here too, so fail2ban knowledge stays in one file.
+
+    Two things this deliberately handles, both learned the hard way:
+
+    1. **The log is seeded so the jail is not born STARVING.** _f2b_dead_jails()
+       treats a 0-byte logpath as proof a jail can never fire, which is right — but
+       a freshly-armed feed legitimately has no rejected tokens yet, and would be
+       reported dead on the fail2ban page from the moment it was enabled. Seeding one
+       non-matching "armed" line makes the file non-zero and is a truthful record of
+       when the control went live. See [[fail2ban-dead-jails-audit]].
+    2. **fail2ban may not be installed.** That is not an error — the feed works fine
+       without it, it is simply unthrottled. Say so plainly rather than failing the
+       deploy or, worse, reporting a jail that does not exist.
+    """
+    def _log(m):
+        if log_fn:
+            log_fn(m)
+
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — the feed works, but repeated bad '
+                       'tokens are not throttled. Deploy the fail2ban module to arm it.')
+    try:
+        # (1) seed the log so the jail is never born 0-byte / STARVING
+        try:
+            if not os.path.exists(CLIENTFEED_FAIL_LOG) or os.path.getsize(CLIENTFEED_FAIL_LOG) == 0:
+                with open(CLIENTFEED_FAIL_LOG, 'a') as f:
+                    f.write('%s clientfeed: jail armed (no rejected tokens yet)\n'
+                            % datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+                os.chmod(CLIENTFEED_FAIL_LOG, 0o600)
+        except Exception:
+            pass
+
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _write_priv('/etc/fail2ban/filter.d/clientfeed.conf', _F2B_OWNED_FILTERS['clientfeed'])
+
+        guarddog_action = ""
+        if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+            guarddog_action = "\n         infratak-guarddog"
+        jail_conf = (
+            "[clientfeed]\n"
+            "enabled  = true\n"
+            "filter   = clientfeed\n"
+            f"logpath  = {CLIENTFEED_FAIL_LOG}\n"
+            f"maxretry = {CLIENTFEED_F2B_MAXRETRY}\n"
+            f"findtime = {CLIENTFEED_F2B_FINDTIME}\n"
+            f"bantime  = {CLIENTFEED_F2B_BANTIME}\n"
+            f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+            f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        )
+        _write_priv('/etc/fail2ban/jail.d/infratak-clientfeed.conf', jail_conf)
+
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s'
+                    % ((r.stderr or r.stdout or '')[:160]))
+
+        # Verify it actually LOADED — writing the file is not the same as arming the
+        # control, which is the entire lesson of the dead-jails audit.
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'clientfeed']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        return (True, 'jail armed and loaded (%d strikes / %ds → %ds ban)'
+                % (CLIENTFEED_F2B_MAXRETRY, CLIENTFEED_F2B_FINDTIME, CLIENTFEED_F2B_BANTIME))
+    except Exception as e:
+        return (False, 'jail setup failed: %s' % str(e)[:200])
+
+
+def _f2b_disarm_clientfeed_jail():
+    """Remove the clientfeed jail + filter and reload. Returns (ok, message)."""
+    if not _f2b_is_available():
+        return (True, 'fail2ban not installed — nothing to remove')
+    try:
+        # Reuse the existing jail remover — it carries the filename guard and the
+        # reload, and it is the one path that knows about stale-jail cleanup.
+        removed = _f2b_remove_jail('infratak-clientfeed.conf',
+                                   'TAK Client Feed uninstalled')
+        fpath = '/etc/fail2ban/filter.d/clientfeed.conf'
+        if _exists_priv(fpath):
+            subprocess.run(_sudo_wrap(['rm', '-f', fpath]), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+            removed = True
+        return (True, 'jail removed' if removed else 'no jail present')
+    except Exception as e:
+        return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
 @app.route('/api/fail2ban/mediamtx/status')
@@ -29055,6 +29191,26 @@ def generate_caddyfile(settings=None):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
 
+    # v10.1.76 — TAK Client Feed: the ONE public, token-authed route family.
+    # MUST be emitted BEFORE the catch-all `route {}` below. With Authentik installed
+    # that catch-all applies forward_auth, and a machine consumer cannot complete an
+    # SSO redirect — the feed would 302 into the login flow and die with an opaque
+    # cross-origin error. Directive ORDER here is the entire reason this works.
+    # Client X-Authentik-* is stripped exactly like every other console route (the
+    # v10.1.0 loopback-trust bypass); auth is the console's own @feed_token_required.
+    # Emitted only when the feed is actually deployed, so a box that never enabled it
+    # gains no public surface at all.
+    if os.path.exists(os.path.join(CONFIG_DIR, 'clientfeed.json')):
+        lines.append(f"    route /feed/* {{")
+        _emit_ak_header_strip("        ")
+        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+        lines.append(f"            transport http {{")
+        lines.append(f"                tls")
+        lines.append(f"                tls_insecure_skip_verify")
+        lines.append(f"            }}")
+        lines.append(f"        }}")
+        lines.append(f"    }}")
+
     def _emit_outpost_callback_rescue(root_url):
         # v10.1.28: the outpost's OAuth callback answers a bare 400 whenever the state in
         # the URL doesn't match a session in THIS browser — most commonly a password-reset
@@ -33956,6 +34112,20 @@ fedhub_rotate_status = {'running': False, 'complete': False, 'error': False}
 def mediamtx_deploy_api():
     if mediamtx_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    # v10.1.77: the symmetric half of the registry's conflict guard (_active_conflict in
+    # modules/__init__.py). MediaMTX is not a registry module, so it needs its own. Both it
+    # and TVR default to the `stream` subdomain (SERVICE_DOMAIN_DEFAULTS), so a box with
+    # both installed makes generate_caddyfile emit two identical site blocks and Caddy
+    # rejects the WHOLE file — every vhost on the box goes down, not just streaming. The
+    # marketplace greys the card, but this route is reachable by direct curl.
+    # Fails OPEN: a transient detection error must never brick a deploy.
+    try:
+        _tvr_installed = detect_modules().get('tak_video_restreamer', {}).get('installed')
+    except Exception:
+        _tvr_installed = False
+    if _tvr_installed:
+        return jsonify({'error': 'Conflicts with TAK Video Restreamer, which is already '
+                                 'installed — uninstall it first, then return here.'}), 409
     data = request.get_json() or {}
     if data.get('config'):
         settings = load_settings()
@@ -82630,6 +82800,10 @@ _MODULE_CTX = {
     '_host_arch': _host_arch,
     '_ssh_probe': _ssh_probe,
     'generate_caddyfile': generate_caddyfile,
+    # v10.1.77: the vhost a module is actually served on — stream.<fqdn> for TVR by
+    # default, or the operator's {service}_domain override. Modules must not rebuild it
+    # from fqdn: that is exactly how the TVR deploy log came to print the apex.
+    '_get_service_domain': _get_service_domain,
     # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
     # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
     # eternal-grace-period hang inside the module registry, where the deploy-job runner's
@@ -82661,6 +82835,13 @@ _MODULE_CTX = {
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
+    # clientfeed seams (v10.1.76) — the cot DB reader, the private config dir the
+    # token store lives in (0600), and the audit writer for mint/revoke events.
+    '_pg_exec': _pg_exec,
+    'CONFIG_DIR': CONFIG_DIR,
+    'audit': audit,
+    '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
+    '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
@@ -82669,6 +82850,228 @@ _MODULE_CTX = {
 _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
+
+
+# ── TAK Client Feed — the ONE public, token-authed route family (v10.1.76) ──
+# PLAN v10.1.76 §4-W5. This does NOT live in modules/clientfeed.py: init_registry()
+# wraps every registry view — generic AND extra_routes — in the same login_required
+# app.py uses, deliberately and with no opt-out (a v10.1.22 acceptance check). A
+# token-authed public route therefore cannot go through the registry.
+#
+# It is also deliberately NOT under /api/*, so the invariant "every /api/* route
+# carries login_required" stays literally true rather than gaining a carve-out.
+#
+# Auth: a 32-byte URL-safe secret in the PATH — the same shape Tablet Command hands
+# us (/esri/tc-file/<TOKEN>/FeatureServer). Stored as SHA-256 only, compared in
+# constant time. An unknown token returns 404, never 401, so the URL space cannot
+# be enumerated and a scanner cannot tell a bad token from a missing service.
+
+CLIENTFEED_FAIL_LOG = os.path.join(CONFIG_DIR, 'clientfeed-auth.log')
+
+
+CLIENTFEED_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
+
+
+def _clientfeed_log_failure(reason):
+    """Record a rejected token for the fail2ban jail. The presented token is
+    NEVER written — only that an attempt was rejected, and from where.
+
+    Rolled at 2 MiB: this file is written on a PUBLIC, unauthenticated path, so an
+    attacker spraying tokens is also choosing how much disk we spend. fail2ban keeps
+    reading the live file after a roll, so the jail is unaffected."""
+    try:
+        try:
+            if os.path.getsize(CLIENTFEED_FAIL_LOG) > CLIENTFEED_FAIL_LOG_MAX:
+                os.replace(CLIENTFEED_FAIL_LOG, CLIENTFEED_FAIL_LOG + '.1')
+        except OSError:
+            pass
+        with open(CLIENTFEED_FAIL_LOG, 'a') as f:
+            f.write('%s clientfeed: rejected token from %s (%s)\n'
+                    % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                       _client_ip(), reason))
+        os.chmod(CLIENTFEED_FAIL_LOG, 0o600)
+    except Exception:
+        pass
+
+
+def _feed_response(payload, status=200):
+    """JSON plus the CORS headers a browser-hosted Esri client needs.
+
+    The wildcard origin is deliberate and weakens nothing: the token in the path
+    is the authentication, and CORS governs which browser ORIGINS may READ a
+    response — not who may call the endpoint. Without it, ArcGIS Online's map
+    viewer and any web app fail with an opaque cross-origin error that looks like
+    an outage. Recorded in the module scan as a reasoned, accepted choice."""
+    resp = make_response(json.dumps(payload), status)
+    resp.headers['Content-Type'] = 'application/json'
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+def _feed_not_found():
+    return _feed_response(
+        {'error': {'code': 404, 'message': 'Service not found', 'details': []}}, 404)
+
+
+def feed_token_required(fn):
+    """Resolve <token> to a feed entry or 404. EVERY view in the /feed/ family
+    carries this — there is no unauthenticated path into it."""
+    @wraps(fn)
+    def wrapper(token, *args, **kwargs):
+        if request.method == 'OPTIONS':
+            return _feed_response({})
+        mod = getattr(mod_registry, 'clientfeed', None)
+        if mod is None:
+            return _feed_not_found()
+        try:
+            entry = mod.resolve_token(_MODULE_CTX, token)
+        except Exception:
+            entry = None
+        if not entry:
+            _clientfeed_log_failure('unknown or disabled token')
+            return _feed_not_found()
+        try:
+            mod.record_pull(_MODULE_CTX, entry['id'], _client_ip())
+        except Exception:
+            pass
+        return fn(entry, *args, **kwargs)
+    return wrapper
+
+
+def _feed_features(mod, entry):
+    """Channel NAMES -> int bit positions -> snapshot. A channel that no longer
+    resolves contributes nothing; it never widens scope to 'all channels'."""
+    bits, _missing = mod._resolve_bitpos(_MODULE_CTX, entry.get('channels'))
+    return mod.snapshot(_MODULE_CTX, bits,
+                        entry.get('stale_minutes') or mod.DEFAULT_STALE_MINUTES,
+                        entry.get('channels'))
+
+
+# ArcGIS clients do not just fetch the service — they first classify it from the URL
+# and probe the server root. ArcGIS Online rejected /feed/<token>/FeatureServer with
+# "This service type is not supported" (2026-09-17) even though every endpoint
+# answered 200 with valid Esri JSON: a real ArcGIS Server publishes its services under
+# /rest/services/ and exposes /rest/info, and AGOL uses that shape to decide what it is
+# talking to. So the same views are also mounted on the canonical Esri layout.
+#
+# The short /feed/<token>/FeatureServer form is KEPT as the primary, because it is what
+# a plain HTTP or GeoJSON consumer wants and it is the shape Tablet Command themselves
+# hand us. Esri-spec clients get the long form. One token, one scope, two layouts.
+
+_ESRI_REST_INFO = {
+    'currentVersion': 11.2,
+    'fullVersion': '11.2',
+    'soapUrl': '',
+    'secureSoapUrl': '',
+    'owningSystemUrl': '',
+    'authInfo': {'isTokenBasedSecurity': False},
+}
+
+
+@app.route('/feed/<token>/rest/info', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_rest_info(entry):
+    """ArcGIS server-root info. Declares no token security \xe2\x80\x94 the credential is the
+    token already in the path, and advertising Esri token auth would make clients go
+    looking for a /generateToken endpoint we deliberately do not have."""
+    return _feed_response(_ESRI_REST_INFO)
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer',
+           methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_service_rest(entry, service):
+    mod = mod_registry.clientfeed
+    return _feed_response(mod.service_json(entry, _feed_features(mod, entry)))
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer/<int:layer>',
+           methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_layer_rest(entry, service, layer):
+    # Call the shared implementation, NOT the decorated view — that one takes a raw
+    # token as its first argument and would try to resolve this entry as one.
+    return _clientfeed_layer_impl(entry, layer)
+
+
+@app.route('/feed/<token>/rest/services/<service>/FeatureServer/<int:layer>/query',
+           methods=['GET', 'POST', 'OPTIONS'])
+@feed_token_required
+def clientfeed_query_rest(entry, service, layer):
+    return _clientfeed_query_impl(entry, layer)
+
+
+@app.route('/feed/<token>/FeatureServer', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_service(entry):
+    # Pass the live features so the service extent matches the layer's. The snapshot
+    # is cached for 15s, so this costs nothing on a client that fetches both.
+    mod = mod_registry.clientfeed
+    return _feed_response(mod.service_json(entry, _feed_features(mod, entry)))
+
+
+def _clientfeed_layer_impl(entry, layer):
+    mod = mod_registry.clientfeed
+    if layer != 0:
+        return _feed_response(
+            {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
+    return _feed_response(mod.layer_json(entry, _feed_features(mod, entry)))
+
+
+@app.route('/feed/<token>/FeatureServer/<int:layer>', methods=['GET', 'OPTIONS'])
+@feed_token_required
+def clientfeed_layer(entry, layer):
+    return _clientfeed_layer_impl(entry, layer)
+
+
+def _clientfeed_query_impl(entry, layer):
+    mod = mod_registry.clientfeed
+    if layer != 0:
+        return _feed_response(
+            {'error': {'code': 400, 'message': 'Invalid layer', 'details': []}}, 400)
+    # Esri clients POST the query form as often as they GET it.
+    params = request.form.to_dict() if request.method == 'POST' else {}
+    params.update(request.args.to_dict())
+    feats = _feed_features(mod, entry)
+    audit('clientfeed_pull', 'token=%s label=%s channels=%s features=%d'
+          % (entry.get('id'), entry.get('label'),
+             ','.join(entry.get('channels') or []), len(feats)))
+    return _feed_response(mod.query_response(entry, feats, params))
+
+
+@app.route('/feed/<token>/FeatureServer/<int:layer>/query',
+           methods=['GET', 'POST', 'OPTIONS'])
+@feed_token_required
+def clientfeed_query(entry, layer):
+    return _clientfeed_query_impl(entry, layer)
+
+
+@app.route('/clientfeed')
+@login_required
+def clientfeed_page():
+    """TAK Client Feed console page (v10.1.76)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('clientfeed'):
+        abort(404)
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('clientfeed', {})
+    # The feed is served on the CONSOLE vhost (infratak.<fqdn>), not the bare fqdn —
+    # that is the site block generate_caddyfile() emits `route /feed/*` into. Showing
+    # the bare fqdn here would hand the operator a URL that does not resolve to this
+    # box's Caddy (caught on test6 2026-09-17: bare fqdn has no vhost and no cert).
+    # Resolve it from the same source Caddy does so a custom subdomain map follows.
+    sd = _get_all_service_domains(settings)
+    feed_host = (sd.get('infratak') or '').strip()
+    if not feed_host:
+        # IP-only box: no Caddy vhost, so the feed is only reachable on the console port.
+        _ip = (settings.get('server_ip') or '').strip()
+        feed_host = f'{_ip}:5001' if _ip else ''
+    return render_template('clientfeed.html', settings=settings, modules=modules,
+                           clientfeed=state, feed_host=feed_host, version=VERSION)
 
 try:
     import threading as _threading_sh

@@ -447,7 +447,17 @@ def deploy(ctx, job, params):
 
         plog('')
         plog('✓ TAK Video Restreamer deployed successfully.')
-        plog(f'  Web UI: https://{fqdn}/  (admin / {admin_pass})' if fqdn else
+        # v10.1.77: the UI is served on the TVR vhost — stream.<fqdn> by default, or the
+        # operator's tak_video_restreamer_domain override — NOT the apex. Printing the apex
+        # sent operators to the console/portal vhost and read as "Caddy never registered
+        # TVR" (field false alarm, 2026-09-17). Resolve it the same way the console page
+        # does (_get_service_domain), never by rebuilding it from fqdn. Fails open to the
+        # loopback line rather than erroring out the last step of a successful deploy.
+        try:
+            tvr_host = (ctx['_get_service_domain'](s, 'tak_video_restreamer') or '').strip()
+        except Exception:
+            tvr_host = ''
+        plog(f'  Web UI: https://{tvr_host}/  (admin / {admin_pass})' if tvr_host else
              f'  Web UI: http://localhost:3100/  (admin / {admin_pass})')
         plog('  RTSP:   rtsp://<host>:8554/<stream>')
         plog('  RTSPS:  rtsps://<host>:8555/<stream>')
