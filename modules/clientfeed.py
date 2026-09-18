@@ -33,10 +33,14 @@ Data model (verified live on test6/test12 2026-09-16, PLAN §3.3):
     Channel scoping is ONE predicate: get_bit(groups, 32767 - bitpos) = 1.
     The bits are stored high-end first — Postgres get_bit() counts from the left
     and TAK's bitpos does not. Do not "simplify" this to get_bit(groups, bitpos).
-  - ATAK EUDs are cot_type 'a-f-G-U-C*' AND carry <takv platform="ATAK-CIV|iTAK|
-    WinTAK"> in detail. The AVL/ADS-B/TFR feeds we INGEST land in cot_router too
-    (a-f-G-E-S / u-d-f / t-x-d-d) — without the platform filter we would export
-    Tablet Command's own engines straight back to Tablet Command.
+  - A TAK client is cot_type 'a-f-G-U-C*' AND carries a <takv …> element in detail
+    (platform / device / version — every TAK app stamps it: ATAK, iTAK, WinTAK,
+    OpenTAK Tracker, TAK Aware, TAK Tracker, whatever comes next). The AVL/ADS-B/TFR
+    feeds we INGEST land in cot_router too (a-f-G-E-S / u-d-f / t-x-d-d) and carry no
+    takv — without the gate we would export Tablet Command's own engines straight back
+    to Tablet Command. v10.1.79 (operator rule 2026-09-18): the gate is takv PRESENCE,
+    not an allowlist of app names — the allowlist silently dropped every tracker.
+    Surveyed test6/test12 (30 d) + CORAZ (90 min): zero a-f-G-U-C rows without takv.
 
 This file imports NOTHING from app.py — every seam arrives through the ctx dict.
 The PUBLIC token-authed route is NOT registered here: init_registry() wraps every
@@ -61,14 +65,29 @@ STORE_NAME = 'clientfeed.json'
 
 # Fleet-uniform constants — no per-customer knobs (CLAUDE.md fleet-uniform config).
 DEFAULT_STALE_MINUTES = 5          # matches Tablet Command's own AVL stale concept
+# The service name in the Esri layout (/feed/<token>/rest/services/<name>/FeatureServer).
+# ArcGIS Online classifies a service from its URL before reading the payload and rejects the
+# short /feed/<token>/FeatureServer form with 'This service type is not supported'
+# (2026-09-17 on test6, 2026-09-18 on CORAZ with the URL the console itself handed out).
+# Any name works server-side; this one is what AGOL shows as the layer name.
+ESRI_SERVICE_NAME = 'TAKClients'
 MAX_STALE_MINUTES = 60
 SNAPSHOT_CACHE_TTL = 15            # seconds; N tokens on one channel set = 1 query
 MAX_RECORD_COUNT = 2000
 GROUPS_BITMAP_LEN = 32768          # TAK's cot_router.groups width
 
-# ATAK/TAK EUD platforms we export. Anything else connected to TAK Server is a
-# feed, a service or a plugin and is deliberately out of scope.
-EUD_PLATFORMS = ('ATAK', 'ITAK', 'WINTAK', 'TAK-CIV', 'ATAK-CIV', 'ATAK-MIL')
+# Any TAK client on the channel is exported — the test is the <takv> element every TAK
+# app stamps into its position report, NOT a list of app names. v10.1.77 shipped an
+# ATAK/iTAK/WinTAK prefix allowlist that silently dropped every tracker: CORAZ had 5
+# devices reporting platform="OpenTAK-Tracker-Android" (cot_type a-f-G-U-C, same as
+# ATAK) and 3 ATAK-CIV, and ArcGIS showed 3 (2026-09-18). TAK Aware on test6/test12 was
+# dropped the same way. Operator rule: "if it's a TAK client it shows up."
+#
+# The ONE exclusion is our own synthetic traffic: the TAK Simulator stamps
+# <takv platform="infra-TAK" device="TAK Simulator"> on its simulated people so they look
+# like clients to TAK Server — which is its job — but a training scenario must never land
+# on a partner agency's map. Exact match on the platform string, upper-cased.
+SYNTHETIC_PLATFORMS = ('INFRA-TAK',)
 
 # CoT writes 9999999.0 into hae/ce/le when the value is UNKNOWN — it is a sentinel,
 # not a measurement. Passing it through put a unit at 9,999,999 m in ArcGIS (observed
@@ -384,11 +403,16 @@ def _clean_alt(hae):
     return round(v, 1)
 
 
-def _is_eud(platform):
-    """True for a real end-user device. Prefix match only — a substring test made
-    anything merely CONTAINING 'ATAK' qualify, which is how a feed sneaks in."""
-    p = (platform or '').upper().strip()
-    return bool(p) and p.startswith(EUD_PLATFORMS)
+_RE_TAKV = re.compile(r'<takv\b', re.I)
+
+
+def _is_tak_client(detail, platform):
+    """True for anything that is a TAK client: the position report carries a <takv>
+    element. No app-name allowlist (see SYNTHETIC_PLATFORMS for why, and for the one
+    exclusion). A feed we ingest has no takv and fails here."""
+    if not _RE_TAKV.search(detail or ''):
+        return False
+    return (platform or '').upper().strip() not in SYNTHETIC_PLATFORMS
 
 
 def snapshot(ctx, bitpos_list, stale_minutes, channel_names=None):
@@ -444,8 +468,8 @@ def snapshot(ctx, bitpos_list, stale_minutes, channel_names=None):
         detail = row.get('detail') or ''
         m = _RE_PLATFORM.search(detail)
         platform = m.group(1) if m else ''
-        if not _is_eud(platform):
-            continue     # feeds/services/plugins are never exported (see header)
+        if not _is_tak_client(detail, platform):
+            continue     # feeds/services/simulator are never exported (see header)
         uid = row.get('uid') or ''
         cid = _client_id(store, uid)
         m = _RE_CALLSIGN.search(detail)
@@ -909,7 +933,8 @@ def register(ctx):
                      'label=%s channels=%s' % (entry['label'], ','.join(channels)),
                      force=True)
         return jsonify({'success': True, 'id': entry['id'], 'token': secret,
-                        'path': '/feed/%s/FeatureServer' % secret})
+                        'path': '/feed/%s/FeatureServer' % secret,
+                        'esri_path': '/feed/%s/rest/services/%s/FeatureServer' % (secret, ESRI_SERVICE_NAME)})
 
     def revoke_view():
         d = request.get_json(silent=True) or {}
@@ -956,7 +981,8 @@ def register(ctx):
                                                       entry.get('rotations')),
                      force=True)
         return jsonify({'success': True, 'id': entry['id'], 'token': secret,
-                        'path': '/feed/%s/FeatureServer' % secret})
+                        'path': '/feed/%s/FeatureServer' % secret,
+                        'esri_path': '/feed/%s/rest/services/%s/FeatureServer' % (secret, ESRI_SERVICE_NAME)})
 
     def preview_view():
         """What a given token currently returns — so the operator can see the

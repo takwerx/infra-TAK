@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.78-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.78-alpha)**
+**Current release: [v10.1.79-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.79-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.79-alpha — 2026-09-18 — Every TAK client on the channel shows up in the feed, and the console hands out the URL ArcGIS accepts
+
+**Headline: two things we hit within an hour of putting the TAK Client Feed on a real ArcGIS Online org. The URL the console gave you was one ArcGIS Online refuses, and the feed silently left out tracker devices. Both are fixed.**
+
+**The URL.** ArcGIS Online decides what kind of service it is looking at from the shape of the URL before it reads a byte of data, and it rejects the short form the console displayed with "This service type is not supported." The feed has served the ArcGIS-shaped form since v10.1.77, but the console never showed it to you. The token dialog now shows the ArcGIS Online / ArcGIS Pro URL first with its own Copy button, and the shorter form for plain REST and GeoJSON consumers beneath it.
+
+**Every TAK client counts.** The feed used to decide what a "TAK client" was from a list of app names, and the list only knew ATAK, iTAK, and WinTAK. Trackers such as OpenTAK Tracker, and apps such as TAK Aware, were dropped from the map as if they were data feeds. The feed now recognizes a client the way TAK Server does: by the device stamp every TAK app puts in its position report. Any TAK app, current or future, shows up. Feeds you ingest still do not.
+
+Simulated units from the TAK Simulator are deliberately kept out of agency feeds, so a training scenario never lands on a partner's map.
+
+> **Upgrade note.** Nothing to do beyond updating. Existing tokens keep working, and the same token starts returning your tracker devices immediately. ArcGIS items you already built with the long-form URL are unaffected.
 
 ### v10.1.78-alpha — 2026-09-18 — TAK Client Feed now works when your database lives somewhere else
 

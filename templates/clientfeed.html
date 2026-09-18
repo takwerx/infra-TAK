@@ -86,8 +86,9 @@
     <span style="font-size:12px;color:var(--text-dim)" id="tokCount"></span>
   </div>
   <div style="font-size:12px;color:var(--text-secondary);line-height:1.7">
-    Each agency gets its own URL:
-    <div class="url-box" style="margin-top:8px">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer</div>
+    Each agency gets its own URL. ArcGIS Online and ArcGIS Pro need the first form; plain REST and GeoJSON consumers can use the shorter second one:
+    <div class="url-box" style="margin-top:8px">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/rest/services/TAKClients/FeatureServer &nbsp;<span style="color:var(--text-dim)">— ArcGIS Online / Pro</span></div>
+    <div class="url-box" style="margin-top:6px;color:var(--text-secondary)">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer &nbsp;<span style="color:var(--text-dim)">— plain REST / GeoJSON</span></div>
     <div class="fmt-row">
       <span class="fmt">/FeatureServer/0/query?where=1=1&amp;outFields=*&amp;f=json &nbsp;— ArcGIS REST</span>
       <span class="fmt">&amp;f=geojson &nbsp;— GeoJSON</span>
@@ -144,9 +145,13 @@
   <div class="modal">
     <h3 id="urlTitle">Send this URL to the agency</h3>
     <div class="warn-box">This is the only time this URL is shown. Copy it now.</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">ArcGIS Online / ArcGIS Pro — paste this one as an ArcGIS Server web service</div>
     <div class="url-box" id="urlOut"></div>
+    <div style="font-size:11px;color:var(--text-dim);margin:10px 0 4px">Plain REST / GeoJSON consumers</div>
+    <div class="url-box" id="urlOutShort" style="color:var(--text-secondary)"></div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="copyUrl()" id="copyBtn">Copy</button>
+      <button class="btn btn-secondary" onclick="copyUrl('urlOut','copyBtn')" id="copyBtn">Copy ArcGIS URL</button>
+      <button class="btn btn-secondary" onclick="copyUrl('urlOutShort','copyBtnShort')" id="copyBtnShort">Copy REST URL</button>
       <button class="btn btn-primary" onclick="closeModal('urlModal');loadTokens()">Done</button>
     </div>
   </div>
@@ -320,22 +325,29 @@ async function doMintOrSave(){
     if(!d.success){ err.textContent = d.error || 'Failed.'; err.style.display='block'; return; }
     closeModal('mintModal');
     if(EDIT_ID){ loadTokens(); }
-    else { showUrl('Send this URL to the agency', d.path); }
+    else { showUrl('Send this URL to the agency', d); }
   }catch(e){ err.textContent = 'Request failed.'; err.style.display='block'; }
   finally{ btn.disabled = false; btn.textContent = orig; }
 }
 
-function showUrl(title, path){
+function showUrl(title, d){
+  // d = the mint/rotate response. The ArcGIS form goes FIRST: AGOL rejects the short form
+  // ("This service type is not supported"), and the operator copied the short form straight off
+  // this modal on 2026-09-18. Older responses without esri_path are derived from path.
+  const shortPath = d.path;
+  const esriPath = d.esri_path || shortPath.replace(/\/FeatureServer$/, '/rest/services/TAKClients/FeatureServer');
   document.getElementById('urlTitle').textContent = title;
-  document.getElementById('urlOut').textContent = 'https://' + FEED_HOST + path;
-  document.getElementById('copyBtn').textContent = 'Copy';
+  document.getElementById('urlOut').textContent = 'https://' + FEED_HOST + esriPath;
+  document.getElementById('urlOutShort').textContent = 'https://' + FEED_HOST + shortPath;
+  document.getElementById('copyBtn').textContent = 'Copy ArcGIS URL';
+  document.getElementById('copyBtnShort').textContent = 'Copy REST URL';
   document.getElementById('urlModal').classList.add('open');
 }
 
-function copyUrl(){
-  const t = document.getElementById('urlOut').textContent;
+function copyUrl(boxId, btnId){
+  const t = document.getElementById(boxId).textContent;
   navigator.clipboard.writeText(t).then(
-    () => { document.getElementById('copyBtn').textContent = 'Copied'; }, () => {});
+    () => { document.getElementById(btnId).textContent = 'Copied'; }, () => {});
 }
 
 async function doRotate(id){
@@ -346,7 +358,7 @@ async function doRotate(id){
   const d = await (await fetch('/api/clientfeed/tokens/rotate', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})})).json();
   if(!d.success){ alert(d.error || 'Failed to reissue.'); return; }
-  showUrl('New URL for ' + t.label, d.path);
+  showUrl('New URL for ' + t.label, d);
 }
 
 async function doToggle(id){
