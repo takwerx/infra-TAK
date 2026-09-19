@@ -966,3 +966,60 @@ def test_the_renewal_upload_behaves():
 
     assert result.returncode == 0, output
     assert "all renewal-upload checks passed" in output, output
+
+
+# --------------------------------------------------------------------------- #
+# The removal dialog asks for the password the route demands (W247)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_removal_dialog_has_a_password_field():
+    """⚠️ **The route and the page disagreed, and only the operator
+    found out.** `instance_remove_view` requires the console password; this
+    dialog collected only the typed slug, so every teardown came back
+    "invalid admin password" with no field to supply one in.
+
+    ⚠️ Asserted on the markup, not through the node harness: that
+    harness auto-creates any element it is asked for, so renaming this field
+    passes there while the real page has nowhere to type. A mutation doing
+    exactly that survived the harness.
+    """
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    start = page.index('id="instanceRemoveModal"')
+    modal = page[start:page.index("</div>" + chr(10) + "</div>", start)]
+
+    assert 'id="removePw"' in modal, 'no password field in the removal dialog'
+    assert 'type="password"' in modal
+
+
+def test_the_removal_dialog_matches_the_other_destructive_ones():
+    """⚠️ One page, one wording. Uninstall and the three CA dialogs have
+    always asked for the "Console password"; a fourth that asked differently
+    would read as a different kind of secret."""
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    start = page.index('id="instanceRemoveModal"')
+    modal = page[start:page.index("</div>" + chr(10) + "</div>", start)]
+
+    assert "Console password" in modal
+
+
+def test_the_removal_password_is_cleared_once_it_is_sent():
+    """⚠️ The dialog stays open for the length of a teardown — a minute
+    or more — and leaving the console password in the DOM for that long is
+    gratuitous.
+
+    ⚠️ **A source guard, and it is second choice.** The node harness
+    would be better, but its `fetch` double resolves on a microtask and the
+    harness prints its summary synchronously, so a check placed after the
+    response runs *after* the exit code is decided and can never fail. A
+    test that cannot fail is worse than a source assertion that can.
+    """
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    start = page.index("function doRemove(")
+    body = page[start:page.index("function renderRemoval(", start)]
+
+    # ⚠️ The *statement*, not the substring. `if (false) pw.value = ''`
+    # still contains the text, and a mutation doing exactly that survived
+    # the first version of this guard.
+    assert "if (pw) pw.value = ''" in body, (
+        "the console password is left in the DOM after the removal is sent")
