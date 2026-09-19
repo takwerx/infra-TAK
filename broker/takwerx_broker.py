@@ -133,6 +133,20 @@ TAK_BUNDLE_DIR = os.path.join(_NONROOT_HOME, 'tak-docker')
 MODULE_DIR_NAMES = (
     'tak-video-restreamer', 'webodm', 'netbird', 'cesium-tiles',
     'TAK-Portal', 'CloudTAK', 'node-red', 'authentik', 'eud-remote-assist',
+    # ⚠️ **ATLAS MDM, and one entry covers every deployment on the box.**
+    # It runs one deployment per agency, and they used to sit side by side as
+    # `atlas`, `atlas-corona`, `atlas-redlands` -- siblings, which this list
+    # cannot express: it expands to `<home>/<name>/`, so `<home>/atlas-corona`
+    # never matched `<home>/atlas/` and every write, chown and delete inside
+    # an agency was refused. 61 refusals on one deploy, all of them fatal the
+    # day enforcement is switched on.
+    #
+    # Widening the rule was tried first -- a bare `<home>/atlas-` prefix -- and
+    # it does not work either: `_within_realpath` resolves the real path
+    # against a containment *directory*, and a name fragment is not one. The
+    # module nests its deployments under `<home>/atlas/<slug>/` instead, which
+    # is what this list already means by "one add-on, one directory".
+    'atlas',
 )
 ROOT_MODULE_DIRS = tuple('/root/%s/' % n for n in MODULE_DIR_NAMES)
 # Allowlist module dirs under EVERY plausible console home (the resolved home AND

@@ -3160,6 +3160,28 @@ def detect_modules():
             'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
+    # ATLAS MDM — registry-resident (modules/atlas.py). Identity and probes come
+    # from the descriptor; this block is what puts the tile on the Marketplace at
+    # all, because detect_modules() enumerates rather than iterating the registry.
+    _atlas_desc = mod_registry.MODULES.get('atlas')
+    try:
+        _atlas_state = _atlas_desc['detect'](mod_registry.get_ctx()) if _atlas_desc else {}
+    except Exception:
+        _atlas_state = {}
+    if _atlas_desc:
+        modules['atlas'] = {'name': _atlas_desc['name'],
+            'installed': bool(_atlas_state.get('installed')), 'running': bool(_atlas_state.get('running')),
+            'description': _atlas_desc['description'], 'icon': _atlas_desc['icon'],
+            'icon_url': _atlas_desc.get('icon_url'), 'route': _atlas_desc['route'],
+            'priority': _atlas_desc['priority'], 'conflicts': list(_atlas_desc.get('conflicts') or [])}
+    else:
+        # boot race only: the registry loads at the bottom of app.py, so an early
+        # daemon-thread poll in that window reports the tile not-installed once.
+        modules['atlas'] = {'name': 'ATLAS MDM', 'installed': False, 'running': False,
+            'description': 'Android device management for ATAK tablets — policies, apps, enrolment',
+            'icon': '📱', 'icon_url': '/static/logos/atlas-banner.png',
+            'route': '/atlas', 'priority': 16, 'conflicts': []}
+
     # TAK Simulator — registry-resident (modules/simulator.py, v10.1.61). v10.1.63 W1: the
     # dev-channel gate is gone. v10.1.62 shipped the module to the main *git branch*, which is
     # a different thing from the main *update channel* — the two were conflated when the gate
@@ -3626,6 +3648,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
         parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+    atlas_nav = modules.get('atlas', {})
+    if atlas_nav.get('installed'):
+        parts.append(link('/atlas', '<img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" style="height:auto;width:100%;max-width:150px;object-fit:contain;display:block">', 'ATLAS MDM'))
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
@@ -25762,6 +25787,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'webodm': 'webodm',
     'netbird': 'netbird',
     'remote_assist': 'remote',
+    'atlas': 'atlas',
 }
 
 def _get_service_domain(settings, service_key):
@@ -29539,6 +29565,141 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'netbird'), nb_host)
+
+    atlas_mod = modules.get('atlas', {})
+    # W216 — one console vhost, one plain-HTTP APK vhost and one device site per
+    # ATLAS deployment, because a box may host several (one per agency).
+    #
+    # The body below is unchanged: replacing the `if` with a `for` at the same
+    # indent keeps it where it was, which matters because a Caddyfile that
+    # differs by one character takes every vhost on this box with it, not just
+    # ATLAS's. `caddy_sites` returns exactly one entry for a single deployment,
+    # carrying the host, upstream and CA path this block used before.
+    for _at_site in (mod_registry.atlas.caddy_sites(
+            settings, sd.get('atlas') or _get_service_domain(settings, 'atlas'))
+            if atlas_mod.get('installed') else []):
+        at_host = _at_site['host']
+        at_up = _at_site['upstream']
+        at_device_paths = '/api/v1/device/* /api/v1/enroll /api/v1/provisioning/*'
+        at_ca = _at_site['ca_path']
+
+        # Administration console (443). Admin tooling, so Authentik fronts it and
+        # the device paths are refused here — a tablet cannot complete an
+        # interactive login, and an admin does not need the device API.
+        lines.append(f"# ATLAS MDM — administration console (443). Device channel is :8449 only.")
+        lines.append(f"{at_host} {{")
+        lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        # SEC_AUDIT M-1. ATLAS caps uploads itself, during the read, so this is
+        # the backstop rather than the limit — deliberately ABOVE the
+        # application's 2 GiB default so an over-size upload is refused by ATLAS
+        # with a message naming the limit, not by Caddy with a bare 413. An
+        # operator who raises TAKMDM_MAX_UPLOAD_BYTES past this will hit Caddy
+        # first; that is the one case worth knowing about.
+        lines.append(f"    request_body {{")
+        lines.append(f"        max_size 2304MiB")
+        lines.append(f"    }}")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            # ⚠️ The strip runs FIRST, before forward_auth re-adds the authentic
+            # values. ATLAS trusts x-authentik-username / -groups to decide who
+            # is an administrator, so a client that could set them itself would
+            # own the fleet. Same reasoning as the mTLS certificate header.
+            _emit_ak_header_strip("        ")
+            _emit_outpost_callback_rescue(f"https://{at_host}/")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            # Refused before authentication, not after: a tablet cannot complete
+            # an interactive login, so sending it into the SSO round-trip would
+            # turn a clean 404 into a redirect loop.
+            lines.append(f"        @atlas_device path {at_device_paths}")
+            lines.append(f"        respond @atlas_device 404")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            # SEC_AUDIT (ATLAS) S-1 — the same mechanism the console already uses
+            # for itself, extended to this module's vhost.
+            #
+            # ⚠️ AFTER forward_auth, so it is attached only to requests that
+            # passed it. Inside a `route` the directives run in written order and
+            # forward_auth short-circuits on failure, so a 302'd request never
+            # reaches this line.
+            #
+            # Why it matters: ATLAS reads the administrator from
+            # X-Authentik-Username, and nothing in that header proves Caddy set
+            # it. Its own peer check cannot help — Caddy runs on this host and
+            # reaches the container through the bridge gateway, and so does every
+            # other process here. This secret is what separates them.
+            _at_pa = (_proxy_auth_state(create=True).get('secret') or '').strip()
+            if _at_pa:
+                lines.append(f"        request_header X-Infratak-Proxy-Auth {_at_pa}")
+            lines.append(f"        reverse_proxy {at_up}")
+            lines.append(f"    }}")
+        else:
+            # ⚠️ Not published without Authentik. ATLAS has two auth modes and no
+            # middle one: forward_auth (which nothing would satisfy here, so the
+            # console would answer 401 forever) or disabled (which would put an
+            # unauthenticated fleet-management console on the public internet).
+            # The honest answer is an SSH tunnel, which is what the deploy log
+            # tells the operator to use.
+            lines.append(f"    respond 404")
+        lines.append(f"}}")
+        lines.append("")
+        if _at_site['slug'] is None:
+            # The alias names the box's general ATLAS. Emitting it per
+            # agency would point one name at several hosts.
+            _emit_alias_redirect(_get_service_alias(settings, 'atlas'), at_host)
+
+        # The agent package, in the clear on the well-known port.
+        #
+        # A tablet in out-of-box setup is fetching this before it has been told
+        # anything, often on a guest network that blocks high ports. Declaring
+        # the site as http:// suppresses Caddy's automatic redirect to TLS for
+        # this host, which is the point: an Android setup wizard follows no
+        # redirect here. Integrity comes from the signature checksum carried in
+        # the provisioning QR, which the wizard verifies before installing.
+        lines.append(f"# ATLAS MDM — agent package, plain HTTP (device provisioning, no redirect)")
+        lines.append(f"http://{at_host} {{")
+        lines.append(f"    @atlas_apk path /api/v1/provisioning/agent.apk")
+        lines.append(f"    handle @atlas_apk {{")
+        lines.append(f"        reverse_proxy {at_up}")
+        lines.append(f"    }}")
+        lines.append(f"    handle {{")
+        lines.append(f"        redir https://{{host}}{{uri}} permanent")
+        lines.append(f"    }}")
+        lines.append(f"}}")
+        lines.append("")
+
+        # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
+        if at_ca:
+            lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
+            lines.append(f"{at_host}:8449 {{")
+            lines.append(f"    tls {{")
+            # verify_if_given, NOT require_and_verify: a device enrolling for the
+            # first time has no certificate yet and calls /api/v1/enroll without
+            # one. Requiring a certificate at the listener would make enrolment
+            # impossible — the application decides which paths need an identity.
+            lines.append(f"        client_auth {{")
+            lines.append(f"            mode verify_if_given")
+            lines.append(f"            trust_pool file {{")
+            lines.append(f"                pem_file {at_ca}")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    @atlas_device path {at_device_paths}")
+            lines.append(f"    handle @atlas_device {{")
+            lines.append(f"        reverse_proxy {at_up} {{")
+            # The verified certificate, single-line base64 DER. Caddy's PEM
+            # placeholder carries real newlines and a header cannot.
+            #
+            # This SETS the header, which is what makes it safe: an inbound copy
+            # from a client is replaced, never appended to.
+            lines.append(f"            header_up X-SSL-Client-Cert {{http.request.tls.client.certificate_der_base64}}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"    respond 404")
+            lines.append(f"}}")
+            lines.append("")
 
     ra_mod = modules.get('remote_assist', {})
     if ra_mod.get('installed'):
@@ -80734,6 +80895,10 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
+    # ATLAS MDM needs these two Authentik helpers, which this file
+    # already defines and did not previously hand to a module.
+    '_outpost_add_providers_safe': _outpost_add_providers_safe,
+    '_authentik_application_open_in_new_tab': _authentik_application_open_in_new_tab,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
