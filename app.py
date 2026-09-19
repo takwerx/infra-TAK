@@ -41142,6 +41142,34 @@ def tvr_page():
     return r
 
 
+@app.route('/atlas')
+@login_required
+def atlas_page():
+    """The ATLAS MDM module page (v10.1.80).
+
+    Hand-written like every other module page: the registry generates the API
+    routes (deploy/log/control/uninstall + extra_routes), never the page. PR #76
+    shipped the template and the API but not this handler, so the tile and the
+    nav link pointed at a 404 — caught at landing, before the fleet pulled.
+    """
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    atlas = modules.get('atlas', {})
+    atlas_domain = _get_service_domain(settings, 'atlas')
+    job = mod_registry.job_state('atlas')
+    r = make_response(render_template('atlas.html',
+        settings=settings, modules=modules, atlas=atlas,
+        installed=bool(atlas.get('installed')), running=bool(atlas.get('running')),
+        atlas_domain=atlas_domain,
+        deploy_log=job.get('log') or [],
+        deploy_running=bool(job.get('running')),
+        deploy_error=bool(job.get('error')),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
 @app.route('/simulator')
 @login_required
 def simulator_page():
