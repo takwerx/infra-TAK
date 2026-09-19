@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.81-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.81-alpha)**
+**Current release: [v10.1.82-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.82-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.82-alpha — 2026-09-19 — ATLAS: removing an agency deployment works again
+
+**Headline: on v10.1.81, the "Remove deployment" button for an ATLAS agency deployment always failed with "invalid admin password". The dialog now asks for your console password, as the uninstall and certificate dialogs already do, and removal completes.** The server-side check that requires the password was added during review because removing a deployment destroys that agency's device certificate authority and database; the dialog that collects the password was missed. Removing the whole module was never affected. Fix contributed by Michael Leckliter.
+
+> **Upgrade note.** Nothing to do beyond updating.
 
 ### v10.1.81-alpha — 2026-09-19 — ATLAS MDM shows on every box
 
