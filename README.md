@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.80-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.80-alpha)**
+**Current release: [v10.1.81-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.81-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -68,7 +68,7 @@ No more SSH. No more editing XML by hand. No more running scripts and hoping.
 
 ```bash
 # Ensure git is installed (Ubuntu usually has it; bare RHEL/Rocky cloud AMIs often don't)
-command -v git >/dev/null 2>&1 || sudo apt-get install -y git 2>/dev/null || sudo dnf install -y git
+command -v git >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && sudo apt-get update -qq && sudo apt-get install -y git; } || { command -v dnf >/dev/null 2>&1 && sudo dnf install -y git; }
 
 git clone --depth 1 https://github.com/takwerx/infra-TAK.git
 cd infra-TAK
@@ -421,6 +421,14 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.81-alpha — 2026-09-19 — ATLAS MDM shows on every box
+
+**Headline: the ATLAS MDM tile now appears in the Marketplace on every box, whichever update channel it is set to.** v10.1.80-alpha, released earlier today, shipped the module with its tile visible only on boxes set to the dev update channel. That restriction is lifted; the module itself is unchanged.
+
+Also in this release: the Quick Start's "install git" line now refreshes the package index before installing on Ubuntu, so a fresh cloud image with a stale package list no longer fails with a 404 on the first command. Ubuntu 22.04 remains the supported baseline; 24.04 support follows TAK Server 5.8.
+
+> **Upgrade note.** Nothing to do beyond updating. The ATLAS MDM tile appears in the Marketplace on the next update.
 
 ### v10.1.80-alpha — 2026-09-19 — ATLAS MDM: Android device management for ATAK tablets (dev channel)
 
