@@ -57,7 +57,7 @@ import subprocess
 # would have waited for the worst possible moment to surface.
 import time
 
-from . import register_module, job_log, job_state
+from . import register_module, job_log, job_state, get_ctx
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
@@ -3381,6 +3381,16 @@ def deploy(ctx, job, params):
         plog('✓ Device CA staged for Caddy at %s' % staged)
 
         ctx['generate_caddyfile'](s)
+        # ⚠️ Read back. Staging the CA and rendering the listener are two
+        # different questions, and on the first Rocky non-root deploy the first
+        # was true while the second was false (see `_ca_is_staged`).
+        if not _caddyfile_has_device_listener(_me['host']):
+            raise RuntimeError(
+                'The Caddyfile was rendered without the :%d device listener for %s '
+                'although the device CA is staged at %s. Stopping here rather than '
+                'leaving the device channel silently missing.'
+                % (DEVICE_PORT, _me['host'], staged))
+        plog('✓ Device listener :%d rendered for %s' % (DEVICE_PORT, _me['host']))
         if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
 
@@ -3572,17 +3582,47 @@ def device_ca_path(inst=None):
                           'device-ca.crt')
 
 
-def _ca_is_staged(inst=None):
+def _ca_is_staged(inst=None, ctx=None):
     """Is there actually a trust pool at that path?
 
     ⚠️ Asked rather than assumed, because the answer decides whether the
     device listener is emitted at all. `caddy_sites` runs on every Caddyfile
     render, long after the deploy that staged it.
+
+    ⚠️ **The direct probe is not enough (v10.1.80 T&E, Rocky non-root).**
+    `/var/lib/caddy` is `drwxr-x--- caddy:caddy`. The console can traverse it
+    only where something once added it to the `caddy` group (the MediaMTX
+    editor setup does, on Ubuntu boxes that ran it); on a born-non-root Rocky
+    box it is `takwerx wheel` and `getsize()` raised EACCES about a file the
+    deploy had just staged through the broker. The listener was then left out
+    of the Caddyfile while the deploy log read staged + reloaded. Same shape
+    as the `pki/` lesson: a stat the console cannot make is not "absent".
+    So on OSError, ask the broker, which can read that path.
     """
+    path = device_ca_path(inst)
     try:
-        return os.path.getsize(device_ca_path(inst)) > 0
+        return os.path.getsize(path) > 0
+    except OSError:
+        pass
+    reader = ((ctx or get_ctx()) or {}).get('_read_priv')
+    if reader is None:
+        return False
+    try:
+        return bool((reader(path) or '').strip())
+    except Exception:
+        return False
+
+
+def _caddyfile_has_device_listener(host):
+    """Did the render actually emit `<host>:8449 {`? Read back, never assumed."""
+    if not host:
+        return True
+    try:
+        with open('/etc/caddy/Caddyfile') as f:
+            body = f.read()
     except OSError:
         return False
+    return ('%s:%d {' % (host, DEVICE_PORT)) in body
 
 
 def sync_device_ca_for_caddy(inst=None, ctx=None):
