@@ -138,7 +138,25 @@ function harness(capacity) {
   // ⚠️ A request that never settles, so the state the page shows *while* it is
   // waiting can be asserted. That moment is the whole subject: before this, the
   // dialog closed and the operator was left with no sign anything was happening.
-  global.fetch = () => new Promise(() => {});
+  // ⚠️ It used to be `() => new Promise(() => {})`, discarding the call.
+  // Nothing in this harness could then see what the page *sends*, and that
+  // is how a removal request missing the console password shipped: the
+  // route demanded one, the dialog never collected one, and every teardown
+  // failed with "invalid admin password".
+  global.sentRequests = [];
+  global.fetch = (url, opts) => {
+    let body = null;
+    try { body = JSON.parse((opts && opts.body) || "null"); } catch (e) {}
+    global.sentRequests.push({ url, body });
+    // A queued reply resolves; otherwise the request hangs, which is what
+    // most checks here want (the dialog should sit in its busy state).
+    if (global.nextReply !== undefined) {
+      const reply = global.nextReply;
+      global.nextReply = undefined;
+      return Promise.resolve({ json: () => Promise.resolve(reply) });
+    }
+    return new Promise(() => {});
+  };
 
   const ctx = {};
   // eslint-disable-next-line no-eval
@@ -163,7 +181,18 @@ function harness(capacity) {
     askAgain: ctx.askAgain,
     renderRemoval: ctx.renderRemoval,
     openUninstall: ctx.openUninstall,
-    typeConfirm(v) { el("removeConfirm").value = v; ctx.removeGate(); },
+    sent() { return global.sentRequests; },
+    replyWith(d) { global.nextReply = d; },
+    clearSent() { global.sentRequests = []; },
+    typeConfirm(v) {
+      el("removeConfirm").value = v;
+      // The removal gate wants a console password as well as the typed
+      // name. These checks are about the name, so the password is always
+      // present; `typePassword` below is what varies it.
+      if (!el("removePw").value) el("removePw").value = "hunter2";
+      ctx.removeGate();
+    },
+    typePassword(v) { el("removePw").value = v; ctx.removeGate(); },
     pick(mode) {
       radios.dynamic.checked = mode === "dynamic";
       radios.fixed.checked = mode === "fixed";
@@ -592,6 +621,47 @@ const UNFINISHED = { slug: "gone", mode: "dynamic", size_gb: 50,
   check("but 'general' is", h.el("removeGo").disabled === false);
 }
 
+
+{
+  // ⚠️ **The removal request body.** `instance_remove_view` requires the
+  // console password as well as the typed slug; the dialog collected only
+  // the slug, so every teardown failed with "invalid admin password" and
+  // there was no field to supply one in. Nothing here could see it,
+  // because the fetch double discarded its arguments.
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+  h.typeConfirm("corona");
+  h.typePassword("hunter2");
+  h.clearSent();
+  h.doRemove();
+
+  const req = h.sent()[0];
+  check("the removal request is sent", !!req, JSON.stringify(h.sent()));
+  check("it carries the typed confirmation",
+    !!req && req.body && req.body.confirm === "corona",
+    JSON.stringify(req && req.body));
+  check("it carries the console password",
+    !!req && req.body && req.body.password === "hunter2",
+    JSON.stringify(req && req.body));
+}
+
+{
+  // The gate: both halves, and neither alone.
+  const h = harness({ ...CAPACITY });
+  h.openRemove(RUNNING);
+
+  h.typePassword("hunter2");
+  check("a password with no typed name does not enable it",
+    h.el("removeGo").disabled === true);
+
+  h.typeConfirm("corona");
+  h.typePassword("");
+  check("a typed name with no password does not enable it",
+    h.el("removeGo").disabled === true);
+
+  h.typePassword("hunter2");
+  check("both together enable it", h.el("removeGo").disabled === false);
+}
 {
   const h = harness({ ...CAPACITY });
   h.openRemove(RUNNING);

@@ -667,6 +667,19 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
       <p class="note" style="margin-top:10px" id="removePrompt"></p>
       <input type="text" id="removeConfirm" autocomplete="off" spellcheck="false"
              oninput="refreshRemoveGate()">
+      <!--
+        {W} **The route asks for the console password and this dialog did
+        not collect one**, so every removal failed with "invalid admin
+        password" and no way to supply it. The gate was added to
+        `instance_remove_view` without the half the operator touches.
+
+        Same control and same wording as the uninstall dialog and the three
+        CA dialogs, which have always asked: a typed slug proves which
+        deployment, the password proves intent.
+      -->
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="removePw" placeholder="Console password"
+             oninput="refreshRemoveGate()">
       <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-secondary" onclick="closeRemove()">Cancel</button>
         <button class="btn btn-danger" id="removeGo" disabled
@@ -1111,9 +1124,15 @@ function refreshRemoveGate(){
   // merely be a name that exists. Accepting any of them is how the wrong agency
   // gets destroyed by an operator who typed from memory.
   const field = document.getElementById('removeConfirm');
+  const pw = document.getElementById('removePw');
   const go = document.getElementById('removeGo');
   const want = removeName(removeTarget);
-  if (go) go.disabled = !field || field.value.trim() !== want;
+  // {W} Both, because the route wants both. Enabling on the typed name
+  // alone sent a request that could only fail, and the failure named the
+  // password -- a field that was not on the page.
+  const named = !!field && field.value.trim() === want;
+  const gave = !!pw && pw.value.length > 0;
+  if (go) go.disabled = !(named && gave);
 }
 
 let removePolling = false;
@@ -1128,6 +1147,11 @@ function removeAskAgain(message){
   if (ask) ask.hidden = false;
   if (err && message){ err.textContent = message; err.style.display = ''; }
   refreshRemoveGate();
+}
+
+function removePassword(){
+  const pw = document.getElementById('removePw');
+  return pw ? pw.value : '';
 }
 
 function doRemove(){
@@ -1146,10 +1170,14 @@ function doRemove(){
   fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove',
         {method: 'POST', credentials: 'same-origin',
          headers: {'Content-Type': 'application/json'},
-         body: JSON.stringify({confirm: name})})
+         body: JSON.stringify({confirm: name, password: removePassword()})})
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (d.error){ removeAskAgain(d.error); return; }
+      // {W} Cleared the moment it is no longer needed. The dialog stays open
+      // for the length of a teardown, which is a minute or more.
+      const pw = document.getElementById('removePw');
+      if (pw) pw.value = '';
       removePolling = slug;
       pollRemove();
     }).catch(function(){
