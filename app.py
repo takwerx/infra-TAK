@@ -3168,13 +3168,20 @@ def detect_modules():
         _atlas_state = _atlas_desc['detect'](mod_registry.get_ctx()) if _atlas_desc else {}
     except Exception:
         _atlas_state = {}
-    if _atlas_desc:
+    # v10.1.80: dev-channel only for this release (Module Developer Guide §16 — a third-party
+    # module lands on the dev update channel first and is promoted later). The CODE ships to
+    # every box; the tile shows only where update_channel == 'dev', or wherever ATLAS is
+    # already installed (an installed module is never hidden). This gates on the update
+    # CHANNEL, not the git branch — see the Simulator note below (v10.1.63 W1) for the
+    # conflation that once hid a tile from every main-channel customer by mistake.
+    _atlas_dev_box = (settings.get('update_channel') or 'main').strip().lower() == 'dev'
+    if _atlas_desc and (_atlas_dev_box or _atlas_state.get('installed')):
         modules['atlas'] = {'name': _atlas_desc['name'],
             'installed': bool(_atlas_state.get('installed')), 'running': bool(_atlas_state.get('running')),
             'description': _atlas_desc['description'], 'icon': _atlas_desc['icon'],
             'icon_url': _atlas_desc.get('icon_url'), 'route': _atlas_desc['route'],
             'priority': _atlas_desc['priority'], 'conflicts': list(_atlas_desc.get('conflicts') or [])}
-    else:
+    elif not _atlas_desc and _atlas_dev_box:
         # boot race only: the registry loads at the bottom of app.py, so an early
         # daemon-thread poll in that window reports the tile not-installed once.
         modules['atlas'] = {'name': 'ATLAS MDM', 'installed': False, 'running': False,
