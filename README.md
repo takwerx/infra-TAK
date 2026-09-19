@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.79-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.79-alpha)**
+**Current release: [v10.1.80-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.80-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.80-alpha — 2026-09-19 — ATLAS MDM: Android device management for ATAK tablets (dev channel)
+
+**Headline: a new Marketplace module manages the tablets themselves. ATLAS MDM enrolls Android devices, pushes policy and apps to them, and issues each one its own certificate, one deployment per agency on a single box. Contributed by Michael Leckliter ([ATLAS](https://github.com/cfd2474/TAK-MDM)), reviewed and landed through the module security gate. It ships on the dev update channel first.**
+
+**What it does.** Deploy it from the Marketplace like any other module. It gets its own subdomain behind Authentik for administrators, a separate mutual-TLS channel on port 8449 that enrolled tablets talk to, and a plain-HTTP path a factory-reset tablet can fetch the agent from during setup. Each deployment has its own certificate authority, so one agency's devices never trust another's. Uninstall removes everything it created, including the Authentik application and the firewall rule.
+
+**What it needs.** Authentik on the box (the admin console is not published without it), a working FQDN, and **at least 25 GB of free disk**: the module keeps that much clear for the rest of the box and refuses to deploy below it. The console's own update button for ATLAS follows the upstream `main` branch, the same way CloudTAK's does.
+
+**Dev channel only.** Every box gets the code, but the Marketplace tile appears only on boxes set to the dev update channel. Promotion to the main channel is a separate decision after a release cycle in the field.
+
+**Platforms.** Validated on Ubuntu 22.04 and Rocky Linux 9, including non-root installs. On ARM64 the console runs the module, but one upstream app source (the APKPure fetcher, an x86-only binary) does not work yet; enrollment and the bundled agent are unaffected.
+
+> **Upgrade note.** Nothing to do beyond updating. Main-channel boxes see no change in the Marketplace. Dev-channel boxes get the ATLAS MDM tile.
 
 ### v10.1.79-alpha — 2026-09-18 — Every TAK client on the channel shows up in the feed, and the console hands out the URL ArcGIS accepts
 

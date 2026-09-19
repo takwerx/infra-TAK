@@ -1,0 +1,2171 @@
+{% extends 'base.html' %}
+{% block title %}ATLAS MDM — infra-TAK{% endblock %}
+{% block page_css %}<style>
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.mono{font-family:'JetBrains Mono',monospace}
+.atlas-banner{height:44px;width:auto;max-width:100%;object-fit:contain;display:block}
+.atlas-link{color:var(--cyan);text-decoration:none}
+.badge-new{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3);border-radius:999px;padding:2px 10px;font-size:11px;font-weight:700}
+.spinner-row{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-secondary)}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.atlas-link:hover{text-decoration:underline}
+/* A scrolling viewer for streaming output. The fixed height is deliberate: the
+   box exists before the first line arrives and must not resize under the
+   operator as a deploy writes into it.
+   ⚠️ `white-space:pre-wrap` is load-bearing, not decoration. `renderLog` sets
+   `textContent` to lines joined with a newline, and the CSS default `normal`
+   collapsed every one — so a running deploy rendered as one run-on paragraph.
+   Every other module's template already carried this. */
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:340px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+/* A short block to read, which is a different thing from a log to watch:
+   height follows the content, and newlines survive.
+
+   ⚠️ **Both halves were learned the hard way.** The break-glass commands used
+   `.log-box`, so one line of `sed` got a 340px box of empty space — and with
+   newlines collapsing, two commands printed as one line that could not run.
+   That card is gone (W224), but the rule is not decoration: the capacity panel
+   and the uninstall dialog's list of deployments are both several lines that
+   mean nothing run together. */
+.cmd{background:#050810;border:1px solid var(--border);border-radius:6px;padding:8px 11px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.55;color:#94a3b8;white-space:pre-wrap;overflow-x:auto}
+.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
+.url-row:last-child{border-bottom:none}
+.note{font-size:12px;color:var(--text-dim);line-height:1.7}
+textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--border);border-radius:8px;color:#94a3b8;font-family:'JetBrains Mono',monospace;font-size:11px;padding:10px}
+/* The release-channel switch (W228). Two buttons rather than a toggle: a
+   toggle has an implied "off", and neither channel is off — a box is always
+   following one of them. Each carries the version it currently offers, because
+   the choice an operator is making is between two numbers, not two words. */
+.chan-row{display:flex;gap:10px;flex-wrap:wrap}
+.chan{flex:1;min-width:230px;text-align:left;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg-deep);color:var(--text-secondary);cursor:pointer;font-family:inherit}
+.chan:hover{border-color:var(--border-hover)}
+.chan.on{border-color:var(--cyan);background:rgba(34,211,238,.07);color:var(--text-primary)}
+.chan:disabled{cursor:progress;opacity:.6}
+.chan-name{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
+.chan-ver{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);margin-top:3px}
+.chan-ver.unknown{color:var(--text-dim)}
+.chan-blurb{font-size:11px;color:var(--text-dim);line-height:1.6;margin-top:7px}
+.chan-warn{font-size:11px;color:var(--yellow);line-height:1.6;margin-top:7px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal input{width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:12px}
+</style>{% endblock %}
+
+{% block content %}
+<div class="main">
+  <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
+
+  <!--
+    ⚠️ **The deploy log is the first card, above Install.** It used to be
+    last, so the one thing an operator watches for five to ten minutes sat
+    below two cards of prose they had just finished reading — off-screen at
+    the moment it starts moving.
+  -->
+  <!--
+    ⚠️ **Shown while a deploy runs, and after one that failed. Not after one
+    that worked.** The condition was `deploy_log`, which is the registry's job
+    log and stays populated until the *next* deploy starts — so a successful
+    deployment left its own log pinned to the top of the page through every
+    refresh, above the deployment it had just created.
+
+    A failure keeps it deliberately: that log is the only account of what went
+    wrong, and it has to survive the refresh an operator reaches for first.
+  -->
+  <!--
+    ⚠️ **At the top, beside the deploy log, for the same reason.** An update is
+    minutes of build output and an operator watches it; three cards down it was
+    off screen at the moment it started, and the only sign anything was
+    happening was a button that had stopped responding. Operator asked for it
+    here after watching an update fail with the card below the fold.
+
+    Hidden until something writes to it — `pollUpdate`, `pollUpdateAll` and the
+    removal poll all reveal it and set its title, so the card says which of the
+    three it is showing.
+  -->
+  <div class="card" id="updateCard" hidden>
+    <div class="card-title" id="updateLogTitle">Update log</div>
+    <div class="log-box" id="updateLog"></div>
+  </div>
+
+  <div class="card" id="deployCard" {% if not deploy_running and not deploy_error %}style="display:none"{% endif %}>
+    <div class="card-title">Deploy log</div>
+    <!--
+      ⚠️ **Shown only while a deploy is actually running**, because `pollDeploy`
+      reloads on `d.complete && !d.error` and on nothing else. Left up beside a
+      *failed* deploy it would promise a refresh that never arrives, and an
+      operator would sit waiting on it instead of reading the error.
+    -->
+    <p class="note" id="deployNote"
+       style="margin:0 0 12px{% if not deploy_running %};display:none{% endif %}">
+      ⏳ Leave this page open — it refreshes itself once ATLAS has deployed.
+    </p>
+    <div class="log-box" id="deployLog">{% for line in deploy_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+    <!--
+      ⚠️ The failure banner lives with the log now. It used to sit on the Install
+      card, which was retired when the two deploy paths merged — and `pollDeploy`
+      still reveals it, so leaving it out made a failed deploy silent.
+    -->
+    <div id="deployError" style="display:none;margin-top:12px;color:var(--red);font-size:13px">✗ Deploy failed — see the log above.</div>
+  </div>
+
+  <!--
+    ⚠️ **Outside the installed/not-installed branch, deliberately.** This card
+    lived in the installed-only arm, so a box with nothing deployed saw only the
+    legacy Install form — fixed size, no slug, no choice of mode. The *first*
+    deployment is exactly the one that most needs them: neither choice can be
+    changed afterwards, because `resize2fs` will not shrink a mounted filesystem
+    and a fixed store cannot become sparse once its blocks are allocated.
+  -->
+  <!--
+    Deployments (W216).
+
+    ⚠️ **One card listing N instances, not N cards.** The registry holds any
+    number of distinct keys, but `register()` runs only at console import — so a
+    deployment created here would not exist as a module until a restart, and
+    "Deploy additional instance" has to work without one.
+  -->
+  <!--
+    Release channel (W228).
+
+    ⚠️ **First card in the idle state, which is what "at the top" means
+    here.** The update and deploy logs sit above it in the markup and are both
+    hidden unless something is running — and when an update *is* running its
+    log must stay at the very top, which is the whole reason it was moved
+    there. So this is the top card whenever there is nothing to watch, and
+    yields to the log when there is.
+
+    ⚠️ **Both channels show their version, not just the selected one.** The
+    decision is between two numbers; a card showing only the current one would
+    make an operator flip the switch to find out what the other offers, which
+    on a box mid-rollout is a question they cannot un-ask.
+  -->
+  <div class="card" id="channelCard">
+    <div class="card-title">Release channel</div>
+    <div class="chan-row" id="channelRow">
+      <div class="note">Asking GitHub what each channel offers&hellip;</div>
+    </div>
+    <p class="note" id="channelNote" style="margin:14px 0 0"></p>
+  </div>
+
+  <div class="card" id="instancesCard">
+    <div class="card-title">ATLAS deployments</div>
+
+    <div id="instanceList" class="note">Reading this box&hellip;</div>
+
+    <!--
+      ⚠️ **The capacity panel names the binding constraint.** On the box
+      measured, disk allowed four or five more instances and memory about
+      twelve; an operator shown only the larger figure would plan for three
+      times what fits.
+    -->
+    <div id="capacityPanel" class="cmd" style="margin-top:14px;display:none"></div>
+
+    <!--
+      ⚠️ One row per *finished* deployment, each acting on itself. The single
+      "Update ATLAS" / Restart / Stop trio below acted on `takmdm` whatever the
+      box held, so on a box whose only deployment is an agency all three did
+      nothing and said nothing.
+    -->
+    <div id="instanceRows" style="margin-top:14px"></div>
+
+    <div id="retryRow" hidden style="margin-top:14px"></div>
+
+    <!--
+      ⚠️ Drift is expected, not a fault: updates are manual by design (§9) and
+      several agencies will not all be done on the same day. Naming it is what
+      makes a staged rollout deliberate rather than discovered later.
+    -->
+    <p class="note" id="driftNote" hidden style="margin:12px 0 0"></p>
+
+    <div id="updateAllRow" hidden style="margin-top:12px">
+      <button class="btn btn-secondary" id="updateAllBtn"
+              onclick="startUpdateAll()">Update all deployments</button>
+    </div>
+
+    <button class="btn btn-primary" id="addInstanceBtn"
+            onclick="openAddInstance()" style="margin-top:16px">
+      Deploy instance
+    </button>
+
+    <div id="addInstanceForm" hidden style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+
+      <!--
+        ⚠️ **The sizing mode comes first, because everything below depends on
+        it** — and because neither it nor the slug can be changed afterwards:
+        `resize2fs` will not shrink a mounted filesystem, and a fixed store
+        cannot become sparse once its blocks are allocated.
+
+        Dynamic is the default: it takes nothing from the box until the agency
+        stores something, so it is the choice that is hardest to regret.
+      -->
+      <div style="margin-bottom:16px">
+        <label style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Deployment type
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="dynamic" checked
+                 onchange="onModeChanged()">
+          <strong>Dynamic</strong> — shares whatever space is free, growing as it
+          is used and giving it back when things are deleted
+        </label>
+        <label class="note" style="display:block">
+          <input type="radio" name="sizeMode" value="fixed"
+                 onchange="onModeChanged()">
+          <strong>Fixed</strong> — a set amount, taken from the box now and held
+          for this deployment alone
+        </label>
+      </div>
+
+      <!-- Only fixed is asked for a size. Dynamic's ceiling is the pool. -->
+      <div id="sizeField" style="margin-bottom:16px;display:none">
+        <label for="instanceSize"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Reserved storage
+        </label>
+        <input type="number" id="instanceSize" min="2" step="1" placeholder="e.g. 50"
+               oninput="refreshAddGate()"
+               style="width:140px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <span style="font-size:13px;color:var(--text-dim);margin-left:6px">GB</span>
+        <p class="note" style="margin:8px 0 0">
+          ⚠️ <strong>Free disk drops by this much immediately</strong> — that is
+          the reservation working, not a leak.
+        </p>
+      </div>
+      <p class="note" id="dynamicNote" style="margin:0 0 16px"></p>
+
+      <div style="margin-bottom:16px">
+        <label for="agencySlug"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency slug
+        </label>
+        <input type="text" id="agencySlug" placeholder="leave blank for the box's general ATLAS"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
+               inputmode="latin" pattern="[a-z]*"
+               oninput="previewSlug()"
+               style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" style="margin:6px 0 0">
+          The agency this deployment belongs to. <strong>Lowercase letters
+          only</strong> — no spaces, digits or symbols, because it becomes part
+          of a hostname, a systemd unit name and a Docker volume name at once.
+          <strong>Leave it blank</strong> for the box&rsquo;s general ATLAS, of
+          which there can be only one.
+        </p>
+        <p class="note" id="slugPreview" style="margin:6px 0 0"></p>
+      </div>
+
+      <!--
+        ⚠️ **The slug is not the name.** `corona` is what goes in a hostname, a
+        systemd unit and a Docker volume; "Corona Fire Department" is what the
+        agency calls itself, and it is what an administrator needs to see in the
+        footer of that deployment's own console to know which fleet they are
+        about to push a policy to.
+      -->
+      <div style="margin-bottom:16px">
+        <label for="agencyName"
+               style="display:block;font-size:13px;font-weight:600;margin-bottom:6px">
+          Agency name
+        </label>
+        <!--
+          ⚠️ No placeholder, by operator decision. A greyed-out example in an
+          agency-name field reads as a value that is already there — and a
+          field that is *optional* and looks filled in is one an operator walks
+          past. The prose below says what it is for.
+        -->
+        <input type="text" id="agencyName" maxlength="60"
+               oninput="previewSlug()"
+               style="width:320px;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text-primary);font-size:13px">
+        <p class="note" style="margin:6px 0 0">
+          Shown in the footer of this deployment&rsquo;s own console, above the
+          version. Free text &mdash; spaces, capitals and punctuation are all
+          fine. Optional, and it can be changed later.
+        </p>
+      </div>
+
+      <div id="addInstanceError" style="display:none;margin-bottom:12px;color:var(--red);font-size:13px"></div>
+      <button class="btn btn-primary" id="createInstanceBtn" onclick="openInstanceConfirm()">
+        Review &amp; deploy
+      </button>
+      <button class="btn btn-secondary" onclick="closeAddInstance()">Cancel</button>
+      <p class="note" id="addInstanceGate" style="margin:8px 0 0"></p>
+    </div>
+  </div>
+
+  {% if not installed %}
+  <!--
+    ⚠️ **Hidden while a deploy runs**, server-side here and again in
+    `startDeploy`, because nothing on it can be acted on once one is under
+    way: the button is disabled, the size is already committed, and the prose
+    describes a decision made. `startDeploy` puts it back if the deploy is
+    refused or fails, because retrying needs the field it carries.
+  -->
+  <div class="card" id="installCard"{% if deploy_running %} style="display:none"{% endif %}>
+    <div class="card-title">Install</div>
+    <p class="note">
+      Android device management for ATAK tablets — policies, app catalogues,
+      enrolment by QR, and a device channel secured with client certificates.
+    </p>
+    <p class="note" style="margin-top:12px">
+      The console is published at <span class="mono">{{ atlas_domain or 'atlas.&lt;your-domain&gt;' }}</span>
+      behind Authentik, and enrolled devices talk to
+      <span class="mono">:8449</span> over mutual TLS. The database never leaves
+      the container network.
+    </p>
+    <p class="note" style="margin-top:12px;color:var(--yellow)">
+      ⏳ The first deploy clones the repository and builds images — allow 5–10 minutes.
+    </p>
+
+
+  </div>
+
+  <!--
+    The walkthrough, on the card an operator is looking at *before* they install.
+
+    ⚠️ It stops at "you have one device enrolled". Everything past that is covered
+    properly by the guides inside ATLAS, and a second copy here would be a second
+    copy to keep true — which is how documentation starts lying.
+  -->
+  <div class="card">
+    <div class="card-title">Getting started</div>
+
+    <p class="note"><strong>Before you deploy</strong></p>
+    <ul class="note" style="margin:6px 0 0 18px;line-height:1.8">
+      <li><strong>Caddy</strong> and <strong>Authentik</strong> must already be
+        deployed. ATLAS publishes its console as a Caddy vhost behind Authentik
+        sign-in, and registers itself as an Authentik application.
+        ⚠️ Without Authentik the deploy still succeeds but the console vhost is
+        <em>not published</em>, and the log says so.</li>
+      <li>A domain pointed at this box. The console lands on
+        <span class="mono">atlas.&lt;your-domain&gt;</span>.</li>
+      <li>One Android tablet you can <strong>factory reset</strong>. Device Owner
+        can only be established during the out-of-box wizard — there is no way to
+        convert a set-up device.</li>
+    </ul>
+
+    <p class="note" style="margin-top:14px"><strong>1. Deploy</strong></p>
+    <p class="note" style="margin-left:18px">
+      Press <strong>Deploy ATLAS</strong>. It clones the pinned release, builds the
+      image, generates a device certificate authority, opens
+      <span class="mono">:8449</span> for devices, registers the Authentik
+      application and restricts it to administrators. Seven steps, 5–10 minutes on
+      the first run.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>2. Open the console</strong></p>
+    <p class="note" style="margin-left:18px">
+      <span class="mono">https://atlas.&lt;your-domain&gt;</span>, signing in through
+      Authentik. The Android agent and launcher are already loaded — they ship with
+      the release and are installed into the app library on first start, so there
+      is nothing to upload.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>3. Enrol one device</strong></p>
+    <ul class="note" style="margin:6px 0 0 18px;line-height:1.8">
+      <li>On the <strong>Enroll</strong> page, create an enrollment token.</li>
+      <li>Fill in the Wi-Fi the tablet should use while provisioning, then
+        <strong>Generate enrollment QR</strong>.</li>
+      <li>On the factory-reset tablet, tap the first setup screen
+        <strong>six times in the same spot</strong> to open the QR scanner, and
+        scan it.</li>
+      <li>The tablet joins Wi-Fi, installs the agent as Device Owner, and appears
+        on <strong>Manage</strong> within a few seconds.</li>
+    </ul>
+    <p class="note" style="margin-left:18px;margin-top:6px">
+      ⚠️ The QR expires after <strong>15 minutes</strong> by default — it is a live
+      credential, and a photograph of it is too. There is a permanent option for a
+      provisioning bench, with the trade explained on the page.
+    </p>
+
+    <p class="note" style="margin-top:14px"><strong>4. Then use the guides inside ATLAS</strong></p>
+    <p class="note" style="margin-left:18px">
+      The <strong>Guides</strong> section of the console covers policies, app
+      deployment, kiosk mode, content and device identification. They live with the
+      release, so they describe the version you are actually running.
+    </p>
+
+    <p class="note" style="margin-top:14px;color:var(--yellow)">
+      ⚠️ <strong>One security step afterwards.</strong> A new install keeps the
+      certificate authority's root key on this server, where anyone who reaches the
+      box can take it and mint a device identity for ever. Once ATLAS is running,
+      the <strong>Certificate authority</strong> card on this page walks through
+      moving it somewhere safer. Devices are unaffected and nothing needs to be
+      touched on any tablet.
+    </p>
+  </div>
+
+  {% else %}
+  <!--
+    ⚠️ **The console link, the version and the three buttons have moved** into
+    the deployments card above, one set per deployment. Each of them named the
+    plain deployment: the link went to `atlas.<fqdn>` whatever this box serves,
+    the version read the plain checkout, and Restart/Stop ran compose in
+    `/root/atlas`. On a box whose only deployment is an agency every one of them
+    was wrong, and the two buttons failed silently.
+
+    What is left is genuinely box-wide: which release is available, and removing
+    the module.
+  -->
+  <div class="card">
+    <div class="card-title">Module</div>
+    <div class="url-row"><strong>Latest release</strong>
+      <span class="mono" id="latestRelease">checking…</span></div>
+
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-secondary" onclick="loadLogs()">Refresh logs</button>
+      <button class="btn btn-danger" onclick="openUninstall()">Uninstall</button>
+    </div>
+  </div>
+
+  <!--
+    ⚠️ **One certificate authority per deployment, and one block each.** Every
+    deployment issues its own device certificates from its own root — that is
+    the separation the agency model rests on, and it means there is no such
+    thing as "the" CA on a box with three agencies. This card used to show one,
+    always the plain deployment's, and reported "ATLAS is not running" over a
+    healthy split CA whenever that deployment did not exist.
+
+    The blocks are built in `renderCa`; this is the shell they land in.
+  -->
+  <div class="card" id="caCard" hidden>
+    <div class="card-title">Certificate authorities</div>
+
+    <!--
+      ⚠️ **The box-level question, asked once at the top.** "Is there a root key
+      on this server at all" is what matters, and a per-deployment banner three
+      screens down is easy to scroll past. While one is here, anyone who reaches
+      this machine can impersonate that deployment's devices.
+    -->
+    <div id="caRootKeys" hidden class="banner-bad" style="margin-bottom:14px">
+      <strong>Root keys are still on this server</strong>
+      <p style="margin:6px 0 0;font-size:13px;line-height:1.6" id="caRootKeysBody"></p>
+      <p style="margin:6px 0 0;font-size:13px;line-height:1.6">
+        Save each one below and we will remove it from here.
+        <strong>Nothing on any device changes.</strong> You will need those
+        files again in about five years — one per deployment, named for it.
+      </p>
+    </div>
+
+    <div id="caBlocks"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Logs</div>
+    <div class="log-box" id="logBox">Loading…</div>
+  </div>
+
+  {% endif %}
+
+</div>
+
+
+<!--
+  The ceremony, guided.
+
+  The value here is not that pasting a key is nicer than SSH \u2014 it is that the
+  cleanup is guaranteed. The step an operator forgets is deleting ca.key
+  afterwards, and forgetting it means the whole exercise bought nothing.
+-->
+
+<!--
+  Save-the-recovery-file, in two steps that cannot be half-finished.
+
+  ⚠️ Step 2 verifies and deletes in **one** server call. Splitting them would
+  allow "verified but still on the server", which is precisely the half-finished
+  state this feature exists to eliminate — and the state the console used to
+  misreport as done.
+-->
+<div class="modal-overlay" id="recoveryModal">
+  <div class="modal">
+    <h3 id="recoveryTitle">Save your recovery file</h3>
+
+    <div id="recoveryStep1">
+      <p style="color:var(--muted);font-size:13px;line-height:1.6">
+        This file is the master key for your devices. Treat it like the spare key
+        to a building: somewhere safe, not on this server, and not the only copy.
+      </p>
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="recoveryPw" placeholder="Console password">
+      <div class="banner-bad" id="recoveryError" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-secondary" onclick="closeRecovery()">Cancel</button>
+        <button class="btn btn-primary" id="recoveryDownloadBtn" onclick="doRecoveryDownload()">
+          Download the file
+        </button>
+      </div>
+    </div>
+
+    <div id="recoveryStep2" hidden>
+      <p style="color:var(--muted);font-size:13px;line-height:1.6">
+        <strong>Now prove you have it.</strong> Upload the file you just saved.
+        ⚠️ We ask because a file you cannot find later is the same as no file at
+        all — and you would not discover that for years.
+      </p>
+      <input type="file" id="recoveryFile" accept=".key,.pem,text/plain">
+      <!--
+        ⚠️ Its own field, because "Check my recovery file" enters at step 2 and
+        never sees step 1. Reading step 1's input there gave an empty password
+        and an "Invalid admin password" error on a button that had asked for
+        nothing.
+      -->
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="recoveryPw2" placeholder="Console password">
+      <div class="banner-bad" id="recoveryError2" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px" id="recoveryConfirmButtons">
+        <button class="btn btn-secondary" onclick="closeRecovery()">Finish later</button>
+        <button class="btn btn-primary" onclick="doRecoveryConfirm()">
+          Confirm and remove from server
+        </button>
+      </div>
+      <div id="recoveryBusy" hidden style="margin-top:14px;color:var(--muted)">
+        Checking the file and removing the key&hellip;
+      </div>
+    </div>
+
+    <div id="recoveryDone" hidden>
+      <div class="log-box" id="recoverySteps" style="margin-top:12px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="location.reload()">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="renewModal">
+  <div class="modal">
+    <h3 id="renewTitle">Renew the issuing certificate</h3>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6">
+      ATLAS signs device certificates with an <strong>issuing certificate</strong>.
+      When it expires, every device stops authenticating. Renewing it needs the
+      <strong>root key</strong>, which is deliberately not kept on this server.
+    </p>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6">
+      Devices roll onto the new certificate by themselves &mdash; nothing needs to
+      be done to any tablet.
+    </p>
+
+    <div id="renewForm">
+      <label style="font-size:13px">Root key file</label>
+      <!--
+        ⚠️ **A file, not a paste (W236).** The operator has this as a file
+        already -- "Save ... recovery file" downloaded it -- so asking them to
+        open it in an editor and paste the PEM was friction at the one moment
+        they are handling the most dangerous secret in the system.
+
+        Same control, same `accept`, same read-to-text as the "check my
+        recovery file" step below: this modal was simply the one that never
+        got it. The request body is unchanged, so nothing on the server moved.
+      -->
+      <input type="file" id="renewKeyFile" accept=".key,.pem,text/plain">
+      <p style="color:var(--muted);font-size:12px;margin-top:4px">
+        Choose nothing if the root key is still on this server &mdash; that is the
+        usual case, and the console will use the key it already has. A file you
+        choose is written for the length of one command and removed immediately
+        afterwards, whether the command succeeds or fails.
+      </p>
+
+      <label style="font-size:13px;margin-top:10px;display:block">Valid for (days)</label>
+      <input type="number" id="renewDays" value="1825" min="1" max="7300" style="width:120px">
+
+      <label style="font-size:13px;margin-top:10px;display:block">Console password</label>
+      <input type="password" id="renewPw" placeholder="Console password">
+
+      <div class="banner-bad" id="renewError" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:14px" id="renewButtons">
+        <button class="btn btn-secondary" onclick="closeRenew()">Cancel</button>
+        <button class="btn btn-primary" onclick="doRenew()">Renew</button>
+      </div>
+      <div id="renewBusy" hidden style="margin-top:14px;color:var(--muted)">
+        Issuing, staging the trust bundle and restarting ATLAS&hellip;
+      </div>
+    </div>
+
+    <div id="renewDone" hidden>
+      <div class="log-box" id="renewSteps" style="margin-top:12px"></div>
+      <div style="margin-top:14px">
+        <button class="btn btn-primary" onclick="location.reload()">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!--
+  ⚠️ Confirming a **reservation**, not a deployment. The number is the one
+  thing on this page that changes the box outside ATLAS: the space leaves `df`
+  immediately and does not come back without deliberate work. So it is repeated
+  here, in the operator's own units, after they have typed it and before
+  anything is allocated.
+-->
+
+<!--
+  ⚠️ The summary an operator approves before anything is built. Same shape as
+  the reservation confirmation it replaces: neither the type nor the slug can be
+  changed after the deploy, so this is the last point at which a mistake is free.
+-->
+<div class="modal-overlay" id="instanceModal">
+  <div class="modal">
+    <h3>Deploy ATLAS</h3>
+    <div class="cmd" id="instanceConfirmSummary" style="margin-bottom:14px"></div>
+    <p class="note" id="instanceConfirmNote"></p>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeInstanceConfirm()">Cancel</button>
+      <button class="btn btn-primary" id="instanceConfirmBtn" onclick="confirmCreateInstance()">Deploy</button>
+    </div>
+  </div>
+</div>
+
+<!--
+  ⚠️ **A separate confirmation from the whole-module uninstall, and no easier.**
+  Removing one deployment destroys *that* deployment's device CA, so every tablet
+  enrolled against it needs a factory reset in person. Deployments do not share a
+  CA — that is the point of the per-agency trust pool — so this is exactly one
+  agency's fleet, and the operator has to name which one.
+
+  ⚠️ The name is typed, not clicked. A red button beside five rows is one
+  mis-click away from the wrong agency, and there is no undo.
+-->
+<div class="modal-overlay" id="nameModal">
+  <div class="modal">
+    <h3 id="nameTitle">Name this deployment</h3>
+    <p class="note" id="nameWhat"></p>
+    <input type="text" id="nameField" maxlength="60"
+           placeholder="Corona Fire Department">
+    <p class="note" style="margin-top:8px">
+      Shown in the footer of that deployment&rsquo;s own console, above the
+      version. Leave it blank to remove the name.
+    </p>
+    <p class="note" style="margin-top:8px">
+      ⚠️ The deployment restarts to pick this up &mdash; a few seconds during
+      which its console is unavailable. Enrolled tablets are unaffected.
+    </p>
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-secondary" onclick="closeNameDeployment()">Cancel</button>
+      <button class="btn btn-primary" id="nameGo" onclick="doNameDeployment()">Save</button>
+    </div>
+    <div id="nameError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="instanceRemoveModal">
+  <div class="modal">
+    <h3 id="removeTitle">Remove deployment</h3>
+    <p class="note" id="removeWhat"></p>
+    <p class="note" style="margin-top:10px;color:var(--red)">
+      ⚠️ <strong>This destroys that deployment's device CA and database.</strong>
+      Every tablet enrolled against it is signed by that CA. Once it is gone they
+      cannot be re-adopted — each needs a factory reset, in person. Other
+      deployments on this box are untouched.
+    </p>
+    <div id="removeAsk">
+      <p class="note" style="margin-top:10px" id="removePrompt"></p>
+      <input type="text" id="removeConfirm" autocomplete="off" spellcheck="false"
+             oninput="refreshRemoveGate()">
+      <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-secondary" onclick="closeRemove()">Cancel</button>
+        <button class="btn btn-danger" id="removeGo" disabled
+                onclick="doRemove()">Remove deployment</button>
+      </div>
+    </div>
+
+    <!--
+      ⚠️ **The dialog stays open and says it is working.** A teardown is a
+      `docker compose down -v`, three unmounts, a loop device and an `rmtree`
+      over a store — a minute or more. Closing the dialog and leaving the log to
+      appear in a card further down the page meant the only honest reading of
+      the moment after the click was that it had missed. Same answer the
+      uninstall dialog already had.
+
+      ⚠️ No Cancel here, deliberately. Once `down -v` has run there is nothing
+      to go back to, and a button that cannot do what it says is worse than no
+      button.
+    -->
+    <div id="removeBusy" hidden style="margin-top:14px">
+      <div class="spinner-row">
+        <span class="spinner"></span>
+        <span id="removeBusyText">Removing… please wait.</span>
+      </div>
+      <p class="note" style="margin-top:8px">
+        Stopping containers, releasing the store and deleting the certificate
+        authority. This page reloads itself when it is done.
+      </p>
+    </div>
+
+    <div id="removeSteps" hidden class="log-box"
+         style="height:150px;margin-top:12px"></div>
+    <div id="removeError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="uninstallModal">
+  <div class="modal">
+    <h3>Uninstall ATLAS</h3>
+    <!--
+      ⚠️ **It removes every deployment, and the prose used to hide that.** This
+      text was written when a box ran one ATLAS: "the database volume", "the
+      device CA", "the ATLAS application" — all singular. On a box with three
+      agencies the same button destroys three fleets, and an operator reading
+      this would reasonably believe otherwise. The list is filled from the
+      deployments actually on the box, so it cannot drift from them.
+    -->
+    <p class="note">
+      Removes ATLAS completely: every deployment on this box, with its
+      containers, images, database volume, reserved store, install directory,
+      Caddy vhosts and its own Authentik application. Installing again rebuilds
+      all of it from scratch.
+    </p>
+    <div id="uninstallScope" hidden class="cmd" style="margin-top:10px"></div>
+    <p class="note" style="margin-top:10px;color:var(--red)">
+      ⚠️ <strong>This destroys every device CA and every database.</strong>
+      Each enrolled tablet's identity is signed by its own deployment's CA. Once
+      those are gone the tablets cannot be re-adopted — each needs a factory
+      reset, in person. There is no undo and no backup taken.
+    </p>
+    <p class="note" style="margin-top:10px" id="uninstallOneInstead" hidden>
+      To remove a single deployment and leave the others running, use
+      <strong>Remove</strong> on its row instead.
+    </p>
+    <input type="password" id="uninstallPw" placeholder="Console password">
+    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end" id="uninstallButtons">
+      <button class="btn btn-secondary" onclick="closeUninstall()">Cancel</button>
+      <button class="btn btn-danger" id="uninstallGo" onclick="doUninstall()">Uninstall</button>
+    </div>
+    <!-- The operator pressed uninstall and got silence for the length of a
+         `docker compose down -v`. Nothing said it had started, so the only
+         honest reading was that the click had missed. -->
+    <div id="uninstallBusy" hidden style="margin-top:14px">
+      <div class="spinner-row">
+        <span class="spinner"></span>
+        <span>Uninstalling… stopping containers and removing data.</span>
+      </div>
+      <p class="note" style="margin-top:8px">
+        This takes up to a minute. The page reloads itself when it is done.
+      </p>
+    </div>
+    <div id="uninstallSteps" hidden class="log-box" style="height:150px;margin-top:12px"></div>
+    <div id="uninstallError" style="display:none;margin-top:10px;color:var(--red);font-size:12px"></div>
+  </div>
+</div>
+
+<script>
+let polling = false;
+
+// ⚠️ The box's storage numbers are no longer fetched here. They arrive with
+// `capacity_facts` on `/api/atlas/instances`, which the one remaining
+// deployment form already reads — a second fetch of the same figures is a
+// second place for them to disagree.
+
+// The Install card stands down while a deploy runs: nothing on it can be acted
+// on, and the log above it is the only thing worth the screen.
+//
+// ⚠️ Shown again on refusal or failure, because a retry needs the reserved
+// storage field that lives on it. Hiding it and leaving it hidden would strand
+// an operator on a page with nothing left to act on.
+// --------------------------------------------------------------------------- //
+// Deployments (W216)
+// --------------------------------------------------------------------------- //
+
+let capacityState = null;
+
+//: The deployments the page last heard about. ⚠️ Kept so the uninstall dialog
+//: can name what it is about to destroy without a second request — and so it
+//: cannot name a list that disagrees with the one on screen above it.
+let lastInstances = [];
+
+function renderInstances(data){
+  const list = document.getElementById('instanceList');
+  const panel = document.getElementById('capacityPanel');
+  if (!list) return;
+  capacityState = data.capacity || {};
+  lastInstances = data.instances || [];
+
+  const rows = (data.instances || []).map(i => {
+    const name = i.slug ? i.slug : 'general (no slug)';
+    const held = i.mode === 'fixed' ? 'reserved' : 'maximum';
+    // ⚠️ An unfinished deployment says so. The record is written before the
+    // build so the slug is held while it runs; when the build then fails, the
+    // record is all that is left and it must not read as a working deployment.
+    const state = i.built ? i.mode : i.mode + '  (not finished)';
+    return '  ' + name.padEnd(24) + String(i.size_gb || 0).padStart(5) +
+           ' GB ' + held.padEnd(9) + ' ' + state;
+  });
+
+  // ⚠️ A deployment that never finished needs a way forward. Without this the
+  // only route was to re-create it, and the form refuses the slug as a
+  // duplicate — leaving the operator with a claimed name and no button.
+  // ⚠️ A stranded deployment is **not** unfinished, and must not be offered
+  // the finish-deploying button. Its containers are up; that button would
+  // build a second copy with the same compose project, ports and database
+  // volume. The module refuses it server-side too — this keeps the operator
+  // from meeting that refusal without knowing why.
+  const unfinished = (data.instances || []).filter(i => !i.built && !i.stranded);
+  const retry = document.getElementById('retryRow');
+  if (retry){
+    retry.hidden = unfinished.length === 0 || polling;
+    retry.innerHTML = '';
+    unfinished.forEach(i => {
+      const b = document.createElement('button');
+      b.className = 'btn btn-primary';
+      b.style.marginRight = '8px';
+      b.textContent = 'Finish deploying ' + (i.slug || 'the general ATLAS');
+      b.onclick = () => startDeployFor(i);
+      // ⚠️ A second "finish" during a build starts the same deploy twice. The
+      // registry's job slot refuses it, but a button that silently does
+      // nothing reads as a broken page.
+      if (!polling) retry.appendChild(b);
+      // ⚠️ **Abandoning it has to be possible too.** "Forget" refuses once a
+      // directory exists on disk — which is exactly what a deploy that cloned
+      // and then failed leaves behind — so without this the only way out of a
+      // failed deploy was to finish it. The slug stays claimed either way, and
+      // an operator who has changed their mind is left with a name they cannot
+      // reuse and a store they cannot reclaim.
+      // ⚠️ Same rule, and this is the one that was actually pressed: an
+      // unfinished deployment is exactly what a deploy *in progress* looks
+      // like, so this button sat beside a running build offering to delete it.
+      if (!polling)
+        retry.appendChild(rowButton('Remove ' + (i.slug || 'the general ATLAS'),
+                                    'btn-danger',
+                                    function(){ openRemove(i); }));
+    });
+  }
+  list.textContent = rows.length
+    ? 'Deployments on this box:\n' + rows.join('\n')
+    : 'No ATLAS deployment on this box yet.';
+
+  // ⚠️ Built deployments only. An unfinished one has nothing to update,
+  // restart or link to, and its row would offer three buttons that all fail.
+  const built = (data.instances || []).filter(i => i.built);
+  const rowBox = document.getElementById('instanceRows');
+  if (rowBox){
+    rowBox.innerHTML = '';
+    built.forEach(i => rowBox.appendChild(instanceRow(i)));
+  }
+
+  // ⚠️ Offered only from two. With one deployment it is the same action as its
+  // own Update button, and two buttons for one outcome is how an operator comes
+  // to wonder which one is the real one.
+  const allRow = document.getElementById('updateAllRow');
+  if (allRow) allRow.hidden = built.length < 2;
+
+  const versions = [];
+  built.forEach(i => {
+    if (i.version && versions.indexOf(i.version) < 0) versions.push(i.version);
+  });
+  const drift = document.getElementById('driftNote');
+  if (drift){
+    drift.hidden = versions.length < 2;
+    drift.textContent = versions.length < 2 ? '' :
+      'These deployments are on different releases: ' + versions.sort().join(', ')
+      + '. That is expected while a rollout is in progress — "Update all '
+      + 'deployments" brings them together.';
+  }
+
+  // ⚠️ "Deploy additional instance" on a box with none is a contradiction,
+  // so the wording follows the count. The markup ships the empty-box form, so
+  // a fresh box reads correctly on first paint rather than flashing the wrong
+  // one while the capacity fetch is in flight.
+  const add = document.getElementById('addInstanceBtn');
+  if (add) add.textContent = rows.length
+    ? 'Deploy additional instance'
+    : 'Deploy instance';
+
+  // ⚠️ The question disappears from the server's own predicate, never from a
+  // count made here — the page and the validator must not be able to disagree.
+  const choice = document.getElementById('agencyChoice');
+  const forced = document.getElementById('agencyForced');
+  const mayPlain = !!capacityState.may_deploy_plain;
+  if (choice) choice.style.display = mayPlain ? '' : 'none';
+  if (forced) forced.style.display = mayPlain ? 'none' : '';
+  if (!mayPlain){
+    const yes = document.querySelector('input[name="agencyKind"][value="yes"]');
+    if (yes) yes.checked = true;
+  }
+  onModeChanged();
+  previewSlug();
+
+  if (panel){
+    const c = capacityState;
+    panel.style.display = '';
+    panel.textContent =
+      'ATLAS budget      ' + c.budget_gb + ' GB   (floor ' + c.floor_gb + ' GB protected)\n' +
+      'committed         ' + c.committed_gb + ' GB across ' + c.instances + '\n' +
+      'remaining         ' + c.remaining_gb + ' GB\n' +
+      '\n' +
+      'disk allows       ' + c.by_disk + ' more\n' +
+      'memory allows     ' + c.by_ram + ' more   (' + c.per_instance_peak_gb + ' GB peak each)\n' +
+      '\n' +
+      'room for ' + c.room_for + ' more - ' + c.binding + ' is the limit';
+  }
+}
+
+function stateLabel(i){
+  // ⚠️ Four states now. "Stranded" is containers up with the files out of
+  // reach — what a box converted from a root install to a non-root one looks
+  // like. It must not read as "not finished", because the action that state
+  // offers is Deploy, and deploying would build a second copy of something
+  // already serving.
+  if (i.stranded) return 'running, but this console cannot reach its files';
+  // ⚠️ Three states, not two. "Stopped" and "never finished" both mean "not
+  // serving" and need opposite actions — start it, or deploy it — so a page
+  // that collapsed them would offer the wrong button for the one an operator
+  // is most likely to be looking at.
+  if (!i.built) return 'not finished';
+  const v = i.version ? 'v' + i.version : 'version unknown';
+  return (i.running ? 'running' : 'stopped') + '  ' + v;
+}
+
+function rowButton(label, kind, handler){
+  const b = document.createElement('button');
+  b.className = 'btn ' + kind;
+  b.style.marginLeft = '8px';
+  b.textContent = label;
+  b.onclick = handler;
+  return b;
+}
+
+function instanceRow(i){
+  const row = document.createElement('div');
+  row.className = 'url-row';
+
+  const name = document.createElement('strong');
+  name.textContent = i.slug || 'general';
+  row.appendChild(name);
+
+  // ⚠️ The agency's own name, when it has one. The slug is what the machine
+  // uses; this is what the operator calls them, and on a box with four
+  // agencies it is the only label that distinguishes them at a glance.
+  if (i.agency_name){
+    const agency = document.createElement('span');
+    agency.textContent = i.agency_name;
+    agency.style.cssText = 'margin-right:8px';
+    row.appendChild(agency);
+  }
+
+  // ⚠️ `hostFor` again, so the link an operator clicks is built by the same
+  // rule Caddy serves and `.env` records. A second rule here is how the page
+  // comes to link somewhere nothing answers.
+  const link = document.createElement('a');
+  link.className = 'mono atlas-link';
+  link.href = 'https://' + hostFor(i.slug) + '/';
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = hostFor(i.slug);
+  row.appendChild(link);
+
+  const state = document.createElement('span');
+  state.className = 'mono';
+  state.textContent = stateLabel(i);
+  row.appendChild(state);
+
+  // ⚠️ **The server decides, not this.** Comparing versions here would mean a
+  // second implementation of a comparison that has to be on integers —
+  // `0.10.0` sorts before `0.9.0` as a string, which would stop showing the
+  // badge at the tenth release of any series and do it silently.
+  if (i.update_available){
+    const badge = document.createElement('span');
+    badge.className = 'badge-new';
+    badge.style.marginLeft = '8px';
+    // Names the release, so the badge answers "to what" as well as "yes".
+    badge.textContent = 'v' + i.latest + ' available';
+    row.appendChild(badge);
+  }
+
+  // ⚠️ Changeable after the fact. `deploy` is the only thing that writes
+  // `.env`, so without this a deployment could only be named by tearing it down
+  // and building it again — and every deployment that exists today has no name.
+  row.appendChild(rowButton(i.agency_name ? 'Rename' : 'Name', 'btn-secondary',
+                            function(){ openNameDeployment(i); }));
+  row.appendChild(rowButton('Update', 'btn-primary',
+                            function(){ startUpdate(i.slug); }));
+  row.appendChild(rowButton(i.running ? 'Restart' : 'Start', 'btn-secondary',
+                            function(){
+                              controlInstance(i, i.running ? 'restart' : 'start');
+                            }));
+  if (i.running)
+    row.appendChild(rowButton('Stop', 'btn-secondary',
+                              function(){ controlInstance(i, 'stop'); }));
+  // ⚠️ **Not while something is being built.** Measured on the box
+  // 2026-09-18: a removal started during a deploy ran `docker compose down -v`
+  // over the containers the deploy had just created, and the deploy failed
+  // three seconds later. The server refuses this too — this is so the button
+  // is not there to be pressed in the first place.
+  if (!polling)
+    row.appendChild(rowButton('Remove', 'btn-danger',
+                              function(){ openRemove(i); }));
+  return row;
+}
+
+function controlInstance(i, action){
+  // ⚠️ `atlas` addresses the plain deployment, and it is a reserved slug — so
+  // no agency can ever claim that URL, and there is no empty path segment to
+  // special-case.
+  fetch('/api/atlas/instances/' + (i.slug || 'atlas') + '/control',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({action: action})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error) { alert(d.error); return; }
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){});
+}
+
+let nameTarget = null;
+
+function openNameDeployment(i){
+  nameTarget = i;
+  const shown = (i && i.slug) || 'general';
+  const title = document.getElementById('nameTitle');
+  const what = document.getElementById('nameWhat');
+  const field = document.getElementById('nameField');
+  const err = document.getElementById('nameError');
+  if (title) title.textContent = (i.agency_name ? 'Rename ' : 'Name ') + shown;
+  if (what) what.textContent = 'Which agency ' + hostFor(i.slug) + ' serves.';
+  // ⚠️ Seeded with what is set, so a rename is an edit rather than a retype —
+  // and an operator correcting one character does not have to get the other
+  // fifty right from memory.
+  if (field) field.value = i.agency_name || '';
+  if (err) err.style.display = 'none';
+  document.getElementById('nameModal').classList.add('open');
+}
+
+function closeNameDeployment(){
+  document.getElementById('nameModal').classList.remove('open');
+  nameTarget = null;
+}
+
+function doNameDeployment(){
+  if (!nameTarget) return;
+  const slug = nameTarget.slug || 'atlas';
+  const field = document.getElementById('nameField');
+  const go = document.getElementById('nameGo');
+  const err = document.getElementById('nameError');
+  if (go) go.disabled = true;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/name',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({agency_name: field ? field.value : ''})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (go) go.disabled = false;
+      if (!d.success){
+        if (err){ err.textContent = d.error || 'Could not set the name.';
+                  err.style.display = ''; }
+        return;
+      }
+      closeNameDeployment();
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){ if (go) go.disabled = false; });
+}
+
+let removeTarget = null;
+
+function removeName(i){
+  // ⚠️ `general` for the slug-less deployment, because "" is not something an
+  // operator can type and the server expects the same word.
+  return (i && i.slug) || 'general';
+}
+
+function openRemove(i){
+  removeTarget = i;
+  const name = removeName(i);
+  const host = hostFor(i.slug);
+  const title = document.getElementById('removeTitle');
+  const what = document.getElementById('removeWhat');
+  const prompt = document.getElementById('removePrompt');
+  const field = document.getElementById('removeConfirm');
+  const err = document.getElementById('removeError');
+  if (title) title.textContent = 'Remove ' + name;
+  if (what) what.textContent =
+    'Removes the ' + name + ' deployment at ' + host + ': its containers, '
+    + 'images, database volume, reserved store, install directory, Caddy vhost '
+    + 'and its own Authentik application.';
+  if (prompt) prompt.textContent = 'Type ' + name + ' to confirm.';
+  if (field){ field.value = ''; field.placeholder = name; }
+  if (err) err.style.display = 'none';
+  // ⚠️ Reset, because the dialog is reused. Opening it after a failed removal
+  // would otherwise show the previous attempt's log above a fresh prompt.
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const steps = document.getElementById('removeSteps');
+  if (ask) ask.hidden = false;
+  if (busy) busy.hidden = true;
+  if (steps){ steps.hidden = true; steps.textContent = ''; }
+  refreshRemoveGate();
+  document.getElementById('instanceRemoveModal').classList.add('open');
+}
+
+function closeRemove(){
+  document.getElementById('instanceRemoveModal').classList.remove('open');
+  removeTarget = null;
+}
+
+function refreshRemoveGate(){
+  // ⚠️ The typed name must match the deployment the modal was opened for, not
+  // merely be a name that exists. Accepting any of them is how the wrong agency
+  // gets destroyed by an operator who typed from memory.
+  const field = document.getElementById('removeConfirm');
+  const go = document.getElementById('removeGo');
+  const want = removeName(removeTarget);
+  if (go) go.disabled = !field || field.value.trim() !== want;
+}
+
+let removePolling = false;
+
+function removeAskAgain(message){
+  // ⚠️ Back to a usable dialog. A refusal — an update running, a busy mount —
+  // has to be retryable without reopening, and the typed name is still there.
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const err = document.getElementById('removeError');
+  if (busy) busy.hidden = true;
+  if (ask) ask.hidden = false;
+  if (err && message){ err.textContent = message; err.style.display = ''; }
+  refreshRemoveGate();
+}
+
+function doRemove(){
+  if (!removeTarget) return;
+  const slug = removeTarget.slug || 'atlas';
+  const name = removeName(removeTarget);
+  const ask = document.getElementById('removeAsk');
+  const busy = document.getElementById('removeBusy');
+  const text = document.getElementById('removeBusyText');
+  const err = document.getElementById('removeError');
+  if (err) err.style.display = 'none';
+  // The dialog stays open; the prompt gives way to the spinner.
+  if (ask) ask.hidden = true;
+  if (text) text.textContent = 'Removing ' + name + '… please wait.';
+  if (busy) busy.hidden = false;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({confirm: name})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.error){ removeAskAgain(d.error); return; }
+      removePolling = slug;
+      pollRemove();
+    }).catch(function(){
+      removeAskAgain('The removal request did not reach the console.');
+    });
+}
+
+function renderRemoval(d){
+  // ⚠️ **What the dialog shows, separated from the loop that asks.** Everything
+  // here used to live inside a `.then`, which no test could reach without the
+  // request settling — three mutations survived the sweep for exactly that
+  // reason. The polling loop keeps the timing; this keeps the decision, and
+  // returns which of the three states the operator is now looking at.
+  const steps = document.getElementById('removeSteps');
+  if (steps){
+    steps.hidden = false;
+    steps.textContent = (d.entries || []).join(String.fromCharCode(10));
+    steps.scrollTop = steps.scrollHeight;
+  }
+  if (d.complete && !d.error){
+    const busy = document.getElementById('removeBusy');
+    const text = document.getElementById('removeBusyText');
+    if (text) text.textContent = 'Removed. Reloading…';
+    if (busy) busy.hidden = true;
+    return 'done';
+  }
+  // ⚠️ A failed removal does not reload, and the log stays on screen. Its
+  // record and settings are left in place deliberately so it can be retried,
+  // and that log is the only account of what is still on disk.
+  if (d.error && !d.running){
+    removeAskAgain('The removal did not finish — see the log above.');
+    return 'failed';
+  }
+  return 'running';
+}
+
+function pollRemove(){
+  if (!removePolling) return;
+  const slug = removePolling;
+  fetch('/api/atlas/instances/' + encodeURIComponent(slug) + '/remove-status',
+        {credentials: 'same-origin'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      // ⚠️ In the dialog the operator is looking at, not in a card further down
+      // the page. The update-log card is for updates; a teardown shown under
+      // "update log" is how somebody comes to believe a deployment was updated
+      // when it was destroyed.
+      const outcome = renderRemoval(d);
+      if (outcome === 'done'){
+        removePolling = false;
+        setTimeout(function(){ location.reload(); }, 1800);
+        return;
+      }
+      if (outcome === 'failed'){ removePolling = false; return; }
+      setTimeout(pollRemove, 2000);
+    }).catch(function(){ setTimeout(pollRemove, 4000); });
+}
+
+function hostFor(slug){
+  // ⚠️ The server sends the template, so the rule for where a slug sits in a
+  // hostname lives in `agency_host` and nowhere else. This only substitutes.
+  // `<your-domain>` is the honest fallback before the box's FQDN is known —
+  // a guessed domain in a confirmation is worse than an obvious placeholder.
+  const plain = (capacityState && capacityState.plain_host) || '';
+  const tpl = (capacityState && capacityState.host_template) || '';
+  if (!slug) return plain || 'atlas.<your-domain>';
+  return tpl ? tpl.replace('{slug}', slug) : 'atlas.' + slug + '.<your-domain>';
+}
+
+function typedAgencyName(){
+  // ⚠️ Read through one function, so the confirmation summarises exactly what
+  // the request will carry. Two readings of the same field is how a modal comes
+  // to repeat back something the server was never sent.
+  const field = document.getElementById('agencyName');
+  return field ? field.value.trim() : '';
+}
+
+function currentMode(){
+  const fixed = document.querySelector('input[name="sizeMode"][value="fixed"]');
+  return fixed && fixed.checked ? 'fixed' : 'dynamic';
+}
+
+function typedSlug(){
+  // ⚠️ **The field is filtered as it is typed, not merely validated on submit**
+  // (operator decision): anything that is not a lowercase letter is dropped
+  // before it can be held. Case is forced rather than refused, because a capital
+  // has exactly one sensible reading; a space or a symbol has none.
+  //
+  // ⚠️ The server validates the same string again. A control that rejects
+  // characters is a convenience, never the guard — a value pasted past a browser
+  // is not a validation.
+  const input = document.getElementById('agencySlug');
+  if (!input) return '';
+  const clean = (input.value || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (input.value !== clean) input.value = clean;
+  return clean;
+}
+
+function onModeChanged(){
+  const isFixed = currentMode() === 'fixed';
+  const field = document.getElementById('sizeField');
+  const note = document.getElementById('dynamicNote');
+  if (field) field.style.display = isFixed ? '' : 'none';
+  if (note) note.textContent = isFixed ? '' :
+    'No size to choose: a dynamic deployment shares the ' +
+    ((capacityState && capacityState.pool_gb) || 0) +
+    ' GB left in the ATLAS budget, taking space as it is used and giving it back '
+    + 'when things are deleted.';
+  refreshAddGate();
+}
+
+function previewSlug(){
+  const out = document.getElementById('slugPreview');
+  if (!out) return;
+  const slug = typedSlug();
+  const mayPlain = !capacityState || capacityState.may_deploy_plain;
+  if (!slug){
+    out.textContent = mayPlain
+      ? 'No slug — this becomes the box\u2019s general ATLAS at its plain hostname.'
+      : '⚠ This box already has a general ATLAS, so a slug is required.';
+  } else if (!/^[a-z]+$/.test(slug)){
+    out.textContent = '⚠ Lowercase letters only — no spaces, digits or symbols.';
+  } else {
+    out.textContent = 'Will deploy as ' + slug + ' at ' + hostFor(slug);
+  }
+  refreshAddGate();
+}
+
+function addInstanceProblem(){
+  const slug = typedSlug();
+  const mayPlain = !capacityState || capacityState.may_deploy_plain;
+  // ⚠️ Blank means "the general ATLAS", and there can be only one. Refusing it
+  // here rather than after the deploy keeps the operator out of a state where a
+  // slug is claimed and nothing was built.
+  if (!slug && !mayPlain)
+    return 'This box already has a general ATLAS. Enter an agency slug.';
+  if (slug && !/^[a-z]+$/.test(slug))
+    return 'Use lowercase letters only — no spaces, digits or symbols.';
+  if (slug && (capacityState.slugs || []).indexOf(slug) !== -1)
+    return 'There is already a deployment for ' + slug + '.';
+  if (currentMode() === 'fixed'){
+    const size = document.getElementById('instanceSize');
+    if (!size || size.value === '' || Number(size.value) <= 0)
+      return 'Enter a size for a fixed deployment.';
+    // ⚠️ The bounds the retired Install card enforced, carried across rather
+    // than dropped when the two paths merged. A deployment under the floor
+    // fills before it is useful — ATLAS ships about 570 MB of applications and
+    // indexes before anything is uploaded — and one over the ceiling would take
+    // the disk the rest of the box needs.
+    const gb = Number(size.value);
+    const min = capacityState && capacityState.min_gb;
+    const max = capacityState && capacityState.max_gb;
+    if (min && gb < min)
+      return 'Reserve at least ' + min + ' GB — ATLAS ships about 570 MB of '
+        + 'applications and indexes before anything is uploaded.';
+    if (max && gb > max)
+      return 'This box can offer at most ' + max + ' GB (85% of what is free).';
+  }
+  return null;
+}
+
+function refreshAddGate(){
+  const problem = addInstanceProblem();
+  const btn = document.getElementById('createInstanceBtn');
+  const gate = document.getElementById('addInstanceGate');
+  if (btn) btn.disabled = problem !== null;
+  if (gate) gate.textContent = problem || '';
+}
+
+function openInstanceConfirm(){
+  if (addInstanceProblem() !== null) return;
+  const slug = typedSlug();
+  const mode = currentMode();
+  const size = document.getElementById('instanceSize');
+  const name = typedAgencyName();
+  const rows = [
+    '  agency      ' + (slug || 'none — the box\u2019s general ATLAS'),
+    // ⚠️ Repeated back because it is free text nobody validates for
+    // spelling. The slug is checked against rules; the name is checked by
+    // the operator reading it, and this is the only place they get to.
+    '  name        ' + (name || 'not set'),
+    '  hostname    ' + hostFor(slug),
+    '  type        ' + mode,
+    '  storage     ' + (mode === 'fixed'
+      ? (size.value + ' GB, reserved and held')
+      : ('shares the ' + ((capacityState && capacityState.pool_gb) || 0) + ' GB pool'))
+  ];
+  document.getElementById('instanceConfirmSummary').textContent = rows.join('\n');
+  document.getElementById('instanceConfirmNote').textContent = mode === 'fixed'
+    ? 'Free disk drops by this much straight away, and neither the type nor the slug can be changed afterwards. The name can.'
+    : 'Nothing is taken from the box now. Neither the type nor the slug can be changed afterwards. The name can.';
+  document.getElementById('instanceModal').classList.add('open');
+}
+
+function closeInstanceConfirm(){
+  document.getElementById('instanceModal').classList.remove('open');
+}
+
+function confirmCreateInstance(){
+  closeInstanceConfirm();
+  createInstance();
+}
+
+function refreshCapacity(){
+  const size = document.getElementById('instanceSize');
+  const q = size && size.value ? ('?size_gb=' + encodeURIComponent(size.value)) : '';
+  fetch('/api/atlas/instances' + q, {credentials:'same-origin'})
+    .then(r => r.json())
+    .then(renderInstances)
+    .catch(() => {});
+}
+
+function openAddInstance(){
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = false;
+  refreshCapacity();
+}
+
+function closeAddInstance(){
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = true;
+}
+
+
+
+
+function createInstance(){
+  const btn = document.getElementById('createInstanceBtn');
+  const err = document.getElementById('addInstanceError');
+  const slug = typedSlug();
+  const size = document.getElementById('instanceSize');
+  const mode = currentMode();
+  if (err) err.style.display = 'none';
+  if (btn) btn.disabled = true;
+  fetch('/api/atlas/instances', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      agency_specific: !!slug,
+      slug: slug || null,
+      agency_name: typedAgencyName(),
+      mode: mode,
+      size_gb: (mode === 'fixed' && size && size.value) ? Number(size.value) : null
+    })
+  }).then(r => r.json()).then(d => {
+    if (btn) btn.disabled = false;
+    if (!d.success){
+      if (err){ err.textContent = d.error || 'Could not create the deployment.'; err.style.display = ''; }
+      return;
+    }
+    closeAddInstance();
+    refreshCapacity();
+    // ⚠️ Recording a deployment is not deploying one. The instance row claims
+    // the slug and the port; this is what builds it, carrying the mode and slug
+    // so the store is created the way the operator chose.
+    startDeployFor(d.instance);
+  }).catch(() => { if (btn) btn.disabled = false; });
+}
+
+function setInstallCard(visible){
+  const card = document.getElementById('installCard');
+  if (card) card.style.display = visible ? '' : 'none';
+}
+
+// The promise that the page will reload by itself, which `pollDeploy` keeps
+// only on `d.complete && !d.error`.
+//
+// ⚠️ Taken down the moment a deploy stops running. A note saying "it refreshes
+// itself" above a deploy that has failed sends an operator off to wait for
+// something that is never coming, instead of reading the error under it.
+function setDeployNote(visible){
+  const note = document.getElementById('deployNote');
+  if (note) note.style.display = visible ? '' : 'none';
+}
+
+function showDeployCard(){
+  // ⚠️ Revealed the moment a deploy starts, not when the first log line lands.
+  // `renderLog` used to be the only thing that unhid it, so the card stayed
+  // hidden until the first poll returned — and if the deploy was refused before
+  // that, it never appeared at all and the operator was left with a page that
+  // looked like nothing had happened.
+  const card = document.getElementById('deployCard');
+  if (card) card.style.display = '';
+  const err = document.getElementById('deployError');
+  if (err) err.style.display = 'none';
+}
+
+function deployRefused(inst, message){
+  // ⚠️ A refused deploy must not leave the slug claimed. The record is written
+  // before the deploy so the name and port are held while it runs; if it never
+  // starts, that record is the only trace and it would block a retry under the
+  // same name with "there is already a deployment for ...".
+  setInstallCard(true);
+  setDeployNote(false);
+  const box = document.getElementById('addInstanceError');
+  if (box){ box.textContent = message; box.style.display = ''; }
+  const form = document.getElementById('addInstanceForm');
+  if (form) form.hidden = false;
+  if (inst && inst.slug){
+    fetch('/api/atlas/instances/' + encodeURIComponent(inst.slug) + '/forget',
+          {method: 'POST', credentials: 'same-origin'})
+      .then(() => refreshCapacity()).catch(() => {});
+  } else {
+    refreshCapacity();
+  }
+}
+
+function startDeployFor(inst){
+  // The deploy for one recorded instance. `store_gb` still carries the size,
+  // because that is what `deploy_validate` measures against the box's free
+  // space; `mode` and `slug` are what the older single-instance path could not
+  // express.
+  const body = {
+    store_gb: inst && inst.size_gb,
+    mode: inst && inst.mode,
+    slug: (inst && inst.slug) || null
+  };
+  setInstallCard(false);
+  setDeployNote(true);
+  showDeployCard();
+  fetch('/api/atlas/deploy', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+    credentials: 'same-origin'
+  }).then(r => r.json()).then(d => {
+    if (d.error) { deployRefused(inst, d.error); return; }
+    polling = true; pollDeploy();
+  }).catch(() => deployRefused(inst, 'The deploy request did not reach the console.'));
+}
+
+
+function renderLog(entries){
+  const card = document.getElementById('deployCard');
+  const box = document.getElementById('deployLog');
+  if (!box) return;
+  if (card) card.style.display = '';
+  // The route returns `entries`, not `log` — reading the wrong key showed an
+  // empty box for the whole deploy and nothing to explain a failure.
+  // ⚠️ Joined with a char code on purpose. A backslash-n escape written
+  // here by a generator arrived as a real newline inside a JS string
+  // literal, which is a syntax error — and a syntax error anywhere in this
+  // block means startDeploy is never defined and the button does nothing at
+  // all, silently. Third time this bit; the escape is simply not used now.
+  box.textContent = (entries || []).join(String.fromCharCode(10));
+  box.scrollTop = box.scrollHeight;
+}
+
+function pollDeploy(){
+  if (!polling) return;
+  fetch('/api/atlas/log', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    renderLog(d.entries);
+    if (d.complete && !d.error) { polling = false; setTimeout(() => location.reload(), 1200); return; }
+    if (d.error && !d.running) {
+      polling = false;
+      const e = document.getElementById('deployError');
+      if (e) e.style.display = '';
+      // Back, so the size can be corrected and the deploy tried again.
+      setInstallCard(true);
+      // ⚠️ And the promise of a refresh comes down: pollDeploy reloads on
+      // success only, so leaving it up would have an operator waiting here
+      // for something that is never coming.
+      setDeployNote(false);
+      return;
+    }
+    setTimeout(pollDeploy, 2000);
+  }).catch(() => setTimeout(pollDeploy, 4000));
+}
+
+// ⚠️ `control()` is gone with the buttons that called it. It POSTed to the
+// registry's `/api/atlas/control`, which takes no deployment and so could only
+// ever act on `takmdm` — the reason Start/Stop did nothing on an agency-only
+// box. `controlInstance` replaces it, addressed.
+
+function loadLogs(){
+  fetch('/api/atlas/logs', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    const box = document.getElementById('logBox');
+    if (!box) return;
+    box.textContent = (d.lines || []).join('\n') || '(no output)';
+    box.scrollTop = box.scrollHeight;
+  });
+}
+
+function openUninstall(){
+  // ⚠️ Named, not counted. "3 deployments" is a number an operator can misread
+  // as "3 of something else"; "corona, test, redlands" is the thing they will
+  // recognise, and the thing they will notice is missing if it is wrong.
+  const scope = document.getElementById('uninstallScope');
+  const one = document.getElementById('uninstallOneInstead');
+  const names = lastInstances.map(i => (i.agency_name || i.slug || 'general'));
+  if (scope){
+    scope.hidden = names.length === 0;
+    scope.textContent = names.length
+      ? 'This will destroy ' + names.length + ' deployment'
+        + (names.length === 1 ? '' : 's') + ':' + String.fromCharCode(10)
+        + names.map(n => '  ' + n).join(String.fromCharCode(10))
+      : '';
+  }
+  // Only worth offering when there is another one to leave running.
+  if (one) one.hidden = names.length < 2;
+  document.getElementById('uninstallModal').classList.add('open');
+}
+function closeUninstall(){ document.getElementById('uninstallModal').classList.remove('open'); }
+
+async function doUninstall(){
+  const pw = document.getElementById('uninstallPw').value;
+  const err = document.getElementById('uninstallError');
+  const busy = document.getElementById('uninstallBusy');
+  const buttons = document.getElementById('uninstallButtons');
+  const steps = document.getElementById('uninstallSteps');
+
+  // The request blocks for the length of a `docker compose down -v`. Without
+  // this the dialog sat there unchanged and the only honest reading was that
+  // the click had missed.
+  err.style.display = 'none';
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    const r = await fetch('/api/atlas/uninstall', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+      credentials: 'same-origin'
+    });
+    const d = await r.json();
+    if (d.success) {
+      busy.hidden = true;
+      steps.hidden = false;
+      steps.textContent = (d.steps || ['Removed.']).join(String.fromCharCode(10));
+      setTimeout(function(){ location.reload(); }, 2500);
+      return;
+    }
+    err.textContent = d.error || 'Uninstall failed.';
+  } catch (e) {
+    err.textContent = 'Uninstall failed: ' + e;
+  }
+  // Back to a usable dialog: a wrong password must be retryable.
+  busy.hidden = true;
+  buttons.hidden = false;
+  err.style.display = '';
+}
+
+// ── Version and updates ────────────────────────────────────────────────────
+function loadLatest(){
+  // ⚠️ The *available* release, which is the only version fact that belongs to
+  // the box rather than to a deployment. Each deployment's own version is in
+  // its row above, read from its own checkout.
+  const now = document.getElementById('latestRelease');
+  if (!now) return;
+  fetch('/api/atlas/version', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    // ⚠️ A latest of null means the check could not run — GitHub allows 60
+    // unauthenticated requests an hour. That is not the same as being current,
+    // and saying "up to date" here would be a guess.
+    now.textContent = d.latest ? ('v' + d.latest) : 'update check unavailable';
+  }).catch(() => { now.textContent = 'unknown'; });
+}
+
+let updatePolling = null;
+
+function startUpdate(slug){
+  fetch('/api/atlas/update', {method:'POST', credentials:'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({slug: slug || null})})
+    .then(r => r.json()).then(d => {
+      if (d.error) { alert(d.error); return; }
+      updatePolling = slug || null;
+      pollUpdate();
+    }).catch(() => {});
+}
+
+function pollUpdate(){
+  if (updatePolling === false) return;
+  const q = updatePolling ? ('?slug=' + encodeURIComponent(updatePolling)) : '';
+  fetch('/api/atlas/update-status' + q, {credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+    const card = document.getElementById('updateCard');
+    const title = document.getElementById('updateLogTitle');
+    const box = document.getElementById('updateLog');
+    if (card) card.hidden = false;
+    if (title) title.textContent = updatePolling
+      ? 'Update log — ' + updatePolling : 'Update log';
+    if (box) {
+      box.textContent = (d.entries || []).join(String.fromCharCode(10));
+      box.scrollTop = box.scrollHeight;
+    }
+    if (d.complete && !d.error) {
+      updatePolling = false;
+      setTimeout(function(){ location.reload(); }, 1500);
+      return;
+    }
+    if (d.error && !d.running) { updatePolling = false; return; }
+    setTimeout(pollUpdate, 2000);
+  }).catch(() => setTimeout(pollUpdate, 4000));
+}
+
+let updateAllPolling = false;
+
+function startUpdateAll(){
+  const btn = document.getElementById('updateAllBtn');
+  if (btn) btn.disabled = true;
+  fetch('/api/atlas/update-all', {method:'POST', credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+      if (d.error) { if (btn) btn.disabled = false; alert(d.error); return; }
+      updateAllPolling = true;
+      pollUpdateAll();
+    }).catch(() => { if (btn) btn.disabled = false; });
+}
+
+function pollUpdateAll(){
+  if (!updateAllPolling) return;
+  fetch('/api/atlas/update-all-status', {credentials:'same-origin'})
+    .then(r => r.json()).then(d => {
+    const card = document.getElementById('updateCard');
+    const title = document.getElementById('updateLogTitle');
+    const box = document.getElementById('updateLog');
+    if (card) card.hidden = false;
+    if (title) title.textContent = 'Update log — every deployment';
+    if (box) {
+      // ⚠️ The result list first, then the log. A run where one of five failed
+      // is the case this button exists to make legible, and burying which one
+      // under two hundred lines of build output is how it stops being legible.
+      const results = (d.results || []).map(function(r){
+        const mark = r.ok === null ? '—' : (r.ok ? '\u2713' : '\u2717');
+        return mark + ' ' + r.name + '  ' + (r.detail || '');
+      });
+      const parts = results.length
+        ? results.join(String.fromCharCode(10)) + String.fromCharCode(10, 10)
+        : '';
+      box.textContent = parts + (d.entries || []).join(String.fromCharCode(10));
+      box.scrollTop = box.scrollHeight;
+    }
+    // ⚠️ `complete` means the run ended; `error` means something in it failed.
+    // A partial failure must stop the poll — it is finished — and must not
+    // reload, or the operator never reads which deployment failed.
+    if (d.complete && !d.error) {
+      updateAllPolling = false;
+      setTimeout(function(){ location.reload(); }, 2000);
+      return;
+    }
+    if (d.complete || (d.error && !d.running)) { updateAllPolling = false; return; }
+    setTimeout(pollUpdateAll, 2000);
+  }).catch(() => setTimeout(pollUpdateAll, 4000));
+}
+
+{% if installed %}loadLogs(); loadLatest();{% endif %}
+refreshCapacity();
+{% if deploy_running %}polling = true; pollDeploy();{% endif %}
+{% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
+
+// ---- Certificate authority -------------------------------------------------
+//
+// \u26a0\ufe0f Polled on load only. The expiry moves once a day; refreshing it on a timer
+// would run a `docker exec` against ATLAS for a number that cannot have changed.
+//: The deployment each CA modal is acting on. ⚠️ Set when the modal opens and
+//: read when it submits, the same shape the removal confirmation uses — a modal
+//: that does not know which deployment it is about would renew or destroy the
+//: wrong certificate authority, and the operator would not find out until a
+//: fleet stopped checking in.
+let caTarget = null;
+
+function caBlock(d){
+  const box = document.createElement('div');
+  box.className = 'mono';
+  box.style.cssText = 'font-size:13px;line-height:1.7;padding:12px 0;'
+    + 'border-top:1px solid rgba(255,255,255,.08)';
+
+  const title = document.createElement('div');
+  title.innerHTML = '<strong>' + escapeHtml(d.name || 'atlas') + '</strong>';
+  box.appendChild(title);
+
+  const body = document.createElement('div');
+  if (!d || !d.ok){
+    // Not running, or mid-ceremony. Say so rather than showing nothing — the
+    // broken state is exactly when someone opens this page.
+    body.textContent = (d && d.error) ? d.error : 'Certificate authority unavailable';
+    box.appendChild(body);
+    return box;
+  }
+  body.innerHTML =
+    'Signing with <strong>' + escapeHtml(d.issuing_subject || '?') + '</strong><br>' +
+    'Expires ' + escapeHtml(d.issuing_expires || '?') +
+    ' (' + d.issuing_days_left + ' days)<br>' +
+    'Device certificates ' + d.device_cert_validity_days + ' days, renewed automatically ' +
+    d.renew_within_days + ' days before expiry';
+  box.appendChild(body);
+
+  if (d.needs_attention){
+    const warn = document.createElement('div');
+    warn.className = 'banner-bad';
+    warn.style.marginTop = '10px';
+    // ⚠️ Names the recovery file, because that is what renewing needs and the
+    // moment someone reads this is the moment to discover it is missing — not
+    // on the day the certificate expires.
+    warn.textContent = 'The issuing certificate expires in ' + d.issuing_days_left +
+      ' days. When it does, every device on ' + (d.name || 'this deployment') +
+      ' stops authenticating. Renewing needs that deployment\'s recovery file — '
+      + 'find it now, then use Renew below.';
+    box.appendChild(warn);
+  }
+
+  const actions = document.createElement('div');
+  actions.style.marginTop = '10px';
+  // ⚠️ One of these two is always shown, and which one is decided by the key
+  // file. `is_split` answers a different question and used to be used for this.
+  if (d.root_key_on_server){
+    actions.appendChild(rowButton('Save ' + (d.name || 'this') + ' recovery file',
+                                  'btn-primary',
+                                  function(){ openRecovery(d); }));
+  } else {
+    const safe = document.createElement('span');
+    safe.className = 'note';
+    safe.style.marginRight = '8px';
+    safe.textContent = '✓ The master key is not on this server. ';
+    actions.appendChild(safe);
+    actions.appendChild(rowButton('Check my recovery file', 'btn-secondary',
+                                  function(){ openRecoveryCheck(d); }));
+  }
+  actions.appendChild(rowButton('Renew issuing certificate', 'btn-secondary',
+                                function(){ openRenew(d); }));
+  box.appendChild(actions);
+  return box;
+}
+
+function renderRootKeys(info){
+  const panel = document.getElementById('caRootKeys');
+  const body = document.getElementById('caRootKeysBody');
+  if (!panel || !body) return;
+  const holders = (info && info.holders) || [];
+  panel.hidden = holders.length === 0;
+  if (!holders.length) return;
+  body.textContent =
+    (holders.length === 1
+      ? 'The certificate authority master key for ' + holders[0] + ' is'
+      : 'The certificate authority master keys for ' + holders.join(', ') + ' are')
+    + ' still on this server. Anyone who reaches this machine can use '
+    + (holders.length === 1 ? 'it' : 'them')
+    + ' to impersonate any of those deployments\' devices, and the only fix '
+    + 'would be setting up every tablet again.';
+}
+
+async function loadCa(){
+  // ⚠️ One request per deployment, because each has its own certificate
+  // authority to ask about. The list comes from the deployments route, so a
+  // deployment that is not finished is never asked — it has no container.
+  const card = document.getElementById('caCard');
+  const blocks = document.getElementById('caBlocks');
+  if (!card || !blocks) return;
+  let data;
+  try {
+    const r = await fetch('/api/atlas/instances', {credentials:'same-origin'});
+    data = await r.json();
+  } catch (e) { return; }
+  renderRootKeys(data.root_keys);
+  const built = (data.instances || []).filter(i => i.built);
+  if (!built.length) return;
+  card.hidden = false;
+  blocks.innerHTML = '';
+  for (const inst of built){
+    let d = {name: inst.name, slug: inst.slug, ok: false,
+             error: 'Certificate authority unavailable'};
+    try {
+      const q = inst.slug ? ('?slug=' + encodeURIComponent(inst.slug)) : '';
+      const r = await fetch('/api/atlas/ca' + q, {credentials:'same-origin'});
+      const got = await r.json();
+      if (got) d = Object.assign(d, got, {name: got.name || inst.name});
+    } catch (e) { /* the block says unavailable */ }
+    blocks.appendChild(caBlock(d));
+  }
+}
+
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+function caName(){
+  // ⚠️ The deployment a CA modal is acting on, by the name the page shows. Used
+  // in every title, because three identical dialogs over three certificate
+  // authorities is how the wrong one gets renewed.
+  return (caTarget && caTarget.name) || 'ATLAS';
+}
+
+function caSlug(){
+  return (caTarget && caTarget.slug) || null;
+}
+
+function openRenew(d){
+  caTarget = d || null;
+  const title = document.getElementById('renewTitle');
+  if (title) title.textContent = 'Renew ' + caName() + "'s issuing certificate";
+  document.getElementById('renewModal').classList.add('open');
+}
+function closeRenew(){ document.getElementById('renewModal').classList.remove('open'); }
+
+async function doRenew(){
+  const err = document.getElementById('renewError');
+  const buttons = document.getElementById('renewButtons');
+  const busy = document.getElementById('renewBusy');
+  const picker = document.getElementById('renewKeyFile');
+
+  err.style.display = 'none';
+
+  // ⚠️ **No file means "use the key already on the server"**, and that is
+  // the normal path -- W235 is what made the console able to see that key at
+  // all. Treating an empty picker as an error would undo it.
+  let keyPem = '';
+  if (picker && picker.files && picker.files[0]) {
+    keyPem = await picker.files[0].text();
+    // ⚠️ Checked here so that picking the wrong file does not send its
+    // contents to the server at all. The server checks too -- this is in
+    // front of that, never instead of it.
+    if (keyPem.indexOf('PRIVATE KEY') < 0) {
+      err.textContent = 'That file is not a PEM private key. Choose the '
+                      + 'recovery file you saved.';
+      err.style.display = 'block';
+      return;
+    }
+  }
+
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    const r = await fetch('/api/atlas/ca/renew', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        slug: caSlug(),
+        password: document.getElementById('renewPw').value,
+        root_key: keyPem,
+        days: parseInt(document.getElementById('renewDays').value, 10) || 1825,
+      }),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      // \u26a0\ufe0f Back to a usable dialog. A wrong password or a bad key must be
+      // retryable without losing what was typed \u2014 except the key itself, which is
+      // cleared below on success only.
+      err.textContent = d.error || 'Renewal failed';
+      err.style.display = 'block';
+      busy.hidden = true;
+      buttons.hidden = false;
+      if (d.steps) { showRenewSteps(d.steps); }
+      return;
+    }
+    // ⚠️ Clear the key out of the DOM the moment it is no longer needed. It
+    // is still in memory somewhere, but leaving it on a page that may sit open
+    // for hours is gratuitous. The picker holds a handle to the file rather
+    // than its bytes, and clearing it also stops a second Renew re-sending a
+    // key the operator thinks they already used.
+    if (picker) { picker.value = ''; }
+    document.getElementById('renewPw').value = '';
+    document.getElementById('renewForm').hidden = true;
+    document.getElementById('renewDone').hidden = false;
+    showRenewSteps(d.steps || []);
+  } catch (e) {
+    err.textContent = 'Renewal failed: ' + e;
+    err.style.display = 'block';
+    busy.hidden = true;
+    buttons.hidden = false;
+  }
+}
+
+function showRenewSteps(steps){
+  const box = document.getElementById('renewSteps');
+  box.textContent = steps.join('\\n');
+  document.getElementById('renewDone').hidden = false;
+}
+
+// ---- Release channel (W228) -------------------------------------------------
+//
+// Which branch of the public mirror this box takes updates from. `main` is
+// promoted-and-tested; `dev` is the newest release.
+//
+// ⚠️ **Switching changes nothing on disk and starts nothing.** It decides
+// which version the *next* update targets. The operator still presses Update
+// and still watches the log — a toggle that silently began rebuilding every
+// deployment on the box would be a very surprising thing to click.
+
+function renderChannels(d) {
+  const row = document.getElementById('channelRow');
+  const note = document.getElementById('channelNote');
+  row.textContent = '';
+
+  for (const c of (d.channels || [])) {
+    const btn = document.createElement('button');
+    btn.className = 'chan' + (c.key === d.channel ? ' on' : '');
+    btn.type = 'button';
+    btn.onclick = () => setChannel(c.key);
+
+    const name = document.createElement('div');
+    name.className = 'chan-name';
+    name.textContent = c.label || c.key;
+    if (c.key === d.channel) {
+      const tick = document.createElement('span');
+      tick.className = 'badge-new';
+      tick.textContent = 'following';
+      name.appendChild(tick);
+    }
+    btn.appendChild(name);
+
+    const ver = document.createElement('div');
+    // ⚠️ Unknown is said, never guessed as "up to date". A rate-limited or
+    // offline box, or a mirror with no such branch, lands here — and "offers
+    // nothing" read as "nothing new" is how a box sits a release behind with
+    // a page that looks healthy.
+    ver.className = 'chan-ver' + (c.version ? '' : ' unknown');
+    ver.textContent = c.version ? ('offers ' + c.version)
+                                : 'offers — could not ask GitHub';
+    btn.appendChild(ver);
+
+    const blurb = document.createElement('div');
+    blurb.className = 'chan-blurb';
+    blurb.textContent = c.blurb || '';
+    btn.appendChild(blurb);
+
+    if ((c.ahead || []).length) {
+      // ⚠️ The downgrade warning, and it belongs on the button rather than in
+      // a footnote. Update refuses to move a deployment backwards, so on this
+      // channel that button would do nothing and look broken.
+      const warn = document.createElement('div');
+      warn.className = 'chan-warn';
+      warn.textContent = '⚠ Already newer than this channel: '
+        + c.ahead.join(', ') + '. Update will not move '
+        + (c.ahead.length > 1 ? 'them' : 'it') + ' back.';
+      btn.appendChild(warn);
+    }
+    row.appendChild(btn);
+  }
+
+  const parts = [];
+  if (d.install_tag) {
+    // ⚠️ Said plainly, because it is the one place the channel does not apply.
+    // A dev-channel operator deploying a new agency gets the pinned release and
+    // an immediate update prompt; without this line that reads as a bug.
+    parts.push('A new deployment always installs ' + d.install_tag
+      + ' — the pin is a verified commit, where a channel is a branch that '
+      + 'moves — and is then offered this channel’s release.');
+  }
+  note.textContent = parts.join(' ');
+}
+
+async function loadChannel() {
+  try {
+    const r = await fetch('/api/atlas/channel');
+    renderChannels(await r.json());
+  } catch (e) {
+    document.getElementById('channelRow').textContent =
+      'Could not read the channel: ' + e;
+  }
+}
+
+async function setChannel(key) {
+  const buttons = document.querySelectorAll('#channelRow .chan');
+  buttons.forEach(b => { b.disabled = true; });
+  try {
+    const r = await fetch('/api/atlas/channel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({channel: key}),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      document.getElementById('channelNote').textContent =
+        d.error || 'Could not switch channel';
+      buttons.forEach(b => { b.disabled = false; });
+      return;
+    }
+    renderChannels(d);
+    // The update badge and the drift table both read the channel, so they are
+    // stale the instant it changes.
+    if (typeof loadInstances === 'function') loadInstances();
+    if (typeof loadLatest === 'function') loadLatest();
+  } catch (e) {
+    document.getElementById('channelNote').textContent =
+      'Could not switch channel: ' + e;
+    buttons.forEach(b => { b.disabled = false; });
+  }
+}
+
+loadChannel();
+
+// ⚠️ Guarded like loadLogs/loadLatest above. On a box where ATLAS is not
+// installed this would docker-exec a container that does not exist and paint an
+// error card onto a page whose whole message is "not installed yet".
+{% if installed %}loadCa();{% endif %}
+
+// ---- The recovery file (W187) ----------------------------------------------
+//
+// Two steps, and the second is the one that matters: it proves the customer can
+// produce the file before the server stops being able to.
+
+let recoveryCheckOnly = false;
+
+function openRecovery(d){
+  if (d) caTarget = d;
+  recoveryCheckOnly = false;
+  document.getElementById('recoveryTitle').textContent =
+    'Save ' + caName() + "'s recovery file";
+  document.getElementById('recoveryStep1').hidden = false;
+  document.getElementById('recoveryStep2').hidden = true;
+  document.getElementById('recoveryDone').hidden = true;
+  document.getElementById('recoveryError').style.display = 'none';
+  document.getElementById('recoveryError2').style.display = 'none';
+  document.getElementById('recoveryModal').classList.add('open');
+}
+
+// The same modal, for "is the file I saved years ago still the right one?".
+// ⚠️ This works *because* verification compares against the CA certificate
+// rather than the key — the key is long gone by the time anyone asks.
+function openRecoveryCheck(d){
+  openRecovery(d);
+  recoveryCheckOnly = true;
+  document.getElementById('recoveryTitle').textContent =
+    'Check ' + caName() + "'s recovery file";
+  document.getElementById('recoveryStep1').hidden = true;
+  document.getElementById('recoveryStep2').hidden = false;
+}
+
+function closeRecovery(){
+  document.getElementById('recoveryModal').classList.remove('open');
+}
+
+async function doRecoveryDownload(){
+  const err = document.getElementById('recoveryError');
+  err.style.display = 'none';
+  try {
+    const r = await fetch('/api/atlas/ca/recovery', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({slug: caSlug(),
+                            password: document.getElementById('recoveryPw').value}),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      err.textContent = d.error || 'Could not read the key';
+      err.style.display = 'block';
+      return;
+    }
+    // Built client-side so the key is never a URL the browser remembers.
+    const blob = new Blob([d.key_pem], {type: 'application/octet-stream'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = d.filename || 'atlas-recovery.key';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+
+    document.getElementById('recoveryStep1').hidden = true;
+    document.getElementById('recoveryStep2').hidden = false;
+  } catch (e) {
+    err.textContent = 'Could not read the key: ' + e;
+    err.style.display = 'block';
+  }
+}
+
+async function doRecoveryConfirm(){
+  const err = document.getElementById('recoveryError2');
+  const buttons = document.getElementById('recoveryConfirmButtons');
+  const busy = document.getElementById('recoveryBusy');
+  const input = document.getElementById('recoveryFile');
+  err.style.display = 'none';
+
+  if (!input.files || !input.files[0]) {
+    err.textContent = 'Choose the file you saved.';
+    err.style.display = 'block';
+    return;
+  }
+
+  const text = await input.files[0].text();
+  buttons.hidden = true;
+  busy.hidden = false;
+
+  try {
+    // ⚠️ `verify_only` is a real difference, not decoration. Without it the
+    // check path would run the delete too — harmless, since the key is already
+    // gone, but it would report "Root key removed from this server" to somebody
+    // who asked a completely different question. A reassuring message on the
+    // wrong screen is how the console came to claim the root was gone when it
+    // was not (W185).
+    const r = await fetch('/api/atlas/ca/recovery/confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        slug: caSlug(),
+        password: document.getElementById('recoveryPw2').value
+                  || document.getElementById('recoveryPw').value,
+        root_key: text,
+        verify_only: recoveryCheckOnly,
+      }),
+    });
+    const d = await r.json();
+    if (!d.success) {
+      err.textContent = d.error || 'That file did not match';
+      err.style.display = 'block';
+      busy.hidden = true;
+      buttons.hidden = false;
+      return;
+    }
+    document.getElementById('recoveryStep2').hidden = true;
+    document.getElementById('recoveryDone').hidden = false;
+    document.getElementById('recoverySteps').textContent = (d.steps || []).join('\n');
+  } catch (e) {
+    err.textContent = 'Could not complete: ' + e;
+    err.style.display = 'block';
+    busy.hidden = true;
+    buttons.hidden = false;
+  }
+}
+</script>
+{% endblock %}
