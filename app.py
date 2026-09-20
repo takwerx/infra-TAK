@@ -44995,15 +44995,89 @@ def _compose_error_tail(out, limit=700):
 
 
 def _nodered_container_running():
-    """True if the nodered container is up. Used to keep a slow `up -d` from being
-    reported as a deploy failure when the container actually started."""
+    """True if the container named exactly `nodered` is up. Used to keep a slow `up -d`
+    from being reported as a deploy failure when the container actually started.
+
+    Exact name, same as _nodered_container_exists(): `--filter name=nodered` is a
+    SUBSTRING match, so a stranger's `mynodered` (the name in Node-RED's own Docker
+    quick-start) read as ours and the deploy would have said "container is running —
+    continuing" against a container infra-TAK never started (v10.1.83).
+    """
     try:
         r = subprocess.run(
-            _sudo_wrap(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Status}}']),
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=nodered', '--format', '{{.Names}}\t{{.Status}}']),
             capture_output=True, text=True, timeout=20)
-        return (r.stdout or '').strip().lower().startswith('up')
+        for ln in (r.stdout or '').splitlines():
+            name, _sep, status = ln.partition('\t')
+            if name.strip() == 'nodered':
+                return status.strip().lower().startswith('up')
+        return False
     except Exception:
         return False
+
+
+def _nodered_port_holders_as_conflicts(port=1880):
+    """Every listener on tcp <port>, shaped for _preflight_conflict_message(), with a
+    docker-proxy row resolved to the container publishing the port (and its image).
+
+    NO ownership bias on purpose. This runs AFTER `docker compose up -d` failed to bind
+    the port, so the holder is foreign by construction. _preflight_port_conflicts()'s
+    "ours" rules would read a stranger's container called `node-red` as our own and
+    report nothing — and nothing is exactly what the operator had (v10.1.83, field
+    report Richard/AUS-NSW 2026-09-20: `failed to bind host port 127.0.0.1:1880/tcp:
+    address already in use`, and not one word about by whom).
+    """
+    try:
+        holders = _preflight_port_holders(port)
+    except Exception:
+        holders = []
+    if not holders:
+        return []
+    try:
+        container = _preflight_docker_publishers().get(port, '')
+    except Exception:
+        container = ''
+    image = ''
+    if container:
+        try:
+            ri = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.Config.Image}}', container]),
+                                capture_output=True, text=True, timeout=10)
+            image = (ri.stdout or '').strip() if ri.returncode == 0 else ''
+        except Exception:
+            image = ''
+    out = []
+    for h in holders:
+        who = (h.get('holder') or '').strip()
+        if who.lower() == 'docker-proxy' and container:
+            who = f'Docker container "{container}"' + (f' (image {image})' if image else '')
+        elif who.lower() == 'docker-proxy':
+            who = 'docker-proxy (a container publishes this port, but `docker ps` did not name it)'
+        elif not who:
+            who = 'unknown (process owner not visible)'
+        out.append({'port': port, 'label': 'Node-RED', 'holder': who, 'pid': h.get('pid'),
+                    'cmd': h.get('cmd') or '', 'addr': h.get('addr') or ''})
+    return out
+
+
+def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
+    """Plain-English consequence of a foreign listener on 1880, for the deploy log.
+
+    The operator's symptom is NOT "deploy failed" — it is "Node-RED is there but has no
+    Configurator". Caddy proxies nodered.<fqdn> to 127.0.0.1:1880, so whatever holds
+    that port is what the browser shows; infra-TAK's flows were never loaded into it.
+    Say so, or the two facts never get connected."""
+    host = f'nodered.{domain}' if domain else 'nodered.<your-domain>'
+    tail = ('The image is already pulled, so the retry is quick.' if pulled
+            else 'Nothing was written or pulled by this attempt.')
+    return [
+        '',
+        f'  What this means: Caddy sends https://{host} to 127.0.0.1:{port}, so if a Node-RED',
+        '  page opens there right now it is served by the listener named above — NOT by',
+        "  infra-TAK's Node-RED. That is why it has no Configurator: infra-TAK's flows were",
+        '  never loaded into it.',
+        '  Stop or remove that listener (infra-TAK never stops software it did not install),',
+        f'  then click Deploy again. {tail}',
+    ]
 
 
 def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
@@ -45339,11 +45413,27 @@ def run_nodered_deploy():
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             _run_nodered_deploy_remote(settings, deploy_cfg, plog)
             return
+        domain = (settings.get('fqdn') or '').strip()
+        # v10.1.83 — port pre-flight, BEFORE anything is written or pulled. Caddy and
+        # Authentik have refused on a foreign listener since v10.1.27; Node-RED never did,
+        # so a box with something else on 1880 pulled ~200 MB, died at Step 3/4 with a bare
+        # "address already in use", and the browser kept showing whatever answered on
+        # 127.0.0.1:1880 — a Node-RED with no Configurator (Richard/AUS-NSW, 2026-09-20).
+        # Same ownership table as the other modules: our own `nodered` container on a
+        # redeploy is "ours", never a conflict — a false refusal would block every redeploy.
+        _pf = _preflight_port_conflicts('nodered')
+        if _pf:
+            plog("━━━ Pre-flight: is port 1880 free? ━━━")
+            for _ln in _preflight_conflict_message('Node-RED', _pf).splitlines():
+                plog(f"  {_ln}")
+            for _ln in _nodered_foreign_listener_lines(domain, pulled=False):
+                plog(_ln)
+            nodered_deploy_status.update({'running': False, 'error': True})
+            return
         plog("━━━ Ensuring Docker log limits (prevents container logs from filling disk) ━━━")
         _ensure_docker_log_limits(plog)
         if nodered_deploy_status.get('cancelled'):
             return
-        domain = (settings.get('fqdn') or '').strip()
         nr_dir = os.path.expanduser('~/node-red')
         os.makedirs(nr_dir, exist_ok=True)
         plog("")
@@ -45494,7 +45584,16 @@ volumes:
         # unique across EVERY state, an *exited* leftover does it just as effectively as a
         # running one. This is a self-heal on the failure path only: the normal deploy is
         # untouched, so a working box cannot regress through this branch.
-        if _up_rc != 0 and 'already in use' in (_up_out or '') and _nodered_container_exists():
+        # Two daemon errors both contain "already in use": a NAME conflict (`Conflict. The
+        # container name "/nodered" is already in use by container …`) and a PORT bind
+        # failure (`failed to bind host port 127.0.0.1:1880/tcp: address already in use`).
+        # F2a cures only the first. Matching the bare substring made it fire on the second:
+        # compose had just CREATED our container so "exists" was true, we removed our own
+        # fresh container, retried into the same port error, and the log blamed a leftover
+        # that never existed (Richard/AUS-NSW, 2026-09-20). Require the name signature.
+        _up_low = (_up_out or '').lower()
+        _name_conflict = 'container name' in _up_low and 'already in use' in _up_low
+        if _up_rc != 0 and _name_conflict and _nodered_container_exists():
             plog("  A leftover 'nodered' container is holding the name and blocking the start.")
             plog("  Removing it and retrying — the named volume is NOT touched, so Configurator")
             plog("  configs survive (they live in node_red_data, not in the container).")
@@ -45517,6 +45616,26 @@ volumes:
                 # of "Network … Creating / Created" and cut the actual error off mid-sentence —
                 # see _compose_error_tail().
                 plog(f"✗ docker compose up failed: {_compose_error_tail(_up_out or 'timed out')}")
+                # Classify from the FINAL output (F2a may have retried above). A port-bind
+                # failure gets the holder named right here — no round trip to ask who.
+                _fin_low = (_up_out or '').lower()
+                _port_conflict = (('container name' not in _fin_low) and bool(re.search(
+                    r'failed to bind host port|port is already allocated|address already in use', _fin_low)))
+                if _port_conflict:
+                    _who = _nodered_port_holders_as_conflicts(1880)
+                    if _who:
+                        plog("")
+                        for _ln in _preflight_conflict_message('Node-RED', _who).splitlines():
+                            plog(f"  {_ln}")
+                    else:
+                        plog("  Port 1880 was busy when the container tried to bind it, but nothing")
+                        plog("  holds it now — a listener that comes and goes. Retry the deploy; if it")
+                        plog("  fails again, run  sudo ss -lptn 'sport = :1880'  at that moment.")
+                    for _ln in _nodered_foreign_listener_lines(domain, pulled=True):
+                        plog(_ln)
+                else:
+                    for _ln in _translate_known_failure(_up_out or ''):
+                        plog(f"  {_ln}")
                 nodered_deploy_status.update({'running': False, 'error': True})
                 return
             plog("  ✓ Container is running — continuing.")
