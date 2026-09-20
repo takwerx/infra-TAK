@@ -72929,8 +72929,18 @@ def run_takserver_deploy(config):
             except Exception:
                 _edb_conn = {}
             _edb_sv = _tak58_external_schema_version(_edb_conn)
-            if _edb_sv is not None and _edb_sv >= _TAK58_MIN_SCHEMA_VERSION:
-                log_step(f"✓ SchemaManager complete — managed database at schema_version {_edb_sv}")
+            # The floor depends on WHICH TAK is being installed, not on the release
+            # this code shipped in. _TAK58_MIN_SCHEMA_VERSION is 100 because V100 is
+            # where 5.8 adds flow_tags/username — but 5.7's schema TOPS OUT AT 99, so
+            # holding every deploy to 100 failed a 5.7 install whose SchemaManager had
+            # just reported "Successfully applied 94 update(s)" and left the managed
+            # database correctly at 99 (az-test-rds, 2026-09-19). A version-specific
+            # ceiling is not a defect to fail on.
+            _pkg_ver = _tak_artifact_version(config.get('package_path') or '')
+            _min_sv = _TAK58_MIN_SCHEMA_VERSION if (_pkg_ver and _pkg_ver >= TAK_GATE_BLOCK_FROM) else 1
+            if _edb_sv is not None and _edb_sv >= _min_sv:
+                log_step(f"✓ SchemaManager complete — managed database at schema_version {_edb_sv}"
+                         + (f" (>= {_min_sv} required for TAK {_pkg_ver[0]}.{_pkg_ver[1]})" if _pkg_ver else ""))
             elif sm_r.returncode == 0 and _edb_sv is None:
                 # Ran clean but we could not read it back (no psql client, say). Say so
                 # rather than claiming either outcome.
@@ -72941,7 +72951,8 @@ def run_takserver_deploy(config):
                          "putting this server into service.")
             else:
                 log_step(f"✗ FATAL: SchemaManager did not build the schema (exit {sm_r.returncode}, "
-                         f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}). "
+                         f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}, "
+                         f"needed >= {_min_sv}). "
                          f"The managed database is not usable, so this deploy is NOT complete. "
                          f"The most common cause is PostGIS missing from the database: re-run "
                          f"Provision Database, which creates it. On Azure the azure.extensions "
