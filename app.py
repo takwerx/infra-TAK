@@ -8469,7 +8469,8 @@ def takserver_external_db_provision():
                     'PostGIS could not be created in the database and TAK\'s schema cannot be '
                     'built without it. On Azure this normally means the extension is not '
                     'whitelisted: Azure Portal → your PostgreSQL Flexible Server → Server '
-                    'parameters → search "azure.extensions" → add POSTGIS and PGCRYPTO → '
+                    'parameters → search "azure.extensions" → set it to '
+                    'POSTGIS,PGCRYPTO,FUZZYSTRMATCH,POSTGIS_TOPOLOGY → '
                     'Save, then re-run Provision Database. Reported: %s'
                     % (out or 'unknown error'))
             else:
@@ -8492,6 +8493,48 @@ def takserver_external_db_provision():
             plog('  △ Not available on this instance: %s. PostGIS is present, so the base '
                  'schema will build; note these in case a later TAK feature needs them.'
                  % ', '.join(_opt_missing))
+
+        # Azure only: the allow-list must also cover the extensions TAK DROPs.
+        #
+        # SchemaManager's `upgrade` opens with UpgradeCommand -> SchemaManager.purge(),
+        # which issues DROP EXTENSION IF EXISTS fuzzystrmatch / postgis_topology CASCADE
+        # on both 5.7 and 5.8. Azure refuses a DROP naming a non-allow-listed extension
+        # even when it does not exist, so SchemaManager exits 2 and no schema is ever
+        # built. Creating postgis and pgcrypto is therefore NOT sufficient on Azure, and
+        # provisioning that returns success here while the deploy is guaranteed to fail
+        # ten minutes later is a worse outcome than refusing now. Measured az-test-rds
+        # 2026-09-19. AWS RDS is unaffected — a DROP IF EXISTS of an absent extension
+        # simply succeeds there.
+        if is_azure:
+            _az_need = ['POSTGIS', 'PGCRYPTO', 'FUZZYSTRMATCH', 'POSTGIS_TOPOLOGY']
+            ok_al, out_al = run_sql('show azure.extensions;', 'read azure.extensions',
+                                    use_db=db_name)
+            if ok_al:
+                _allowed = set(x.strip().upper()
+                               for x in (out_al or '').replace('\n', ',').split(',') if x.strip())
+                _az_missing = [e for e in _az_need if e not in _allowed]
+                if _az_missing:
+                    _all = ','.join(sorted(set(list(_allowed) + _az_need)))
+                    msg = (
+                        'Azure: %s %s not allow-listed. TAK\'s SchemaManager runs '
+                        'DROP EXTENSION IF EXISTS fuzzystrmatch / postgis_topology before it '
+                        'builds the schema, and Azure rejects a DROP naming an extension that '
+                        'is not allow-listed even when it is not installed — so the deploy '
+                        'would fail with no schema. Azure Portal → %s → Settings → Server '
+                        'parameters → azure.extensions → set value to: %s → Save, then re-run '
+                        'Provision Database.'
+                        % (', '.join(_az_missing),
+                           'is' if len(_az_missing) == 1 else 'are',
+                           db_host.split('.')[0], _all))
+                    plog('  \u2717 ' + msg)
+                    return jsonify({'success': False, 'error': msg, 'log': log,
+                                    'extensions_not_whitelisted': True,
+                                    'missing_extensions': _az_missing}), 400
+                plog('  \u2713 azure.extensions covers all 4 required: ' + ','.join(_az_need))
+            else:
+                plog('  \u25b3 Could not read azure.extensions (%s) \u2014 confirm POSTGIS, '
+                     'PGCRYPTO, FUZZYSTRMATCH and POSTGIS_TOPOLOGY are allow-listed in the '
+                     'Azure Portal.' % (out_al or 'no output'))
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -8616,36 +8659,62 @@ def takserver_external_db_test_connection():
         if not db_pass:
             add_check('Azure extensions whitelisted', None, 'Skipped — run Provision Database first, then re-test')
         else:
-            azure_required = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
+            # What Azure must ALLOW — which is not the same as what we create.
+            #
+            # We create postgis and pgcrypto (TAK 5.8 stopped creating them itself).
+            # But TAK's SchemaManager, on both 5.7 and 5.8, opens `upgrade` with
+            # UpgradeCommand -> SchemaManager.purge(), which unconditionally issues:
+            #
+            #   DROP EXTENSION IF EXISTS fuzzystrmatch CASCADE;
+            #   DROP EXTENSION IF EXISTS postgis_topology CASCADE;
+            #
+            # On AWS RDS that is a no-op when the extension isn't there. **Azure rejects
+            # a DROP of a non-allow-listed extension by NAME, even with IF EXISTS** —
+            # "extension \"fuzzystrmatch\" is not allow-listed for users". SchemaManager
+            # dies at exit 2 and the database never gets a schema. Measured on
+            # az-test-rds, 2026-09-19, on a fresh 5.7 install.
+            #
+            # So the allow-list is four, not the two we create. address_standardizer is
+            # NOT included: only SetupPostresOnRDS/SetupPostresGeneric reference it and
+            # neither is on the `upgrade` path we run.
+            _AZ_EXT_REASON = {
+                'POSTGIS': 'TAK schema (we create it)',
+                'PGCRYPTO': 'TAK schema (we create it)',
+                'FUZZYSTRMATCH': "SchemaManager.purge() DROPs it — Azure blocks the DROP if it isn't allow-listed",
+                'POSTGIS_TOPOLOGY': "SchemaManager.purge() DROPs it — same",
+            }
+            azure_required = list(_AZ_EXT_REASON)
             try:
-                names_sql = "SELECT name FROM pg_available_extensions WHERE name IN ({});".format(
-                    ','.join(f"'{e}'" for e in azure_required)
-                )
+                # Ask for the ALLOW-LIST, not pg_available_extensions. The latter lists
+                # what the engine could install and answers "yes" for extensions Azure
+                # still refuses, so it passed this check green while the deploy failed.
                 env = dict(os.environ, PGPASSWORD=db_pass)
-                # Use postgres system db — cot may not exist yet before first deploy
                 r = subprocess.run(
                     ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', 'postgres',
-                     '-c', names_sql, '--no-password', '-t', '-A'],
+                     '-c', 'show azure.extensions;', '--no-password', '-t', '-A'],
                     capture_output=True, text=True, timeout=15, env=env
                 )
                 if r.returncode == 0:
-                    available = set(line.strip() for line in r.stdout.splitlines() if line.strip())
-                    missing = [e for e in azure_required if e not in available]
+                    allowed = set(x.strip().upper() for x in (r.stdout or '').replace('\n', ',').split(',') if x.strip())
+                    missing = [e for e in azure_required if e not in allowed]
                     if missing:
-                        missing_upper = ','.join(e.upper() for e in missing)
-                        all_upper = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
+                        all_upper = ','.join(sorted(set(list(allowed) + azure_required)))
                         detail = (
-                            f'Missing: {missing_upper}. '
-                            f'In Azure Portal → {db_host.split(".")[0]} → Settings → Server parameters → '
-                            f'azure.extensions → set value to: {all_upper} → Save.'
+                            'Missing: %s (%s). In Azure Portal → %s → Settings → Server parameters → '
+                            'azure.extensions → set value to: %s → Save.'
+                            % (','.join(missing),
+                               '; '.join(f'{m}: {_AZ_EXT_REASON[m]}' for m in missing),
+                               db_host.split('.')[0], all_upper)
                         )
-                        add_check('Azure extensions whitelisted', False, detail)
+                        add_check('Azure extensions allow-listed', False, detail)
                     else:
-                        add_check('Azure extensions whitelisted', True, 'All 5 required extensions available')
+                        add_check('Azure extensions allow-listed', True,
+                                  'All 4 required extensions allow-listed: ' + ','.join(azure_required))
                 else:
-                    add_check('Azure extensions whitelisted', None, f'Could not query extensions — verify manually in Azure Portal')
+                    add_check('Azure extensions allow-listed', None,
+                              'Could not read azure.extensions — verify manually in Azure Portal')
             except Exception as e:
-                add_check('Azure extensions whitelisted', None, f'Extension check skipped: {str(e)[:150]}')
+                add_check('Azure extensions allow-listed', None, f'Extension check skipped: {str(e)[:150]}')
 
     all_ok = all(c['ok'] for c in checks if c.get('ok') is not None)
     return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
@@ -71110,7 +71179,7 @@ def deploy_takserver():
         if not (_edb_cfg.get('host') or '').strip():
             return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
         if not (_edb_cfg.get('password') or '').strip():
-            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, whitelist POSTGIS and PGCRYPTO in azure.extensions first), then Test Connection (step 3), before deploying.'}), 400
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, set azure.extensions to POSTGIS,PGCRYPTO,FUZZYSTRMATCH,POSTGIS_TOPOLOGY first), then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -72847,8 +72916,11 @@ def run_takserver_deploy(config):
                          f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}). "
                          f"The managed database is not usable, so this deploy is NOT complete. "
                          f"The most common cause is PostGIS missing from the database: re-run "
-                         f"Provision Database, which creates it. On Azure also confirm POSTGIS "
-                         f"and PGCRYPTO are whitelisted in the azure.extensions server parameter.")
+                         f"Provision Database, which creates it. On Azure the azure.extensions "
+                         f"server parameter must allow POSTGIS, PGCRYPTO, FUZZYSTRMATCH and "
+                         f"POSTGIS_TOPOLOGY \u2014 the last two because SchemaManager DROPs them "
+                         f"before building the schema, and Azure rejects a DROP naming an "
+                         f"extension it does not allow.")
                 # Do NOT start TAK and do NOT report COMPLETE. A server pointed at a
                 # schemaless managed database is not a working server, and every time this
                 # has been downgraded to a warning the deploy has gone on to print
