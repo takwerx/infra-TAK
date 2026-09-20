@@ -66,6 +66,17 @@ stays Available, still on the old version, and it looks like the upgrade silentl
 Flexible Server supports an in-place **major version upgrade** from the portal or CLI: stop the
 server, choose the target major version, upgrade. The server is unavailable during it.
 
+Portal → your server → **Overview → Upgrade**. Pick **18** under *PostgreSQL version to upgrade*.
+
+> **Check the Action radio before you click Start.** It defaults to **"Validate only"**, which
+> runs the pre-upgrade checks and then **does not upgrade anything**. Clicking Start and watching
+> it report success reads exactly like a completed upgrade — and your server is still on 15. Pick
+> **"Validate and upgrade"** to actually do it; it still runs validation first and aborts if the
+> checks fail, so you are not risking a half-upgrade.
+>
+> This is the same shape as the RDS trap above, where the Modify summary defaults to
+> "Apply during the next maintenance window.
+
 ### Azure only: the `azure.extensions` allow-list
 
 **This will fail your upgrade if you skip it, and the error will not obviously point here.**
