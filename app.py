@@ -595,6 +595,28 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _read_own_or_priv(path):
+    """Read a file the console may well own itself; go to the broker only when it cannot.
+
+    v10.1.84. `_read_priv` is broker-FIRST whenever the broker routes, and the broker's
+    allow-list covers what the console cannot read — `.config/` is console-owned and is
+    deliberately not on it. So a `_read_priv` of `.config/ssl/custom-fullchain.pem` was
+    DENIED on every non-root box, which made custom-certificate mode a silent no-op
+    there: the Caddy-readable copy came back (None, None), the Caddyfile never got its
+    `tls` lines, the 8446 enrollment-cert install logged "custom cert not readable", and
+    the upload route still answered success. Found on test6 during the v10.1.84 T&E.
+
+    Direct read first — that is the owner's file, or root reading anything. Only when the
+    plain read fails (a directory the console cannot traverse, e.g. Caddy's own
+    0750 store) does it become a privileged read, which is exactly `_read_priv`'s job.
+    """
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return _read_priv(path)
+
+
 def _exists_priv(path):
     """Existence test that survives a directory the console cannot traverse.
 
@@ -24673,8 +24695,11 @@ def _sync_custom_cert_for_caddy():
         # then chown to the caddy user via the broker. Without this, custom (BYO) cert mode
         # silently returns (None,None) and the Caddyfile never gets the `tls` directive.
         _makedirs_priv(base)
-        _write_priv(dst_cert, _read_priv(src_cert), perm=0o644)
-        _write_priv(dst_key, _read_priv(src_key), perm=0o600)
+        # v10.1.84: the SOURCE is console-owned (.config/ssl) — read it as ourselves.
+        # `_read_priv` here went broker-first and was DENIED on every non-root box,
+        # so this returned (None, None) and custom mode silently never took effect.
+        _write_priv(dst_cert, _read_own_or_priv(src_cert), perm=0o644)
+        _write_priv(dst_key, _read_own_or_priv(src_key), perm=0o600)
         if caddy_pw:
             subprocess.run(_sudo_wrap(['chown', f'{caddy_pw.pw_uid}:{caddy_pw.pw_gid}', dst_cert, dst_key]), capture_output=True)
         return dst_cert, dst_key
@@ -30038,8 +30063,10 @@ def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
     crt = key = None
     while True:
         try:
-            crt = _read_priv(cert_crt)
-            key = _read_priv(cert_key)
+            # v10.1.84: in custom mode these are the console-owned .config/ssl copies,
+            # which the broker refuses to read; Caddy's own store still goes through it.
+            crt = _read_own_or_priv(cert_crt)
+            key = _read_own_or_priv(cert_key)
         except Exception:
             crt = key = None
         if (crt and key) or not wait_for_cert or waited >= 120:
