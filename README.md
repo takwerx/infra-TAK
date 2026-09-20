@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.83-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.83-alpha)**
+**Current release: [v10.1.84-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.84-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.84-alpha — 2026-09-20 — Custom certificates: ATLAS deploys, and the mode now takes effect on non-root installs
+
+**Headline: on a box that runs its own certificate instead of Let's Encrypt, ATLAS MDM could not be deployed on v10.1.80 through v10.1.82. The deploy stopped at the web-server step with "Caddyfile REJECTED … server listening on [:80] is HTTP, but attempts to configure TLS connection policies", the previous configuration was restored, and nothing else on the box was affected.** The certificate line was being added to every site, including ATLAS's plain-HTTP agent-package site and its device channel, which already carries its own client-certificate settings. Both shapes are handled now. While validating that fix, a second and older gap surfaced: on a non-root console (the default install since v10.0.5), uploading a custom certificate reported success but changed nothing, because the console read its own certificate files through the privilege broker, which refuses that path. Caddy kept serving Let's Encrypt and TAK Server's enrollment port never received the certificate. Both now take effect.
+
+> **Upgrade note.** Nothing to do beyond updating. If you uploaded a custom certificate on a non-root install before this release, upload it once more from the Caddy page after updating: it is then applied to every site and to TAK Server's 8446 enrollment port (TAK Server restarts once). ATLAS on a custom-certificate box deploys normally.
 
 ### v10.1.83-alpha — 2026-09-19 — Node-RED: the deploy now tells you what is holding port 1880
 

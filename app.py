@@ -595,6 +595,28 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _read_own_or_priv(path):
+    """Read a file the console may well own itself; go to the broker only when it cannot.
+
+    v10.1.84. `_read_priv` is broker-FIRST whenever the broker routes, and the broker's
+    allow-list covers what the console cannot read — `.config/` is console-owned and is
+    deliberately not on it. So a `_read_priv` of `.config/ssl/custom-fullchain.pem` was
+    DENIED on every non-root box, which made custom-certificate mode a silent no-op
+    there: the Caddy-readable copy came back (None, None), the Caddyfile never got its
+    `tls` lines, the 8446 enrollment-cert install logged "custom cert not readable", and
+    the upload route still answered success. Found on test6 during the v10.1.84 T&E.
+
+    Direct read first — that is the owner's file, or root reading anything. Only when the
+    plain read fails (a directory the console cannot traverse, e.g. Caddy's own
+    0750 store) does it become a privileged read, which is exactly `_read_priv`'s job.
+    """
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return _read_priv(path)
+
+
 def _exists_priv(path):
     """Existence test that survives a directory the console cannot traverse.
 
@@ -965,7 +987,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.84-alpha"
+VERSION = "10.1.85-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -25016,8 +25038,11 @@ def _sync_custom_cert_for_caddy():
         # then chown to the caddy user via the broker. Without this, custom (BYO) cert mode
         # silently returns (None,None) and the Caddyfile never gets the `tls` directive.
         _makedirs_priv(base)
-        _write_priv(dst_cert, _read_priv(src_cert), perm=0o644)
-        _write_priv(dst_key, _read_priv(src_key), perm=0o600)
+        # v10.1.84: the SOURCE is console-owned (.config/ssl) — read it as ourselves.
+        # `_read_priv` here went broker-first and was DENIED on every non-root box,
+        # so this returned (None, None) and custom mode silently never took effect.
+        _write_priv(dst_cert, _read_own_or_priv(src_cert), perm=0o644)
+        _write_priv(dst_key, _read_own_or_priv(src_key), perm=0o600)
         if caddy_pw:
             subprocess.run(_sudo_wrap(['chown', f'{caddy_pw.pw_uid}:{caddy_pw.pw_gid}', dst_cert, dst_key]), capture_output=True)
         return dst_cert, dst_key
@@ -29357,6 +29382,69 @@ def _startup_caddy_selfheal():
           % ('reloaded' if _rl_ok else 'reload FAILED'), flush=True)
 
 
+def _inject_custom_cert_tls(lines, cert_path, key_path):
+    """Apply the operator's own certificate to every TLS site in a rendered Caddyfile.
+
+    Custom-certificate mode (`ssl_mode == 'custom'`) has no ACME, so every site that
+    speaks TLS needs a `tls <cert> <key>` directive. Two shapes the old inline loop got
+    wrong, found on a DigiCert-wildcard box on 2026-09-19 — each one made `caddy validate`
+    refuse the WHOLE file, the GH #59 backstop put the previous file back, and the module
+    whose deploy triggered the regeneration failed while every other vhost carried on:
+
+      * `http://<host> {` is an HTTP server (ATLAS serves its agent package there, in the
+        clear, because Android's setup wizard follows no redirect). A `tls` line on it is
+        "server listening on [:80] is HTTP, but attempts to configure TLS connection
+        policies". Skip it.
+      * `<host>:8449 {` already opens its own `tls {` block (client_auth for ATLAS's device
+        channel). Adding a second `tls` directive is "two policies with same match criteria
+        have conflicting client auth configuration". Merge instead: rewrite that opener to
+        `tls <cert> <key> {` so the certificate and the block's own options are ONE
+        directive — the form Caddy accepts (proven with `caddy validate` on the box).
+
+    A site that carries any other `tls …` line of its own is left alone: it is managing
+    its certificate itself. Everything else gets the directive appended right after the
+    address line, exactly as before. Pure function on the line list so it can be tested
+    without a box.
+    """
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        out.append(ln)
+        stripped = ln.rstrip()
+        # A site address block opens at column 0 (no indent), ends with '{', and is
+        # neither a comment, a snippet/global block, nor a bare '{'. Nested blocks
+        # (route {, handle {, transport http {) are indented, so they're skipped.
+        is_site = (stripped.endswith('{') and stripped != '{'
+                   and not stripped[0].isspace()
+                   and not stripped.startswith(('#', '(')))
+        if not is_site or stripped.startswith('http://'):
+            i += 1
+            continue
+        # Look through this site's body (up to its column-0 closer) for a tls line of
+        # its own. Indent 4 = a directive of the site itself, not a nested block's.
+        own_tls, j = None, i + 1
+        while j < n:
+            s = lines[j].rstrip()
+            if s == '}':
+                break
+            if s == '    tls' or s.startswith('    tls ') or s == '    tls {':
+                own_tls = j
+                break
+            j += 1
+        if own_tls is None:
+            out.append(f"    tls {cert_path} {key_path}")
+            i += 1
+            continue
+        if lines[own_tls].rstrip() != '    tls {':
+            i += 1          # has its own certificate arguments — leave the site alone
+            continue
+        out.extend(lines[i + 1:own_tls])
+        out.append(f"    tls {cert_path} {key_path} {{")
+        i = own_tls + 1
+    return out
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -30171,19 +30259,7 @@ def generate_caddyfile(settings=None):
         # and point `tls` at THAT (see _sync_custom_cert_for_caddy).
         cert_path, key_path = _sync_custom_cert_for_caddy()
         if cert_path and key_path:
-            tls_directive = f"    tls {cert_path} {key_path}"
-            injected = []
-            for ln in lines:
-                injected.append(ln)
-                stripped = ln.rstrip()
-                # A site address block opens at column 0 (no indent), ends with '{', and is
-                # neither a comment, a snippet/global block, nor a bare '{'. Nested blocks
-                # (route {, handle {, transport http {) are indented, so they're skipped.
-                if (stripped.endswith('{') and stripped != '{'
-                        and not stripped[0].isspace()
-                        and not stripped.startswith(('#', '('))):
-                    injected.append(tls_directive)
-            lines = injected
+            lines = _inject_custom_cert_tls(lines, cert_path, key_path)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
@@ -30407,8 +30483,10 @@ def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
     crt = key = None
     while True:
         try:
-            crt = _read_priv(cert_crt)
-            key = _read_priv(cert_key)
+            # v10.1.84: in custom mode these are the console-owned .config/ssl copies,
+            # which the broker refuses to read; Caddy's own store still goes through it.
+            crt = _read_own_or_priv(cert_crt)
+            key = _read_own_or_priv(cert_key)
         except Exception:
             crt = key = None
         if (crt and key) or not wait_for_cert or waited >= 120:
