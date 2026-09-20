@@ -8240,6 +8240,17 @@ def takserver_two_server_preflight():
 
 _PG_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
 
+# The value we tell an operator to put in Azure's `azure.extensions` server parameter.
+# It is deliberately the SAME string static/takserver.js has displayed since the Azure
+# instructions shipped: handing someone two different values for one field is how you
+# get a half-applied setting. The ENFORCED requirement is narrower (see the allow-list
+# gate in the provision route) — POSTGIS and PGCRYPTO because TAK's schema needs them
+# and 5.8 stopped creating them, FUZZYSTRMATCH and POSTGIS_TOPOLOGY because
+# SchemaManager.purge() DROPs them and Azure rejects a DROP naming an extension it does
+# not allow. ADDRESS_STANDARDIZER is not needed by anything on the upgrade path; it
+# stays in the recommended string only because boxes in the field already carry it.
+_AZURE_EXTENSIONS_RECOMMENDED = 'FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO'
+
 
 @app.route('/api/takserver/external-db/provision', methods=['POST'])
 @login_required
@@ -8470,7 +8481,7 @@ def takserver_external_db_provision():
                     'built without it. On Azure this normally means the extension is not '
                     'whitelisted: Azure Portal → your PostgreSQL Flexible Server → Server '
                     'parameters → search "azure.extensions" → set it to '
-                    'POSTGIS,PGCRYPTO,FUZZYSTRMATCH,POSTGIS_TOPOLOGY → '
+                    + _AZURE_EXTENSIONS_RECOMMENDED + ' → '
                     'Save, then re-run Provision Database. Reported: %s'
                     % (out or 'unknown error'))
             else:
@@ -8514,7 +8525,7 @@ def takserver_external_db_provision():
                                for x in (out_al or '').replace('\n', ',').split(',') if x.strip())
                 _az_missing = [e for e in _az_need if e not in _allowed]
                 if _az_missing:
-                    _all = ','.join(sorted(set(list(_allowed) + _az_need)))
+                    _all = _AZURE_EXTENSIONS_RECOMMENDED
                     msg = (
                         'Azure: %s %s not allow-listed. TAK\'s SchemaManager runs '
                         'DROP EXTENSION IF EXISTS fuzzystrmatch / postgis_topology before it '
@@ -8698,7 +8709,12 @@ def takserver_external_db_test_connection():
                     allowed = set(x.strip().upper() for x in (r.stdout or '').replace('\n', ',').split(',') if x.strip())
                     missing = [e for e in azure_required if e not in allowed]
                     if missing:
-                        all_upper = ','.join(sorted(set(list(allowed) + azure_required)))
+                        # Suggest the exact string the UI has shown since this feature
+                        # shipped (static/takserver.js) — an operator must never be handed
+                        # two different values for the same field. ADDRESS_STANDARDIZER is
+                        # not required by anything on the upgrade path, but it is already
+                        # set on boxes in the field and is harmless as a superset.
+                        all_upper = _AZURE_EXTENSIONS_RECOMMENDED
                         detail = (
                             'Missing: %s (%s). In Azure Portal → %s → Settings → Server parameters → '
                             'azure.extensions → set value to: %s → Save.'
@@ -71179,7 +71195,7 @@ def deploy_takserver():
         if not (_edb_cfg.get('host') or '').strip():
             return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
         if not (_edb_cfg.get('password') or '').strip():
-            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, set azure.extensions to POSTGIS,PGCRYPTO,FUZZYSTRMATCH,POSTGIS_TOPOLOGY first), then Test Connection (step 3), before deploying.'}), 400
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, set the azure.extensions server parameter first — the TAK Server page shows the exact value), then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),

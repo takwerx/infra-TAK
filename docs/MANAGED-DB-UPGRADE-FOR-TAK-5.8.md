@@ -66,6 +66,53 @@ stays Available, still on the old version, and it looks like the upgrade silentl
 Flexible Server supports an in-place **major version upgrade** from the portal or CLI: stop the
 server, choose the target major version, upgrade. The server is unavailable during it.
 
+### Azure only: the `azure.extensions` allow-list
+
+**This will fail your upgrade if you skip it, and the error will not obviously point here.**
+
+Azure refuses any `CREATE EXTENSION` for an extension that is not in the `azure.extensions`
+server parameter — and it also refuses a `DROP EXTENSION IF EXISTS` that merely **names** a
+disallowed extension, *even when that extension is not installed*.
+
+TAK's SchemaManager begins its schema build by dropping two extensions it no longer wants:
+
+```
+DROP EXTENSION IF EXISTS fuzzystrmatch CASCADE;
+DROP EXTENSION IF EXISTS postgis_topology CASCADE;
+```
+
+On AWS RDS those are harmless no-ops. On Azure, if either name is not allow-listed, SchemaManager
+dies with `exit 2` and your database ends up with **no schema at all**:
+
+```
+ERROR: extension "fuzzystrmatch" is not allow-listed for users in
+       Azure Database for PostgreSQL
+```
+
+Azure Portal → your server → **Settings → Server parameters** → search **`azure.extensions`** →
+set it to:
+
+```
+FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO
+```
+
+→ **Save**.
+
+| extension | why it must be allowed |
+|---|---|
+| `POSTGIS` | TAK's schema needs it. 5.8 stopped creating it in its own migrations, so the console creates it for you — which Azure only permits if it is allow-listed. |
+| `PGCRYPTO` | Same. |
+| `FUZZYSTRMATCH` | SchemaManager **drops** it. Azure blocks the drop unless the name is allowed. |
+| `POSTGIS_TOPOLOGY` | Same. |
+| `ADDRESS_STANDARDIZER` | Not needed by the upgrade path. Kept in the list because existing deployments already carry it. |
+
+This applies to **both** a fresh 5.8 install and a 5.7 → 5.8 upgrade, and it applies on TAK 5.7 as
+well as 5.8 — the purge behaviour is identical in both versions.
+
+The console checks this for you: **Test Connection** reports *Azure extensions allow-listed*, and
+**Provision Database** refuses with the exact missing names rather than letting the deploy fail
+later.
+
 ### Either way
 
 **PostGIS matters.** TAK's schema uses it. Confirm your upgraded instance has a PostGIS version
