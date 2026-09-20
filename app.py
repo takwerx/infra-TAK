@@ -68449,8 +68449,17 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
                         % (running, TAK_PG_MAJOR), wedged=True)
         _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
         _say('')
-        _say('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
-                   'removed once you are satisfied — it is your rollback until then.')
+        # Name the right rollback. On a managed database there IS no local PostgreSQL 15
+        # cluster holding their data — the only local cluster is the vestigial one TAK's
+        # own package pulls in, which nothing uses. Telling a managed customer that is
+        # their rollback points them at the wrong thing at the worst possible moment.
+        if _mig_edb:
+            _say('Migration complete. Your rollback is the provider-side snapshot you took '
+                 'before the engine upgrade, plus the verified pre-migration dump below — '
+                 'there is no PostgreSQL 15 cluster on this host holding your data.')
+        else:
+            _say('Migration complete. The PostgreSQL 15 cluster was left on disk and can be '
+                       'removed once you are satisfied — it is your rollback until then.')
         _say('Backup kept at %s' % bk.get('snapshot_path'))
         _status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
