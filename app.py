@@ -28937,6 +28937,69 @@ def _startup_caddy_selfheal():
           % ('reloaded' if _rl_ok else 'reload FAILED'), flush=True)
 
 
+def _inject_custom_cert_tls(lines, cert_path, key_path):
+    """Apply the operator's own certificate to every TLS site in a rendered Caddyfile.
+
+    Custom-certificate mode (`ssl_mode == 'custom'`) has no ACME, so every site that
+    speaks TLS needs a `tls <cert> <key>` directive. Two shapes the old inline loop got
+    wrong, found on a DigiCert-wildcard box on 2026-09-19 — each one made `caddy validate`
+    refuse the WHOLE file, the GH #59 backstop put the previous file back, and the module
+    whose deploy triggered the regeneration failed while every other vhost carried on:
+
+      * `http://<host> {` is an HTTP server (ATLAS serves its agent package there, in the
+        clear, because Android's setup wizard follows no redirect). A `tls` line on it is
+        "server listening on [:80] is HTTP, but attempts to configure TLS connection
+        policies". Skip it.
+      * `<host>:8449 {` already opens its own `tls {` block (client_auth for ATLAS's device
+        channel). Adding a second `tls` directive is "two policies with same match criteria
+        have conflicting client auth configuration". Merge instead: rewrite that opener to
+        `tls <cert> <key> {` so the certificate and the block's own options are ONE
+        directive — the form Caddy accepts (proven with `caddy validate` on the box).
+
+    A site that carries any other `tls …` line of its own is left alone: it is managing
+    its certificate itself. Everything else gets the directive appended right after the
+    address line, exactly as before. Pure function on the line list so it can be tested
+    without a box.
+    """
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        out.append(ln)
+        stripped = ln.rstrip()
+        # A site address block opens at column 0 (no indent), ends with '{', and is
+        # neither a comment, a snippet/global block, nor a bare '{'. Nested blocks
+        # (route {, handle {, transport http {) are indented, so they're skipped.
+        is_site = (stripped.endswith('{') and stripped != '{'
+                   and not stripped[0].isspace()
+                   and not stripped.startswith(('#', '(')))
+        if not is_site or stripped.startswith('http://'):
+            i += 1
+            continue
+        # Look through this site's body (up to its column-0 closer) for a tls line of
+        # its own. Indent 4 = a directive of the site itself, not a nested block's.
+        own_tls, j = None, i + 1
+        while j < n:
+            s = lines[j].rstrip()
+            if s == '}':
+                break
+            if s == '    tls' or s.startswith('    tls ') or s == '    tls {':
+                own_tls = j
+                break
+            j += 1
+        if own_tls is None:
+            out.append(f"    tls {cert_path} {key_path}")
+            i += 1
+            continue
+        if lines[own_tls].rstrip() != '    tls {':
+            i += 1          # has its own certificate arguments — leave the site alone
+            continue
+        out.extend(lines[i + 1:own_tls])
+        out.append(f"    tls {cert_path} {key_path} {{")
+        i = own_tls + 1
+    return out
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -29751,19 +29814,7 @@ def generate_caddyfile(settings=None):
         # and point `tls` at THAT (see _sync_custom_cert_for_caddy).
         cert_path, key_path = _sync_custom_cert_for_caddy()
         if cert_path and key_path:
-            tls_directive = f"    tls {cert_path} {key_path}"
-            injected = []
-            for ln in lines:
-                injected.append(ln)
-                stripped = ln.rstrip()
-                # A site address block opens at column 0 (no indent), ends with '{', and is
-                # neither a comment, a snippet/global block, nor a bare '{'. Nested blocks
-                # (route {, handle {, transport http {) are indented, so they're skipped.
-                if (stripped.endswith('{') and stripped != '{'
-                        and not stripped[0].isspace()
-                        and not stripped.startswith(('#', '('))):
-                    injected.append(tls_directive)
-            lines = injected
+            lines = _inject_custom_cert_tls(lines, cert_path, key_path)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
