@@ -68217,41 +68217,88 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
                        'PostgreSQL 15 server — 5.8 refuses to finish until the database is '
                        'migrated. Continuing to the database migration.' % rc)
 
-        # 5. The vendor migration. Bare, per D1.
-        _say('')
-        _say('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
-                   'not interrupt it. Duration scales with database size, and with whether the '
-                   '5.8 schema update has to rewrite cot_router (see the note above).'
-                   % TAK_PG_MAJOR)
-        if not os.path.exists(_TAK58_UPGRADE_DB_SH):
-            return fail('The 5.8 package did not provide %s — cannot migrate the database.'
-                        % _TAK58_UPGRADE_DB_SH, wedged=True)
-        rc = _tak58_run_upgrade_db(log=_log)
-        # The script has no shebang and uses bashisms, so under dash it emits
-        # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
-        # while still doing its job. Noise is NOT failure — only the exit code is.
-        if rc != 0:
-            return fail('The database migration failed (exit %d). See the output above.' % rc,
-                        wedged=True)
+        # 5. The database half. WHICH database matters.
+        #
+        # On a MANAGED database there is no local cluster to pg_upgrade: the provider
+        # already moved the engine to 18 (our pre-flight refuses 5.8 until they have).
+        # Running the local path there is wrong twice over — upgrade-db.sh migrates a
+        # cluster that is not the one TAK uses, and the md5->scram repair re-encodes a
+        # password in a cluster nobody is authenticating against. Worse, the check that
+        # follows used the LOCAL helper, so on az-ubuntu-1 2026-09-19 it read 99 off the
+        # leftover local cluster while the managed instance had just reached 106, called
+        # a completely successful migration a failure, ran the repair against the wrong
+        # database, and left the box reading "THIS SERVER IS MID-UPGRADE AND TAK IS NOT
+        # RUNNING". Same fault as 7aca0f9 (asking the wrong server), one layer down.
+        _mig_edb = None
+        try:
+            _mig_cfg = _get_tak_deployment_config(load_settings()) or {}
+            if _mig_cfg.get('mode') == 'external_db':
+                _mig_edb = _mig_cfg.get('external_db') or {}
+                if not (_mig_edb.get('host') or '').strip():
+                    _mig_edb = None
+        except Exception:
+            _mig_edb = None
 
-        # The vendor script's exit code is NOT evidence that the schema updated — it
-        # exits 0 even when SchemaManager failed to authenticate. Ask the database.
-        _sv = _tak58_schema_version()
-        if _sv is not None and _sv < _TAK58_MIN_SCHEMA_VERSION:
+        if _mig_edb:
             _say('')
-            _say('The database migrated but the 5.8 schema updates did not apply '
-                 '(schema_version %d). Repairing…' % _sv)
-            _tak58_heal_md5_scram(_say)
-            _sv2 = _tak58_schema_version()
-            if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
-                return fail('The 5.8 schema updates could not be applied (schema_version %s). '
-                            'TAK Server 5.8 must NOT be run against a pre-5.8 schema — it will '
-                            'appear healthy and behave incorrectly. See the output above.'
-                            % (_sv2 if _sv2 is not None else 'unknown'), wedged=True)
-            _say('  Schema updates applied — now at version %d.' % _sv2)
-        elif _sv is None:
-            _say('  WARNING: could not read schema_version to confirm the 5.8 schema updates '
-                 'applied. Verify by hand before putting this server back in service.')
+            _say('Managed database (%s): the provider already runs PostgreSQL %d, so there is '
+                 'no cluster on this host to migrate. Applying the 5.8 schema updates to the '
+                 'managed instance instead.' % (_mig_edb.get('host'), TAK_PG_MAJOR))
+            if not os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
+                return fail('The 5.8 package did not provide SchemaManager.jar — cannot apply '
+                            'the schema updates.', wedged=True)
+            _smr = subprocess.run(
+                'cd /opt/tak && java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                shell=True, capture_output=True, text=True, timeout=3600)
+            for _l in ((_smr.stdout or '') + (_smr.stderr or '')).strip().split('\n')[:40]:
+                if _l.strip():
+                    _log.append('    %s' % _l.rstrip())
+            # Ask the MANAGED instance, never the local one.
+            _sv = _tak58_external_schema_version(_mig_edb)
+            if _sv is None or _sv < _TAK58_MIN_SCHEMA_VERSION:
+                return fail('The 5.8 schema updates did not apply to the managed database '
+                            '(schema_version %s, needed >= %d). TAK Server 5.8 must NOT be run '
+                            'against a pre-5.8 schema — it will appear healthy and behave '
+                            'incorrectly. See the output above.'
+                            % (_sv if _sv is not None else 'unreadable',
+                               _TAK58_MIN_SCHEMA_VERSION), wedged=True)
+            _say('  Managed database now at schema_version %d.' % _sv)
+        else:
+            # Local cluster: the vendor migration. Bare, per D1.
+            _say('')
+            _say('Migrating the database from PostgreSQL 15 to %d. This is the long part — do '
+                       'not interrupt it. Duration scales with database size, and with whether the '
+                       '5.8 schema update has to rewrite cot_router (see the note above).'
+                       % TAK_PG_MAJOR)
+            if not os.path.exists(_TAK58_UPGRADE_DB_SH):
+                return fail('The 5.8 package did not provide %s — cannot migrate the database.'
+                            % _TAK58_UPGRADE_DB_SH, wedged=True)
+            rc = _tak58_run_upgrade_db(log=_log)
+            # The script has no shebang and uses bashisms, so under dash it emits
+            # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
+            # while still doing its job. Noise is NOT failure — only the exit code is.
+            if rc != 0:
+                return fail('The database migration failed (exit %d). See the output above.' % rc,
+                            wedged=True)
+
+            # The vendor script's exit code is NOT evidence that the schema updated — it
+            # exits 0 even when SchemaManager failed to authenticate. Ask the database.
+            _sv = _tak58_schema_version()
+            if _sv is not None and _sv < _TAK58_MIN_SCHEMA_VERSION:
+                _say('')
+                _say('The database migrated but the 5.8 schema updates did not apply '
+                     '(schema_version %d). Repairing…' % _sv)
+                _tak58_heal_md5_scram(_say)
+                _sv2 = _tak58_schema_version()
+                if _sv2 is None or _sv2 < _TAK58_MIN_SCHEMA_VERSION:
+                    return fail('The 5.8 schema updates could not be applied (schema_version %s). '
+                                'TAK Server 5.8 must NOT be run against a pre-5.8 schema — it will '
+                                'appear healthy and behave incorrectly. See the output above.'
+                                % (_sv2 if _sv2 is not None else 'unknown'), wedged=True)
+                _say('  Schema updates applied — now at version %d.' % _sv2)
+            elif _sv is None:
+                _say('  WARNING: could not read schema_version to confirm the 5.8 schema updates '
+                     'applied. Verify by hand before putting this server back in service.')
 
         # Finish the package. On Debian the 5.8 install DELIBERATELY exits non-zero on a
         # PG-15 box ("A pg15 install has been detected…"), so dpkg is left holding a
