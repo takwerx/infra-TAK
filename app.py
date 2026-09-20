@@ -70803,13 +70803,25 @@ def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, ta
 
         say('')
         say('Upgrading the core to 5.8…')
+        # argv, not a shell string. `sh` is on the broker's DENY list, so
+        # _sudo_wrap(['sh', '-c', …]) is refused the moment broker enforcement is
+        # switched on — it only works today because the broker runs permissive and
+        # executes what it would otherwise deny. That makes this line a latent break
+        # on every non-root split-box, timed to the enforcement rollout rather than to
+        # anything an operator does. The other two 5.8 `sh` call sites already branch
+        # to their dedicated broker ops (tak58_upgrade_db / tak58_setup_db) and fall
+        # back to `sh` only when running as root; this one never got the same
+        # treatment. dnf/apt-get are both allow-listed with `install` gated, so the
+        # shell buys nothing here. DEBIAN_FRONTEND goes in the environment, where the
+        # broker can carry it, instead of an inline assignment only a shell can parse.
         if _distro_family() == 'rhel':
-            cmd = 'dnf -y install ' + shlex.quote(core_pkg_path) + ' 2>&1'
+            _inst_argv = ['dnf', '-y', 'install', core_pkg_path]
+            _inst_env = None
         else:
-            cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
-                   + shlex.quote(core_pkg_path) + ' 2>&1')
-        r = subprocess.run(_sudo_wrap(['sh', '-c', cmd]), capture_output=True, text=True,
-                           timeout=1800, env=_broker_shim_env())
+            _inst_argv = ['apt-get', 'install', '-y', '--allow-downgrades', core_pkg_path]
+            _inst_env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+        r = subprocess.run(_sudo_wrap(_inst_argv), capture_output=True, text=True,
+                           timeout=1800, env=_inst_env)
         for line in ((r.stdout or '') + (r.stderr or '')).strip().splitlines()[-8:]:
             say('    ' + line[:170])
         # Ask the package manager what is actually installed, on either family.
