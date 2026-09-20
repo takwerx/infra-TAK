@@ -66868,25 +66868,47 @@ def _tak58_managed_pg_major(edb):
 
 
 def _tak58_external_schema_version(edb):
-    """schema_version reached on a MANAGED database, or None. Read as the app user."""
+    """schema_version reached on a MANAGED database.
+
+    Returns an int (0 = reachable but no schema at all), or None when the database
+    could not be questioned. Those two are NOT the same answer and must not collapse
+    into one: measured on Azure 2026-09-19, a deploy that had silently built its
+    schema in a LOCAL cluster left the managed `cot` with no `schema_version` table,
+    the single query below failed to PARSE, this returned None, and the caller read
+    that as "ran clean but unreadable" and shipped a WARNING on top of a deploy that
+    had not touched the managed database at all. A missing table is not an unreadable
+    database — it is a definitive zero, and the caller must be able to fail on it.
+
+    So: probe for the relation first, and only then read the version out of it.
+    """
     host = (edb.get('host') or '').strip()
     if not host or not _safe_migration_db_host(host):
         return None
     pw = edb.get('password') or ''
     if not pw:
         return None
-    try:
-        r = subprocess.run(
-            ['psql', '-h', host, '-p', str(int(edb.get('port') or 5432)),
-             '-U', (edb.get('user') or 'martiuser'), '-d', (edb.get('name') or 'cot'),
-             '-c', 'select coalesce(max(version::int), 0) from schema_version where success',
-             '--no-password', '-t', '-A'],
-            capture_output=True, text=True, timeout=30,
-            env=dict(os.environ, PGPASSWORD=pw))
-    except Exception:
+
+    def _q(sql):
+        try:
+            return subprocess.run(
+                ['psql', '-h', host, '-p', str(int(edb.get('port') or 5432)),
+                 '-U', (edb.get('user') or 'martiuser'), '-d', (edb.get('name') or 'cot'),
+                 '-c', sql, '--no-password', '-t', '-A'],
+                capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, PGPASSWORD=pw))
+        except Exception:
+            return None
+
+    r = _q("select to_regclass('public.schema_version') is not null")
+    if r is None or r.returncode != 0:
+        return None                      # could not reach / authenticate — unknown
+    if (r.stdout or '').strip() != 't':
+        return 0                         # reachable, and the schema is definitively absent
+    r = _q('select coalesce(max(version::int), 0) from schema_version where success')
+    if r is None or r.returncode != 0:
         return None
     out = (r.stdout or '').strip()
-    return int(out) if r.returncode == 0 and out.isdigit() else None
+    return int(out) if out.isdigit() else None
 
 
 def _tak_58_preflight():
@@ -71088,7 +71110,7 @@ def deploy_takserver():
         if not (_edb_cfg.get('host') or '').strip():
             return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
         if not (_edb_cfg.get('password') or '').strip():
-            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database with all 5 Azure extensions whitelisted, then Test Connection (step 3), before deploying.'}), 400
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database (on Azure, whitelist POSTGIS and PGCRYPTO in azure.extensions first), then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -72422,6 +72444,23 @@ def run_takserver_deploy(config):
             _edb_port_early = int(_edb_early.get('port') or 5432)
             _edb_pass_early = (_edb_early.get('password') or '').strip()
             _edb_user_early = (_edb_early.get('username') or 'martiuser').strip()
+            # TAK's .deb/.rpm ships CoreConfig.example.xml only — CoreConfig.xml does not
+            # exist until takserver first starts and writes one. So guarding this pre-patch
+            # on CoreConfig.xml existing meant it NEVER ran on a fresh external_db install:
+            # TAK started, wrote a CoreConfig pointing at 127.0.0.1, and from then on owned
+            # the file (measured on Azure 2026-09-19). Seed it from the example now so the
+            # very first start already targets the managed database.
+            if _edb_host_early and not os.path.exists('/opt/tak/CoreConfig.xml') \
+                    and os.path.exists('/opt/tak/CoreConfig.example.xml'):
+                try:
+                    _seed = subprocess.run(['cat', '/opt/tak/CoreConfig.example.xml'],
+                                           capture_output=True, text=True, timeout=5).stdout or ''
+                    if _seed.strip():
+                        _write_priv('/opt/tak/CoreConfig.xml', _seed)
+                        log_step("External DB: seeded CoreConfig.xml from CoreConfig.example.xml "
+                                 "(TAK has not written one yet)")
+                except Exception as _e:
+                    log_step(f"⚠ Could not seed CoreConfig.xml from the example: {_e}")
             if _edb_host_early and os.path.exists('/opt/tak/CoreConfig.xml'):
                 log_step(f"External DB: pre-patching CoreConfig JDBC → {_edb_host_early}:{_edb_port_early} (before first start)...")
                 try:
@@ -72725,6 +72764,43 @@ def run_takserver_deploy(config):
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
 
+        # For external_db: re-assert the JDBC target now that TAK is STOPPED.
+        #
+        # The patch above runs while takserver is still up, and TAK Server rewrites
+        # CoreConfig.xml from its own in-memory config as it shuts down — it also drops
+        # its own CoreConfig.xml.backup beside it. Measured on Azure 2026-09-19: our edit
+        # landed at 00:15:28, `systemctl stop takserver` ran at 00:15:32, and at 00:15:34
+        # TAK wrote the file back with jdbc:postgresql://127.0.0.1:5432/cot. Everything
+        # downstream — SchemaManager, and then the server itself — then used the LOCAL
+        # cluster that TAK's own .deb had installed and populated, while the managed
+        # database sat empty and the deploy reported COMPLETE.
+        #
+        # A config edit that races the process which owns the file is not an edit. Re-apply
+        # it here, with nothing running to overwrite it.
+        if config.get('external_db') and config.get('tak_deploy_cfg'):
+            _edb_late = config['tak_deploy_cfg'].get('external_db', {})
+            _h_late = (_edb_late.get('host') or '').strip()
+            _p_late = int(_edb_late.get('port') or 5432)
+            _pw_late = (_edb_late.get('password') or '').strip()
+            if _h_late:
+                try:
+                    _cc_late = subprocess.run(['cat', '/opt/tak/CoreConfig.xml'],
+                                              capture_output=True, text=True, timeout=5).stdout or ''
+                    if _cc_late and f'//{_h_late}:{_p_late}/' not in _cc_late:
+                        log_step(f"External DB: CoreConfig was rewritten by TAK on shutdown — "
+                                 f"re-pointing JDBC at {_h_late}:{_p_late} with the server stopped...")
+                        _cc_late = re.sub(r'jdbc:postgresql://[^"]*',
+                                          f'jdbc:postgresql://{_h_late}:{_p_late}/cot', _cc_late)
+                        if _pw_late:
+                            _pw_late_xml = html.escape(_pw_late, quote=True)
+                            _cc_late = re.sub(r'(<connection[^>]*password=")[^"]*(")',
+                                              lambda m: m.group(1) + _pw_late_xml + m.group(2), _cc_late)
+                        _cc_late = _coreconfig_db_tls_converge(_cc_late)
+                        _write_priv('/opt/tak/CoreConfig.xml', _cc_late)
+                        log_step(f"✓ JDBC re-asserted → {_h_late}:{_p_late}")
+                except Exception as _e:
+                    log_step(f"⚠ Could not re-assert the JDBC target: {_e}")
+
         # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
         # points at the correct host. SchemaManager has no CLI JDBC flags — it reads
         # CoreConfig.xml from the working directory. Run from /opt/tak so it finds the
@@ -72767,15 +72843,21 @@ def run_takserver_deploy(config):
                          "read back from the managed database — verify it by hand before "
                          "putting this server into service.")
             else:
-                log_step(f"✗ SchemaManager did not build the schema (exit {sm_r.returncode}, "
+                log_step(f"✗ FATAL: SchemaManager did not build the schema (exit {sm_r.returncode}, "
                          f"schema_version {_edb_sv if _edb_sv is not None else 'unreadable'}). "
-                         f"TAK Server will start but the database is not usable — check the "
-                         f"output above. The most common cause is PostGIS missing from the "
-                         f"database: re-run Provision Database, which creates it.")
-                deploy_warnings.append(
-                    'The managed database schema was NOT built (schema_version %s) — this server '
-                    'is not usable until that is fixed'
-                    % (_edb_sv if _edb_sv is not None else 'unreadable'))
+                         f"The managed database is not usable, so this deploy is NOT complete. "
+                         f"The most common cause is PostGIS missing from the database: re-run "
+                         f"Provision Database, which creates it. On Azure also confirm POSTGIS "
+                         f"and PGCRYPTO are whitelisted in the azure.extensions server parameter.")
+                # Do NOT start TAK and do NOT report COMPLETE. A server pointed at a
+                # schemaless managed database is not a working server, and every time this
+                # has been downgraded to a warning the deploy has gone on to print
+                # DEPLOYMENT COMPLETE over a broken install — RDS 2026-09-04 (SchemaManager
+                # exit 2) and Azure 2026-09-19 (schema built in a local cluster instead).
+                log_step("  Stopping TAK Server (managed database has no schema, deploy incomplete)...")
+                run_cmd('systemctl stop takserver', check=False)
+                deploy_status.update({'error': True, 'running': False})
+                return
 
         run_cmd('systemctl start takserver')
         log_step("Waiting 10 minutes for full initialization before promoting admin...")
