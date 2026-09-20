@@ -66325,22 +66325,34 @@ def takserver_uninstall():
             shell=True, capture_output=True, text=True
         ).stdout.strip()
         if pkg_status:
-            # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
-            # stderr so silent failures don't pretend success.
-            purge_ok = False
-            for cmd in (
-                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
-                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
-                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
-            ):
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-                after = subprocess.run(
+            # Try purge, escalating. These MUST go through _sudo_wrap: the console
+            # runs as `takwerx` on a born-non-root box, so the original unwrapped
+            # `apt-get purge` / `dpkg --purge` shell strings failed with permission
+            # denied every single time and Remove ended on "still registered with
+            # dpkg — manual cleanup required". Reproduced twice on az-ubuntu-1,
+            # 2026-09-19; the leftover half-installed package then has to be cleared
+            # by hand before the box can be redeployed.
+            #
+            # Shape matters too: the broker runs argv, not a shell, and both `env`
+            # and every shell are on its deny list — so DEBIAN_FRONTEND goes in the
+            # process environment, never as an `env`/inline prefix. The first step
+            # uses the apt<->dnf shim rather than a bare apt-get, per CLAUDE.md.
+            def _pkg_gone():
+                st = subprocess.run(
                     "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-                    shell=True, capture_output=True, text=True
-                ).stdout.strip()
-                if not after or 'not-installed' in after:
-                    purge_ok = True
-                    break
+                    shell=True, capture_output=True, text=True).stdout.strip()
+                return (not st) or ('not-installed' in st)
+
+            _pkg_remove('takserver', purge=True, timeout=180)
+            purge_ok = _pkg_gone()
+            if not purge_ok:
+                for argv in (['dpkg', '--purge', 'takserver'],
+                             ['dpkg', '--purge', '--force-all', 'takserver']):
+                    _run_priv_chain([argv], 'seq', timeout=180,
+                                    env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+                    if _pkg_gone():
+                        purge_ok = True
+                        break
             if purge_ok:
                 steps.append('Purged TAK Server package')
             else:
