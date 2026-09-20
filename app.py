@@ -67371,6 +67371,21 @@ def _tak_58_backup(plog=None):
     except Exception:
         out['dump_bytes'] = 0
 
+    # A managed-database dump was already proven readable by the snapshot itself,
+    # client-side, before it was copied into the root-owned snapshot directory —
+    # the broker's pg_restore op will not touch it, because its HMAC sidecar proves
+    # "the broker produced this dump" and a managed DB is necessarily dumped by the
+    # console over TCP. Same standard, verified at the only point where the file is
+    # readable without root. Trust it rather than re-asking the broker, which can
+    # only ever answer "not mine".
+    if meta.get('db_dump_toc'):
+        out['toc_entries'] = int(meta.get('db_dump_toc') or 0)
+        out['dump_bytes'] = int(meta.get('db_dump_bytes') or out['dump_bytes'] or 0)
+        out['ok'] = True
+        plog('  backup verified: %s, %d objects in the archive (%s)'
+             % (_cotdb_fmt_bytes(out['dump_bytes']), out['toc_entries'], out['snapshot_path']))
+        return out
+
     # Prove it reads. This is the entire point of the wrapper.
     #
     # It must go through the broker, not `runuser -u postgres -- pg_restore`: the
@@ -69055,11 +69070,43 @@ def _tak_snapshot(label, plog=None):
                             [_pgdump, '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
                             stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
                     if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
-                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
-                        if _cp.returncode == 0:
-                            meta['db_dump'] = True
-                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written ({os.path.getsize(_tmp_dump) // 1024} KB)")
+                        # Prove the archive READS, here, while the console still owns the
+                        # file. The broker cannot vouch for this one: its pg_restore op
+                        # requires an HMAC sidecar proving the BROKER produced the dump,
+                        # and a managed database is dumped client-side over TCP (the
+                        # broker has no remote-host pg_dump, and giving it outbound
+                        # credentialed database access to satisfy a check is a far bigger
+                        # surface change than the check is worth). So the same standard is
+                        # met the same way — pg_restore --list parses the table of
+                        # contents, which catches truncation and corruption that a
+                        # non-zero byte count does not — just on this side of the copy.
+                        _toc_n = 0
+                        _prbin = _pg_client_bin('pg_restore', _emaj, plog=plog) if _emaj else _shu.which('pg_restore')
+                        if _prbin:
+                            try:
+                                _pr = subprocess.run([_prbin, '--list', _tmp_dump],
+                                                     capture_output=True, text=True, timeout=600)
+                                _toc_n = len([l for l in (_pr.stdout or '').splitlines()
+                                              if l.strip() and not l.lstrip().startswith(';')])
+                                if _pr.returncode != 0 or not _toc_n:
+                                    plog("  snapshot: external-DB dump did NOT verify (%s) — "
+                                         "refusing to record it as a backup"
+                                         % ((_pr.stderr or '').strip()[:200] or 'empty table of contents'))
+                                    _toc_n = 0
+                            except Exception as _pe:
+                                plog(f"  snapshot: could not verify the external-DB dump: {str(_pe)[:160]}")
+                                _toc_n = 0
                         else:
+                            plog("  snapshot: no pg_restore able to read PostgreSQL %s — cannot verify the dump"
+                                 % (_emaj if _emaj else '?'))
+                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120) if _toc_n else None
+                        if _toc_n and _cp is not None and _cp.returncode == 0:
+                            meta['db_dump'] = True
+                            meta['db_dump_toc'] = _toc_n
+                            meta['db_dump_bytes'] = os.path.getsize(_tmp_dump)
+                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written and verified "
+                                 f"({os.path.getsize(_tmp_dump) // 1024} KB, {_toc_n} objects)")
+                        elif _toc_n:
                             plog(f"  snapshot: pg_dump copy into snapshot FAILED: {(_cp.stderr or b'').decode()[:160]}")
                     else:
                         plog(f"  snapshot: external-DB pg_dump FAILED (check network path + client-vs-server version): {(r2.stderr or b'').decode()[:200]}")
