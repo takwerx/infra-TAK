@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.82-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.82-alpha)**
+**Current release: [v10.1.83-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.83-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.83-alpha — 2026-09-19 — Node-RED: the deploy now tells you what is holding port 1880
+
+**Headline: if something else on the box already listens on port 1880, the Node-RED deploy now refuses up front and names it, instead of pulling the image, failing at the start step, and blaming a leftover container that was never there.** A Node-RED installed directly on the host (for example with the npm install script) binds port 1880 on every interface, so infra-TAK's container can never start, and the Node-RED subdomain quietly serves that other instance, which has no Configurator. The deploy log now shows the process or container holding the port, its command line, and what to do. The same check runs if the port turns out to be taken at start time, and a genuine leftover container is still cleared automatically as before.
+
+> **Upgrade note.** Nothing to do beyond updating. If your Node-RED page shows no Configurator, run Deploy on the Node-RED module again: the log names what is holding port 1880. Stop or remove it, then Deploy once more.
 
 ### v10.1.82-alpha — 2026-09-19 — ATLAS: removing an agency deployment works again
 
