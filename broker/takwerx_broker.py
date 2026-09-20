@@ -1926,6 +1926,50 @@ def _check_pg_restore(req):
     _check_pg_dump(req)
 
 
+def _newest_pg_client(name):
+    """Highest-versioned PostgreSQL client binary on this host, else PATH lookup.
+
+    pg_restore REFUSES an archive written by a newer pg_dump:
+
+        pg_restore: error: unsupported version (1.16) in file header
+
+    `shutil.which` returns Debian's pg_wrapper, which selects the DEFAULT cluster
+    version — on a TAK box that is 15, because TAK's own package depends on
+    postgresql-15. Once a managed database has been upgraded to 18 (which the 5.8
+    pre-flight requires), the console dumps it with an 18 client and this
+    verification step could no longer read the result, failing the pre-migration
+    backup and blocking the update with a message about a corrupt archive when the
+    archive was fine. Measured against az-test-rds 18.6, 2026-09-19: pg_restore 15
+    rejected the file header, pg_restore 18 read 522 TOC entries from it.
+
+    Only versioned binaries in the distributions' own root-owned directories are
+    considered, by exact pattern — this must not become a way to point the broker
+    at an attacker-writable binary, which is the whole reason BROKER_TRUSTED_PATH
+    exists. Each candidate must be a regular file, owned by root, and not writable
+    by group or other.
+    """
+    best = None
+    for pattern in ('/usr/lib/postgresql/%d/bin/', '/usr/pgsql-%d/bin/'):
+        for major in range(30, 8, -1):
+            cand = (pattern % major) + name
+            try:
+                st = os.stat(cand)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                continue
+            if not os.access(cand, os.X_OK):
+                continue
+            if best is None or major > best[0]:
+                best = (major, cand)
+            break
+    if best:
+        return best[1]
+    return shutil.which(name, path=BROKER_TRUSTED_PATH)
+
+
 def _do_pg_restore(req):
     """Symmetric to _do_pg_dump (v10.0.8 §B): the broker opens the snapshot dump
     as root and feeds it to pg_restore's stdin — the dump never crosses the
@@ -1957,7 +2001,7 @@ def _do_pg_restore(req):
     # additionally proves the archive is well-formed, which is what a pre-migration
     # backup check is actually claiming.
     if req.get('list_only'):
-        pg_restore = shutil.which('pg_restore', path=BROKER_TRUSTED_PATH)
+        pg_restore = _newest_pg_client('pg_restore')
         if not pg_restore:
             return {'ok': False, 'error': 'pg_restore not found on trusted PATH'}
         proc = subprocess.run([pg_restore, '--list', path],

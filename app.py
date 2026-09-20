@@ -66953,6 +66953,66 @@ def _tak_58_preflight_cached(max_age=60):
     return d
 
 
+def _pg_client_bin(name, min_major, plog=None):
+    """Path to a `name` client (pg_dump/pg_restore/psql) of at least `min_major`.
+
+    PostgreSQL client tools REFUSE to talk to a newer server:
+
+        pg_dump: error: aborting because of server version mismatch
+        pg_dump: detail: server version: 18.6; pg_dump version: 15.19
+
+    On a managed-database box that is not a corner case, it is the normal state.
+    TAK's own .deb/.rpm depends on postgresql-15, so `pg_dump` on PATH is 15 — and
+    the moment the customer upgrades their RDS/Azure instance to 18 (which our own
+    pre-flight REQUIRES before 5.8), the local client can no longer dump it. The
+    5.8 pre-migration backup then fails, and because that backup is a hard gate the
+    update is permanently blocked with nothing on the box to explain why.
+    Measured on az-ubuntu-1 against az-test-rds 18.6, 2026-09-19. It applies
+    identically to AWS RDS.
+
+    So: prefer an explicitly versioned binary >= min_major, and install the client
+    package if none is present. Returns a path, or None if nothing suitable could
+    be obtained (callers must handle that — never silently fall back to a client
+    that cannot read the server).
+    """
+    if plog is None:
+        plog = lambda m: None
+    try:
+        min_major = int(min_major)
+    except (TypeError, ValueError):
+        return shutil.which(name)
+
+    def _probe():
+        # Highest first: a newer client can always read an older server.
+        for major in range(min_major + 6, min_major - 1, -1):
+            for layout in _TAK58_PG_BIN_LAYOUTS:
+                cand = os.path.join(layout.format(major=major), name)
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    return cand
+        return None
+
+    found = _probe()
+    if found:
+        return found
+
+    # Nothing local is new enough. The PGDG repo is already configured by the TAK
+    # deploy (Step 2), so the versioned client package is available on both families.
+    pkg = ('postgresql%d' % min_major) if _distro_family() == 'rhel' \
+        else ('postgresql-client-%d' % min_major)
+    plog('  no pg client >= %d on this host — installing %s...' % (min_major, pkg))
+    try:
+        ok, out = _pkg_install(pkg, timeout=600)
+    except Exception as e:
+        ok, out = False, str(e)
+    if not ok:
+        plog('  could not install %s: %s' % (pkg, (out or '')[:200]))
+        return None
+    found = _probe()
+    if found:
+        plog('  using %s' % found)
+    return found
+
+
 def _tak58_managed_pg_major(edb):
     """(major, detail) for a MANAGED database, read over TCP. (None, why) if unknown.
 
@@ -68969,11 +69029,21 @@ def _tak_snapshot(label, plog=None):
             _ep = int(_snap_edb.get('port') or 5432)
             _en = _snap_edb.get('name') or 'cot'
             _eu = _snap_edb.get('user') or 'martiuser'
-            if not _shu.which('pg_dump'):
-                plog("  snapshot: external-DB mode but no pg_dump client on this box — DB dump skipped "
-                     "(managed-DB automated backups still apply; install postgresql client tools to capture dumps in snapshots)")
+            # Resolve a pg_dump at least as new as the MANAGED server, installing the
+            # versioned client if needed. A bare `pg_dump` is whatever TAK's own
+            # postgresql-15 dependency put on PATH, and it refuses to dump an 18
+            # server — which is the state every managed box is in once the engine has
+            # been upgraded for 5.8. See _pg_client_bin().
+            _emaj, _ewhy = _tak58_managed_pg_major(_snap_edb)
+            _pgdump = _pg_client_bin('pg_dump', _emaj, plog=plog) if _emaj else _shu.which('pg_dump')
+            if not _pgdump:
+                plog("  snapshot: external-DB mode but no pg_dump client able to read PostgreSQL %s "
+                     "on this box — DB dump skipped (managed-DB automated backups still apply; "
+                     "install the postgresql client tools to capture dumps in snapshots)"
+                     % (_emaj if _emaj else '?'))
             else:
-                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}")
+                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}"
+                     + (f" (client {_pgdump})" if _emaj else ""))
                 import tempfile
                 _fd, _tmp_dump = tempfile.mkstemp(prefix='cot-snap-', suffix='.pgdump')
                 os.close(_fd)
@@ -68982,7 +69052,7 @@ def _tak_snapshot(label, plog=None):
                     _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
                     with open(_tmp_dump, 'wb') as _f:
                         r2 = subprocess.run(
-                            ['pg_dump', '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            [_pgdump, '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
                             stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
                     if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
                         _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
