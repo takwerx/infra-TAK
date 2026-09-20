@@ -66291,9 +66291,40 @@ def takserver_uninstall():
             _stopped_cleanly = False
     steps.append('Stopped TAK Server' if _stopped_cleanly else
                  'TAK Server did not stop within 5 minutes — killed instead (uninstall continued)')
-    # Kill any remaining processes
+    # Kill any remaining processes.
+    #
+    # This used to be a bare unwrapped `pkill -9 -f takserver`, which on a born-non-root
+    # box runs as `takwerx` and therefore cannot signal anything owned by `tak` — the
+    # step reported "Killed remaining processes" while every one of them survived.
+    # What survives matters: TAK's own postrm runs `userdel tak`, and userdel exits 8
+    # ("user tak is currently used by process N") if ANY tak-owned process is left, so
+    # the package purge fails and the package is stranded half-installed. Measured on
+    # az-ubuntu-1, 2026-09-19 — survivors were a lingering `systemd --user` manager,
+    # four abandoned login session scopes, and orphaned takserver-plugins.sh /
+    # takserver-retention.sh wrappers with their JVMs.
+    #
+    # `pkill` is not on the broker's allow-list (and should not be — it is a
+    # signal-anything primitive). `loginctl` is, and terminate-user is the correct
+    # systemd answer anyway: it takes down the user's manager and every session scope,
+    # which is exactly where those orphans live. disable-linger stops it coming back.
+    _run_priv_chain([['loginctl', 'terminate-user', 'tak'],
+                     ['loginctl', 'disable-linger', 'tak']], 'seq', timeout=60)
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
-    steps.append('Killed remaining processes')
+    time.sleep(3)
+    _tak_left = subprocess.run("ps -u tak -o pid= 2>/dev/null | wc -l",
+                               shell=True, capture_output=True, text=True).stdout.strip()
+    try:
+        _tak_left = int(_tak_left)
+    except (TypeError, ValueError):
+        _tak_left = 0
+    if _tak_left:
+        # Say so. The purge below is about to fail because of exactly this, and a step
+        # list that claims a kill that did not happen sends the operator to the wrong place.
+        steps.append('⚠ %d process(es) still owned by the tak user after terminate-user — '
+                     'the package purge may fail (userdel refuses while they are running)'
+                     % _tak_left)
+    else:
+        steps.append('Killed remaining processes')
     # Purge package — must complete BEFORE removing /opt/tak, otherwise the
     # package can remain in 'ii' state with files gone, and the next
     # `apt-get install` becomes a no-op ("already newest version") that leaves
