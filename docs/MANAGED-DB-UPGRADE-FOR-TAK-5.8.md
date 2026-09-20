@@ -131,9 +131,24 @@ available and enabled for PostgreSQL 18 — on managed services PostGIS is an ex
 offers per engine version, and the available version changes with the engine. If PostGIS is
 missing or too old after the upgrade, TAK's schema work will fail.
 
-In practice the provider handles this for you: on an RDS instance taken from PostgreSQL 15 to 18,
-PostGIS moved from 3.4.6 to 3.6.3 as part of the same upgrade, with nothing to do by hand. Confirm
-it rather than assume it — the check is in the next section.
+In practice the provider usually handles this for you — but **not always, and the two clouds do not
+behave the same way.** Measured 2026-09-20 on 15 → 18 upgrades of both:
+
+| | PostGIS before | after the engine upgrade |
+|---|---|---|
+| **Azure Flexible Server** | 3.6.4 | 3.6.4 — carried forward |
+| **AWS RDS** | 3.4.6 | **3.4.6 — left as it was** |
+
+A *fresh* RDS 18 instance gets PostGIS **3.6.3**, so after an upgrade you can end up running an
+older PostGIS than a new install of the same thing would. TAK Server 5.8's schema applied cleanly
+on 3.4.6, so this is not a blocker — but if you want the newer PostGIS, ask for it deliberately
+after the engine upgrade:
+
+```sql
+ALTER EXTENSION postgis UPDATE;
+```
+
+Confirm what you actually have rather than assume it — the check is in the next section.
 
 ---
 
