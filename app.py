@@ -14980,8 +14980,17 @@ def _psql_client_bin():
         return int(m.group(1)) if m else 0
     if cands:
         return max(cands, key=_ver)
-    return shutil.which('psql') or ''
-
+    w = shutil.which('psql') or ''
+    # v10.1.85: on Debian /usr/bin/psql may be postgresql-client-common's pg_wrapper
+    # with NO versioned client behind it — it is not a client, it is the thing that
+    # prints "You must install at least one postgresql-client-<version> package".
+    # Returning it here would also skip _ensure_psql_client()'s install.
+    try:
+        if w and 'pg_wrapper' in os.path.realpath(w):
+            return ''
+    except OSError:
+        pass
+    return w
 
 
 _PSQL_CLIENT_INSTALL = {'ts': 0.0}
