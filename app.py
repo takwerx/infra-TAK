@@ -14983,6 +14983,43 @@ def _psql_client_bin():
     return shutil.which('psql') or ''
 
 
+
+_PSQL_CLIENT_INSTALL = {'ts': 0.0}
+
+
+def _ensure_psql_client(log_fn=None, timeout=180):
+    """A psql client binary for a REMOTE cot database — installing one when the box
+    has none. v10.1.85, field report from NC TAK (2026-09-21): the v10.1.78 remote
+    branch of _cot_pg_exec was validated on the split box test8, which had a
+    PostgreSQL 18 client only because an unrelated `apt full-upgrade` had pulled one
+    in. A split-box console that infra-TAK itself installed never gets a client (TAK
+    Server is a JVM; the database is on Server One), so the Client Feed answered
+    "no PostgreSQL client on this box" for a database that was up the whole time.
+    Installs through the apt↔dnf shim (postgresql-client on Debian/Ubuntu, postgresql
+    on RHEL/Rocky — both resolve to a real versioned psql the resolver prefers), at
+    most once per 10 minutes so a broken repo cannot turn every channel read into a
+    package run. Returns the binary path or ''."""
+    psql = _psql_client_bin()
+    if psql:
+        return psql
+    now = time.time()
+    if now - _PSQL_CLIENT_INSTALL['ts'] < 600:
+        return ''
+    _PSQL_CLIENT_INSTALL['ts'] = now
+    pkg = 'postgresql' if _pkg_mgr() == 'dnf' else 'postgresql-client'
+    if log_fn:
+        log_fn(f"  No PostgreSQL client on this box — installing {pkg} (a remote cot database needs one)…")
+    ok, out = _pkg_install(pkg, log_fn=log_fn, timeout=timeout)
+    psql = _psql_client_bin()
+    msg = (f"  ✓ PostgreSQL client installed: {psql}" if psql
+           else f"  ✗ Could not install {pkg}: {(out or '').strip()[-300:]}")
+    if log_fn:
+        log_fn(msg)
+    else:
+        print(f"_ensure_psql_client: {msg.strip()}", flush=True)
+    return psql
+
+
 _COT_CONN_CACHE = {'ts': 0.0, 'val': None}
 
 
@@ -15076,10 +15113,11 @@ def _cot_pg_exec(args, timeout=30):
     if not pw:
         return _fail(2, f'remote cot database {host}:{port}: no password for {user} in '
                         'CoreConfig.xml or TAK deployment settings')
-    psql = _psql_client_bin()
+    psql = _psql_client_bin() or _ensure_psql_client()
     if not psql:
-        return _fail(127, 'no PostgreSQL client on this box: install postgresql-client '
-                          '(Debian/Ubuntu) or postgresql (RHEL/Rocky) and retry')
+        return _fail(127, 'no PostgreSQL client on this box and the automatic install did not '
+                          'succeed: install postgresql-client (Debian/Ubuntu) or postgresql '
+                          '(RHEL/Rocky) and retry')
     env = dict(os.environ, PGPASSWORD=pw, PGCONNECT_TIMEOUT=str(max(2, min(int(timeout), 10))))
     argv = [psql, '-X', '-h', host, '-p', str(port), '-U', user, '-d', db] + rest
     try:
@@ -39744,6 +39782,60 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         return False
 
 
+# Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
+# consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
+_CLOUDTAK_REMOTE_MEDIA_PERL = (
+    "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
+    "[ -f \"$f\" ] && perl -i -pe "
+    "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
+    "\"$f\"; done; true"
+)
+
+
+def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None):
+    """Put ~/CloudTAK back on the commit it was on before a failed update's checkout.
+
+    v10.1.85 (PWC incident, 2026-09-21): a build that died on a transient GitHub 504
+    left the tree at the NEW tag while the OLD images kept running — a mixed state
+    the version card then misreported, and one the operator had no button for.
+    compose `up -d` runs only after a successful build, so the containers were never
+    replaced; after this the tree and the images agree again. Re-applies the port
+    hardening the checkout reset. Never raises — it runs on the failure path and must
+    not mask the build error."""
+    if not prev_sha or not re.fullmatch(r'[0-9a-f]{40}', prev_sha):
+        plog("  ⚠ Previous commit unknown — checkout left at the new tag; the running containers are unchanged")
+        return False
+    try:
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && git checkout -f {prev_sha}", timeout=120)
+            if ok:
+                _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
+        else:
+            r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                                'checkout', '-f', prev_sha],
+                               capture_output=True, text=True, timeout=300)
+            ok, out = (r.returncode == 0), ((r.stderr or '') + (r.stdout or ''))
+            if ok:
+                try:
+                    _patch_cloudtak_minio_registry(cloudtak_dir)
+                    _patch_cloudtak_compose_ports(cloudtak_dir)
+                except Exception as _pe:
+                    plog(f"  ⚠ Port-hardening re-apply after revert failed (non-fatal): {_pe}")
+        if ok:
+            plog(f"↩ Reverted the checkout to {prev_sha[:10]} — the tree matches the images that are still running")
+        else:
+            plog(f"  ⚠ Could not revert the checkout: {(out or '').strip()[:200]}")
+        return bool(ok)
+    except Exception as e:
+        plog(f"  ⚠ Revert failed (non-fatal): {str(e)[:200]}")
+        return False
+
+
+def _cloudtak_update_failed_note(plog):
+    plog("  CloudTAK is still running on the previous build — nothing was removed.")
+    plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -39756,6 +39848,7 @@ def run_cloudtak_update():
         is_remote = cfg.get('target_mode') == 'remote'
         remote_cfg = cfg.get('remote', {}) if is_remote else {}
         remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
+        prev_sha = ''   # v10.1.85: where the tree was before checkout — restored on a failed build
 
         plog("━━━ Step 1/3: Resolving target release ━━━")
         # v10.1.17: version gate removed — every channel installs upstream latest
@@ -39771,6 +39864,8 @@ def run_cloudtak_update():
                 plog("✗ Remote host not configured")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _okp, _outp = _ssh_probe(remote_cfg, "cd ~/CloudTAK && git rev-parse HEAD", timeout=30)
+            prev_sha = (_outp or '').strip() if _okp else ''
             checkout_cmd = (
                 f"cd ~/CloudTAK && "
                 f"git checkout -- . && "
@@ -39804,6 +39899,9 @@ def run_cloudtak_update():
             # .docker-store are untracked, so they survive. Patches (nginx, port
             # bindings) live in docker-compose.override.yml which is untracked.
             # Generous timeout so no family crosses it (CloudTAK is ~18k tracked files).
+            _prev = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                                    'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=30)
+            prev_sha = (_prev.stdout or '').strip() if _prev.returncode == 0 else ''
             _cloudtak_git_prep(cloudtak_dir, plog)
             if release_tag:
                 r = subprocess.run(
@@ -39898,13 +39996,7 @@ def run_cloudtak_update():
             # critical media:9997 → loopback rewrite via perl (consistent regex across
             # distros; sed's brace/backref handling diverges). The `unless /127.0.0.1/`
             # guard makes it idempotent. Fuller hardening runs on the box's next restart.
-            _media_perl = (
-                "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
-                "[ -f \"$f\" ] && perl -i -pe "
-                "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
-                "\"$f\"; done; true"
-            )
-            ok_sed, _ = _ssh_probe(remote_cfg, _media_perl, timeout=30)
+            ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
         else:
@@ -39921,6 +40013,8 @@ def run_cloudtak_update():
             dcc = _compose_cmd(remote_cfg=remote_cfg)
             if not dcc:
                 plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
+                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
@@ -39928,6 +40022,8 @@ def run_cloudtak_update():
             ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
             if not ok:
                 plog(f"✗ Build/restart failed on remote: {(out or '')[:600]}")
+                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         else:
@@ -39935,6 +40031,8 @@ def run_cloudtak_update():
             dcc = _compose_cmd()
             if not dcc:
                 plog("✗ Neither `docker compose` nor `docker-compose` is available")
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
@@ -39969,12 +40067,16 @@ def run_cloudtak_update():
                     plog(f"✗ Build/restart failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
+                    _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                    _cloudtak_update_failed_note(plog)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
                 proc.kill()
                 reader.join(timeout=5)
                 plog("✗ Build timed out after 90 minutes")
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
@@ -45469,6 +45571,11 @@ volumes:
         generate_caddyfile(settings)
         _caddy_reload()
         plog(f"✓ Caddy updated — https://nodered.{domain}")
+    else:
+        # v10.1.85 (field report, 2026-09-21): a remote deploy from a console with no
+        # domain silently produced no route and no certificate anywhere.
+        plog("  ⚠ No domain configured on THIS console — no Caddy route or certificate was created for Node-RED.")
+        plog("    Set the domain under Caddy SSL, then run Deploy again to publish https://nodered.<domain>.")
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
     if domain and ak_token:
         plog("  Configuring Authentik for Node-RED...")
@@ -46136,7 +46243,14 @@ window.pollLog = function(redeployBtn) {
               var banner = document.createElement("div");
               banner.id = "deploy-fail-banner";
               banner.style.cssText = "background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)";
-              banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick=\"document.getElementById('uninstall-modal').classList.add('open')\" style='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer'>\ud83d\uddd1 Remove failed install</button>";
+              // v10.1.85: the wipe offer is for a failed FIRST install only. On an installed
+              // module (a failed Update or Update-config) it opened the real uninstall — PWC lost
+              // a working CloudTAK and its database to it on 2026-09-21.
+              if (window.MOD_INSTALLED) {
+                banner.innerHTML = "<strong>\u2717 Failed.</strong> See the log above for the cause. Nothing was removed \u2014 CloudTAK's containers and data were left in place, and if it was running before it still is.";
+              } else {
+                banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick=\"document.getElementById('uninstall-modal').classList.add('open')\" style='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer'>\ud83d\uddd1 Remove failed install</button>";
+              }
               logCard.insertBefore(banner, logCard.querySelector(".log-box") || logCard.firstChild);
             }
             var btn = document.getElementById("deploy-btn");
@@ -81119,6 +81233,8 @@ _MODULE_CTX = {
     # token store lives in (0600), and the audit writer for mint/revoke events.
     '_pg_exec': _pg_exec,
     '_cot_pg_exec': _cot_pg_exec,   # v10.1.78: local / container / split / managed (RDS, Azure)
+    '_tak_db_topology': _tak_db_topology,
+    '_ensure_psql_client': _ensure_psql_client,   # v10.1.85: split/managed box with no psql client
     'CONFIG_DIR': CONFIG_DIR,
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,

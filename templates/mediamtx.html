@@ -209,6 +209,7 @@
   </div>
 </div>
 
+<script>window.MOD_INSTALLED={{ 'true' if mtx.installed else 'false' }};</script>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('service-logs');</script>
 <script>
@@ -310,7 +311,7 @@ function startDeploy() {
           var banner = document.createElement('div');
           banner.id = 'deploy-fail-banner';
           banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
-          banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
+          if(window.MOD_INSTALLED){banner.innerHTML='<strong>✗ Failed.</strong> See the log above for the cause. Nothing was removed — the existing install and its data were left in place.';}else{banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);}
           lg.insertBefore(banner, lg.querySelector('.log-box') || lg.firstChild);
         }
         var btn = document.getElementById('deploy-btn');
@@ -350,7 +351,7 @@ function pollLog() {
               var banner = document.createElement('div');
               banner.id = 'deploy-fail-banner';
               banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
-              banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
+              if(window.MOD_INSTALLED){banner.innerHTML='<strong>✗ Failed.</strong> See the log above for the cause. Nothing was removed — the existing install and its data were left in place.';}else{banner.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);}
               logCard.insertBefore(banner, logCard.querySelector('.log-box') || logCard.firstChild);
             }
             var btn = document.getElementById('deploy-btn');

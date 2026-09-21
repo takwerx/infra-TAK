@@ -91,6 +91,7 @@ select.input-field{cursor:pointer}
 <!-- Deploy Log -->
 <div class="section-title">Deployment Log</div>
 <div class="deploy-log" id="deploy-log">Starting deployment...</div>
+<script>window.MOD_INSTALLED={{ 'true' if email.installed else 'false' }};</script>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');</script>
 <script>
@@ -101,7 +102,7 @@ select.input-field{cursor:pointer}
         var r=await fetch('/api/emailrelay/log');var d=await r.json();
         if(d.entries&&d.entries.length>last){el.textContent=d.entries.join('\n');el.scrollTop=el.scrollHeight;last=d.entries.length}
         if(!d.running){clearInterval(iv);
-        if(d.error){var card=el.parentElement;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,el);}var rbtn=document.createElement('button');rbtn.textContent='✗ Deployment failed — Retry';rbtn.style.cssText='margin-top:12px;padding:12px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer';rbtn.onclick=function(){location.reload();};card.appendChild(rbtn);}
+        if(d.error){var card=el.parentElement;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';if(window.MOD_INSTALLED){b.innerHTML='<strong>✗ Failed.</strong> See the log above for the cause. Nothing was removed — the existing install and its data were left in place.';}else{b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);}card.insertBefore(b,el);}var rbtn=document.createElement('button');rbtn.textContent='✗ Deployment failed — Retry';rbtn.style.cssText='margin-top:12px;padding:12px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer';rbtn.onclick=function(){location.reload();};card.appendChild(rbtn);}
         else if(d.complete){setTimeout(()=>location.reload(),1500)}}
     },1500);
 })();
@@ -190,8 +191,11 @@ Switching providers later requires only updating Postfix credentials — no chan
 
 <div class="section-title">Deploy Email Relay</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
-{% if deploy_error %}
+{% if deploy_error and not email.installed %}
 <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="emailUninstall()" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
+{% elif deploy_error %}
+{# v10.1.85: never offer the wipe on an installed module (PWC CloudTAK incident, 2026-09-21) #}
+<div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Failed.</strong> See the log above for the cause. Nothing was removed &mdash; the existing install and its data were left in place.</div>
 {% endif %}
 <div class="form-grid">
 <div class="form-group full">
@@ -262,7 +266,7 @@ async function deployRelay(){
     var d=await r.json();
     if(d.success){location.reload()}
     else{var card=btn.closest('div[style*="background:var(--bg-card)"]')||btn.parentElement;
-    if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
+    if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';if(window.MOD_INSTALLED){b.innerHTML='<strong>✗ Failed.</strong> See the log above for the cause. Nothing was removed — the existing install and its data were left in place.';}else{b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);}card.insertBefore(b,card.firstChild);}
     btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='὎7 Deploy Email Relay';btn.style.background='';deployRelay();};}
 }
 
