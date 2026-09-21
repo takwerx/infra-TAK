@@ -67437,12 +67437,43 @@ def _tak_58_preflight():
     datadir = None if facts.get('external_db') else _sql('SHOW data_directory;', db='postgres')
     facts['data_directory'] = datadir
     if datadir:
-        du = _sh(['du', '-sb', datadir], timeout=120)
         target_parent = '/var/lib/pgsql' if datadir.startswith('/var/lib/pgsql') else '/var/lib/postgresql'
-        df = _sh(['df', '-B1', '--output=avail', target_parent], timeout=20)
+
+        # Measure WITHOUT needing root. `du` and `df` are not on the broker's
+        # allow-list, so on a non-root console — which is every modern box — both
+        # calls were denied, the int() below raised, and the whole gate was skipped
+        # via the except. The card showed "database 0 B · 0 B free (needs 0 B)" and,
+        # far worse, the `avail < need` blocker NEVER RAN on the boxes it exists to
+        # protect: pg_upgrade copies the cluster, so a box without ~1.5x free can
+        # fill its disk mid-migration and there is nothing to stop it. Seen on dev-4
+        # 2026-09-21 in the operator's own browser, which is the only place it shows.
+        #
+        # Neither number needs privilege:
+        #   free  — shutil.disk_usage() stats the filesystem, no root, no broker.
+        #   size  — ask PostgreSQL. We can already query it (the row count above
+        #           comes from the same helper), and it is a better question than
+        #           `du` on the data directory anyway.
+        used = avail = None
         try:
-            used = int((du.stdout or '').split()[0])
-            avail = int((df.stdout or '').splitlines()[-1].strip())
+            import shutil as _shutil
+            _probe = target_parent if os.path.exists(target_parent) else '/'
+            avail = _shutil.disk_usage(_probe).free
+        except Exception:
+            avail = None
+
+        _sz = _sql('SELECT COALESCE(sum(pg_database_size(datname)), 0)::bigint FROM pg_database;',
+                   db='postgres')
+        if _sz and _sz.strip().isdigit():
+            used = int(_sz.strip())
+        else:
+            # Root console (or a box where du IS reachable) — keep the old source.
+            _du = _sh(['du', '-sb', datadir], timeout=120)
+            try:
+                used = int((_du.stdout or '').split()[0])
+            except Exception:
+                used = None
+
+        if used is not None and avail is not None:
             need = int(used * _TAK58_MIN_DISK_RATIO)
             facts['data_bytes'], facts['avail_bytes'], facts['need_bytes'] = used, avail, need
             if avail < need:
@@ -67451,8 +67482,14 @@ def _tak_58_preflight():
                     '(1.5x the %s database). pg_upgrade runs in copy mode so the PostgreSQL 15 '
                     'cluster survives — that is the only way back if the upgrade fails.'
                     % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used)))
-        except Exception:
-            warnings.append('Could not measure free disk space for the new cluster — verify by hand.')
+        else:
+            # Say that the CHECK did not run, not merely that a number is missing.
+            # The old wording read like a cosmetic gap; it meant the safety gate was off.
+            warnings.append(
+                'Could not measure %s, so the free-disk safety check did NOT run. pg_upgrade '
+                'copies the cluster and needs about 1.5x the database size free — confirm that '
+                'by hand on %s before starting, because nothing here will stop you.'
+                % ('the database size' if used is None else 'free disk space', target_parent))
 
     # 5. The conditional expensive bit: cot_router's PK type and size.
     if mode == 'local' and running_major:
