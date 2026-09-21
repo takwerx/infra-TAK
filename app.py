@@ -61241,6 +61241,60 @@ def _ensure_authentik_ldap_service_account():
     except Exception as e:
         return False, str(e)[:120]
 
+def _ak_apply_webadmin_password(webadmin_pass, log_fn=None):
+    """Apply the operator-typed webadmin password to the AUTHENTIK account.
+
+    On an Authentik box the TAK deploy deliberately does not create a flat-file
+    webadmin (it would shadow the LDAP one on 8446). But it also did nothing else:
+    it removed webadmin from UserAuthenticationFile.xml and dropped the password
+    the operator had just typed on the floor. The account exists in Authentik with
+    whatever password a PREVIOUS run set — or none — so the operator is handed a
+    credential that does not work and no hint about where webadmin actually lives.
+    Found on dev-4 2026-09-21 when the operator could not open 8446 on a server
+    this console had just deployed for them.
+
+    The Authentik deploy already knows how to do this (it creates webadmin, adds it
+    to tak_ROLE_ADMIN and sets the password) — but the documented deploy order is
+    Authentik BEFORE TAK, so by the time the TAK deploy collects a webadmin
+    password there is nothing left to apply it.
+
+    Returns (ok, message). Never raises: a failure here must not fail a deploy that
+    is otherwise fine, but it MUST be said out loud rather than swallowed.
+    """
+    import urllib.request as _req
+    if log_fn is None:
+        log_fn = lambda m: None
+    try:
+        _s = load_settings()
+        ak_token = (_get_authentik_env_value(_s, 'AUTHENTIK_TOKEN')
+                    or _get_authentik_env_value(_s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not ak_token:
+            return False, 'no Authentik API token on this box'
+        url = _get_authentik_api_url(_s)
+        headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+        req = _req.Request(f'{url}/api/v3/core/users/?username=webadmin', headers=headers)
+        results = json.loads(_req.urlopen(req, timeout=15).read().decode()).get('results') or []
+        if not results:
+            return False, ('no `webadmin` user exists in Authentik — create one and put it in '
+                           'tak_ROLE_ADMIN, or deploy Authentik with a webadmin password')
+        uid = results[0]['pk']
+
+        req = _req.Request(f'{url}/api/v3/core/users/{uid}/set_password/',
+                           data=json.dumps({'password': webadmin_pass}).encode(),
+                           headers=headers, method='POST')
+        _req.urlopen(req, timeout=15)
+
+        groups = [g.get('name', '') for g in (results[0].get('groups_obj') or [])]
+        if not any(g == 'tak_ROLE_ADMIN' for g in groups):
+            return True, ('password set, but webadmin is NOT in tak_ROLE_ADMIN '
+                          f'(groups: {", ".join(groups) or "none"}) — it will not have admin '
+                          'rights on 8446 until it is')
+        return True, 'password set in Authentik; webadmin is in tak_ROLE_ADMIN'
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def _remove_webadmin_from_userauth():
     """Remove webadmin entry from UserAuthenticationFile.xml so flat-file can't shadow LDAP auth.
     Uses XML parsing to avoid producing malformed XML that crashes TAK Server's FileAuthenticator."""
@@ -72564,8 +72618,15 @@ def _deploy_takserver_container(config):
         authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(_s_wa))
         if webadmin_pass:
             if authentik_for_webadmin:
-                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file; avoids 8446 WebTAK shadow).")
+                log_step("Authentik detected — webadmin lives in Authentik/LDAP, not the flat file "
+                         "(a flat-file copy would shadow it on 8446).")
                 _remove_webadmin_from_userauth()
+                _wa_ok, _wa_msg = _ak_apply_webadmin_password(webadmin_pass, log_step)
+                if _wa_ok:
+                    log_step(f"  ✓ webadmin: {_wa_msg}")
+                else:
+                    log_step(f"  ⚠ The webadmin password you entered was NOT applied: {_wa_msg}. "
+                             f"Sign in to 8446 with an Authentik account that is in tak_ROLE_ADMIN.")
             else:
                 log_step("Creating webadmin user (flat-file)...")
                 run_cmd(_tak_exec(f'java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin') + ' 2>&1', check=False)
@@ -73502,8 +73563,15 @@ def run_takserver_deploy(config):
         authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(settings_for_ak))
         if webadmin_pass:
             if authentik_for_webadmin:
-                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file UserManager; avoids 8446 shadowing).")
+                log_step("Authentik detected — webadmin lives in Authentik/LDAP, not the flat file "
+                         "(a flat-file copy would shadow it on 8446).")
                 _remove_webadmin_from_userauth()
+                _wa_ok, _wa_msg = _ak_apply_webadmin_password(webadmin_pass, log_step)
+                if _wa_ok:
+                    log_step(f"  ✓ webadmin: {_wa_msg}")
+                else:
+                    log_step(f"  ⚠ The webadmin password you entered was NOT applied: {_wa_msg}. "
+                             f"Sign in to 8446 with an Authentik account that is in tak_ROLE_ADMIN.")
             else:
                 # v0.9.12: shlex.quote the password so any future operator-supplied
                 # value with shell metacharacters is safely literalized instead of
