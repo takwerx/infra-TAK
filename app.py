@@ -14993,7 +14993,7 @@ def _psql_client_bin():
     return w
 
 
-_PSQL_CLIENT_INSTALL = {'ts': 0.0}
+_PSQL_CLIENT_INSTALL = {'ts': 0.0, 'lock': threading.Lock()}
 
 
 def _ensure_psql_client(log_fn=None, timeout=180):
@@ -15005,28 +15005,46 @@ def _ensure_psql_client(log_fn=None, timeout=180):
     Server is a JVM; the database is on Server One), so the Client Feed answered
     "no PostgreSQL client on this box" for a database that was up the whole time.
     Installs through the apt↔dnf shim (postgresql-client on Debian/Ubuntu, postgresql
-    on RHEL/Rocky — both resolve to a real versioned psql the resolver prefers), at
-    most once per 10 minutes so a broken repo cannot turn every channel read into a
-    package run. Returns the binary path or ''."""
+    on RHEL/Rocky — both resolve to a real versioned psql the resolver prefers).
+
+    Concurrency: detect_modules() reaches this from background pollers as well as
+    from request threads, so two callers can want the install at once. The lock makes
+    the second one WAIT for the first's apt run and then find the binary, instead of
+    reporting "could not be installed" two seconds into an install that succeeded
+    (test8 validation, 2026-09-21). A FAILED attempt is not retried for 10 minutes so
+    a broken repo cannot turn every channel read into a package run.
+    Returns the binary path or ''."""
     psql = _psql_client_bin()
     if psql:
         return psql
-    now = time.time()
-    if now - _PSQL_CLIENT_INSTALL['ts'] < 600:
+    lk = _PSQL_CLIENT_INSTALL['lock']
+    if not lk.acquire(timeout=timeout):
         return ''
-    _PSQL_CLIENT_INSTALL['ts'] = now
-    pkg = 'postgresql' if _pkg_mgr() == 'dnf' else 'postgresql-client'
-    if log_fn:
-        log_fn(f"  No PostgreSQL client on this box — installing {pkg} (a remote cot database needs one)…")
-    ok, out = _pkg_install(pkg, log_fn=log_fn, timeout=timeout)
-    psql = _psql_client_bin()
-    msg = (f"  ✓ PostgreSQL client installed: {psql}" if psql
-           else f"  ✗ Could not install {pkg}: {(out or '').strip()[-300:]}")
-    if log_fn:
-        log_fn(msg)
-    else:
-        print(f"_ensure_psql_client: {msg.strip()}", flush=True)
-    return psql
+    try:
+        psql = _psql_client_bin()
+        if psql:
+            return psql
+        now = time.time()
+        if now - _PSQL_CLIENT_INSTALL['ts'] < 600:
+            if log_fn:
+                log_fn("  PostgreSQL client install failed less than 10 minutes ago — not retrying yet")
+            return ''
+        pkg = 'postgresql' if _pkg_mgr() == 'dnf' else 'postgresql-client'
+        if log_fn:
+            log_fn(f"  No PostgreSQL client on this box — installing {pkg} (a remote cot database needs one)…")
+        ok, out = _pkg_install(pkg, log_fn=log_fn, timeout=timeout)
+        psql = _psql_client_bin()
+        if not psql:
+            _PSQL_CLIENT_INSTALL['ts'] = now
+        msg = (f"  ✓ PostgreSQL client installed: {psql}" if psql
+               else f"  ✗ Could not install {pkg}: {(out or '').strip()[-300:]}")
+        if log_fn:
+            log_fn(msg)
+        else:
+            print(f"_ensure_psql_client: {msg.strip()}", flush=True)
+        return psql
+    finally:
+        lk.release()
 
 
 _COT_CONN_CACHE = {'ts': 0.0, 'val': None}
