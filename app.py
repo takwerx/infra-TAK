@@ -72941,8 +72941,46 @@ def run_takserver_deploy(config):
                 log_step("  /opt/tak missing after install — forcing reinstall from .deb...")
                 run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y --allow-downgrades {pkg} 2>&1', check=False)
                 run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
-            if not os.path.exists('/opt/tak'):
-                log_step("✗ FATAL: /opt/tak not found after install (even after forced reinstall) — run `dpkg --purge --force-all takserver && rm -rf /opt/tak` on the host and retry")
+            # Verify the PACKAGE installed, not merely that /opt/tak exists.
+            #
+            # An empty root-owned /opt/tak satisfies os.path.exists() and is exactly
+            # what a FAILED unpack leaves behind, so this guard passed over a dpkg
+            # error and the deploy went on to print "✓ TAK Server installed", then
+            # "✓ All certificates created" against a directory with no certs in it.
+            # Measured on dev-4 2026-09-21. A customer would have read a fully green
+            # deploy off a server that had never installed.
+            _pkg_state = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True).stdout.strip()
+            _tak_installed = ('install ok installed' in _pkg_state
+                              and os.path.exists('/opt/tak/CoreConfig.example.xml'))
+            if not _tak_installed:
+                # Name the cause when we can. Converting a split-box (two-server) box
+                # back to single-server leaves takserver-core / takserver-database
+                # registered, and the combined package then cannot unpack:
+                #   trying to overwrite '/opt/tak/TAKServer.bat', which is also in
+                #   package takserver-core 5.8-RELEASE75
+                # Purging `takserver` alone does not clear that — which is precisely
+                # the wrong thing the old FATAL message told the operator to do.
+                _conflicts = []
+                for _p in ('takserver-core', 'takserver-database'):
+                    _st = subprocess.run(
+                        "dpkg-query -W -f='${Status} ${Version}' " + _p + " 2>/dev/null",
+                        shell=True, capture_output=True, text=True).stdout.strip()
+                    if 'install ok installed' in _st:
+                        _conflicts.append(f'{_p} {_st.split()[-1]}')
+                if _conflicts:
+                    log_step("✗ FATAL: TAK Server did not install — %s still registered, and the "
+                             "combined package cannot overwrite files owned by it. This box was "
+                             "previously a two-server (split) install. Remove the split packages "
+                             "first: `sudo dpkg --purge --force-all %s` then retry."
+                             % (' and '.join(_conflicts),
+                                ' '.join(c.split()[0] for c in _conflicts)))
+                else:
+                    log_step("✗ FATAL: TAK Server did not install (dpkg state: %r, /opt/tak "
+                             "contents missing). Check the apt/dpkg output above — run "
+                             "`sudo dpkg --purge --force-all takserver && sudo rm -rf /opt/tak` "
+                             "and retry." % (_pkg_state or 'not registered'))
                 deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
 
@@ -73089,16 +73127,38 @@ def run_takserver_deploy(config):
             except Exception as e:
                 log_step(f"  ✗ {e}")
                 return False
-        _tak_cert(['/opt/tak/certs/makeRootCa.sh'], inp=f'{root_ca}\n', desc=f"Creating Root CA: {root_ca}...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'ca', int_ca], inp='y\n', desc=f"Creating Intermediate CA: {int_ca}...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], desc="Creating server certificate...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'admin'], desc="Creating admin certificate...")
-        _tak_cert(['/opt/tak/certs/makeCert.sh', 'client', 'user'], desc="Creating user certificate...")
+        # Every one of these returned a bool that every caller threw away, and the
+        # "✓ All certificates created" below printed unconditionally. Measured on
+        # dev-4 2026-09-21: with /opt/tak/certs absent, each step logged
+        # "✗ [Errno 2] No such file or directory: '/opt/tak/certs'" and the deploy
+        # still reported all certificates created AND the truststore imported. A
+        # TAK Server with no certificates cannot serve a single client, so this is
+        # not a warning — it ends the deploy.
+        _cert_steps = [
+            ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
+            ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
+            ("server cert", ['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], None, "Creating server certificate..."),
+            ("admin cert", ['/opt/tak/certs/makeCert.sh', 'client', 'admin'], None, "Creating admin certificate..."),
+            ("user cert", ['/opt/tak/certs/makeCert.sh', 'client', 'user'], None, "Creating user certificate..."),
+        ]
+        _cert_failed = [name for name, argv, inp, desc in _cert_steps
+                        if not _tak_cert(argv, inp=inp, desc=desc)]
+        if _cert_failed:
+            log_step("✗ FATAL: certificate generation failed (%s). TAK Server cannot serve any "
+                     "client without these, so the deploy stops here rather than reporting "
+                     "success over a server nothing can connect to. See the errors above."
+                     % ', '.join(_cert_failed))
+            run_cmd('systemctl stop takserver', check=False)
+            deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
         log_step("Importing root CA into TAK clients truststore...")
-        _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
-                   '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
-                   '-storepass', cert_pass, '-noprompt'])
+        if not _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
+                          '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
+                          '-storepass', cert_pass, '-noprompt']):
+            log_step("✗ FATAL: could not import the root CA into the clients truststore — enrolled "
+                     "clients would not trust this server. See the errors above.")
+            run_cmd('systemctl stop takserver', check=False)
+            deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
