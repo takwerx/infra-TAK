@@ -67696,6 +67696,16 @@ def _tak_58_preflight():
     facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
     facts['avail_human'] = _cotdb_fmt_bytes(facts.get('avail_bytes') or 0)
     facts['need_human'] = _cotdb_fmt_bytes(facts.get('need_bytes') or 0)
+    # The cot_router facts are only gathered for a LOCAL cluster (step 5 above is
+    # gated on `mode == 'local'`), so a container / remote / managed box reached this
+    # return with the keys ABSENT, not None. Jinja renders a missing key as Undefined,
+    # `Undefined is not none` is TRUE, and the card's `'{:,}'.format(...)` then raised
+    # `unsupported format string passed to Undefined.__format__` — a 500 on the whole
+    # TAK Server page for every containerised 5.7 box, i.e. the exact machines that
+    # need the page to upgrade (measured on aws-arm, plain 5.7 container, 2026-09-22).
+    # Establish the keys unconditionally; the template also guards with `is defined`.
+    facts.setdefault('cot_router_rows', None)
+    facts.setdefault('cot_router_id_type', None)
     return {'ready': not blockers, 'blockers': blockers, 'warnings': warnings, 'facts': facts}
 
 
