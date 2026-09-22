@@ -391,6 +391,20 @@ PATH_ALLOW = (
                                  # netplan YAML (additive AP add, validate-before-apply).
                                  # Root-owned dir; console cannot symlink-plant here.
     '/opt/tak/',
+    # PostgreSQL cluster data directories, both families. The console ALREADY
+    # creates, upgrades, dumps and destroys these as root through this broker —
+    # initdb, pg_upgrade, pg_dump and the uninstall's DROP DATABASE all go through
+    # here — so this grants no destructive power it does not already have. What it
+    # fixes is the console being able to build a cluster but not clean up its own
+    # FAILED attempt: a 5.8 migration that aborts part-way leaves
+    # /var/lib/pgsql/<new>/data behind, every retry then dies on "New cluster
+    # database cot is not empty", and the recovery the console prints ("run Update
+    # again") can never succeed. On a born-non-root box the operator has no shell
+    # route either, so the box is stuck with no way out through the product.
+    # Measured on nuc, 2026-09-21. Same dead end exists on Debian; it was simply
+    # never hit there because that migration did not fail.
+    '/var/lib/pgsql/',
+    '/var/lib/postgresql/',
     '/opt/tak-guarddog/',
     TAK_BUNDLE_DIR + '/',        # console-owned TAK docker bundle (ln source for /opt/tak)
     '/usr/local/etc/',

@@ -68534,6 +68534,38 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             # because the new major is installed BY this migration and its lib dir is
             # legitimately incomplete until then (that mistake produced 88 false
             # positives and blocked a healthy box before this replaced it).
+            # A target-major cluster left over from a FAILED earlier attempt makes every
+            # retry impossible: pg_upgrade refuses with "New cluster database cot is not
+            # empty", and the recovery this console prints ("run Update again") can then
+            # never succeed. Measured on nuc 2026-09-21 after the pg_repack failure.
+            #
+            # Safe to clear ONLY when all three hold, which together mean it cannot be
+            # anyone's live data:
+            #   * the live database is still on the OLD major (the real data is there),
+            #   * the target-major cluster is NOT serving,
+            #   * we are mid-migration.
+            # Move it aside rather than delete it, so a wrong call stays recoverable.
+            _new_data = ('/var/lib/pgsql/%d/data' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
+                else ('/var/lib/postgresql/%d/main' % TAK_PG_MAJOR)
+            _new_svc = ('postgresql-%d' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
+                else ('postgresql@%d-main' % TAK_PG_MAJOR)
+            _new_serving = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _new_svc]),
+                                          capture_output=True, text=True,
+                                          timeout=30).stdout.strip() == 'active'
+            _new_exists = subprocess.run(_sudo_wrap(['test', '-d', _new_data]),
+                                         capture_output=True, timeout=30).returncode == 0
+            if _new_exists and not _new_serving and running_major and running_major != TAK_PG_MAJOR:
+                _stale = '%s.failed-%s' % (_new_data, time.strftime('%Y%m%d-%H%M%S'))
+                _say('  A PostgreSQL %d data directory already exists from an earlier failed '
+                     'attempt, and the live database is still on %d. pg_upgrade cannot write '
+                     'into it, so moving it aside to %s…' % (TAK_PG_MAJOR, running_major, _stale))
+                _mv = subprocess.run(_sudo_wrap(['mv', _new_data, _stale]),
+                                     capture_output=True, text=True, timeout=120)
+                if _mv.returncode == 0:
+                    _say('  \u2713 Previous attempt moved aside (delete it once you are satisfied)')
+                else:
+                    _say('  \u26a0 Could not move it: %s' % ((_mv.stderr or '').strip()[:200]))
+
             _is_rhel = _distro_family() == 'rhel'
             _rp_installed = subprocess.run(
                 ("rpm -qa 2>/dev/null | grep -q '^pg_repack_'" if _is_rhel
