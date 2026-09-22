@@ -350,6 +350,17 @@ function takPurgeFailed(){
 </details>
 <div style="font-size:12px;margin-top:10px"><a href="https://github.com/takwerx/infra-TAK/blob/main/docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Full step-by-step guide &#8599;</a></div>
 </div>
+{% elif tak58.facts.two_server %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8 on a two-server deployment</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">5.8 requires <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong>. This server's database is on <strong>Server One ({{ tak58.facts.server_one_host }})</strong>, and the console migrates it there over SSH.</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-top:10px">
+<strong style="color:var(--text-primary)">Two uploads, one click:</strong><br>
+1. Upload the 5.8 <strong>takserver-core</strong> package for this server below.<br>
+2. Upload the 5.8 <strong>takserver-database</strong> package for Server One in the two-server panel on this page &mdash; it must match Server One's OS family, not this server's.<br>
+3. Click <strong>Update</strong>. The console checks Server One's PostgreSQL version and free disk, takes a backup it proves readable, runs TAK's migration there, then verifies PostgreSQL {{ tak58.facts.pg_target_major }} is serving with the schema applied and no rows lost. Measured: 498&nbsp;s end to end on an 11,000-row database; larger databases take longer.
+</div>
+</div>
 {% elif tak58.blockers %}
 <div style="border-left:3px solid var(--red);background:rgba(239,68,68,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
 <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:4px">TAK Server 5.8 cannot be installed on this server yet</div>

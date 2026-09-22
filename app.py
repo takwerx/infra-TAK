@@ -67522,10 +67522,33 @@ def _tak_58_preflight():
                     'schema change is not something this console can roll back for you.'
                     % (db_host or 'remote host', _mm))
         else:
-            blockers.append(
-                'The CoT database is on a separate server (%s). The 5.8 migration has to run '
-                'on that host, and driving a two-server migration from here is not supported '
-                'in this release.' % (db_host or 'unknown'))
+            # W9 (2026-09-04) made the two-server migration real: Update drives it on Server
+            # One over SSH. This branch kept refusing it — "not supported in this release" —
+            # so a split-box operator read a red card above a button that would have run it
+            # (test8, v10.2.0 T&E 2026-09-21). A two-server box with a Server One host is a
+            # WARNING with instructions; only a remote database the console does not manage
+            # is a blocker. Server One's own major, disk and backup are checked when the
+            # migration starts (run_takserver_58_two_server_migration), not here.
+            try:
+                _s1_host = (((_get_tak_deployment_config(load_settings()) or {})
+                             .get('server_one') or {}).get('host') or '').strip()
+            except Exception:
+                _s1_host = ''
+            if _dep_mode == 'two_server' and _s1_host:
+                facts['two_server'] = True
+                facts['server_one_host'] = _s1_host
+                warnings.append(
+                    'The CoT database is on Server One (%s). Update migrates it there over SSH: '
+                    'upload the 5.8 takserver-core package for this host AND the 5.8 '
+                    'takserver-database package for Server One, then click Update. Server '
+                    "One's PostgreSQL version, free disk and backup are checked when the "
+                    'migration starts.' % _s1_host)
+            else:
+                blockers.append(
+                    'The CoT database is on a separate server (%s) that this console does not '
+                    'manage — no Server One is configured for it. The 5.8 migration has to run '
+                    'on that host: configure it as Server One (two-server deployment) or '
+                    'migrate it there by hand.' % (db_host or 'unknown'))
 
     # 2. Which major is actually serving, and is 15 present at all?
     #    upgrade-db.sh exits 1 with "Upgrade will be skipped" if no 15 cluster exists.
