@@ -317,7 +317,8 @@ function takPurgeFailed(){
 <p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">AWS RDS</p>
 <ol style="margin:0 0 12px;padding-left:18px">
 <li style="margin-bottom:6px">Take a snapshot. The 5.8 schema change is not one this console can roll back for you.</li>
-<li style="margin-bottom:6px">Your instance &rarr; <strong>Modify</strong> &rarr; <strong>DB engine version</strong> &rarr; pick an <strong>18.x</strong> release &rarr; Continue.</li>
+<li style="margin-bottom:6px">AWS Console &rarr; search <strong>RDS</strong> &rarr; <strong>Databases</strong> &rarr; click your instance. Check the region selector top-right is the region it lives in, or it will not be listed.</li>
+<li style="margin-bottom:6px"><strong>Modify</strong> (top right) &rarr; <strong>DB engine version</strong> &rarr; pick an <strong>18.x</strong> release &rarr; <strong>Continue</strong>.</li>
 <li style="margin-bottom:6px">On the summary page set <strong>Scheduling of modifications</strong> to <strong>Apply immediately</strong>.
 <div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Apply during the next maintenance window</em>. Leave it there and nothing happens now &mdash; which looks exactly like the upgrade failing.</div></li>
 </ol>
@@ -325,12 +326,14 @@ function takPurgeFailed(){
 <p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">Azure Database for PostgreSQL Flexible Server</p>
 <ol style="margin:0 0 10px;padding-left:18px">
 <li style="margin-bottom:6px">Take a snapshot / backup first, same reason.</li>
-<li style="margin-bottom:6px">Your server &rarr; <strong>Settings &rarr; Server parameters</strong> &rarr; search <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">azure.extensions</code> and set it to exactly:</li>
+<li style="margin-bottom:6px">Azure Portal &rarr; search for <strong>Azure Database for PostgreSQL flexible servers</strong> &rarr; click your server.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; Not <em>Azure SQL</em> &mdash; that is Microsoft SQL Server and is a different product entirely. The one you want has &ldquo;PostgreSQL&rdquo; in the name.</div></li>
+<li style="margin-bottom:6px"><strong>Settings &rarr; Server parameters</strong> &rarr; search <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">azure.extensions</code> &rarr; set it to exactly this, then <strong>Save</strong>:</li>
 </ol>
 <div style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--green);margin:0 0 10px 18px;word-break:break-all">FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO</div>
 <div style="margin:0 0 10px 18px;font-size:11px;color:var(--text-dim)">TAK's schema tool <strong>drops</strong> fuzzystrmatch and postgis_topology before it builds the schema, and Azure refuses a DROP naming an extension that is not allow-listed &mdash; even one that is not installed. Without these the upgrade fails with no schema built.</div>
 <ol start="3" style="margin:0 0 12px;padding-left:18px">
-<li style="margin-bottom:6px">Your server &rarr; <strong>Overview &rarr; Upgrade</strong> &rarr; choose <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong>.</li>
+<li style="margin-bottom:6px">Back on the same server &rarr; <strong>Overview</strong> &rarr; <strong>Upgrade</strong> on the top toolbar &rarr; set <em>PostgreSQL version to upgrade</em> to <strong>{{ tak58.facts.pg_target_major }}</strong>.</li>
 <li style="margin-bottom:6px">Set <strong>Action</strong> to <strong>Validate and upgrade</strong>.
 <div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Validate only</em>, which runs the checks, reports success, and leaves your server on {{ tak58.facts.pg_running_major }}.</div></li>
 </ol>
