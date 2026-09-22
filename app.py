@@ -67527,65 +67527,6 @@ def _tak_58_preflight():
             facts['pk_rewrite_expected'] = False
             facts['cot_router_id_stays_integer'] = False
 
-    # 5b. Every loadable library the OLD cluster uses must exist for the NEW major,
-    #     or pg_upgrade aborts — AFTER we have stopped TAK and started the migration.
-    #
-    #     Measured on nuc (Rocky 9.8) 2026-09-21, in the operator's own browser:
-    #
-    #       Checking for presence of required libraries                   fatal
-    #       Your installation references loadable libraries that are missing from
-    #       the new installation.
-    #       Database upgrade failed. Stopping to prevent data loss
-    #       *** THIS SERVER IS MID-UPGRADE AND TAK IS NOT RUNNING. ***
-    #
-    #     The missing library was pg_repack.so — and WE are the ones who put it
-    #     there. scripts/guarddog/tak-db-repack.sh installs pg_repack_<major> /
-    #     postgresql-<major>-repack when Guard Dog's weekly online repack runs, so
-    #     the old cluster references it, and the 5.8 migration installs PostgreSQL
-    #     and PostGIS for the new major but never pg_repack. Any box whose repack
-    #     timer has ever fired cannot migrate — and finds out only once TAK is down.
-    #
-    #     This is cheap to know BEFOREHAND: compare the two majors' lib directories.
-    #     A blocker here costs an operator nothing; the same fact discovered later
-    #     costs them a dead server and a page of vendor output.
-    if not facts.get('external_db') and facts.get('db_mode') != 'remote' and running_major:
-        _old_lib = None
-        _new_lib = None
-        for _tmpl in ('/usr/pgsql-{m}/lib', '/usr/lib/postgresql/{m}/lib'):
-            _o = _tmpl.format(m=running_major)
-            _n = _tmpl.format(m=TAK_PG_MAJOR)
-            if os.path.isdir(_o):
-                _old_lib, _new_lib = _o, _n
-                break
-        if _old_lib and os.path.isdir(_new_lib):
-            try:
-                _o_set = {f for f in os.listdir(_old_lib) if f.endswith('.so')}
-                _n_set = {f for f in os.listdir(_new_lib) if f.endswith('.so')}
-                # Only the ones an EXTENSION could plausibly pull in. adminpack,
-                # old_snapshot and libecpg were dropped by PostgreSQL itself and are
-                # not extensions the cot database carries — flagging them would be a
-                # false alarm on every single box.
-                _ignore = {'adminpack.so', 'libecpg.so', 'libecpg_compat.so',
-                           'libpgtypes.so', 'old_snapshot.so'}
-                _missing = sorted((_o_set - _n_set) - _ignore)
-                facts['missing_pg_libs'] = _missing
-                if _missing:
-                    _pkg_hint = ('pg_repack_%d' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
-                        else ('postgresql-%d-repack' % TAK_PG_MAJOR)
-                    _names = ', '.join(_missing)
-                    blockers.append(
-                        'PostgreSQL %d is missing libraries that this server\'s PostgreSQL %s '
-                        'cluster uses: %s. pg_upgrade refuses to migrate without them, and it '
-                        'refuses AFTER TAK Server has been stopped. Install the PostgreSQL %d '
-                        'build of each one first — for pg_repack (installed by Guard Dog\'s '
-                        'weekly online repack) that is `%s` — then run this again.'
-                        % (TAK_PG_MAJOR, running_major, _names, TAK_PG_MAJOR, _pkg_hint))
-            except Exception:
-                warnings.append('Could not compare PostgreSQL %s and %d extension libraries — '
-                                'if pg_upgrade later reports missing loadable libraries, install '
-                                'the PostgreSQL %d build of the named packages and retry.'
-                                % (running_major, TAK_PG_MAJOR, TAK_PG_MAJOR))
-
     facts['pg_target_major'] = TAK_PG_MAJOR
     # Pre-formatted for the template — Jinja should not be doing byte math.
     facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
@@ -68576,6 +68517,41 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             if not os.path.exists(_TAK58_UPGRADE_DB_SH):
                 return fail('The 5.8 package did not provide %s — cannot migrate the database.'
                             % _TAK58_UPGRADE_DB_SH, wedged=True)
+
+            # pg_upgrade aborts if the OLD cluster references a loadable library the
+            # NEW major does not have — and it aborts AFTER TAK has been stopped.
+            # The one that bites us is our own: scripts/guarddog/tak-db-repack.sh
+            # installs pg_repack_<major> / postgresql-<major>-repack when Guard Dog's
+            # weekly online repack runs, so the old cluster carries pg_repack.so and
+            # nothing installs the new major's build. Measured on nuc (Rocky 9.8),
+            # 2026-09-21: "Checking for presence of required libraries  fatal",
+            # migration dead, TAK down, on a box whose only sin was running the
+            # maintenance job we ship.
+            #
+            # We installed it, so we install its counterpart — this is not something
+            # to hand back to the operator as a blocker. Narrowly scoped to pg_repack
+            # on purpose: a generic "diff the two lib directories" check is WRONG,
+            # because the new major is installed BY this migration and its lib dir is
+            # legitimately incomplete until then (that mistake produced 88 false
+            # positives and blocked a healthy box before this replaced it).
+            _is_rhel = _distro_family() == 'rhel'
+            _rp_installed = subprocess.run(
+                ("rpm -qa 2>/dev/null | grep -q '^pg_repack_'" if _is_rhel
+                 else "dpkg -l 2>/dev/null | grep -q 'postgresql-[0-9]*-repack'"),
+                shell=True, capture_output=True).returncode == 0
+            if _rp_installed:
+                _rp_new = ('pg_repack_%d' % TAK_PG_MAJOR) if _is_rhel \
+                    else ('postgresql-%d-repack' % TAK_PG_MAJOR)
+                _say('  pg_repack is installed for the old cluster (Guard Dog online repack) — '
+                     'installing %s so pg_upgrade can load it...' % _rp_new)
+                _ok_rp, _out_rp = _pkg_install(_rp_new, timeout=600)
+                if _ok_rp:
+                    _say('  ✓ %s installed' % _rp_new)
+                else:
+                    _say('  ⚠ Could not install %s: %s. pg_upgrade will refuse if the old '
+                         'cluster uses pg_repack — install it by hand and run Update again.'
+                         % (_rp_new, (_out_rp or '')[:160]))
+
             rc = _tak58_run_upgrade_db(log=_log)
             # The script has no shebang and uses bashisms, so under dash it emits
             # stderr noise (`[: ==: unexpected operator`, `wc: unrecognized option`)
