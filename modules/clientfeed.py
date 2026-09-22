@@ -807,6 +807,16 @@ def deploy(ctx, job, params):
         if not os.path.isdir('/opt/tak') and not os.path.exists('/opt/tak'):
             plog('⚠ TAK Server not detected on this host — the feed will return '
                  'no features until TAK Server is installed.')
+        # v10.1.85: a split / managed-DB console has no local postgres and, unless
+        # something unrelated installed one, no psql client either (NC TAK, 2026-09-21).
+        # Put it on the box here, in the deploy log, instead of failing at the first mint.
+        try:
+            if ctx['_tak_db_topology']()[0] == 'remote':
+                if not ctx['_ensure_psql_client'](log_fn=plog, timeout=600):
+                    plog('   ⚠ remote cot database and no PostgreSQL client could be installed — '
+                         'channels will not resolve until one is present')
+        except Exception as e:
+            plog('   ⚠ psql client check failed: %s' % str(e)[:160])
         r = ctx['_cot_pg_exec'](['psql', 'cot', '-tAc', 'SELECT count(*) FROM groups'], timeout=10)
         if r.returncode == 0:
             plog('   ✓ cot DB reachable — %s channels visible' % (r.stdout or '').strip())

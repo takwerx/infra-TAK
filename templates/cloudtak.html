@@ -367,11 +367,15 @@
   <!-- Deploy log (single card: shown when deploying or after error) -->
   <div id="log-card" class="card" style="display:{% if deploying or deploy_error %}block{% else %}none{% endif %}">
     <div class="card-title">Deploy Log</div>
-    {% if deploy_error %}
+    {% if deploy_error and not cloudtak.installed %}
     <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="document.getElementById('uninstall-modal').classList.add('open')" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
+    {% elif deploy_error %}
+    {# v10.1.85: never offer the wipe on an installed module — a failed Update opened the real uninstall (PWC, 2026-09-21) #}
+    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Failed.</strong> See the log above for the cause. Nothing was removed &mdash; CloudTAK's containers and data were left in place, and if it was running before it still is.</div>
     {% endif %}
     <div class="log-box" id="deploy-log-dyn">{% if deploy_error %}Deployment failed. See log above.{% else %}Waiting...{% endif %}</div>
   </div>
+<script>window.MOD_INSTALLED={{ 'true' if cloudtak.installed else 'false' }};</script>
   {% if deploy_error %}
   <script>(function(){ var btn = document.getElementById("deploy-btn"); if(btn){ btn.disabled = false; btn.textContent = "✗ Deployment failed — Retry"; btn.style.background = "var(--red)"; btn.style.opacity = "1"; btn.onclick = function(){ btn.textContent = "🚀 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); }; } })();</script>
   {% endif %}
@@ -394,7 +398,8 @@
 <div class="modal-overlay" id="uninstall-modal">
   <div class="modal">
     <h3>&#x26a0; Uninstall CloudTAK?</h3>
-    <p>This will stop and remove all CloudTAK Docker containers, volumes, and the ~/CloudTAK directory. This cannot be undone.</p>
+    <p>This stops and removes all CloudTAK containers and the ~/CloudTAK directory, <strong>including CloudTAK's data</strong>: the PostGIS database (users, overlays, basemaps, iconsets, channels, video leases) and every uploaded file (imports, profile files). TAK Server missions and Data Syncs are not affected. This cannot be undone.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-top:6px">If an <em>Update</em> just failed, do not use this &mdash; CloudTAK is still running on the previous build. Fix the cause in the log and run Update again.</p>
     <div class="form-group">
       <label class="form-label">Admin Password</label>
       <input class="form-input" id="uninstall-password" type="password" placeholder="Confirm your password">

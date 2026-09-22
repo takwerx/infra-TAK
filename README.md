@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.84-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.84-alpha)**
+**Current release: [v10.1.85-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.85-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,12 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.85-alpha — 2026-09-22 — CloudTAK: a failed update can no longer offer to remove a working install; TAK Client Feed works on split deployments out of the box
+
+**Headline: after a CloudTAK update failed part-way (a transient GitHub error during the image build), the CloudTAK page showed the first-install banner "Deployment failed — Remove failed install". That button is the real uninstall. Pressed on a running deployment it removed the containers, the install directory and, with them, uploaded files and the database's normal home.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.85-alpha)) The banner was only ever meant for a first install that never came up, but nothing restricted it to that case, and the same pattern existed on six other module pages. In this release the removal offer appears only when the module is not installed; on an installed module a failed update or reconfigure says plainly that nothing was removed and the previous build is still running. A failed CloudTAK build now also puts the checkout back on the commit it was on, so the working tree and the running images agree again and a plain "Update" retries cleanly. The uninstall dialog now states in words that it deletes the CloudTAK database and every uploaded file, and that a failed update is not a reason to use it. Separately, the TAK Client Feed reported "no PostgreSQL client on this box" on deployments whose TAK database lives on another machine or a managed service: the console now installs the client it needs, on Debian/Ubuntu and RHEL/Rocky alike, so channels resolve without any manual step. The Node-RED remote deploy also now says so when the console has no domain and therefore created no site or certificate.
+
+> **Upgrade note.** Nothing to do beyond updating. If a CloudTAK update ever fails, read the log and run Update again; do not use Remove. If your TAK Client Feed page shows "TAK DB unreachable" on a split deployment, open the module once after updating: the database client installs on its own within a minute.
 
 ### v10.1.84-alpha — 2026-09-20 — Custom certificates: ATLAS deploys, and the mode now takes effect on non-root installs
 
