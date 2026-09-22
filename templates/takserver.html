@@ -310,7 +310,42 @@ function takPurgeFailed(){
 2. Confirm TAK's database user can still sign in afterwards &mdash; a provider upgrade can leave the stored password in an older format, and the symptom is a server that looks healthy with its schema never migrated.<br>
 3. Come back here, upload the 5.8 package and click Update. This card turns green once {{ tak58.facts.pg_target_major }} is actually serving.
 </div>
-<div style="font-size:12px;margin-top:10px"><a href="https://github.com/takwerx/infra-TAK/blob/main/docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Step-by-step guide &#8599;</a></div>
+<details style="margin-top:12px;border:1px solid rgba(234,179,8,0.28);border-radius:8px;overflow:hidden">
+<summary style="padding:10px 14px;background:rgba(234,179,8,0.10);cursor:pointer;font-size:12px;color:var(--yellow);font-family:'JetBrains Mono',monospace;font-weight:600;list-style:none"><span style="font-size:14px">&#9729;</span> Exact steps in your provider's console &mdash; and the two defaults that silently do nothing</summary>
+<div style="padding:14px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">AWS RDS</p>
+<ol style="margin:0 0 12px;padding-left:18px">
+<li style="margin-bottom:6px">Take a snapshot. The 5.8 schema change is not one this console can roll back for you.</li>
+<li style="margin-bottom:6px">Your instance &rarr; <strong>Modify</strong> &rarr; <strong>DB engine version</strong> &rarr; pick an <strong>18.x</strong> release &rarr; Continue.</li>
+<li style="margin-bottom:6px">On the summary page set <strong>Scheduling of modifications</strong> to <strong>Apply immediately</strong>.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Apply during the next maintenance window</em>. Leave it there and nothing happens now &mdash; which looks exactly like the upgrade failing.</div></li>
+</ol>
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">Azure Database for PostgreSQL Flexible Server</p>
+<ol style="margin:0 0 10px;padding-left:18px">
+<li style="margin-bottom:6px">Take a snapshot / backup first, same reason.</li>
+<li style="margin-bottom:6px">Your server &rarr; <strong>Settings &rarr; Server parameters</strong> &rarr; search <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">azure.extensions</code> and set it to exactly:</li>
+</ol>
+<div style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--green);margin:0 0 10px 18px;word-break:break-all">FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO</div>
+<div style="margin:0 0 10px 18px;font-size:11px;color:var(--text-dim)">TAK's schema tool <strong>drops</strong> fuzzystrmatch and postgis_topology before it builds the schema, and Azure refuses a DROP naming an extension that is not allow-listed &mdash; even one that is not installed. Without these the upgrade fails with no schema built.</div>
+<ol start="3" style="margin:0 0 12px;padding-left:18px">
+<li style="margin-bottom:6px">Your server &rarr; <strong>Overview &rarr; Upgrade</strong> &rarr; choose <strong>PostgreSQL {{ tak58.facts.pg_target_major }}</strong>.</li>
+<li style="margin-bottom:6px">Set <strong>Action</strong> to <strong>Validate and upgrade</strong>.
+<div style="margin-top:4px;color:var(--yellow)">&#9888; It defaults to <em>Validate only</em>, which runs the checks, reports success, and leaves your server on {{ tak58.facts.pg_running_major }}.</div></li>
+</ol>
+
+<p style="margin:0 0 6px;color:var(--text-primary);font-weight:600">Either provider</p>
+<ul style="margin:0 0 10px;padding-left:18px">
+<li style="margin-bottom:6px"><strong>The instance goes offline.</strong> Measured on small databases: <strong>~3 minutes</strong> on RDS, <strong>~4&ndash;5 minutes</strong> on Azure after about 3 minutes of validation. A large database takes longer &mdash; treat these as a floor when you book the window.</li>
+<li style="margin-bottom:6px"><strong>PostGIS does not move the same way.</strong> Azure carries its version forward; RDS leaves yours as it was. TAK 5.8 works either way; run <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">ALTER EXTENSION postgis UPDATE;</code> afterwards if you want the newer one.</li>
+<li style="margin-bottom:6px">When it is back, click <strong>Test Connection</strong> above. TAK's database user must still sign in &mdash; on Azure it also confirms the extensions are allow-listed.</li>
+</ul>
+
+<p style="margin:0;font-size:11px;color:var(--text-dim)">Then upload the 5.8 package below and click Update. The console reads <code style="background:#0a0e1a;padding:1px 4px;border-radius:3px">schema_version</code> back off your instance afterwards and only reports success once it reaches {{ tak58.facts.pg_target_major }}&rsquo;s schema &mdash; it will not tell you it worked when it did not.</p>
+</div>
+</details>
+<div style="font-size:12px;margin-top:10px"><a href="https://github.com/takwerx/infra-TAK/blob/main/docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Full step-by-step guide &#8599;</a></div>
 </div>
 {% elif tak58.blockers %}
 <div style="border-left:3px solid var(--red);background:rgba(239,68,68,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
