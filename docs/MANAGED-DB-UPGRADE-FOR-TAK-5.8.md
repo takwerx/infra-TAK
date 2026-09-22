@@ -124,6 +124,22 @@ The console checks this for you: **Test Connection** reports *Azure extensions a
 **Provision Database** refuses with the exact missing names rather than letting the deploy fail
 later.
 
+### How long the engine upgrade takes
+
+Measured end to end, on small databases, 2026-09-19/20:
+
+| provider | endpoint unreachable for | notes |
+|---|---|---|
+| **AWS RDS** (15.19 → 18.6, db.m7g.large) | **~3 minutes** | the Modify runs as soon as you pick "Apply immediately" |
+| **Azure Flexible Server** (15.19 → 18.6, D2ds_v5) | **~4–5 minutes**, after ~3 minutes of validation | "Validate and upgrade" validates first, then restarts the server |
+
+These are measured runs on databases of a few hundred MB, not estimates, and **a large
+database will take longer** — the provider is doing the work, not us, and neither publishes a
+formula. Treat these as the floor when you plan the window, not the expectation.
+
+**TAK Server is down for the whole of it**, plus however long the 5.8 install and schema update
+take afterwards. That is one outage, scheduled by you, in two parts.
+
 ### Either way
 
 **PostGIS matters.** TAK's schema uses it. Confirm your upgraded instance has a PostGIS version
