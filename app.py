@@ -68549,16 +68549,20 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
                 else ('/var/lib/postgresql/%d/main' % TAK_PG_MAJOR)
             _new_svc = ('postgresql-%d' % TAK_PG_MAJOR) if _distro_family() == 'rhel' \
                 else ('postgresql@%d-main' % TAK_PG_MAJOR)
+            # NB: running_major is a local of _tak_58_preflight(), NOT of this function —
+            # referencing it here raised NameError and wedged a migration mid-run on nuc,
+            # 2026-09-21. The value is already in the pre-flight result computed above.
+            _live_major = (pf.get('facts') or {}).get('pg_running_major')
             _new_serving = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _new_svc]),
                                           capture_output=True, text=True,
                                           timeout=30).stdout.strip() == 'active'
             _new_exists = subprocess.run(_sudo_wrap(['test', '-d', _new_data]),
                                          capture_output=True, timeout=30).returncode == 0
-            if _new_exists and not _new_serving and running_major and running_major != TAK_PG_MAJOR:
+            if _new_exists and not _new_serving and _live_major and _live_major != TAK_PG_MAJOR:
                 _stale = '%s.failed-%s' % (_new_data, time.strftime('%Y%m%d-%H%M%S'))
                 _say('  A PostgreSQL %d data directory already exists from an earlier failed '
                      'attempt, and the live database is still on %d. pg_upgrade cannot write '
-                     'into it, so moving it aside to %s…' % (TAK_PG_MAJOR, running_major, _stale))
+                     'into it, so moving it aside to %s…' % (TAK_PG_MAJOR, _live_major, _stale))
                 _mv = subprocess.run(_sudo_wrap(['mv', _new_data, _stale]),
                                      capture_output=True, text=True, timeout=120)
                 if _mv.returncode == 0:
