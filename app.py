@@ -39892,10 +39892,12 @@ def _cloudtak_legacy_minio_image(cloudtak_dir):
 def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None):
     """Copy .docker-store (MinIO) into Garage, verify, archive. Returns (ok, error).
 
-    Upstream's `cloudtak.sh migrate-store`, step for step: stop the services that use the
-    store, start Garage + a legacy MinIO from a local image, rclone sync, rclone check
-    --size-only, remove the legacy MinIO, move .docker-store aside. On ANY failure
-    .docker-store is left exactly where it was — nothing is archived until the copy verified."""
+    Upstream's `cloudtak.sh migrate-store`, step for step — stop the services that use the
+    store, start Garage + a legacy MinIO from a local image, copy, check, remove the legacy
+    MinIO, move .docker-store aside — with one deliberate difference: `rclone copy --update`
+    and `check --one-way` instead of `sync`/`check`, so this can never delete or downgrade a
+    file already in Garage. On ANY failure .docker-store is left exactly where it was —
+    nothing is archived until the copy verified."""
     bucket = env.get('ASSET_BUCKET', '')
     if not _CT_BUCKET_RE.match(bucket):
         return False, 'ASSET_BUCKET is missing or invalid in CloudTAK .env'
@@ -39938,15 +39940,23 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
         else:
             _cleanup()
             return False, f'the {side} store never answered: ' + out.strip()[-300:]
+    # `copy --update`, NOT upstream's `sync`: sync makes Garage MATCH the source, deleting
+    # whatever the source lacks. If anything ever starts minio-legacy after a migration, docker
+    # recreates .docker-store and MinIO initialises it as a fresh EMPTY store (seen on test12,
+    # 2026-10-07) — a sync from that would wipe Garage. copy never deletes, and --update never
+    # replaces a newer file already in Garage. For a first migration into an empty Garage the
+    # result is identical to sync.
     ok, out = _step('Copied files from MinIO to Garage',
-                    rclone + ['sync', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
+                    rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
     if not ok:
         _cleanup()
         return False, 'copying the files failed: ' + out.strip()[-300:]
     _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
     plog(f"    {_n} file(s) copied")
+    # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
     ok, out = _step('Verified every file arrived (rclone check)',
-                    rclone + ['check', '--size-only', f'minio:{bucket}', f'garage:{bucket}'], timeout=3600)
+                    rclone + ['check', '--one-way', '--size-only', f'minio:{bucket}', f'garage:{bucket}'],
+                    timeout=3600)
     if not ok:
         _cleanup()
         return False, 'verification failed — not every file arrived: ' + out.strip()[-300:]

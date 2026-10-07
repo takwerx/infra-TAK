@@ -102,7 +102,7 @@ class Compose:
         self.calls.append(list(args))
         if self.fail_on and self.fail_on in args:
             return 1, 'boom: ' + self.fail_on
-        if 'sync' in args:
+        if 'copy' in args:
             return 0, '2026/10/07 INFO  : a.png: Copied (new)\n2026/10/07 INFO  : b.kml: Copied (new)\n'
         return 0, ''
 
@@ -164,8 +164,8 @@ def test_migration_runs_upstreams_steps_in_order_then_archives(ct):
             '--profile migrate up -d --pull missing store minio-legacy',
             '--profile migrate run --rm --quiet-pull migrate lsd garage:',
             '--profile migrate run --rm --quiet-pull migrate lsd minio:',
-            '--profile migrate run --rm --quiet-pull migrate sync -v minio:cloudtak garage:cloudtak',
-            '--profile migrate run --rm --quiet-pull migrate check --size-only minio:cloudtak garage:cloudtak',
+            '--profile migrate run --rm --quiet-pull migrate copy --update -v minio:cloudtak garage:cloudtak',
+            '--profile migrate run --rm --quiet-pull migrate check --one-way --size-only minio:cloudtak garage:cloudtak',
             '--profile migrate rm -sf minio-legacy']
     assert flat == want
     assert not (ct / '.docker-store').exists()
@@ -174,7 +174,7 @@ def test_migration_runs_upstreams_steps_in_order_then_archives(ct):
     assert any('2 file(s) copied' in l for l in log)
 
 
-@pytest.mark.parametrize('fail_on', ['sync', 'check', 'minio-legacy'])
+@pytest.mark.parametrize('fail_on', ['copy', 'check', 'minio-legacy'])
 def test_failed_migration_never_moves_the_minio_data(ct, fail_on):
     (ct / '.docker-store' / 'cloudtak').mkdir(parents=True)
     c = Compose(fail_on=fail_on)
@@ -255,3 +255,11 @@ def test_no_plugin_path_is_hardcoded_to_api_web_any_more():
     # only the "look in both roots" list in the update path may still name the old root
     assert len(hits) == 1
     assert '_plugin_bases_before' in code[hits[0] - 200:hits[0]]
+
+
+def test_migration_can_never_delete_or_downgrade_garage_files():
+    # 2026-10-07 test12: a stray minio-legacy start recreated .docker-store as a fresh EMPTY
+    # MinIO. Upstream's `rclone sync` from that would have wiped Garage.
+    code = re.sub(r'#.*', '', _body('_cloudtak_migrate_minio_to_garage'))
+    assert "'sync'" not in code
+    assert "['copy', '--update', '-v'" in code and "'--one-way'" in code
