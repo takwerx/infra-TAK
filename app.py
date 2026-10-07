@@ -1059,7 +1059,7 @@ def inject_source_url():
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
+AUTHENTIK_VETTED_RELEASE = "2026.5.7"   # v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release. Previous: 2026.5.6 — v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
 
 # Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
 # AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
@@ -1076,7 +1076,7 @@ AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + 
 # MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
 # streaming box is a crash-loop, not a warning.
 MEDIAMTX_VETTED_RELEASE = "1.20.0"      # v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
-AUTHENTIK_DEV_RELEASE    = "2026.5.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+AUTHENTIK_DEV_RELEASE    = "2026.5.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
@@ -7772,7 +7772,13 @@ def _diag_section_takserver(settings):
                 jvm = os.readlink(f'/proc/{pid}/exe')
             except OSError:
                 jvm = '(not readable as the console user)'
-            out.append(f"running JVM ({prof}): {jvm}   (TAK 5.7 on Java 21 = every new QR enrollment fails)")
+            # v10.2.7: warn only when it applies. Printed unconditionally before, it read as a
+            # diagnosis on every healthy Java-17 box (seen in the lutak2.net report, 2026-10-03).
+            _jm = re.search(r'(?:java|jdk|jre)-?(\d{2})\b', jvm)
+            _jmajor = int(_jm.group(1)) if _jm else 0
+            _jnote = ('   WARNING: TAK 5.7 on Java 21+ = every new QR enrollment fails (pin Java 17)'
+                      if _jmajor >= 21 and '5.7' in (ver or '') else '')
+            out.append(f"running JVM ({prof}): {jvm}{_jnote}")
     out.append(f"default java: {os.path.realpath(shutil.which('java') or '') or '(none)'}")
     try:
         out.append(f"installed JVMs: {', '.join(sorted(d for d in os.listdir('/usr/lib/jvm') if not d.startswith('.'))) or '(none)'}")
@@ -16638,7 +16644,10 @@ PORT_EXPOSURE_POLICY = [
     {'module': 'takserver', 'label': 'TAK Server (mTLS)',   'port': 8089, 'tier': 1, 'why': 'TAK client mutual-TLS'},
     {'module': 'takserver', 'label': 'TAK Admin WebGUI',    'port': 8443, 'tier': 1, 'why': 'Admin WebGUI (client-cert)'},
     {'module': 'takserver', 'label': 'TAK Admin (LE cert)', 'port': 8446, 'tier': 1, 'why': 'Admin WebGUI (LE cert)'},
-    {'module': 'authentik', 'label': 'Authentik HTTP',      'port': 9000, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    # v10.2.7: the HOST port is 9090 (127.0.0.1:9090 → container :9000, see _get_authentik_upstream);
+    # this row said 9000 for many releases, so it read "not listening" on every box and would have
+    # labelled any other 9000 listener (CloudTAK's object store, say) as Authentik.
+    {'module': 'authentik', 'label': 'Authentik HTTP',      'port': 9090, 'tier': 3, 'why': 'Reached via Caddy 443'},
     {'module': 'authentik', 'label': 'Authentik HTTPS',     'port': 9443, 'tier': 3, 'why': 'Reached via Caddy 443'},
     {'module': 'takportal',  'label': 'TAK Portal',         'port': 3000, 'tier': 3, 'why': 'Reached via Caddy + forward_auth'},
     {'module': 'nodered',    'label': 'Node-RED',           'port': 1880, 'tier': 3, 'why': 'Reached via Caddy + forward_auth'},
@@ -37497,7 +37506,7 @@ cloudtak_uninstall_status = {'running': False, 'done': False, 'error': None}
 _cloudtak_deploy_lock = threading.Lock()
 
 # Plugin catalog — each entry describes a community CloudTAK plugin.
-# install_dir: subdirectory under ~/CloudTAK/api/web/plugins/ that Vite
+# install_dir: subdirectory under ~/CloudTAK/<web root>/plugins/ (app/ since CloudTAK 13.102.0, api/web/ before) that Vite
 #   auto-discovers via import.meta.glob at build time (no wiring needed).
 #
 # local_path (optional): absolute path to the plugin source directory on this
@@ -38759,7 +38768,7 @@ def _cleanup_snapshot(snap_info):
 def _detect_cloudtak_plugins():
     """Return the CLOUDTAK_PLUGINS catalog annotated with installed/commit/update_available."""
     ct_dir = os.path.expanduser('~/CloudTAK')
-    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    plugins_base = _cloudtak_plugins_dir(ct_dir)   # v10.2.7: app/plugins on CloudTAK >= 13.102.0
     result = []
     _settings = load_settings()
     _dev_box = (_settings.get('update_channel') or 'main').strip().lower() == 'dev'
@@ -38841,7 +38850,7 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         return
 
     ct_dir = os.path.expanduser('~/CloudTAK')
-    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    plugins_base = _cloudtak_plugins_dir(ct_dir)   # v10.2.7: app/plugins on CloudTAK >= 13.102.0
     install_path = os.path.join(plugins_base, plugin['install_dir'])
 
     def plog(msg):
@@ -39770,6 +39779,345 @@ def _cloudtak_remote_store_endpoint(remote_cfg):
     return 'http://store:9000'
 
 
+# ── CloudTAK object store: MinIO -> Garage (v10.2.7) ───────────────────────────
+# CloudTAK v13.102.0 (2026-10-02, upstream PR #1847) replaced the MinIO store with Garage.
+# v10.2.0 made our .env writers Garage-aware (_cloudtak_store_endpoint above, and
+# GARAGE_RPC_SECRET preserved through every rewrite). The rest — filed on the ROADMAP "for when
+# Garage is in a CloudTAK release" — is below. Measured on test12 2026-10-07 through the Update
+# button: the update reported "CloudTAK is running" while compose warned GARAGE_RPC_SECRET was
+# unset, .env still pointed at :9000 (the update path never wrote .env), and the store
+# crash-looped on `Error: Invalid RPC secret key: expected 32 bytes of random hex`.
+#
+# Upstream's answer is `./cloudtak.sh migrate-store`. This is the same procedure, step for
+# step, run through OUR docker path: on a non-root box that is the broker, which deliberately
+# does not forward the caller's environment — so MINIO_LEGACY_IMAGE travels in .env (compose
+# interpolates from it) instead of being exported.
+
+_CT_IMAGE_REF_RE = re.compile(r'^[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?$')
+_CT_BUCKET_RE = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+_CT_ENV_LINE_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$')
+_CT_GARAGE_ENDPOINT = 'http://store:3900'
+_CT_MINIO_ENDPOINT = 'http://store:9000'
+
+
+def _cloudtak_compose_is_garage(cloudtak_dir):
+    """True when the checked-out compose file's `store` service is Garage (CloudTAK >= 13.102.0).
+    The compose file alone — not .env — so a half-written .env can never decide it."""
+    return _cloudtak_store_endpoint(cloudtak_dir, '') == _CT_GARAGE_ENDPOINT
+
+
+def _cloudtak_env_read(env_path):
+    """KEY -> value for CloudTAK's .env (comments and blank lines ignored)."""
+    out = {}
+    try:
+        with open(env_path) as f:
+            for ln in f:
+                m = _CT_ENV_LINE_RE.match(ln.rstrip('\n'))
+                if m:
+                    out[m.group(1)] = m.group(2).strip()
+    except OSError:
+        pass
+    return out
+
+
+def _cloudtak_env_set(env_path, updates=None, remove=()):
+    """Set or drop exact keys in CloudTAK's .env; every other line stays byte-identical.
+
+    Only for keys this module owns in the Garage case (the same three upstream's own
+    cloudtak.sh writes), with values we generated or validated — never operator input.
+    Written in place, so the file keeps its owner and mode."""
+    updates = dict(updates or {})
+    with open(env_path) as f:
+        lines = f.read().splitlines()
+    out, seen = [], set()
+    for ln in lines:
+        m = _CT_ENV_LINE_RE.match(ln)
+        k = m.group(1) if m else None
+        if k is not None and k in remove:
+            continue
+        if k is not None and k in updates:
+            if k not in seen:                  # one definition; a duplicate would shadow ours
+                out.append(f'{k}={updates[k]}')
+                seen.add(k)
+            continue
+        out.append(ln)
+    for k, v in updates.items():
+        if k not in seen:
+            out.append(f'{k}={v}')
+    with open(env_path, 'w') as f:
+        f.write('\n'.join(out) + '\n')
+
+
+def _cloudtak_compose_run(cloudtak_dir, args, timeout=600):
+    """`docker compose <args>` in the CloudTAK project — through the broker on a non-root box
+    (it forwards our cwd; TAKWERX_BROKER_TIMEOUT rides to the CLI so long steps are not cut
+    at the broker's 600 s default). Returns (returncode, combined output). Never raises."""
+    dcc = _compose_cmd()
+    if not dcc:
+        return 127, 'neither `docker compose` nor `docker-compose` is available'
+    try:
+        r = subprocess.run(_sudo_wrap(dcc.split() + list(args)), cwd=cloudtak_dir,
+                           capture_output=True, text=True, timeout=timeout + 30,
+                           env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(int(timeout))})
+        return r.returncode, (r.stdout or '') + (r.stderr or '')
+    except subprocess.TimeoutExpired:
+        return 124, f'timed out after {timeout}s'
+    except Exception as e:
+        return 1, str(e)[:300]
+
+
+def _cloudtak_legacy_minio_image(cloudtak_dir):
+    """A LOCAL image that can still read .docker-store, or ''.
+
+    MinIO is no longer pullable from any registry ([[minio-withdrawn-from-dockerhub]]), so it
+    has to be on the box already: the store container's own image while it is still MinIO —
+    capture this BEFORE anything recreates that container — else any cached minio/minio:* tag.
+    The same order upstream's migrate-store uses."""
+    cands = []
+    rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-a', '--format', '{{.Image}}', 'store'], timeout=60)
+    if rc == 0:
+        cands += [l.strip() for l in out.splitlines()]
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}']),
+                           capture_output=True, text=True, timeout=60)
+        cands += [l.strip() for l in (r.stdout or '').splitlines() if 'minio/minio:' in l]
+    except Exception:
+        pass
+    for c in cands:
+        if 'minio' in c.lower() and '<none>' not in c and _CT_IMAGE_REF_RE.match(c):
+            return c
+    return ''
+
+
+def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None):
+    """Copy .docker-store (MinIO) into Garage, verify, archive. Returns (ok, error).
+
+    Upstream's `cloudtak.sh migrate-store`, step for step: stop the services that use the
+    store, start Garage + a legacy MinIO from a local image, rclone sync, rclone check
+    --size-only, remove the legacy MinIO, move .docker-store aside. On ANY failure
+    .docker-store is left exactly where it was — nothing is archived until the copy verified."""
+    bucket = env.get('ASSET_BUCKET', '')
+    if not _CT_BUCKET_RE.match(bucket):
+        return False, 'ASSET_BUCKET is missing or invalid in CloudTAK .env'
+    if not env.get('MINIO_ROOT_USER') or not env.get('MINIO_ROOT_PASSWORD'):
+        return False, 'MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing from CloudTAK .env — the MinIO data cannot be read'
+    img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
+    img = img or _cloudtak_legacy_minio_image(cloudtak_dir)
+    if not img:
+        return False, ('no MinIO image is cached on this box to read .docker-store with, and MinIO can no '
+                       'longer be downloaded from any registry. Your files are safe in ~/CloudTAK/.docker-store.')
+    env_path = os.path.join(cloudtak_dir, '.env')
+    _cloudtak_env_set(env_path, {'MINIO_LEGACY_IMAGE': img})
+    plog(f"  Moving CloudTAK's files from MinIO to Garage (reading them with {img})")
+    plog("  CloudTAK is stopped while the files are copied")
+    mig = ['--profile', 'migrate']
+
+    def _step(label, args, timeout=600):
+        rc, out = _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+        plog(f"  {'✓' if rc == 0 else '✗'} {label}" + ('' if rc == 0 else f": {out.strip()[-400:]}"))
+        return rc == 0, out
+
+    def _cleanup():
+        _cloudtak_compose_run(cloudtak_dir, mig + ['rm', '-sf', 'minio-legacy'], timeout=120)
+
+    ok, _ = _step('Stopped CloudTAK services', ['stop', 'api', 'events', 'tiles', 'retention'])
+    if not ok:
+        return False, 'could not stop the CloudTAK services'
+    ok, out = _step('Started Garage and the legacy MinIO',
+                    mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
+    if not ok:
+        _cleanup()
+        return False, 'could not start Garage and the legacy MinIO: ' + out.strip()[-200:]
+    rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
+    for side in ('garage', 'minio'):
+        for _i in range(30):
+            rc, out = _cloudtak_compose_run(cloudtak_dir, rclone + ['lsd', f'{side}:'], timeout=180)
+            if rc == 0:
+                break
+            time.sleep(2)
+        else:
+            _cleanup()
+            return False, f'the {side} store never answered: ' + out.strip()[-300:]
+    ok, out = _step('Copied files from MinIO to Garage',
+                    rclone + ['sync', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
+    if not ok:
+        _cleanup()
+        return False, 'copying the files failed: ' + out.strip()[-300:]
+    _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
+    plog(f"    {_n} file(s) copied")
+    ok, out = _step('Verified every file arrived (rclone check)',
+                    rclone + ['check', '--size-only', f'minio:{bucket}', f'garage:{bucket}'], timeout=3600)
+    if not ok:
+        _cleanup()
+        return False, 'verification failed — not every file arrived: ' + out.strip()[-300:]
+    _cleanup()
+    src = os.path.join(cloudtak_dir, '.docker-store')
+    archive = os.path.join(cloudtak_dir, '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S'))
+    try:
+        os.rename(src, archive)
+    except OSError:
+        r = subprocess.run(_sudo_wrap(['mv', src, archive]), capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return False, ('files copied and verified, but .docker-store could not be moved aside: '
+                           + (r.stderr or '').strip()[:200])
+    _cloudtak_env_set(env_path, remove=('MINIO_LEGACY_IMAGE',))
+    plog(f"  ✓ Old MinIO data kept at ~/CloudTAK/{os.path.basename(archive)} — remove it once CloudTAK checks out")
+    return True, ''
+
+
+def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True):
+    """Bring a Garage-based CloudTAK tree to a working store. Returns (ok, error). Never raises.
+
+    No-op for a MinIO-era tree. Otherwise, in upstream's order:
+      1. GARAGE_RPC_SECRET (64 hex, not all zeros) and AWS_S3_Endpoint=http://store:3900 in .env
+      2. MinIO data still in .docker-store -> _cloudtak_migrate_minio_to_garage()
+      3. `docker compose up -d` when start=True
+    The caller decides what a failure means (the Update path rolls back; boot just reports)."""
+    try:
+        if not _cloudtak_compose_is_garage(cloudtak_dir):
+            return True, ''
+        env_path = os.path.join(cloudtak_dir, '.env')
+        if not os.path.isfile(env_path):
+            return False, 'CloudTAK .env not found'
+        env = _cloudtak_env_read(env_path)
+        upd = {}
+        sec = env.get('GARAGE_RPC_SECRET', '')
+        if not re.fullmatch(r'[0-9a-fA-F]{64}', sec) or set(sec) == {'0'}:
+            upd['GARAGE_RPC_SECRET'] = secrets.token_hex(32)
+        if env.get('AWS_S3_Endpoint') != _CT_GARAGE_ENDPOINT:
+            upd['AWS_S3_Endpoint'] = _CT_GARAGE_ENDPOINT
+        if upd:
+            _cloudtak_env_set(env_path, upd)
+            if 'GARAGE_RPC_SECRET' in upd:
+                plog("  ✓ Generated the Garage store secret (GARAGE_RPC_SECRET) in CloudTAK .env")
+            if 'AWS_S3_Endpoint' in upd:
+                plog(f"  ✓ CloudTAK now talks to the Garage store ({_CT_GARAGE_ENDPOINT})")
+        if os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')):
+            ok, err = _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image)
+            if not ok:
+                return False, err
+        if start:
+            rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)
+            if rc != 0:
+                return False, 'docker compose up -d failed: ' + out.strip()[-300:]
+        return True, ''
+    except Exception as e:
+        return False, f'Garage store setup error: {str(e)[:300]}'
+
+
+def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
+    """A failed MinIO->Garage migration during Update: put the stack back as it was.
+
+    Runs BEFORE the build, so the previous images are still the ones tagged. Order matters:
+    revert the tree first, then let the reverted compose decide .env — a GARAGE_RPC_SECRET left
+    in .env would make _cloudtak_store_endpoint() say 3900 on a MinIO box. .docker-store was
+    never moved (nothing is archived until the copy verified); a half-filled Garage dir is set
+    aside so the next attempt starts clean. Never raises."""
+    try:
+        _cloudtak_compose_run(cloudtak_dir, ['--profile', 'migrate', 'rm', '-sf', 'minio-legacy', 'store'], timeout=120)
+        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        if not _cloudtak_compose_is_garage(cloudtak_dir):
+            env_path = os.path.join(cloudtak_dir, '.env')
+            if os.path.isfile(env_path):
+                _cloudtak_env_set(env_path, {'AWS_S3_Endpoint': _CT_MINIO_ENDPOINT},
+                                  remove=('GARAGE_RPC_SECRET', 'MINIO_LEGACY_IMAGE'))
+            _gd = os.path.join(cloudtak_dir, '.docker-garage')
+            if os.path.isdir(_gd):
+                _dst = _gd + '-failed-' + time.strftime('%Y%m%d_%H%M%S')
+                try:
+                    os.rename(_gd, _dst)
+                except OSError:
+                    subprocess.run(_sudo_wrap(['mv', _gd, _dst]), capture_output=True, timeout=120)
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=900)
+        plog("↩ CloudTAK restarted on the previous version and its MinIO store" if rc == 0
+             else f"  ⚠ Could not restart the previous CloudTAK: {out.strip()[-300:]}")
+    except Exception as e:
+        plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
+# v10.2.7: upstream moved the web app out of api/web/ into app/ (dfpc-coe/CloudTAK 7c806acfb,
+# released in v13.102.0; plugin glob now app/src/main.ts). A plugin copied into the OLD dir is
+# not a build error — it is simply never bundled, so every installed plugin vanished on update
+# and a fresh plugin install reported "installed" and never appeared.
+def _cloudtak_web_dir(ct_dir):
+    """CloudTAK's web app root for THIS tree: app/ (>= 13.102.0) or api/web/ (before)."""
+    if os.path.isdir(os.path.join(ct_dir, 'app', 'src')):
+        return os.path.join(ct_dir, 'app')
+    return os.path.join(ct_dir, 'api', 'web')
+
+
+def _cloudtak_plugins_dir(ct_dir):
+    """Where Vite's plugin glob looks in THIS tree."""
+    return os.path.join(_cloudtak_web_dir(ct_dir), 'plugins')
+
+
+# v10.2.7 — the same Garage step for a CloudTAK that lives on another host. There the SSH user is
+# the operator's own (root on every remote deploy we make), so upstream's own `cloudtak.sh
+# migrate-store` runs as-is; we only hand it the MinIO image we captured before the checkout.
+_CT_REMOTE_STORE_IMAGE_AWK = (
+    "awk '/^[[:space:]]*store:/{f=1;next} f&&/^[[:space:]]*[a-zA-Z_-]+:[[:space:]]*$/{exit} "
+    "f&&/image:/{print; exit}' ~/CloudTAK/docker-compose.yml 2>/dev/null")
+_CT_REMOTE_LEGACY_MINIO_SH = (
+    "cd ~/CloudTAK 2>/dev/null && [ -d .docker-store ] && "
+    "{ docker compose ps -a --format '{{.Image}}' store 2>/dev/null; "
+    "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep 'minio/minio:'; } "
+    "| grep -i minio | grep -v '<none>' | head -n1")
+
+
+def _cloudtak_remote_legacy_image(remote_cfg):
+    """`_cloudtak_legacy_minio_image()` over SSH; '' when there is no .docker-store or no image."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, _CT_REMOTE_LEGACY_MINIO_SH, timeout=60)
+        cand = ((out or '').strip().splitlines() or [''])[0].strip() if ok else ''
+        return cand if _CT_IMAGE_REF_RE.match(cand) else ''
+    except Exception:
+        return ''
+
+
+def _cloudtak_remote_compose_is_garage(remote_cfg):
+    """`_cloudtak_compose_is_garage()` over SSH — the compose file only, never .env."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, _CT_REMOTE_STORE_IMAGE_AWK, timeout=20)
+        return bool(ok and 'garage' in (out or '').lower())
+    except Exception:
+        return False
+
+
+def _cloudtak_remote_garage_sh(legacy_image=''):
+    """Shell for the remote host: secret + endpoint in .env (upstream's ensure_rpc_secret and
+    endpoint rewrite), then upstream's migrate-store when MinIO data is still in .docker-store."""
+    img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
+    mig_env = f"MINIO_LEGACY_IMAGE={shlex.quote(img)} " if img else ''
+    return (
+        "set -e; cd ~/CloudTAK; "
+        "cur=$(grep '^GARAGE_RPC_SECRET=' .env | head -n1 | cut -d= -f2-); "
+        "if ! printf '%s' \"$cur\" | grep -qE '^[0-9a-fA-F]{64}$' || [ \"$cur\" = \"$(printf '0%.0s' $(seq 64))\" ]; then "
+        "  s=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n'); "
+        "  sed -i '/^GARAGE_RPC_SECRET=/d' .env; echo \"GARAGE_RPC_SECRET=$s\" >> .env; "
+        "  echo 'Generated the Garage store secret (GARAGE_RPC_SECRET)'; fi; "
+        "if grep -q '^AWS_S3_Endpoint=' .env; then sed -i 's|^AWS_S3_Endpoint=.*|AWS_S3_Endpoint=http://store:3900|' .env; "
+        "else echo 'AWS_S3_Endpoint=http://store:3900' >> .env; fi; "
+        f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
+
+
+def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
+    """`_cloudtak_garage_rollback()` over SSH. Never raises."""
+    try:
+        _ssh_probe(remote_cfg, "cd ~/CloudTAK && docker compose --profile migrate rm -sf minio-legacy store", timeout=120)
+        _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+        ok, out = _ssh_probe(
+            remote_cfg,
+            "cd ~/CloudTAK && if ! " + _CT_REMOTE_STORE_IMAGE_AWK + " | grep -qi garage; then "
+            "sed -i '/^GARAGE_RPC_SECRET=/d;/^MINIO_LEGACY_IMAGE=/d' .env; "
+            "sed -i 's|^AWS_S3_Endpoint=.*|AWS_S3_Endpoint=http://store:9000|' .env; "
+            "[ -d .docker-garage ] && mv .docker-garage .docker-garage-failed-$(date +%Y%m%d_%H%M%S); "
+            "fi; docker compose up -d", timeout=900)
+        plog("↩ CloudTAK restarted on the previous version and its MinIO store" if ok
+             else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
+    except Exception as e:
+        plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
 def _cloudtak_env_preserve_unknown(generated, existing_text):
     """Keep every KEY= line CloudTAK's .env already had that we do not write ourselves.
 
@@ -39856,6 +40204,12 @@ def _cloudtak_store_image_status(cloudtak_dir, log=None):
             return True, ''
         with open(compose) as f:
             body = f.read()
+        # v10.2.7: a Garage-based compose (CloudTAK >= 13.102.0) still names MinIO — in the
+        # profile-gated `minio-legacy` service that only the MinIO->Garage migration starts
+        # (`image: ${MINIO_LEGACY_IMAGE:-quay.io/minio/minio:…}`). The regex below matched it
+        # and warned "a NEW install cannot complete" on every fresh Garage install.
+        if _cloudtak_compose_is_garage(cloudtak_dir):
+            return True, ''
         m = re.search(r'(?m)^\s*image:\s*(\S*minio/minio:\S+)', body)
         if not m:
             return True, ''          # not a MinIO-based CloudTAK (Garage or newer) — nothing to warn about
@@ -40303,6 +40657,11 @@ def _cloudtak_git_prep(cloudtak_dir, plog):
             os.makedirs(os.path.dirname(_excl), exist_ok=True)
             with open(_excl, 'a') as _f:
                 _f.write('\n# TAKWERX: never track the root-owned MinIO bind-mount\n.docker-store/\n')
+        if '.docker-garage' not in _cur:
+            os.makedirs(os.path.dirname(_excl), exist_ok=True)
+            with open(_excl, 'a') as _f:
+                _f.write('\n# TAKWERX v10.2.7: Garage store data + archived/failed migration trees\n'
+                         '.docker-garage/\n.docker-garage-failed-*/\n.docker-store-migrated-*/\n')
     except Exception:
         pass
 
@@ -40530,6 +40889,16 @@ def run_cloudtak_deploy(cfg=None):
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             plog("✓ Remote .env and override written")
+            # v10.2.7: Garage (CloudTAK >= 13.102.0) — secret, endpoint, and any MinIO data moved.
+            if _cloudtak_remote_compose_is_garage(remote_cfg):
+                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)),
+                                         timeout=7200)
+                for _l in (_gout or '').strip().splitlines()[-25:]:
+                    plog(f"  {_l}")
+                if not _gok:
+                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -40801,6 +41170,16 @@ def run_cloudtak_deploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
         with open(env_path, 'w') as f:
             f.write(env_content)
+
+        # v10.2.7: a Garage-based CloudTAK (>= 13.102.0) cannot start without GARAGE_RPC_SECRET,
+        # and MinIO data still in .docker-store has to move into Garage first (upstream's
+        # migrate-store, same steps). No-op on a MinIO-era tree.
+        if _cloudtak_compose_is_garage(cloudtak_dir):
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            if not _gok:
+                plog(f"✗ Garage store setup failed: {_gerr}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
         try:
             _pwfile = os.path.join(cloudtak_dir, '.postgres-password')
             with open(_pwfile, 'w') as _pf:
@@ -41387,12 +41766,18 @@ def run_cloudtak_redeploy(cfg=None):
                     return
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
+            # move any MinIO data before `up -d` — the store cannot start otherwise.
+            _g_sh = ''
+            if _cloudtak_remote_compose_is_garage(remote_cfg):
+                _g_sh = '( ' + _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)) + ' ) && '
             cmd = (
                 "mv /tmp/.env ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
+                + _g_sh +
                 "cd ~/CloudTAK && docker compose up -d"
             )
-            ok, out = _ssh_probe(remote_cfg, cmd, timeout=180)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=7200 if _g_sh else 180)
             if not ok:
                 plog(f"✗ Restart failed: {(out or '')[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -41455,6 +41840,16 @@ def run_cloudtak_redeploy(cfg=None):
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
             f.write(env_content)
+
+        # v10.2.7: a Garage-based CloudTAK (>= 13.102.0) cannot start without GARAGE_RPC_SECRET,
+        # and MinIO data still in .docker-store has to move into Garage first (upstream's
+        # migrate-store, same steps). No-op on a MinIO-era tree.
+        if _cloudtak_compose_is_garage(cloudtak_dir):
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            if not _gok:
+                plog(f"✗ Garage store setup failed: {_gerr}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
         with open(override_path, 'w') as f:
             f.write(_cloudtak_build_override_yml(settings))
@@ -41685,6 +42080,7 @@ def run_cloudtak_update():
         remote_cfg = cfg.get('remote', {}) if is_remote else {}
         remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
         prev_sha = ''   # v10.1.85: where the tree was before checkout — restored on a failed build
+        legacy_minio_img = ''   # v10.2.7: the image that can still read MinIO's data (captured pre-checkout)
 
         plog("━━━ Step 1/3: Resolving target release ━━━")
         # v10.1.17: version gate removed — every channel installs upstream latest
@@ -41702,6 +42098,9 @@ def run_cloudtak_update():
                 return
             _okp, _outp = _ssh_probe(remote_cfg, "cd ~/CloudTAK && git rev-parse HEAD", timeout=30)
             prev_sha = (_outp or '').strip() if _okp else ''
+            # v10.2.7: before the checkout recreates anything, note the MinIO image that can still
+            # read .docker-store (MinIO can no longer be downloaded from any registry).
+            legacy_minio_img = _cloudtak_remote_legacy_image(remote_cfg)
             checkout_cmd = (
                 f"cd ~/CloudTAK && "
                 f"git checkout -- . && "
@@ -41719,14 +42118,21 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            plugins_base = os.path.join(cloudtak_dir, 'api', 'web', 'plugins')
+            # v10.2.7: CloudTAK 13.102.0 moved the web app (and its plugins/ glob) from api/web/
+            # to app/. Look in BOTH — this update may cross that line — and move, don't lose.
+            _plugin_bases_before = [os.path.join(cloudtak_dir, 'app', 'plugins'),
+                                    os.path.join(cloudtak_dir, 'api', 'web', 'plugins')]
             # Note which catalog plugins are installed before checkout.
             # git shallow-fetch checkouts can wipe untracked subdirectories.
             pre_installed = {
                 p['install_dir']: p for p in CLOUDTAK_PLUGINS
-                if os.path.isdir(os.path.join(plugins_base, p['install_dir']))
-                   or os.path.islink(os.path.join(plugins_base, p['install_dir']))
+                if any(os.path.isdir(os.path.join(_b, p['install_dir']))
+                       or os.path.islink(os.path.join(_b, p['install_dir'])) for _b in _plugin_bases_before)
             }
+            # v10.2.7: capture the image that can still read MinIO's data NOW, while the store
+            # container still runs it — the Garage switch recreates that container.
+            if os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')):
+                legacy_minio_img = _cloudtak_legacy_minio_image(cloudtak_dir)
             # Clear any stale .git/index.lock (a prior checkout that ran long enough
             # to be timeout-killed on a slower/SELinux box leaves one and wedges the
             # repo) and exclude the root-owned .docker-store MinIO bind-mount from git.
@@ -41756,6 +42162,7 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             # Restore any catalog plugins that the checkout wiped.
+            plugins_base = _cloudtak_plugins_dir(cloudtak_dir)
             os.makedirs(plugins_base, exist_ok=True)
             # Version-appropriate AFTER the checkout: a 13.44→13.45+ update must land
             # server routes in api/stateless/routes/ (api/routes/ is dead there).
@@ -41785,6 +42192,17 @@ def run_cloudtak_update():
                         subprocess.run(['git', '-c', f'safe.directory={cache_path}', '-C', cache_path,
                                         'pull', '--ff-only'], capture_output=True, timeout=120)
                     server_path = os.path.join(cache_path, server_subpath) if server_subpath else None
+                if not os.path.exists(dest) and not os.path.islink(dest):
+                    # v10.2.7: an era-crossing update leaves the plugin in the OLD web root, where
+                    # Vite no longer looks — move it rather than re-fetching (keeps local edits).
+                    for _ob in _plugin_bases_before:
+                        _old = os.path.join(_ob, install_dir)
+                        if _ob != plugins_base and (os.path.isdir(_old) or os.path.islink(_old)):
+                            import shutil as _shutil
+                            _shutil.move(_old, dest)
+                            plog(f"  Moved plugin {p['name']} to {os.path.relpath(plugins_base, cloudtak_dir)}/ "
+                                 f"(CloudTAK moved its web app)")
+                            break
                 if not os.path.exists(dest) and not os.path.islink(dest):
                     import shutil as _shutil
                     if use_subpaths:
@@ -41842,6 +42260,35 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+
+        # v10.2.7: CloudTAK >= 13.102.0 keeps its files in Garage, not MinIO. Same procedure as
+        # upstream's `cloudtak.sh migrate-store`, run BEFORE the build: until the build, the
+        # previous version's images are still the tagged ones, so a failed migration can put
+        # the box back exactly as it was. A MinIO-era tree skips this; an already-migrated one
+        # only re-checks .env.
+        if is_remote:
+            if _cloudtak_remote_compose_is_garage(remote_cfg):
+                plog("")
+                plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
+                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(legacy_minio_img), timeout=7200)
+                for _l in (_gout or '').strip().splitlines()[-25:]:
+                    plog(f"  {_l}")
+                if not _gok:
+                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
+                    plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+        elif _cloudtak_compose_is_garage(cloudtak_dir):
+            plog("")
+            plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)
+            if not _gok:
+                plog(f"✗ Garage store setup failed: {_gerr}")
+                _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
+                plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
@@ -51532,6 +51979,38 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
             plog(f"  \u26a0 Starter branding: {e}")
 
 
+def _yaml_duplicate_keys(raw, yaml_mod):
+    """Every mapping key that appears twice in `raw`, as 'key (line N)' strings.
+
+    PyYAML's safe_load silently keeps the last of two duplicate keys; docker compose refuses
+    the whole file. Merge keys (`<<`) are not flagged — compose allows overriding merged keys,
+    and this inspects each mapping before it is flattened. Returns [] when there are no
+    duplicates or the text does not parse (the caller already handles unparseable YAML)."""
+    found = []
+
+    class _DupLoader(yaml_mod.SafeLoader):
+        pass
+
+    def _construct_mapping(loader, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            try:
+                k = loader.construct_object(key_node, deep=deep)
+                if k in seen:
+                    found.append(f'{k} (line {key_node.start_mark.line + 1})')
+                seen.add(k)
+            except TypeError:
+                continue  # unhashable complex key — not a compose construct
+        return yaml_mod.SafeLoader.construct_mapping(loader, node, deep)
+
+    _DupLoader.add_constructor(yaml_mod.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+    try:
+        yaml_mod.load(raw, Loader=_DupLoader)
+    except Exception:
+        return []
+    return found
+
+
 def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
     """Legacy text-based compose patcher — kept as fallback if PyYAML cannot parse the file.
     Used by _ensure_authentik_compose_patches when yaml.safe_load raises YAMLError.
@@ -51721,6 +52200,18 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
 
     changed = False
     services = data.setdefault('services', {})
+
+    # v10.2.7 (GH #85): safe_load keeps the LAST of two duplicate keys without a word, but
+    # docker compose rejects the same file outright ("mapping key "healthcheck" already
+    # defined"). A box broken by the pre-10.2.7 deploy re-run therefore parsed fine here,
+    # nothing else needed changing, and the file was never rewritten — the stack stayed down.
+    # Find duplicates explicitly and force the re-dump (last-wins: in the #85 case the two
+    # healthcheck blocks are identical).
+    _dups = _yaml_duplicate_keys(raw, _yaml)
+    if _dups:
+        changed = True
+        if plog:
+            plog(f"  ✓ Repaired duplicate key(s) {', '.join(_dups)} in docker-compose.yml (GH #85)")
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
     # v10.1.0: RAM-tiered deterministic autotune (was: unconditional enterprise —
@@ -60447,34 +60938,12 @@ entries:
         except Exception as _e:
             plog(f"  ! .env AUTHENTIK_TAG converge failed ({_e}) - compose may still resolve the old tag")
 
-        # Inject healthchecks for server and worker if missing (upstream compose may not have them)
-        if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
-            _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
-            patched = []
-            for i, line in enumerate(lines):
-                patched.append(line)
-                if line.strip() == 'command: server' or line.strip() == 'command: worker':
-                    patched.append(_hc_block)
-            lines = patched
-            needs_write = True
-            plog("  Added healthchecks for server and worker")
-        else:
-            # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
-            for i, line in enumerate(lines):
-                if 'start_period' in line and 'start_period: 600s' not in line:
-                    # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
-                    # Check if this is under a server or worker service by looking backwards
-                    for j in range(i - 1, max(i - 15, 0), -1):
-                        if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
-                            lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
-                            needs_write = True
-                            break
-                        if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
-                            break
-                        if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
-                            break
-            if needs_write:
-                plog("  Updated healthcheck start_period to 600s for first-run migrations")
+        # v10.2.7 (GH #85): server/worker healthchecks are owned by _ensure_authentik_compose_patches()
+        # below — structurally, so they survive any YAML style. The text injection that used to live
+        # here matched only the one-line `test: ["CMD", "ak", "healthcheck"]` form; once the YAML
+        # patcher re-dumped the file as a block list, every re-run of this deploy injected a SECOND
+        # `healthcheck:` key, which docker compose rejects ("mapping key already defined") and the
+        # whole stack failed to start.
 
         ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
         if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
@@ -69360,6 +69829,36 @@ def takserver_58_preflight():
 # was about; this is the same fault with a database attached.
 
 
+def _pg_restore_toc(dump_path, timeout=600):
+    """(toc_entries, error) from `pg_restore --list dump_path`, run by THIS process.
+
+    For dumps this process wrote itself — the root console's snapshot branch. Reading a
+    table of contents needs no database, and with no privilege boundary between the console
+    and the file there is nothing for the broker's HMAC sidecar to protect. Counts entries
+    exactly like the broker's list_only op and the external-DB branch. pg_restore reads
+    archives from older servers, so any client on the box will do: PATH first (Debian's
+    pg_wrapper), then the versioned layouts, newest first (RHEL PGDG is never on PATH —
+    [[rhel-pgdg-binaries-not-on-path]]). Never installs anything."""
+    cands = [shutil.which('pg_restore')]
+    for major in range(25, 12, -1):
+        for layout in _TAK58_PG_BIN_LAYOUTS:
+            cands.append(os.path.join(layout.format(major=major), 'pg_restore'))
+    prbin = next((c for c in cands if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    if not prbin:
+        return 0, 'no pg_restore client found on this box to verify the dump'
+    try:
+        r = subprocess.run([prbin, '--list', dump_path], capture_output=True, text=True,
+                           timeout=timeout, cwd='/')
+    except subprocess.TimeoutExpired:
+        return 0, 'pg_restore --list did not finish within %d s' % timeout
+    except Exception as e:
+        return 0, 'pg_restore --list could not run: %s' % str(e)[:160]
+    toc = [l for l in (r.stdout or '').splitlines() if l.strip() and not l.lstrip().startswith(';')]
+    if r.returncode != 0 or not toc:
+        return 0, 'could not read the archive (%s)' % ((r.stderr or '').strip()[:200] or 'empty table of contents')
+    return len(toc), ''
+
+
 def _tak_58_backup(plog=None):
     """Snapshot before the 5.8 migration, then PROVE the cot dump reads.
 
@@ -69406,12 +69905,25 @@ def _tak_58_backup(plog=None):
     # console over TCP. Same standard, verified at the only point where the file is
     # readable without root. Trust it rather than re-asking the broker, which can
     # only ever answer "not mine".
+    # v10.2.7: a ROOT console's local dump is verified the same way, in _tak_snapshot()'s
+    # root branch (db_dump_via='root') — it has no HMAC sidecar either, so before this the
+    # broker answered "not mine" on every root console and 5.8 could never start there.
     if meta.get('db_dump_toc'):
         out['toc_entries'] = int(meta.get('db_dump_toc') or 0)
         out['dump_bytes'] = int(meta.get('db_dump_bytes') or out['dump_bytes'] or 0)
         out['ok'] = True
         plog('  backup verified: %s, %d objects in the archive (%s)'
              % (_cotdb_fmt_bytes(out['dump_bytes']), out['toc_entries'], out['snapshot_path']))
+        return out
+
+    # Only the broker's own dumps can be proven through the broker (HMAC sidecar). Anything
+    # else that reached here was not verified where it was written — say why, in words,
+    # instead of the broker's "authenticity check" refusal, which reads like tampering.
+    if meta.get('db_dump_via') != 'broker':
+        out['error'] = ('backup verification FAILED — %s. Do not proceed with the migration.'
+                        % (meta.get('db_dump_verify_error')
+                           or 'this dump was not written by the broker and could not be verified where it was written'))
+        plog(out['error'])
         return out
 
     # Prove it reads. This is the entire point of the wrapper.
@@ -71441,6 +71953,7 @@ def _tak_snapshot(label, plog=None):
                                     container=(TAK_DB_CONTAINER if _tak_is_container() else None))
                 if _sz > 0:
                     meta['db_dump'] = True
+                    meta['db_dump_via'] = 'broker'
                     plog(f"  snapshot: cot pg_dump written via broker ({_sz // 1024} KB)")
                 else:
                     plog("  snapshot: broker pg_dump produced an EMPTY dump — db_dump=False (config+certs captured)")
@@ -71483,7 +71996,21 @@ def _tak_snapshot(label, plog=None):
                     _p.communicate()
             if r2 is not None and r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
                 meta['db_dump'] = True
+                meta['db_dump_via'] = 'root'
+                meta['db_dump_bytes'] = os.path.getsize(pg_dump_path)
                 plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+                # v10.2.7: prove it reads HERE, the way the external-DB branch above does. Only
+                # the broker's own dumps carry the HMAC sidecar its pg_restore op demands, so a
+                # root console's dump was refused by the 5.8 pre-migration check every time
+                # ("dump failed authenticity check — not a broker-produced snapshot", lutak2.net
+                # 2026-10-03) — a root console could never reach 5.8. This process wrote the
+                # file; there is no privilege boundary between it and the file to protect.
+                _toc_n, _why = _pg_restore_toc(pg_dump_path)
+                if _toc_n:
+                    meta['db_dump_toc'] = _toc_n
+                else:
+                    meta['db_dump_verify_error'] = _why
+                    plog(f"  snapshot: cot dump did NOT verify ({_why})")
             else:
                 if r2 is not None:
                     _stderr = (r2.stderr or b'').decode(errors='replace').strip()
@@ -78750,12 +79277,16 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
     if not os.path.isdir(mod_dir):
         return False, ''
     uid = os.getuid()
-    skip = {'.docker-store'} | set(prune)
+    skip = {'.docker-store', '.docker-garage'} | set(prune)
+    # v10.2.7: CloudTAK >= 13.102.0 stores objects in Garage (.docker-garage/, root-owned bind
+    # mounts) and the MinIO->Garage migration archives the old tree as .docker-store-migrated-<ts>
+    # (or .docker-garage-failed-<ts> after a rolled-back attempt) — container data, never ours.
+    _skip_prefixes = ('.docker-store-migrated-', '.docker-garage-failed-')
     git_dirty, work_offenders = False, []
     _CAP = 400
     try:
         for dirpath, dirnames, filenames in os.walk(mod_dir):
-            dirnames[:] = [d for d in dirnames if d not in skip]
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(_skip_prefixes)]
             for name in dirnames + filenames:
                 full = os.path.join(dirpath, name)
                 try:
@@ -85971,6 +86502,50 @@ try:
     _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
 except Exception as _e:
     print(f"[startup] failed to start postgis sync (non-fatal): {_e}", flush=True)
+
+# v10.2.7: finish the Garage switch on a local CloudTAK that an EARLIER Update already moved to
+# >= 13.102.0 without the store step — every Update between 2026-10-02 and v10.2.7 did that: the
+# store crash-loops on "Invalid RPC secret key" and the files are still in .docker-store. Same
+# converge the Update button now runs (upstream's migrate-store), so a plain console update heals
+# it. Once per boot; only when something is actually missing; never while a CloudTAK operation is
+# in flight; progress lands on the CloudTAK page's log like any other CloudTAK operation.
+try:
+    import threading as _threading_garage
+    def _startup_cloudtak_garage():
+        try:
+            if (_get_cloudtak_deployment_config(load_settings()).get('target_mode') or 'local') == 'remote':
+                return
+            _ct = os.path.expanduser('~/CloudTAK')
+            _envp = os.path.join(_ct, '.env')
+            if not os.path.isfile(_envp) or not _cloudtak_compose_is_garage(_ct):
+                return
+            _env = _cloudtak_env_read(_envp)
+            _sec = _env.get('GARAGE_RPC_SECRET', '')
+            if (re.fullmatch(r'[0-9a-fA-F]{64}', _sec) and set(_sec) != {'0'}
+                    and _env.get('AWS_S3_Endpoint') == _CT_GARAGE_ENDPOINT
+                    and not os.path.isdir(os.path.join(_ct, '.docker-store'))):
+                return                       # already on a working Garage store
+            time.sleep(60)                   # let docker and the boot sequence settle first
+            with _cloudtak_deploy_lock:
+                if cloudtak_deploy_status.get('running'):
+                    print("[startup-garage] a CloudTAK operation is running — skipping this boot", flush=True)
+                    return
+                cloudtak_deploy_log.clear()
+                cloudtak_deploy_status.update({'running': True, 'complete': False, 'error': False})
+            def _gl(m):
+                cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+                print(f"[startup-garage] {m}", flush=True)
+            _gl("CloudTAK store repair: this CloudTAK version keeps its files in Garage — finishing the switch")
+            _ok, _err = _cloudtak_garage_converge(_ct, _gl, start=True)
+            _gl("✓ CloudTAK store repaired — CloudTAK is running on Garage" if _ok
+                else f"✗ CloudTAK store repair failed: {_err}")
+            cloudtak_deploy_status.update({'running': False, 'complete': _ok, 'error': not _ok})
+        except Exception as _e:
+            print(f"[startup-garage] error (non-fatal): {_e}", flush=True)
+            cloudtak_deploy_status['running'] = False
+    _threading_garage.Thread(target=_startup_cloudtak_garage, daemon=True, name='cloudtak-garage-heal').start()
+except Exception as _e:
+    print(f"[startup] failed to start CloudTAK Garage heal (non-fatal): {_e}", flush=True)
 
 # v10.1.4 (WS3): W1 MFA re-assert at boot — covers (a) already-hardened boxes picking up
 # the recovery-flow bypass fix from a plain console update, and (b) any Authentik app
