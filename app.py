@@ -1075,7 +1075,7 @@ AUTHENTIK_VETTED_RELEASE = "2026.5.7"   # v10.2.7: SECURITY — 2026.5.7 fixes f
 # 2026-08-14).  There is deliberately NO startup converge that moves existing boxes:
 # MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
 # streaming box is a crash-loop, not a warning.
-MEDIAMTX_VETTED_RELEASE = "1.20.0"      # v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
+MEDIAMTX_VETTED_RELEASE = "1.21.1"      # v10.2.8 W7: SECURITY — GHSA-w334-5mp5-h897 (CRITICAL, 2026-10-08): CSRF on the Control API → runOnInit command execution, fixed in 1.21.1 (plus RTMP publisher panics GHSA-7498/-5jgv, fixed 1.21.0). FRESH installs only — existing boxes are told by the upstream badge and update in the web editor. Previous 1.20.0 — v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
 AUTHENTIK_DEV_RELEASE    = "2026.5.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -1151,8 +1151,11 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # the orphaned-store self-heal. Dev pins stay == vetted until a newer pair is under trial.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.74.4"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.90.4"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV == vetted (no newer candidate under trial)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.90.4"
+# v10.2.8 W9: 0.80.0 / v2.94.0 UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4 carries
+# GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated bytes before the HMAC check; fixed 0.75.0).
+# Promote to VETTED only after dashboard login + peer connect on dev, per the comment above.
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -15375,7 +15378,10 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.14.0'
+COTURN_IMAGE = 'coturn/coturn:4.18.0'   # v10.2.8 W8: SECURITY — 4.14.0 carried GHSA-m23x (pre-auth heap
+# disclosure), GHSA-fvj6 (weak RNG) + five MEDIUM; all fixed by 4.17.0. Our flags include none of 4.18's
+# three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
+# defaults do not touch a cert-less UDP/TCP TURN.
 # Fleet constant (v10.0.7): standalone Remote-Assist CoTURN ALWAYS defaults to 3479,
 # never 3478 — 3478 is reserved for NetBird's TURN so the two can land on one box in
 # ANY install order with zero conflicts. RA clients are explicitly told URL+port by
@@ -36207,7 +36213,10 @@ writeTimeout: 10s
 api: yes
 apiAddress: 127.0.0.1:9898
 apiEncryption: no
-apiAllowOrigins: ['*']
+# v10.2.8 W7: no wildcard. 1.21.1 rejects a browser POST only when its origin is NOT
+# allowed, so '*' would leave the CSRF→runOnInit hole open. The web editor calls this API
+# server-side (no Origin header) and needs no browser origin here.
+apiAllowOrigins: []
 rtsp: yes
 rtspTransports: [tcp]
 rtspAddress: :8554
@@ -36857,7 +36866,10 @@ api: yes
 # moved from 9997 — CloudTAK media container owns port 9997 (hardcoded in video-service.ts).
 apiAddress: 127.0.0.1:9898
 apiEncryption: no
-apiAllowOrigins: ['*']
+# v10.2.8 W7: no wildcard. 1.21.1 rejects a browser POST only when its origin is NOT
+# allowed, so '*' would leave the CSRF→runOnInit hole open. The web editor calls this API
+# server-side (no Origin header) and needs no browser origin here.
+apiAllowOrigins: []
 apiTrustedProxies: []
 
 metrics: no
