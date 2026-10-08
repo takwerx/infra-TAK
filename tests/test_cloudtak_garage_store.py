@@ -263,3 +263,15 @@ def test_migration_can_never_delete_or_downgrade_garage_files():
     code = re.sub(r'#.*', '', _body('_cloudtak_migrate_minio_to_garage'))
     assert "'sync'" not in code
     assert "['copy', '--update', '-v'" in code and "'--one-way'" in code
+
+
+def test_every_local_rollback_moves_plugins_back_first():
+    # 2026-10-07 test6 forced-failure test: the update moved taksim into app/plugins, the
+    # rollback put the 13.73 tree back (which reads api/web/plugins) and left it stranded.
+    body = re.sub(r'#.*', '', _body('run_cloudtak_update'))
+    for call in ('_cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)',
+                 '_cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)'):
+        for m in re.finditer(re.escape(call), body):
+            before = body[max(0, m.start() - 160):m.start()]
+            assert '_undo_plugin_moves()' in before, call
+    assert '_plugin_moves.append((_old, dest))' in body

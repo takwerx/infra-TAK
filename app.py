@@ -1979,9 +1979,12 @@ def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
     except Exception as e:
         _log(f"  (could not read Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
         return False
-    if 'archive.debian.org' in src:
+    if 'apt-archive.postgresql.org' in src:
         return False                      # already patched (re-deploy / upgrade re-run)
     m = re.search(r'(?m)^RUN\s+apt-get\s+update\s*&&\s*apt(?:-get)?\s+install\s+-y\s+(.+)$', src)
+    if not m:
+        # A tree patched by the v10.1.x GH #69 fix alone: re-patch it for the PGDG move below.
+        m = re.search(r"(?m)^RUN sed -i -e '/debian-security/d'.*? install -y (.+)$", src)
     if not m:
         _log("  (Dockerfile.takserver-db has an unrecognised install line — building as shipped)")
         return False
@@ -1989,9 +1992,25 @@ def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
     # Delete the security suite FIRST (it does not exist on the archive), then repoint what
     # does. Order matters: repointing first would leave an archive.debian.org/debian-security
     # line that 404s and kills the &&-chain.
+    #
+    # v10.2.7 (GH #84, habr05 2026-10-06 — reported from Armbian/ARM64 but NOT arch- or
+    # OS-specific): PostgreSQL then moved bullseye off apt.postgresql.org too —
+    #     Err:5 http://apt.postgresql.org/pub/repos/apt bullseye-pgdg Release  404  Not Found
+    # The base image's own pgdg.list points there. The same `bullseye-pgdg` suite (same signing
+    # key, postgresql-15-postgis-3 3.5.2 for amd64 AND arm64 — checked 2026-10-07) now lives on
+    # apt-archive.postgresql.org, which only serves https, and postgres:15.1 ships WITHOUT
+    # ca-certificates. So: take PGDG out of the sources, install ca-certificates from the Debian
+    # archive, put PGDG back on the archive host over https, then install BBN's list. TLS
+    # verification stays ON — that is the point of installing the CA bundle rather than
+    # telling apt to skip verification.
     fixed = (
         "RUN sed -i -e '/debian-security/d'"
         " -e 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list"
+        " && if [ -f /etc/apt/sources.list.d/pgdg.list ]; then mv /etc/apt/sources.list.d/pgdg.list /tmp/pgdg.list; fi"
+        " && apt-get -o Acquire::Check-Valid-Until=false update"
+        " && apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends ca-certificates"
+        " && if [ -f /tmp/pgdg.list ]; then sed 's|http://apt.postgresql.org/|https://apt-archive.postgresql.org/|'"
+        " /tmp/pgdg.list > /etc/apt/sources.list.d/pgdg.list; fi"
         " && apt-get -o Acquire::Check-Valid-Until=false update"
         f" && apt-get -o Acquire::Check-Valid-Until=false install -y {pkgs}"
     )
@@ -2001,8 +2020,9 @@ def _patch_tak_db_dockerfile(build_ctx, log_fn=None):
     except Exception as e:
         _log(f"  (could not patch Dockerfile.takserver-db: {str(e)[:120]} — building as shipped)")
         return False
-    _log("  Patched Dockerfile.takserver-db for EOL Debian bullseye (GH #69): apt sources → "
-         "archive.debian.org. Without this the db image build fails on every platform.")
+    _log("  Patched Dockerfile.takserver-db for EOL Debian bullseye (GH #69, #84): Debian → "
+         "archive.debian.org, PostgreSQL → apt-archive.postgresql.org (https, CA bundle installed). "
+         "Without this the db image build fails on every platform.")
     return True
 
 
@@ -39929,7 +39949,7 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
                     mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
     if not ok:
         _cleanup()
-        return False, 'could not start Garage and the legacy MinIO: ' + out.strip()[-200:]
+        return False, 'could not start Garage and the legacy MinIO (output above)'
     rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
     for side in ('garage', 'minio'):
         for _i in range(30):
@@ -39950,7 +39970,7 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
                     rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
     if not ok:
         _cleanup()
-        return False, 'copying the files failed: ' + out.strip()[-300:]
+        return False, 'copying the files failed (rclone output above)'
     _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
     plog(f"    {_n} file(s) copied")
     # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
@@ -39959,7 +39979,7 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
                     timeout=3600)
     if not ok:
         _cleanup()
-        return False, 'verification failed — not every file arrived: ' + out.strip()[-300:]
+        return False, 'verification failed — not every file arrived (rclone output above)'
     _cleanup()
     src = os.path.join(cloudtak_dir, '.docker-store')
     archive = os.path.join(cloudtak_dir, '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S'))
@@ -42091,6 +42111,22 @@ def run_cloudtak_update():
         remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
         prev_sha = ''   # v10.1.85: where the tree was before checkout — restored on a failed build
         legacy_minio_img = ''   # v10.2.7: the image that can still read MinIO's data (captured pre-checkout)
+        _plugin_moves = []      # v10.2.7: (old, new) plugin dirs moved across the api/web -> app/ split
+
+        def _undo_plugin_moves():
+            # A rolled-back update puts the OLD tree back, which looks for plugins in api/web/ —
+            # move them back, or they read as uninstalled and drop out of the next build
+            # (found 2026-10-07 on test6 in the forced-failure test).
+            import shutil as _shutil
+            for _old, _new in reversed(_plugin_moves):
+                try:
+                    if os.path.lexists(_new) and not os.path.lexists(_old):
+                        os.makedirs(os.path.dirname(_old), exist_ok=True)
+                        _shutil.move(_new, _old)
+                        plog(f"  ↩ Moved plugin back to {os.path.relpath(os.path.dirname(_old), os.path.expanduser('~/CloudTAK'))}/")
+                except Exception as _ue:
+                    plog(f"  ⚠ Could not move plugin back ({_ue})")
+            _plugin_moves.clear()
 
         plog("━━━ Step 1/3: Resolving target release ━━━")
         # v10.1.17: version gate removed — every channel installs upstream latest
@@ -42210,6 +42246,7 @@ def run_cloudtak_update():
                         if _ob != plugins_base and (os.path.isdir(_old) or os.path.islink(_old)):
                             import shutil as _shutil
                             _shutil.move(_old, dest)
+                            _plugin_moves.append((_old, dest))
                             plog(f"  Moved plugin {p['name']} to {os.path.relpath(plugins_base, cloudtak_dir)}/ "
                                  f"(CloudTAK moved its web app)")
                             break
@@ -42295,6 +42332,7 @@ def run_cloudtak_update():
             _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)
             if not _gok:
                 plog(f"✗ Garage store setup failed: {_gerr}")
+                _undo_plugin_moves()
                 _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
                 plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -42324,6 +42362,7 @@ def run_cloudtak_update():
             dcc = _compose_cmd()
             if not dcc:
                 plog("✗ Neither `docker compose` nor `docker-compose` is available")
+                _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -42360,6 +42399,7 @@ def run_cloudtak_update():
                     plog(f"✗ Build/restart failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
+                    _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                     _cloudtak_update_failed_note(plog)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -42368,6 +42408,7 @@ def run_cloudtak_update():
                 proc.kill()
                 reader.join(timeout=5)
                 plog("✗ Build timed out after 90 minutes")
+                _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
