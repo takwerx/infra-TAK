@@ -1821,12 +1821,14 @@ _UPDATE_ERROR_RE = re.compile(
     r"refusing|did not|exit (code|status)|traceback|exception|✗|⚠)", re.I)
 
 
-def _update_error_line(text, limit=300):
+def _update_error_line(text, limit=600):
     """The line that actually says what went wrong, from a message or a whole log.
 
     Strips ANSI and pull/build progress, then takes the LAST line that reads like an error
     (the cause is at the end of compose output, not the head), else the last non-empty line.
-    Accepts a string or a list of log entries (str, or dicts carrying msg/message/text)."""
+    Accepts a string or a list of log entries (str, or dicts carrying msg/message/text).
+    600 chars, not 300: the W10b rollback note ("… (the tag pin was restored to v…)") rides at
+    the END of the message and is the part that tells a customer nothing changed."""
     if not text:
         return ''
     if isinstance(text, (list, tuple, deque)):

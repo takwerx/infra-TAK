@@ -378,3 +378,11 @@ def test_failed_update_restores_the_tag_pin_remotely():
     remote = body[:body.index("    ak_dir = os.path.expanduser('~/authentik')")]
     assert remote.index('_remote_prev = ') < remote.index("sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g'")
     assert remote.count('_remote_restore_pin()') >= 3      # def + pull failure + tag refusal
+
+
+def test_the_rollback_note_at_the_end_of_a_long_error_is_kept(h):
+    msg = ('Authentik pull/recreate failed (docker compose pull): Error response from daemon: failed to '
+           'resolve reference "ghcr.io/goauthentik/ldap:2026.8.3": failed to do request: Head "https://'
+           'ghcr.io/v2/goauthentik/ldap/manifests/2026.8.3": remote error: tls: internal error '
+           '(the tag pin was restored to v2026.5.7 (compose))')
+    assert h['_update_error_line'](msg).endswith('(the tag pin was restored to v2026.5.7 (compose))')
