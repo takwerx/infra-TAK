@@ -23229,8 +23229,13 @@ def guarddog_test_email():
             force=True   # a test that goes silent while paused looks like a broken relay
         )
         paused, _u = _gd_alerts_pause_state(settings)
+        # v10.2.8 W6 (GH #87): say "accepted", not "sent" — the relay cannot see delivery.
+        try:
+            _said = mod_registry.emailrelay.accepted_message(settings, to_addr)
+        except Exception:
+            _said = f'Test email handed to the relay for {to_addr}'
         return jsonify({'success': True,
-                        'message': f'Test email sent to {to_addr}'
+                        'message': _said
                                    + (' — note: alerts are currently PAUSED, so real alerts are not being delivered.'
                                       if paused else '')})
     except Exception as e:
@@ -38541,6 +38546,12 @@ def cloudtak_uninstall():
                                    capture_output=True, timeout=120)
                 if cloudtak_dir:
                     subprocess.run(_sudo_wrap(['rm', '-rf', cloudtak_dir]), capture_output=True, timeout=120)
+            # v10.2.8 W4: close what deploy opened (both target modes). After the teardown,
+            # so nothing is still listening behind a rule we leave; never aborts the uninstall.
+            try:
+                _cloudtak_close_firewall(cfg)
+            except Exception as _fwe:
+                print(f"cloudtak uninstall: firewall cleanup warning (continuing): {_fwe}", flush=True)
             cfg['deployed'] = False
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
@@ -39273,6 +39284,14 @@ MEDIA_PORT_SRT=18890
 """
 
 
+# v10.2.8 W2: the media-infra image the CloudTAK override pins on EVERY box. Multi-arch
+# (amd64 + arm64 in the ghcr index — verified 2026-10-08), so no arch branch and no on-box
+# arm64 build. If a future pin is amd64-only again, set MEDIA_INFRA_MULTIARCH = False and the
+# arm64 source build (_cloudtak_build_arm64_media) comes back into play.
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.11.0'
+MEDIA_INFRA_MULTIARCH = True
+
+
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
 
@@ -39390,10 +39409,9 @@ def _cloudtak_build_override_yml(settings):
             '    external: true\n'
         )
 
-    # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
-    media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
-                   if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
-                   else 'ghcr.io/dfpc-coe/media-infra:v9.7.0')
+    # media-infra pin — one fleet constant for both architectures since v10.2.8 W2; see the
+    # comment in the template below and MEDIA_INFRA_IMAGE.
+    media_image = MEDIA_INFRA_IMAGE
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -39433,20 +39451,15 @@ services:
     environment:
       API_URL: "http://api:5000"
   media:
-    # v10.1.8 W5: pin media-infra PAST upstream CloudTAK's v9.1.1 pin. v9.1.1's
-    # hls route fetch()es whatever the lease proxy URL is — an rtsp:// proxy hits
-    # undici "unknown scheme" → every RTSP-lease playback 500s once /stream is
-    # correctly routed to media-infra (W1). ≥v9.5 routes non-HLS proxies to
-    # MediaMTX's internal HLS instead. v9.7.0 = MediaMTX 1.19.2 (needs the
-    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). Field-proven
-    # test6 2026-07-24.
-    # W5e: ≥v9.2 ships amd64-ONLY — v9.1.1 is upstream's last arm64 build
-    # (verified against ghcr manifests 2026-07-24; an unconditional v9.7.0 pin
-    # crash-looped cloudtak-media on aws-arm: 'exec format error'). ARM stays
-    # pinned to v9.1.1: external-HLS leases work; RTSP-lease playback there
-    # remains the pre-existing 10.1.7 behavior — documented ARM caveat (same
-    # class as pmtiles). settings['arch'] is the LOCAL box arch; a REMOTE ARM
-    # CloudTAK target is out of the pin's scope (parked in PLAN-v10.1.8).
+    # infra-TAK pins media-infra itself (this override wins over CloudTAK's own pin).
+    # v10.2.8 W2: v9.11.0 on BOTH architectures — multi-arch since v9.8.0 (ghcr index
+    # carries amd64 + arm64, checked 2026-10-08), so ARM's old v9.1.1 pin and its
+    # RTSP-lease playback caveat are gone. Also picks up v9.9.0's fix for HLS proxy
+    # playback dying with "403 Invalid or expired signed URL" after 10 minutes, and
+    # MediaMTX 1.20.0. Our HLS tuning (mpegts, 3x500ms) is still applied over upstream's
+    # new `hlsVariant: fmp4` by _CT_MEDIA_APPLY_SH — a deliberate divergence (June A/B).
+    # History: v10.1.8 W5 pinned past CloudTAK's v9.1.1 (its hls route 500'd every
+    # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
     extra_hosts:
 {hosts_block}
@@ -39599,6 +39612,52 @@ true
 '''
 
 
+# v10.2.8 W4: every host-firewall rule CloudTAK puts on a box, in ONE place. Deploy, both
+# hardening passes and uninstall read these, so uninstall can close exactly what deploy
+# opened — before this, uninstall never touched the firewall (lutak2.net diagnostics: allows
+# for 5000/5002/9997 with nothing listening behind them).
+CLOUDTAK_FW_WEB = ((5000, 'tcp'), (5002, 'tcp'), (9997, 'tcp'))
+CLOUDTAK_FW_STREAM = ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp'))
+CLOUDTAK_FW_ALLOW = CLOUDTAK_FW_WEB + CLOUDTAK_FW_STREAM
+# _auto_harden_cloudtak()'s explicit denies (defense in depth). Only ufw holds them as rules;
+# on firewalld "denied" is simply "not opened" (see _fw_deny).
+CLOUDTAK_FW_DENY = (5000, 5002, 5003, 5433, 9000, 9002, 18888)
+
+
+def _cloudtak_close_firewall(cfg, log=None):
+    """v10.2.8 W4: uninstall closes what CloudTAK opened. Returns (closed, failed).
+
+    Every allow in CLOUDTAK_FW_ALLOW is removed on the CloudTAK target (local or remote,
+    ufw or firewalld — _module_fw picks), then, on a local ufw box, the hardening pass's
+    deny rules too, so the firewall reads as it did before CloudTAK. Deleting a rule that
+    is not there is a no-op. Never raises; a failure is reported, not fatal — the
+    containers are already gone by the time this runs.
+
+    9997 is CloudTAK's alone (Caddy's video vhost — no other module opens it; checked
+    2026-10-08). If that ever changes, take it out of CLOUDTAK_FW_WEB's uninstall here.
+    """
+    _log = log or (lambda m: print(m, flush=True))
+    closed, failed = [], []
+    for port, proto in CLOUDTAK_FW_ALLOW:
+        try:
+            ok, msg = _module_fw(cfg, 'remove', port, proto)
+        except Exception as e:
+            ok, msg = False, str(e)[:120]
+        (closed if ok else failed).append(f'{port}/{proto}' + ('' if ok else f' ({msg[:80]})'))
+    if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
+        for port in CLOUDTAK_FW_DENY:
+            try:
+                subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', 'deny', f'{port}/tcp']),
+                               capture_output=True, text=True, timeout=20)
+            except Exception:
+                pass
+    if closed:
+        _log(f"cloudtak uninstall: firewall closed {', '.join(closed)}")
+    if failed:
+        _log(f"cloudtak uninstall: \u26a0 firewall could not close {', '.join(failed)}")
+    return closed, failed
+
+
 def _cloudtak_open_stream_ports(log=None):
     """v10.1.8 W5: explicitly ALLOW CloudTAK's direct-streaming host ports. The
     port policy always classed RTSP 18554 / RTMP 11935 / SRT 18890 as Tier 1
@@ -39609,7 +39668,7 @@ def _cloudtak_open_stream_ports(log=None):
     clients that negotiate RTP over UDP."""
     _log = log or (lambda m: print(m, flush=True))
     opened = []
-    for port, proto in ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp')):
+    for port, proto in CLOUDTAK_FW_STREAM:
         ok, _msg = _fw_allow(port, proto)
         if ok:
             opened.append(f'{port}/{proto}')
@@ -40563,6 +40622,13 @@ def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
         return False
     import re as _re
     _log = plog or (lambda _m: None)
+    if MEDIA_INFRA_MULTIARCH:
+        # v10.2.8 W2: the override pins MEDIA_INFRA_IMAGE and wins over CloudTAK's own
+        # media pin, so building CloudTAK's tag from source here produced an image nothing
+        # ran (true since W5e pinned ARM to v9.1.1). The pinned image publishes arm64 —
+        # `up` pulls the native variant.
+        _log(f"  arm64: {MEDIA_INFRA_IMAGE} publishes an arm64 image — no source build needed")
+        return False
     if cloudtak_dir is None:
         cloudtak_dir = os.path.expanduser('~/CloudTAK')
     image_ref = None
@@ -41246,9 +41312,9 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _ppe:
             plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
 
-        # v10.0.1 (arm64 only): the media-infra image is amd64-only on ghcr; build it
-        # from source on-box and tag it as the pinned image so `up` uses the arm64
-        # build (no-op on amd64). Non-fatal — media is a non-core video proxy.
+        # v10.0.1 (arm64 only): build media-infra from source when the pinned image is
+        # amd64-only. No-op on amd64, and since v10.2.8 W2 a no-op on arm64 too while
+        # MEDIA_INFRA_MULTIARCH holds. Non-fatal — media is a non-core video proxy.
         try:
             _cloudtak_build_arm64_media(cloudtak_dir, plog=plog)
         except Exception as _me:
@@ -41433,15 +41499,17 @@ def run_cloudtak_deploy(cfg=None):
         #
         # compose_yml=None on purpose: a bare `docker compose pull` in cloudtak_dir
         # loads docker-compose.yml AND docker-compose.override.yml, exactly like the
-        # `up -d` below. The override re-pins media-infra (v9.7.0 on amd64) over the
-        # base file's v9.10.0, so an explicit `-f docker-compose.yml` would download
+        # `up -d` below. The override re-pins media-infra (MEDIA_INFRA_IMAGE) over the
+        # base file's own pin, so an explicit `-f docker-compose.yml` would download
         # a tag that never starts and skip the one that does.
         #
         # api/tiles/events/retention are built locally in Step 4 and carry no
         # `image:` key, so compose skips them by itself ("Skipped - No image to be
         # pulled") — verified on compose v5.5.0. They cost nothing here.
         _pull_services = None  # None = the whole project
-        if _host_arch() == 'arm64':
+        # v10.2.8 W2: only while the pinned media-infra is amd64-only. A multi-arch pin
+        # has no local build to protect, so ARM pre-pulls media like every other box.
+        if _host_arch() == 'arm64' and not MEDIA_INFRA_MULTIARCH:
             # media-infra is built FROM SOURCE and tagged as the pinned ref a few
             # steps above (_cloudtak_build_arm64_media) because dfpc-coe publishes
             # no arm64 image. `up -d` leaves that local tag alone — compose's default
@@ -41559,8 +41627,8 @@ def run_cloudtak_deploy(cfg=None):
         # firewall-cmd onto the console PATH on every platform, so `which firewall-cmd`
         # mis-detects on Debian (and bare `ufw` errors on RHEL). Drive the firewall
         # through _fw_allow() instead of raw ufw + `which firewall-cmd`.
-        for _p in (5000, 5002, 9997):
-            _fw_allow(_p, 'tcp')
+        for _p, _pr in CLOUDTAK_FW_WEB:
+            _fw_allow(_p, _pr)
         plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
@@ -47628,8 +47696,8 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', se
     exactly what a bare `docker compose up -d` in that directory would load —
     base file PLUS `docker-compose.override.yml`. Pass None wherever the caller's
     `up` is itself overrideless, or the pull and the start disagree about which
-    image is meant: CloudTAK's override re-pins media-infra (v9.7.0/v9.1.1) over
-    the base file's v9.10.0, so pulling with an explicit `-f docker-compose.yml`
+    image is meant: CloudTAK's override re-pins media-infra (MEDIA_INFRA_IMAGE) over
+    the base file's own pin, so pulling with an explicit `-f docker-compose.yml`
     would fetch a tag that never gets started and skip the one that does.
 
     `services` restricts the pull to named services. Build-only services are
@@ -78460,6 +78528,34 @@ def _running_tak_jvm_version():
         return ''
 
 
+def _java_alternative_state(fam=None):
+    """('manual'|'auto'|'', current_target) for the box-wide `java` alternative.
+
+    Read UNPRIVILEGED — both tools answer a query as any user — so this never goes near the
+    broker and never leaves a line in its audit log (v10.2.8 W5a). Debian:
+    `update-alternatives --query java` → `Status: manual` / `Value: <path>`. RHEL:
+    `alternatives --display java` → `java - status is auto.` / ` link currently points to <path>`
+    (read on nuc, 2026-10-08). ('', '') when neither answers.
+    """
+    fam = fam or _distro_family()
+    try:
+        if fam == 'debian':
+            r = subprocess.run(['update-alternatives', '--query', 'java'],
+                               capture_output=True, text=True, timeout=15)
+            out = r.stdout or ''
+            st = re.search(r'^Status:\s*(\S+)', out, re.MULTILINE)
+            val = re.search(r'^Value:\s*(\S+)', out, re.MULTILINE)
+        else:
+            r = subprocess.run(['alternatives', '--display', 'java'],
+                               capture_output=True, text=True, timeout=15)
+            out = r.stdout or ''
+            st = re.search(r'status is (\w+)', out)
+            val = re.search(r'link currently points to\s+(\S+)', out)
+        return ((st.group(1).lower() if st else ''), (val.group(1) if val else ''))
+    except Exception:
+        return '', ''
+
+
 def _pin_takserver_jvm(plog=None):
     """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
 
@@ -78575,7 +78671,32 @@ def _pin_takserver_jvm(plog=None):
     #    that could reach the console repoint the system java, which is a far worse primitive
     #    than the problem it solves. So: try, verify, and report honestly. A warning here must
     #    never read as "the JVM pin failed", because it did not.
+    #
+    #    v10.2.8 W5a: READ FIRST, unprivileged, and never ask the broker. Until 10.2.8 this
+    #    step called `--set` through the broker on every console start. On a PERMISSIVE
+    #    broker that is a WOULD-DENY each time (test8 x64, test12 x44 by 2026-10-08), and
+    #    the broker only enforces after 72 h with NO WOULD-DENY — while the console restarts
+    #    at least daily. So since v10.1.63 no permissive native-TAK box could ever reach
+    #    ENFORCE, even after the operator opted in. Our own defense in depth was holding the
+    #    real control off.
     alt = 'update-alternatives' if fam == 'debian' else 'alternatives'
+    alt_status, alt_value = _java_alternative_state(fam)
+    if alt_status == 'manual' and alt_value and \
+            os.path.realpath(alt_value) == os.path.realpath(jbin):
+        if changed:
+            _log(f"✓ TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+                 f"Takes effect on the next TAK Server restart.")
+        return {'java_home': home, 'changed': changed}
+    if _broker_should_route() and _broker_available():
+        _log(f"ℹ box-wide java alternative is not managed on a broker-mediated console "
+             f"(by design — currently {alt_status or 'unknown'}"
+             f"{', ' + alt_value if alt_value else ''}). TAK Server is pinned to JDK 17 by its "
+             f"/opt/tak/setenv.sh entry, which its launchers source before invoking java — so "
+             f"this does not depend on /usr/bin/java.")
+        if changed:
+            _log(f"✓ TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+                 f"Takes effect on the next TAK Server restart.")
+        return {'java_home': home, 'changed': changed}
     alt_err = ''
     try:
         r = subprocess.run(_sudo_wrap([alt, '--set', 'java', jbin]),
@@ -79125,7 +79246,9 @@ def _startup_ensure_broker():
             f'ExecStart={venv_py} {broker_py} serve\n'
             'Restart=always\n'
             'RestartSec=2\n'
-            'RuntimeMaxSec=24h\n'
+            # v10.2.8 W3: NO RuntimeMaxSec. systemd's stop SIGTERMs the whole cgroup, so
+            # the daily limit killed brokered builds mid-run; the broker now recycles
+            # itself once a day when idle (takwerx_broker._recycle_watch).
             'Environment=PYTHONUNBUFFERED=1\n'
             f'{enforce_line}'
             '\n'
@@ -85826,23 +85949,26 @@ def _post_update_auto_deploy():
                     # URL it builds; see generate_caddyfile). The cloudtak-media
                     # container still publishes 9997 on 127.0.0.1 ONLY, so allowing the
                     # port exposes Caddy (auth-gated, cert-fronted), not the container.
+                    #
+                    # v10.2.8 W4b: through the ufw↔firewalld shims. Until 10.2.8 this ran a
+                    # bare `ufw` — on RHEL the broker shim has no ufw behind it, so every
+                    # deny and the 9997 allow silently did nothing while the line below
+                    # still printed "rules applied".
                     try:
-                        for _port in ('5000/tcp', '5002/tcp', '5003/tcp',
-                                      '5433/tcp', '9000/tcp', '9002/tcp',
-                                      '18888/tcp'):
-                            subprocess.run(
-                                _sudo_wrap(['ufw', 'deny', _port]), capture_output=True, timeout=10
-                            )
+                        _be = _fw_backend()
+                        for _port in CLOUDTAK_FW_DENY:
+                            _fw_deny(_port, 'tcp')
                         # Flip 9997 from deny→allow: delete any legacy deny rule first
                         # (ufw is first-match, so an older `deny 9997` would shadow a
                         # newly-appended allow), then allow inbound to Caddy's listener.
-                        subprocess.run(
-                            _sudo_wrap(['ufw', 'delete', 'deny', '9997/tcp']), capture_output=True, timeout=10
-                        )
-                        subprocess.run(
-                            _sudo_wrap(['ufw', 'allow', '9997/tcp']), capture_output=True, timeout=10
-                        )
-                        print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
+                        # firewalld has no deny rules, so the delete is ufw-only.
+                        if _be == 'ufw':
+                            subprocess.run(
+                                _sudo_wrap(['ufw', 'delete', 'deny', '9997/tcp']), capture_output=True, timeout=10
+                            )
+                        _fw_allow(9997, 'tcp')
+                        print(f"  CloudTAK firewall rules applied via {_be or 'no firewall'} "
+                              f"(deny {','.join(str(p) for p in CLOUDTAK_FW_DENY)}; allow 9997 for Caddy video)")
                         _cloudtak_open_stream_ports()
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
@@ -86162,8 +86288,9 @@ def _post_update_auto_deploy():
 # v10.1.13: make broker fixes ride Update Now. The broker daemon executes
 # broker/takwerx_broker.py from THIS repo (start.sh unit ExecStart), so a console
 # update already puts new broker source on disk — but the RUNNING daemon keeps the
-# old code and old rulebook until something restarts it (RuntimeMaxSec=24h bounds
-# that on newer units; older units run stale forever). That is how a box ends up
+# old code and old rulebook until something restarts it (the broker's own daily idle
+# recycle bounds that since v10.2.8 — RuntimeMaxSec=24h did before; older units run stale
+# forever). That is how a box ends up
 # with a console issuing operations its own broker denies (field report
 # 2026-07-28: privileged actions failing across modules on a non-root box).
 # Compare the daemon's running-source sha (ping.src_sha) with the repo file and

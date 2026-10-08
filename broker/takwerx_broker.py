@@ -249,6 +249,13 @@ EXEC_ALLOW = {
     # xfs_growfs/resize2fs) are deliberately NOT here — they are reachable only
     # through the fixed-shape `disk_reclaim` op below, never as free-form argv.
     'lvs', 'vgs', 'pvs', 'findmnt', 'lsblk',
+    # v10.2.8 W5b: `pg_lsclusters --no-header` (the TAK 5.8 pre-flight's own cluster
+    # check). Read-only listing; it MUST run as root — as the console user it cannot
+    # read /etc/postgresql/*/main/postgresql.conf and answers `15 main <unknown> down`
+    # for a cluster that is online (test6/test12, 2026-10-08): a silently wrong
+    # answer, not an error. Gated to that exact argv (see _check_pg_lsclusters).
+    # Without it every pre-flight run left a WOULD-DENY that holds ENFORCE off 72 h.
+    'pg_lsclusters',
     # v10.1.0: `wg show …` is read-only WireGuard inspection (relay tunnel status /
     # handshake age for the connectivity anchor + Guard Dog relay health). Gated to
     # the `show` subcommand only — `wg set`/`setconf`/`genkey` are denied (see
@@ -715,6 +722,8 @@ def check_exec(argv, cwd=None):
         _check_nmcli(argv)
     elif base == 'wg':
         _check_wg(argv)
+    elif base == 'pg_lsclusters':
+        _check_pg_lsclusters(argv)
     elif base == 'wpa_cli':
         _check_wpa_cli(argv)
     elif base == 'chown':
@@ -798,6 +807,15 @@ def _check_wg(argv):
     if len(argv) >= 2 and argv[1] == 'show':
         return
     raise Denied('wg: only `wg show` is allowed')
+
+
+def _check_pg_lsclusters(argv):
+    """pg_lsclusters: exactly `pg_lsclusters --no-header` (v10.2.8 W5b). Read-only, but
+    gated to the one shape the console issues — `-s` / `--json` / anything else is
+    denied rather than reasoned about."""
+    if list(argv[1:]) == ['--no-header']:
+        return
+    raise Denied('pg_lsclusters: only `pg_lsclusters --no-header` is allowed')
 
 
 def _check_netplan(argv):
@@ -2831,6 +2849,15 @@ def _dispatch(req, peer):
 
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self):
+        # v10.2.8 W3: every request is counted while it runs, so the daily recycle can
+        # wait for an idle moment instead of killing work in flight (_recycle_watch).
+        _inflight_add(1)
+        try:
+            self._handle()
+        finally:
+            _inflight_add(-1)
+
+    def _handle(self):
         conn = self.request
         peer = _peercred(conn)
         if not _allowed_peer(peer[1]):
@@ -3097,6 +3124,89 @@ def _selinux_policy_converge():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# v10.2.8 W3: recycle once a day — but only when idle
+# ---------------------------------------------------------------------------
+# Until 10.2.8 the unit carried `RuntimeMaxSec=24h`, so systemd stopped the broker every
+# 24 h whatever it was doing. A stop SIGTERMs the whole cgroup, children included, so a
+# brokered `docker compose build` that spanned the moment died with it (T&E 2026-10-08,
+# test6: "Service reached runtime time limit" cut a CloudTAK build 30 s in → the console
+# saw `cannot reach broker: Expecting value` → exit 125). Draining on SIGTERM cannot fix
+# that — the child is already signalled. So the unit no longer has a runtime limit and the
+# broker recycles itself: after RECYCLE_AFTER_SECS of uptime it waits for a moment with no
+# request in flight, stops accepting, and exits 0; `Restart=always` brings it back in 2 s
+# (the same window the old recycle had). Code staleness stays bounded separately — the
+# console restarts the broker whenever its source hash changes.
+RECYCLE_AFTER_SECS = 24 * 3600
+RECYCLE_POLL_SECS = 5
+RECYCLE_NOTE_SECS = 3600        # how often a deferred recycle says so in the audit log
+RECYCLE_DRAIN_MAX_SECS = 6 * 3600
+
+_INFLIGHT = 0
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _inflight_add(n):
+    global _INFLIGHT
+    with _INFLIGHT_LOCK:
+        _INFLIGHT += n
+        return _INFLIGHT
+
+
+def _inflight():
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT
+
+
+def _recycle_after_secs():
+    """RECYCLE_AFTER_SECS, unless TAKWERX_BROKER_RECYCLE_SECS is set. That variable is a
+    TEST HOOK for the T&E drill only (a unit drop-in, root-written) — never a fleet knob;
+    floored at 60 s so a typo cannot turn the broker into a restart loop."""
+    v = os.environ.get('TAKWERX_BROKER_RECYCLE_SECS', '').strip()
+    if not v:
+        return RECYCLE_AFTER_SECS
+    try:
+        return max(60, int(v))
+    except ValueError:
+        return RECYCLE_AFTER_SECS
+
+
+def _recycle_watch(srv, after, started, clock=time.monotonic, sleep=time.sleep,
+                   poll=RECYCLE_POLL_SECS, note_every=RECYCLE_NOTE_SECS, log=None):
+    """Stop `srv` once uptime >= `after` AND nothing is in flight. Returns 'idle'.
+
+    `srv.shutdown()` only stops the accept loop; requests already accepted keep running,
+    and serve() waits for them before it exits — so the in-flight count can only fall
+    after this decides."""
+    log = log or (lambda summary: AUDIT and AUDIT.info(json.dumps(
+        {'op': 'recycle', 'verdict': 'INFO', 'summary': summary})))
+    last_note = None
+    while True:
+        sleep(poll)
+        up = clock() - started
+        if up < after:
+            continue
+        n = _inflight()
+        if n == 0:
+            log('recycle: idle after %.1fh uptime — exiting for a clean restart' % (up / 3600.0))
+            srv.shutdown()
+            return 'idle'
+        now = clock()
+        if last_note is None or now - last_note >= note_every:
+            log('recycle deferred: %d request(s) in flight' % n)
+            last_note = now
+
+
+def _drain(max_secs=RECYCLE_DRAIN_MAX_SECS, clock=time.monotonic, sleep=time.sleep):
+    """Wait for in-flight requests to finish (bounded). True when drained."""
+    t0 = clock()
+    while _inflight() > 0:
+        if clock() - t0 >= max_secs:
+            return False
+        sleep(1)
+    return True
+
+
 def serve():
     global AUDIT, ENFORCE, ENFORCE_INFO
     if os.geteuid() != 0:
@@ -3136,15 +3246,33 @@ def serve():
     # take tens of seconds; the console's boot ping must not wait on it).
     threading.Thread(target=_selinux_policy_converge, daemon=True,
                      name='selinux-policy-converge').start()
+    _after = _recycle_after_secs()
+    threading.Thread(target=_recycle_watch, args=(srv, _after, time.monotonic()),
+                     daemon=True, name='recycle-watch').start()
+    if _after != RECYCLE_AFTER_SECS:
+        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                               'summary': 'recycle threshold overridden to %ds '
+                                          '(TAKWERX_BROKER_RECYCLE_SECS test hook)' % _after}))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        # Unlink first so a new client fails fast (ENOENT) instead of waiting in the
+        # backlog of a socket nobody will accept on; then let accepted work finish.
         try:
             os.unlink(SOCKET_PATH)
         except OSError:
             pass
+        try:
+            srv.server_close()
+        except OSError:
+            pass
+        if not _drain():
+            AUDIT.info(json.dumps({'op': 'recycle', 'verdict': 'ERROR',
+                                   'summary': 'recycle: %d request(s) still running after '
+                                              '%ds — exiting anyway' % (_inflight(),
+                                                                        RECYCLE_DRAIN_MAX_SECS)}))
     return 0
 
 

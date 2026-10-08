@@ -371,3 +371,43 @@ def test_the_name_returning_wrapper_keeps_its_contract(authentik):
     authentik(FakeAuthentik(fail=('core/applications',)))
 
     assert atlas.ensure_agency_admin_group(None, CORONA, 'http://ak', {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# v10.2.8 (PR #89 review): a binding that admits nobody is not "present"
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize('binding', [
+    {'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False},
+    {'pk': 'b1', 'group': 'g9', 'order': 10, 'negate': True},
+    {'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False, 'negate': True},
+])
+def test_a_disabled_or_negated_binding_is_a_problem_not_a_pass(authentik, binding):
+    """⚠️ It passed before: any binding naming the group counted, so the tile
+    said OK while every member of the group was turned away."""
+    fake = authentik(FakeAuthentik(
+        groups=[{'name': 'atlas-corona-admins', 'is_superuser': False, 'pk': 'g9'}],
+        bindings=[binding]))
+    ctx = make_ctx()
+
+    atlas._reconcile_agency_group(ctx, CORONA, lambda _m: None)
+
+    assert recorded(ctx)['status'] == 'failed'
+    assert 'disabled or negated' in recorded(ctx)['detail']
+    # ⚠️ Never repaired from here: somebody switched it off in Authentik.
+    assert fake.posted == []
+    said = atlas.agency_group_problem(ctx['_store']['s'], CORONA)
+    assert said and 'disabled or negated' in said
+
+
+def test_one_live_binding_beside_a_disabled_one_is_present(authentik):
+    authentik(FakeAuthentik(
+        groups=[{'name': 'atlas-corona-admins', 'is_superuser': False, 'pk': 'g9'}],
+        bindings=[{'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False},
+                  {'pk': 'b2', 'group': 'g9', 'order': 11, 'enabled': True}]))
+    ctx = make_ctx()
+
+    atlas._reconcile_agency_group(ctx, CORONA, lambda _m: None)
+
+    assert recorded(ctx)['status'] == 'present'

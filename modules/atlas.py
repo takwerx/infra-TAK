@@ -1915,8 +1915,20 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
         app = api('core/applications/%s/' % names['authentik_slug'])
         target = app['pk']
         bindings = api('policies/bindings/?target=%s&page_size=100' % target)
-        if any(str(b.get('group')) == str(group_pk)
-               for b in bindings.get('results', [])):
+        ours = [b for b in bindings.get('results', [])
+                if str(b.get('group')) == str(group_pk)]
+        # ⚠️ A binding that is there but disabled or negated admits nobody — the
+        # exact silent state this check exists to surface — so it is not
+        # "present". And it is NOT re-enabled here: somebody switched it off in
+        # Authentik, and that is their decision to undo (v10.2.8, PR #89 review).
+        if ours and not any(b.get('enabled', True) and not b.get('negate')
+                            for b in ours):
+            detail = ('"%s" is bound to this deployment, but the binding is '
+                      'disabled or negated in Authentik — its members are '
+                      'turned away until it is re-enabled there' % group_name)
+            log('  ⚠ ' + detail)
+            return outcome('failed', detail)
+        if ours:
             log('  ✓ "%s" already admitted to this deployment' % group_name)
             return outcome('created' if created else 'present')
         api('policies/bindings/', {
