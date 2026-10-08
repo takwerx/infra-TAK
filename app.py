@@ -39628,9 +39628,17 @@ true
 # hardening passes and uninstall read these, so uninstall can close exactly what deploy
 # opened — before this, uninstall never touched the firewall (lutak2.net diagnostics: allows
 # for 5000/5002/9997 with nothing listening behind them).
-CLOUDTAK_FW_WEB = ((5000, 'tcp'), (5002, 'tcp'), (9997, 'tcp'))
+#
+# 5000/5002 are NOT opened any more (T&E pre-flight 2026-10-08): deploy binds api/tiles to
+# 127.0.0.1 a few steps earlier (_patch_cloudtak_compose_ports, Tier 3), so an allow there
+# reaches nothing — and because ufw keys rules by (port, proto) and ignores the action, that
+# dead allow also stopped the hardening pass's `deny` from ever landing (test12 after a fresh
+# deploy: 5000/5002 ALLOW; test6/test8: DENY). Older deploys still carry it, so uninstall
+# and the hardening pass remove it (CLOUDTAK_FW_LEGACY_ALLOW).
+CLOUDTAK_FW_WEB = ((9997, 'tcp'),)
 CLOUDTAK_FW_STREAM = ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp'))
-CLOUDTAK_FW_ALLOW = CLOUDTAK_FW_WEB + CLOUDTAK_FW_STREAM
+CLOUDTAK_FW_LEGACY_ALLOW = ((5000, 'tcp'), (5002, 'tcp'))
+CLOUDTAK_FW_ALLOW = CLOUDTAK_FW_WEB + CLOUDTAK_FW_STREAM + CLOUDTAK_FW_LEGACY_ALLOW
 # _auto_harden_cloudtak()'s explicit denies (defense in depth). Only ufw holds them as rules;
 # on firewalld "denied" is simply "not opened" (see _fw_deny).
 CLOUDTAK_FW_DENY = (5000, 5002, 5003, 5433, 9000, 9002, 18888)
@@ -41630,7 +41638,8 @@ def run_cloudtak_deploy(cfg=None):
         _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog, fresh=True)
         plog("✓ Restart complete.")
 
-        # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
+        # v10.2.8 W4: 9997 only — api 5000 / tiles 5002 are bound to 127.0.0.1 above, so the old
+        # "open 5000/5002 so http://ip:5000 works" allow reached nothing (see CLOUDTAK_FW_WEB).
         # 9997 (v0.9.48): Caddy fronts the CloudTAK video vhost on :9997 (CloudTAK hardcodes
         # that port for every media URL); allow it now so a fresh install works without
         # waiting for the next console-update _auto_harden_cloudtak() pass. The media
@@ -41641,7 +41650,7 @@ def run_cloudtak_deploy(cfg=None):
         # through _fw_allow() instead of raw ufw + `which firewall-cmd`.
         for _p, _pr in CLOUDTAK_FW_WEB:
             _fw_allow(_p, _pr)
-        plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
+        plog("✓ Firewall: port 9997 (Caddy video) opened — CloudTAK's own ports stay loopback-only")
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
@@ -85969,6 +85978,11 @@ def _post_update_auto_deploy():
                     try:
                         _be = _fw_backend()
                         for _port in CLOUDTAK_FW_DENY:
+                            # ufw keys a rule by (port, proto), not action: a `deny` on a port
+                            # that already has an `allow` (every deploy before 10.2.8 added one
+                            # for 5000/5002) is skipped, so delete the allow first.
+                            if _be == 'ufw':
+                                _fw_remove(_port, 'tcp')
                             _fw_deny(_port, 'tcp')
                         # Flip 9997 from deny→allow: delete any legacy deny rule first
                         # (ufw is first-match, so an older `deny 9997` would shadow a

@@ -113,3 +113,24 @@ def test_hardening_pass_has_no_bare_ufw_deny_or_allow():
     assert "['ufw', 'deny'" not in code
     assert "['ufw', 'allow'" not in code
     assert '_fw_deny(_port' in code and '_fw_allow(9997' in code
+
+
+def test_deploy_no_longer_opens_the_loopback_only_ports():
+    """T&E pre-flight 2026-10-08: test12 after a fresh deploy had 5000/5002 ALLOW (test6/test8
+    DENY). api/tiles are bound to 127.0.0.1 by deploy, so the allow reached nothing — and ufw
+    ignores the action when matching, so it also blocked the harden pass's deny."""
+    ns = {}
+    exec(compile(_module_ns(), 'app.py', 'exec'), ns)
+    web = {p for p, _ in ns['CLOUDTAK_FW_WEB']}
+    assert web == {9997}
+    # legacy allows from older deploys are still closed on uninstall
+    assert {(5000, 'tcp'), (5002, 'tcp')} <= set(ns['CLOUDTAK_FW_ALLOW'])
+
+
+def test_hardening_deletes_a_legacy_allow_before_denying_on_ufw():
+    start = APP.index('def _auto_harden_cloudtak():')
+    body = APP[start:start + 40000]
+    body = re.sub(r'#.*', '', body[:body.index('# 7. Recreate the stack only if clean')])
+    loop = body[body.index('for _port in CLOUDTAK_FW_DENY:'):]
+    assert loop.index("_fw_remove(_port, 'tcp')") < loop.index("_fw_deny(_port, 'tcp')")
+    assert "if _be == 'ufw':" in loop[:loop.index("_fw_remove(_port, 'tcp')")]
