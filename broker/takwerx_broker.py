@@ -3137,7 +3137,10 @@ def _selinux_policy_converge():
 # request in flight, stops accepting, and exits 0; `Restart=always` brings it back in 2 s
 # (the same window the old recycle had). Code staleness stays bounded separately — the
 # console restarts the broker whenever its source hash changes.
-RECYCLE_AFTER_SECS = 24 * 3600
+# 23 h, not 24: a box that took this release still runs under the OLD unit's
+# RuntimeMaxSec=24h until _converge_own_unit() lands, and the idle recycle must win that
+# race whenever the broker is idle.
+RECYCLE_AFTER_SECS = 23 * 3600
 RECYCLE_POLL_SECS = 5
 RECYCLE_NOTE_SECS = 3600        # how often a deferred recycle says so in the audit log
 RECYCLE_DRAIN_MAX_SECS = 6 * 3600
@@ -3197,6 +3200,41 @@ def _recycle_watch(srv, after, started, clock=time.monotonic, sleep=time.sleep,
             last_note = now
 
 
+# Lines this broker removes from its OWN unit at startup. Nothing else in the unit is
+# touched — in particular the TAKWERX_BROKER_ENFORCE line start.sh writes.
+OWN_UNIT_DROP_PREFIXES = ('RuntimeMaxSec=',)
+
+
+def _converge_own_unit(unit_path=BROKER_UNIT, run=None):
+    """v10.2.8 W3: drop `RuntimeMaxSec=` from this broker's own unit, then daemon-reload.
+
+    The console cannot do it: on a non-root box `_startup_ensure_broker()` writes the
+    unit with a raw open(), which fails as `takwerx` (and the rulebook refuses writes to
+    the broker's unit, on purpose). Measured on test6, 2026-10-08: the unit was last
+    written 2026-07-01 and still carried RuntimeMaxSec=24h after the console took the
+    release. The broker runs as root and owns this file, so it converges it itself —
+    no request-driven op, no new surface. Returns True when it changed the unit.
+    """
+    run = run or subprocess.run
+    try:
+        with open(unit_path) as f:
+            cur = f.read()
+    except OSError:
+        return None
+    lines = cur.splitlines(keepends=True)
+    keep = [ln for ln in lines if not ln.strip().startswith(OWN_UNIT_DROP_PREFIXES)]
+    if len(keep) == len(lines):
+        return False
+    tmp = unit_path + '.takwerx-tmp'
+    with open(tmp, 'w') as f:
+        f.write(''.join(keep))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, unit_path)
+    systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
+    run([systemctl, 'daemon-reload'], capture_output=True, timeout=60)
+    return True
+
+
 def _drain(max_secs=RECYCLE_DRAIN_MAX_SECS, clock=time.monotonic, sleep=time.sleep):
     """Wait for in-flight requests to finish (bounded). True when drained."""
     t0 = clock()
@@ -3246,6 +3284,14 @@ def serve():
     # take tens of seconds; the console's boot ping must not wait on it).
     threading.Thread(target=_selinux_policy_converge, daemon=True,
                      name='selinux-policy-converge').start()
+    try:
+        if _converge_own_unit():
+            AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                                   'summary': 'own unit converged: RuntimeMaxSec removed '
+                                              '(daily recycle is idle-only now) + daemon-reload'}))
+    except Exception as e:  # noqa: BLE001 — never let a unit tidy-up stop the broker
+        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
+                               'summary': 'own unit converge failed: %s' % e}))
     _after = _recycle_after_secs()
     threading.Thread(target=_recycle_watch, args=(srv, _after, time.monotonic()),
                      daemon=True, name='recycle-watch').start()

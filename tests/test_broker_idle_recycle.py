@@ -137,13 +137,14 @@ def test_handler_counts_every_request_even_on_error():
 def test_recycle_threshold_test_hook(monkeypatch):
     b = _broker()
     monkeypatch.delenv('TAKWERX_BROKER_RECYCLE_SECS', raising=False)
-    assert b._recycle_after_secs() == 24 * 3600
+    # 23 h: beats an old unit's RuntimeMaxSec=24h until the unit converge lands
+    assert b._recycle_after_secs() == 23 * 3600
     monkeypatch.setenv('TAKWERX_BROKER_RECYCLE_SECS', '300')
     assert b._recycle_after_secs() == 300
     monkeypatch.setenv('TAKWERX_BROKER_RECYCLE_SECS', '1')       # floored: no restart loop
     assert b._recycle_after_secs() == 60
     monkeypatch.setenv('TAKWERX_BROKER_RECYCLE_SECS', 'nope')
-    assert b._recycle_after_secs() == 24 * 3600
+    assert b._recycle_after_secs() == 23 * 3600
 
 
 def test_no_runtime_limit_in_either_broker_unit_writer():
@@ -166,3 +167,44 @@ def test_pg_lsclusters_is_exact_argv_only():
                 ['pg_lsclusters', '--no-header;id']):
         with pytest.raises(b.Denied):
             b.check_exec(bad)
+
+
+UNIT = """[Unit]
+Description=infra-TAK privileged broker (least-privilege console mediation)
+
+[Service]
+Type=simple
+ExecStart=/opt/infratak/.venv/bin/python3 /opt/infratak/broker/takwerx_broker.py serve
+Restart=always
+RestartSec=2
+RuntimeMaxSec=24h
+Environment=PYTHONUNBUFFERED=1
+Environment=TAKWERX_BROKER_ENFORCE=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def test_broker_drops_only_its_runtime_limit_from_its_own_unit(tmp_path):
+    """test6, 2026-10-08: the unit was last written 2026-07-01 — a non-root console cannot
+    rewrite it, so the RuntimeMaxSec removal never arrived. The broker (root) does it."""
+    b = _broker()
+    unit = tmp_path / 'takwerx-broker.service'
+    unit.write_text(UNIT)
+    ran = []
+    assert b._converge_own_unit(str(unit), run=lambda argv, **k: ran.append(argv)) is True
+    out = unit.read_text()
+    assert 'RuntimeMaxSec' not in out
+    assert out == UNIT.replace('RuntimeMaxSec=24h\n', '')        # nothing else moved
+    assert 'Environment=TAKWERX_BROKER_ENFORCE=1' in out
+    assert ran and ran[0][-1] == 'daemon-reload'
+    # idempotent: a converged unit is left alone, no reload
+    ran.clear()
+    assert b._converge_own_unit(str(unit), run=lambda argv, **k: ran.append(argv)) is False
+    assert ran == []
+
+
+def test_missing_unit_is_not_an_error(tmp_path):
+    b = _broker()
+    assert b._converge_own_unit(str(tmp_path / 'absent.service'), run=lambda *a, **k: None) is None
