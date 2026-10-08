@@ -48,6 +48,11 @@ def ns(tmp_path):
          '_TAK_UPDATE_HISTORY_KEEP': 5, '_TAK_UPDATE_HISTORY_LINES': 400,
          '_TAK_UPDATE_HISTORY_LOCK': threading.Lock(),
          'upgrade_status': {'running': False}, 'tak58_status': {'running': False}}
+    # v10.2.8 W10: the factory also records the outcome for the card + Diagnostics
+    n['w10'] = []
+    n['_mod_result_start'] = lambda *a, **k: n['w10'].append(('start',) + a)
+    n['_tracked_finish'] = lambda module, status, log, exc=None, kind='update': n['w10'].append(
+        ('finish', module, bool(status.get('error')) or exc is not None))
     for f in ('_tak_update_history', '_tak_update_record', '_tak_update_job', '_diag_tak_update_history'):
         exec(compile(_cut(f), 'app.py:' + f, 'exec'), n)
     return n
@@ -134,3 +139,13 @@ def test_history_is_in_the_redacted_report():
     assert 'out.extend(_diag_tak_update_history())' in body            # installed boxes
     assert "['TAK Server not installed on this box'] + _diag_tak_update_history()" in body
     assert re.search(r"return _diag_redact\('\\n'\.join\(parts\), settings\)", APP)
+
+
+def test_the_factory_also_feeds_the_w10_record(ns):
+    """v10.2.8 W10: every TAK update variant lands on the card and in Diagnostics too."""
+    status, log = {'running': True}, []
+    job = ns['_tak_update_job']('5.8 migration', _worker(['✗ pg_upgrade failed'], status,
+                                                         {'running': False, 'error': True}), log, status)
+    job('takserver-5.8.zip', log=log, status_=status)
+    assert ns['w10'][0][:2] == ('start', 'takserver')
+    assert ns['w10'][-1] == ('finish', 'takserver', True)

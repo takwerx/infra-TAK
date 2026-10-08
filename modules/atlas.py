@@ -4554,6 +4554,30 @@ def _reconcile_access(ctx, inst, plog):
     _reconcile_agency_group(ctx, inst, plog)
 
 
+def _run_update_recorded(ctx, inst=None):
+    """v10.2.8 W10: _run_update, with its outcome recorded through the console's seam (card +
+    Diagnostics). One record per deployment: `atlas` for the plain one, `atlas-<slug>` for an
+    agency. The slot is read at the END, never captured up front."""
+    start, finish = ctx.get('mod_result_start'), ctx.get('tracked_finish')
+    name = 'atlas' + (('-' + inst['slug']) if inst and inst.get('slug') else '')
+    if callable(start):
+        try:
+            frm = _installed_version(ctx, inst) or ''
+        except Exception:
+            frm = ''
+        start(name, 'update', frm, '')
+    exc = None
+    try:
+        return _run_update(ctx, inst)
+    except Exception as e:
+        exc = e
+        raise
+    finally:
+        if callable(finish):
+            slot = _update_slot(inst)
+            finish(name, slot, slot.get('log'), exc=exc)
+
+
 def _run_update(ctx, inst=None):
     """Fetch the newest release and rebuild in place. Data is never touched.
 
@@ -4745,7 +4769,7 @@ def _run_update_all(ctx):
                 _update_all_status['results'] = list(results)
                 continue
             plog('━━━ ' + name + ' ━━━')
-            _run_update(ctx, inst)
+            _run_update_recorded(ctx, inst)     # v10.2.8 W10: per-deployment record
             slot = _update_slot(inst)
             for line in slot['log']:
                 log.append('    ' + line)
@@ -5566,7 +5590,7 @@ def register(ctx):
             return jsonify({'success': False,
                             'error': 'An update of every deployment is already '
                                      'running'})
-        threading.Thread(target=_run_update, args=(ctx, inst),
+        threading.Thread(target=_run_update_recorded, args=(ctx, inst),
                          daemon=True).start()
         return jsonify({'success': True})
 

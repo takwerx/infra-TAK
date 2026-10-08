@@ -385,6 +385,7 @@ function takPurgeFailed(){
 <button type="button" id="tak-update-btn" onclick="startTakUpdate()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;cursor:pointer">Update TAK Server</button>
 <span id="tak-update-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('takserver') }}
 <div id="upgrade-log-wrap" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};margin-top:20px">
 <div class="section-title">Update log</div>
 <div id="upgrade-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if upgrading %}Connecting...{% else %}{% if upgrade_done %}Done.{% elif upgrade_error %}Update failed.{% endif %}{% endif %}</div>

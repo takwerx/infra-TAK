@@ -86,6 +86,7 @@
   <div class="log-box" id="updateLogBox"></div>
 </div>
 {% endif %}
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('tvr') }}
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
   <div class="card" style="margin-bottom:0">
     <div class="card-title">Status</div>

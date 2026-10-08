@@ -63,6 +63,7 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
 {% block content %}
 <div class="main">
   <h1 class="section-title"><img src="/static/logos/atlas-banner.png" alt="ATLAS MDM" class="atlas-banner"></h1>
+  {% from '_module_result.html' import last_update_result %}{% if module_results_failing is defined %}{% for _m in module_results_failing('atlas') %}{{ last_update_result(_m, label=('update of ' ~ _m)) }}{% endfor %}{% endif %}
 
   <!--
     ⚠️ **The deploy log is the first card, above Install.** It used to be

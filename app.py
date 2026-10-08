@@ -1792,6 +1792,304 @@ def _heal_settings_core_keys():
         save_settings(s)
         print(f"[heal-settings] restored missing core keys: {list(healed)}", flush=True)
 
+# ---------------------------------------------------------------------------
+# v10.2.8 W10: a failed module update records its own reason
+# ---------------------------------------------------------------------------
+# Field report (Richard, AUS-NSW, 2026-10-08): "Authentik failed to update" — and nothing he
+# could send from the UI said why. Measured in code: the Authentik Update ran synchronously and
+# its reason existed ONLY in the HTTP response (not the journal, not on disk); the page treats a
+# gateway timeout as "still running" and reloads after 3 minutes, so on any proxy timeout the
+# reason was gone. The async updates (CloudTAK, TAK Server, …) keep their log in memory, which any
+# console restart wipes. Diagnostics had no update section at all.
+#
+# So every module update/deploy writes its outcome here, the module card shows the last failure,
+# and Diagnostics carries it. A customer never has to capture anything. (UI-only rule.)
+MODULE_RESULTS_FILE = os.path.join(CONFIG_DIR, 'module-results.json')
+_MODULE_RESULTS_LOCK = threading.Lock()
+_MODULE_RESULTS_KEEP = 10
+_MODULE_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_:-]{0,48}$')
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+# Pull / build progress — the head of `docker compose` stderr is all of this, never the cause.
+_UPDATE_NOISE_RE = re.compile(
+    r'^\s*(\[\+\]|#\d+\s|Pulling\b|Pulled\b|Downloading\b|Download complete|Extracting\b|'
+    r'Verifying Checksum|Waiting\b|Pull complete|Already exists|Digest:|Status: (Downloaded|Image is up)|'
+    r'[0-9a-f]{12}\s+(Pulling|Waiting|Downloading|Extracting|Verifying|Download complete|'
+    r'Pull complete|Already exists)|[\w.-]+\s+(Pulling|Pulled|Waiting|Skipped)\b)', re.I)
+_UPDATE_ERROR_RE = re.compile(
+    r"(error|fail|denied|unauthori[sz]ed|forbidden|not found|no such|no space|timed? ?out|"
+    r"refused|manifest unknown|toomanyrequests|rate limit|cannot|can't|unable|invalid|"
+    r"refusing|did not|exit (code|status)|traceback|exception|✗|⚠)", re.I)
+
+
+def _update_error_line(text, limit=300):
+    """The line that actually says what went wrong, from a message or a whole log.
+
+    Strips ANSI and pull/build progress, then takes the LAST line that reads like an error
+    (the cause is at the end of compose output, not the head), else the last non-empty line.
+    Accepts a string or a list of log entries (str, or dicts carrying msg/message/text)."""
+    if not text:
+        return ''
+    if isinstance(text, (list, tuple, deque)):
+        parts = []
+        for t in text:
+            if isinstance(t, dict):
+                t = t.get('msg') or t.get('message') or t.get('text') or t.get('line') or ''
+            parts.append(str(t))
+        text = '\n'.join(parts)
+    lines = [_ANSI_RE.sub('', l).strip() for l in str(text).replace('\r', '\n').splitlines()]
+    lines = [l for l in lines if l and not _UPDATE_NOISE_RE.match(l)]
+    if not lines:
+        return ''
+    pick = next((l for l in reversed(lines) if _UPDATE_ERROR_RE.search(l)), lines[-1])
+    return pick[:limit]
+
+
+def _mod_result_scrub(text):
+    """Defense in depth before command output is stored and shown on a card (which, unlike the
+    Diagnostics export, is not passed through _diag_redact): credentials embedded in a URL,
+    Bearer tokens, and key=value secrets."""
+    if not text:
+        return text
+    text = re.sub(r'(?<=://)[^/\s:@]+:[^/\s@]+@', '[REDACTED]@', text)
+    text = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer [REDACTED]', text)
+    return re.sub(r'(?i)\b(password|passwd|secret|token|api[_-]?key)(["\']?\s*[=:]\s*["\']?)([^\s"\',;&]{4,})',
+                  r'\1\2[REDACTED]', text)
+
+
+def _mod_results_load():
+    try:
+        with open(MODULE_RESULTS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mod_results_save(d):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = MODULE_RESULTS_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, MODULE_RESULTS_FILE)
+
+
+def _mod_results_now():
+    return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _mod_result_start(module, kind='update', frm='', to=''):
+    """Record that an update/deploy began. Never raises — bookkeeping must not break the work."""
+    try:
+        entry = {'id': secrets.token_hex(6), 'module': module, 'kind': kind, 'outcome': 'running',
+                 'from': str(frm or ''), 'to': str(to or ''), 'step': 'started',
+                 'error': '', 'summary': '', 'started_at': _mod_results_now(), 'finished_at': None}
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            d.setdefault(module, {'history': []})['last'] = entry
+            _mod_results_save(d)
+        return entry
+    except Exception as e:
+        print(f'[module-result] could not record start for {module}: {e}', flush=True)
+        return None
+
+
+def _mod_result_step(module, step):
+    """Persist the step an in-flight update has reached, so a crash or restart still says where."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            last = (d.get(module) or {}).get('last')
+            if last and last.get('outcome') == 'running':
+                last['step'] = str(step)[:120]
+                _mod_results_save(d)
+    except Exception:
+        pass
+
+
+def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None):
+    """Record the outcome. `error` may be a message or a whole log; the real line is extracted."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            m = d.setdefault(module, {'history': []})
+            e = m.get('last') or {'id': secrets.token_hex(6), 'module': module,
+                                  'kind': kind or 'update', 'from': '', 'to': '',
+                                  'step': '', 'started_at': _mod_results_now()}
+            if kind:
+                e['kind'] = kind
+            e['outcome'] = 'ok' if ok else 'failed'
+            e['finished_at'] = _mod_results_now()
+            if to:
+                e['to'] = str(to)
+            if step:
+                e['step'] = str(step)[:120]
+            if ok:
+                e['error'] = ''
+                e['summary'] = ''
+            else:
+                raw = error if isinstance(error, str) else '\n'.join(map(str, error or []))
+                e['error'] = _mod_result_scrub(_update_error_line(error)) or 'failed (no error text was returned)'
+                e['summary'] = _mod_result_scrub((raw.strip().splitlines() or [''])[0][:200])
+            hist = [h for h in m.get('history', []) if h.get('id') != e.get('id')]
+            m['history'] = ([dict(e)] + hist)[:_MODULE_RESULTS_KEEP]
+            m['last'] = e
+            _mod_results_save(d)
+        print(f"[module-result] {module} {e.get('kind')} {e['outcome']}"
+              f"{' at ' + e['step'] if e.get('step') not in (None, '', 'started') and not ok else ''}"
+              f"{': ' + e['error'] if not ok else ''}", flush=True)
+        return e
+    except Exception as ex:
+        print(f'[module-result] could not record result for {module}: {ex}', flush=True)
+        return None
+
+
+def _mod_results_mark_interrupted():
+    """At console start, anything still `running` was cut off by the restart — say so."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            changed = []
+            for name, m in d.items():
+                last = (m or {}).get('last') or {}
+                if last.get('outcome') == 'running':
+                    last['outcome'] = 'interrupted'
+                    last['finished_at'] = _mod_results_now()
+                    last['error'] = ('the console restarted while this was running '
+                                     f"(last step: {last.get('step') or 'started'})")
+                    hist = [h for h in m.get('history', []) if h.get('id') != last.get('id')]
+                    m['history'] = ([dict(last)] + hist)[:_MODULE_RESULTS_KEEP]
+                    changed.append(name)
+            if changed:
+                _mod_results_save(d)
+                print(f"[module-result] marked interrupted by the restart: {', '.join(changed)}", flush=True)
+    except Exception:
+        pass
+
+
+def _mod_result_last(module):
+    """Last recorded update/deploy result for a module, or None. Used by every module card."""
+    try:
+        return ((_mod_results_load().get(module) or {}).get('last')) or None
+    except Exception:
+        return None
+
+
+def _response_outcome(rv):
+    """(ok, error_text, version) from a Flask view's return value."""
+    resp, code = rv, 200
+    if isinstance(rv, tuple):
+        resp = rv[0]
+        if len(rv) > 1 and isinstance(rv[1], int):
+            code = rv[1]
+    if hasattr(resp, 'status_code') and not isinstance(rv, tuple):
+        code = resp.status_code
+    data = None
+    try:
+        data = resp.get_json(silent=True) if hasattr(resp, 'get_json') else (resp if isinstance(resp, dict) else None)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return code < 400, ('' if code < 400 else f'HTTP {code}'), ''
+    ok = code < 400 and not data.get('error') and data.get('success', True) is not False
+    err = '' if ok else str(data.get('error') or data.get('output') or data.get('message') or f'HTTP {code}')
+    ver = str(data.get('version') or '') if ok else ''
+    return ok, err, ver
+
+
+def _records_module_update(module, when=None, from_fn=None, to_fn=None, kind='update'):
+    """Decorator for a SYNCHRONOUS update route: record start, then the outcome its response carries."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*a, **kw):
+            try:
+                active = when() if when else True
+            except Exception:
+                active = False
+            if not active:
+                return fn(*a, **kw)
+
+            def _safe(f):
+                try:
+                    return f() if f else ''
+                except Exception:
+                    return ''
+            _mod_result_start(module, kind, _safe(from_fn), _safe(to_fn))
+            try:
+                rv = fn(*a, **kw)
+            except Exception as e:
+                _mod_result_finish(module, False, f'{type(e).__name__}: {e}')
+                raise
+            ok, err, ver = _response_outcome(rv)
+            _mod_result_finish(module, ok, err, to=ver or None)
+            return rv
+        return wrapper
+    return deco
+
+
+def _mod_results_failing(prefix):
+    """Names of `prefix` and `prefix-*` records whose last result failed or was interrupted —
+    for a page with one record per deployment (ATLAS: `atlas`, `atlas-<slug>`)."""
+    out = []
+    for name, m in sorted(_mod_results_load().items()):
+        if name == prefix or name.startswith(prefix + '-'):
+            if ((m or {}).get('last') or {}).get('outcome') in ('failed', 'interrupted'):
+                out.append(name)
+    return out
+
+
+# Every module page can show its last failure: {{ module_last_result('authentik') }}.
+app.jinja_env.globals['module_last_result'] = _mod_result_last
+app.jinja_env.globals['module_results_failing'] = _mod_results_failing
+# This process just started, so nothing can still be running: an entry left `running` was cut off
+# by a console restart (the 24 h recycle, Update Now, a module's own restart). Say so on its card.
+_mod_results_mark_interrupted()
+
+_LOG_STEP_RE = re.compile(r'(━━━\s*(.+?)\s*━━━|\bStep\s+\d+\s*/\s*\d+\b[^\n]*)')
+
+
+def _run_tracked(module, status, log, fn, *args, kind='update', frm='', to='', **kw):
+    """Thread target for an ASYNC update/deploy: run it, then record what its status/log say.
+
+    Outcome = the job's own status dict (`error` truthy = failed); the reason = the real error line
+    from its log; the step = the last "━━━ … ━━━" / "Step N/M" header it printed."""
+    _mod_result_start(module, kind, frm, to)
+    try:
+        fn(*args, **kw)
+    except Exception as e:
+        _tracked_finish(module, status, log, exc=e, kind=kind)
+        raise
+    _tracked_finish(module, status, log, kind=kind)
+
+
+def _tracked_finish(module, status, log, exc=None, kind='update'):
+    """Record an async job's end from its own status dict and log (shared by _run_tracked and
+    the TAK Server update factory). Never raises."""
+    try:
+        # Prefer the job's CURRENT log: some workers replace status['log'] with a new list as
+        # they go (WebODM, Remote Assist — found in the W10 security review), so a list captured
+        # when the thread started can be empty by the end.
+        cur = (status or {}).get('log') if isinstance(status, dict) else None
+        entries = list(cur if isinstance(cur, (list, tuple, deque)) and cur else (log or []))
+        step = ''
+        for entry in reversed(entries):
+            txt = entry if isinstance(entry, str) else str((entry or {}).get('msg') or entry)
+            m = _LOG_STEP_RE.search(txt)
+            if m:
+                step = (m.group(2) or m.group(1)).strip()[:120]
+                break
+        err = (status or {}).get('error')
+        if exc is not None:
+            _mod_result_finish(module, False, f'{type(exc).__name__}: {exc}', step=step or None, kind=kind)
+        elif err:
+            detail = err if isinstance(err, str) and err.strip() else entries
+            _mod_result_finish(module, False, detail, step=step or None, kind=kind)
+        else:
+            _mod_result_finish(module, True, step=step or None, kind=kind)
+    except Exception:
+        pass
+
+
 def load_auth():
     """Load auth.json from CONFIG_DIR. Never raises — returns {} on missing file or error."""
     try:
@@ -7962,9 +8260,36 @@ def _diag_section_modules(settings):
             'container states: see "Containers" above']
 
 
+def _diag_section_module_results(settings):
+    """v10.2.8 W10: the last update/deploy result of every module, from .config/module-results.json —
+    so a failure the customer saw (or did not see) is in the report they send, with its reason."""
+    d = _mod_results_load()
+    if not d:
+        return ['no module update or deploy has been recorded on this box yet '
+                '(recording began in v10.2.8)']
+    out = []
+    for name in sorted(d):
+        m = d.get(name) or {}
+        last = m.get('last') or {}
+        when = last.get('finished_at') or last.get('started_at') or '?'
+        line = (f"{name}: last {last.get('kind') or 'update'} {(last.get('outcome') or '?').upper()} "
+                f"{when} UTC ({last.get('from') or '?'} -> {last.get('to') or '?'})")
+        if last.get('outcome') in ('failed', 'interrupted'):
+            line += f" | step: {last.get('step') or '?'} | {last.get('error') or '(no reason recorded)'}"
+            if last.get('summary') and last.get('summary') not in (last.get('error') or ''):
+                line += f" | message: {last.get('summary')}"
+        out.append(line)
+        for h in (m.get('history') or [])[1:4]:
+            if h.get('outcome') in ('failed', 'interrupted'):
+                out.append(f"    earlier {h.get('outcome')} {h.get('finished_at') or h.get('started_at')}: "
+                           f"{h.get('error') or '?'}")
+    return out
+
+
 _DIAG_SECTIONS = (
     ('Box', _diag_section_box),
     ('Console', _diag_section_console),
+    ('Module updates — last result per module', _diag_section_module_results),
     ('Connectivity', _diag_section_connectivity),
     ('Containers', _diag_section_containers),
     ('Authentik / LDAP / webadmin', _diag_section_authentik),
@@ -7994,6 +8319,15 @@ def _diag_collect():
         parts.extend(str(x) for x in body)
     parts.append(f"\n===== end — {time.time() - t0:.0f} s =====")
     return _diag_redact('\n'.join(parts), settings)
+
+
+@app.route('/api/module-results/<module>')
+@login_required
+def module_result_api(module):
+    """v10.2.8 W10: a module's last recorded update/deploy result (read-only)."""
+    if not _MODULE_NAME_RE.match(module or ''):
+        return jsonify({'error': 'unknown module'}), 400
+    return jsonify({'module': module, 'last': _mod_result_last(module)})
 
 
 def _diag_worker():
@@ -12500,6 +12834,11 @@ def netbird_deploy_status_api():
 
 @app.route('/api/netbird/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10
+    'netbird',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_netbird_version_info().get('version') or ''),
+    to_fn=lambda: _get_netbird_target_images()[0].rsplit(':', 1)[-1])
 def netbird_control_api():
     action = (request.json or {}).get('action', '')
     if action not in ('start', 'stop', 'restart', 'update'):
@@ -15327,7 +15666,10 @@ def remote_assist_update_api():
     if _remote_assist_update_status.get('running'):
         return jsonify({'started': False, 'error': 'Update already in progress'})
     _remote_assist_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-    threading.Thread(target=_run_remote_assist_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10 (the worker mutates this dict in place)
+                     args=('remote-assist', _remote_assist_update_status, None,
+                           _run_remote_assist_update),
+                     daemon=True).start()
     return jsonify({'started': True})
 
 
@@ -22631,6 +22973,7 @@ def guarddog_apply_docker_log_limits():
 
 @app.route('/api/guarddog/update', methods=['POST'])
 @login_required
+@_records_module_update('guarddog', to_fn=lambda: VERSION)  # v10.2.8 W10
 def guarddog_update():
     """Re-deploy Guard Dog scripts and timers from latest console version."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -25203,7 +25546,9 @@ def fedhub_update_api():
         _caddy_regenerate_if_fqdn()
     fedhub_upgrade_log.clear()
     fedhub_upgrade_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_fedhub_remote_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10
+                     args=('fedhub', fedhub_upgrade_status, fedhub_upgrade_log, run_fedhub_remote_update),
+                     daemon=True).start()
     return jsonify({'success': True})
 
 
@@ -27096,6 +27441,8 @@ def _caddy_ensure_apt_repo(log_fn=None):
 
 @app.route('/api/caddy/update', methods=['POST'])
 @login_required
+@_records_module_update('caddy',  # v10.2.8 W10
+                        from_fn=lambda: (_get_caddy_version_info().get('version') or ''))
 def caddy_update():
     """Upgrade Caddy to the latest package version and reload.
 
@@ -34647,6 +34994,10 @@ def _takportal_build_settings_json(settings):
 
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10
+    'takportal',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -38393,7 +38744,10 @@ def cloudtak_update_api():
         cloudtak_deploy_log.clear()
         cloudtak_deploy_status.update({'running': True, 'complete': False, 'error': False})
         cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] CloudTAK update started")
-        threading.Thread(target=run_cloudtak_update, daemon=True).start()
+        # v10.2.8 W10: the outcome is recorded, not just held in the in-memory log
+        threading.Thread(target=_run_tracked,
+                         args=('cloudtak', cloudtak_deploy_status, cloudtak_deploy_log, run_cloudtak_update),
+                         daemon=True).start()
     return jsonify({'success': True, 'message': 'CloudTAK update started'})
 
 @app.route('/api/cloudtak/control', methods=['POST'])
@@ -43631,7 +43985,9 @@ def webodm_update():
     if _webodm_update_status.get('running'):
         return jsonify({'started': False, 'error': 'Update already in progress'})
     _webodm_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-    threading.Thread(target=_run_webodm_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10 (the worker mutates this dict in place)
+                     args=('webodm', _webodm_update_status, None, _run_webodm_update),
+                     daemon=True).start()
     return jsonify({'started': True})
 
 
@@ -49297,6 +49653,11 @@ def authentik_page():
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10: the outcome outlives the HTTP response
+    'authentik',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_authentik_version_info().get('version') or ''),
+    to_fn=lambda: _get_authentik_target_release(load_settings()))
 def authentik_control():
     action = request.json.get('action')
     settings = load_settings()
@@ -49321,6 +49682,7 @@ def authentik_control():
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
+            _mod_result_step('authentik', f'pin the tag to {latest} (remote)')
             _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
             # Rewrite an EXISTING active pin only (see _ak_env_pin_tag for why we do not
             # create one). sed -i writes a temp file and renames, so .env is never left
@@ -49335,10 +49697,13 @@ def authentik_control():
                                              f'{", ".join(sorted(_ctags))}, not {latest} alone. '
                                              f'Something outside docker-compose.yml and .env is '
                                              f'pinning the tag.'}), 500
+            _mod_result_step('authentik', 'pull + recreate (remote)')
             _pok, _pout = _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
             if not _pok:
+                _real = _update_error_line(_pout or '')
                 return jsonify({'error': f'Remote Authentik pull/recreate failed: '
-                                         f'{(_pout or "no output").strip()[-400:]}'}), 500
+                                         f'{_real or (_pout or "no output").strip()[-400:]}'}), 500
+            _mod_result_step('authentik', 'confirm the running image (remote)')
             _rtag = ''
             for _ in range(8):
                 time.sleep(2)
@@ -49396,6 +49761,7 @@ def authentik_control():
                                      f'this channel targets v{latest}. Promote the vetted '
                                      f'release instead of downgrading a live IdP.'}), 409
         try:
+            _mod_result_step('authentik', f'pin the tag to {latest}')
             # (a) The compose `:-` default — governs only while .env does NOT set the tag.
             if os.path.isfile(cp):
                 _cc = None
@@ -49412,6 +49778,7 @@ def authentik_control():
             _ak_env_pin_tag(latest, ak_dir)
             _ensure_authentik_compose_patches(cp)
             # (c) VERIFY before pulling anything, with Compose's own verification command.
+            _mod_result_step('authentik', 'verify with docker compose config')
             _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
             if not _cok:
                 return jsonify({'error': f'docker compose config failed - refusing to update '
@@ -49423,16 +49790,21 @@ def authentik_control():
                                          f'(the console process environment, a services.*.environment '
                                          f'override, or a second env file).'}), 500
             # (d) Pull + recreate, and BELIEVE the return code (it used to be discarded).
+            _mod_result_step('authentik', 'pull + recreate')
             _last = _run_priv_chain([['docker', 'compose', 'pull'],
                                      ['docker', 'compose', 'down', '--timeout', '30'],
                                      ['docker', 'compose', 'up', '-d']],
                                     'and', timeout=360, cwd=ak_dir)
             if _last is None or _last.returncode != 0:
-                _err = ((_last.stderr or _last.stdout or '') if _last else '').strip()
-                return jsonify({'error': f'Authentik pull/recreate failed: '
-                                         f'{_err[-400:] or "no output"}'}), 500
+                _err = (((_last.stdout or '') + '\n' + (_last.stderr or '')) if _last else '').strip()
+                _which = ' '.join(_last.args[-3:]) if _last is not None and isinstance(_last.args, list) else 'pull/recreate'
+                # v10.2.8 W10: the real error line, not 400 chars of pull progress.
+                _real = _update_error_line(_err)
+                return jsonify({'error': f'Authentik pull/recreate failed ({_which}): '
+                                         f'{_real or _err[-400:] or "no output"}'}), 500
             # (e) Confirm the RUNNING image before claiming success, and only prune once it
             #     is right — pruning after a failed upgrade throws away the rollback images.
+            _mod_result_step('authentik', 'confirm the running image')
             _run_tag = ''
             for _ in range(8):
                 time.sleep(2)
@@ -69238,6 +69610,7 @@ def _tak_update_job(kind, target, log, status):
     success, failure, or an exception (recorded, then re-raised)."""
     def run(*a, **kw):
         started, exc = time.time(), None
+        _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
         try:
             target(*a, **kw)
         except BaseException as e:
@@ -69249,6 +69622,8 @@ def _tak_update_job(kind, target, log, status):
                                    log, status, started, exc)
             except Exception as _re:
                 print(f'TAK Server update: record not saved ({_re})', flush=True)
+            _tracked_finish('takserver', status, log,
+                            exc=exc if isinstance(exc, Exception) else None)
     return run
 
 plugin_install_log = []
@@ -86833,6 +87208,10 @@ except Exception as _e:
 # only touch the seams it is handed — the enforced version of the ARCHITECTURE.md
 # seams table. Registered routes go live before gunicorn serves (import-time).
 _MODULE_CTX = {
+    # v10.2.8 W10: a module's update/deploy outcome is recorded where the card and
+    # Diagnostics read it (modules import nothing from app.py — these are the seams)
+    'mod_result_start': _mod_result_start,
+    'tracked_finish': _tracked_finish,
     # core seams (PLAN v10.1.22 §4-W2)
     'load_settings': load_settings,
     'save_settings': save_settings,

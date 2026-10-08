@@ -106,6 +106,7 @@
 {% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button><button class="control-btn" onclick="fixAkLdapToken(this)" title="Re-read the LDAP outpost token from Authentik and recreate the LDAP container. Use when the outpost logs 403 Token invalid/expired.">🔑 Fix LDAP token</button><button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button><button class="control-btn" onclick="fixAkLdapToken(this)" title="Re-read the LDAP outpost token from Authentik and recreate the LDAP container. Use when the outpost logs 403 Token invalid/expired.">🔑 Fix LDAP token</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
 </div>
 <div id="ak-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('authentik') }}
 </div>
 {% endif %}
 
@@ -678,11 +679,30 @@ async function akUpdate(){
     // threw "Unexpected token '<'" and showed a scary failure even though the update was
     // still running on the box (seen on CORAZ). Detect the gateway-timeout / non-JSON
     // case and tell the operator to wait, instead of surfacing a parse error.
+    // v10.2.8 W10: the outcome is RECORDED on the box now, so on a gateway timeout we ask for
+    // it instead of reloading blind three minutes later (which is how a failure's reason used
+    // to vanish: Richard, AUS-NSW, 2026-10-08).
     function _akUpdateStillRunning(){
         status.style.color='var(--cyan)';
-        status.innerHTML='⏳ Authentik update is still running in the background — the image pull can exceed the gateway timeout. This page will refresh automatically in a few minutes (or refresh manually once Authentik is back). Do not re-click Update.';
+        status.textContent='⏳ Authentik update is still running on the box — the image pull can outlast the gateway timeout. Waiting for its result here. Do not re-click Update.';
         btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating…';
-        setTimeout(()=>location.reload(),180000);
+        var started=Date.now();
+        (function poll(){
+            fetch('/api/module-results/authentik',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+                var last=(j&&j.last)||{};
+                if(last.outcome==='ok'){
+                    status.style.color='var(--green)';status.textContent='✓ Authentik is now running v'+(last.to||'the target release')+'. Reloading…';
+                    setTimeout(function(){location.reload();},2500);return;
+                }
+                if(last.outcome==='failed'||last.outcome==='interrupted'){
+                    status.style.color='var(--red)';status.textContent='✗ Update failed'+(last.step&&last.step!=='started'?' at “'+last.step+'”':'')+': '+(last.error||'unknown error');
+                    btn.disabled=false;btn.innerHTML='⬆ Update';
+                    document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+                    return;
+                }
+                if(Date.now()-started<900000){setTimeout(poll,10000);}else{location.reload();}
+            }).catch(function(){ if(Date.now()-started<900000){setTimeout(poll,10000);}else{location.reload();} });
+        })();
     }
     try{
         var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});

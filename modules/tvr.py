@@ -495,6 +495,24 @@ def uninstall(ctx, job, params):
 _update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
 
 
+def _run_update_recorded(ctx):
+    """v10.2.8 W10: _run_update, with its outcome recorded through the console's seam so the
+    card and Diagnostics can say why it failed after the in-memory log is gone. Reads the status
+    object at the END (the view swaps in a new one per run)."""
+    start, finish = ctx.get('mod_result_start'), ctx.get('tracked_finish')
+    if callable(start):
+        start('tvr', 'update', '', '')
+    exc = None
+    try:
+        return _run_update(ctx)
+    except Exception as e:
+        exc = e
+        raise
+    finally:
+        if callable(finish):
+            finish('tvr', _update_status, _update_status.get('log'), exc=exc)
+
+
 def _run_update(ctx):
     import secrets as _sec
     global _update_status
@@ -622,7 +640,7 @@ def register(ctx):
         if _update_status.get('running'):
             return jsonify({'started': False, 'error': 'Update already in progress'})
         _update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-        threading.Thread(target=_run_update, args=(ctx,), daemon=True).start()
+        threading.Thread(target=_run_update_recorded, args=(ctx,), daemon=True).start()
         return jsonify({'started': True})
 
     def update_status_view():
