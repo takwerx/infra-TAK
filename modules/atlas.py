@@ -1062,7 +1062,8 @@ def version_drift(ctx):
     }
 
 
-def instance_status(ctx, inst, projects=None, probe_version=False):
+def instance_status(ctx, inst, projects=None, probe_version=False,
+                    settings=None):
     """Everything the console needs to say about one deployment.
 
     ⚠️ **`probe_version` is off by default, and that is a performance
@@ -1114,6 +1115,10 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
         'version': _installed_version(ctx, inst),
         'running_version': (_running_version(ctx, inst)
                             if running and probe_version else None),
+        # ⚠️ From the record, never probed: see `_record_agency_group_state`.
+        # `settings` is passed by the page's route; a caller that does not
+        # pass it is not asking about the group, and gets None.
+        'admin_group_problem': agency_group_problem(settings, inst),
     }
 
 
@@ -1126,7 +1131,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False):
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'latest', 'update_available', 'paths')
+                   'agency_name', 'admin_group_problem', 'latest',
+                   'update_available', 'paths')
 
 
 def update_available_for(installed, latest):
@@ -1170,6 +1176,7 @@ def instances_payload(ctx, size_gb=None):
     # call behind a 15-minute cache, and the allowance is 60 an hour per IP — a
     # box with five agencies polling this route would spend it on one page.
     latest = _latest_version(use_cache=True, channel=_channel_of(ctx))
+    settings = ctx['load_settings']()
     return {
         'instances': [
             dict(inst,
@@ -1178,7 +1185,7 @@ def instances_payload(ctx, size_gb=None):
                  # five-second timeout would make the card slower the more
                  # agencies a box has. The checkout's version is what the row
                  # shows; the drift table asks the containers.
-                 **instance_status(ctx, inst, projects),
+                 **instance_status(ctx, inst, projects, settings=settings),
                  latest=latest,
                  update_available=update_available_for(
                      _installed_version(ctx, inst), latest),
@@ -1813,7 +1820,31 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
     """Create this deployment's admin group and let it into this deployment.
 
     Returns the group's name, or None when there is nothing to do (the plain
-    deployment) or the work failed.
+    deployment) or the work failed. `agency_admin_group_outcome` says which.
+    """
+    outcome = agency_admin_group_outcome(ctx, inst, ak_url, ak_headers,
+                                         plog=plog)
+    if outcome and outcome['status'] in GROUP_OK:
+        return outcome['group']
+    return None
+
+
+#: The outcomes that leave the agency's administrators able to sign in.
+GROUP_OK = ('present', 'created')
+
+
+def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
+    """Create this deployment's admin group and admit it, saying what happened.
+
+    Returns None for the plain deployment, which has no group of its own.
+    Otherwise ``{'status', 'group', 'detail'}``, where status is ``present``
+    (group and binding were already there), ``created`` (either was added
+    now) or ``failed`` (``detail`` says which step and why).
+
+    ⚠️ **A result, not just a log line.** A failure here used to be one `⚠`
+    line in a deploy or update log that otherwise read as success, and the
+    tile said nothing. An agency deployment could then run with no admin
+    group, and the only symptom was its administrators being turned away.
 
     ⚠️ **Bound beside "Allow authentik Admins", never instead of it.** Measured
     on the box: the ATLAS applications run with `policy_engine_mode: any`, so
@@ -1835,6 +1866,14 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
         return None
     group_name = names['admin_group']
 
+    def outcome(status, detail=''):
+        return {'status': status, 'group': group_name, 'detail': detail}
+
+    def failed(step, exc):
+        detail = '%s: %s' % (step, str(exc)[:80])
+        log('  ⚠ ' + detail)
+        return outcome('failed', detail)
+
     def api(path, data=None, method=None):
         req = _urlreq.Request(
             f'{ak_url}/api/v3/{path}',
@@ -1844,6 +1883,7 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
 
     # --- the group ---------------------------------------------------------- #
     group_pk = None
+    created = False
     try:
         from urllib.parse import quote as _q
         found = api('core/groups/?name=%s' % _q(group_name))
@@ -1852,8 +1892,7 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
                 group_pk = group.get('pk')
                 break
     except Exception as exc:
-        log('  ⚠ Could not look up the agency admin group: %s' % str(exc)[:80])
-        return None
+        return failed('Could not look up the agency admin group', exc)
 
     if group_pk:
         log('  ✓ Admin group "%s" already exists' % group_name)
@@ -1865,11 +1904,11 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
             group_pk = api('core/groups/', {'name': group_name,
                                             'is_superuser': False},
                            method='POST').get('pk')
+            created = True
             log('  ✓ Admin group "%s" created — add this agency\'s '
                 'administrators to it' % group_name)
         except Exception as exc:
-            log('  ⚠ Could not create the agency admin group: %s' % str(exc)[:80])
-            return None
+            return failed('Could not create the agency admin group', exc)
 
     # --- and its way in ----------------------------------------------------- #
     try:
@@ -1879,7 +1918,7 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
         if any(str(b.get('group')) == str(group_pk)
                for b in bindings.get('results', [])):
             log('  ✓ "%s" already admitted to this deployment' % group_name)
-            return group_name
+            return outcome('created' if created else 'present')
         api('policies/bindings/', {
             'target': target, 'group': group_pk,
             # ⚠️ After the admins policy, which sits at 0. Order does not decide
@@ -1888,10 +1927,57 @@ def ensure_agency_admin_group(ctx, inst, ak_url, ak_headers, plog=None):
             'order': 10, 'negate': False, 'enabled': True, 'timeout': 30,
         }, method='POST')
         log('  ✓ "%s" admitted to this deployment only' % group_name)
-        return group_name
+        return outcome('created')
     except Exception as exc:
-        log('  ⚠ Could not admit the agency admin group: %s' % str(exc)[:80])
+        return failed('Could not admit the agency admin group', exc)
+
+
+def agency_group_key(inst=None):
+    """Where one deployment's admin-group answer is recorded.
+
+    Per deployment, for the reason `access_keys` gives: one agency's group
+    being fine says nothing about another's.
+    """
+    return atlas_instances.derive(inst)['settings_prefix'] + 'admin_group_state'
+
+
+def _record_agency_group_state(ctx, inst, outcome, plog=None):
+    """Remember what the last admin-group check found, for the tile.
+
+    ⚠️ **Stored, not probed on demand,** for the reason `_record_access_state`
+    gives: the tile is polled and must not wait on Authentik.
+    """
+    import time as _time
+    if not outcome:
+        return outcome
+    try:
+        s = ctx['load_settings']()
+        s[agency_group_key(inst)] = dict(outcome, checked_at=int(_time.time()))
+        ctx['save_settings'](s)
+    except Exception as exc:
+        if plog:
+            plog('  ⚠ Could not record the admin-group state: %s' % str(exc)[:80])
+    return outcome
+
+
+def agency_group_problem(settings, inst):
+    """What the tile should say about this deployment's admin group, or None.
+
+    None for the plain deployment, for an agency not checked since this
+    record existed, and for one whose group is in place. ⚠️ **Skipped is a
+    problem, not a pass:** a check that could not run has not shown the group
+    is there.
+    """
+    if not atlas_instances.derive(inst)['slug']:
         return None
+    state = (settings or {}).get(agency_group_key(inst))
+    if not isinstance(state, dict) or state.get('status') in GROUP_OK:
+        return None
+    group = state.get('group') or atlas_instances.derive(inst)['admin_group']
+    why = state.get('detail') or 'not checked'
+    return ('Admin group "%s" could not be confirmed (%s). Press Update to '
+            'check again, or create it in Authentik and bind it to this '
+            'deployment\'s application.' % (group, why))
 
 
 def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
@@ -2206,8 +2292,7 @@ def _verify_access_control(ctx, plog=None, inst=None):
     try:
         s = ctx['load_settings']()
         fqdn = ctx['_get_authentik_env_value'](s, 'AUTHENTIK_FQDN') or ''
-        token = (ctx['_get_authentik_env_value'](s, 'AUTHENTIK_TOKEN') or
-                 s.get('authentik_api_token') or '')
+        token = _authentik_token(ctx, s)
         if not fqdn or not token:
             return None
         ak_url = ctx['_get_authentik_api_url'](s)
@@ -3546,6 +3631,11 @@ def deploy(ctx, job, params):
             # and the console answers 401 to everyone, permanently.
             ensure_authentik_app(ctx, fqdn, token, plog=plog, settings=s,
                                  inst=_inst)
+            # ⚠️ Again, outside the app registration. That step returns early
+            # (no flow yet, a provider it could not resolve) without reaching
+            # the group, and said nothing when it did. Idempotent: on the
+            # ordinary path this only confirms what was just made.
+            _reconcile_agency_group(ctx, _inst, plog)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -4044,7 +4134,11 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
             # group exists by the time anything is bound to it — and so an
             # operator reading the deploy log finds the name they have to add
             # people to, beside everything else that deployment created.
-            ensure_agency_admin_group(ctx, inst, _ak_url, _ak_headers, plog=log)
+            _record_agency_group_state(
+                ctx, inst,
+                agency_admin_group_outcome(ctx, inst, _ak_url, _ak_headers,
+                                           plog=log),
+                plog=log)
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
             ctx['_authentik_application_open_in_new_tab'](
                 _ak_url, _ak_headers, _names['app_slug'], plog=log)
@@ -4384,24 +4478,68 @@ def get_version_info(ctx):
     return info
 
 
+def _authentik_token(ctx, settings):
+    """The Authentik API token, wherever this box keeps it, or None.
+
+    ⚠️ **One lookup for every caller.** The access-control check read
+    `AUTHENTIK_TOKEN` then the `authentik_api_token` setting; the group
+    reconcile read `AUTHENTIK_TOKEN` then `AUTHENTIK_BOOTSTRAP_TOKEN`. A box
+    holding only one of the fallbacks had one check run and the other skip.
+    """
+    return (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+            ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            settings.get('authentik_api_token') or None)
+
+
 def _reconcile_agency_group(ctx, inst, plog):
     """Make sure this deployment's admin group exists and is admitted.
 
-    Best effort: a box with no Authentik has nothing to reconcile, and an
-    update must not fail over it.
+    Returns the outcome (see `agency_admin_group_outcome`), or None for the
+    plain deployment. Never raises: an update must not fail over it.
+
+    ⚠️ **Said and recorded, whatever happens.** This used to return in
+    silence when no token was found, so an update could finish "successfully"
+    with no group and no line in its log saying the group was never checked.
     """
+    if not atlas_instances.derive(inst)['slug']:
+        return None
+    group = atlas_instances.derive(inst)['admin_group']
     try:
         settings = ctx['load_settings']()
-        token = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
-                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        token = _authentik_token(ctx, settings)
         if not token:
-            return
-        ensure_agency_admin_group(
-            ctx, inst, ctx['_get_authentik_api_url'](settings),
-            {'Authorization': 'Bearer %s' % token,
-             'Content-Type': 'application/json'}, plog=plog)
+            plog('  ⚠ No Authentik API token found — admin group "%s" was not '
+                 'checked' % group)
+            outcome = {'status': 'skipped', 'group': group,
+                       'detail': 'no Authentik API token on this box'}
+        else:
+            outcome = agency_admin_group_outcome(
+                ctx, inst, ctx['_get_authentik_api_url'](settings),
+                {'Authorization': 'Bearer %s' % token,
+                 'Content-Type': 'application/json'}, plog=plog)
     except Exception as exc:
         plog('  ⚠ Could not reconcile the agency admin group: %s' % str(exc)[:80])
+        outcome = {'status': 'failed', 'group': group,
+                   'detail': 'Could not reconcile: %s' % str(exc)[:80]}
+    return _record_agency_group_state(ctx, inst, outcome, plog=plog)
+
+
+def _reconcile_access(ctx, inst, plog):
+    """Every Authentik check an update owes a deployment, in one place.
+
+    ⚠️ **Called on every update, including one with nothing to install.** These
+    used to sit after the rebuild, so an Update press on a deployment already
+    on the newest release returned at "nothing to do" and checked nothing —
+    the one press an operator makes to repair a missing group did nothing.
+    """
+    # ⚠️ Re-asked on every update, because the binding can disappear long
+    # after the deploy that made it — an Authentik restore, or somebody
+    # unbinding the policy. A check that only runs at install answers a
+    # question about the past (H-1).
+    _verify_access_control(ctx, plog=plog, inst=inst)
+    # ⚠️ Idempotent, and the only route by which a deployment made before
+    # W221 gets its group and its binding at all.
+    _reconcile_agency_group(ctx, inst, plog)
 
 
 def _run_update(ctx, inst=None):
@@ -4462,11 +4600,13 @@ def _run_update(ctx, inst=None):
                  'database ' + (current or 'a newer release') + ' has migrated.')
             plog('  Switch back to the channel it came from, or publish a '
                  'forward fix.')
+            _reconcile_access(ctx, inst, plog)
             slot.update({'running': False, 'complete': True, 'error': False})
             return
         if here and there and there == here:
             plog('✓ Already on the newest release for the ' + channel +
-                 ' channel — nothing to do')
+                 ' channel — nothing to install')
+            _reconcile_access(ctx, inst, plog)
             slot.update({'running': False, 'complete': True, 'error': False})
             return
 
@@ -4505,14 +4645,7 @@ def _run_update(ctx, inst=None):
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
 
-        # ⚠️ Re-asked on every update, because the binding can disappear long
-        # after the deploy that made it — an Authentik restore, or somebody
-        # unbinding the policy. A check that only runs at install answers a
-        # question about the past (H-1).
-        _verify_access_control(ctx, plog=plog, inst=inst)
-        # ⚠️ Idempotent, and the only route by which a deployment made before
-        # W221 gets its group and its binding at all.
-        _reconcile_agency_group(ctx, inst, plog)
+        _reconcile_access(ctx, inst, plog)
 
         # ⚠️ Re-emit the vhost. `deploy` does this and `update` did not, so a
         # change to what ATLAS's Caddy block contains reached the box and then

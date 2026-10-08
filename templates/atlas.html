@@ -980,6 +980,17 @@ function instanceRow(i){
   // second implementation of a comparison that has to be on integers —
   // `0.10.0` sorts before `0.9.0` as a string, which would stop showing the
   // badge at the tenth release of any series and do it silently.
+  // ⚠️ **On the row, not only in a log.** A missing agency admin group used to
+  // surface as one line in an update log that read as success, and then as
+  // that agency's administrators being turned away.
+  if (i.admin_group_problem){
+    const warn = document.createElement('span');
+    warn.className = 'chan-warn';
+    warn.style.cssText = 'margin:0 8px;display:inline';
+    warn.textContent = '⚠ ' + i.admin_group_problem;
+    row.appendChild(warn);
+  }
+
   if (i.update_available){
     const badge = document.createElement('span');
     badge.className = 'badge-new';
