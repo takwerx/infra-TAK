@@ -225,6 +225,7 @@ def test_diagnostics_carries_the_last_result_per_module(h):
     lines = h['_diag_section_module_results']({})
     assert any('authentik' in l and 'FAILED' in l and 'no space left on device' in l
                and 'pull + recreate' in l for l in lines)
+    assert not any('Z UTC' in l for l in lines)          # one timezone marker, not two
     assert "('Module updates — last result per module', _diag_section_module_results)" in APP
 
 

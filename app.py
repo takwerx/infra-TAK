@@ -8271,7 +8271,7 @@ def _diag_section_module_results(settings):
     for name in sorted(d):
         m = d.get(name) or {}
         last = m.get('last') or {}
-        when = last.get('finished_at') or last.get('started_at') or '?'
+        when = (last.get('finished_at') or last.get('started_at') or '?').replace('T', ' ').rstrip('Z')
         line = (f"{name}: last {last.get('kind') or 'update'} {(last.get('outcome') or '?').upper()} "
                 f"{when} UTC ({last.get('from') or '?'} -> {last.get('to') or '?'})")
         if last.get('outcome') in ('failed', 'interrupted'):
@@ -8281,7 +8281,8 @@ def _diag_section_module_results(settings):
         out.append(line)
         for h in (m.get('history') or [])[1:4]:
             if h.get('outcome') in ('failed', 'interrupted'):
-                out.append(f"    earlier {h.get('outcome')} {h.get('finished_at') or h.get('started_at')}: "
+                out.append(f"    earlier {h.get('outcome')} "
+                           f"{(h.get('finished_at') or h.get('started_at') or '?').replace('T', ' ').rstrip('Z')} UTC: "
                            f"{h.get('error') or '?'}")
     return out
 
@@ -42005,6 +42006,11 @@ def run_cloudtak_deploy(cfg=None):
         for _p, _pr in CLOUDTAK_FW_WEB:
             _fw_allow(_p, _pr)
         plog("✓ Firewall: port 9997 (Caddy video) opened — CloudTAK's own ports stay loopback-only")
+        # v10.2.8 W4 (found in T&E on nuc + test12): open the direct-streaming ports HERE too. Until
+        # now only the startup migration / post-update hardening opened them, so on a freshly
+        # deployed box an EUD could not publish into a CloudTAK lease until the next console
+        # restart. Same constant as those paths (CLOUDTAK_FW_STREAM), so all three agree.
+        _cloudtak_open_stream_ports(plog)
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".

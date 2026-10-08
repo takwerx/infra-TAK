@@ -134,3 +134,10 @@ def test_hardening_deletes_a_legacy_allow_before_denying_on_ufw():
     loop = body[body.index('for _port in CLOUDTAK_FW_DENY:'):]
     assert loop.index("_fw_remove(_port, 'tcp')") < loop.index("_fw_deny(_port, 'tcp')")
     assert "if _be == 'ufw':" in loop[:loop.index("_fw_remove(_port, 'tcp')")]
+
+
+def test_a_fresh_deploy_opens_the_streaming_ports_itself():
+    """T&E 2026-10-08 (nuc + test12): after a fresh deploy only 9997 was open — the stream ports
+    came only from the startup migration / hardening pass, i.e. after the next console restart."""
+    i = APP.index('for _p, _pr in CLOUDTAK_FW_WEB:')
+    assert '_cloudtak_open_stream_ports(plog)' in APP[i:i + 1200]
