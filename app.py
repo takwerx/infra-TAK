@@ -49688,6 +49688,19 @@ def authentik_control():
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
+            # v10.2.8 W10b: remember the tag this host is pinned to now, so a failure can restore it.
+            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | cut -d- -f2", timeout=10)
+            _remote_prev = (_rp_out or '').strip().splitlines()[0].strip() if _rp_ok and (_rp_out or '').strip() else ''
+            if not _ak_tag_is_sane(_remote_prev):
+                _remote_prev = ''
+
+            def _remote_restore_pin():
+                if not _remote_prev:
+                    return 'the previous tag pin could not be read, so it was not restored'
+                _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{_remote_prev}/g' docker-compose.yml 2>/dev/null; "
+                                   f"(grep -qE '^[ \t]*AUTHENTIK_TAG[ \t]*=' .env 2>/dev/null && sed -i 's/^[ \t]*AUTHENTIK_TAG[ \t]*=.*/AUTHENTIK_TAG={_remote_prev}/' .env || true); "
+                                   f"docker compose up -d >/dev/null 2>&1", timeout=360)
+                return f'the tag pin was restored to v{_remote_prev} and the stack brought up on it'
             _mod_result_step('authentik', f'pin the tag to {latest} (remote)')
             _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
             # Rewrite an EXISTING active pin only (see _ak_env_pin_tag for why we do not
@@ -49698,7 +49711,8 @@ def authentik_control():
             if _cok:
                 _ctags = _ak_tags_from_text(_cout or '')
                 if _ctags and _ctags != {latest}:
-                    return jsonify({'error': f'Refusing to update {remote.get("host")}: compose '
+                    _rp = _remote_restore_pin()
+                    return jsonify({'error': f'Refusing to update {remote.get("host")} ({_rp}): compose '
                                              f'resolves Authentik to '
                                              f'{", ".join(sorted(_ctags))}, not {latest} alone. '
                                              f'Something outside docker-compose.yml and .env is '
@@ -49707,8 +49721,9 @@ def authentik_control():
             _pok, _pout = _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
             if not _pok:
                 _real = _update_error_line(_pout or '')
+                _rp = _remote_restore_pin()
                 return jsonify({'error': f'Remote Authentik pull/recreate failed: '
-                                         f'{_real or (_pout or "no output").strip()[-400:]}'}), 500
+                                         f'{_real or (_pout or "no output").strip()[-400:]} ({_rp})'}), 500
             _mod_result_step('authentik', 'confirm the running image (remote)')
             _rtag = ''
             for _ in range(8):
@@ -49766,6 +49781,26 @@ def authentik_control():
             return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} is running, '
                                      f'this channel targets v{latest}. Promote the vetted '
                                      f'release instead of downgrading a live IdP.'}), 409
+        # v10.2.8 W10b: a failed update must leave NOTHING changed. The pin is converged BEFORE
+        # the pull, so a failed pull used to leave compose/.env pointing at the new tag — and the
+        # next `compose up` (a post-update Reconfigure, a restart, a reboot) quietly pulled and
+        # started it, or, with the registry still unreachable, failed to start Authentik at all
+        # (T&E test12, 2026-10-08). Remember what was there and put it back on failure.
+        _pin_orig = {'compose': None, 'compose_changed': False, 'env_prev': ''}
+
+        def _restore_pin():
+            restored = []
+            try:
+                if _pin_orig['compose_changed'] and _pin_orig['compose'] is not None:
+                    _write_priv(cp, _pin_orig['compose'])
+                    restored.append('compose')
+                if _pin_orig['env_prev']:
+                    _ak_env_pin_tag(_pin_orig['env_prev'], ak_dir)
+                    restored.append('.env')
+            except Exception as _rpe:
+                return f'could NOT restore the previous tag pin ({str(_rpe)[:120]})'
+            return (f"the tag pin was restored to v{_inst or 'previous'} ({' + '.join(restored)})"
+                    if restored else 'no tag pin had been changed')
         try:
             _mod_result_step('authentik', f'pin the tag to {latest}')
             # (a) The compose `:-` default — governs only while .env does NOT set the tag.
@@ -49779,18 +49814,23 @@ def authentik_control():
                 if _cc:
                     _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
                     if _new != _cc:
+                        _pin_orig['compose'] = _cc
                         _write_priv(cp, _new)
+                        _pin_orig['compose_changed'] = True
             # (b) The .env pin — the half we never wrote. When present it OVERRIDES (a).
-            _ak_env_pin_tag(latest, ak_dir)
+            _env_changed, _env_prev = _ak_env_pin_tag(latest, ak_dir)
+            if _env_changed:
+                _pin_orig['env_prev'] = _env_prev
             _ensure_authentik_compose_patches(cp)
             # (c) VERIFY before pulling anything, with Compose's own verification command.
             _mod_result_step('authentik', 'verify with docker compose config')
             _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
             if not _cok:
                 return jsonify({'error': f'docker compose config failed - refusing to update '
-                                         f'a stack we cannot resolve: {_cerr}'}), 500
+                                         f'a stack we cannot resolve: {_cerr} ({_restore_pin()})'}), 500
             if _ctags and _ctags != {latest}:
-                return jsonify({'error': f'Refusing to update: compose resolves Authentik to '
+                _rp = _restore_pin()
+                return jsonify({'error': f'Refusing to update ({_rp}): compose resolves Authentik to '
                                          f'{", ".join(sorted(_ctags))}, not {latest} alone. Something '
                                          f'outside docker-compose.yml and .env is pinning the tag '
                                          f'(the console process environment, a services.*.environment '
@@ -49806,8 +49846,18 @@ def authentik_control():
                 _which = ' '.join(_last.args[-3:]) if _last is not None and isinstance(_last.args, list) else 'pull/recreate'
                 # v10.2.8 W10: the real error line, not 400 chars of pull progress.
                 _real = _update_error_line(_err)
+                # v10.2.8 W10b: put the old pin back. A failed pull or down left the old containers
+                # running, so that is the whole rollback; a failed `up` left the stack DOWN, so also
+                # bring it back up on the old version (its images are still here — nothing is pruned
+                # before success).
+                _rp = _restore_pin()
+                if _last is not None and isinstance(_last.args, list) and _last.args[-2:] == ['up', '-d']:
+                    _mod_result_step('authentik', 'roll back: start the previous version')
+                    _rb = _run_priv_chain([['docker', 'compose', 'up', '-d']], 'and', timeout=360, cwd=ak_dir)
+                    _rp += ('; restarted on the previous version' if _rb is not None and _rb.returncode == 0
+                            else '; the previous version did NOT come back up either — check the Authentik containers')
                 return jsonify({'error': f'Authentik pull/recreate failed ({_which}): '
-                                         f'{_real or _err[-400:] or "no output"}'}), 500
+                                         f'{_real or _err[-400:] or "no output"} ({_rp})'}), 500
             # (e) Confirm the RUNNING image before claiming success, and only prune once it
             #     is right — pruning after a failed upgrade throws away the rollback images.
             _mod_result_step('authentik', 'confirm the running image')
@@ -49836,7 +49886,7 @@ def authentik_control():
                             'version': _run_tag})
         except Exception as _e:
             _authentik_release_cache['tag'] = None
-            return jsonify({'error': f'Authentik update failed: {str(_e)[:400]}'}), 500
+            return jsonify({'error': f'Authentik update failed: {str(_e)[:400]} ({_restore_pin()})'}), 500
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)

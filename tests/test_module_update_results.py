@@ -346,3 +346,35 @@ def test_stored_error_is_scrubbed_of_credentials(h):
                             "fatal: unable to access 'https://bot:ghp_abcdef123456@github.com/x/y.git/': error 403")
     err = h['_mod_result_last']('takportal')['error']
     assert 'ghp_abcdef123456' not in err and '[REDACTED]@github.com' in err
+
+
+# --------------------------------------------------------------------------- #
+# W10b: a failed Authentik Update leaves nothing changed (T&E test12, 2026-10-08)
+# --------------------------------------------------------------------------- #
+
+def _ak_update_body():
+    body = APP[APP.index('def authentik_control():'):APP.index("@app.route('/api/authentik/deploy'")]
+    return body[body.index("    elif action == 'update':\n        # v10.1.39 (COPIX"):]
+
+
+def test_failed_update_restores_the_tag_pin_locally():
+    b = _ak_update_body()
+    # the original is captured BEFORE anything is written
+    assert b.index("_pin_orig['compose'] = _cc") < b.index('_write_priv(cp, _new)')
+    assert "_pin_orig['env_prev'] = _env_prev" in b
+    # every failure exit restores it
+    for marker in ("refusing to update '\n                                         f'a stack we cannot resolve: {_cerr} ({_restore_pin()})",
+                   "_rp = _restore_pin()\n                return jsonify({'error': f'Refusing to update ({_rp})",
+                   "({_restore_pin()})'}), 500"):
+        assert marker in b, marker[:60]
+    fail = b[b.index('if _last is None or _last.returncode != 0:'):b.index('# (e) Confirm the RUNNING image')]
+    assert '_rp = _restore_pin()' in fail
+    # a failed `up` (stack DOWN) is brought back up on the previous version
+    assert "_last.args[-2:] == ['up', '-d']" in fail and "['docker', 'compose', 'up', '-d']" in fail
+
+
+def test_failed_update_restores_the_tag_pin_remotely():
+    body = APP[APP.index('def authentik_control():'):APP.index("@app.route('/api/authentik/deploy'")]
+    remote = body[:body.index("    ak_dir = os.path.expanduser('~/authentik')")]
+    assert remote.index('_remote_prev = ') < remote.index("sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g'")
+    assert remote.count('_remote_restore_pin()') >= 3      # def + pull failure + tag refusal
