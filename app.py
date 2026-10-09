@@ -354,6 +354,7 @@ def _run_priv_chain(cmds, mode='and', timeout=120, **kw):
 # the same value. Never per-box, never tier-derived, never operator-preserved.
 CADDY_GRACE_PERIOD = '10s'      # bounds Caddy's own shutdown of the outgoing config
 CADDY_RELOAD_TIMEOUT = 45       # our ceiling per attempt; >> the grace period on purpose
+CADDY_STREAM_CLOSE_DELAY = '5m'  # how long a reload leaves proxied WebSockets open (GH #90)
 
 
 def _caddy_reload_checked(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
@@ -437,6 +438,41 @@ def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True
     WITHOUT taking the deploy down with it."""
     return _caddy_reload_checked(plog=plog, timeout=timeout,
                                  restart_on_error=restart_on_error)[0]
+
+
+def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
+    """Load the on-disk Caddyfile ONLY if Caddy is not already running it. Returns (ok, detail).
+
+    GH #90 — `systemctl reload caddy` runs the packaged unit's ExecReload, which is
+    `caddy reload --config /etc/caddy/Caddyfile --force` (checked on test8 + nuc, 2026-10-09).
+    --force makes Caddy rebuild every server even when the config is byte-identical, and a
+    rebuild closes every proxied WebSocket — WebTAK went red on every console start, because
+    two startup steps regenerate the Caddyfile and reload it whether or not anything changed.
+
+    Without --force, Caddy compares the adapted config with the one it is running and skips
+    the reload when they match ("config is unchanged" — changeConfig() in caddy.go). That is
+    the check we want, and Caddy makes it against its RUNNING config, not the file: a file
+    that a previous reload refused still differs from what is running, so it is loaded (and
+    refused again, loudly) here. `caddy reload` only adapts and POSTs to the admin API on
+    localhost:2019, so it needs nothing privileged — unlike `caddy validate`, it never opens
+    the log files or certs that the console user cannot read.
+
+    ANY failure of the unforced attempt falls through to _caddy_reload_checked() with the
+    caller's own arguments, so the outcome is never worse than calling that directly. Do not
+    use this where a reload must re-read files the Caddyfile only points at (e.g. a swapped
+    custom cert) — only --force reprovisions those."""
+    # No EAB environment needed, unlike _caddy_validate_config(): adapting keeps the
+    # `{env.…}` placeholders verbatim and nothing is provisioned on this side.
+    try:
+        if shutil.which('caddy'):
+            r = subprocess.run(['caddy', 'reload', '--config', CADDYFILE_PATH,
+                                '--adapter', 'caddyfile'],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return True, ''
+    except Exception:
+        pass                        # never raises — same contract as _caddy_reload_checked()
+    return _caddy_reload_checked(plog=plog, timeout=timeout, restart_on_error=restart_on_error)
 
 
 def _priv_pipe(argv, filter_argv, timeout=60, **kw):
@@ -19646,7 +19682,10 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
             # restart_on_error=False keeps the promise the comment above makes: a refused
             # config must leave the RUNNING Caddy untouched. A restart would read the same
             # bad file and take the edge down entirely.
-            rl_ok, rl_detail = _caddy_reload_checked(timeout=60, restart_on_error=False)
+            # GH #90: unforced, so Caddy skips it when it is already running this file —
+            # which is itself the proof it accepted it. This ran on every console start
+            # (and every gunicorn worker respawn) and cut every proxied WebSocket each time.
+            rl_ok, rl_detail = _caddy_reload_if_changed(timeout=60, restart_on_error=False)
             if not rl_ok:
                 _log('fail2ban: Caddy REFUSED the config carrying the portal access log '
                      '(%s). The running config is untouched, but the ON-DISK Caddyfile is '
@@ -30663,6 +30702,7 @@ def _get_service_alias(settings, service_key):
 # box that ALREADY had Caddy — Ubuntu 22.04 universe ships 2.4.5, Debian bookworm 2.6.2 —
 # because the only checks anywhere were "does the binary execute".
 _CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
+_CADDY_MIN_STREAM_CLOSE_DELAY = (2, 7)  # reverse_proxy `stream_close_delay` landed here
 _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
@@ -30700,6 +30740,25 @@ def _caddy_supports_heredoc():
     """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
     v = _caddy_version_tuple()
     return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_stream_close_delay_lines(indent):
+    """`stream_close_delay` for a reverse_proxy block, or [] on Caddy < 2.7 / unknown.
+
+    GH #90 — Caddy closes every proxied WebSocket the instant a reload unloads the config
+    (close code 1001, measured on test12), so WebTAK and CloudTAK went red on
+    every reload. With a delay, the OUTGOING config leaves its streams open for that long
+    instead; Caddy's docs suggest 5m (https://caddyserver.com/docs/caddyfile/directives/
+    reverse_proxy). The close is scheduled on a timer and the reload returns at once, so
+    this does not hold the reload against grace_period. The cost is that each reload's old
+    config stays in memory until its open streams close or the delay runs out.
+
+    Same fail-closed gate as the heredoc: the directive arrived in Caddy 2.7.0 (caddy PR
+    #5567), and an unknown directive makes the WHOLE Caddyfile unloadable."""
+    v = _caddy_version_tuple()
+    if not (v and v >= _CADDY_MIN_STREAM_CLOSE_DELAY):
+        return []
+    return [f"{indent}stream_close_delay {CADDY_STREAM_CLOSE_DELAY}"]
 
 
 def _caddy_rescue_html_oneline(root_url):
@@ -30971,6 +31030,50 @@ def _startup_caddy_grace_period_converge():
     print('Startup migration: ✓ Caddyfile now carries grace_period %s and Caddy %s '
           '(reload-hang fix)' % (CADDY_GRACE_PERIOD,
                                  'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
+          flush=True)
+
+
+def _startup_caddy_stream_close_delay_converge():
+    """GH #90 — put stream_close_delay into the TAK Server / CloudTAK vhosts on boxes that
+    already have them. Same reason as _startup_caddy_grace_period_converge(): the emitter
+    alone reaches a box only when something regenerates the Caddyfile.
+
+    Idempotent: a box whose file already carries the directive, or has neither vhost, or
+    runs Caddy < 2.7 (nothing would be emitted) costs one read. The reload that delivers it
+    still drops open sockets once — the OUTGOING config has no delay to honour."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: stream_close_delay converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'stream_close_delay' in generated:
+        return
+    if '# TAK Server' not in generated and '# CloudTAK Web UI' not in generated:
+        return
+    if not _caddy_stream_close_delay_lines(''):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    # Read back: generate_caddyfile() restores the previous file if the new one is rejected.
+    try:
+        after = _read_priv(CADDYFILE_PATH)
+        if 'stream_close_delay' not in after:
+            if '# TAK Server' in after or '# CloudTAK Web UI' in after:
+                print('Startup migration: ⚠ stream_close_delay converge FAILED — the '
+                      'regenerated Caddyfile was rejected and rolled back. A Caddy reload '
+                      'still cuts WebTAK and CloudTAK sockets on this box.', flush=True)
+            return                  # else both vhosts are gone: nothing left to converge
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Server/CloudTAK vhosts now carry stream_close_delay %s '
+          'and Caddy %s (GH #90)' % (CADDY_STREAM_CLOSE_DELAY,
+                                     'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
           flush=True)
 
 
@@ -31434,6 +31537,8 @@ def generate_caddyfile(settings=None):
         # Location headers naming 127.0.0.1:8446 because that is the Host it was handed.
         # Kept as belt-and-braces; removing them is a separate, evidence-free change.
         lines.append(f"        header_up Host {{host}}")
+        # GH #90: a Caddy reload no longer cuts WebTAK's socket on the spot.
+        lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
         lines.append(f"            tls")
         lines.append(f"            tls_insecure_skip_verify")
@@ -31530,6 +31635,8 @@ def generate_caddyfile(settings=None):
         lines.append(f"{ct_map} {{")
         lines.append(f"    reverse_proxy {ct_up['map']} {{")
         lines.append(f"        flush_interval -1")
+        # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
+        lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
         lines.append(f"            read_timeout 120s")
         lines.append(f"            write_timeout 120s")
@@ -80682,7 +80789,9 @@ def _startup_ensure_hardening_posture():
         if w1.get('caddy_login_locked'):
             try:
                 generate_caddyfile()
-                _caddy_reload()
+                # GH #90: only when Caddy is not already running this file. An unconditional
+                # forced reload here cut every WebTAK/CloudTAK socket on every console start.
+                _caddy_reload_if_changed()
                 print('[startup-posture] hardened: Caddy /login SSO-lock re-asserted', flush=True)
             except Exception as _ce:
                 print('[startup-posture] Caddy re-assert warning: %s' % str(_ce)[:140], flush=True)
@@ -85247,6 +85356,11 @@ def _startup_migrations():
             _startup_caddy_grace_period_converge()
         except Exception as _gp_err:
             print(f"Startup migration: grace_period converge error (non-fatal): {_gp_err}",
+                  flush=True)
+        try:
+            _startup_caddy_stream_close_delay_converge()
+        except Exception as _scd_err:
+            print(f"Startup migration: stream_close_delay converge error (non-fatal): {_scd_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
