@@ -815,7 +815,6 @@ ${BROKER_SELINUX:+$BROKER_SELINUX
 }ExecStart=$INSTALL_DIR/.venv/bin/python3 $broker_py serve
 Restart=always
 RestartSec=2
-RuntimeMaxSec=24h
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

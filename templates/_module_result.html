@@ -1,0 +1,15 @@
+{# v10.2.8 W10 — a module's last update/deploy failure, on its own card, so the customer never has
+   to capture anything. Data: module_last_result(<module>) from .config/module-results.json.
+   Jinja autoescapes every field (they carry raw command output). #}
+{% macro last_update_result(module, label=None) %}
+{%- set r = module_last_result(module) if module_last_result is defined else none -%}
+{%- if r and r.outcome in ('failed', 'interrupted') -%}
+<div class="module-last-result" data-module="{{ module }}" style="margin-top:10px;padding:10px 14px;border-radius:8px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);font-size:12px;line-height:1.5">
+  <div style="color:var(--red);font-weight:600">
+    ✗ Last {{ label or r.kind or 'update' }} {{ 'failed' if r.outcome == 'failed' else 'was interrupted' }}{% if r.step and r.step != 'started' %} at “{{ r.step }}”{% endif %}{% if r['from'] or r.to %} ({{ r['from'] or '?' }} → {{ r.to or '?' }}){% endif %}
+  </div>
+  <div style="font-family:'JetBrains Mono',monospace;color:var(--text-primary);margin-top:4px;word-break:break-word">{{ r.error }}</div>
+  <div style="color:var(--text-secondary);margin-top:4px">{{ (r.finished_at or r.started_at or '')|replace('T', ' ')|replace('Z', '') }} UTC · this is also in Diagnostics, so you do not need to copy it. Running the {{ label or r.kind or 'update' }} again clears this once it succeeds.</div>
+</div>
+{%- endif -%}
+{% endmacro %}

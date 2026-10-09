@@ -344,6 +344,7 @@
         <button type="button" id="fedhub-update-btn" class="btn btn-primary" onclick="fedhubStartUpdate()">Update Federation Hub</button>
         <span id="fedhub-update-msg" class="form-hint" style="margin:0"></span>
       </div>
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('fedhub') }}
       <div id="fedhub-upgrade-log-wrap" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};margin-top:18px">
         <div class="card-title" style="margin-bottom:8px">Update log</div>
         <div class="log-box" id="fedhub-upgrade-log">{% if fedhub_upgrading %}Connecting…{% elif fedhub_upgrade_done %}Done.{% elif fedhub_upgrade_error %}Update failed.{% endif %}</div>

@@ -587,6 +587,21 @@ def _write_priv(path, content, mode='w', perm=None):
                            capture_output=True, text=True, check=False)
 
 
+def _read_priv_bytes(path):
+    """_read_priv for BINARY files (.p12, keystores): same routing, no text decode.
+    v10.2.8 W11c — admin.p12 on a hardened container tree is root:root 660, so the console's
+    raw open() is Permission denied on a non-root box."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'read', 'path': path})
+        if not resp.get('ok'):
+            raise BrokerError(f"broker read denied ({path}): {resp.get('error')}")
+        return _b64.b64decode(resp.get('content_b64') or '')
+    if os.getuid() == 0:
+        with open(path, 'rb') as f:
+            return f.read()
+    return subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, check=True).stdout
+
+
 def _read_priv(path):
     """Read a privileged path. Routes through the broker when active; otherwise
     direct (root) or 'sudo cat' (legacy non-root). Returns text."""
@@ -1018,7 +1033,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.7-alpha"
+VERSION = "10.2.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1075,7 +1090,7 @@ AUTHENTIK_VETTED_RELEASE = "2026.5.7"   # v10.2.7: SECURITY — 2026.5.7 fixes f
 # 2026-08-14).  There is deliberately NO startup converge that moves existing boxes:
 # MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
 # streaming box is a crash-loop, not a warning.
-MEDIAMTX_VETTED_RELEASE = "1.20.0"      # v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
+MEDIAMTX_VETTED_RELEASE = "1.21.1"      # v10.2.8 W7: SECURITY — GHSA-w334-5mp5-h897 (CRITICAL, 2026-10-08): CSRF on the Control API → runOnInit command execution, fixed in 1.21.1 (plus RTMP publisher panics GHSA-7498/-5jgv, fixed 1.21.0). FRESH installs only — existing boxes are told by the upstream badge and update in the web editor. Previous 1.20.0 — v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
 AUTHENTIK_DEV_RELEASE    = "2026.5.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -1151,8 +1166,11 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # the orphaned-store self-heal. Dev pins stay == vetted until a newer pair is under trial.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.74.4"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.90.4"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV == vetted (no newer candidate under trial)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.90.4"
+# v10.2.8 W9: 0.80.0 / v2.94.0 UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4 carries
+# GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated bytes before the HMAC check; fixed 0.75.0).
+# Promote to VETTED only after dashboard login + peer connect on dev, per the comment above.
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -1788,6 +1806,306 @@ def _heal_settings_core_keys():
         s.update(healed)
         save_settings(s)
         print(f"[heal-settings] restored missing core keys: {list(healed)}", flush=True)
+
+# ---------------------------------------------------------------------------
+# v10.2.8 W10: a failed module update records its own reason
+# ---------------------------------------------------------------------------
+# Field report (Richard, AUS-NSW, 2026-10-08): "Authentik failed to update" — and nothing he
+# could send from the UI said why. Measured in code: the Authentik Update ran synchronously and
+# its reason existed ONLY in the HTTP response (not the journal, not on disk); the page treats a
+# gateway timeout as "still running" and reloads after 3 minutes, so on any proxy timeout the
+# reason was gone. The async updates (CloudTAK, TAK Server, …) keep their log in memory, which any
+# console restart wipes. Diagnostics had no update section at all.
+#
+# So every module update/deploy writes its outcome here, the module card shows the last failure,
+# and Diagnostics carries it. A customer never has to capture anything. (UI-only rule.)
+MODULE_RESULTS_FILE = os.path.join(CONFIG_DIR, 'module-results.json')
+_MODULE_RESULTS_LOCK = threading.Lock()
+_MODULE_RESULTS_KEEP = 10
+_MODULE_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_:-]{0,48}$')
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+# Pull / build progress — the head of `docker compose` stderr is all of this, never the cause.
+_UPDATE_NOISE_RE = re.compile(
+    r'^\s*(\[\+\]|#\d+\s|Pulling\b|Pulled\b|Downloading\b|Download complete|Extracting\b|'
+    r'Verifying Checksum|Waiting\b|Pull complete|Already exists|Digest:|Status: (Downloaded|Image is up)|'
+    r'[0-9a-f]{12}\s+(Pulling|Waiting|Downloading|Extracting|Verifying|Download complete|'
+    r'Pull complete|Already exists)|[\w.-]+\s+(Pulling|Pulled|Waiting|Skipped)\b)', re.I)
+_UPDATE_ERROR_RE = re.compile(
+    r"(error|fail|denied|unauthori[sz]ed|forbidden|not found|no such|no space|timed? ?out|"
+    r"refused|manifest unknown|toomanyrequests|rate limit|cannot|can't|unable|invalid|"
+    r"refusing|did not|exit (code|status)|traceback|exception|✗|⚠)", re.I)
+
+
+def _update_error_line(text, limit=600):
+    """The line that actually says what went wrong, from a message or a whole log.
+
+    Strips ANSI and pull/build progress, then takes the LAST line that reads like an error
+    (the cause is at the end of compose output, not the head), else the last non-empty line.
+    Accepts a string or a list of log entries (str, or dicts carrying msg/message/text).
+    600 chars, not 300: the W10b rollback note ("… (the tag pin was restored to v…)") rides at
+    the END of the message and is the part that tells a customer nothing changed."""
+    if not text:
+        return ''
+    if isinstance(text, (list, tuple, deque)):
+        parts = []
+        for t in text:
+            if isinstance(t, dict):
+                t = t.get('msg') or t.get('message') or t.get('text') or t.get('line') or ''
+            parts.append(str(t))
+        text = '\n'.join(parts)
+    lines = [_ANSI_RE.sub('', l).strip() for l in str(text).replace('\r', '\n').splitlines()]
+    lines = [l for l in lines if l and not _UPDATE_NOISE_RE.match(l)]
+    if not lines:
+        return ''
+    pick = next((l for l in reversed(lines) if _UPDATE_ERROR_RE.search(l)), lines[-1])
+    return pick[:limit]
+
+
+def _mod_result_scrub(text):
+    """Defense in depth before command output is stored and shown on a card (which, unlike the
+    Diagnostics export, is not passed through _diag_redact): credentials embedded in a URL,
+    Bearer tokens, and key=value secrets."""
+    if not text:
+        return text
+    text = re.sub(r'(?<=://)[^/\s:@]+:[^/\s@]+@', '[REDACTED]@', text)
+    text = re.sub(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer [REDACTED]', text)
+    return re.sub(r'(?i)\b(password|passwd|secret|token|api[_-]?key)(["\']?\s*[=:]\s*["\']?)([^\s"\',;&]{4,})',
+                  r'\1\2[REDACTED]', text)
+
+
+def _mod_results_load():
+    try:
+        with open(MODULE_RESULTS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mod_results_save(d):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = MODULE_RESULTS_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, MODULE_RESULTS_FILE)
+
+
+def _mod_results_now():
+    return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _mod_result_start(module, kind='update', frm='', to=''):
+    """Record that an update/deploy began. Never raises — bookkeeping must not break the work."""
+    try:
+        entry = {'id': secrets.token_hex(6), 'module': module, 'kind': kind, 'outcome': 'running',
+                 'from': str(frm or ''), 'to': str(to or ''), 'step': 'started',
+                 'error': '', 'summary': '', 'started_at': _mod_results_now(), 'finished_at': None}
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            d.setdefault(module, {'history': []})['last'] = entry
+            _mod_results_save(d)
+        return entry
+    except Exception as e:
+        print(f'[module-result] could not record start for {module}: {e}', flush=True)
+        return None
+
+
+def _mod_result_step(module, step):
+    """Persist the step an in-flight update has reached, so a crash or restart still says where."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            last = (d.get(module) or {}).get('last')
+            if last and last.get('outcome') == 'running':
+                last['step'] = str(step)[:120]
+                _mod_results_save(d)
+    except Exception:
+        pass
+
+
+def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None):
+    """Record the outcome. `error` may be a message or a whole log; the real line is extracted."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            m = d.setdefault(module, {'history': []})
+            e = m.get('last') or {'id': secrets.token_hex(6), 'module': module,
+                                  'kind': kind or 'update', 'from': '', 'to': '',
+                                  'step': '', 'started_at': _mod_results_now()}
+            if kind:
+                e['kind'] = kind
+            e['outcome'] = 'ok' if ok else 'failed'
+            e['finished_at'] = _mod_results_now()
+            if to:
+                e['to'] = str(to)
+            if step:
+                e['step'] = str(step)[:120]
+            if ok:
+                e['error'] = ''
+                e['summary'] = ''
+            else:
+                raw = error if isinstance(error, str) else '\n'.join(map(str, error or []))
+                e['error'] = _mod_result_scrub(_update_error_line(error)) or 'failed (no error text was returned)'
+                e['summary'] = _mod_result_scrub((raw.strip().splitlines() or [''])[0][:200])
+            hist = [h for h in m.get('history', []) if h.get('id') != e.get('id')]
+            m['history'] = ([dict(e)] + hist)[:_MODULE_RESULTS_KEEP]
+            m['last'] = e
+            _mod_results_save(d)
+        print(f"[module-result] {module} {e.get('kind')} {e['outcome']}"
+              f"{' at ' + e['step'] if e.get('step') not in (None, '', 'started') and not ok else ''}"
+              f"{': ' + e['error'] if not ok else ''}", flush=True)
+        return e
+    except Exception as ex:
+        print(f'[module-result] could not record result for {module}: {ex}', flush=True)
+        return None
+
+
+def _mod_results_mark_interrupted():
+    """At console start, anything still `running` was cut off by the restart — say so."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            changed = []
+            for name, m in d.items():
+                last = (m or {}).get('last') or {}
+                if last.get('outcome') == 'running':
+                    last['outcome'] = 'interrupted'
+                    last['finished_at'] = _mod_results_now()
+                    last['error'] = ('the console restarted while this was running '
+                                     f"(last step: {last.get('step') or 'started'})")
+                    hist = [h for h in m.get('history', []) if h.get('id') != last.get('id')]
+                    m['history'] = ([dict(last)] + hist)[:_MODULE_RESULTS_KEEP]
+                    changed.append(name)
+            if changed:
+                _mod_results_save(d)
+                print(f"[module-result] marked interrupted by the restart: {', '.join(changed)}", flush=True)
+    except Exception:
+        pass
+
+
+def _mod_result_last(module):
+    """Last recorded update/deploy result for a module, or None. Used by every module card."""
+    try:
+        return ((_mod_results_load().get(module) or {}).get('last')) or None
+    except Exception:
+        return None
+
+
+def _response_outcome(rv):
+    """(ok, error_text, version) from a Flask view's return value."""
+    resp, code = rv, 200
+    if isinstance(rv, tuple):
+        resp = rv[0]
+        if len(rv) > 1 and isinstance(rv[1], int):
+            code = rv[1]
+    if hasattr(resp, 'status_code') and not isinstance(rv, tuple):
+        code = resp.status_code
+    data = None
+    try:
+        data = resp.get_json(silent=True) if hasattr(resp, 'get_json') else (resp if isinstance(resp, dict) else None)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return code < 400, ('' if code < 400 else f'HTTP {code}'), ''
+    ok = code < 400 and not data.get('error') and data.get('success', True) is not False
+    err = '' if ok else str(data.get('error') or data.get('output') or data.get('message') or f'HTTP {code}')
+    ver = str(data.get('version') or '') if ok else ''
+    return ok, err, ver
+
+
+def _records_module_update(module, when=None, from_fn=None, to_fn=None, kind='update'):
+    """Decorator for a SYNCHRONOUS update route: record start, then the outcome its response carries."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*a, **kw):
+            try:
+                active = when() if when else True
+            except Exception:
+                active = False
+            if not active:
+                return fn(*a, **kw)
+
+            def _safe(f):
+                try:
+                    return f() if f else ''
+                except Exception:
+                    return ''
+            _mod_result_start(module, kind, _safe(from_fn), _safe(to_fn))
+            try:
+                rv = fn(*a, **kw)
+            except Exception as e:
+                _mod_result_finish(module, False, f'{type(e).__name__}: {e}')
+                raise
+            ok, err, ver = _response_outcome(rv)
+            _mod_result_finish(module, ok, err, to=ver or None)
+            return rv
+        return wrapper
+    return deco
+
+
+def _mod_results_failing(prefix):
+    """Names of `prefix` and `prefix-*` records whose last result failed or was interrupted —
+    for a page with one record per deployment (ATLAS: `atlas`, `atlas-<slug>`)."""
+    out = []
+    for name, m in sorted(_mod_results_load().items()):
+        if name == prefix or name.startswith(prefix + '-'):
+            if ((m or {}).get('last') or {}).get('outcome') in ('failed', 'interrupted'):
+                out.append(name)
+    return out
+
+
+# Every module page can show its last failure: {{ module_last_result('authentik') }}.
+app.jinja_env.globals['module_last_result'] = _mod_result_last
+app.jinja_env.globals['module_results_failing'] = _mod_results_failing
+# This process just started, so nothing can still be running: an entry left `running` was cut off
+# by a console restart (the 24 h recycle, Update Now, a module's own restart). Say so on its card.
+_mod_results_mark_interrupted()
+
+_LOG_STEP_RE = re.compile(r'(━━━\s*(.+?)\s*━━━|\bStep\s+\d+\s*/\s*\d+\b[^\n]*)')
+
+
+def _run_tracked(module, status, log, fn, *args, kind='update', frm='', to='', **kw):
+    """Thread target for an ASYNC update/deploy: run it, then record what its status/log say.
+
+    Outcome = the job's own status dict (`error` truthy = failed); the reason = the real error line
+    from its log; the step = the last "━━━ … ━━━" / "Step N/M" header it printed."""
+    _mod_result_start(module, kind, frm, to)
+    try:
+        fn(*args, **kw)
+    except Exception as e:
+        _tracked_finish(module, status, log, exc=e, kind=kind)
+        raise
+    _tracked_finish(module, status, log, kind=kind)
+
+
+def _tracked_finish(module, status, log, exc=None, kind='update'):
+    """Record an async job's end from its own status dict and log (shared by _run_tracked and
+    the TAK Server update factory). Never raises."""
+    try:
+        # Prefer the job's CURRENT log: some workers replace status['log'] with a new list as
+        # they go (WebODM, Remote Assist — found in the W10 security review), so a list captured
+        # when the thread started can be empty by the end.
+        cur = (status or {}).get('log') if isinstance(status, dict) else None
+        entries = list(cur if isinstance(cur, (list, tuple, deque)) and cur else (log or []))
+        step = ''
+        for entry in reversed(entries):
+            txt = entry if isinstance(entry, str) else str((entry or {}).get('msg') or entry)
+            m = _LOG_STEP_RE.search(txt)
+            if m:
+                step = (m.group(2) or m.group(1)).strip()[:120]
+                break
+        err = (status or {}).get('error')
+        if exc is not None:
+            _mod_result_finish(module, False, f'{type(exc).__name__}: {exc}', step=step or None, kind=kind)
+        elif err:
+            detail = err if isinstance(err, str) and err.strip() else entries
+            _mod_result_finish(module, False, detail, step=step or None, kind=kind)
+        else:
+            _mod_result_finish(module, True, step=step or None, kind=kind)
+    except Exception:
+        pass
+
 
 def load_auth():
     """Load auth.json from CONFIG_DIR. Never raises — returns {} on missing file or error."""
@@ -7904,6 +8222,17 @@ def _diag_section_takportal(settings):
     hits = [l for l in lg.splitlines() if re.search(r'enroll|qr|itak|error|fail', l, re.I)]
     out.append(f"{web} log, last 3 h (enrollment / errors): {len(hits)} line(s)")
     out.extend('  ' + l[:260] for l in hits[-20:])
+    # v10.2.8 W12: the addresses Portal uses for TAK, its own links and Authentik — the bcg-tak
+    # report could not show that Portal was still on the server's IP.
+    try:
+        existing = _takportal_get_existing_settings() or {}
+        out.append('addresses: ' + ', '.join(f"{k}={existing.get(k) or '(unset)'}" for k in TAKPORTAL_DOMAIN_KEYS))
+        stale = _takportal_stale_address_fields(settings, existing=existing)
+        if stale:
+            out.append('⚠ still on the server IP while the box has a domain: '
+                       + ', '.join(f"{f['key']} (should be {f['suggested']})" for f in stale))
+    except Exception as e:
+        out.append(f'addresses: could not read ({str(e)[:100]})')
     return out
 
 
@@ -7959,9 +8288,37 @@ def _diag_section_modules(settings):
             'container states: see "Containers" above']
 
 
+def _diag_section_module_results(settings):
+    """v10.2.8 W10: the last update/deploy result of every module, from .config/module-results.json —
+    so a failure the customer saw (or did not see) is in the report they send, with its reason."""
+    d = _mod_results_load()
+    if not d:
+        return ['no module update or deploy has been recorded on this box yet '
+                '(recording began in v10.2.8)']
+    out = []
+    for name in sorted(d):
+        m = d.get(name) or {}
+        last = m.get('last') or {}
+        when = (last.get('finished_at') or last.get('started_at') or '?').replace('T', ' ').rstrip('Z')
+        line = (f"{name}: last {last.get('kind') or 'update'} {(last.get('outcome') or '?').upper()} "
+                f"{when} UTC ({last.get('from') or '?'} -> {last.get('to') or '?'})")
+        if last.get('outcome') in ('failed', 'interrupted'):
+            line += f" | step: {last.get('step') or '?'} | {last.get('error') or '(no reason recorded)'}"
+            if last.get('summary') and last.get('summary') not in (last.get('error') or ''):
+                line += f" | message: {last.get('summary')}"
+        out.append(line)
+        for h in (m.get('history') or [])[1:4]:
+            if h.get('outcome') in ('failed', 'interrupted'):
+                out.append(f"    earlier {h.get('outcome')} "
+                           f"{(h.get('finished_at') or h.get('started_at') or '?').replace('T', ' ').rstrip('Z')} UTC: "
+                           f"{h.get('error') or '?'}")
+    return out
+
+
 _DIAG_SECTIONS = (
     ('Box', _diag_section_box),
     ('Console', _diag_section_console),
+    ('Module updates — last result per module', _diag_section_module_results),
     ('Connectivity', _diag_section_connectivity),
     ('Containers', _diag_section_containers),
     ('Authentik / LDAP / webadmin', _diag_section_authentik),
@@ -7991,6 +8348,15 @@ def _diag_collect():
         parts.extend(str(x) for x in body)
     parts.append(f"\n===== end — {time.time() - t0:.0f} s =====")
     return _diag_redact('\n'.join(parts), settings)
+
+
+@app.route('/api/module-results/<module>')
+@login_required
+def module_result_api(module):
+    """v10.2.8 W10: a module's last recorded update/deploy result (read-only)."""
+    if not _MODULE_NAME_RE.match(module or ''):
+        return jsonify({'error': 'unknown module'}), 400
+    return jsonify({'module': module, 'last': _mod_result_last(module)})
 
 
 def _diag_worker():
@@ -12497,6 +12863,11 @@ def netbird_deploy_status_api():
 
 @app.route('/api/netbird/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10
+    'netbird',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_netbird_version_info().get('version') or ''),
+    to_fn=lambda: _get_netbird_target_images()[0].rsplit(':', 1)[-1])
 def netbird_control_api():
     action = (request.json or {}).get('action', '')
     if action not in ('start', 'stop', 'restart', 'update'):
@@ -15324,7 +15695,10 @@ def remote_assist_update_api():
     if _remote_assist_update_status.get('running'):
         return jsonify({'started': False, 'error': 'Update already in progress'})
     _remote_assist_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-    threading.Thread(target=_run_remote_assist_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10 (the worker mutates this dict in place)
+                     args=('remote-assist', _remote_assist_update_status, None,
+                           _run_remote_assist_update),
+                     daemon=True).start()
     return jsonify({'started': True})
 
 
@@ -15375,7 +15749,10 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.14.0'
+COTURN_IMAGE = 'coturn/coturn:4.18.0'   # v10.2.8 W8: SECURITY — 4.14.0 carried GHSA-m23x (pre-auth heap
+# disclosure), GHSA-fvj6 (weak RNG) + five MEDIUM; all fixed by 4.17.0. Our flags include none of 4.18's
+# three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
+# defaults do not touch a cert-less UDP/TCP TURN.
 # Fleet constant (v10.0.7): standalone Remote-Assist CoTURN ALWAYS defaults to 3479,
 # never 3478 — 3478 is reserved for NetBird's TURN so the two can land on one box in
 # ANY install order with zero conflicts. RA clients are explicitly told URL+port by
@@ -22625,6 +23002,7 @@ def guarddog_apply_docker_log_limits():
 
 @app.route('/api/guarddog/update', methods=['POST'])
 @login_required
+@_records_module_update('guarddog', to_fn=lambda: VERSION)  # v10.2.8 W10
 def guarddog_update():
     """Re-deploy Guard Dog scripts and timers from latest console version."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -23229,8 +23607,13 @@ def guarddog_test_email():
             force=True   # a test that goes silent while paused looks like a broken relay
         )
         paused, _u = _gd_alerts_pause_state(settings)
+        # v10.2.8 W6 (GH #87): say "accepted", not "sent" — the relay cannot see delivery.
+        try:
+            _said = mod_registry.emailrelay.accepted_message(settings, to_addr)
+        except Exception:
+            _said = f'Test email handed to the relay for {to_addr}'
         return jsonify({'success': True,
-                        'message': f'Test email sent to {to_addr}'
+                        'message': _said
                                    + (' — note: alerts are currently PAUSED, so real alerts are not being delivered.'
                                       if paused else '')})
     except Exception as e:
@@ -25192,7 +25575,9 @@ def fedhub_update_api():
         _caddy_regenerate_if_fqdn()
     fedhub_upgrade_log.clear()
     fedhub_upgrade_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_fedhub_remote_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10
+                     args=('fedhub', fedhub_upgrade_status, fedhub_upgrade_log, run_fedhub_remote_update),
+                     daemon=True).start()
     return jsonify({'success': True})
 
 
@@ -27085,6 +27470,8 @@ def _caddy_ensure_apt_repo(log_fn=None):
 
 @app.route('/api/caddy/update', methods=['POST'])
 @login_required
+@_records_module_update('caddy',  # v10.2.8 W10
+                        from_fn=lambda: (_get_caddy_version_info().get('version') or ''))
 def caddy_update():
     """Upgrade Caddy to the latest package version and reload.
 
@@ -28879,6 +29266,154 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+# v10.2.8 W11a/b — the cert-subject variables makeCert.sh needs from cert-metadata.sh.
+_CERT_META_VARS = ('COUNTRY', 'STATE', 'CITY', 'ORGANIZATION', 'ORGANIZATIONAL_UNIT')
+_CERT_META_REQUIRED = ('STATE', 'CITY', 'ORGANIZATIONAL_UNIT')   # what makeCert.sh refuses without
+_CERT_META_SAFE = re.compile(r'[^A-Za-z0-9 ._-]')
+
+
+def _cert_metadata_literals(text):
+    """{VAR: value} for the subject variables that hold a LITERAL value — not empty, not a
+    `${VAR}` / `${VAR:-default}` placeholder (the stock hardened-bundle form, which only works
+    when the variable is in makeCert's environment, and the console never sets it there)."""
+    out = {}
+    for var in _CERT_META_VARS:
+        m = re.search(rf'(?m)^[ \t]*{var}=(.*)$', text or '')
+        if not m:
+            continue
+        v = m.group(1).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+            v = v[1:-1]
+        if v and '$' not in v:
+            out[var] = v
+    return out
+
+
+def _cert_metadata_fill(text, values):
+    """(new_text, [vars changed]) — set each var in `values` ONLY where the file has no literal
+    for it yet. Never overwrites a value an operator or the deploy set. Values are reduced to
+    [A-Za-z0-9 ._-]: makeCert.sh SOURCES this file, so nothing shell-active may reach it."""
+    have = _cert_metadata_literals(text)
+    lines = (text or '').splitlines(keepends=True)
+    changed = []
+    for var in _CERT_META_VARS:
+        val = _CERT_META_SAFE.sub('', str(values.get(var) or '')).strip()
+        if var in have or not val:
+            continue
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(var + '='):
+                lines[i] = f'{line[:len(line) - len(stripped)]}{var}="{val}"\n'
+                changed.append(var)
+                break
+    return ''.join(lines), changed
+
+
+def _ca_subject_values(ca_pem=None, ca_path='/opt/tak/certs/files/ca.pem'):
+    """{COUNTRY, STATE, CITY, ORGANIZATION, ORGANIZATIONAL_UNIT} from the CA that signs this
+    box's client certs — the faithful source when cert-metadata.sh lost its values: new certs
+    then carry the same subject as the CA issuing them."""
+    pem = ca_pem if ca_pem is not None else _read_priv(ca_path)
+    r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-nameopt', 'RFC2253'],
+                       input=pem, capture_output=True, text=True, timeout=15)
+    subj = (r.stdout or '').strip().split('=', 1)[-1] if r.returncode == 0 else ''
+    keymap = {'C': 'COUNTRY', 'ST': 'STATE', 'L': 'CITY', 'O': 'ORGANIZATION', 'OU': 'ORGANIZATIONAL_UNIT'}
+    out = {}
+    for part in re.split(r'(?<!\\),', subj):
+        k, _, v = part.partition('=')
+        if k.strip() in keymap and v.strip():
+            out[keymap[k.strip()]] = v.strip().replace('\\', '')
+    return out
+
+
+def _heal_cert_metadata_placeholders(log=None):
+    """v10.2.8 W11b — a container upgrade used to replace cert-metadata.sh with the stock
+    hardened file (`STATE=${STATE}` …) and delete the old tree, so every later console makeCert
+    failed "Please set the following variables" (aws-arm, since 2026-09-22). Fill ONLY the
+    placeholder/empty subject variables from the current CA's own subject. Returns True when
+    it changed the file, False when nothing was needed, None when it could not tell."""
+    _log = log or (lambda m: print(m, flush=True))
+    cm = '/opt/tak/certs/cert-metadata.sh'
+    try:
+        text = _read_priv(cm)
+    except Exception:
+        return None
+    if all(v in _cert_metadata_literals(text) for v in _CERT_META_REQUIRED):
+        return False
+    try:
+        vals = _ca_subject_values()
+    except Exception as e:
+        _log(f"  cert-metadata.sh has placeholders and the CA subject could not be read ({str(e)[:120]})")
+        return None
+    new, changed = _cert_metadata_fill(text, vals)
+    if not changed:
+        _log("  cert-metadata.sh has placeholders but the CA subject does not carry the missing fields")
+        return None
+    _write_priv(cm, new)
+    if _tak_is_container():
+        _container_readable(cm, _log)
+    _log(f"  ✓ cert-metadata.sh: filled {', '.join(changed)} from the CA's own subject "
+         f"(the file held placeholders — a container upgrade had replaced it)")
+    return True
+
+
+def _carry_cert_metadata(old_tak, new_tak, log=None, old_text=None):
+    """v10.2.8 W11a — an upgrade replaces cert-metadata.sh with the stock placeholder file
+    (`STATE=${STATE}` …): a container upgrade extracts a fresh bundle, and a native .deb/.rpm
+    upgrade overwrites it in place (test6, 5.7 → 5.8 on 2026-09-22). Carry the old file's literal
+    subject values into it (falling back to the carried CA's own subject for anything the old file
+    lacked too), so makeCert keeps working. Native passes the pre-upgrade `old_text` because the
+    path is the same before and after. Returns the vars filled; never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    new_cm = os.path.join(new_tak, 'certs', 'cert-metadata.sh')
+    try:
+        new_text = _read_priv(new_cm)
+    except Exception as e:
+        _log(f"  ⚠ new bundle has no readable cert-metadata.sh ({str(e)[:100]}) — client certs may need it set by hand")
+        return []
+    vals = {}
+    try:
+        vals = _cert_metadata_literals(old_text if old_text is not None
+                                       else _read_priv(os.path.join(old_tak, 'certs', 'cert-metadata.sh')))
+    except Exception:
+        pass
+    if not all(v in vals for v in _CERT_META_REQUIRED):
+        try:
+            for k, v in _ca_subject_values(ca_path=os.path.join(new_tak, 'certs', 'files', 'ca.pem')).items():
+                vals.setdefault(k, v)
+        except Exception:
+            pass
+    out, changed = _cert_metadata_fill(new_text, vals)
+    if changed:
+        try:
+            _write_priv(new_cm, out)
+            if _tak_is_container():
+                _container_readable(new_cm, _log)
+            else:
+                _run_priv_chain([['chown', 'tak:tak', new_cm], ['chmod', '600', new_cm]], 'and')
+            _log(f"  ✓ cert-metadata.sh carried over ({', '.join(changed)})")
+        except Exception as e:
+            _log(f"  ⚠ could not write cert-metadata.sh in the new bundle ({str(e)[:100]})")
+            return []
+    return changed
+
+
+def _cert_metadata_prepare_for_makecert(log=None):
+    """Before a console makeCert.sh run: fill placeholder subject vars (W11b), then set the
+    file mode makeCert's runner can read. Container (hardened 5.8 runs as uid 1001 / gid 0):
+    group 0 + 640 — the old `chmod 500` left it owner-only, which only worked on a box whose
+    console uid happened to be 1001 (aws-arm). Native: tak:tak 500, unchanged."""
+    cm = '/opt/tak/certs/cert-metadata.sh'
+    try:
+        _heal_cert_metadata_placeholders(log)
+    except Exception:
+        pass
+    if _tak_is_container():
+        _container_readable(cm, log)
+    else:
+        _run_priv_chain([['chown', 'tak:tak', cm], ['chmod', '500', cm]], 'and')
+
+
 def _container_readable(path, log=None):
     """Make a bundle file readable by the TAK container's non-root user.
 
@@ -29037,6 +29572,13 @@ def _load_admin_p12_bytes_from_tak_core(settings):
         try:
             with open(local_path, 'rb') as f:
                 return f.read(), local_path, ''
+        except PermissionError:
+            # v10.2.8 W11c — root:root 660 on a hardened container tree; a non-root console
+            # reads it through the broker instead.
+            try:
+                return _read_priv_bytes(local_path), local_path, ''
+            except Exception as e:
+                return b'', local_path, f'Could not read local admin.p12: {e}'
         except Exception as e:
             return b'', local_path, f'Could not read local admin.p12: {e}'
 
@@ -33731,6 +34273,64 @@ takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 TAKPORTAL_AUTHORITATIVE_KEYS = frozenset(['AUTHENTIK_URL', 'AUTHENTIK_TOKEN',
                                           'AUTHENTIK_BOOTSTRAP_TOKEN'])
 
+# v10.2.8 W12 — the addresses TAK Portal derives from THIS box's identity. Seed-only like
+# everything else, so a portal installed before the box had a domain keeps IP addresses forever
+# (bcg-tak, 2026-10-09: deletes refused "Unable to list certificates from /api/certadmin/cert",
+# invite emails linking to http://<ip>:3000). Never auto-healed: the operator presses
+# "Use the domain" and only then does the merge write them (`adopt=`).
+TAKPORTAL_DOMAIN_KEYS = ('TAK_URL', 'TAK_PORTAL_PUBLIC_URL', 'AUTHENTIK_PUBLIC_URL')
+_TAKPORTAL_DOMAIN_KEY_INFO = {
+    'TAK_URL': ('TAK URL', "TAK Portal cannot reach TAK Server's API at this address, so deleting "
+                           "users and certificate actions fail, and QR codes send devices to it"),
+    'TAK_PORTAL_PUBLIC_URL': ('TAK Portal Public URL', "links in TAK Portal's emails go to this address"),
+    'AUTHENTIK_PUBLIC_URL': ('Authentik Public URL', 'signing out sends people to this address'),
+}
+
+
+def _url_host_is_address(url):
+    """True when a URL's host is an IP literal, localhost or host.docker.internal — an address,
+    not a name a certificate or a person outside the box can use."""
+    try:
+        host = (urllib.parse.urlsplit(str(url or '').strip()).hostname or '').strip('[]').lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host in ('localhost', 'host.docker.internal'):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _takportal_stale_address_fields(settings, existing=None, built=None):
+    """v10.2.8 W12 — the TAKPORTAL_DOMAIN_KEYS still on an address while this box has a domain.
+    A key is listed only when Portal's value has an address host (_url_host_is_address) AND the
+    value infra-TAK would seed today is different and carries a real hostname. A domain an
+    operator typed is never listed. TAK_URL only when TAK Server is on this box: a portal aimed
+    at a remote TAK by IP may mean it, and the in-container alias only covers a local TAK."""
+    if not (settings.get('fqdn') or '').strip():
+        return []
+    if existing is None:
+        existing = _takportal_get_existing_settings()
+    if not isinstance(existing, dict) or not existing:
+        return []
+    if built is None:
+        built = _takportal_build_settings_dict(settings)
+    out = []
+    for k in TAKPORTAL_DOMAIN_KEYS:
+        if k == 'TAK_URL' and not os.path.isdir('/opt/tak'):
+            continue
+        cur = str(existing.get(k) or '').strip()
+        sug = str(built.get(k) or '').strip()
+        if cur and sug and cur != sug and _url_host_is_address(cur) and not _url_host_is_address(sug):
+            label, effect = _TAKPORTAL_DOMAIN_KEY_INFO[k]
+            out.append({'key': k, 'label': label, 'current': cur, 'suggested': sug, 'effect': effect})
+    return out
+
+
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
 # EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
@@ -34227,7 +34827,7 @@ def _takportal_settings_value_is_blank(v):
     return False
 
 
-def _takportal_merged_settings_json(settings):
+def _takportal_merged_settings_json(settings, adopt=()):
     """Build settings JSON for TAK Portal. THE single source of every settings.json we write.
 
     v10.1.42 (W-P1) — ownership is inverted. The old model wrote everything infra-TAK computes
@@ -34243,7 +34843,11 @@ def _takportal_merged_settings_json(settings):
     There is deliberately no heuristic that infers ownership from the VALUE. "Overwrite it if it
     equals something we might have written" cannot tell our default from an operator who chose
     the same thing — that is exactly how a customer's deliberate TAK_SSH_USER=root was healed
-    away on every portal update (field report, Justin Davis/TN, 2026-08-20)."""
+    away on every portal update (field report, Justin Davis/TN, 2026-08-20).
+
+    v10.2.8 W12: `adopt` — keys the operator explicitly asked to move to this box's domain
+    (the "Use the domain" button). Intersected with TAKPORTAL_DOMAIN_KEYS; nothing else passes it."""
+    adopt = frozenset(adopt or ()) & frozenset(TAKPORTAL_DOMAIN_KEYS)
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
@@ -34262,6 +34866,9 @@ def _takportal_merged_settings_json(settings):
             continue
         if k in EMAIL_TRANSPORT_KEYS and _relay_configured:
             merged[k] = v
+            continue
+        if k in adopt:
+            merged[k] = v  # the operator pressed "Use the domain" for this key
             continue
         # operator-owned — hands off, whatever the current value is
     return json.dumps(merged, indent=2)
@@ -34634,8 +35241,68 @@ def _takportal_build_settings_json(settings):
     return json.dumps(d, indent=2), None
 
 
+@app.route('/api/takportal/address-check')
+@login_required
+def takportal_address_check_api():
+    """v10.2.8 W12 — TAK Portal fields still on this server's IP while the box has a domain."""
+    settings = load_settings()
+    try:
+        fields = _takportal_stale_address_fields(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200], 'fields': []}), 500
+    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields})
+
+
+@app.route('/api/takportal/use-domain', methods=['POST'])
+@login_required
+def takportal_use_domain_api():
+    """v10.2.8 W12 — the operator's one-click recovery: move the named TAKPORTAL_DOMAIN_KEYS from
+    the server IP to this box's domain. Only keys that are stale RIGHT NOW are written (through
+    the single merge + single writer), the container's host alias for takserver.<fqdn> is
+    refreshed (recreate only if it changed), the app services restart, and every key is read
+    back. Postgres is never recreated."""
+    settings = load_settings()
+    data = request.get_json(silent=True) or {}
+    want = data.get('keys')
+    if not isinstance(want, list) or not want or not all(isinstance(k, str) for k in want):
+        return jsonify({'success': False, 'error': 'keys must be a non-empty list'}), 400
+    try:
+        stale = {f['key']: f for f in _takportal_stale_address_fields(settings)}
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    keys = [k for k in TAKPORTAL_DOMAIN_KEYS if k in want and k in stale]
+    if not keys:
+        return jsonify({'success': True, 'changed': {}, 'message': 'Nothing to change: TAK Portal already uses the domain.'})
+    ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings, adopt=keys))
+    if not ok:
+        return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
+    print(f"[takportal] use-domain: {', '.join(keys)} moved to {settings.get('fqdn')} (operator)", flush=True)
+    recreated = False
+    try:
+        portal_dir = _takportal_dir()
+        if _write_takportal_override():
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps',
+                                           *_takportal_app_services(portal_dir)]),
+                               cwd=portal_dir, capture_output=True, text=True, timeout=180)
+            recreated = r.returncode == 0
+    except Exception:
+        pass
+    restarted = recreated or bool(_takportal_restart())
+    after = _takportal_get_existing_settings() or {}
+    changed = {k: after.get(k) for k in keys}
+    verified = all(changed[k] == stale[k]['suggested'] for k in keys)
+    return jsonify({'success': verified, 'changed': changed, 'restarted': restarted,
+                    'message': ('TAK Portal now uses ' + ', '.join(stale[k]['suggested'] for k in keys))
+                               if verified else '',
+                    'error': '' if verified else 'TAK Portal did not keep the new values — check its Settings page'})
+
+
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10
+    'takportal',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -34745,6 +35412,16 @@ def takportal_control():
             # Informational, NOT a warning -- see tak_local above. Appended after the chain
             # message so a remote-TAK box still learns whether Authentik reconciled.
             msg = msg + ' TAK Server is not on this box, so SSH setup and client-cert sync were skipped (configure those in TAK Portal).'
+        try:
+            _stale = _takportal_stale_address_fields(settings)
+        except Exception:
+            _stale = []
+        if _stale:
+            # v10.2.8 W12: Update config deliberately leaves these alone (operator-owned), so a
+            # bare "updated" left bcg-tak with no idea why deletes and email links still failed.
+            warnings.append('TAK Portal still uses this server\'s IP address for '
+                            + ', '.join(f['label'] for f in _stale)
+                            + ' — Update config does not change those; press "Fix" in the yellow card on this page.')
         if warnings:
             msg = msg + ' | ' + ' | '.join(warnings)
         return jsonify({'success': True, 'running': running, 'action': action,
@@ -36202,7 +36879,10 @@ writeTimeout: 10s
 api: yes
 apiAddress: 127.0.0.1:9898
 apiEncryption: no
-apiAllowOrigins: ['*']
+# v10.2.8 W7: no wildcard. 1.21.1 rejects a browser POST only when its origin is NOT
+# allowed, so '*' would leave the CSRF→runOnInit hole open. The web editor calls this API
+# server-side (no Origin header) and needs no browser origin here.
+apiAllowOrigins: []
 rtsp: yes
 rtspTransports: [tcp]
 rtspAddress: :8554
@@ -36852,7 +37532,10 @@ api: yes
 # moved from 9997 — CloudTAK media container owns port 9997 (hardcoded in video-service.ts).
 apiAddress: 127.0.0.1:9898
 apiEncryption: no
-apiAllowOrigins: ['*']
+# v10.2.8 W7: no wildcard. 1.21.1 rejects a browser POST only when its origin is NOT
+# allowed, so '*' would leave the CSRF→runOnInit hole open. The web editor calls this API
+# server-side (no Origin header) and needs no browser origin here.
+apiAllowOrigins: []
 apiTrustedProxies: []
 
 metrics: no
@@ -38124,6 +38807,275 @@ def _cloudtak_bootstrap_cert_target(settings):
     return 'absent', None
 
 
+def _cert_signed_by(cert_pem, ca_pem):
+    """True when cert_pem's leaf was signed by a cert in ca_pem, False when it was not, None when
+    it cannot tell. A SIGNATURE check (`openssl verify -partial_chain`), not a DN compare: a
+    regenerated CA can carry the very same subject. Expiry is ignored — this answers "which CA",
+    not "is it valid"."""
+    pat = r'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----'
+    leaf = re.search(pat, cert_pem or '', re.S)
+    if not leaf or not re.search(pat, ca_pem or '', re.S):
+        return None
+    fd, ca_file = tempfile.mkstemp(prefix='infratak-ca-', suffix='.pem')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(ca_pem)
+        r = subprocess.run(['openssl', 'verify', '-no_check_time', '-partial_chain', '-CAfile', ca_file],
+                           input=leaf.group(0) + '\n', capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(ca_file)
+        except OSError:
+            pass
+    if r.returncode == 0:
+        return True
+    out = ((r.stdout or '') + (r.stderr or '')).lower()
+    if 'unable to get local issuer' in out or 'unable to get issuer' in out or 'signature failure' in out:
+        return False
+    return None
+
+
+def _local_bootstrap_cert_ensure(settings):
+    """makeCert.sh client cloudtak-svc-bootstrap + UserManager certmod -A on the LOCAL TAK cert
+    store; idempotent. v10.2.8 W11d: an on-disk cert that the current CA did not sign (the CA was
+    replaced — a container upgrade, a root-CA rotation) is re-issued instead of reused, because
+    TAK refuses it. Returns {success, created, regenerated, admin_flip_ok, note, error}."""
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    cert_dir = '/opt/tak/certs/files'
+    p12_path = os.path.join(cert_dir, f'{cn}.p12')
+    pem_path = os.path.join(cert_dir, f'{cn}.pem')
+    created = regenerated = False
+    try:
+        have = os.path.exists(p12_path) or _exists_priv(pem_path)
+        if have:
+            try:
+                if _cert_signed_by(_read_priv(pem_path), _read_priv(os.path.join(cert_dir, 'ca.pem'))) is False:
+                    have, regenerated = False, True
+            except Exception:
+                pass
+        if not have:
+            _patch_openssl_string_mask()
+            _cert_metadata_prepare_for_makecert()
+            r = subprocess.run(
+                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
+                shell=True, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not _exists_priv(pem_path):
+                return {'success': False, 'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}
+            created = True
+        # CloudTAK's ROLE_ADMIN credential: makeCert in the container leaves it 644 (aws-arm,
+        # 2026-10-09). Owner-only; the console reads it through the broker.
+        try:
+            _chmod_priv(p12_path, 0o600)
+        except Exception:
+            pass
+
+        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
+        # then feeds it every channel). Unlike the best-effort group assignment
+        # in create-client-cert, a failure here is surfaced, not swallowed.
+        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
+        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
+        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
+        certmod_ok = gr.returncode == 0
+        # Canary — never assume the jar wrote the UAF entry (native non-root
+        # consoles can't write the tak-owned UAF from a bare java run).
+        uaf_has_entry = False
+        try:
+            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+        except Exception:
+            pass
+        note = ''
+        if not (certmod_ok and uaf_has_entry):
+            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
+                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
+                    + (gr.stdout or gr.stderr or '')[-300:])
+        return {'success': True, 'created': created, 'regenerated': regenerated,
+                'admin_flip_ok': bool(certmod_ok and uaf_has_entry), 'note': note}
+    except Exception as e:
+        return {'success': False, 'error': str(e)[:300]}
+
+
+def _cloudtak_admin_token(secret, email='infra-tak-console', ttl=300):
+    """A short-lived CloudTAK admin JWT, signed with CloudTAK's own SigningSecret (HS256 — the
+    jsonwebtoken default its tokenParser verifies). No `s` claim: CloudTAK treats such a token as
+    server-minted and checks no session (api/common/auth.ts tokenParser). Never logged."""
+    now = int(time.time())
+
+    def _seg(obj):
+        return _b64.urlsafe_b64encode(json.dumps(obj, separators=(',', ':')).encode()).rstrip(b'=')
+    signing = _seg({'alg': 'HS256', 'typ': 'JWT'}) + b'.' + _seg(
+        {'access': 'admin', 'email': email, 'iat': now, 'exp': now + int(ttl)})
+    sig = _b64.urlsafe_b64encode(hmac.new(secret.encode(), signing, hashlib.sha256).digest()).rstrip(b'=')
+    return (signing + b'.' + sig).decode()
+
+
+def _cloudtak_signing_secret():
+    env_path = os.path.join(os.path.expanduser('~/CloudTAK'), '.env')
+    try:
+        with open(env_path) as f:
+            text = f.read()
+    except PermissionError:
+        text = _read_priv(env_path)
+    except OSError:
+        return ''
+    for line in (text or '').splitlines():
+        if line.strip().startswith('SigningSecret='):
+            return line.split('=', 1)[1].strip()
+    return ''
+
+
+def _tak_ca_bundle(cert_dir='/opt/tak/certs/files'):
+    """Every certificate PEM in TAK's cert dir, concatenated — the CAs this TAK can still
+    vouch for, INCLUDING an old CA a rotation keeps (`<old>.pem`) for its transition period.
+    Falls back to ca.pem + root-ca.pem when the dir cannot be listed."""
+    try:
+        names = sorted(n for n in os.listdir(cert_dir) if n.endswith('.pem'))
+    except OSError:
+        names = ['ca.pem', 'root-ca.pem']
+    out = []
+    for n in names:
+        try:
+            text = _read_priv(os.path.join(cert_dir, n))
+        except Exception:
+            continue
+        if 'BEGIN CERTIFICATE' in (text or ''):
+            out.append(text.strip())
+    return '\n'.join(out) + '\n' if out else ''
+
+
+def _cloudtak_reset_foreign_profile_certs(log=None):
+    """v10.2.8 W11g — each CloudTAK user holds its OWN TAK client cert (profile.auth). After the
+    CA was replaced, every one of them is from a CA TAK no longer has: TAK closes the socket, and
+    CloudTAK's login probe does not count a closed socket as "rejected", so it never re-issues —
+    login fails "UND_ERR_SOCKET: other side closed" (aws-arm, 2026-10-09, after W11d had fixed the
+    admin connection). Empty ONLY the certs that no certificate in TAK's cert dir signed (a
+    rotation keeps its old CA on disk, so its certs are left alone); CloudTAK then treats the
+    cert as unparseable and re-issues it at that user's next password login. Set to
+    {cert:'',key:''}, not NULL: older CloudTAK dereferences profile.auth.cert unguarded.
+    Connection (machine) certs are only counted — CloudTAK cannot re-issue those itself.
+    Returns the usernames reset, or None when it could not tell."""
+    _log = log or (lambda m: print(m, flush=True))
+
+    def _psql(sql):
+        return subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker',
+                                          '-d', 'gis', '-v', 'ON_ERROR_STOP=1', '-tAc', sql]),
+                              capture_output=True, text=True, timeout=30)
+    try:
+        rows = json.loads((_psql("select coalesce(json_agg(json_build_object('u', username, 'c', auth->>'cert')), "
+                                 "'[]') from profile where coalesce(auth->>'cert', '') <> ''").stdout or '').strip() or '[]')
+        conns = json.loads((_psql("select coalesce(json_agg(json_build_object('n', name, 'c', auth->>'cert')), "
+                                  "'[]') from connections where coalesce(auth->>'cert', '') <> ''").stdout or '').strip() or '[]')
+    except Exception:
+        return None
+    bundle = _tak_ca_bundle()
+    if not bundle:
+        return None
+    reset = []
+    for row in rows:
+        cert = row.get('c') or ''
+        if _cert_signed_by(cert, bundle) is not False:
+            continue
+        # Match by the cert's own digest — no username ever enters the SQL.
+        digest = hashlib.md5(cert.encode()).hexdigest()
+        r = _psql("update profile set auth = '{\"cert\":\"\",\"key\":\"\"}'::jsonb "
+                  f"where md5(auth->>'cert') = '{digest}'")
+        if r.returncode == 0:
+            reset.append(str(row.get('u') or '?'))
+    if reset:
+        _log(f"  ✓ CloudTAK: {len(reset)} user cert(s) were from a CA this TAK Server no longer has "
+             f"({', '.join(reset[:10])}{' …' if len(reset) > 10 else ''}) — each is re-issued at that user's next login")
+    stale = [c.get('n') for c in conns if _cert_signed_by(c.get('c') or '', bundle) is False]
+    if stale:
+        _log(f"  ⚠ CloudTAK: {len(stale)} connection cert(s) are from a CA this TAK Server no longer has "
+             f"({', '.join(str(n) for n in stale[:10])}) — re-upload a current cert in CloudTAK → Connections")
+    return reset
+
+
+def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
+    """v10.2.8 W11d — give CloudTAK a cert the CURRENT TAK CA signed, when (and only when) its
+    admin connection is dead BECAUSE its cert came from a CA this TAK no longer has.
+
+    Both conditions, never one: CloudTAK must report connection 0 `dead` on every read (a TAK
+    restart reads dead for a minute — and during a CA rotation the old CA is still trusted, so
+    the old cert still works and reads `live`), AND its cert must fail a signature check against
+    the current ca.pem. That is a connection that cannot recover by itself. A working identity
+    is never swapped and an unconfigured CloudTAK is never bootstrapped (2026-08-03 decision).
+    Local CloudTAK + local TAK only. CloudTAK itself verifies the new cert against TAK before it
+    accepts the PATCH. Returns True healed, False tried and failed, None nothing to do / unknown."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = settings or load_settings()
+    try:
+        if (_get_cloudtak_deployment_config(settings).get('target_mode') or 'local').strip().lower() == 'remote':
+            return None
+    except Exception:
+        return None
+    if _cloudtak_bootstrap_cert_target(settings)[0] != 'local':
+        return None
+    secret = _cloudtak_signing_secret()
+    if not secret:
+        return None
+    base = 'http://127.0.0.1:5000'
+    status = None
+    srv = {}
+    for w in waits:
+        if w:
+            time.sleep(w)
+        ok, code, srv = _cloudtak_request_json(
+            'GET', base + '/api/server', timeout=20,
+            headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+        if not ok or not isinstance(srv, dict) or srv.get('status') != 'configured':
+            return None
+        status = srv.get('connection_status')
+        if status != 'dead':
+            return None
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-tAc', "select coalesce(auth->>'cert','') from server where id = 1"]),
+                           capture_output=True, text=True, timeout=20)
+        ct_cert = (r.stdout or '').strip()
+        signed = _cert_signed_by(ct_cert, _read_priv('/opt/tak/certs/files/ca.pem'))
+    except Exception:
+        signed = None
+    if signed is not False:
+        if signed is True:
+            _log("  CloudTAK's TAK connection is down, but its cert is from the current CA — not a CA problem; left alone")
+        return None
+    _log("  CloudTAK's TAK connection is down: its cert was issued by a CA this TAK Server no longer has. "
+         "Re-issuing the CloudTAK bootstrap admin cert from the current CA...")
+    res = _local_bootstrap_cert_ensure(settings)
+    if not res.get('success'):
+        _log(f"  ✗ could not issue the bootstrap cert: {res.get('error')}")
+        return False
+    try:
+        cert_pem, key_pem = _p12_bytes_to_pem(
+            _read_priv_bytes(f'/opt/tak/certs/files/{CLOUDTAK_BOOTSTRAP_CERT_CN}.p12'),
+            _get_tak_cert_password(settings))
+    except Exception as e:
+        _log(f"  ✗ could not read the new bootstrap cert: {str(e)[:160]}")
+        return False
+    ok, code, out = _cloudtak_request_json(
+        'PATCH', base + '/api/server', timeout=60,
+        payload={'url': srv.get('url') or '', 'api': srv.get('api') or '', 'webtak': srv.get('webtak') or '',
+                 'auth': {'cert': cert_pem, 'key': key_pem}},
+        headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+    if not ok:
+        msg = (out or {}).get('message') if isinstance(out, dict) else ''
+        _log(f"  ✗ CloudTAK refused the new cert (HTTP {code}): {str(msg)[:200]}")
+        return False
+    _log(f"  ✓ CloudTAK now connects to TAK Server with {CLOUDTAK_BOOTSTRAP_CERT_CN} from the current CA"
+         + ("" if res.get('admin_flip_ok') else " (ROLE_ADMIN flip did not verify — Events may not deliver)"))
+    # CloudTAK opens a NEW connection 0 on the PATCH but leaves the old one's retry timer running
+    # with the old cert — measured aws-arm 2026-10-09: TLS alert 80 against TAK every 15 s, with no
+    # end. An API restart drops it; the connection was dead until a moment ago, so no session is lost.
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']), capture_output=True, timeout=120)
+        _log("  ✓ CloudTAK API restarted (drops the old connection's retry loop)")
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK API restart skipped ({str(e)[:100]}) — the old connection keeps retrying until its next restart")
+    return True
+
+
 @app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
 @login_required
 def cloudtak_generate_bootstrap_cert_api():
@@ -38166,55 +39118,18 @@ def cloudtak_generate_bootstrap_cert_api():
         })
 
     # Local (native or container) — mirrors takserver_create_client_cert.
-    cert_dir = '/opt/tak/certs/files'
-    p12_path = os.path.join(cert_dir, f'{cn}.p12')
-    pem_path = os.path.join(cert_dir, f'{cn}.pem')
-    created = False
-    try:
-        if not os.path.exists(p12_path):
-            _patch_openssl_string_mask()
-            if _tak_is_container():
-                _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-            else:
-                _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'],
-                                 ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-            r = subprocess.run(
-                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
-                shell=True, capture_output=True, text=True, timeout=60)
-            if r.returncode != 0 or not os.path.exists(p12_path):
-                return jsonify({'success': False,
-                                'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}), 500
-            created = True
-
-        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
-        # then feeds it every channel). Unlike the best-effort group assignment
-        # in create-client-cert, a failure here is surfaced, not swallowed.
-        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
-        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
-        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
-        certmod_ok = gr.returncode == 0
-        # Canary — never assume the jar wrote the UAF entry (native non-root
-        # consoles can't write the tak-owned UAF from a bare java run).
-        uaf_has_entry = False
-        try:
-            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
-        except Exception:
-            pass
-        note = ''
-        if not (certmod_ok and uaf_has_entry):
-            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
-                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
-                    + (gr.stdout or gr.stderr or '')[-300:])
-        return jsonify({
-            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
-            'created': created,
-            'admin_flip_ok': bool(certmod_ok and uaf_has_entry),
-            'cert_password': _get_tak_cert_password(settings),
-            'download_url': '/api/cloudtak/bootstrap-cert/download',
-            'note': note,
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+    res = _local_bootstrap_cert_ensure(settings)
+    if not res.get('success'):
+        return jsonify({'success': False, 'error': res.get('error') or 'bootstrap cert failed'}), 500
+    return jsonify({
+        'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
+        'created': res.get('created'),
+        'regenerated': res.get('regenerated'),
+        'admin_flip_ok': res.get('admin_flip_ok'),
+        'cert_password': _get_tak_cert_password(settings),
+        'download_url': '/api/cloudtak/bootstrap-cert/download',
+        'note': res.get('note') or '',
+    })
 
 
 @app.route('/api/cloudtak/bootstrap-cert/download')
@@ -38376,7 +39291,10 @@ def cloudtak_update_api():
         cloudtak_deploy_log.clear()
         cloudtak_deploy_status.update({'running': True, 'complete': False, 'error': False})
         cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] CloudTAK update started")
-        threading.Thread(target=run_cloudtak_update, daemon=True).start()
+        # v10.2.8 W10: the outcome is recorded, not just held in the in-memory log
+        threading.Thread(target=_run_tracked,
+                         args=('cloudtak', cloudtak_deploy_status, cloudtak_deploy_log, run_cloudtak_update),
+                         daemon=True).start()
     return jsonify({'success': True, 'message': 'CloudTAK update started'})
 
 @app.route('/api/cloudtak/control', methods=['POST'])
@@ -38541,6 +39459,12 @@ def cloudtak_uninstall():
                                    capture_output=True, timeout=120)
                 if cloudtak_dir:
                     subprocess.run(_sudo_wrap(['rm', '-rf', cloudtak_dir]), capture_output=True, timeout=120)
+            # v10.2.8 W4: close what deploy opened (both target modes). After the teardown,
+            # so nothing is still listening behind a rule we leave; never aborts the uninstall.
+            try:
+                _cloudtak_close_firewall(cfg)
+            except Exception as _fwe:
+                print(f"cloudtak uninstall: firewall cleanup warning (continuing): {_fwe}", flush=True)
             cfg['deployed'] = False
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
@@ -39273,6 +40197,14 @@ MEDIA_PORT_SRT=18890
 """
 
 
+# v10.2.8 W2: the media-infra image the CloudTAK override pins on EVERY box. Multi-arch
+# (amd64 + arm64 in the ghcr index — verified 2026-10-08), so no arch branch and no on-box
+# arm64 build. If a future pin is amd64-only again, set MEDIA_INFRA_MULTIARCH = False and the
+# arm64 source build (_cloudtak_build_arm64_media) comes back into play.
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.11.0'
+MEDIA_INFRA_MULTIARCH = True
+
+
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
 
@@ -39390,10 +40322,9 @@ def _cloudtak_build_override_yml(settings):
             '    external: true\n'
         )
 
-    # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
-    media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
-                   if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
-                   else 'ghcr.io/dfpc-coe/media-infra:v9.7.0')
+    # media-infra pin — one fleet constant for both architectures since v10.2.8 W2; see the
+    # comment in the template below and MEDIA_INFRA_IMAGE.
+    media_image = MEDIA_INFRA_IMAGE
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -39433,20 +40364,15 @@ services:
     environment:
       API_URL: "http://api:5000"
   media:
-    # v10.1.8 W5: pin media-infra PAST upstream CloudTAK's v9.1.1 pin. v9.1.1's
-    # hls route fetch()es whatever the lease proxy URL is — an rtsp:// proxy hits
-    # undici "unknown scheme" → every RTSP-lease playback 500s once /stream is
-    # correctly routed to media-infra (W1). ≥v9.5 routes non-HLS proxies to
-    # MediaMTX's internal HLS instead. v9.7.0 = MediaMTX 1.19.2 (needs the
-    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). Field-proven
-    # test6 2026-07-24.
-    # W5e: ≥v9.2 ships amd64-ONLY — v9.1.1 is upstream's last arm64 build
-    # (verified against ghcr manifests 2026-07-24; an unconditional v9.7.0 pin
-    # crash-looped cloudtak-media on aws-arm: 'exec format error'). ARM stays
-    # pinned to v9.1.1: external-HLS leases work; RTSP-lease playback there
-    # remains the pre-existing 10.1.7 behavior — documented ARM caveat (same
-    # class as pmtiles). settings['arch'] is the LOCAL box arch; a REMOTE ARM
-    # CloudTAK target is out of the pin's scope (parked in PLAN-v10.1.8).
+    # infra-TAK pins media-infra itself (this override wins over CloudTAK's own pin).
+    # v10.2.8 W2: v9.11.0 on BOTH architectures — multi-arch since v9.8.0 (ghcr index
+    # carries amd64 + arm64, checked 2026-10-08), so ARM's old v9.1.1 pin and its
+    # RTSP-lease playback caveat are gone. Also picks up v9.9.0's fix for HLS proxy
+    # playback dying with "403 Invalid or expired signed URL" after 10 minutes, and
+    # MediaMTX 1.20.0. Our HLS tuning (mpegts, 3x500ms) is still applied over upstream's
+    # new `hlsVariant: fmp4` by _CT_MEDIA_APPLY_SH — a deliberate divergence (June A/B).
+    # History: v10.1.8 W5 pinned past CloudTAK's v9.1.1 (its hls route 500'd every
+    # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
     extra_hosts:
 {hosts_block}
@@ -39599,6 +40525,60 @@ true
 '''
 
 
+# v10.2.8 W4: every host-firewall rule CloudTAK puts on a box, in ONE place. Deploy, both
+# hardening passes and uninstall read these, so uninstall can close exactly what deploy
+# opened — before this, uninstall never touched the firewall (lutak2.net diagnostics: allows
+# for 5000/5002/9997 with nothing listening behind them).
+#
+# 5000/5002 are NOT opened any more (T&E pre-flight 2026-10-08): deploy binds api/tiles to
+# 127.0.0.1 a few steps earlier (_patch_cloudtak_compose_ports, Tier 3), so an allow there
+# reaches nothing — and because ufw keys rules by (port, proto) and ignores the action, that
+# dead allow also stopped the hardening pass's `deny` from ever landing (test12 after a fresh
+# deploy: 5000/5002 ALLOW; test6/test8: DENY). Older deploys still carry it, so uninstall
+# and the hardening pass remove it (CLOUDTAK_FW_LEGACY_ALLOW).
+CLOUDTAK_FW_WEB = ((9997, 'tcp'),)
+CLOUDTAK_FW_STREAM = ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp'))
+CLOUDTAK_FW_LEGACY_ALLOW = ((5000, 'tcp'), (5002, 'tcp'))
+CLOUDTAK_FW_ALLOW = CLOUDTAK_FW_WEB + CLOUDTAK_FW_STREAM + CLOUDTAK_FW_LEGACY_ALLOW
+# _auto_harden_cloudtak()'s explicit denies (defense in depth). Only ufw holds them as rules;
+# on firewalld "denied" is simply "not opened" (see _fw_deny).
+CLOUDTAK_FW_DENY = (5000, 5002, 5003, 5433, 9000, 9002, 18888)
+
+
+def _cloudtak_close_firewall(cfg, log=None):
+    """v10.2.8 W4: uninstall closes what CloudTAK opened. Returns (closed, failed).
+
+    Every allow in CLOUDTAK_FW_ALLOW is removed on the CloudTAK target (local or remote,
+    ufw or firewalld — _module_fw picks), then, on a local ufw box, the hardening pass's
+    deny rules too, so the firewall reads as it did before CloudTAK. Deleting a rule that
+    is not there is a no-op. Never raises; a failure is reported, not fatal — the
+    containers are already gone by the time this runs.
+
+    9997 is CloudTAK's alone (Caddy's video vhost — no other module opens it; checked
+    2026-10-08). If that ever changes, take it out of CLOUDTAK_FW_WEB's uninstall here.
+    """
+    _log = log or (lambda m: print(m, flush=True))
+    closed, failed = [], []
+    for port, proto in CLOUDTAK_FW_ALLOW:
+        try:
+            ok, msg = _module_fw(cfg, 'remove', port, proto)
+        except Exception as e:
+            ok, msg = False, str(e)[:120]
+        (closed if ok else failed).append(f'{port}/{proto}' + ('' if ok else f' ({msg[:80]})'))
+    if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
+        for port in CLOUDTAK_FW_DENY:
+            try:
+                subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', 'deny', f'{port}/tcp']),
+                               capture_output=True, text=True, timeout=20)
+            except Exception:
+                pass
+    if closed:
+        _log(f"cloudtak uninstall: firewall closed {', '.join(closed)}")
+    if failed:
+        _log(f"cloudtak uninstall: \u26a0 firewall could not close {', '.join(failed)}")
+    return closed, failed
+
+
 def _cloudtak_open_stream_ports(log=None):
     """v10.1.8 W5: explicitly ALLOW CloudTAK's direct-streaming host ports. The
     port policy always classed RTSP 18554 / RTMP 11935 / SRT 18890 as Tier 1
@@ -39609,7 +40589,7 @@ def _cloudtak_open_stream_ports(log=None):
     clients that negotiate RTP over UDP."""
     _log = log or (lambda m: print(m, flush=True))
     opened = []
-    for port, proto in ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp')):
+    for port, proto in CLOUDTAK_FW_STREAM:
         ok, _msg = _fw_allow(port, proto)
         if ok:
             opened.append(f'{port}/{proto}')
@@ -40563,6 +41543,13 @@ def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
         return False
     import re as _re
     _log = plog or (lambda _m: None)
+    if MEDIA_INFRA_MULTIARCH:
+        # v10.2.8 W2: the override pins MEDIA_INFRA_IMAGE and wins over CloudTAK's own
+        # media pin, so building CloudTAK's tag from source here produced an image nothing
+        # ran (true since W5e pinned ARM to v9.1.1). The pinned image publishes arm64 —
+        # `up` pulls the native variant.
+        _log(f"  arm64: {MEDIA_INFRA_IMAGE} publishes an arm64 image — no source build needed")
+        return False
     if cloudtak_dir is None:
         cloudtak_dir = os.path.expanduser('~/CloudTAK')
     image_ref = None
@@ -41246,9 +42233,9 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _ppe:
             plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
 
-        # v10.0.1 (arm64 only): the media-infra image is amd64-only on ghcr; build it
-        # from source on-box and tag it as the pinned image so `up` uses the arm64
-        # build (no-op on amd64). Non-fatal — media is a non-core video proxy.
+        # v10.0.1 (arm64 only): build media-infra from source when the pinned image is
+        # amd64-only. No-op on amd64, and since v10.2.8 W2 a no-op on arm64 too while
+        # MEDIA_INFRA_MULTIARCH holds. Non-fatal — media is a non-core video proxy.
         try:
             _cloudtak_build_arm64_media(cloudtak_dir, plog=plog)
         except Exception as _me:
@@ -41433,15 +42420,17 @@ def run_cloudtak_deploy(cfg=None):
         #
         # compose_yml=None on purpose: a bare `docker compose pull` in cloudtak_dir
         # loads docker-compose.yml AND docker-compose.override.yml, exactly like the
-        # `up -d` below. The override re-pins media-infra (v9.7.0 on amd64) over the
-        # base file's v9.10.0, so an explicit `-f docker-compose.yml` would download
+        # `up -d` below. The override re-pins media-infra (MEDIA_INFRA_IMAGE) over the
+        # base file's own pin, so an explicit `-f docker-compose.yml` would download
         # a tag that never starts and skip the one that does.
         #
         # api/tiles/events/retention are built locally in Step 4 and carry no
         # `image:` key, so compose skips them by itself ("Skipped - No image to be
         # pulled") — verified on compose v5.5.0. They cost nothing here.
         _pull_services = None  # None = the whole project
-        if _host_arch() == 'arm64':
+        # v10.2.8 W2: only while the pinned media-infra is amd64-only. A multi-arch pin
+        # has no local build to protect, so ARM pre-pulls media like every other box.
+        if _host_arch() == 'arm64' and not MEDIA_INFRA_MULTIARCH:
             # media-infra is built FROM SOURCE and tagged as the pinned ref a few
             # steps above (_cloudtak_build_arm64_media) because dfpc-coe publishes
             # no arm64 image. `up -d` leaves that local tag alone — compose's default
@@ -41550,7 +42539,8 @@ def run_cloudtak_deploy(cfg=None):
         _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog, fresh=True)
         plog("✓ Restart complete.")
 
-        # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
+        # v10.2.8 W4: 9997 only — api 5000 / tiles 5002 are bound to 127.0.0.1 above, so the old
+        # "open 5000/5002 so http://ip:5000 works" allow reached nothing (see CLOUDTAK_FW_WEB).
         # 9997 (v0.9.48): Caddy fronts the CloudTAK video vhost on :9997 (CloudTAK hardcodes
         # that port for every media URL); allow it now so a fresh install works without
         # waiting for the next console-update _auto_harden_cloudtak() pass. The media
@@ -41559,9 +42549,14 @@ def run_cloudtak_deploy(cfg=None):
         # firewall-cmd onto the console PATH on every platform, so `which firewall-cmd`
         # mis-detects on Debian (and bare `ufw` errors on RHEL). Drive the firewall
         # through _fw_allow() instead of raw ufw + `which firewall-cmd`.
-        for _p in (5000, 5002, 9997):
-            _fw_allow(_p, 'tcp')
-        plog("✓ Firewall: ports 5000 (Web UI), 5002 (tiles), 9997 (Caddy video) opened")
+        for _p, _pr in CLOUDTAK_FW_WEB:
+            _fw_allow(_p, _pr)
+        plog("✓ Firewall: port 9997 (Caddy video) opened — CloudTAK's own ports stay loopback-only")
+        # v10.2.8 W4 (found in T&E on nuc + test12): open the direct-streaming ports HERE too. Until
+        # now only the startup migration / post-update hardening opened them, so on a freshly
+        # deployed box an EUD could not publish into a CloudTAK lease until the next console
+        # restart. Same constant as those paths (CLOUDTAK_FW_STREAM), so all three agree.
+        _cloudtak_open_stream_ports(plog)
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
@@ -43542,7 +44537,9 @@ def webodm_update():
     if _webodm_update_status.get('running'):
         return jsonify({'started': False, 'error': 'Update already in progress'})
     _webodm_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
-    threading.Thread(target=_run_webodm_update, daemon=True).start()
+    threading.Thread(target=_run_tracked,  # v10.2.8 W10 (the worker mutates this dict in place)
+                     args=('webodm', _webodm_update_status, None, _run_webodm_update),
+                     daemon=True).start()
     return jsonify({'started': True})
 
 
@@ -47628,8 +48625,8 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', se
     exactly what a bare `docker compose up -d` in that directory would load —
     base file PLUS `docker-compose.override.yml`. Pass None wherever the caller's
     `up` is itself overrideless, or the pull and the start disagree about which
-    image is meant: CloudTAK's override re-pins media-infra (v9.7.0/v9.1.1) over
-    the base file's v9.10.0, so pulling with an explicit `-f docker-compose.yml`
+    image is meant: CloudTAK's override re-pins media-infra (MEDIA_INFRA_IMAGE) over
+    the base file's own pin, so pulling with an explicit `-f docker-compose.yml`
     would fetch a tag that never gets started and skip the one that does.
 
     `services` restricts the pull to named services. Build-only services are
@@ -49208,6 +50205,11 @@ def authentik_page():
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
+@_records_module_update(  # v10.2.8 W10: the outcome outlives the HTTP response
+    'authentik',
+    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
+    from_fn=lambda: (_get_authentik_version_info().get('version') or ''),
+    to_fn=lambda: _get_authentik_target_release(load_settings()))
 def authentik_control():
     action = request.json.get('action')
     settings = load_settings()
@@ -49232,6 +50234,20 @@ def authentik_control():
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
+            # v10.2.8 W10b: remember the tag this host is pinned to now, so a failure can restore it.
+            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | cut -d- -f2", timeout=10)
+            _remote_prev = (_rp_out or '').strip().splitlines()[0].strip() if _rp_ok and (_rp_out or '').strip() else ''
+            if not _ak_tag_is_sane(_remote_prev):
+                _remote_prev = ''
+
+            def _remote_restore_pin():
+                if not _remote_prev:
+                    return 'the previous tag pin could not be read, so it was not restored'
+                _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{_remote_prev}/g' docker-compose.yml 2>/dev/null; "
+                                   f"(grep -qE '^[ \t]*AUTHENTIK_TAG[ \t]*=' .env 2>/dev/null && sed -i 's/^[ \t]*AUTHENTIK_TAG[ \t]*=.*/AUTHENTIK_TAG={_remote_prev}/' .env || true); "
+                                   f"docker compose up -d >/dev/null 2>&1", timeout=360)
+                return f'the tag pin was restored to v{_remote_prev} and the stack brought up on it'
+            _mod_result_step('authentik', f'pin the tag to {latest} (remote)')
             _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
             # Rewrite an EXISTING active pin only (see _ak_env_pin_tag for why we do not
             # create one). sed -i writes a temp file and renames, so .env is never left
@@ -49241,15 +50257,20 @@ def authentik_control():
             if _cok:
                 _ctags = _ak_tags_from_text(_cout or '')
                 if _ctags and _ctags != {latest}:
-                    return jsonify({'error': f'Refusing to update {remote.get("host")}: compose '
+                    _rp = _remote_restore_pin()
+                    return jsonify({'error': f'Refusing to update {remote.get("host")} ({_rp}): compose '
                                              f'resolves Authentik to '
                                              f'{", ".join(sorted(_ctags))}, not {latest} alone. '
                                              f'Something outside docker-compose.yml and .env is '
                                              f'pinning the tag.'}), 500
+            _mod_result_step('authentik', 'pull + recreate (remote)')
             _pok, _pout = _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
             if not _pok:
+                _real = _update_error_line(_pout or '')
+                _rp = _remote_restore_pin()
                 return jsonify({'error': f'Remote Authentik pull/recreate failed: '
-                                         f'{(_pout or "no output").strip()[-400:]}'}), 500
+                                         f'{_real or (_pout or "no output").strip()[-400:]} ({_rp})'}), 500
+            _mod_result_step('authentik', 'confirm the running image (remote)')
             _rtag = ''
             for _ in range(8):
                 time.sleep(2)
@@ -49306,7 +50327,28 @@ def authentik_control():
             return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} is running, '
                                      f'this channel targets v{latest}. Promote the vetted '
                                      f'release instead of downgrading a live IdP.'}), 409
+        # v10.2.8 W10b: a failed update must leave NOTHING changed. The pin is converged BEFORE
+        # the pull, so a failed pull used to leave compose/.env pointing at the new tag — and the
+        # next `compose up` (a post-update Reconfigure, a restart, a reboot) quietly pulled and
+        # started it, or, with the registry still unreachable, failed to start Authentik at all
+        # (T&E test12, 2026-10-08). Remember what was there and put it back on failure.
+        _pin_orig = {'compose': None, 'compose_changed': False, 'env_prev': ''}
+
+        def _restore_pin():
+            restored = []
+            try:
+                if _pin_orig['compose_changed'] and _pin_orig['compose'] is not None:
+                    _write_priv(cp, _pin_orig['compose'])
+                    restored.append('compose')
+                if _pin_orig['env_prev']:
+                    _ak_env_pin_tag(_pin_orig['env_prev'], ak_dir)
+                    restored.append('.env')
+            except Exception as _rpe:
+                return f'could NOT restore the previous tag pin ({str(_rpe)[:120]})'
+            return (f"the tag pin was restored to v{_inst or 'previous'} ({' + '.join(restored)})"
+                    if restored else 'no tag pin had been changed')
         try:
+            _mod_result_step('authentik', f'pin the tag to {latest}')
             # (a) The compose `:-` default — governs only while .env does NOT set the tag.
             if os.path.isfile(cp):
                 _cc = None
@@ -49318,32 +50360,53 @@ def authentik_control():
                 if _cc:
                     _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
                     if _new != _cc:
+                        _pin_orig['compose'] = _cc
                         _write_priv(cp, _new)
+                        _pin_orig['compose_changed'] = True
             # (b) The .env pin — the half we never wrote. When present it OVERRIDES (a).
-            _ak_env_pin_tag(latest, ak_dir)
+            _env_changed, _env_prev = _ak_env_pin_tag(latest, ak_dir)
+            if _env_changed:
+                _pin_orig['env_prev'] = _env_prev
             _ensure_authentik_compose_patches(cp)
             # (c) VERIFY before pulling anything, with Compose's own verification command.
+            _mod_result_step('authentik', 'verify with docker compose config')
             _cok, _ctags, _cerr = _ak_resolved_authentik_tags(ak_dir)
             if not _cok:
                 return jsonify({'error': f'docker compose config failed - refusing to update '
-                                         f'a stack we cannot resolve: {_cerr}'}), 500
+                                         f'a stack we cannot resolve: {_cerr} ({_restore_pin()})'}), 500
             if _ctags and _ctags != {latest}:
-                return jsonify({'error': f'Refusing to update: compose resolves Authentik to '
+                _rp = _restore_pin()
+                return jsonify({'error': f'Refusing to update ({_rp}): compose resolves Authentik to '
                                          f'{", ".join(sorted(_ctags))}, not {latest} alone. Something '
                                          f'outside docker-compose.yml and .env is pinning the tag '
                                          f'(the console process environment, a services.*.environment '
                                          f'override, or a second env file).'}), 500
             # (d) Pull + recreate, and BELIEVE the return code (it used to be discarded).
+            _mod_result_step('authentik', 'pull + recreate')
             _last = _run_priv_chain([['docker', 'compose', 'pull'],
                                      ['docker', 'compose', 'down', '--timeout', '30'],
                                      ['docker', 'compose', 'up', '-d']],
                                     'and', timeout=360, cwd=ak_dir)
             if _last is None or _last.returncode != 0:
-                _err = ((_last.stderr or _last.stdout or '') if _last else '').strip()
-                return jsonify({'error': f'Authentik pull/recreate failed: '
-                                         f'{_err[-400:] or "no output"}'}), 500
+                _err = (((_last.stdout or '') + '\n' + (_last.stderr or '')) if _last else '').strip()
+                _which = ' '.join(_last.args[-3:]) if _last is not None and isinstance(_last.args, list) else 'pull/recreate'
+                # v10.2.8 W10: the real error line, not 400 chars of pull progress.
+                _real = _update_error_line(_err)
+                # v10.2.8 W10b: put the old pin back. A failed pull or down left the old containers
+                # running, so that is the whole rollback; a failed `up` left the stack DOWN, so also
+                # bring it back up on the old version (its images are still here — nothing is pruned
+                # before success).
+                _rp = _restore_pin()
+                if _last is not None and isinstance(_last.args, list) and _last.args[-2:] == ['up', '-d']:
+                    _mod_result_step('authentik', 'roll back: start the previous version')
+                    _rb = _run_priv_chain([['docker', 'compose', 'up', '-d']], 'and', timeout=360, cwd=ak_dir)
+                    _rp += ('; restarted on the previous version' if _rb is not None and _rb.returncode == 0
+                            else '; the previous version did NOT come back up either — check the Authentik containers')
+                return jsonify({'error': f'Authentik pull/recreate failed ({_which}): '
+                                         f'{_real or _err[-400:] or "no output"} ({_rp})'}), 500
             # (e) Confirm the RUNNING image before claiming success, and only prune once it
             #     is right — pruning after a failed upgrade throws away the rollback images.
+            _mod_result_step('authentik', 'confirm the running image')
             _run_tag = ''
             for _ in range(8):
                 time.sleep(2)
@@ -49369,7 +50432,7 @@ def authentik_control():
                             'version': _run_tag})
         except Exception as _e:
             _authentik_release_cache['tag'] = None
-            return jsonify({'error': f'Authentik update failed: {str(_e)[:400]}'}), 500
+            return jsonify({'error': f'Authentik update failed: {str(_e)[:400]} ({_restore_pin()})'}), 500
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
@@ -68358,11 +69421,7 @@ def takserver_create_client_cert():
 
     try:
         _patch_openssl_string_mask()
-        if _tak_is_container():
-            # container: no host `tak` user — chown tak:tak is invalid; just fix the mode (broker root)
-            _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-        else:
-            _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+        _cert_metadata_prepare_for_makecert()
         r = subprocess.run(
             _rotate_tak_cert_cmd(f'cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client {cert_name} 2>&1'),
             shell=True, capture_output=True, text=True, timeout=30
@@ -69149,6 +70208,7 @@ def _tak_update_job(kind, target, log, status):
     success, failure, or an exception (recorded, then re-raised)."""
     def run(*a, **kw):
         started, exc = time.time(), None
+        _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
         try:
             target(*a, **kw)
         except BaseException as e:
@@ -69160,6 +70220,8 @@ def _tak_update_job(kind, target, log, status):
                                    log, status, started, exc)
             except Exception as _re:
                 print(f'TAK Server update: record not saved ({_re})', flush=True)
+            _tracked_finish('takserver', status, log,
+                            exc=exc if isinstance(exc, Exception) else None)
     return run
 
 plugin_install_log = []
@@ -72914,6 +73976,12 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         ulog("TAK Server update (upgrade)")
         ulog("=" * 50)
+        # v10.2.8 W11a (native) — the package ships a stock cert-metadata.sh with placeholders
+        # and overwrites ours; keep its values to carry into the new file after the install.
+        try:
+            cm_backup = _read_priv('/opt/tak/certs/cert-metadata.sh')
+        except Exception:
+            cm_backup = None
         heap_backup = None
         heap_file = '/etc/default/takserver'
         if os.path.isfile(heap_file):
@@ -72989,6 +74057,8 @@ def run_takserver_upgrade(pkg_path):
                 ulog("✓ JVM heap settings restored")
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
+        if cm_backup:
+            _carry_cert_metadata('/opt/tak', '/opt/tak', ulog, old_text=cm_backup)
         ulog("Restarting TAK Server...")
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)  # v10.0.1: container-aware
         if _get_authentik_env_content(settings):
@@ -73196,6 +74266,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
         for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml'):
             subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
+        _carry_cert_metadata(old_tak, new_tak, ulog)
         if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
             return _fail("Certs did not carry over (takserver.jks missing in new bundle) — aborting before swap. Old install untouched.")
         subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
@@ -78460,6 +79531,34 @@ def _running_tak_jvm_version():
         return ''
 
 
+def _java_alternative_state(fam=None):
+    """('manual'|'auto'|'', current_target) for the box-wide `java` alternative.
+
+    Read UNPRIVILEGED — both tools answer a query as any user — so this never goes near the
+    broker and never leaves a line in its audit log (v10.2.8 W5a). Debian:
+    `update-alternatives --query java` → `Status: manual` / `Value: <path>`. RHEL:
+    `alternatives --display java` → `java - status is auto.` / ` link currently points to <path>`
+    (read on nuc, 2026-10-08). ('', '') when neither answers.
+    """
+    fam = fam or _distro_family()
+    try:
+        if fam == 'debian':
+            r = subprocess.run(['update-alternatives', '--query', 'java'],
+                               capture_output=True, text=True, timeout=15)
+            out = r.stdout or ''
+            st = re.search(r'^Status:\s*(\S+)', out, re.MULTILINE)
+            val = re.search(r'^Value:\s*(\S+)', out, re.MULTILINE)
+        else:
+            r = subprocess.run(['alternatives', '--display', 'java'],
+                               capture_output=True, text=True, timeout=15)
+            out = r.stdout or ''
+            st = re.search(r'status is (\w+)', out)
+            val = re.search(r'link currently points to\s+(\S+)', out)
+        return ((st.group(1).lower() if st else ''), (val.group(1) if val else ''))
+    except Exception:
+        return '', ''
+
+
 def _pin_takserver_jvm(plog=None):
     """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
 
@@ -78575,7 +79674,32 @@ def _pin_takserver_jvm(plog=None):
     #    that could reach the console repoint the system java, which is a far worse primitive
     #    than the problem it solves. So: try, verify, and report honestly. A warning here must
     #    never read as "the JVM pin failed", because it did not.
+    #
+    #    v10.2.8 W5a: READ FIRST, unprivileged, and never ask the broker. Until 10.2.8 this
+    #    step called `--set` through the broker on every console start. On a PERMISSIVE
+    #    broker that is a WOULD-DENY each time (test8 x64, test12 x44 by 2026-10-08), and
+    #    the broker only enforces after 72 h with NO WOULD-DENY — while the console restarts
+    #    at least daily. So since v10.1.63 no permissive native-TAK box could ever reach
+    #    ENFORCE, even after the operator opted in. Our own defense in depth was holding the
+    #    real control off.
     alt = 'update-alternatives' if fam == 'debian' else 'alternatives'
+    alt_status, alt_value = _java_alternative_state(fam)
+    if alt_status == 'manual' and alt_value and \
+            os.path.realpath(alt_value) == os.path.realpath(jbin):
+        if changed:
+            _log(f"✓ TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+                 f"Takes effect on the next TAK Server restart.")
+        return {'java_home': home, 'changed': changed}
+    if _broker_should_route() and _broker_available():
+        _log(f"ℹ box-wide java alternative is not managed on a broker-mediated console "
+             f"(by design — currently {alt_status or 'unknown'}"
+             f"{', ' + alt_value if alt_value else ''}). TAK Server is pinned to JDK 17 by its "
+             f"/opt/tak/setenv.sh entry, which its launchers source before invoking java — so "
+             f"this does not depend on /usr/bin/java.")
+        if changed:
+            _log(f"✓ TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
+                 f"Takes effect on the next TAK Server restart.")
+        return {'java_home': home, 'changed': changed}
     alt_err = ''
     try:
         r = subprocess.run(_sudo_wrap([alt, '--set', 'java', jbin]),
@@ -79125,7 +80249,9 @@ def _startup_ensure_broker():
             f'ExecStart={venv_py} {broker_py} serve\n'
             'Restart=always\n'
             'RestartSec=2\n'
-            'RuntimeMaxSec=24h\n'
+            # v10.2.8 W3: NO RuntimeMaxSec. systemd's stop SIGTERMs the whole cgroup, so
+            # the daily limit killed brokered builds mid-run; the broker now recycles
+            # itself once a day when idle (takwerx_broker._recycle_watch).
             'Environment=PYTHONUNBUFFERED=1\n'
             f'{enforce_line}'
             '\n'
@@ -84476,9 +85602,21 @@ def _post_update_auto_deploy():
             # os.stat/chown/chmod this file — do it all through the broker (idempotent re-assert).
             if subprocess.run(_sudo_wrap(['test', '-f', _cm]), capture_output=True, timeout=10).returncode == 0:
                 try:
-                    subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
-                    _chmod_priv(_cm, 0o600)
-                    print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
+                    # v10.2.8 W11b — fill placeholder subject vars a container upgrade left behind.
+                    _heal_cert_metadata_placeholders(lambda m: print(f"Post-update:{m}", flush=True))
+                except Exception as e:
+                    print(f"Post-update: cert-metadata.sh placeholder check skipped: {e}")
+                try:
+                    if _tak_is_container():
+                        # The hardened container reads it as uid 1001 / gid 0 and the host has no
+                        # `tak` user — tak:tak 600 would lock the container out on any box whose
+                        # console uid is not 1001.
+                        _container_readable(_cm)
+                        print("Post-update: cert-metadata.sh ownership/mode re-asserted (group 0, 640 — container)")
+                    else:
+                        subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
+                        _chmod_priv(_cm, 0o600)
+                        print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
                     # Validate that cert-metadata.sh defines a non-empty DIR (what makeCert.sh
                     # sources it for). v10.0.8: read the file via the broker and check in Python
                     # instead of `runuser -u tak -- bash -c '. cert-metadata.sh …'` — running an
@@ -84502,6 +85640,24 @@ def _post_update_auto_deploy():
                         print("Post-update: cert-metadata.sh content-check OK (DIR set)")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
+
+            # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
+            # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
+            # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
+            def _ct_heal():
+                _plog = lambda m: print(f"Post-update:{m}", flush=True)
+                try:
+                    _cloudtak_tak_cert_heal(log=_plog)
+                except Exception as e:
+                    print(f"Post-update: CloudTAK cert check skipped: {e}", flush=True)
+                try:
+                    _s = load_settings()
+                    if ((_get_cloudtak_deployment_config(_s).get('target_mode') or 'local').strip().lower() != 'remote'
+                            and _cloudtak_bootstrap_cert_target(_s)[0] == 'local'):
+                        _cloudtak_reset_foreign_profile_certs(_plog)
+                except Exception as e:
+                    print(f"Post-update: CloudTAK user cert check skipped: {e}", flush=True)
+            threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal').start()
 
             # Fix LDAP outpost AUTHENTIK_HOST if it was set to external HTTPS URL AND the outpost is
             # confirmed broken with `tls: internal error` (the original v0.8.0 use case — Caddy ACME
@@ -85826,23 +86982,31 @@ def _post_update_auto_deploy():
                     # URL it builds; see generate_caddyfile). The cloudtak-media
                     # container still publishes 9997 on 127.0.0.1 ONLY, so allowing the
                     # port exposes Caddy (auth-gated, cert-fronted), not the container.
+                    #
+                    # v10.2.8 W4b: through the ufw↔firewalld shims. Until 10.2.8 this ran a
+                    # bare `ufw` — on RHEL the broker shim has no ufw behind it, so every
+                    # deny and the 9997 allow silently did nothing while the line below
+                    # still printed "rules applied".
                     try:
-                        for _port in ('5000/tcp', '5002/tcp', '5003/tcp',
-                                      '5433/tcp', '9000/tcp', '9002/tcp',
-                                      '18888/tcp'):
-                            subprocess.run(
-                                _sudo_wrap(['ufw', 'deny', _port]), capture_output=True, timeout=10
-                            )
+                        _be = _fw_backend()
+                        for _port in CLOUDTAK_FW_DENY:
+                            # ufw keys a rule by (port, proto), not action: a `deny` on a port
+                            # that already has an `allow` (every deploy before 10.2.8 added one
+                            # for 5000/5002) is skipped, so delete the allow first.
+                            if _be == 'ufw':
+                                _fw_remove(_port, 'tcp')
+                            _fw_deny(_port, 'tcp')
                         # Flip 9997 from deny→allow: delete any legacy deny rule first
                         # (ufw is first-match, so an older `deny 9997` would shadow a
                         # newly-appended allow), then allow inbound to Caddy's listener.
-                        subprocess.run(
-                            _sudo_wrap(['ufw', 'delete', 'deny', '9997/tcp']), capture_output=True, timeout=10
-                        )
-                        subprocess.run(
-                            _sudo_wrap(['ufw', 'allow', '9997/tcp']), capture_output=True, timeout=10
-                        )
-                        print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
+                        # firewalld has no deny rules, so the delete is ufw-only.
+                        if _be == 'ufw':
+                            subprocess.run(
+                                _sudo_wrap(['ufw', 'delete', 'deny', '9997/tcp']), capture_output=True, timeout=10
+                            )
+                        _fw_allow(9997, 'tcp')
+                        print(f"  CloudTAK firewall rules applied via {_be or 'no firewall'} "
+                              f"(deny {','.join(str(p) for p in CLOUDTAK_FW_DENY)}; allow 9997 for Caddy video)")
                         _cloudtak_open_stream_ports()
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
@@ -86162,8 +87326,9 @@ def _post_update_auto_deploy():
 # v10.1.13: make broker fixes ride Update Now. The broker daemon executes
 # broker/takwerx_broker.py from THIS repo (start.sh unit ExecStart), so a console
 # update already puts new broker source on disk — but the RUNNING daemon keeps the
-# old code and old rulebook until something restarts it (RuntimeMaxSec=24h bounds
-# that on newer units; older units run stale forever). That is how a box ends up
+# old code and old rulebook until something restarts it (the broker's own daily idle
+# recycle bounds that since v10.2.8 — RuntimeMaxSec=24h did before; older units run stale
+# forever). That is how a box ends up
 # with a console issuing operations its own broker denies (field report
 # 2026-07-28: privileged actions failing across modules on a non-root box).
 # Compare the daemon's running-source sha (ping.src_sha) with the repo file and
@@ -86680,6 +87845,10 @@ except Exception as _e:
 # only touch the seams it is handed — the enforced version of the ARCHITECTURE.md
 # seams table. Registered routes go live before gunicorn serves (import-time).
 _MODULE_CTX = {
+    # v10.2.8 W10: a module's update/deploy outcome is recorded where the card and
+    # Diagnostics read it (modules import nothing from app.py — these are the seams)
+    'mod_result_start': _mod_result_start,
+    'tracked_finish': _tracked_finish,
     # core seams (PLAN v10.1.22 §4-W2)
     'load_settings': load_settings,
     'save_settings': save_settings,

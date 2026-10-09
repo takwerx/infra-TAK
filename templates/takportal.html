@@ -87,6 +87,15 @@
 {% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% else %}Update follows the latest TAK Portal GitHub Release. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% else %}Update follows the latest TAK Portal GitHub Release. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% endif %}
 </div>
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('takportal') }}
+</div>
+<div id="portal-address-card" style="display:none;background:var(--bg-card);border:1px solid var(--yellow);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div style="font-weight:600;color:var(--yellow);margin-bottom:8px">&#9888; TAK Portal needs a fix: it is still using this server's IP address</div>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">TAK Portal was set up before this server had its domain name, so these settings still point at the IP:</div>
+<ul id="portal-address-list" style="margin:0 0 12px 18px;padding:0;font-size:13px"></ul>
+<div style="font-size:13px;margin-bottom:12px"><b>Press Fix</b> to switch all of them to your domain in one step. TAK Portal restarts (about 30 seconds); nothing else in it changes.</div>
+<button class="control-btn" id="portal-use-domain-btn" type="button" style="border-color:var(--yellow);color:var(--yellow);font-weight:600"></button>
+<span id="portal-use-domain-msg" style="margin-left:10px;font-size:12px"></span>
 </div>
 {% endif %}
 
@@ -524,6 +533,59 @@ async function doUninstallPortal(){
         cancelBtn.disabled=false;
     }
 }
+
+// v10.2.8 W12 — a portal seeded before the box had a domain: name each field still on the
+// server IP and offer the one-click move. Values go in via textContent, never as HTML.
+var portalStaleKeys=[];
+async function portalAddressCheck(){
+    var card=document.getElementById('portal-address-card');
+    if(!card) return;
+    try{
+        var r=await fetch('/api/takportal/address-check');
+        var d=await r.json();
+        var fields=(d&&d.fields)||[];
+        if(!fields.length){card.style.display='none';return;}
+        var list=document.getElementById('portal-address-list');
+        list.textContent='';
+        portalStaleKeys=[];
+        fields.forEach(function(f){
+            portalStaleKeys.push(f.key);
+            var li=document.createElement('li');
+            li.style.marginBottom='6px';
+            var b=document.createElement('b');b.textContent=f.label;li.appendChild(b);
+            li.appendChild(document.createTextNode(': '+f.current+' \u2192 '+f.suggested));
+            var why=document.createElement('div');
+            why.style.color='var(--text-secondary)';why.style.fontSize='12px';
+            why.textContent='Now: '+f.effect+'.';
+            li.appendChild(why);
+            list.appendChild(li);
+        });
+        document.getElementById('portal-use-domain-btn').textContent='\ud83d\udd27 Fix: switch to '+(d.fqdn||'the domain');
+        card.style.display='block';
+    }catch(e){card.style.display='none';}
+}
+async function portalUseDomain(){
+    var btn=document.getElementById('portal-use-domain-btn');
+    var msg=document.getElementById('portal-use-domain-msg');
+    if(!portalStaleKeys.length) return;
+    btn.disabled=true;btn.style.opacity='0.5';
+    msg.style.color='var(--text-secondary)';msg.textContent='Updating TAK Portal and restarting it...';
+    try{
+        var r=await fetch('/api/takportal/use-domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:portalStaleKeys})});
+        var d=await r.json();
+        if(d.success){
+            msg.style.color='var(--green)';msg.textContent='\u2713 Fixed. '+(d.message||'');
+            setTimeout(portalAddressCheck,3000);
+        }else{
+            msg.style.color='var(--red)';msg.textContent='\u2717 '+(d.error||'Failed');
+        }
+    }catch(e){msg.style.color='var(--red)';msg.textContent='\u2717 '+e.message;}
+    btn.disabled=false;btn.style.opacity='1';
+}
+(function(){
+    var btn=document.getElementById('portal-use-domain-btn');
+    if(btn){btn.addEventListener('click',portalUseDomain);portalAddressCheck();}
+})();
 
 {% if deploying %}pollDeployLog();{% endif %}
 </script>

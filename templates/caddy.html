@@ -69,6 +69,7 @@
 {% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
 </div>
 <div id="caddy-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+{% from '_module_result.html' import last_update_result %}{{ last_update_result('caddy') }}
 </div>
 {% endif %}
 

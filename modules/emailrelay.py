@@ -25,6 +25,28 @@ PROVIDERS = {
 }
 
 
+def accepted_message(settings, to_addr):
+    """What a successful test send actually proves, in words (v10.2.8 W6, GH #87).
+
+    `sendmail` returning means the provider ACCEPTED the message — nothing more. Brevo then
+    drops mail silently for an unauthorized IP, an unverified sender, or a domain without
+    DKIM/DMARC, and the console never hears about it. "Test email sent" read as "delivered",
+    so a reporter whose mail never arrived concluded the relay worked and the problem was
+    elsewhere. Say what we know, and where the provider shows the rest.
+    """
+    relay = (settings or {}).get('email_relay') or {}
+    key = (relay.get('provider') or '').strip()
+    name = PROVIDERS.get(key, {}).get('name', '') if key and key != 'custom' else ''
+    if name:
+        where = ' (Transactional \u2192 Logs)' if key == 'brevo' else ''
+        return (f"Handed to {name} for delivery to {to_addr}. If it hasn't arrived in a few "
+                f"minutes, check {name}'s sending log{where}. The console can confirm {name} "
+                f"accepted the message, not that it was delivered.")
+    return (f"Handed to the email relay for delivery to {to_addr}. If it hasn't arrived in a "
+            f"few minutes, check your email provider's sending log. The console can confirm the "
+            f"provider accepted the message, not that it was delivered.")
+
+
 def _plog(msg):
     return job_log('emailrelay', msg)
 
@@ -289,7 +311,7 @@ def register(ctx):
             msg.attach(MIMEText('Test email from TAK-infra Email Relay.\n\nIf you received this, your email relay is working correctly.', 'plain'))
             with smtplib.SMTP('localhost', 25, timeout=15) as s:
                 s.sendmail(from_addr, [to_addr], msg.as_string())
-            return jsonify({'success': True, 'output': f'Test email sent to {to_addr}'})
+            return jsonify({'success': True, 'output': accepted_message(settings, to_addr)})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:200]})
 
