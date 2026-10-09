@@ -465,3 +465,89 @@ def test_generate_route_uses_the_shared_ensure():
     body = _func('cloudtak_generate_bootstrap_cert_api')
     assert '_local_bootstrap_cert_ensure(settings)' in body and "'regenerated'" in body
     assert 'makeCert.sh client' not in body[body.index('# Local (native or container)'):]
+
+
+# ---------------------------------------------------------------- W11g CloudTAK user certs
+
+class _PG:
+    """docker exec … psql seam: answers the profile / connections selects, records updates."""
+
+    def __init__(self, profiles, conns=()):
+        self.profiles, self.conns, self.updates = profiles, list(conns), []
+
+    def run(self, argv, **kw):
+        sql = argv[-1]
+        out = ''
+        if sql.startswith('select') and 'from profile' in sql:
+            out = json.dumps([{'u': u, 'c': c} for u, c in self.profiles])
+        elif sql.startswith('select') and 'from connections' in sql:
+            out = json.dumps([{'n': n, 'c': c} for n, c in self.conns])
+        elif sql.startswith('update'):
+            self.updates.append(sql)
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr='')
+
+
+def _reset_ns(pg, signed):
+    logs = []
+    ns = {'_sudo_wrap': lambda a: a, 'subprocess': types.SimpleNamespace(run=pg.run),
+          '_tak_ca_bundle': lambda: 'BUNDLE', '_cert_signed_by': lambda c, b: signed[c]}
+    _load(['_cloudtak_reset_foreign_profile_certs'], ns)
+    return ns, logs
+
+
+def test_user_certs_from_a_lost_ca_are_emptied_by_digest_and_nothing_else():
+    pg = _PG([('cloudtakgh', 'OLDCERT'), ("o'brien; drop table profile", 'OLD2'), ('alice', 'GOOD')],
+             conns=[('agency-feed', 'OLDCONN')])
+    ns, logs = _reset_ns(pg, {'OLDCERT': False, 'OLD2': False, 'GOOD': True, 'OLDCONN': False})
+    reset = ns['_cloudtak_reset_foreign_profile_certs'](logs.append)
+    assert reset == ['cloudtakgh', "o'brien; drop table profile"]
+    assert len(pg.updates) == 2
+    for sql, cert in zip(pg.updates, ('OLDCERT', 'OLD2')):
+        assert f"md5(auth->>'cert') = '{hashlib.md5(cert.encode()).hexdigest()}'" in sql
+        assert '\'{"cert":"","key":""}\'::jsonb' in sql, 'NULL breaks older CloudTAK (profile.auth.cert unguarded)'
+        assert 'brien' not in sql, 'a username must never enter the SQL'
+    assert any('re-issued at that user' in m for m in logs)
+    assert any('connection cert' in m and 'agency-feed' in m for m in logs)
+    assert not any('connections' in u for u in pg.updates), 'connection certs are reported, never modified'
+
+
+def test_user_certs_are_left_alone_when_signed_or_unknown():
+    """A rotation keeps its old CA on disk (signed=True); an unreadable cert answers None."""
+    pg = _PG([('a', 'C1'), ('b', 'C2')])
+    ns, logs = _reset_ns(pg, {'C1': True, 'C2': None})
+    assert ns['_cloudtak_reset_foreign_profile_certs'](logs.append) == []
+    assert pg.updates == [] and logs == []
+
+
+def test_ca_bundle_includes_a_rotation_s_old_ca(tmp_path):
+    (tmp_path / 'ca.pem').write_text('-----BEGIN CERTIFICATE-----\nNEW\n-----END CERTIFICATE-----\n')
+    (tmp_path / 'INT-CA-00.pem').write_text('-----BEGIN CERTIFICATE-----\nOLD\n-----END CERTIFICATE-----\n')
+    (tmp_path / 'admin.key').write_text('-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n')
+    (tmp_path / 'notes.pem').write_text('not a cert')
+    ns = {'_read_priv': lambda p: pathlib.Path(p).read_text()}
+    _load(['_tak_ca_bundle'], ns)
+    b = ns['_tak_ca_bundle'](str(tmp_path))
+    assert 'NEW' in b and 'OLD' in b and 'PRIVATE KEY' not in b and 'not a cert' not in b
+
+
+@pytest.mark.skipif(not HAVE_OPENSSL, reason='openssl not installed')
+def test_ca_bundle_signature_check_end_to_end(tmp_path):
+    subj = '/C=US/O=TAK/OU=FIRE/CN=INT-CA-01'
+    _mkca(tmp_path, 'new', subj)
+    _mkca(tmp_path, 'gone', '/C=US/O=FIRE/OU=TAK/CN=INT-CA-01')
+    leaf_new, leaf_gone = _mkleaf(tmp_path, 'new', 'alice'), _mkleaf(tmp_path, 'gone', 'cloudtakgh')
+    d = tmp_path / 'files'
+    d.mkdir()
+    (d / 'ca.pem').write_text((tmp_path / 'new.pem').read_text())
+    ns = {'_read_priv': lambda p: pathlib.Path(p).read_text()}
+    _load(['_tak_ca_bundle', '_cert_signed_by'], ns)
+    bundle = ns['_tak_ca_bundle'](str(d))
+    assert ns['_cert_signed_by'](leaf_new, bundle) is True
+    assert ns['_cert_signed_by'](leaf_gone, bundle) is False
+
+
+def test_post_update_runs_the_user_cert_reset_for_local_cloudtak_only():
+    body = APP[APP.index('def _ct_heal():'):]
+    body = body[:body.index("name='ct-cert-heal'")]
+    assert '_cloudtak_reset_foreign_profile_certs(_plog)' in body
+    assert "!= 'remote'" in body and "_cloudtak_bootstrap_cert_target(_s)[0] == 'local'" in body

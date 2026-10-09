@@ -38783,6 +38783,73 @@ def _cloudtak_signing_secret():
     return ''
 
 
+def _tak_ca_bundle(cert_dir='/opt/tak/certs/files'):
+    """Every certificate PEM in TAK's cert dir, concatenated — the CAs this TAK can still
+    vouch for, INCLUDING an old CA a rotation keeps (`<old>.pem`) for its transition period.
+    Falls back to ca.pem + root-ca.pem when the dir cannot be listed."""
+    try:
+        names = sorted(n for n in os.listdir(cert_dir) if n.endswith('.pem'))
+    except OSError:
+        names = ['ca.pem', 'root-ca.pem']
+    out = []
+    for n in names:
+        try:
+            text = _read_priv(os.path.join(cert_dir, n))
+        except Exception:
+            continue
+        if 'BEGIN CERTIFICATE' in (text or ''):
+            out.append(text.strip())
+    return '\n'.join(out) + '\n' if out else ''
+
+
+def _cloudtak_reset_foreign_profile_certs(log=None):
+    """v10.2.8 W11g — each CloudTAK user holds its OWN TAK client cert (profile.auth). After the
+    CA was replaced, every one of them is from a CA TAK no longer has: TAK closes the socket, and
+    CloudTAK's login probe does not count a closed socket as "rejected", so it never re-issues —
+    login fails "UND_ERR_SOCKET: other side closed" (aws-arm, 2026-10-09, after W11d had fixed the
+    admin connection). Empty ONLY the certs that no certificate in TAK's cert dir signed (a
+    rotation keeps its old CA on disk, so its certs are left alone); CloudTAK then treats the
+    cert as unparseable and re-issues it at that user's next password login. Set to
+    {cert:'',key:''}, not NULL: older CloudTAK dereferences profile.auth.cert unguarded.
+    Connection (machine) certs are only counted — CloudTAK cannot re-issue those itself.
+    Returns the usernames reset, or None when it could not tell."""
+    _log = log or (lambda m: print(m, flush=True))
+
+    def _psql(sql):
+        return subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker',
+                                          '-d', 'gis', '-v', 'ON_ERROR_STOP=1', '-tAc', sql]),
+                              capture_output=True, text=True, timeout=30)
+    try:
+        rows = json.loads((_psql("select coalesce(json_agg(json_build_object('u', username, 'c', auth->>'cert')), "
+                                 "'[]') from profile where coalesce(auth->>'cert', '') <> ''").stdout or '').strip() or '[]')
+        conns = json.loads((_psql("select coalesce(json_agg(json_build_object('n', name, 'c', auth->>'cert')), "
+                                  "'[]') from connections where coalesce(auth->>'cert', '') <> ''").stdout or '').strip() or '[]')
+    except Exception:
+        return None
+    bundle = _tak_ca_bundle()
+    if not bundle:
+        return None
+    reset = []
+    for row in rows:
+        cert = row.get('c') or ''
+        if _cert_signed_by(cert, bundle) is not False:
+            continue
+        # Match by the cert's own digest — no username ever enters the SQL.
+        digest = hashlib.md5(cert.encode()).hexdigest()
+        r = _psql("update profile set auth = '{\"cert\":\"\",\"key\":\"\"}'::jsonb "
+                  f"where md5(auth->>'cert') = '{digest}'")
+        if r.returncode == 0:
+            reset.append(str(row.get('u') or '?'))
+    if reset:
+        _log(f"  ✓ CloudTAK: {len(reset)} user cert(s) were from a CA this TAK Server no longer has "
+             f"({', '.join(reset[:10])}{' …' if len(reset) > 10 else ''}) — each is re-issued at that user's next login")
+    stale = [c.get('n') for c in conns if _cert_signed_by(c.get('c') or '', bundle) is False]
+    if stale:
+        _log(f"  ⚠ CloudTAK: {len(stale)} connection cert(s) are from a CA this TAK Server no longer has "
+             f"({', '.join(str(n) for n in stale[:10])}) — re-upload a current cert in CloudTAK → Connections")
+    return reset
+
+
 def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
     """v10.2.8 W11d — give CloudTAK a cert the CURRENT TAK CA signed, when (and only when) its
     admin connection is dead BECAUSE its cert came from a CA this TAK no longer has.
@@ -85436,10 +85503,18 @@ def _post_update_auto_deploy():
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
             # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
             def _ct_heal():
+                _plog = lambda m: print(f"Post-update:{m}", flush=True)
                 try:
-                    _cloudtak_tak_cert_heal(log=lambda m: print(f"Post-update:{m}", flush=True))
+                    _cloudtak_tak_cert_heal(log=_plog)
                 except Exception as e:
                     print(f"Post-update: CloudTAK cert check skipped: {e}", flush=True)
+                try:
+                    _s = load_settings()
+                    if ((_get_cloudtak_deployment_config(_s).get('target_mode') or 'local').strip().lower() != 'remote'
+                            and _cloudtak_bootstrap_cert_target(_s)[0] == 'local'):
+                        _cloudtak_reset_foreign_profile_certs(_plog)
+                except Exception as e:
+                    print(f"Post-update: CloudTAK user cert check skipped: {e}", flush=True)
             threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal').start()
 
             # Fix LDAP outpost AUTHENTIK_HOST if it was set to external HTTPS URL AND the outpost is
