@@ -136,6 +136,11 @@ the only part you do by hand.
 | TCP | 8554 | MediaMTX **RTSP** video |
 | TCP | 8322 | MediaMTX **RTSPS** video |
 | UDP | 8890 | MediaMTX **SRT** video |
+| TCP | 8555 | TAK Video Restreamer **RTSPS** video |
+| TCP | 1935 | TAK Video Restreamer **RTMP** video |
+| TCP | 18554 | CloudTAK video **RTSP** |
+| TCP | 11935 | CloudTAK video **RTMP** |
+| UDP | 18890 | CloudTAK video **SRT** |
 | TCP | 8448 | **EUD Remote Assist device API — the enrolment QR points here** |
 | TCP | 8449 | **ATLAS MDM device channel — enrolled tablets connect here** |
 | TCP + UDP | 3479 | CoTURN control channel — EUD Remote Assist |
@@ -198,6 +203,11 @@ cat > ingress.json <<'EOF'
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"MediaMTX RTSP video","tcpOptions":{"destinationPortRange":{"min":8554,"max":8554}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"MediaMTX RTSPS video","tcpOptions":{"destinationPortRange":{"min":8322,"max":8322}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"MediaMTX SRT video","udpOptions":{"destinationPortRange":{"min":8890,"max":8890}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"TAK Video Restreamer RTSPS video","tcpOptions":{"destinationPortRange":{"min":8555,"max":8555}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"TAK Video Restreamer RTMP video","tcpOptions":{"destinationPortRange":{"min":1935,"max":1935}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTSP","tcpOptions":{"destinationPortRange":{"min":18554,"max":18554}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTMP","tcpOptions":{"destinationPortRange":{"min":11935,"max":11935}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CloudTAK video SRT","udpOptions":{"destinationPortRange":{"min":18890,"max":18890}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"EUD Remote Assist device API (QR target)","tcpOptions":{"destinationPortRange":{"min":8448,"max":8448}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"ATLAS MDM device channel","tcpOptions":{"destinationPortRange":{"min":8449,"max":8449}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CoTURN control (Remote Assist)","tcpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
@@ -213,7 +223,7 @@ oci network security-list update \
   --force
 ```
 
-Refresh the **Security rules** page and you should see 19 ingress rules.
+Refresh the **Security rules** page and you should see 24 ingress rules.
 
 > **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
 > through command history instead of moving the cursor, so a mis-paste is easier to start over than

@@ -13545,8 +13545,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = 'bc875abc62a10a3f58f6ce208aaa624d014851a2'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '889770b2e5f7398d27aa236d8d420de4f008cb93edfa9000e8494c2c22a21f08'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '44d6a17132f3e3c2a424c3bb3278b7bc5630ff2b'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'e86c99bcb1f76ef4e8059e281aff186c4e04120a3dccb226ac14045d7a628212'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -13864,6 +13864,25 @@ def _conn_verify_ports(settings):
             # distinguish "open" from "silently dropped". Reporting a made-up
             # state for it would be the exact defect this whole line of work is
             # about. It is called out in the UI instead.
+    except Exception:
+        pass
+    # v10.2.9 (GH #92 follow-up): TAK Video Restreamer's and CloudTAK's video ports, which
+    # the relay forwards from this release. TVR shares MediaMTX's 8554 (the two conflict, so
+    # only one is ever deployed) and adds RTSPS 8555 and RTMP 1935. CloudTAK's are probed
+    # only for a local deploy: the relay forwards to this box, not to a remote CloudTAK host.
+    # SRT (8890 / 18890) is UDP and not probed, for the reason given for MediaMTX above.
+    if settings.get('tak_video_restreamer_enabled'):
+        if 8554 not in {p for p, _label, _req in ports}:
+            ports.append((8554, 'Video RTSP (TAK Video Restreamer)', True))
+        ports.append((8555, 'Video RTSPS (TAK Video Restreamer)', True))
+        ports.append((1935, 'Video RTMP (TAK Video Restreamer)', True))
+    try:
+        _ct = _get_cloudtak_deployment_config(settings)
+        _ct_dir = os.path.expanduser('~/CloudTAK')
+        if _ct.get('target_mode') != 'remote' and any(
+                os.path.exists(os.path.join(_ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
+            ports.append((18554, 'CloudTAK video RTSP', True))
+            ports.append((11935, 'CloudTAK video RTMP', True))
     except Exception:
         pass
     return ports
