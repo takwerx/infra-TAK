@@ -72,6 +72,15 @@ RA_UDP_RANGE="${RA_UDP_RANGE:-50000:50050}"  # CoTURN relayed media (pinned rang
 # SocketTimeoutException ... port 8449"). Reported by Eggman1414 again. Every ATLAS
 # deployment on a box shares this one port (Caddy picks the deployment by SNI).
 MDM_PORTS="${MDM_PORTS:-8449}"             # ATLAS MDM device channel (mutual TLS, QR target)
+# v10.2.9 (GH #92 follow-up): the same gap again, for video. TAK Video Restreamer streams
+# RTSPS on 8555 and RTMP on 1935 (its RTSP 8554 and SRT 8890 are MediaMTX's, already
+# here), and CloudTAK's video server takes RTSP on 18554, RTMP on 11935 and SRT on 18890
+# (UDP, below). Each module opens its ports in the box firewall and the README lists them
+# as public, but no forward list here named them, so a relayed box silently dropped
+# every publisher and player on those ports. RTSP crosses the relay over TCP, as for
+# MediaMTX. tests/test_relay_forwards_module_ports.py now checks every port a module
+# declares against these lists, so the next module can't miss them.
+VIDEO_PORTS="${VIDEO_PORTS:-8555 1935 18554 11935}"   # TVR RTSPS · TVR RTMP · CloudTAK RTSP · CloudTAK RTMP
 # v10.1.28: the console's own port, so a relayed box has the SAME direct-IP
 # backdoor every other box has (README "Recovery / backdoor"). Not forwarding it
 # gave relayed boxes a quietly different security posture from the rest of the
@@ -80,14 +89,14 @@ MDM_PORTS="${MDM_PORTS:-8449}"             # ATLAS MDM device channel (mutual TL
 # box, closed by Hardening W1, which drops it at the box's own firewall whether it
 # arrives over the tunnel or off the LAN.
 CONSOLE_PORT="${CONSOLE_PORT:-5001}"       # infra-TAK console (W1 closes it box-side)
-FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS $MDM_PORTS $CONSOLE_PORT"   # TCP forwards
+FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS $MDM_PORTS $VIDEO_PORTS $CONSOLE_PORT"   # TCP forwards
 # UDP forwards. SRT is UDP by protocol design, and until v10.1.10 this script only ever
 # wrote `-p tcp` rules — which made SRT look like something a relay fundamentally could
 # not carry. It isn't: DNAT handles UDP, the MASQUERADE and ESTABLISHED/RELATED rules
 # below are protocol-agnostic, and WireGuard carries UDP natively. It was simply never
 # written. RTSP's UDP transport (8000/8001) stays out on purpose — our MediaMTX ships
 # `rtspTransports: [tcp]`, so no client negotiates it.
-UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890 3479}"   # 8890 SRT · 3479 CoTURN control
+UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890 3479 18890}"   # 8890 SRT · 3479 CoTURN control · 18890 CloudTAK SRT
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"
