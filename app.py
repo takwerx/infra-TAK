@@ -587,6 +587,21 @@ def _write_priv(path, content, mode='w', perm=None):
                            capture_output=True, text=True, check=False)
 
 
+def _read_priv_bytes(path):
+    """_read_priv for BINARY files (.p12, keystores): same routing, no text decode.
+    v10.2.8 W11c — admin.p12 on a hardened container tree is root:root 660, so the console's
+    raw open() is Permission denied on a non-root box."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'read', 'path': path})
+        if not resp.get('ok'):
+            raise BrokerError(f"broker read denied ({path}): {resp.get('error')}")
+        return _b64.b64decode(resp.get('content_b64') or '')
+    if os.getuid() == 0:
+        with open(path, 'rb') as f:
+            return f.read()
+    return subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, check=True).stdout
+
+
 def _read_priv(path):
     """Read a privileged path. Routes through the broker when active; otherwise
     direct (root) or 'sudo cat' (legacy non-root). Returns text."""
@@ -29240,6 +29255,148 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+# v10.2.8 W11a/b — the cert-subject variables makeCert.sh needs from cert-metadata.sh.
+_CERT_META_VARS = ('COUNTRY', 'STATE', 'CITY', 'ORGANIZATION', 'ORGANIZATIONAL_UNIT')
+_CERT_META_REQUIRED = ('STATE', 'CITY', 'ORGANIZATIONAL_UNIT')   # what makeCert.sh refuses without
+_CERT_META_SAFE = re.compile(r'[^A-Za-z0-9 ._-]')
+
+
+def _cert_metadata_literals(text):
+    """{VAR: value} for the subject variables that hold a LITERAL value — not empty, not a
+    `${VAR}` / `${VAR:-default}` placeholder (the stock hardened-bundle form, which only works
+    when the variable is in makeCert's environment, and the console never sets it there)."""
+    out = {}
+    for var in _CERT_META_VARS:
+        m = re.search(rf'(?m)^[ \t]*{var}=(.*)$', text or '')
+        if not m:
+            continue
+        v = m.group(1).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+            v = v[1:-1]
+        if v and '$' not in v:
+            out[var] = v
+    return out
+
+
+def _cert_metadata_fill(text, values):
+    """(new_text, [vars changed]) — set each var in `values` ONLY where the file has no literal
+    for it yet. Never overwrites a value an operator or the deploy set. Values are reduced to
+    [A-Za-z0-9 ._-]: makeCert.sh SOURCES this file, so nothing shell-active may reach it."""
+    have = _cert_metadata_literals(text)
+    lines = (text or '').splitlines(keepends=True)
+    changed = []
+    for var in _CERT_META_VARS:
+        val = _CERT_META_SAFE.sub('', str(values.get(var) or '')).strip()
+        if var in have or not val:
+            continue
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith(var + '='):
+                lines[i] = f'{line[:len(line) - len(stripped)]}{var}="{val}"\n'
+                changed.append(var)
+                break
+    return ''.join(lines), changed
+
+
+def _ca_subject_values(ca_pem=None, ca_path='/opt/tak/certs/files/ca.pem'):
+    """{COUNTRY, STATE, CITY, ORGANIZATION, ORGANIZATIONAL_UNIT} from the CA that signs this
+    box's client certs — the faithful source when cert-metadata.sh lost its values: new certs
+    then carry the same subject as the CA issuing them."""
+    pem = ca_pem if ca_pem is not None else _read_priv(ca_path)
+    r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-nameopt', 'RFC2253'],
+                       input=pem, capture_output=True, text=True, timeout=15)
+    subj = (r.stdout or '').strip().split('=', 1)[-1] if r.returncode == 0 else ''
+    keymap = {'C': 'COUNTRY', 'ST': 'STATE', 'L': 'CITY', 'O': 'ORGANIZATION', 'OU': 'ORGANIZATIONAL_UNIT'}
+    out = {}
+    for part in re.split(r'(?<!\\),', subj):
+        k, _, v = part.partition('=')
+        if k.strip() in keymap and v.strip():
+            out[keymap[k.strip()]] = v.strip().replace('\\', '')
+    return out
+
+
+def _heal_cert_metadata_placeholders(log=None):
+    """v10.2.8 W11b — a container upgrade used to replace cert-metadata.sh with the stock
+    hardened file (`STATE=${STATE}` …) and delete the old tree, so every later console makeCert
+    failed "Please set the following variables" (aws-arm, since 2026-09-22). Fill ONLY the
+    placeholder/empty subject variables from the current CA's own subject. Returns True when
+    it changed the file, False when nothing was needed, None when it could not tell."""
+    _log = log or (lambda m: print(m, flush=True))
+    cm = '/opt/tak/certs/cert-metadata.sh'
+    try:
+        text = _read_priv(cm)
+    except Exception:
+        return None
+    if all(v in _cert_metadata_literals(text) for v in _CERT_META_REQUIRED):
+        return False
+    try:
+        vals = _ca_subject_values()
+    except Exception as e:
+        _log(f"  cert-metadata.sh has placeholders and the CA subject could not be read ({str(e)[:120]})")
+        return None
+    new, changed = _cert_metadata_fill(text, vals)
+    if not changed:
+        _log("  cert-metadata.sh has placeholders but the CA subject does not carry the missing fields")
+        return None
+    _write_priv(cm, new)
+    if _tak_is_container():
+        _container_readable(cm, _log)
+    _log(f"  ✓ cert-metadata.sh: filled {', '.join(changed)} from the CA's own subject "
+         f"(the file held placeholders — a container upgrade had replaced it)")
+    return True
+
+
+def _carry_cert_metadata(old_tak, new_tak, log=None):
+    """v10.2.8 W11a — a container upgrade extracts a fresh bundle whose cert-metadata.sh is the
+    stock placeholder file. Carry the old tree's literal subject values into it (falling back to
+    the carried CA's own subject for anything the old file lacked too), so makeCert keeps working
+    after the old tree is deleted. Returns the vars filled; never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    new_cm = os.path.join(new_tak, 'certs', 'cert-metadata.sh')
+    try:
+        new_text = _read_priv(new_cm)
+    except Exception as e:
+        _log(f"  ⚠ new bundle has no readable cert-metadata.sh ({str(e)[:100]}) — client certs may need it set by hand")
+        return []
+    vals = {}
+    try:
+        vals = _cert_metadata_literals(_read_priv(os.path.join(old_tak, 'certs', 'cert-metadata.sh')))
+    except Exception:
+        pass
+    if not all(v in vals for v in _CERT_META_REQUIRED):
+        try:
+            for k, v in _ca_subject_values(ca_path=os.path.join(new_tak, 'certs', 'files', 'ca.pem')).items():
+                vals.setdefault(k, v)
+        except Exception:
+            pass
+    out, changed = _cert_metadata_fill(new_text, vals)
+    if changed:
+        try:
+            _write_priv(new_cm, out)
+            _container_readable(new_cm, _log)
+            _log(f"  ✓ cert-metadata.sh carried over ({', '.join(changed)})")
+        except Exception as e:
+            _log(f"  ⚠ could not write cert-metadata.sh in the new bundle ({str(e)[:100]})")
+            return []
+    return changed
+
+
+def _cert_metadata_prepare_for_makecert(log=None):
+    """Before a console makeCert.sh run: fill placeholder subject vars (W11b), then set the
+    file mode makeCert's runner can read. Container (hardened 5.8 runs as uid 1001 / gid 0):
+    group 0 + 640 — the old `chmod 500` left it owner-only, which only worked on a box whose
+    console uid happened to be 1001 (aws-arm). Native: tak:tak 500, unchanged."""
+    cm = '/opt/tak/certs/cert-metadata.sh'
+    try:
+        _heal_cert_metadata_placeholders(log)
+    except Exception:
+        pass
+    if _tak_is_container():
+        _container_readable(cm, log)
+    else:
+        _run_priv_chain([['chown', 'tak:tak', cm], ['chmod', '500', cm]], 'and')
+
+
 def _container_readable(path, log=None):
     """Make a bundle file readable by the TAK container's non-root user.
 
@@ -29398,6 +29555,13 @@ def _load_admin_p12_bytes_from_tak_core(settings):
         try:
             with open(local_path, 'rb') as f:
                 return f.read(), local_path, ''
+        except PermissionError:
+            # v10.2.8 W11c — root:root 660 on a hardened container tree; a non-root console
+            # reads it through the broker instead.
+            try:
+                return _read_priv_bytes(local_path), local_path, ''
+            except Exception as e:
+                return b'', local_path, f'Could not read local admin.p12: {e}'
         except Exception as e:
             return b'', local_path, f'Could not read local admin.p12: {e}'
 
@@ -38495,6 +38659,194 @@ def _cloudtak_bootstrap_cert_target(settings):
     return 'absent', None
 
 
+def _cert_signed_by(cert_pem, ca_pem):
+    """True when cert_pem's leaf was signed by a cert in ca_pem, False when it was not, None when
+    it cannot tell. A SIGNATURE check (`openssl verify -partial_chain`), not a DN compare: a
+    regenerated CA can carry the very same subject. Expiry is ignored — this answers "which CA",
+    not "is it valid"."""
+    pat = r'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----'
+    leaf = re.search(pat, cert_pem or '', re.S)
+    if not leaf or not re.search(pat, ca_pem or '', re.S):
+        return None
+    fd, ca_file = tempfile.mkstemp(prefix='infratak-ca-', suffix='.pem')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(ca_pem)
+        r = subprocess.run(['openssl', 'verify', '-no_check_time', '-partial_chain', '-CAfile', ca_file],
+                           input=leaf.group(0) + '\n', capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(ca_file)
+        except OSError:
+            pass
+    if r.returncode == 0:
+        return True
+    out = ((r.stdout or '') + (r.stderr or '')).lower()
+    if 'unable to get local issuer' in out or 'unable to get issuer' in out or 'signature failure' in out:
+        return False
+    return None
+
+
+def _local_bootstrap_cert_ensure(settings):
+    """makeCert.sh client cloudtak-svc-bootstrap + UserManager certmod -A on the LOCAL TAK cert
+    store; idempotent. v10.2.8 W11d: an on-disk cert that the current CA did not sign (the CA was
+    replaced — a container upgrade, a root-CA rotation) is re-issued instead of reused, because
+    TAK refuses it. Returns {success, created, regenerated, admin_flip_ok, note, error}."""
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    cert_dir = '/opt/tak/certs/files'
+    p12_path = os.path.join(cert_dir, f'{cn}.p12')
+    pem_path = os.path.join(cert_dir, f'{cn}.pem')
+    created = regenerated = False
+    try:
+        have = os.path.exists(p12_path) or _exists_priv(pem_path)
+        if have:
+            try:
+                if _cert_signed_by(_read_priv(pem_path), _read_priv(os.path.join(cert_dir, 'ca.pem'))) is False:
+                    have, regenerated = False, True
+            except Exception:
+                pass
+        if not have:
+            _patch_openssl_string_mask()
+            _cert_metadata_prepare_for_makecert()
+            r = subprocess.run(
+                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
+                shell=True, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not _exists_priv(pem_path):
+                return {'success': False, 'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}
+            created = True
+
+        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
+        # then feeds it every channel). Unlike the best-effort group assignment
+        # in create-client-cert, a failure here is surfaced, not swallowed.
+        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
+        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
+        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
+        certmod_ok = gr.returncode == 0
+        # Canary — never assume the jar wrote the UAF entry (native non-root
+        # consoles can't write the tak-owned UAF from a bare java run).
+        uaf_has_entry = False
+        try:
+            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+        except Exception:
+            pass
+        note = ''
+        if not (certmod_ok and uaf_has_entry):
+            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
+                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
+                    + (gr.stdout or gr.stderr or '')[-300:])
+        return {'success': True, 'created': created, 'regenerated': regenerated,
+                'admin_flip_ok': bool(certmod_ok and uaf_has_entry), 'note': note}
+    except Exception as e:
+        return {'success': False, 'error': str(e)[:300]}
+
+
+def _cloudtak_admin_token(secret, email='infra-tak-console', ttl=300):
+    """A short-lived CloudTAK admin JWT, signed with CloudTAK's own SigningSecret (HS256 — the
+    jsonwebtoken default its tokenParser verifies). No `s` claim: CloudTAK treats such a token as
+    server-minted and checks no session (api/common/auth.ts tokenParser). Never logged."""
+    now = int(time.time())
+
+    def _seg(obj):
+        return _b64.urlsafe_b64encode(json.dumps(obj, separators=(',', ':')).encode()).rstrip(b'=')
+    signing = _seg({'alg': 'HS256', 'typ': 'JWT'}) + b'.' + _seg(
+        {'access': 'admin', 'email': email, 'iat': now, 'exp': now + int(ttl)})
+    sig = _b64.urlsafe_b64encode(hmac.new(secret.encode(), signing, hashlib.sha256).digest()).rstrip(b'=')
+    return (signing + b'.' + sig).decode()
+
+
+def _cloudtak_signing_secret():
+    env_path = os.path.join(os.path.expanduser('~/CloudTAK'), '.env')
+    try:
+        with open(env_path) as f:
+            text = f.read()
+    except PermissionError:
+        text = _read_priv(env_path)
+    except OSError:
+        return ''
+    for line in (text or '').splitlines():
+        if line.strip().startswith('SigningSecret='):
+            return line.split('=', 1)[1].strip()
+    return ''
+
+
+def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
+    """v10.2.8 W11d — give CloudTAK a cert the CURRENT TAK CA signed, when (and only when) its
+    admin connection is dead BECAUSE its cert came from a CA this TAK no longer has.
+
+    Both conditions, never one: CloudTAK must report connection 0 `dead` on every read (a TAK
+    restart reads dead for a minute — and during a CA rotation the old CA is still trusted, so
+    the old cert still works and reads `live`), AND its cert must fail a signature check against
+    the current ca.pem. That is a connection that cannot recover by itself. A working identity
+    is never swapped and an unconfigured CloudTAK is never bootstrapped (2026-08-03 decision).
+    Local CloudTAK + local TAK only. CloudTAK itself verifies the new cert against TAK before it
+    accepts the PATCH. Returns True healed, False tried and failed, None nothing to do / unknown."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = settings or load_settings()
+    try:
+        if (_get_cloudtak_deployment_config(settings).get('target_mode') or 'local').strip().lower() == 'remote':
+            return None
+    except Exception:
+        return None
+    if _cloudtak_bootstrap_cert_target(settings)[0] != 'local':
+        return None
+    secret = _cloudtak_signing_secret()
+    if not secret:
+        return None
+    base = 'http://127.0.0.1:5000'
+    status = None
+    srv = {}
+    for w in waits:
+        if w:
+            time.sleep(w)
+        ok, code, srv = _cloudtak_request_json(
+            'GET', base + '/api/server', timeout=20,
+            headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+        if not ok or not isinstance(srv, dict) or srv.get('status') != 'configured':
+            return None
+        status = srv.get('connection_status')
+        if status != 'dead':
+            return None
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-tAc', "select coalesce(auth->>'cert','') from server where id = 1"]),
+                           capture_output=True, text=True, timeout=20)
+        ct_cert = (r.stdout or '').strip()
+        signed = _cert_signed_by(ct_cert, _read_priv('/opt/tak/certs/files/ca.pem'))
+    except Exception:
+        signed = None
+    if signed is not False:
+        if signed is True:
+            _log("  CloudTAK's TAK connection is down, but its cert is from the current CA — not a CA problem; left alone")
+        return None
+    _log("  CloudTAK's TAK connection is down: its cert was issued by a CA this TAK Server no longer has. "
+         "Re-issuing the CloudTAK bootstrap admin cert from the current CA...")
+    res = _local_bootstrap_cert_ensure(settings)
+    if not res.get('success'):
+        _log(f"  ✗ could not issue the bootstrap cert: {res.get('error')}")
+        return False
+    try:
+        cert_pem, key_pem = _p12_bytes_to_pem(
+            _read_priv_bytes(f'/opt/tak/certs/files/{CLOUDTAK_BOOTSTRAP_CERT_CN}.p12'),
+            _get_tak_cert_password(settings))
+    except Exception as e:
+        _log(f"  ✗ could not read the new bootstrap cert: {str(e)[:160]}")
+        return False
+    ok, code, out = _cloudtak_request_json(
+        'PATCH', base + '/api/server', timeout=60,
+        payload={'url': srv.get('url') or '', 'api': srv.get('api') or '', 'webtak': srv.get('webtak') or '',
+                 'auth': {'cert': cert_pem, 'key': key_pem}},
+        headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+    if not ok:
+        msg = (out or {}).get('message') if isinstance(out, dict) else ''
+        _log(f"  ✗ CloudTAK refused the new cert (HTTP {code}): {str(msg)[:200]}")
+        return False
+    _log(f"  ✓ CloudTAK now connects to TAK Server with {CLOUDTAK_BOOTSTRAP_CERT_CN} from the current CA"
+         + ("" if res.get('admin_flip_ok') else " (ROLE_ADMIN flip did not verify — Events may not deliver)"))
+    return True
+
+
 @app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
 @login_required
 def cloudtak_generate_bootstrap_cert_api():
@@ -38537,55 +38889,18 @@ def cloudtak_generate_bootstrap_cert_api():
         })
 
     # Local (native or container) — mirrors takserver_create_client_cert.
-    cert_dir = '/opt/tak/certs/files'
-    p12_path = os.path.join(cert_dir, f'{cn}.p12')
-    pem_path = os.path.join(cert_dir, f'{cn}.pem')
-    created = False
-    try:
-        if not os.path.exists(p12_path):
-            _patch_openssl_string_mask()
-            if _tak_is_container():
-                _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-            else:
-                _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'],
-                                 ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-            r = subprocess.run(
-                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
-                shell=True, capture_output=True, text=True, timeout=60)
-            if r.returncode != 0 or not os.path.exists(p12_path):
-                return jsonify({'success': False,
-                                'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}), 500
-            created = True
-
-        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
-        # then feeds it every channel). Unlike the best-effort group assignment
-        # in create-client-cert, a failure here is surfaced, not swallowed.
-        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
-        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
-        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
-        certmod_ok = gr.returncode == 0
-        # Canary — never assume the jar wrote the UAF entry (native non-root
-        # consoles can't write the tak-owned UAF from a bare java run).
-        uaf_has_entry = False
-        try:
-            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
-        except Exception:
-            pass
-        note = ''
-        if not (certmod_ok and uaf_has_entry):
-            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
-                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
-                    + (gr.stdout or gr.stderr or '')[-300:])
-        return jsonify({
-            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
-            'created': created,
-            'admin_flip_ok': bool(certmod_ok and uaf_has_entry),
-            'cert_password': _get_tak_cert_password(settings),
-            'download_url': '/api/cloudtak/bootstrap-cert/download',
-            'note': note,
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+    res = _local_bootstrap_cert_ensure(settings)
+    if not res.get('success'):
+        return jsonify({'success': False, 'error': res.get('error') or 'bootstrap cert failed'}), 500
+    return jsonify({
+        'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
+        'created': res.get('created'),
+        'regenerated': res.get('regenerated'),
+        'admin_flip_ok': res.get('admin_flip_ok'),
+        'cert_password': _get_tak_cert_password(settings),
+        'download_url': '/api/cloudtak/bootstrap-cert/download',
+        'note': res.get('note') or '',
+    })
 
 
 @app.route('/api/cloudtak/bootstrap-cert/download')
@@ -68877,11 +69192,7 @@ def takserver_create_client_cert():
 
     try:
         _patch_openssl_string_mask()
-        if _tak_is_container():
-            # container: no host `tak` user — chown tak:tak is invalid; just fix the mode (broker root)
-            _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
-        else:
-            _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'], ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+        _cert_metadata_prepare_for_makecert()
         r = subprocess.run(
             _rotate_tak_cert_cmd(f'cd /opt/tak/certs && runuser -u tak -- /opt/tak/certs/makeCert.sh client {cert_name} 2>&1'),
             shell=True, capture_output=True, text=True, timeout=30
@@ -73718,6 +74029,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
         for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml'):
             subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
+        _carry_cert_metadata(old_tak, new_tak, ulog)
         if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
             return _fail("Certs did not carry over (takserver.jks missing in new bundle) — aborting before swap. Old install untouched.")
         subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
@@ -85053,9 +85365,21 @@ def _post_update_auto_deploy():
             # os.stat/chown/chmod this file — do it all through the broker (idempotent re-assert).
             if subprocess.run(_sudo_wrap(['test', '-f', _cm]), capture_output=True, timeout=10).returncode == 0:
                 try:
-                    subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
-                    _chmod_priv(_cm, 0o600)
-                    print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
+                    # v10.2.8 W11b — fill placeholder subject vars a container upgrade left behind.
+                    _heal_cert_metadata_placeholders(lambda m: print(f"Post-update:{m}", flush=True))
+                except Exception as e:
+                    print(f"Post-update: cert-metadata.sh placeholder check skipped: {e}")
+                try:
+                    if _tak_is_container():
+                        # The hardened container reads it as uid 1001 / gid 0 and the host has no
+                        # `tak` user — tak:tak 600 would lock the container out on any box whose
+                        # console uid is not 1001.
+                        _container_readable(_cm)
+                        print("Post-update: cert-metadata.sh ownership/mode re-asserted (group 0, 640 — container)")
+                    else:
+                        subprocess.run(_sudo_wrap(['chown', 'tak:tak', _cm]), capture_output=True, timeout=10)
+                        _chmod_priv(_cm, 0o600)
+                        print("Post-update: cert-metadata.sh ownership/mode re-asserted (tak:tak 600)")
                     # Validate that cert-metadata.sh defines a non-empty DIR (what makeCert.sh
                     # sources it for). v10.0.8: read the file via the broker and check in Python
                     # instead of `runuser -u tak -- bash -c '. cert-metadata.sh …'` — running an
@@ -85079,6 +85403,16 @@ def _post_update_auto_deploy():
                         print("Post-update: cert-metadata.sh content-check OK (DIR set)")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
+
+            # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
+            # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
+            # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
+            def _ct_heal():
+                try:
+                    _cloudtak_tak_cert_heal(log=lambda m: print(f"Post-update:{m}", flush=True))
+                except Exception as e:
+                    print(f"Post-update: CloudTAK cert check skipped: {e}", flush=True)
+            threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal').start()
 
             # Fix LDAP outpost AUTHENTIK_HOST if it was set to external HTTPS URL AND the outpost is
             # confirmed broken with `tls: internal error` (the original v0.8.0 use case — Caddy ACME
