@@ -8222,6 +8222,17 @@ def _diag_section_takportal(settings):
     hits = [l for l in lg.splitlines() if re.search(r'enroll|qr|itak|error|fail', l, re.I)]
     out.append(f"{web} log, last 3 h (enrollment / errors): {len(hits)} line(s)")
     out.extend('  ' + l[:260] for l in hits[-20:])
+    # v10.2.8 W12: the addresses Portal uses for TAK, its own links and Authentik — the bcg-tak
+    # report could not show that Portal was still on the server's IP.
+    try:
+        existing = _takportal_get_existing_settings() or {}
+        out.append('addresses: ' + ', '.join(f"{k}={existing.get(k) or '(unset)'}" for k in TAKPORTAL_DOMAIN_KEYS))
+        stale = _takportal_stale_address_fields(settings, existing=existing)
+        if stale:
+            out.append('⚠ still on the server IP while the box has a domain: '
+                       + ', '.join(f"{f['key']} (should be {f['suggested']})" for f in stale))
+    except Exception as e:
+        out.append(f'addresses: could not read ({str(e)[:100]})')
     return out
 
 
@@ -34262,6 +34273,64 @@ takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 TAKPORTAL_AUTHORITATIVE_KEYS = frozenset(['AUTHENTIK_URL', 'AUTHENTIK_TOKEN',
                                           'AUTHENTIK_BOOTSTRAP_TOKEN'])
 
+# v10.2.8 W12 — the addresses TAK Portal derives from THIS box's identity. Seed-only like
+# everything else, so a portal installed before the box had a domain keeps IP addresses forever
+# (bcg-tak, 2026-10-09: deletes refused "Unable to list certificates from /api/certadmin/cert",
+# invite emails linking to http://<ip>:3000). Never auto-healed: the operator presses
+# "Use the domain" and only then does the merge write them (`adopt=`).
+TAKPORTAL_DOMAIN_KEYS = ('TAK_URL', 'TAK_PORTAL_PUBLIC_URL', 'AUTHENTIK_PUBLIC_URL')
+_TAKPORTAL_DOMAIN_KEY_INFO = {
+    'TAK_URL': ('TAK URL', "TAK Portal cannot reach TAK Server's API at this address, so deleting "
+                           "users and certificate actions fail, and QR codes send devices to it"),
+    'TAK_PORTAL_PUBLIC_URL': ('TAK Portal Public URL', "links in TAK Portal's emails go to this address"),
+    'AUTHENTIK_PUBLIC_URL': ('Authentik Public URL', 'signing out sends people to this address'),
+}
+
+
+def _url_host_is_address(url):
+    """True when a URL's host is an IP literal, localhost or host.docker.internal — an address,
+    not a name a certificate or a person outside the box can use."""
+    try:
+        host = (urllib.parse.urlsplit(str(url or '').strip()).hostname or '').strip('[]').lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host in ('localhost', 'host.docker.internal'):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _takportal_stale_address_fields(settings, existing=None, built=None):
+    """v10.2.8 W12 — the TAKPORTAL_DOMAIN_KEYS still on an address while this box has a domain.
+    A key is listed only when Portal's value has an address host (_url_host_is_address) AND the
+    value infra-TAK would seed today is different and carries a real hostname. A domain an
+    operator typed is never listed. TAK_URL only when TAK Server is on this box: a portal aimed
+    at a remote TAK by IP may mean it, and the in-container alias only covers a local TAK."""
+    if not (settings.get('fqdn') or '').strip():
+        return []
+    if existing is None:
+        existing = _takportal_get_existing_settings()
+    if not isinstance(existing, dict) or not existing:
+        return []
+    if built is None:
+        built = _takportal_build_settings_dict(settings)
+    out = []
+    for k in TAKPORTAL_DOMAIN_KEYS:
+        if k == 'TAK_URL' and not os.path.isdir('/opt/tak'):
+            continue
+        cur = str(existing.get(k) or '').strip()
+        sug = str(built.get(k) or '').strip()
+        if cur and sug and cur != sug and _url_host_is_address(cur) and not _url_host_is_address(sug):
+            label, effect = _TAKPORTAL_DOMAIN_KEY_INFO[k]
+            out.append({'key': k, 'label': label, 'current': cur, 'suggested': sug, 'effect': effect})
+    return out
+
+
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
 # EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
@@ -34758,7 +34827,7 @@ def _takportal_settings_value_is_blank(v):
     return False
 
 
-def _takportal_merged_settings_json(settings):
+def _takportal_merged_settings_json(settings, adopt=()):
     """Build settings JSON for TAK Portal. THE single source of every settings.json we write.
 
     v10.1.42 (W-P1) — ownership is inverted. The old model wrote everything infra-TAK computes
@@ -34774,7 +34843,11 @@ def _takportal_merged_settings_json(settings):
     There is deliberately no heuristic that infers ownership from the VALUE. "Overwrite it if it
     equals something we might have written" cannot tell our default from an operator who chose
     the same thing — that is exactly how a customer's deliberate TAK_SSH_USER=root was healed
-    away on every portal update (field report, Justin Davis/TN, 2026-08-20)."""
+    away on every portal update (field report, Justin Davis/TN, 2026-08-20).
+
+    v10.2.8 W12: `adopt` — keys the operator explicitly asked to move to this box's domain
+    (the "Use the domain" button). Intersected with TAKPORTAL_DOMAIN_KEYS; nothing else passes it."""
+    adopt = frozenset(adopt or ()) & frozenset(TAKPORTAL_DOMAIN_KEYS)
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
@@ -34793,6 +34866,9 @@ def _takportal_merged_settings_json(settings):
             continue
         if k in EMAIL_TRANSPORT_KEYS and _relay_configured:
             merged[k] = v
+            continue
+        if k in adopt:
+            merged[k] = v  # the operator pressed "Use the domain" for this key
             continue
         # operator-owned — hands off, whatever the current value is
     return json.dumps(merged, indent=2)
@@ -35165,6 +35241,62 @@ def _takportal_build_settings_json(settings):
     return json.dumps(d, indent=2), None
 
 
+@app.route('/api/takportal/address-check')
+@login_required
+def takportal_address_check_api():
+    """v10.2.8 W12 — TAK Portal fields still on this server's IP while the box has a domain."""
+    settings = load_settings()
+    try:
+        fields = _takportal_stale_address_fields(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200], 'fields': []}), 500
+    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields})
+
+
+@app.route('/api/takportal/use-domain', methods=['POST'])
+@login_required
+def takportal_use_domain_api():
+    """v10.2.8 W12 — the operator's one-click recovery: move the named TAKPORTAL_DOMAIN_KEYS from
+    the server IP to this box's domain. Only keys that are stale RIGHT NOW are written (through
+    the single merge + single writer), the container's host alias for takserver.<fqdn> is
+    refreshed (recreate only if it changed), the app services restart, and every key is read
+    back. Postgres is never recreated."""
+    settings = load_settings()
+    data = request.get_json(silent=True) or {}
+    want = data.get('keys')
+    if not isinstance(want, list) or not want or not all(isinstance(k, str) for k in want):
+        return jsonify({'success': False, 'error': 'keys must be a non-empty list'}), 400
+    try:
+        stale = {f['key']: f for f in _takportal_stale_address_fields(settings)}
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    keys = [k for k in TAKPORTAL_DOMAIN_KEYS if k in want and k in stale]
+    if not keys:
+        return jsonify({'success': True, 'changed': {}, 'message': 'Nothing to change: TAK Portal already uses the domain.'})
+    ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings, adopt=keys))
+    if not ok:
+        return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
+    print(f"[takportal] use-domain: {', '.join(keys)} moved to {settings.get('fqdn')} (operator)", flush=True)
+    recreated = False
+    try:
+        portal_dir = _takportal_dir()
+        if _write_takportal_override():
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps',
+                                           *_takportal_app_services(portal_dir)]),
+                               cwd=portal_dir, capture_output=True, text=True, timeout=180)
+            recreated = r.returncode == 0
+    except Exception:
+        pass
+    restarted = recreated or bool(_takportal_restart())
+    after = _takportal_get_existing_settings() or {}
+    changed = {k: after.get(k) for k in keys}
+    verified = all(changed[k] == stale[k]['suggested'] for k in keys)
+    return jsonify({'success': verified, 'changed': changed, 'restarted': restarted,
+                    'message': ('TAK Portal now uses ' + ', '.join(stale[k]['suggested'] for k in keys))
+                               if verified else '',
+                    'error': '' if verified else 'TAK Portal did not keep the new values — check its Settings page'})
+
+
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
 @_records_module_update(  # v10.2.8 W10
@@ -35280,6 +35412,16 @@ def takportal_control():
             # Informational, NOT a warning -- see tak_local above. Appended after the chain
             # message so a remote-TAK box still learns whether Authentik reconciled.
             msg = msg + ' TAK Server is not on this box, so SSH setup and client-cert sync were skipped (configure those in TAK Portal).'
+        try:
+            _stale = _takportal_stale_address_fields(settings)
+        except Exception:
+            _stale = []
+        if _stale:
+            # v10.2.8 W12: Update config deliberately leaves these alone (operator-owned), so a
+            # bare "updated" left bcg-tak with no idea why deletes and email links still failed.
+            warnings.append('TAK Portal still uses this server\'s IP address for '
+                            + ', '.join(f['label'] for f in _stale)
+                            + ' — Update config does not change those; use "Use the domain" on this page.')
         if warnings:
             msg = msg + ' | ' + ' | '.join(warnings)
         return jsonify({'success': True, 'running': running, 'action': action,
