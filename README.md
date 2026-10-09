@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.7-alpha)**
+**Current release: [v10.2.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.8-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.8-alpha — 2026-10-09 — TAK Portal one-click Fix, certificates and CloudTAK survive a TAK Server upgrade, failed updates explain themselves
+
+**Headline: a TAK Portal set up before the server had its domain name gets a one-click Fix, creating certificates and logging in to CloudTAK keep working after a TAK Server upgrade, a failed module update now shows its reason on the card, and MediaMTX and coturn get security updates ([#87](https://github.com/takwerx/infra-TAK/issues/87), [#88](https://github.com/takwerx/infra-TAK/issues/88)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.8-alpha))
+
+**TAK Portal.** A TAK Portal installed before the server had its domain name kept the server's IP address for three settings: its connection to TAK Server, the links in its emails, and sign-out. Deleting users failed with "Unable to list certificates from /api/certadmin/cert", and invite emails linked to an address nobody could open. The TAK Portal page now shows a yellow card naming each setting still on the IP; press **Fix** to move them to your domain. Nothing changes until you press it. Update config now says which TAK Portal settings it leaves alone, and the Diagnostics report shows them.
+
+**Certificates and CloudTAK after a TAK Server upgrade.** Upgrading TAK Server (container or package) replaced its certificate settings with a blank template, so creating client certificates from the console failed with "Please set the following variables". Upgrades now keep those values, and servers already affected are repaired when the console updates. When an upgrade created a new certificate authority, CloudTAK could not connect or log anyone in ("UND_ERR_SOCKET: other side closed"). The console now re-issues CloudTAK's admin certificate from the current authority, but only when CloudTAK's connection is down for that reason. User certificates from the old authority are re-issued at each user's next login.
+
+**Failed updates explain themselves.** When a module update fails, its card shows "Last update failed" with the real error, and it survives console restarts. The Diagnostics report includes the last update result for every module. A failed Authentik update now leaves Authentik exactly as it was.
+
+**Security.** New MediaMTX installs use 1.21.1 (fixes a critical advisory, GHSA-w334) and refuse cross-site API requests. The EUD Remote Assist TURN server moves to coturn 4.18.0.
+
+**Also fixed.** CloudTAK video playback works on ARM servers (the media server runs the same release on both architectures). Removing CloudTAK closes the firewall ports its deploy opened, and a fresh deploy opens its streaming ports. Email test results now say the provider accepted the message, not that it was delivered (#87). ATLAS checks the agency admin group on every Update and shows when it is missing (#88, contributed by Mike Leckliter).
+
+**Upgrade note.** Update the console. If the TAK Portal page shows the yellow card, press **Fix**. If CloudTAK logins failed after a TAK Server upgrade, log in again after updating; your certificate is re-issued automatically.
 
 ### v10.2.7-alpha — 2026-10-08 — Authentik security patch, CloudTAK's new file store works, TAK 5.8 on root installs
 
