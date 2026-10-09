@@ -38844,6 +38844,14 @@ def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
         return False
     _log(f"  ✓ CloudTAK now connects to TAK Server with {CLOUDTAK_BOOTSTRAP_CERT_CN} from the current CA"
          + ("" if res.get('admin_flip_ok') else " (ROLE_ADMIN flip did not verify — Events may not deliver)"))
+    # CloudTAK opens a NEW connection 0 on the PATCH but leaves the old one's retry timer running
+    # with the old cert — measured aws-arm 2026-10-09: TLS alert 80 against TAK every 15 s, with no
+    # end. An API restart drops it; the connection was dead until a moment ago, so no session is lost.
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']), capture_output=True, timeout=120)
+        _log("  ✓ CloudTAK API restarted (drops the old connection's retry loop)")
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK API restart skipped ({str(e)[:100]}) — the old connection keeps retrying until its next restart")
     return True
 
 

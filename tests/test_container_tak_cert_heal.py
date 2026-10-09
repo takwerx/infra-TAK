@@ -313,7 +313,7 @@ class _CT:
     def __init__(self, statuses, signed=False, configured=True, ensure_ok=True):
         self.statuses = list(statuses)
         self.signed, self.configured, self.ensure_ok = signed, configured, ensure_ok
-        self.calls, self.ensured, self.logs = [], 0, []
+        self.calls, self.ensured, self.logs, self.runs = [], 0, [], []
 
     def ns(self):
         def req(method, url, payload=None, timeout=25, headers=None):
@@ -336,7 +336,7 @@ class _CT:
             '_cloudtak_admin_token': lambda secret: 'TOKEN',
             '_cloudtak_request_json': req,
             '_sudo_wrap': lambda argv: argv,
-            'subprocess': types.SimpleNamespace(run=lambda *a, **k: types.SimpleNamespace(
+            'subprocess': types.SimpleNamespace(run=lambda argv, **k: self.runs.append(list(argv)) or types.SimpleNamespace(
                 returncode=0, stdout='-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----', stderr='')),
             '_read_priv': lambda p: 'CA',
             '_cert_signed_by': lambda cert, ca: self.signed,
@@ -366,6 +366,20 @@ def test_heal_reissues_and_patches_when_dead_and_from_another_ca():
                     'auth': {'cert': 'CERT', 'key': 'KEY'}}
     assert headers == {'Authorization': 'Bearer TOKEN'}
     assert not any('TOKEN' in m or 'sekret' in m or 'KEY' == m for m in ct.logs)
+    assert ['docker', 'restart', 'cloudtak-api-1'] in ct.runs, \
+        "the old connection's retry loop survives the PATCH until the API restarts"
+
+
+def test_heal_does_not_restart_cloudtak_when_the_patch_is_refused():
+    ct = _CT(['dead'] * 4, signed=False)
+    ns = _load(['_cloudtak_tak_cert_heal'], ct.ns())
+    real = ns['_cloudtak_request_json']
+    ns['_cloudtak_request_json'] = lambda m, u, payload=None, timeout=25, headers=None: (
+        (False, 400, {'message': 'Could not connect to TAK Server'}) if m == 'PATCH'
+        else real(m, u, payload, timeout, headers))
+    assert ns['_cloudtak_tak_cert_heal'](log=ct.logs.append) is False
+    assert not any(r[:2] == ['docker', 'restart'] for r in ct.runs)
+    assert any('Could not connect to TAK Server' in m for m in ct.logs)
 
 
 @pytest.mark.parametrize('statuses', [['live'], ['dead', 'live'], ['dead', 'dead', 'dead', 'unknown']])
