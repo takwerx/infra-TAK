@@ -317,6 +317,17 @@ def test_no_size_supplied_means_no_reservation():
     assert error is None and params == {}
 
 
+def test_no_size_still_carries_the_slug():
+    """⚠️ What comes back *replaces* the request, so a slug dropped here is a
+    deploy of the plain deployment. An agency redeploy with no size keeps its
+    store, the same as the plain one does (#88)."""
+    params, error = atlas.deploy_validate({'slug': 'corona'})
+    assert error is None and params == {'slug': 'corona'}
+
+    params, error = atlas.deploy_validate({'slug': 'corona', 'store_gb': ''})
+    assert error is None and params == {'slug': 'corona'}
+
+
 def test_a_bad_size_is_refused_before_the_deploy_starts():
     """⚠️ Before, not during. A refusal halfway through leaves a half-built
     box, and this number is knowable from the form alone."""
