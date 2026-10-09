@@ -3017,11 +3017,17 @@ def deploy_validate(data):
     from the form alone.
     """
     data = data or {}
+    slug = data.get('slug') or None
     raw = data.get('store_gb')
     if raw in (None, ''):
         # Not supplied: an existing box keeps whatever it has, and a new one
         # gets no reservation at all rather than a size nobody chose.
-        return {}, None
+        #
+        # ⚠️ **The slug still travels (#88).** What this returns *replaces* the
+        # request, so dropping it here turned "redeploy corona" into a deploy of
+        # the plain deployment. `deploy()` already refuses a slug nobody
+        # registered, so carrying it is safe.
+        return ({'slug': slug} if slug else {}), None
 
     # ⚠️ The sizing mode and the agency travel with the deploy, because the
     # store is built during it and cannot be changed afterwards: `resize2fs`
@@ -3073,8 +3079,7 @@ def deploy_validate(data):
         if error:
             return {}, error
 
-    return {'store_bytes': size, 'mode': mode,
-            'slug': (data.get('slug') or None)}, None
+    return {'store_bytes': size, 'mode': mode, 'slug': slug}, None
 
 
 def _stale_deploy_key(dirpath):
