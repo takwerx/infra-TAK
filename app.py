@@ -13545,8 +13545,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '792e80bfa6a7e9004dadfde0a4807abf5483c89e'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '52beb8a1584b260e1b4f1e247438224efce3e20f12fc2ec6e780b6298edae20a'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = 'bc875abc62a10a3f58f6ce208aaa624d014851a2'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '889770b2e5f7398d27aa236d8d420de4f008cb93edfa9000e8494c2c22a21f08'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -13803,6 +13803,9 @@ _CONN_VERIFY_PORTS = [
     (8446, 'Certificate + QR enrollment',                         True),
     (80,   "Let's Encrypt renewal (HTTP-01)",                     False),
 ]
+# Mirrors modules/atlas.py DEVICE_PORT (the module is loaded by the marketplace, not
+# imported here); tests/test_relay_forwards_module_ports.py keeps the two equal.
+ATLAS_DEVICE_PORT = 8449
 
 
 def _conn_verify_ports(settings):
@@ -13842,6 +13845,15 @@ def _conn_verify_ports(settings):
                           'EUD Remote Assist device enrolment (the QR points here)', True))
     except Exception:
         pass
+    # v10.2.9 (GH #92): ATLAS MDM's device channel, same shape as 8448 above: the
+    # provisioning QR points the tablet at :8449, the module opens it in the host
+    # firewall, and a relay or cloud security group that drops it shows up only as a
+    # SocketTimeoutException on the tablet. `atlas_enabled` is the flag ATLAS's own
+    # detect() treats as "installed" (it self-heals the flag from the running
+    # containers, so it does not have Remote Assist's lost-flag problem).
+    if settings.get('atlas_enabled'):
+        ports.append((ATLAS_DEVICE_PORT,
+                      'ATLAS MDM device channel (enrolled tablets connect here)', True))
     try:
         _mtx = _get_module_deployment_config(settings, 'mediamtx_deployment') or {}
         if _mtx.get('deployed'):
