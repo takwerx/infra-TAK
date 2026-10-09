@@ -240,7 +240,7 @@ def test_routes_are_login_required():
 
 def test_update_config_names_the_fields_it_does_not_change():
     body = APP[APP.index("elif action == 'reconfigure':"):APP.index("elif action == 'update':")]
-    assert '_takportal_stale_address_fields(settings)' in body and 'Use the domain' in body
+    assert '_takportal_stale_address_fields(settings)' in body and 'press "Fix"' in body
 
 
 def test_diagnostics_shows_the_three_addresses_and_never_the_token():
@@ -254,3 +254,4 @@ def test_page_card_builds_values_with_text_nodes_only():
     js = TPL[TPL.index('async function portalAddressCheck'):TPL.index('{% if deploying %}pollDeployLog();')]
     assert 'innerHTML' not in js, 'Portal settings values are operator-controlled text'
     assert "addEventListener('click',portalUseDomain)" in js and 'onclick=' not in js
+    assert 'Fix: switch to' in js and 'Press Fix' in TPL, 'the repair button must say it repairs (operator: "its not obvious")'

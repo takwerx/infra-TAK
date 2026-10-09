@@ -90,10 +90,11 @@
 {% from '_module_result.html' import last_update_result %}{{ last_update_result('takportal') }}
 </div>
 <div id="portal-address-card" style="display:none;background:var(--bg-card);border:1px solid var(--yellow);border-radius:12px;padding:16px 20px;margin-bottom:24px">
-<div style="font-weight:600;color:var(--yellow);margin-bottom:8px">&#9888; TAK Portal still uses this server's IP address</div>
-<div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">TAK Portal was set up before this server had its domain name, and these settings never moved over. Update config does not change them because they are TAK Portal's own settings; the button below does, for exactly these fields.</div>
+<div style="font-weight:600;color:var(--yellow);margin-bottom:8px">&#9888; TAK Portal needs a fix: it is still using this server's IP address</div>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">TAK Portal was set up before this server had its domain name, so these settings still point at the IP:</div>
 <ul id="portal-address-list" style="margin:0 0 12px 18px;padding:0;font-size:13px"></ul>
-<button class="control-btn" id="portal-use-domain-btn" type="button"></button>
+<div style="font-size:13px;margin-bottom:12px"><b>Press Fix</b> to switch all of them to your domain in one step. TAK Portal restarts (about 30 seconds); nothing else in it changes.</div>
+<button class="control-btn" id="portal-use-domain-btn" type="button" style="border-color:var(--yellow);color:var(--yellow);font-weight:600"></button>
 <span id="portal-use-domain-msg" style="margin-left:10px;font-size:12px"></span>
 </div>
 {% endif %}
@@ -559,7 +560,7 @@ async function portalAddressCheck(){
             li.appendChild(why);
             list.appendChild(li);
         });
-        document.getElementById('portal-use-domain-btn').textContent='Use '+(d.fqdn||'the domain');
+        document.getElementById('portal-use-domain-btn').textContent='\ud83d\udd27 Fix: switch to '+(d.fqdn||'the domain');
         card.style.display='block';
     }catch(e){card.style.display='none';}
 }
@@ -573,7 +574,7 @@ async function portalUseDomain(){
         var r=await fetch('/api/takportal/use-domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:portalStaleKeys})});
         var d=await r.json();
         if(d.success){
-            msg.style.color='var(--green)';msg.textContent='\u2713 '+(d.message||'Done');
+            msg.style.color='var(--green)';msg.textContent='\u2713 Fixed. '+(d.message||'');
             setTimeout(portalAddressCheck,3000);
         }else{
             msg.style.color='var(--red)';msg.textContent='\u2717 '+(d.error||'Failed');

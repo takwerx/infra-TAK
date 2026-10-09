@@ -35421,7 +35421,7 @@ def takportal_control():
             # bare "updated" left bcg-tak with no idea why deletes and email links still failed.
             warnings.append('TAK Portal still uses this server\'s IP address for '
                             + ', '.join(f['label'] for f in _stale)
-                            + ' — Update config does not change those; use "Use the domain" on this page.')
+                            + ' — Update config does not change those; press "Fix" in the yellow card on this page.')
         if warnings:
             msg = msg + ' | ' + ' | '.join(warnings)
         return jsonify({'success': True, 'running': running, 'action': action,
