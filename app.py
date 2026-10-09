@@ -29346,11 +29346,13 @@ def _heal_cert_metadata_placeholders(log=None):
     return True
 
 
-def _carry_cert_metadata(old_tak, new_tak, log=None):
-    """v10.2.8 W11a — a container upgrade extracts a fresh bundle whose cert-metadata.sh is the
-    stock placeholder file. Carry the old tree's literal subject values into it (falling back to
-    the carried CA's own subject for anything the old file lacked too), so makeCert keeps working
-    after the old tree is deleted. Returns the vars filled; never raises."""
+def _carry_cert_metadata(old_tak, new_tak, log=None, old_text=None):
+    """v10.2.8 W11a — an upgrade replaces cert-metadata.sh with the stock placeholder file
+    (`STATE=${STATE}` …): a container upgrade extracts a fresh bundle, and a native .deb/.rpm
+    upgrade overwrites it in place (test6, 5.7 → 5.8 on 2026-09-22). Carry the old file's literal
+    subject values into it (falling back to the carried CA's own subject for anything the old file
+    lacked too), so makeCert keeps working. Native passes the pre-upgrade `old_text` because the
+    path is the same before and after. Returns the vars filled; never raises."""
     _log = log or (lambda m: print(m, flush=True))
     new_cm = os.path.join(new_tak, 'certs', 'cert-metadata.sh')
     try:
@@ -29360,7 +29362,8 @@ def _carry_cert_metadata(old_tak, new_tak, log=None):
         return []
     vals = {}
     try:
-        vals = _cert_metadata_literals(_read_priv(os.path.join(old_tak, 'certs', 'cert-metadata.sh')))
+        vals = _cert_metadata_literals(old_text if old_text is not None
+                                       else _read_priv(os.path.join(old_tak, 'certs', 'cert-metadata.sh')))
     except Exception:
         pass
     if not all(v in vals for v in _CERT_META_REQUIRED):
@@ -29373,7 +29376,10 @@ def _carry_cert_metadata(old_tak, new_tak, log=None):
     if changed:
         try:
             _write_priv(new_cm, out)
-            _container_readable(new_cm, _log)
+            if _tak_is_container():
+                _container_readable(new_cm, _log)
+            else:
+                _run_priv_chain([['chown', 'tak:tak', new_cm], ['chmod', '600', new_cm]], 'and')
             _log(f"  ✓ cert-metadata.sh carried over ({', '.join(changed)})")
         except Exception as e:
             _log(f"  ⚠ could not write cert-metadata.sh in the new bundle ({str(e)[:100]})")
@@ -38716,6 +38722,12 @@ def _local_bootstrap_cert_ensure(settings):
             if r.returncode != 0 or not _exists_priv(pem_path):
                 return {'success': False, 'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}
             created = True
+        # CloudTAK's ROLE_ADMIN credential: makeCert in the container leaves it 644 (aws-arm,
+        # 2026-10-09). Owner-only; the console reads it through the broker.
+        try:
+            _chmod_priv(p12_path, 0o600)
+        except Exception:
+            pass
 
         # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
         # then feeds it every channel). Unlike the best-effort group assignment
@@ -73755,6 +73767,12 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         ulog("TAK Server update (upgrade)")
         ulog("=" * 50)
+        # v10.2.8 W11a (native) — the package ships a stock cert-metadata.sh with placeholders
+        # and overwrites ours; keep its values to carry into the new file after the install.
+        try:
+            cm_backup = _read_priv('/opt/tak/certs/cert-metadata.sh')
+        except Exception:
+            cm_backup = None
         heap_backup = None
         heap_file = '/etc/default/takserver'
         if os.path.isfile(heap_file):
@@ -73830,6 +73848,8 @@ def run_takserver_upgrade(pkg_path):
                 ulog("✓ JVM heap settings restored")
             except Exception as e:
                 ulog(f"⚠ Could not restore heap settings: {e}")
+        if cm_backup:
+            _carry_cert_metadata('/opt/tak', '/opt/tak', ulog, old_text=cm_backup)
         ulog("Restarting TAK Server...")
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)  # v10.0.1: container-aware
         if _get_authentik_env_content(settings):

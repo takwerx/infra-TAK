@@ -198,6 +198,31 @@ def test_upgrade_falls_back_to_the_ca_subject_when_the_old_file_was_stock_too():
     assert lit['COUNTRY'] == 'US', 'the stock literal COUNTRY must win over the CA fallback'
 
 
+def test_native_upgrade_carries_the_pre_install_values_in_place():
+    """test6, 2026-09-22: `upgrade takserver 5.7-RELEASE8 5.8-RELEASE84` — dpkg replaced the file
+    with the stock one (STATE=${STATE} …). Same path before and after, so the text is passed in."""
+    files = {'/opt/tak/certs/cert-metadata.sh': STOCK_META}
+    ns, log = _fs_ns(files, container=False)
+    chains = []
+    ns['_run_priv_chain'] = lambda cmds, how: chains.append((cmds, how))
+    ns['_ca_subject_values'] = lambda **k: pytest.fail('the pre-install file had every value')
+    _load(['_cert_metadata_literals', '_cert_metadata_fill', '_carry_cert_metadata'], ns)
+    changed = ns['_carry_cert_metadata']('/opt/tak', '/opt/tak', lambda m: None, old_text=OLD_META)
+    assert set(changed) == {'STATE', 'CITY', 'ORGANIZATION', 'ORGANIZATIONAL_UNIT'}
+    assert ns['_cert_metadata_literals'](files['/opt/tak/certs/cert-metadata.sh'])['CITY'] == 'SAC'
+    assert chains == [([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'],
+                        ['chmod', '600', '/opt/tak/certs/cert-metadata.sh']], 'and')]
+    assert not log, 'native TAK runs makeCert as the host tak user, not the container uid'
+
+
+def test_native_upgrade_backs_up_before_the_install_and_carries_before_the_restart():
+    body = _func('run_takserver_upgrade')
+    backup = body.index("cm_backup = _read_priv('/opt/tak/certs/cert-metadata.sh')")
+    carry = body.index("_carry_cert_metadata('/opt/tak', '/opt/tak', ulog, old_text=cm_backup)")
+    assert backup < body.index('_tak_upgrade_apt_install(') < carry
+    assert carry < body.index('ulog("Restarting TAK Server...")')
+
+
 def test_upgrade_carry_runs_before_the_swap_deletes_the_old_tree():
     body = _func('run_takserver_upgrade_container')
     carry = body.index('_carry_cert_metadata(old_tak, new_tak')
@@ -418,6 +443,7 @@ def test_bootstrap_ensure_reissues_a_cert_the_current_ca_did_not_sign():
         '_rotate_tak_cert_cmd': lambda c: c,
         '_tak_is_container': lambda: False,
         '_tak_exec': lambda c: c,
+        '_chmod_priv': lambda p, m: ran.append(f'chmod {oct(m)} {p}'),
         'subprocess': types.SimpleNamespace(run=lambda cmd, **k: ran.append(cmd) or types.SimpleNamespace(
             returncode=0, stdout='', stderr='')),
     }
@@ -426,11 +452,13 @@ def test_bootstrap_ensure_reissues_a_cert_the_current_ca_did_not_sign():
     res = ns['_local_bootstrap_cert_ensure']({})
     assert res['success'] and res['regenerated'] and res['created'] and res['admin_flip_ok']
     assert any('makeCert.sh client cloudtak-svc-bootstrap' in c for c in ran)
+    assert 'chmod 0o600 /opt/tak/certs/files/cloudtak-svc-bootstrap.p12' in ran, 'admin credential left world-readable'
     ns['_cert_signed_by'] = lambda cert, ca: True
     ran.clear()
     res = ns['_local_bootstrap_cert_ensure']({})
     assert not res['regenerated'] and not res['created']
     assert not any('makeCert.sh' in c for c in ran), 'a current-CA cert must be reused, not re-issued'
+    assert 'chmod 0o600 /opt/tak/certs/files/cloudtak-svc-bootstrap.p12' in ran, 'an existing 644 p12 is tightened too'
 
 
 def test_generate_route_uses_the_shared_ensure():
