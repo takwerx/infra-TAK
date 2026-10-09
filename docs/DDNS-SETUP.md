@@ -30,10 +30,22 @@ and internal port:
 | TCP | 8089 | ATAK / iTAK / WinTAK client connections |
 | TCP | 8443 | TAK admin WebGUI (client-cert auth) |
 | TCP | 8446 | TAK admin WebGUI (Let's Encrypt / LDAP login) |
+| TCP | 8554 | RTSP video — only if you deploy MediaMTX or TAK Video Restreamer |
+| TCP | 8322 | MediaMTX RTSPS video — only if you deploy MediaMTX |
+| UDP | 8890 | SRT video — only if you deploy MediaMTX or TAK Video Restreamer |
+| TCP | 8555 | TAK Video Restreamer RTSPS video — only if you deploy it |
+| TCP | 1935 | TAK Video Restreamer RTMP video — only if you deploy it |
+| TCP | 18554 | CloudTAK video RTSP — only if you deploy CloudTAK |
+| TCP | 11935 | CloudTAK video RTMP — only if you deploy CloudTAK |
+| UDP | 18890 | CloudTAK video SRT — only if you deploy CloudTAK |
+| TCP | 8449 | ATLAS MDM device channel — only if you deploy ATLAS (tablets enroll here) |
+| TCP | 8448 | EUD Remote Assist device API — only if you deploy Remote Assist |
+| TCP + UDP | 3479 | CoTURN control — only if you deploy Remote Assist |
+| UDP | 50000–50050 | CoTURN relayed media — only if you deploy Remote Assist |
 
 > **⚠️ Never use "DMZ host" as a shortcut.** DMZ forwards *every* port — including ones nothing on
 > the box is hardened to answer — and turns one compromised service into a fully exposed machine.
-> Five explicit forwards is the whole job; do it properly.
+> Five explicit forwards, plus the module ports you use, is the whole job; do it properly.
 
 ## 3. Get a hostname that follows your IP (Cloudflare DDNS)
 

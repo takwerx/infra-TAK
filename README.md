@@ -275,6 +275,13 @@ seams, privilege model, SSO patterns, review bar):
 | CloudTAK Media | 18554 | RTSP | CloudTAK video tab — RTSP clients |
 | CloudTAK Media | 11935 | RTMP | CloudTAK video tab — RTMP publishers |
 | CloudTAK Media | 18890 | SRT | CloudTAK video tab — SRT clients |
+| TAK Video Restreamer *(when deployed)* | 8555 | RTSPS | TLS-wrapped RTSP (its RTSP and SRT use MediaMTX's 8554 and 8890) |
+| TAK Video Restreamer *(when deployed)* | 1935 | RTMP | RTMP publishers |
+| ATLAS MDM *(when deployed)* | 8449 | TLS | Enrolled tablets' device channel (mutual TLS) — the provisioning QR points here |
+| EUD Remote Assist *(when deployed)* | 8448 | HTTPS | Device API — the enrolment QR points here |
+| CoTURN — EUD Remote Assist *(when deployed)* | 3479 / 50000–50050 | TCP+UDP / UDP | TURN control / relayed media |
+
+> **Cloud servers and relays:** infra-TAK opens these ports in the server's own firewall, but it can't reach your cloud provider's firewall (AWS security group, Oracle security list, Azure NSG). Allow the ones you use there yourself, module ports included: a tablet that can't reach 8449 installs the ATLAS agent and then times out. On an Oracle relay, the paste-in rule block in [docs/RELAY-SETUP.md](docs/RELAY-SETUP.md#the-fast-way--cloud-shell-recommended) covers all of them.
 
 ### Tier 3 — Caddy-loopback (bound to `127.0.0.1`, **deny in UFW**)
 

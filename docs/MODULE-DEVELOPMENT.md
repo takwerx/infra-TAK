@@ -174,7 +174,7 @@ def register(ctx):
 | `uninstall` | callable `(ctx, job, params) -> dict` | yes | Section 5.4. |
 | `control_map` | `dict[str, list | callable]` | yes | Verb to argv. Section 5.5. |
 | `extra_routes` | `list[dict]` | no | Bespoke endpoints. Section 6.2. |
-| `ports` | `list[str]` | no | Public ports your module opens, `'8449/tcp'` form. Documentation for reviewers today; keep it accurate. |
+| `ports` | `list[str]` | no | Public ports your module opens, `'8449/tcp'` form. A test checks every port here against the relay and the docs; see "Every public port reaches relays and the docs" in section 9.3. |
 | `service_units` | `list[str]` | no | systemd units you install, if any. |
 | `settings_keys` | `list[str]` | no | Every `settings.json` key you write. Reviewers use this to check cleanup on uninstall. |
 
@@ -541,8 +541,9 @@ Port tiers, from the README:
 
 Pick a host port that is not already taken. In use today (partial): 5001
 console, 8089/8443/8446 TAK Server, 9000/9090 Authentik, 3000 TAK Portal, 3100
-TVR, 8767 and 8448 EUD Remote Assist, 8554/8555/8888/8889/8890/1935 media,
-1880 Node-RED, 3478/3479 TURN, 51820 WireGuard, 8080 Guard Dog agent.
+TVR, 8767 and 8448 EUD Remote Assist, 8449 ATLAS, 8554/8555/8888/8889/8890/1935
+media, 18554/11935/18890 CloudTAK video, 1880 Node-RED, 3478/3479 TURN, 51820
+WireGuard, 8080 Guard Dog agent.
 
 ### 9.2 Single sign-on with Authentik
 
@@ -588,6 +589,31 @@ in uninstall. Nothing else. Do not `ufw deny` a loopback port; a port bound to
 `127.0.0.1` needs no rule, and ufw silently mishandles a deny on a port that
 already has an allow.
 
+**Every public port reaches relays and the docs.** Opening a port in the box's
+firewall isn't enough. A relayed box only receives the ports the relay forwards,
+and the user's cloud firewall and home router are opened by hand from our docs.
+A port missing from any of these works on a plain VPS and fails silently behind
+a relay or a router: GH #62 (8448) and GH #92 (8449) were both this. When your
+module opens a public port:
+
+1. List it in the manifest's `ports`, in `'8449/tcp'` form.
+2. Add it to the relay's forward lists in `scripts/connectivity-anchor-bootstrap.sh`
+   (`FWD_PORTS` for TCP, `UDP_FWD_PORTS` for UDP). Commit that change on its
+   own, then point `_CONN_ANCHOR_BOOTSTRAP_COMMIT` and `_CONN_ANCHOR_BOOTSTRAP_SHA256`
+   in `app.py` at that commit. Existing relays pick it up on their next console
+   restart. Merge such a PR with a merge commit, not a squash, or the pin points
+   at a commit that isn't on `dev`.
+3. In `docs/RELAY-SETUP.md`, add a row to the port table and a rule to the Cloud
+   Shell `ingress.json` block, and update the rule count stated under it.
+4. Add it to the README's **Ports → Tier 1** table and to the router table in
+   `docs/DDNS-SETUP.md`, marked as needed only when your module is deployed.
+5. For a TCP port, add a Connectivity → Verify probe in `_conn_verify_ports()`,
+   only when your module is deployed. Leave UDP out: a connectionless probe can't
+   tell open from dropped.
+
+`tests/test_relay_forwards_module_ports.py` fails until steps 1–4 agree, for
+every module's `ports` and every port in the README's Tier 1 table.
+
 ---
 
 ## 10. Hooks in `app.py`
@@ -607,6 +633,7 @@ to find every location. Your PR will include:
 | **Version badge** | `/api/modules/version` handler | `_set('mdm', lambda: mod_registry.mdm.get_version_info(mod_registry.get_ctx()))` inside the installed guard. |
 | **Full uninstall** | `run_full_uninstall()` | `mod_registry.uninstall_module('mdm', log_fn=plog)` in a try/except. |
 | **Authentik** | `_ensure_app_access_policies()` and a new `_ensure_authentik_mdm_app()` | Section 9.2. |
+| **Relay forward and Verify probe** (public ports only) | `scripts/connectivity-anchor-bootstrap.sh`, the bootstrap pin, `_conn_verify_ports()` | Section 9.3. |
 | **Guard Dog monitor** (optional) | the `service_id ==` chain in the Guard Dog health check | A liveness probe so the operator gets an alert if your container dies. |
 | **Dev-channel gate** (if the maintainers ask for it) | the tile hunk in `detect_modules()` | Register the tile only when `settings.get('update_channel') == 'dev'` or the module is already installed, so stable-channel boxes do not see it until it is promoted. |
 
