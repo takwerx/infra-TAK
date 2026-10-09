@@ -137,6 +137,7 @@ the only part you do by hand.
 | TCP | 8322 | MediaMTX **RTSPS** video |
 | UDP | 8890 | MediaMTX **SRT** video |
 | TCP | 8448 | **EUD Remote Assist device API — the enrolment QR points here** |
+| TCP | 8449 | **ATLAS MDM device channel — enrolled tablets connect here** |
 | TCP + UDP | 3479 | CoTURN control channel — EUD Remote Assist |
 | UDP | 50000–50050 | CoTURN relayed media — EUD Remote Assist |
 | **TCP** | **5001** | The infra-TAK console's direct-IP backdoor — see the note below |
@@ -198,6 +199,7 @@ cat > ingress.json <<'EOF'
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"MediaMTX RTSPS video","tcpOptions":{"destinationPortRange":{"min":8322,"max":8322}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"MediaMTX SRT video","udpOptions":{"destinationPortRange":{"min":8890,"max":8890}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"EUD Remote Assist device API (QR target)","tcpOptions":{"destinationPortRange":{"min":8448,"max":8448}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"ATLAS MDM device channel","tcpOptions":{"destinationPortRange":{"min":8449,"max":8449}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CoTURN control (Remote Assist)","tcpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN control (Remote Assist)","udpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN relayed media (Remote Assist)","udpOptions":{"destinationPortRange":{"min":50000,"max":50050}}},
@@ -211,7 +213,7 @@ oci network security-list update \
   --force
 ```
 
-Refresh the **Security rules** page and you should see 18 ingress rules.
+Refresh the **Security rules** page and you should see 19 ingress rules.
 
 > **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
 > through command history instead of moving the cursor, so a mis-paste is easier to start over than
