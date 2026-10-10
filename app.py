@@ -80038,6 +80038,25 @@ def _pin_takserver_jvm(plog=None):
     return {'java_home': home, 'changed': changed}
 
 
+_GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
+
+
+def _gd_baked_remote_values(path):
+    """The endpoint an installed remote-DB Guard Dog script was deployed with, read from
+    its own `KEY="value"` lines — {KEY: value} for each placeholder it filled, or None
+    when the script is absent or was never pointed at a host. GH #99."""
+    try:
+        cur = _read_priv(path)
+    except Exception:
+        return None
+    vals = {}
+    for k in _GD_BAKED_REMOTE_KEYS:
+        m = re.search(r'^%s="([^"\n]*)"$' % k, cur or '', re.M)
+        if m and 'PLACEHOLDER' not in m.group(1):
+            vals[k] = m.group(1)
+    return vals if vals.get('DB_HOST') else None
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -80071,8 +80090,18 @@ def _auto_update_guarddog():
             src = os.path.join(scripts_dir, name)
             if not os.path.isfile(src):
                 continue
+            # v10.2.10 (GH #99): the remote-DB scripts used to be skipped outright unless
+            # settings said two_server. A split box whose settings do not (built by hand,
+            # external_db, or changed since) kept the copy it was first deployed with — on
+            # the field box the May script that restarted a healthy production PostgreSQL
+            # five times — while every other Guard Dog script updated around it. Same trap
+            # as tak-db-watch.sh below. If the script is ON this box, refresh it, keeping
+            # the endpoint it was deployed with; if it is not, there is nothing to update.
+            baked = None
             if not is_two_server and 'remotedb' in name:
-                continue
+                baked = _gd_baked_remote_values(os.path.join('/opt/tak-guarddog', name))
+                if not baked:
+                    continue
             # v10.1.64 W1: tak-db-watch.sh used to be skipped on two-server boxes because it
             # was local-only — a watcher for a database that is not on this host. It is now
             # remote-aware (gd_db_is_remote), and the skip had become actively harmful: a box
@@ -80102,6 +80131,9 @@ def _auto_update_guarddog():
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            if baked:
+                for _k, _v in baked.items():
+                    content = content.replace(f'{_k}_PLACEHOLDER', _v)
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
                 _fh_remote = _fh_cfg.get('remote', {})

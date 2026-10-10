@@ -22,6 +22,19 @@
 #   - Storm cap: identical failure state backs off hourly → daily after 24h;
 #     resets the moment the state changes.
 #   - sudo -n everywhere so a password prompt fails fast and is distinguishable.
+#
+# v10.2.10 (GH #99 — a split install restarted a HEALTHY production PostgreSQL five
+# times, and logged "is down, restart FAILED" 1,540 times over two months, after the
+# operator restricted the shared SSH key to rsync for their own backups):
+#   - TCP failing from HERE is not proof the database is down. It is just as often this
+#     node's own network (the field box had lost outbound connectivity on one of those
+#     days). The restart now needs Server One ITSELF to say PostgreSQL is not responding
+#     (pg_isready rc 2 over SSH). Cannot ask, or it says up / starting -> no restart.
+#   - Daily cap: at most 3 database restarts per 24 h, like the 8089 check. Before this a
+#     real outage that the restart could not fix was restarted on EVERY run, every 2 min.
+#   - The probe's and the restart's real output are logged. "ssh connect/auth failed"
+#     was also what a key restricted to a forced command produced — it connects fine,
+#     it just runs something else — so the log said nothing about why.
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
@@ -36,6 +49,9 @@ LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
 FAIL_COUNT_FILE="/var/lib/takguard/remotedb_fail_count"            # consecutive TCP-down count
 STATE_FILE="/var/lib/takguard/remotedb_state"                     # last state (storm-cap reset)
 STATE_SINCE_FILE="/var/lib/takguard/remotedb_state_since"         # epoch current state began
+DB_RESTART_COUNT_FILE="/var/lib/takguard/remotedb_restart_count_24h"
+DB_RESTART_WINDOW_FILE="/var/lib/takguard/remotedb_restart_window"
+MAX_DAILY_DB_RESTARTS=3
 mkdir -p /var/lib/takguard /var/log/takguard
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 -o BatchMode=yes)
@@ -59,13 +75,22 @@ fi
 # Distinguish the failing leg: ssh reachability vs pg_isready vs passwordless sudo.
 SSH_MGMT_OK=true
 SSH_DETAIL=""
+PR=""   # pg_isready rc ON Server One: 0 up, 1 rejecting (starting), 2 no response, 3 no attempt
 if [ "$EXTERNAL_DB" != "true" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
   PROBE=$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
     'PR=127; command -v pg_isready >/dev/null 2>&1 && { pg_isready -q; PR=$?; }; \
      sudo -n -u postgres psql -lqt >/dev/null 2>&1; SU=$?; echo "SSHOK PR=$PR SU=$SU"' 2>&1)
+  SSH_RC=$?
   if ! printf '%s' "$PROBE" | grep -q "SSHOK"; then
     SSH_MGMT_OK=false
-    SSH_DETAIL="ssh connect/auth failed ($(printf '%s' "$PROBE" | head -1 | cut -c1-120))"
+    PROBE_OUT=$(printf '%s' "$PROBE" | tr '\n' ' ' | cut -c1-200)
+    if [ "$SSH_RC" = "255" ]; then
+      SSH_DETAIL="ssh connect/auth failed: ${PROBE_OUT:-no output}"
+    else
+      # ssh itself worked (255 is ssh's own error) but our command did not run — the
+      # signature of a key restricted to a forced command on Server One.
+      SSH_DETAIL="ssh connected but the probe did not run (rc $SSH_RC; is this key restricted to a forced command on Server One?): ${PROBE_OUT:-no output}"
+    fi
   else
     PR=$(printf '%s' "$PROBE" | sed -n 's/.*PR=\([0-9]*\).*/\1/p')
     SU=$(printf '%s' "$PROBE" | sed -n 's/.*SU=\([0-9]*\).*/\1/p')
@@ -146,25 +171,64 @@ FAIL_COUNT=0; [ -f "$FAIL_COUNT_FILE" ] && FAIL_COUNT=$(cat "$FAIL_COUNT_FILE")
 FAIL_COUNT=$((FAIL_COUNT + 1)); echo "$FAIL_COUNT" > "$FAIL_COUNT_FILE"
 [ "$FAIL_COUNT" -lt 3 ] && exit 0
 
-# Restart authority is gated on TCP failure ONLY (we are here) — never on an SSH
-# probe failure. Two-server only; a managed/external DB is never restarted.
-RESTARTED=false
-if [ "$EXTERNAL_DB" != "true" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-  ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
-    'sudo -n pg_ctlcluster 15 main restart 2>/dev/null || sudo -n systemctl restart postgresql 2>/dev/null' 2>/dev/null
-  sleep 5
-  if timeout 6 bash -c "</dev/tcp/$DB_HOST/$DB_PORT" >/dev/null 2>&1; then
-    RESTARTED=true
+# Restart authority: TCP is down from here (we are here) AND Server One itself says
+# PostgreSQL is not responding. Anything less is "cannot determine", and an unknown
+# state is never restarted. Two-server only; a managed/external DB is never restarted.
+# OUTCOME: external | restarted | restart_failed | capped | unconfirmed
+OUTCOME="unconfirmed"
+WHY=""
+RESTART_OUT=""
+if [ "$EXTERNAL_DB" = "true" ]; then
+  OUTCOME="external"
+elif [ -z "$SSH_KEY" ] || [ ! -f "$SSH_KEY" ]; then
+  WHY="Guard Dog has no SSH key for Server One, so it cannot check PostgreSQL there."
+elif ! $SSH_MGMT_OK && [ -z "$PR" ]; then
+  WHY="Guard Dog could not ask Server One: $SSH_DETAIL"
+elif [ "$PR" = "0" ]; then
+  WHY="Server One reports PostgreSQL is UP and accepting connections locally. The problem is the network path from this node to $DB_HOST:$DB_PORT (firewall, routing, or this node's own connectivity), not the database."
+elif [ "$PR" = "1" ]; then
+  WHY="Server One reports PostgreSQL is rejecting connections (starting up or in recovery). Guard Dog does not restart a database that is coming up."
+elif [ "$PR" != "2" ]; then
+  WHY="pg_isready on Server One could not tell (rc $PR)."
+else
+  # Confirmed down. Daily cap — 3 per 24 h, same as the TAK Server restarts.
+  _window_start=$(cat "$DB_RESTART_WINDOW_FILE" 2>/dev/null || echo 0)
+  if [ $((NOW - _window_start)) -ge 86400 ]; then
+    echo "$NOW" > "$DB_RESTART_WINDOW_FILE"
+    echo 0 > "$DB_RESTART_COUNT_FILE"
+  fi
+  _daily=$(cat "$DB_RESTART_COUNT_FILE" 2>/dev/null || echo 0)
+  if [ "$_daily" -ge "$MAX_DAILY_DB_RESTARTS" ]; then
+    OUTCOME="capped"
+  else
+    echo $((_daily + 1)) > "$DB_RESTART_COUNT_FILE"
+    echo 0 > "$FAIL_COUNT_FILE"   # the next attempt needs 3 fresh consecutive failures
+    RESTART_OUT=$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
+      'sudo -n pg_ctlcluster 15 main restart 2>&1 || sudo -n systemctl restart postgresql 2>&1' 2>&1 \
+      | tr '\n' ' ' | cut -c1-200)
+    sleep 5
+    if timeout 6 bash -c "</dev/tcp/$DB_HOST/$DB_PORT" >/dev/null 2>&1; then
+      OUTCOME="restarted"
+    else
+      OUTCOME="restart_failed"
+    fi
   fi
 fi
 
-if [ "$EXTERNAL_DB" = "true" ]; then
-  RESTART_MSG="This is a managed/external database (RDS, Azure, etc.). Guard Dog cannot restart it automatically. Contact your cloud provider or database administrator to investigate."
-elif $RESTARTED; then
-  RESTART_MSG="Guard Dog attempted a remote restart and the database is now reachable again."
-else
-  RESTART_MSG="Guard Dog attempted a remote restart but the database is still unreachable. Manual intervention required."
-fi
+case "$OUTCOME" in
+  external)
+    RESTART_MSG="This is a managed/external database (RDS, Azure, etc.). Guard Dog cannot restart it automatically. Contact your cloud provider or database administrator to investigate." ;;
+  restarted)
+    RESTART_MSG="Server One confirmed PostgreSQL was not responding. Guard Dog restarted it and the database is now reachable again." ;;
+  restart_failed)
+    RESTART_MSG="Server One confirmed PostgreSQL was not responding. Guard Dog attempted a remote restart but the database is still unreachable. Manual intervention required.
+Restart output: ${RESTART_OUT:-none}" ;;
+  capped)
+    RESTART_MSG="Server One confirms PostgreSQL is not responding, but Guard Dog has already restarted it $MAX_DAILY_DB_RESTARTS times in the last 24 hours and will not try again. Manual intervention required." ;;
+  *)
+    RESTART_MSG="Guard Dog did NOT restart the database: it could not confirm from Server One that PostgreSQL is down.
+$WHY" ;;
+esac
 
 if [ "$EXTERNAL_DB" = "true" ]; then
   SUBJ="TAK Server Managed Database Alert on $SERVER_IDENTIFIER"
@@ -212,10 +276,15 @@ Check on Server One ($DB_HOST):
 fi
 
 send_alert "$SUBJ" "$BODY" "$ALERT_SENT_FILE"
-if [ "$EXTERNAL_DB" = "true" ]; then
-  echo "$(date): Managed DB ($DB_HOST) unreachable (TCP closed) — no auto-restart (external provider)" >> /var/log/takguard/restarts.log
-elif $RESTARTED; then
-  echo "$(date): Remote DB ($DB_HOST) TCP was down, restarted successfully via SSH" >> /var/log/takguard/restarts.log
-else
-  echo "$(date): Remote DB ($DB_HOST) TCP down, restart FAILED" >> /var/log/takguard/restarts.log
-fi
+case "$OUTCOME" in
+  external)
+    echo "$(date): Managed DB ($DB_HOST) unreachable (TCP closed) — no auto-restart (external provider)" ;;
+  restarted)
+    echo "$(date): Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restarted successfully via SSH" ;;
+  restart_failed)
+    echo "$(date): Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restart FAILED — ${RESTART_OUT:-no output}" ;;
+  capped)
+    echo "$(date): Remote DB ($DB_HOST) confirmed down but daily restart cap ($MAX_DAILY_DB_RESTARTS) reached — manual intervention required" ;;
+  *)
+    echo "$(date): Remote DB ($DB_HOST) TCP down — NOT restarted, state not confirmed on Server One: $WHY" ;;
+esac >> /var/log/takguard/restarts.log
