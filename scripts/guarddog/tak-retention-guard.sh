@@ -3,6 +3,8 @@
 # Kills long-running DELETE queries on cot_router that indicate TAK Server
 # retention is stuck (overlapping runs, massive single-transaction deletes).
 # Then runs batched deletes in small chunks so the table stays manageable.
+# It deletes only what TAK Server's own retention would: mission-linked rows and
+# legacy GeoChat are never touched (see "Which rows are expired" below).
 #
 # Intended to run every 15 minutes (systemd timer).
 #
@@ -105,13 +107,44 @@ psql_raw() {
 
 # Pre-flight
 if [ "$TWO_SERVER_MODE" = "1" ]; then
+  # v10.2.10 (GH #98): a deploy that never substituted these leaves the literal
+  # installer placeholders behind. Say so by name instead of folding it into the
+  # generic skip below. (The pattern is `*_PLACEHOLDER*` on purpose: spelling out
+  # a full placeholder name here would itself get substituted at deploy time.)
+  case "${SSH_KEY}|${SSH_USER}|${SSH_TARGET}" in
+    *_PLACEHOLDER*)
+      log_line "RETENTION-GUARD: NOT RUNNING — two_server mode but the SSH key/user/host are still installer placeholders. Nothing was checked or deleted; re-deploy Guard Dog to fill them in."
+      exit 0
+      ;;
+  esac
   if [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ]; then
-    # v10.1.4 (WS5): a clean skip, not a failure — exit 0 so `systemctl --failed`
-    # doesn't list this unit forever on split boxes without a substituted key
-    # (test8, 10.1.3 T&E). The skip is already logged above for diagnosis.
-    log_line "RETENTION-GUARD: two_server mode but SSH target/key unavailable, skipped (clean)"
+    # v10.1.4 (WS5): exit 0 so `systemctl --failed` doesn't list this unit forever
+    # on split boxes without a substituted key (test8, 10.1.3 T&E). v10.2.10: the
+    # line no longer says "(clean)" — the guard is not protecting anything here.
+    log_line "RETENTION-GUARD: NOT RUNNING — two_server mode but SSH target/key unavailable. Nothing was checked or deleted."
     exit 0
   fi
+elif command -v gd_db_is_remote >/dev/null 2>&1 \
+     && [ "$(gd_db_container_state)" != "true" ] && gd_db_is_remote; then
+  # v10.2.10 (GH #98): a split install the console doesn't know about (no two_server
+  # in guarddog.conf) used to run in local mode, fail `sudo -u postgres` against a
+  # box with no postgres user, throw the error away, and log "~0 expired rows ...
+  # nothing to do" every 15 minutes — 8,824 times in a row on the reporter's box. A
+  # false all-clear. Worse, an app node that DOES have a stray local postgres would
+  # have had the batched delete run against the wrong database. TAK's own
+  # CoreConfig says where the database is; if that is another host, stop here.
+  log_line "RETENTION-GUARD: NOT RUNNING — TAK's database is on $(gd_db_host), not this box, and Guard Dog has no SSH access configured for it. Nothing was checked or deleted."
+  exit 0
+fi
+
+# v10.2.10 (GH #98): prove the database answers before trusting any number from it.
+# Every query below discards stderr, so a failed lookup used to read as an empty
+# result, "0 expired rows", and a healthy-looking log line. Fail instead.
+DB_PROBE=$(psql_scalar "SELECT 1;")
+DB_PROBE_RC=$?
+if [ "$DB_PROBE_RC" -ne 0 ] || [ "$(echo "$DB_PROBE" | tr -d '[:space:]')" != "1" ]; then
+  log_line "RETENTION-GUARD: ERROR — could not query the CoT database (rc=${DB_PROBE_RC}). Nothing was checked or deleted; this is NOT an all-clear."
+  exit 1
 fi
 
 # ── Step 1: Find and kill stuck DELETE queries on cot_router ──
@@ -217,13 +250,31 @@ if [ -z "$RETENTION_HOURS" ]; then
   exit 0
 fi
 
+# ── Which rows are "expired" — exactly TAK Server's own definition ──
+# v10.2.10 (GH #98): this used to be every cot_router row older than the window.
+# TAK's retention service (takserver-retention LocalQueryService.deleteCotByTtl)
+# deliberately keeps two kinds of row, and so must we:
+#   - any row whose uid belongs to a mission (mission_uid) — mission content, e.g.
+#     drawn shapes. On the reporter's database that was 35,119 of 40,026 old rows;
+#   - legacy GeoChat (cot_type 'b-t-f'), which TAK ages out on the GeoChat TTL,
+#     not the CoT one.
+# `cot_type <> 'b-t-f'` (not IS DISTINCT FROM) is TAK's own predicate: a NULL
+# cot_type is kept, so the guard can never delete a row TAK itself would not.
+EXPIRED_WHERE="cr.servertime < now() - interval '${RETENTION_HOURS} hours' AND cr.cot_type <> 'b-t-f' AND NOT EXISTS (SELECT 1 FROM mission_uid mu WHERE mu.uid = cr.uid)"
+
 # ── Step 4: Quick count of expired rows ──
-EXPIRED_EST=$(psql_scalar "SELECT count_estimate('SELECT 1 FROM cot_router WHERE servertime < now() - interval ''${RETENTION_HOURS} hours''');" 2>/dev/null)
+EXPIRED_WHERE_QUOTED=$(printf '%s' "$EXPIRED_WHERE" | sed "s/'/''/g")
+EXPIRED_EST=$(psql_scalar "SELECT count_estimate('SELECT 1 FROM cot_router cr WHERE ${EXPIRED_WHERE_QUOTED}');" 2>/dev/null)
 # count_estimate may not exist; fall back to real COUNT with a LIMIT-based estimate
-if [ -z "$EXPIRED_EST" ] || [ "$EXPIRED_EST" = "" ]; then
-  EXPIRED_EST=$(psql_scalar "SELECT COUNT(*) FROM (SELECT 1 FROM cot_router WHERE servertime < now() - interval '${RETENTION_HOURS} hours' LIMIT 100001) sub;")
+if ! [[ "$EXPIRED_EST" =~ ^[0-9]+$ ]]; then
+  EXPIRED_EST=$(psql_scalar "SELECT COUNT(*) FROM (SELECT 1 FROM cot_router cr WHERE ${EXPIRED_WHERE} LIMIT 100001) sub;")
 fi
-EXPIRED_EST=$((${EXPIRED_EST:-0} + 0))
+EXPIRED_EST=$(echo "$EXPIRED_EST" | tr -d '[:space:]')
+if ! [[ "$EXPIRED_EST" =~ ^[0-9]+$ ]]; then
+  # v10.2.10 (GH #98): an empty answer is a failed lookup, not zero rows.
+  log_line "RETENTION-GUARD: ERROR — expired-row count query failed (retention=${RETENTION_HOURS}h). Nothing was deleted; this is NOT an all-clear."
+  exit 1
+fi
 
 if [ "$EXPIRED_EST" -lt 1000 ]; then
   log_line "RETENTION-GUARD: ~${EXPIRED_EST} expired rows (retention=${RETENTION_HOURS}h), nothing to do"
@@ -237,9 +288,15 @@ TOTAL_DELETED=0
 BATCH_NUM=0
 while [ "$BATCH_NUM" -lt "$MAX_BATCHES" ]; do
   # DELETE with subquery LIMIT; parse "DELETE NNNNN" from output
-  DEL_OUT=$(psql_raw "DELETE FROM cot_router WHERE ctid IN (SELECT ctid FROM cot_router WHERE servertime < now() - interval '${RETENTION_HOURS} hours' LIMIT ${BATCH_SIZE});")
-  ROW_COUNT=$(echo "$DEL_OUT" | grep -oP '(?<=DELETE )\d+' | head -1)
-  ROW_COUNT=$((${ROW_COUNT:-0} + 0))
+  DEL_OUT=$(psql_raw "DELETE FROM cot_router WHERE ctid IN (SELECT cr.ctid FROM cot_router cr WHERE ${EXPIRED_WHERE} LIMIT ${BATCH_SIZE});")
+  ROW_COUNT=$(echo "$DEL_OUT" | sed -n 's/^DELETE \([0-9][0-9]*\).*/\1/p' | head -1)
+  if [ -z "$ROW_COUNT" ]; then
+    # v10.2.10 (GH #98): no "DELETE n" tag means the statement failed — report it
+    # as a failure rather than as a run that happened to remove nothing.
+    log_line "RETENTION-GUARD: ERROR — batched delete failed in batch $((BATCH_NUM + 1)) after removing ${TOTAL_DELETED} rows."
+    exit 1
+  fi
+  ROW_COUNT=$((ROW_COUNT + 0))
 
   TOTAL_DELETED=$((TOTAL_DELETED + ROW_COUNT))
   BATCH_NUM=$((BATCH_NUM + 1))
