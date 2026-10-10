@@ -27450,6 +27450,133 @@ def caddy_control():
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
 
+# v10.2.10 — Caddy's Cloudsmith apt repo went dark 2026-10-08..10: the package
+# index answers `402 Payment Required` ("Access to the repository has been restricted")
+# while the GPG key and debian.deb.txt still answer 200. apt-get update exits 100 when ANY
+# source fails, so one dead third-party repo blocked every Ubuntu box's OS patch job
+# ("FATAL: apt-get update failed (exit 100)") and every Caddy deploy/update. Field: two
+# operators, both cleared it by hand with `mv caddy-stable.list caddy-stable.list.disabled`
+# — and Caddy Update would then have re-added the list and broken patching again.
+_CADDY_APT_LIST = '/etc/apt/sources.list.d/caddy-stable.list'
+_CADDY_APT_INDEX_URL = 'https://dl.cloudsmith.io/public/caddy/stable/deb/debian/dists/any-version/InRelease'
+# Only answers that mean "this repo will not serve you" count as dead. 5xx, timeouts and
+# DNS failures are transient and leave the list alone (apt's own retries handle those).
+_CADDY_APT_DEAD_CODES = (401, 402, 403, 404, 410)
+_CADDY_APT_DISABLED_RE = re.compile(r'^# disabled by infra-TAK \S+ \(Caddy apt repo returned HTTP \d+\): (.*)$')
+
+
+def _caddy_cloudsmith_state(timeout=10):
+    """('ok'|'dead'|'unknown', http_code) for Caddy's Cloudsmith package index."""
+    try:
+        req = urllib.request.Request(_CADDY_APT_INDEX_URL, headers={'User-Agent': 'infra-TAK'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return ('ok', r.status)
+    except urllib.error.HTTPError as e:
+        return ('dead' if e.code in _CADDY_APT_DEAD_CODES else 'unknown', e.code)
+    except Exception:
+        return ('unknown', None)
+
+
+def _caddy_apt_repo_heal(log_fn=None):
+    """Keep caddy-stable.list in step with whether Cloudsmith is actually serving.
+
+    dead  -> comment the list's entries out (timestamped backup in /etc/apt, same pattern as
+             _apt_disable_dead_local_sources) so it stops failing every apt-get update.
+    ok    -> undo exactly what we commented out, so the box goes back to apt-managed Caddy
+             updates on its own once Cloudsmith is back. Lines an operator commented are
+             not touched (only our marker is reversed).
+    Returns the probe state. DEBIAN FAMILY ONLY, never raises, and does not probe at all
+    on a box without the list (RHEL uses COPR; most boxes without Caddy have no list)."""
+    _log = log_fn or (lambda m: None)
+    if _distro_family() == 'rhel' or not os.path.exists(_CADDY_APT_LIST):
+        return 'absent'
+    try:
+        with open(_CADDY_APT_LIST, 'r', errors='replace') as f:
+            body = f.read()
+    except Exception:
+        return 'unknown'
+    lines = body.splitlines()
+    active = [i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith('#')]
+    ours = [i for i, ln in enumerate(lines) if _CADDY_APT_DISABLED_RE.match(ln)]
+    if not active and not ours:
+        return 'absent'
+    state, code = _caddy_cloudsmith_state()
+    try:
+        if state == 'dead' and active:
+            stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+            bak = os.path.join('/etc/apt', f'caddy-stable.list.infratak-{stamp}.bak')
+            _write_priv(bak, body)
+            for i in active:
+                lines[i] = f'# disabled by infra-TAK {stamp} (Caddy apt repo returned HTTP {code}): {lines[i]}'
+            _write_priv(_CADDY_APT_LIST, '\n'.join(lines) + '\n')
+            _log(f'  ⚠ Caddy apt repo (Cloudsmith) answered HTTP {code} — disabled {_CADDY_APT_LIST} '
+                 f'so it stops failing apt-get update (backup: {bak}). It is re-enabled '
+                 'automatically once Cloudsmith serves again.')
+        elif state == 'ok' and ours:
+            for i in ours:
+                lines[i] = _CADDY_APT_DISABLED_RE.match(lines[i]).group(1)
+            _write_priv(_CADDY_APT_LIST, '\n'.join(lines) + '\n')
+            _log(f'  ✓ Caddy apt repo (Cloudsmith) is serving again — re-enabled {_CADDY_APT_LIST}')
+    except Exception as e:
+        _log(f'  ⚠ could not update {_CADDY_APT_LIST}: {type(e).__name__}: {e}')
+    return state
+
+
+def _caddy_install_github_deb(log_fn=None):
+    """Install the latest Caddy .deb from Caddy's GitHub release. Returns True on success.
+
+    The fallback for when the Cloudsmith apt repo is not serving. The .deb (not the static
+    binary) because it carries the caddy user, the systemd unit and /etc/caddy, which a
+    fresh deploy needs. SHA-512 checked against the release's checksums file before
+    install. Already-current boxes are a no-op."""
+    _log = log_fn or (lambda m: None)
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    tmpd = None
+    try:
+        with urllib.request.urlopen('https://github.com/caddyserver/caddy/releases/latest', timeout=30) as r:
+            m = re.search(r'/tag/v(\d+\.\d+\.\d+)$', r.geturl())
+        if not m:
+            _log('  ✗ could not determine the latest Caddy release from GitHub')
+            return False
+        ver = m.group(1)
+        cur = _caddy_version_tuple(refresh=True)
+        if cur and cur >= tuple(int(x) for x in ver.split('.')):
+            _log(f'  ✓ Caddy {".".join(map(str, cur))} is already the latest release ({ver})')
+            return True
+        base = f'https://github.com/caddyserver/caddy/releases/download/v{ver}'
+        deb_name = f'caddy_{ver}_linux_{_arch}.deb'
+        with urllib.request.urlopen(f'{base}/caddy_{ver}_checksums.txt', timeout=30) as r:
+            sums = r.read().decode('utf-8', 'replace')
+        want = next((ln.split()[0] for ln in sums.splitlines()
+                     if len(ln.split()) == 2 and ln.split()[1] == deb_name), None)
+        if not want:
+            _log(f'  ✗ {deb_name} is not listed in the Caddy v{ver} checksums file')
+            return False
+        _log(f'  Downloading {deb_name} from Caddy\'s GitHub release...')
+        with urllib.request.urlopen(f'{base}/{deb_name}', timeout=300) as r:
+            data = r.read()
+        if hashlib.sha512(data).hexdigest() != want.lower():
+            _log(f'  ✗ {deb_name} failed its SHA-512 check — not installing it')
+            return False
+        tmpd = tempfile.mkdtemp(prefix='caddy-deb-')
+        os.chmod(tmpd, 0o755)   # apt drops to _apt to read local debs
+        deb_path = os.path.join(tmpd, deb_name)
+        with open(deb_path, 'wb') as f:
+            f.write(data)
+        os.chmod(deb_path, 0o644)
+        ok, out = _pkg_install([deb_path], log_fn=log_fn, timeout=300)
+        _caddy_version_cache['ver'] = None
+        if ok:
+            _log(f'  ✓ Caddy {ver} installed from GitHub release (SHA-512 verified)')
+        return ok
+    except Exception as e:
+        _log(f'  ✗ Caddy GitHub .deb install failed: {type(e).__name__}: {str(e)[:200]}')
+        return False
+    finally:
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+
 def _caddy_ensure_apt_repo(log_fn=None):
     """Make sure the cloudsmith Caddy repo exists and apt has refreshed against it.
 
@@ -27468,11 +27595,19 @@ def _caddy_ensure_apt_repo(log_fn=None):
     That is exactly what GH #59's reporter described ("tried your commands but it didn't
     update the caddy installed") — he was right, and he had to replace the binary by hand.
 
-    Returns True when apt can see a Caddy candidate from cloudsmith."""
+    Returns True when apt can see a Caddy candidate from cloudsmith. False when Cloudsmith
+    is not serving (Cloudsmith 402, 2026-10-10) — the list is then disabled, never (re-)added, and callers fall
+    back to _caddy_install_github_deb()."""
     _log = log_fn or (lambda m: None)
-    listf = '/etc/apt/sources.list.d/caddy-stable.list'
+    listf = _CADDY_APT_LIST
     env = _broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive',
                             'NEEDRESTART_MODE': 'a'})
+    _state = _caddy_apt_repo_heal(log_fn)
+    if _state == 'absent' and not os.path.exists(listf):
+        _state = _caddy_cloudsmith_state()[0]
+    if _state == 'dead':
+        _log('Caddy apt repo (Cloudsmith) is not serving — not adding it')
+        return False
     try:
         if not os.path.exists(listf):
             _log('Caddy repo missing — adding the cloudsmith repository')
@@ -27527,12 +27662,17 @@ def caddy_update():
         _before = _caddy_version_tuple(refresh=True)
         if pkg_mgr == 'apt':
             # Repo FIRST — otherwise apt cannot see a newer Caddy at all.
-            _caddy_ensure_apt_repo()
-            # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
-            # different origin, and `install` is what moves it across. Already-current boxes
-            # are a no-op either way.
-            r = _run_priv_chain([['apt-get', 'update', '-qq'],
-                                 ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+            if _caddy_ensure_apt_repo() or _caddy_cloudsmith_state()[0] != 'dead':
+                # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
+                # different origin, and `install` is what moves it across. Already-current boxes
+                # are a no-op either way.
+                r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                     ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+            else:
+                # v10.2.10 (Cloudsmith 402): Cloudsmith not serving — take the same release from Caddy's GitHub.
+                _gh_log = []
+                _ok = _caddy_install_github_deb(_gh_log.append)
+                r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
             _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
@@ -32856,7 +32996,20 @@ def run_caddy_deploy(domain):
             wait_for_apt_lock(plog, caddy_deploy_log)
 
         plog("━━━ Step 1/4: Installing Caddy ━━━")
+        _cs_dead = False
         if pkg_mgr == 'apt':
+            # v10.2.10 (Cloudsmith 402): if Cloudsmith is not serving, adding its list would fail this step's
+            # apt-get update (and every later one on the box). Install from GitHub instead.
+            _caddy_apt_repo_heal(plog)
+            _cs_dead = _caddy_cloudsmith_state()[0] == 'dead'
+        if _cs_dead:
+            plog("  ⚠ Caddy's apt repository (Cloudsmith) is not serving right now — "
+                 "installing the official .deb from Caddy's GitHub release instead.")
+            if not _caddy_install_github_deb(plog):
+                plog("✗ Caddy install failed (Cloudsmith repo unavailable and GitHub .deb install failed)")
+                caddy_deploy_status.update({'running': False, 'error': True})
+                return
+        elif pkg_mgr == 'apt':
             plog("  Adding Caddy repository...")
             cmds = [
                 'apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>&1',
@@ -76017,7 +76170,9 @@ def _apt_update_capture(timeout=600):
             return False, f'{type(e).__name__}: {e}'
 
     ok, out = _run()
-    if not ok and _apt_disable_dead_local_sources():
+    # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
+    _healed = (not ok and 'cloudsmith.io' in out and _caddy_apt_repo_heal() == 'dead')
+    if not ok and (_apt_disable_dead_local_sources() or _healed):
         ok2, out2 = _run()
         if ok2:
             return True, (out + '\n[infra-TAK] disabled a dead install-medium apt source '
@@ -78541,6 +78696,9 @@ def _kernel_patch_start_job():
     # apt source. Clear it before firing rather than after diagnosing it. No-op on
     # cloud images and on RHEL.
     _apt_disable_dead_local_sources()
+    # v10.2.10 (Cloudsmith 402): same for Caddy's Cloudsmith repo while it answers 402 — the field failure
+    # that left two operators' boxes unpatchable. Re-enabled here too once it is back.
+    _caddy_apt_repo_heal()
     # If unit is in a failed state from a previous run, reset so systemd
     # accepts a fresh start request with the same unit name. Only meaningful
     # if LoadState=loaded — a transient unit that doesn't exist post-reboot
@@ -78609,12 +78767,50 @@ def _kernel_patch_start_job():
         # with nothing installed. Every failing URL returned 200 minutes later — one retry
         # would have carried it. Same class as the v10.1.37 lock-wait: do not hand the
         # operator a red FATAL panel for a transient upstream condition.
-        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        # v10.2.10 (Cloudsmith 402): apt-get update exits 100 when ANY source fails. A third-party repo that
+        # infra-TAK added (Caddy/Cloudsmith, Docker, PGDG) going dark must not block Ubuntu
+        # security patches — field 2026-10-10, Cloudsmith answered 402 and every patch run
+        # died here while the Ubuntu mirrors had refreshed fine. Still FATAL when any error
+        # names anything else (distro mirror, lock, disk), or when apt printed no E: line.
+        # apt keeps the dead repo's LAST index, so full-upgrade still tries to download its
+        # newer packages (measured on test8: caddy 2.11.7 -> 402 again, nothing installed).
+        # Hence --fix-missing on this path only, plus the distro-skip check after it.
+        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
+        'FIXMISSING=""\n'
+        'UPDLOG="$(mktemp)"\n'
+        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
+        'rc=${PIPESTATUS[0]}\n'
+        'if [ "$rc" -ne 0 ]; then\n'
+        '  ERRS="$(grep -E "^E: " "$UPDLOG" | grep -v "Some index files failed to download")"\n'
+        '  OTHER="$(grep -vE "$THIRD_PARTY" <<< "$ERRS" | grep -v "^$")"\n'
+        '  if [ -n "$ERRS" ] && [ -z "$OTHER" ]; then\n'
+        '    echo "[$(TS)] WARN: apt-get update could not refresh a third-party repository (see the E: lines above). Every error is from that repository, not the Ubuntu/Debian sources, so OS patching continues; packages from that repository stay at their current version until it is reachable again."\n'
+        '    FIXMISSING="--fix-missing"\n'
+        '  else\n'
+        '    echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; rm -f "$UPDLOG"; exit $rc\n'
+        '  fi\n'
+        'fi\n'
+        'rm -f "$UPDLOG"\n'
         'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
         'UPGLOG="$(mktemp)"\n'
-        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $FIXMISSING full-upgrade 2>&1 \\\n'
         '  | tee "$UPGLOG"\n'
         'rc=${PIPESTATUS[0]}\n'
+        # v10.2.10 (Cloudsmith 402): --fix-missing installs everything it could download and skips the rest, but
+        # still exits 100 (measured on test8: all Ubuntu + Docker updates set up, caddy 2.11.7
+        # skipped, rc=100). Skips that are ALL from the dead third-party repo are its expected
+        # cost — a clean patch. Any other error falls through to FATAL below.
+        'if [ "$rc" -ne 0 ] && [ -n "$FIXMISSING" ]; then\n'
+        '  UERRS="$(grep -E "^E: " "$UPGLOG" | grep -v "Unable to fetch some archives")"\n'
+        '  if [ -n "$UERRS" ] && ! grep -qvE "$THIRD_PARTY" <<< "$UERRS"; then\n'
+        '    echo "[$(TS)] WARN: packages from the unreachable third-party repository were skipped (see the E: lines above); everything else was installed."\n'
+        '    rc=0\n'
+        '  fi\n'
+        'fi\n'
+        'if [ "$rc" -ne 0 ] && [ -n "$FIXMISSING" ]; then\n'
+        '  echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc) — some packages could not be installed (see above). Packages that downloaded were installed. If the errors name a mirror, run Install updates again in a few minutes."\n'
+        '  rm -f "$UPGLOG"; exit $rc\n'
+        'fi\n'
         'if [ "$rc" -ne 0 ]; then\n'
         # A download failure and an install failure are NOT the same event and must not
         # read the same. On a fetch failure apt installs nothing, so the box is untouched
