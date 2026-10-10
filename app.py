@@ -1726,8 +1726,13 @@ def save_settings(s):
             raise
 
 def _read_os_release():
-    """(os_type, os_name) from /etc/os-release, mirroring start.sh: '<ID>-<VERSION_ID>'
-    (e.g. ubuntu-22.04, rocky-9) and PRETTY_NAME. ('','') if unreadable."""
+    """(os_type, os_name) from /etc/os-release, mapped exactly as start.sh detect_os()
+    does (ubuntu-22.04, ubuntu-24.04, debian-12, rocky-9 for the whole EL9 family, else
+    '<ID>-<VERSION_ID>') and PRETTY_NAME. ('','') if unreadable.
+
+    GH #101: this used to be a plain '<ID>-<VERSION_ID>', which gives 'rhel-9.4' where
+    start.sh writes 'rocky-9' — harmless while it only filled an EMPTY os_type, wrong
+    the moment the boot heal refreshes a stale one (templates test `'rocky' in os_type`)."""
     try:
         d = {}
         with open('/etc/os-release') as f:
@@ -1737,7 +1742,14 @@ def _read_os_release():
                     d[k] = v.strip().strip('"')
         idv = (d.get('ID') or '').lower()
         ver = d.get('VERSION_ID') or ''
-        return (f"{idv}-{ver}" if idv and ver else idv), (d.get('PRETTY_NAME') or '')
+        name = d.get('PRETTY_NAME') or ''
+        if idv == 'ubuntu' and ver.startswith(('22.04', '24.04')):
+            return f"ubuntu-{ver[:5]}", name
+        if idv == 'debian' and ver.startswith('12'):
+            return 'debian-12', name
+        if idv in ('rocky', 'rhel', 'almalinux', 'centos'):
+            return ('rocky-9' if ver.startswith('9') else f"rocky-{ver}"), name
+        return (f"{idv}-{ver}" if idv and ver else idv), name
     except Exception:
         return '', ''
 
@@ -1803,12 +1815,17 @@ def _heal_settings_core_keys():
     except Exception:
         return
     _identity = ('os_type', 'os_name', 'pkg_mgr', 'arch', 'console_port', 'install_dir', 'ssl_mode')
+    # GH #101: the OS is a fact about the box, not an install-time choice. This heal used
+    # to fill only an EMPTY os_name/os_type, so an in-place release upgrade (22.04 -> 24.04)
+    # left the console footer on the old release forever. Re-read it every boot and
+    # correct a stale value; an unreadable os-release changes nothing.
+    _ot, _on = _read_os_release()
+    healed = {k: v for k, v in (('os_type', _ot), ('os_name', _on)) if v and s.get(k) != v}
     # Fast no-op: identity intact AND server_ip present AND (fqdn present OR genuinely
     # no domain to recover). server_ip is included so a value dropped by the
     # load_settings type guard (corrupted to a list on disk) gets re-derived here.
-    if all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
+    if not healed and all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
         return
-    healed = {}
     if not s.get('install_dir'):
         healed['install_dir'] = BASE_DIR
     if not s.get('arch'):
@@ -1818,12 +1835,6 @@ def _heal_settings_core_keys():
             healed['arch'] = 'amd64'
     if not s.get('pkg_mgr'):
         healed['pkg_mgr'] = 'dnf' if _distro_family() == 'rhel' else 'apt'
-    if not s.get('os_type') or not s.get('os_name'):
-        _ot, _on = _read_os_release()
-        if not s.get('os_type') and _ot:
-            healed['os_type'] = _ot
-        if not s.get('os_name') and _on:
-            healed['os_name'] = _on
     if not s.get('console_port'):
         healed['console_port'] = _detect_console_port()
     if not s.get('server_ip'):
@@ -1841,7 +1852,7 @@ def _heal_settings_core_keys():
     if healed:
         s.update(healed)
         save_settings(s)
-        print(f"[heal-settings] restored missing core keys: {list(healed)}", flush=True)
+        print(f"[heal-settings] restored missing or stale core keys: {list(healed)}", flush=True)
 
 # ---------------------------------------------------------------------------
 # v10.2.8 W10: a failed module update records its own reason
@@ -16539,6 +16550,117 @@ def _find_ssh_key_for_server_one(s1_cfg):
     return None
 
 
+GUARDDOG_CONF_PATH = '/opt/tak-guarddog/guarddog.conf'
+_GD_DB_KEYS = ('two_server', 'external_db', 'db_host', 'db_port')
+
+
+def _tak_db_endpoint_from_coreconfig():
+    """(host, port) of the database TAK Server is configured to use; ('', 5432) if unreadable.
+
+    Not _tak_db_topology(): that one reports an unreadable CoreConfig as 'local', and a
+    guarddog.conf writer that can't read CoreConfig must keep what it has, not assume."""
+    try:
+        xml = _read_coreconfig() or ''
+    except Exception:
+        return '', 5432
+    m = re.search(r'jdbc:postgresql://([^:/"]+)(?::(\d+))?', xml)
+    if not m:
+        return '', 5432
+    return m.group(1).strip(), int(m.group(2) or 5432)
+
+
+def _guarddog_db_topology(settings):
+    """(section, source): the database section guarddog.conf should carry, and where it came from.
+
+    GH #101: every writer took this from settings.json's tak_deployment alone. A split box
+    whose settings never said two_server (split by hand, or tak_deployment lost to the
+    torn-write race) got a guarddog.conf with no database section, and every DB module fell
+    back to a local postgres that isn't there. Settings first (they also know the SSH side),
+    then TAK's own CoreConfig — the same ground truth _gd-tak-lib.sh and the console's
+    PostgreSQL card use.
+
+    section {} = the database is on this box. section None = can't tell (CoreConfig
+    unreadable): the writer keeps whatever the file already says rather than guess.
+    """
+    tak_cfg = _get_tak_deployment_config(settings)
+    mode = tak_cfg.get('mode')
+    if mode == 'two_server':
+        host = (tak_cfg.get('server_one', {}).get('host') or '').strip()
+        if host:
+            return ({'two_server': True, 'external_db': False, 'db_host': host,
+                     'db_port': int(tak_cfg.get('database', {}).get('port') or 5432)}, 'settings')
+    elif mode == 'external_db':
+        edb = tak_cfg.get('external_db', {})
+        host = (edb.get('host') or '').strip()
+        if host:
+            return ({'two_server': False, 'external_db': True, 'db_host': host,
+                     'db_port': int(edb.get('port') or 5432)}, 'settings')
+    # Container TAK: CoreConfig names a docker-network alias the host can't resolve, which
+    # would read as remote. Same evidence order as gd_db_running() in _gd-tak-lib.sh.
+    if _tak_is_container():
+        return {}, 'container'
+    host, port = _tak_db_endpoint_from_coreconfig()
+    if not host:
+        return None, 'unknown'
+    if _tak_db_is_remote(host):
+        return ({'two_server': True, 'external_db': False, 'db_host': host, 'db_port': port},
+                'coreconfig')
+    return {}, 'coreconfig'
+
+
+def _write_guarddog_conf(settings, updates=None):
+    """The one writer for guarddog.conf. Returns (ok, message).
+
+    Read-merge-write: a caller that owns one key (cert pass, container mode) never drops the
+    others. A None value in `updates` removes that key. The database section is restated from
+    _guarddog_db_topology() on every write, so no writer can emit a config without it on a
+    split box. If the file exists but can't be read, nothing is written — the old metrics
+    migration read it with open(), which a non-root console can't, and replaced the whole
+    file with just the cert password.
+    """
+    raw = ''
+    try:
+        raw = _read_priv(GUARDDOG_CONF_PATH)
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('utf-8', 'replace')
+    except Exception as e:
+        # The broker can't tell "missing" from "denied"; only a file that also doesn't stat
+        # counts as absent.
+        if os.path.exists(GUARDDOG_CONF_PATH):
+            return False, f'guarddog.conf unreadable, not rewritten: {e}'
+    try:
+        conf = json.loads(raw) if (raw or '').strip() else {}
+    except ValueError:
+        conf = {}           # corrupt: rewriting it is the repair
+    if not isinstance(conf, dict):
+        conf = {}
+    before = dict(conf)
+    for k, v in (updates or {}).items():
+        if v is None:
+            conf.pop(k, None)
+        else:
+            conf[k] = v
+    section, source = _guarddog_db_topology(settings)
+    if section is not None:
+        for k in _GD_DB_KEYS:
+            conf.pop(k, None)
+        conf.update(section)
+    elif any(k in conf for k in _GD_DB_KEYS):
+        source = 'kept'     # can't tell right now; keep what the file already says
+    conf['db_topology'] = ('external_db' if conf.get('external_db')
+                           else 'two_server' if conf.get('two_server')
+                           else 'local' if section is not None else 'unknown')
+    conf['db_topology_source'] = source
+    if conf == before:
+        return True, f"unchanged ({conf['db_topology']}, from {conf['db_topology_source']})"
+    try:
+        _write_priv(GUARDDOG_CONF_PATH, json.dumps(conf), perm=0o600)
+    except Exception as e:
+        return False, f'guarddog.conf: {e}'
+    where = f" {conf['db_host']}:{conf['db_port']}" if conf.get('db_host') else ''
+    return True, f"written ({conf['db_topology']}{where}, from {conf['db_topology_source']})"
+
+
 def _sync_guarddog_remote_db_from_settings(settings=None):
     """Rewrite guarddog.conf + tak-remotedb-*.sh from saved TAK deployment.
     Handles two-server (SSH-managed DB) and external_db (managed DB, no SSH).
@@ -16579,16 +16701,11 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         return False, 'no database host in settings'
 
     alert_email = (settings.get('guarddog_alert_email') or '').strip()
-    try:
-        gd_conf = {
-            'two_server': not is_external,
-            'external_db': is_external,
-            'db_host': db_host,
-            'db_port': int(db_port),
-        }
-        _write_priv(os.path.join(gd_dir, 'guarddog.conf'), json.dumps(gd_conf))
-    except Exception as e:
-        return False, f'guarddog.conf: {e}'
+    # Merge, not replace: this used to write the four DB keys alone, dropping the cert pass
+    # (Marti scrape) and the container keys every time it ran.
+    gd_ok, gd_msg = _write_guarddog_conf(settings)
+    if not gd_ok:
+        return False, gd_msg
 
     # v0.9.29 CRIT-08 fix: provision a pinned SSH known_hosts file for the
     # watchdog scripts. Watchdog SSH calls use StrictHostKeyChecking=accept-new
@@ -24214,20 +24331,24 @@ def run_guarddog_deploy(alert_email):
             dest = os.path.join('/opt/tak-guarddog', name)
             _write_priv(dest, content, perm=(0o755 if name.endswith('.sh') else None))
         plog("✓ Scripts installed")
-        # Write config file for health endpoint (two-server DB host info)
-        gd_conf = {}
-        if is_two_server and s1_host:
-            gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        # Config file for the DB modules and health endpoint. The database section comes from
+        # _guarddog_db_topology() (settings, else TAK's CoreConfig) — GH #101: this used to
+        # come from settings alone, so a split box settings didn't know about was written
+        # with no database section at all.
         # v10.0.1: container TAK — tell _gd-tak-lib.sh to dispatch DB/process/cert
         # work via docker exec against these containers (absent → native mode).
-        if _tak_is_container():
-            gd_conf['tak_mode'] = 'container'
-            gd_conf['tak_container'] = TAK_CONTAINER
-            gd_conf['db_container'] = TAK_DB_CONTAINER
-        # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
-        gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
-        _write_priv('/opt/tak-guarddog/guarddog.conf', json.dumps(gd_conf))
-        _chmod_priv('/opt/tak-guarddog/guarddog.conf', 0o600)
+        _is_ctr = _tak_is_container()
+        gd_ok, gd_msg = _write_guarddog_conf(settings, {
+            'tak_mode': 'container' if _is_ctr else None,
+            'tak_container': TAK_CONTAINER if _is_ctr else None,
+            'db_container': TAK_DB_CONTAINER if _is_ctr else None,
+            # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
+            'tak_cert_pass': _get_tak_cert_password(settings),
+        })
+        plog(f"{'✓' if gd_ok else '✗'} guarddog.conf {gd_msg}")
+        if not gd_ok:
+            guarddog_deploy_status.update({'running': False, 'error': True})
+            return
         # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
         server_identifier = _guarddog_server_identifier(settings)
         _write_priv('/opt/tak-guarddog/server_identifier', server_identifier)
@@ -82245,17 +82366,13 @@ def _startup_ensure_metrics_collector():
             return  # current version already applied AND running — no churn on every boot
         # (re)install: script
         _write_priv('/opt/tak-guarddog/tak-metrics-collector.py', new_src)
-        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Merge — never
-        # clobber two_server keys.
-        conf_path = '/opt/tak-guarddog/guarddog.conf'
-        try:
-            conf = json.load(open(conf_path)) if os.path.exists(conf_path) else {}
-        except Exception:
-            conf = {}
-        cp = _get_tak_cert_password(load_settings())
-        if cp and conf.get('tak_cert_pass') != cp:
-            conf['tak_cert_pass'] = cp
-            _write_priv(conf_path, json.dumps(conf), perm=0o600)
+        # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Through the
+        # one writer: the open() read here failed on a non-root console (root-owned, 600), fell
+        # back to {}, and replaced the whole file with just the cert pass (GH #101).
+        _mc_settings = load_settings()
+        cp = _get_tak_cert_password(_mc_settings)
+        if cp:
+            _write_guarddog_conf(_mc_settings, {'tak_cert_pass': cp})
         # systemd unit
         unit_path = '/etc/systemd/system/tak-metrics-collector.service'
         if (open(unit_path).read() if os.path.exists(unit_path) else None) != _METRICS_COLLECTOR_UNIT:
@@ -84704,6 +84821,15 @@ def _startup_migrations():
             sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
             if sg_ok and 'synced' in (sg_msg or ''):
                 print(f"Startup migration: guarddog.conf synced — {sg_msg}")
+        elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
+            # GH #101: every other box too. A split box whose settings don't say two_server
+            # never reached the sync above, so its guarddog.conf kept no database section
+            # through every update. The writer takes the topology from TAK's CoreConfig.
+            sg_ok, sg_msg = _write_guarddog_conf(s)
+            print(f"Startup migration: guarddog.conf {sg_msg}")
+            if sg_ok and sg_msg.startswith('written'):
+                subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                               capture_output=True, timeout=20)
 
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
