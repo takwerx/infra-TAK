@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.8-alpha)**
+**Current release: [v10.2.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.9-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -421,6 +421,16 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.9-alpha — 2026-10-09 — WebTAK and CloudTAK stay connected when the console restarts
+
+**Headline: WebTAK and the CloudTAK map no longer lose their live connection every time the console starts or Caddy's config is reloaded ([#90](https://github.com/takwerx/infra-TAK/issues/90)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.9-alpha))
+
+**WebTAK and CloudTAK connections.** Every Caddy reload closed every open WebTAK and CloudTAK map connection on the spot, and the console reloaded Caddy twice on every start, even when nothing had changed. Those two startup steps now reload Caddy only when its config actually changed. The TAK Server and CloudTAK map sites also keep open connections for up to 5 minutes across a reload instead of cutting them; WebTAK reconnects on its own after that. This needs Caddy 2.7 or newer; older Caddy keeps today's behaviour.
+
+**Good to know.** TAK Server's web login lasts about 2 hours by default. After that, WebTAK can't reconnect until you reload the page and sign in again. That's TAK Server's own setting, not something the console changes.
+
+**Upgrade note.** Update the console. Caddy reloads once more while the update applies the new setting, so open WebTAK and CloudTAK sessions reconnect one last time.
 
 ### v10.2.8-alpha — 2026-10-09 — TAK Portal one-click Fix, certificates and CloudTAK survive a TAK Server upgrade, failed updates explain themselves
 
