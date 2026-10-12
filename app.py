@@ -4496,6 +4496,8 @@ body.light-mode .header{border-bottom-color:#bfc6d0!important}
 body.light-mode .top-bar{background:linear-gradient(90deg,transparent,#1d4ed8,#0e7490,transparent)!important}
 body.light-mode #theme-toggle-btn{color:var(--text-secondary)}
 body.light-mode #theme-toggle-btn:hover{color:var(--text-primary);background:rgba(0,0,0,.05)}
+body.light-mode .nav-toggle{background:#fff;color:#0f172a;border-color:#bfc6d0}
+body.light-mode .nav-scrim.open{background:rgba(0,0,0,.35)}
 </style>
 <script>
 (function(){var t=localStorage.getItem('infra-tak-theme');if(t==='light')document.body.classList.add('light-mode')})();
@@ -4503,7 +4505,24 @@ function toggleTheme(){var b=document.body;b.classList.toggle('light-mode');var 
 function _syncThemeUI(){var l=document.body.classList.contains('light-mode');var ic=document.getElementById('theme-icon');var lb=document.getElementById('theme-label');if(ic)ic.textContent=l?'dark_mode':'light_mode';if(lb)lb.textContent=l?'Dark Mode':'Light Mode'}
 document.addEventListener('DOMContentLoaded',_syncThemeUI);
 </script>'''
-    return light_mode_block + f'<nav class="sidebar"{nav_style}>\n  ' + '\n  '.join(parts) + '\n</nav>'
+    # v10.3.0 W8 (GH #63): the hamburger + scrim that open the off-canvas sidebar below
+    # base.html's single 900px breakpoint. Both are display:none on desktop. The glyph is
+    # U+2630 (system font), NOT a Material Symbols ligature — the bundled font is a subset
+    # and an unknown ligature paints as its raw name. No route, no static file.
+    mobile_nav = (
+        '<button type="button" class="nav-toggle" id="nav-toggle" aria-label="Menu" '
+        'aria-controls="sidebar-nav" aria-expanded="false">&#9776;</button>'
+        '<div class="nav-scrim" id="nav-scrim"></div>'
+        '<script>(function(){var s=document.getElementById("sidebar-nav"),t=document.getElementById("nav-toggle"),'
+        'c=document.getElementById("nav-scrim");if(!s||!t||!c)return;'
+        'function set(o){s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false")}'
+        't.addEventListener("click",function(){set(!s.classList.contains("open"))});'
+        'c.addEventListener("click",function(){set(false)});'
+        'document.addEventListener("keydown",function(e){if(e.key==="Escape")set(false)});'
+        '})();</script>'
+    )
+    return (light_mode_block + f'<nav class="sidebar" id="sidebar-nav"{nav_style}>\n  ' + '\n  '.join(parts)
+            + '\n</nav>' + mobile_nav)
 
 # v10.1.15: the headline CPU number is a 60s rolling average, not a raw sample.
 # psutil.cpu_percent(interval=0.5) polled every 5s is an honest half-second

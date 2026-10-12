@@ -38,6 +38,22 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 :root{--bg-deep:var(--bg-primary);--bg-surface:var(--bg-primary);--yellow:#f59e0b}
+/* v10.3.0 W8 — the ONE breakpoint (GH #63). Below 900px the sidebar goes off-canvas and is
+   opened by the .nav-toggle hamburger that render_sidebar() emits; .main takes the whole
+   width and leaves room under the fixed toggle. `body .main`/`body .header` win over the
+   per-page `.main{padding:32px}` that follows in page_css by specificity, not !important.
+   Desktop (>=901px) is untouched. */
+.nav-toggle{display:none}
+.nav-scrim{display:none}
+@media (max-width: 900px){
+.sidebar{position:fixed;top:0;left:0;bottom:0;height:100vh;overflow-y:auto;z-index:100;transform:translateX(-100%);transition:transform .2s ease}
+.sidebar.open{transform:none;box-shadow:0 0 40px rgba(0,0,0,.5)}
+.nav-toggle{display:flex;align-items:center;justify-content:center;position:fixed;top:10px;left:10px;z-index:101;width:44px;height:44px;padding:0;border-radius:10px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);font-size:22px;line-height:1;cursor:pointer}
+.nav-scrim.open{display:block;position:fixed;top:0;left:0;right:0;bottom:0;z-index:99;background:rgba(0,0,0,.55)}
+body .main{padding:64px 16px 16px}
+body .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
+.nav-item{min-height:44px}
+}
 </style>
 {% block page_css %}{% endblock %}
 </head><body{% block body_attrs %}{% endblock %}>
