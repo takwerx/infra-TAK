@@ -33,6 +33,15 @@
 .exp-tbl td{padding:6px 8px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;color:var(--text-secondary);vertical-align:top}
 .exp-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .exp-ok{background:var(--green)}.exp-warn{background:var(--yellow)}.exp-alert{background:var(--red)}.exp-na{background:var(--text-dim)}
+/* v10.3.0 W10 — same 900px breakpoint as base.html. Five mono columns cannot fit 390px:
+   drop Tier (Bind says the same thing) and go a point smaller so Status wraps in place
+   instead of scrolling out of view; keep ufw's columns aligned and let the box scroll. */
+@media (max-width: 900px){
+.exp-tbl{font-size:11px}
+.exp-tbl th,.exp-tbl td{padding:6px 5px}
+.exp-tbl th:nth-child(3),.exp-tbl td:nth-child(3){display:none}
+.rules-box{white-space:pre}
+}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
