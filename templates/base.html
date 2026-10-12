@@ -46,9 +46,22 @@ body{display:flex;flex-direction:row;min-height:100vh}
    (custom banner z210 + notice bars z205 set body{padding-top}); render_sidebar()'s JS copies
    that padding into the variable so the toggle and the sidebar start BELOW the banners
    instead of underneath them (dev4 2026-10-12: 118px of banner hid the hamburger). */
+/* v10.3.0 W11 — opt-in responsive utilities for the page passes (W9/W10). Shared, structural,
+   no !important: .grid-2/.grid-3 collapse to one column, .metrics-bar to two, .status-banner
+   and .btn-row wrap, .table-wrap scrolls sideways instead of widening the page. The four pages
+   that already declared an identical .grid-2 keep working and gain the collapse for free. */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.grid-auto{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 .mobile-bar{display:none}
 .nav-scrim{display:none}
 @media (max-width: 900px){
+body .grid-2,body .grid-3{grid-template-columns:1fr}
+body .metrics-bar{grid-template-columns:repeat(2,1fr)}
+body .status-banner{flex-wrap:wrap;gap:12px}
+body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
 /* a SOLID top bar, not a floating button: content scrolls cleanly under an opaque strip
    (operator 2026-10-12: a fixed button over scrolling content "looks like it is hiding
    something"). Sidebar and scrim start below the bar so the toggle stays reachable. */

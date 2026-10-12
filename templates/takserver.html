@@ -33,7 +33,6 @@ body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-
 .form-field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600;margin-bottom:6px}
 .form-field input[type="text"],.form-field input[type="password"]{width:100%;padding:10px 14px;background:rgba(15,23,42,0.6);border:1px solid rgba(59,130,246,0.2);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px}
 .form-field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
-@media(max-width:768px){.metrics-bar{grid-template-columns:repeat(2,1fr)}.modules-grid{grid-template-columns:1fr}.header{padding:16px 20px}.main{padding:20px}}
 
 @keyframes spin{to{transform:rotate(360deg)}}
 .upload-area{border:2px dashed var(--border);border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(15,23,42,0.3);margin-bottom:20px}
@@ -55,7 +54,7 @@ body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-
 .status-logo-wrap{display:flex;align-items:center;gap:10px}
 .status-logo{height:36px;width:auto;max-width:100px;object-fit:contain}
 .status-name{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:18px;color:var(--text-primary)}
-.controls{display:flex;gap:10px}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
 .cert-downloads{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
 .cert-btn{padding:10px 20px;border-radius:8px;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:all 0.2s}
 .cert-btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
@@ -218,7 +217,7 @@ function takPurgeFailed(){
 {% endif %}
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
-<div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
+<div class="btn-row" style="gap:10px">
 <a href="{{ takserver_base_url }}:8443" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 WebGUI :8443 (cert)</a>
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
 <a href="{{ 'https://' + service_domain('takportal') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
@@ -495,7 +494,7 @@ function takPurgeFailed(){
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA stays in the truststore; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
 <div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
 <div id="rotate-ca-controls" style="display:none">
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="grid-2" style="margin-bottom:16px">
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-ca-name" placeholder="e.g. INTERMEDIATE-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New intermediate validity (days)</label><input type="number" id="rotate-ca-validity-days" placeholder="730" min="1" max="3652" style="width:120px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"> <span id="rotate-ca-validity-hint" style="font-size:11px;color:var(--text-dim)">Capped by root CA remaining</span></div>
 </div>
@@ -523,7 +522,7 @@ function takPurgeFailed(){
 <div id="rotate-root-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Full PKI rebuild. Creates a new Root CA, new Intermediate CA, new server cert, and regenerates all client certificates. <strong style="color:var(--red)">All existing connections will be disconnected.</strong> Users must re-enroll via TAK Portal QR code. Schedule a maintenance window before proceeding.</p>
 <div id="rotate-root-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading Root CA info...</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="grid-2" style="margin-bottom:16px">
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Root CA Name</label><input type="text" id="rotate-root-name" placeholder="e.g. ROOT-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-root-int-name" placeholder="e.g. INT-CA-01" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 </div>
@@ -543,7 +542,7 @@ function takPurgeFailed(){
 </div>
 <div id="client-cert-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Generate a signed client certificate and assign it to groups with read/write permissions. The .p12 file can be imported into ATAK, iTAK, or WinTAK.</p>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="grid-2" style="margin-bottom:16px">
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Client Name</label><input type="text" id="cc-name" placeholder="e.g. operator1" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div></div>
 </div>
@@ -570,7 +569,7 @@ function takPurgeFailed(){
 </div>
 <div id="federation-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Server-to-server federation lets two TAK Servers share data directly over V2 TLS (port 9001 by default). Exchange CA certificates, then one side creates an outgoing connection to the other. The receiving side needs the federation port open in the firewall.</p>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+<div class="grid-2" style="gap:20px;margin-bottom:20px">
 <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:16px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:12px">V2 Federation</div>
 <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
@@ -761,7 +760,7 @@ function loadSnapshots(fromBtn){
 +'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
         +'</td></tr>';
     }).join('');
-    c.innerHTML='<table style="width:100%;border-collapse:collapse">'
+    c.innerHTML='<div class="table-wrap"><table style="width:100%;border-collapse:collapse">'
       +'<thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'
       +'<th style="padding:4px 8px;text-align:left">Label</th>'
       +'<th style="padding:4px 8px;text-align:left">Taken</th>'
@@ -769,7 +768,7 @@ function loadSnapshots(fromBtn){
       +'<th style="padding:4px 8px;text-align:left">TAK Version</th>'
       +'<th style="padding:4px 8px;text-align:left">Size</th>'
       +'<th style="padding:4px 8px;text-align:left">Actions</th>'
-      +'</tr></thead><tbody>'+rows+'</tbody></table>';
+      +'</tr></thead><tbody>'+rows+'</tbody></table></div>';
   }).catch(function(e){
     var btn2=document.getElementById('snap-refresh-btn');
     if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
