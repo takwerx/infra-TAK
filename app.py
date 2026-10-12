@@ -4497,6 +4497,7 @@ body.light-mode .top-bar{background:linear-gradient(90deg,transparent,#1d4ed8,#0
 body.light-mode #theme-toggle-btn{color:var(--text-secondary)}
 body.light-mode #theme-toggle-btn:hover{color:var(--text-primary);background:rgba(0,0,0,.05)}
 body.light-mode .nav-toggle{background:#fff;color:#0f172a;border-color:#bfc6d0}
+body.light-mode .mobile-bar{background:#dde1e8;border-bottom-color:#bfc6d0}
 body.light-mode .nav-scrim.open{background:rgba(0,0,0,.35)}
 </style>
 <script>
@@ -4510,8 +4511,11 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
     # U+2630 (system font), NOT a Material Symbols ligature — the bundled font is a subset
     # and an unknown ligature paints as its raw name. No route, no static file.
     mobile_nav = (
+        '<div class="mobile-bar" id="mobile-bar">'
         '<button type="button" class="nav-toggle" id="nav-toggle" aria-label="Menu" '
         'aria-controls="sidebar-nav" aria-expanded="false">&#9776;</button>'
+        f'<span class="mobile-bar-title">infra-TAK<small>v{VERSION}</small></span>'
+        '</div>'
         '<div class="nav-scrim" id="nav-scrim"></div>'
         '<script>(function(){var s=document.getElementById("sidebar-nav"),t=document.getElementById("nav-toggle"),'
         'c=document.getElementById("nav-scrim");if(!s||!t||!c)return;'
@@ -4519,7 +4523,7 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
         # toggle/sidebar sit below them (they are z205/z210, above the toggle on purpose)
         'function ct(){document.documentElement.style.setProperty("--chrome-top",getComputedStyle(document.body).paddingTop||"0px")}'
         'ct();window.addEventListener("resize",ct);'
-        'function set(o){s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false")}'
+        'function set(o){s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false");t.innerHTML=o?"&#10005;":"&#9776;"}'
         't.addEventListener("click",function(){set(!s.classList.contains("open"))});'
         'c.addEventListener("click",function(){set(false)});'
         'document.addEventListener("keydown",function(e){if(e.key==="Escape")set(false)});'
