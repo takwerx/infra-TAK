@@ -65,7 +65,7 @@ body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
 /* a SOLID top bar, not a floating button: content scrolls cleanly under an opaque strip
    (operator 2026-10-12: a fixed button over scrolling content "looks like it is hiding
    something"). Sidebar and scrim start below the bar so the toggle stays reachable. */
-body{flex-direction:column}
+html body{flex-direction:column}  /* html+body: most page_css blocks re-declare body{flex-direction:row} after this sheet */
 .mobile-bar{display:flex;align-items:center;gap:12px;position:sticky;top:0;flex-shrink:0;height:54px;z-index:101;padding:0 10px;background:var(--bg-surface);border-bottom:1px solid var(--border)}
 .mobile-bar-title{font-size:14px;font-weight:700;letter-spacing:.04em;color:var(--text-primary)}
 .mobile-bar-title small{font-size:10px;font-weight:400;color:var(--text-dim);margin-left:8px}
