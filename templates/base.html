@@ -62,6 +62,21 @@ body .grid-2,body .grid-3{grid-template-columns:1fr}
 body .metrics-bar{grid-template-columns:repeat(2,1fr)}
 body .status-banner{flex-wrap:wrap;gap:12px}
 body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
+/* W8c — the phone guard for EVERY page, retrofitted or not (operator on /takportal, dev4:
+   "I can scroll the entire page left"). The templates carry ~3,000 inline styles, so the
+   shared sheet reaches them by attribute: inline flex rows wrap, inline fixed grids go to
+   one column, media/tables/inputs cannot exceed the width, and .main clips anything that
+   still refuses instead of panning. Per-page passes (W9/W10) make things fit nicely;
+   this makes sure nothing is ever wider than the phone. */
+body .main{overflow-x:hidden}
+body .main [style*="display:flex"],body .main [style*="display: flex"]{flex-wrap:wrap}
+body .main [style*="grid-template-columns"]{grid-template-columns:1fr}
+body .main img,body .main video,body .main canvas,body .main svg,body .main iframe{max-width:100%;height:auto}
+body .main table{display:block;overflow-x:auto;max-width:100%}
+body .main .table-wrap table{display:table}
+body .main pre{white-space:pre-wrap;overflow-wrap:anywhere}
+body .main input,body .main select,body .main textarea{max-width:100%}
+body .main .cert-btn,body .main .control-btn,body .main .btn{white-space:normal}
 /* a SOLID top bar, not a floating button: content scrolls cleanly under an opaque strip
    (operator 2026-10-12: a fixed button over scrolling content "looks like it is hiding
    something"). Sidebar and scrim start below the bar so the toggle stays reachable. */
