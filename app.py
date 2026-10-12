@@ -4515,6 +4515,10 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
         '<div class="nav-scrim" id="nav-scrim"></div>'
         '<script>(function(){var s=document.getElementById("sidebar-nav"),t=document.getElementById("nav-toggle"),'
         'c=document.getElementById("nav-scrim");if(!s||!t||!c)return;'
+        # the fixed top banners set body{padding-top:Npx}; mirror it into --chrome-top so the
+        # toggle/sidebar sit below them (they are z205/z210, above the toggle on purpose)
+        'function ct(){document.documentElement.style.setProperty("--chrome-top",getComputedStyle(document.body).paddingTop||"0px")}'
+        'ct();window.addEventListener("resize",ct);'
         'function set(o){s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false")}'
         't.addEventListener("click",function(){set(!s.classList.contains("open"))});'
         'c.addEventListener("click",function(){set(false)});'
