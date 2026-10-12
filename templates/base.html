@@ -70,7 +70,8 @@ body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
    this makes sure nothing is ever wider than the phone. */
 body .main{overflow-x:hidden}
 body .main [style*="display:flex"],body .main [style*="display: flex"]{flex-wrap:wrap}
-body .main [style*="grid-template-columns"]{grid-template-columns:1fr}
+body .main [style*="grid-template-columns"]{grid-template-columns:1fr!important} /* the ONE !important here: an inline
+   grid-template-columns can only be beaten by it (flex-wrap above works without, nothing inline declares it) */
 body .main img,body .main video,body .main canvas,body .main svg,body .main iframe{max-width:100%;height:auto}
 body .main table{display:block;overflow-x:auto;max-width:100%}
 body .main .table-wrap table{display:table}
