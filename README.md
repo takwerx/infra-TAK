@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.11-alpha)**
+**Current release: [v10.2.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.12-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -428,6 +428,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.12-alpha — 2026-10-12 — ATLAS enrollment on relayed boxes; TAK Deploy catches a missing database; big-database backups finish
+
+**Headline: ATLAS enrollment works on relayed boxes, a NetBird redeploy creates a working Authentik login, TAK Server Deploy rebuilds a missing database instead of reporting success, and the TAK 5.8 update no longer kills the database backup on large databases ([#72](https://github.com/takwerx/infra-TAK/issues/72), [#92](https://github.com/takwerx/infra-TAK/issues/92), [#126](https://github.com/takwerx/infra-TAK/issues/126), [#128](https://github.com/takwerx/infra-TAK/issues/128)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.12-alpha))
+
+**Relayed boxes.** The relay now forwards ATLAS's provisioning port 8449, so tablets no longer time out after installing the agent. It also forwards TAK Video Restreamer's RTSPS 8555 and RTMP 1935, and CloudTAK's video ports (RTSP 18554, RTMP 11935, SRT 18890/udp).
+
+**TAK Server database.** A single-server TAK Server 5.8 Deploy now checks that the `cot` database and `martiuser` exist after the package installs. If they're missing (for example after Remove on a box that only has PostgreSQL 15), it runs TAK's own database setup (`upgrade-db.sh` or `takserver-setup-db.sh`) to build them before TAK starts, and stops with an error if it can't. The pre-update snapshot sizes its database dump window to the database (up to 6 hours) instead of a fixed 10 minutes, so large databases are no longer cut off mid-backup and the 5.8 update can go ahead.
+
+**NetBird.** A redeploy now always creates a real NetBird owner and registers the Authentik login, so the login page shows the Authentik button with an account behind it. If that fails, the deploy says so instead of reporting success. Redeploys update the existing Authentik login instead of adding another one.
+
+**Authentik.** The post-update reconfigure restarts the Authentik server and waits for it before recreating the LDAP outpost, so the outpost no longer crashes with a 502 and TAK LDAP logins don't drop for a minute on every console update.
+
+**ARM64 and containers.** CloudTAK's tiles service keeps working on ARM64 after a CloudTAK Update. Container installs of TAK Server 5.8 no longer show `takserver` and `takserver-db` as permanently unhealthy.
+
+**Upgrade note.** Update the console. Relayed boxes re-apply the relay forwards on the console restart that follows the update; you still need to open the new ports in your cloud provider's firewall (Oracle security list, AWS security group, Azure NSG). ARM64 boxes with CloudTAK tiles down get them back on their next CloudTAK Update.
 
 ### v10.2.11-alpha — 2026-10-11 — Guard Dog fixes for split installs and busy hosts; snapshot Restore brings back a missing TAK database
 
