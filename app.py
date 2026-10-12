@@ -1753,6 +1753,36 @@ def _read_os_release():
     except Exception:
         return '', ''
 
+def _apt_codename():
+    """The apt suite codename of this box ('jammy', 'noble', 'bookworm'), or '' when it
+    cannot be determined. v10.3.0 W1: VERSION_CODENAME from /etc/os-release first, then
+    `lsb_release -cs` — noble cloud/minimal images do not always ship lsb-release, and
+    the old literal 'jammy' fallback would have written 22.04's PGDG channel onto a
+    24.04 box. Callers must refuse to write an apt source on ''; never guess."""
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('VERSION_CODENAME='):
+                    cn = line.split('=', 1)[1].strip().strip('"').lower()
+                    if cn:
+                        return cn
+    except Exception:
+        pass
+    try:
+        cn = subprocess.run(['lsb_release', '-cs'], capture_output=True, text=True,
+                            timeout=10).stdout.strip().lower()
+        return cn if re.fullmatch(r'[a-z]+', cn) else ''
+    except Exception:
+        return ''
+
+
+# Shell-side twin of _apt_codename() for commands that run on ANOTHER box (Server One
+# over SSH) or are printed for the operator to paste. Same order, same refusal: an empty
+# codename must never reach `tee`, so callers guard with `[ -n "$codename" ]`.
+_APT_CODENAME_SH = ('$(. /etc/os-release 2>/dev/null; '
+                    'echo "${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null)}")')
+
+
 def _detect_console_port():
     """Console port from the systemd unit's --bind, else 5001."""
     try:
@@ -3136,9 +3166,9 @@ def _install_docker_nonroot(_log):
                         k, v = line.strip().split('=', 1)
                         osr[k] = v.strip('"')
             os_id = 'debian' if osr.get('ID') == 'debian' else 'ubuntu'
-            codename = osr.get('VERSION_CODENAME') or osr.get('UBUNTU_CODENAME') or ''
         except Exception:
             pass
+        codename = _apt_codename()  # v10.3.0 W1: one codename source (lsb_release fallback)
         if not codename:
             _log('  ⚠ could not detect distro codename from /etc/os-release')
             return
@@ -11143,7 +11173,12 @@ _PGDG_REMOTE_SETUP_SH = (
     'sudo mkdir -p /usr/share/keyrings && '
     f'if ! grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then '
     f'sudo curl -sL {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
-    f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt $(lsb_release -cs)-pgdg main" '
+    # v10.3.0 W1: codename from /etc/os-release, lsb_release fallback, and REFUSE on
+    # empty — a bare $(lsb_release -cs) on a noble minimal image expands to nothing and
+    # writes "apt -pgdg main", which apt then rejects for every source on the box.
+    f'cn={_APT_CODENAME_SH} && '
+    '( [ -n "$cn" ] || { echo "cannot determine the apt codename of this host (no VERSION_CODENAME, no lsb_release)" >&2; false; } ) && '
+    f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt ${{cn}}-pgdg main" '
     f'| sudo tee {_PGDG_LIST} >/dev/null; '
     'else echo "PGDG apt source already configured on this host - reusing it"; fi && '
 )
@@ -12304,7 +12339,7 @@ def takserver_two_server_runbook():
         f'grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ && echo "PGDG already configured - skip the next two commands"',
         'sudo mkdir -p /usr/share/keyrings',
         f'sudo curl {_PGDG_KEY_URL} --output {_PGDG_KEYRING}',
-        f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee {_PGDG_LIST} >/dev/null',
+        f'cn={_APT_CODENAME_SH} && [ -n "$cn" ] && echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt ${{cn}}-pgdg main" | sudo tee {_PGDG_LIST} >/dev/null',
         'sudo apt update',
         f'sudo apt install -y ./{db_pkg}' if db_pkg else 'sudo apt install -y ./takserver-database_x.x-RELEASExx_all.deb',
         # v0.9.12 hardening: source-scope only, deny everything else on db_port.
@@ -77102,11 +77137,14 @@ def _setup_pgdg_apt_source():
             except Exception:
                 pass
             return False
-        try:
-            _cn = subprocess.run(['lsb_release', '-cs'], capture_output=True, text=True,
-                                 timeout=10).stdout.strip() or 'jammy'
-        except Exception:
-            _cn = 'jammy'
+        # v10.3.0 W1: the codename comes from /etc/os-release (lsb_release fallback). The
+        # old `or 'jammy'` guess wrote 22.04's PGDG channel onto any box where lsb_release
+        # was missing — which is the DEFAULT on noble minimal images.
+        _cn = _apt_codename()
+        if not _cn:
+            log_step(f"✗ cannot determine the Ubuntu codename; refusing to write {_PGDG_LIST}")
+            log_step("  /etc/os-release has no VERSION_CODENAME and lsb_release is unavailable")
+            return False
         _write_priv(_PGDG_KEYRING, key, perm=0o644)
         _write_priv(_PGDG_LIST,
                     f'deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt {_cn}-pgdg main\n')
@@ -79547,7 +79585,9 @@ def api_host_resource_usage():
 _KERNEL_CVE_FIXES = {
     'CVE-2026-31431 (Copy Fail)': {
         # distro codename (VERSION_CODENAME in /etc/os-release) -> first fixed kernel
-        'jammy': (5, 15, 0, 179),
+        # https://ubuntu.com/security/CVE-2026-31431 — `linux` package rows
+        'jammy': (5, 15, 0, 179),   # 5.15.0-179.189
+        'noble': (6, 8, 0, 117),    # 6.8.0-117.117  (v10.3.0 W1)
     },
 }
 
