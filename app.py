@@ -4160,9 +4160,7 @@ def render_custom_banner(settings):
 
     if logo_b64:
         logo_img = (
-            f'<img src="{html.escape(logo_b64)}" alt="Agency Logo" '
-            f'style="height:{logo_h}px;width:auto;max-height:{logo_h}px;'
-            'object-fit:contain;flex-shrink:0">'
+            f'<img src="{html.escape(logo_b64)}" alt="Agency Logo" class="custom-banner-logo">'
         )
     else:
         logo_img = (
@@ -4186,6 +4184,16 @@ def render_custom_banner(settings):
         'display:flex;flex-direction:column;align-items:center;gap:3px}'
         '.custom-banner-sub{font-size:11px;font-weight:400;opacity:.6;'
         'letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+        f'.custom-banner-logo{{height:{logo_h}px;width:auto;max-height:{logo_h}px;object-fit:contain;flex-shrink:0}}'
+        # v10.3.0 W8b: on a phone the fixed 84px strip is a third of the screen. Below the
+        # single 900px breakpoint it flows in the document (base.html stacks body as a
+        # column there), shrinks, and scrolls away; body padding goes back to 0.
+        '@media (max-width: 900px){'
+        'body{padding-top:0!important}'
+        f'.custom-banner{{position:static;height:auto;min-height:0;padding:8px 12px;gap:10px;font-size:{min(font_size, 16)}px;letter-spacing:.04em}}'
+        '.custom-banner-logo{height:28px;max-height:28px}'
+        '.custom-banner-sub{white-space:normal;font-size:10px}'
+        '}'
         '</style>'
         '<div class="custom-banner">'
         f'{logo_img}'
@@ -4358,16 +4366,25 @@ def _render_notice_bars_inner(settings):
             'style="background:none;border:0;color:inherit;cursor:pointer;font-size:15px;'
             'line-height:1;padding:0 2px;opacity:.75">&times;</button></div>')
     css.append('.itk-notice-x:hover{opacity:1!important}')
+    # v10.3.0 W8b: below 900px the bars are in-flow and wrap (they were fixed 34px strips
+    # with overflow:hidden, which clipped the sentence mid-word on a 390px phone). The
+    # relayout() below mirrors this: it only writes the inline body padding on desktop.
+    css.append('@media (max-width: 900px){body{padding-top:0!important}'
+               '.itk-notice{position:static;height:auto;top:auto;padding:6px 10px;flex-wrap:wrap;'
+               'overflow:visible;font-size:12px;line-height:1.3;text-align:left;justify-content:flex-start}}')
     script = (
         '<script>(function(){'
         'var bars=[].slice.call(document.querySelectorAll(".itk-notice"));'
         'if(!bars.length)return;'
         'var base=parseInt(bars[0].getAttribute("data-base"),10)||0;'
         'var h=parseInt(bars[0].getAttribute("data-h"),10)||34;'
+        'var mq=window.matchMedia("(max-width: 900px)");'
         'function relayout(){'
         'var live=bars.filter(function(b){return b.parentNode;});'
         'live.forEach(function(b,i){b.style.top=(base+i*h)+"px";});'
-        'document.body.style.setProperty("padding-top",(base+live.length*h)+"px","important");}'
+        'if(mq.matches){document.body.style.removeProperty("padding-top");}'
+        'else{document.body.style.setProperty("padding-top",(base+live.length*h)+"px","important");}}'
+        'if(mq.addEventListener)mq.addEventListener("change",relayout);'
         'bars.forEach(function(b){'
         'var k=b.getAttribute("data-key");'
         'try{if(localStorage.getItem("itkNotice:"+k)==="1"){b.parentNode.removeChild(b);}}catch(e){}'
@@ -4519,11 +4536,14 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
         '<div class="nav-scrim" id="nav-scrim"></div>'
         '<script>(function(){var s=document.getElementById("sidebar-nav"),t=document.getElementById("nav-toggle"),'
         'c=document.getElementById("nav-scrim");if(!s||!t||!c)return;'
-        # the fixed top banners set body{padding-top:Npx}; mirror it into --chrome-top so the
-        # toggle/sidebar sit below them (they are z205/z210, above the toggle on purpose)
-        'function ct(){document.documentElement.style.setProperty("--chrome-top",getComputedStyle(document.body).paddingTop||"0px")}'
+        # W8b: the top bar is sticky under the in-flow banners on a phone, so its bottom edge
+        # moves with scroll; --chrome-top is measured from it when the menu opens/scrolls
+        'var mb=document.getElementById("mobile-bar");'
+        'function ct(){var b=(mb&&getComputedStyle(mb).display!=="none")?Math.max(0,mb.getBoundingClientRect().bottom):0;'
+        'document.documentElement.style.setProperty("--chrome-top",b+"px")}'
         'ct();window.addEventListener("resize",ct);'
-        'function set(o){s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false");t.innerHTML=o?"&#10005;":"&#9776;"}'
+        'window.addEventListener("scroll",function(){if(s.classList.contains("open"))ct()},{passive:true});'
+        'function set(o){ct();s.classList.toggle("open",o);c.classList.toggle("open",o);t.setAttribute("aria-expanded",o?"true":"false");t.innerHTML=o?"&#10005;":"&#9776;"}'
         't.addEventListener("click",function(){set(!s.classList.contains("open"))});'
         'c.addEventListener("click",function(){set(false)});'
         'document.addEventListener("keydown",function(e){if(e.key==="Escape")set(false)});'

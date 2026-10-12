@@ -42,10 +42,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
    opened by the .nav-toggle hamburger that render_sidebar() emits; .main takes the whole
    width and leaves room under the fixed toggle. `body .main`/`body .header` win over the
    per-page `.main{padding:32px}` that follows in page_css by specificity, not !important.
-   Desktop (>=901px) is untouched. --chrome-top is the height of the fixed top banners
-   (custom banner z210 + notice bars z205 set body{padding-top}); render_sidebar()'s JS copies
-   that padding into the variable so the toggle and the sidebar start BELOW the banners
-   instead of underneath them (dev4 2026-10-12: 118px of banner hid the hamburger). */
+   Desktop (>=901px) is untouched. W8b: body becomes a COLUMN here so the top banners
+   (custom banner + notice bars, in-flow below the breakpoint by their own media rules)
+   stack above .main and scroll away; the top bar is sticky so it stays. --chrome-top is
+   the bar's bottom edge, measured by render_sidebar()'s JS when the menu opens. */
 /* v10.3.0 W11 — opt-in responsive utilities for the page passes (W9/W10). Shared, structural,
    no !important: .grid-2/.grid-3 collapse to one column, .metrics-bar to two, .status-banner
    and .btn-row wrap, .table-wrap scrolls sideways instead of widening the page. The four pages
@@ -65,14 +65,15 @@ body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
 /* a SOLID top bar, not a floating button: content scrolls cleanly under an opaque strip
    (operator 2026-10-12: a fixed button over scrolling content "looks like it is hiding
    something"). Sidebar and scrim start below the bar so the toggle stays reachable. */
-.mobile-bar{display:flex;align-items:center;gap:12px;position:fixed;top:var(--chrome-top,0px);left:0;right:0;height:54px;z-index:101;padding:0 10px;background:var(--bg-surface);border-bottom:1px solid var(--border)}
+body{flex-direction:column}
+.mobile-bar{display:flex;align-items:center;gap:12px;position:sticky;top:0;flex-shrink:0;height:54px;z-index:101;padding:0 10px;background:var(--bg-surface);border-bottom:1px solid var(--border)}
 .mobile-bar-title{font-size:14px;font-weight:700;letter-spacing:.04em;color:var(--text-primary)}
 .mobile-bar-title small{font-size:10px;font-weight:400;color:var(--text-dim);margin-left:8px}
 .nav-toggle{display:flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;border-radius:10px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);font-size:22px;line-height:1;cursor:pointer}
-.sidebar{position:fixed;top:calc(var(--chrome-top,0px) + 54px);left:0;bottom:0;overflow-y:auto;z-index:100;transform:translateX(-100%);transition:transform .2s ease}
+.sidebar{position:fixed;top:var(--chrome-top,54px);left:0;bottom:0;overflow-y:auto;z-index:100;transform:translateX(-100%);transition:transform .2s ease}
 .sidebar.open{transform:none;box-shadow:0 0 40px rgba(0,0,0,.5)}
-.nav-scrim.open{display:block;position:fixed;top:calc(var(--chrome-top,0px) + 54px);left:0;right:0;bottom:0;z-index:99;background:rgba(0,0,0,.55)}
-body .main{padding:70px 16px 16px}
+.nav-scrim.open{display:block;position:fixed;top:var(--chrome-top,54px);left:0;right:0;bottom:0;z-index:99;background:rgba(0,0,0,.55)}
+body .main{padding:16px}
 body .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
 .nav-item{min-height:44px}
 }
