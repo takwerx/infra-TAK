@@ -78107,14 +78107,49 @@ def run_takserver_deploy(config):
             r = subprocess.run(f"grep 'id=' {config['policy_path']} | head -1 | sed 's/.*id=\"\\([^\"]*\\)\".*/\\1/'", shell=True, capture_output=True, text=True)
             pid = r.stdout.strip()
             log_step(f"  Policy ID: {pid}")
+            # v10.3.0 W1.a: the policy id becomes two directory names under /etc and
+            # /usr/share and is interpolated into shell commands below — a debsig
+            # policy id is a 16-hex-digit key id, so accept nothing else.
+            if pid and not re.fullmatch(r'[0-9A-Fa-f]{16}', pid):
+                log_step(f"⚠ Policy ID {pid[:40]!r} is not a 16-digit key id — skipping verification")
+                pid = ''
             if pid:
+                _kr = f'/usr/share/debsig/keyrings/{pid}/debsig.gpg'
                 run_cmd(f'mkdir -p /usr/share/debsig/keyrings/{pid}')
                 run_cmd(f'mkdir -p /etc/debsig/policies/{pid}')
-                run_cmd(f'rm -f /usr/share/debsig/keyrings/{pid}/debsig.gpg')
-                run_cmd(f'touch /usr/share/debsig/keyrings/{pid}/debsig.gpg')
-                run_cmd(f'gpg --no-default-keyring --keyring /usr/share/debsig/keyrings/{pid}/debsig.gpg --import {config["gpg_key_path"]}')
-                run_cmd(f'cp {config["policy_path"]} /etc/debsig/policies/{pid}/debsig.pol')
-                v = subprocess.run(f'debsig-verify -v {pkg}', shell=True, capture_output=True, text=True)
+                run_cmd(f'rm -f {_kr} {_kr}~')
+                # v10.3.0 W1.a (found by the W2 fresh deploy, aws-noble 2026-10-13; same on
+                # aws-jammy 22.04 — pre-existing on EVERY born-non-root Ubuntu box):
+                # verification never passed through the broker. The old
+                # `gpg --no-default-keyring --keyring <kr> --import <key>` is refused by the
+                # broker's gpg gate (only `--dearmor -o <allowlisted path>` is a legal gpg
+                # shape), so the keyring stayed empty under enforcement. And debsig-verify
+                # itself shells out to `gpg`, which resolved to the console's PATH shim — every
+                # signature check was sent to the root broker and refused there
+                # ("gpg: option not allowed: --no-default-keyring"), so debsig-verify
+                # exited 13 and the deploy printed "installing anyway" for a package whose
+                # signature is in fact good. Fix: write the keyring with the dearmor shape the
+                # broker already allows (the TAK key ships ASCII-armored; a binary key is
+                # copied as-is), and run debsig-verify with a plain system PATH so its gpg is
+                # the real one, running as the console user — verification needs no privilege.
+                _key = config["gpg_key_path"]
+                try:
+                    with open(_key, 'rb') as _kf:
+                        _armored = _kf.read(64).lstrip().startswith(b'-----BEGIN PGP')
+                except Exception:
+                    _armored = True
+                if _armored:
+                    run_cmd(f'gpg --batch --yes --dearmor -o {_kr} {shlex.quote(_key)}')
+                else:
+                    run_cmd(f'cp {shlex.quote(_key)} {_kr}')
+                run_cmd(f'cp {shlex.quote(config["policy_path"])} /etc/debsig/policies/{pid}/debsig.pol')
+                _dv_env = dict(os.environ)
+                _dv_env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+                try:
+                    v = subprocess.run(['debsig-verify', '-v', pkg], capture_output=True, text=True,
+                                       env=_dv_env, timeout=300)
+                except Exception as _dve:
+                    v = subprocess.CompletedProcess(['debsig-verify'], -1, '', f'debsig-verify could not run: {_dve}')
                 if v.returncode == 0: log_step("✓ Package signature VERIFIED")
                 else:
                     log_step(f"⚠ Verification exit code {v.returncode} — installing anyway")
