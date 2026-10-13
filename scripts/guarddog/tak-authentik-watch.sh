@@ -4,6 +4,7 @@
 # - HTTP failure × 3 → restart server+worker; a second escalation within 6h → full down + up -d
 # - HTTP failure while the host is CPU-starved → hold and alert, do not restart (GH #111)
 # - LDAP failure × 3 → targeted LDAP recreate (doesn't nuke the whole stack)
+# - LDAP flow herd that does not drain (8 of the last 10 min busy) → same restart as HTTP (ops #38)
 # - 10-min boot grace period; HTTP cooldown 15 min, doubling per restart in the last 6h (max 2h).
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -230,6 +231,69 @@ _ak_compose_restart_locked() {
   return $_rc
 }
 
+# Postgres, Redis and the LDAP outpost were healthy through the whole field loop;
+# tearing them down added load and reset the outpost every time. The first restart
+# in 6h touches only server+worker; another one within 6h escalates to the full
+# down+up, which is what this watchdog always did. Sets ACTION and MODE.
+_ak_pick_restart_mode() {
+  if [ "$RECENT" -eq 0 ] && _ak_deps_running; then
+    ACTION="Restart of server and worker only (docker compose restart server worker)"
+    MODE="server-worker"
+  else
+    ACTION="Full restart (docker compose down + up -d)"
+    MODE="full"
+  fi
+}
+
+# Run the restart picked above, then the bookkeeping every restart shares (the 6h
+# history the backoff reads, the cooldown stamps, the fail counters).
+_ak_restart() {
+  if [ "$MODE" = "server-worker" ]; then
+    cd "$AK_DIR" && _ak_compose_locked "server-worker-restart" restart -t 30 server worker
+    # The outpost reconnects to the restarted server by itself; if it still cannot
+    # resolve groups, restart it too (the order the LDAP alert below recommends).
+    _ak_verify_ldap_groups "server-worker-restart"
+    if [ $? -eq 1 ]; then
+      cd "$AK_DIR" && _ak_compose_locked "ldap-restart" restart ldap
+      _ak_verify_ldap_groups "ldap-restart" || true
+    fi
+  else
+    # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
+    cd "$AK_DIR" && _ak_compose_restart_locked
+    # v10.1.64 W3 (GH #64): a full stack restart starts the outpost COLD too — same blind spot.
+    _ak_verify_ldap_groups "stack-restart" || true
+  fi
+  _record_restart
+  echo 0 > "$FAIL_HTTP"
+  echo 0 > "$FAIL_LDAP"
+  date +%s > "$COOLDOWN_HTTP"
+  date +%s > "$COOLDOWN_LDAP"
+}
+
+# ── LDAP flow herd (ops #38) ─────────────────────────────────────────────────
+# The outpost (bind_mode: cached) keeps a bind in its cache until the LDAP flow's
+# session expires (hours=1, AK_LDAP_SESSION_DURATION). Then EVERY bind that arrives
+# before a new flow finishes runs the full ldap-authentication-flow itself; the
+# outpost does not wait for the one already running. TAK Server binds about 3 times a
+# second on a busy box, so each expiry is a burst of 25–200 flows that drains in a
+# minute or two. When Authentik is already slow it does not drain: slower flows mean
+# more binds miss the cache, which means more flows. test8, 2026-10-12: flow median
+# 0.5 s → 28 s, 750 flows per 10 min, health check 7 s, and nothing here noticed —
+# HTTP answered inside 30 s and port 389 stayed open. A server+worker restart cleared
+# it. Healthy boxes show 1–2 busy minutes an hour; the stuck herd shows every minute.
+HERD_WINDOW_MIN=10
+HERD_PER_MIN=10
+HERD_BUSY_MIN=8
+
+# Prints how many of the last HERD_WINDOW_MIN minutes ran >= HERD_PER_MIN LDAP flows.
+_ldap_flow_busy_minutes() {
+  timeout 30 docker logs authentik-server-1 --since "${HERD_WINDOW_MIN}m" 2>&1 \
+    | grep 'flows/executor/ldap-authentication-flow' \
+    | grep -oE '"timestamp": ?"[0-9-]{10}T[0-9]{2}:[0-9]{2}' \
+    | sed -E 's/.*T//' | sort | uniq -c \
+    | awk -v n="$HERD_PER_MIN" '$1 >= n { b++ } END { print b + 0 }'
+}
+
 # ── HTTP health check (Authentik server) ──
 # GH #111: --max-time bounds each probe. Without it a starved server held a probe open
 # for 100–200 s, so slow and down looked the same and one tick could run for minutes.
@@ -315,17 +379,7 @@ If the host is still overloaded after 2 hours, Guard Dog will restart Authentik 
       [ "$HELD_FOR" -ge "$HOLD_MAX_SECS" ] && _log "hold | held ${HELD_FOR}s with the host still starved — restarting anyway"
       rm -f "$HOLD_SINCE" "$HOLD_ALERTED"
 
-      # Postgres, Redis and the LDAP outpost were healthy through the whole field loop;
-      # tearing them down added load and reset the outpost every time. The first restart
-      # in 6h touches only server+worker; another one within 6h escalates to the full
-      # down+up, which is what this watchdog always did.
-      if [ "$RECENT" -eq 0 ] && _ak_deps_running; then
-        ACTION="Restart of server and worker only (docker compose restart server worker)"
-        MODE="server-worker"
-      else
-        ACTION="Full restart (docker compose down + up -d)"
-        MODE="full"
-      fi
+      _ak_pick_restart_mode
       NEXT_COOLDOWN=$(_backoff_secs $(( RECENT + 1 )))
       _log "restart | Authentik HTTP unhealthy ($PROBE_DESC) for $FAILS checks — $MODE restart (restart $(( RECENT + 1 )) in 6h; next allowed after $(( NEXT_COOLDOWN / 60 )) min)"
       SUBJ="Guard Dog: Authentik restarted on $SERVER_IDENTIFIER"
@@ -337,26 +391,7 @@ Action: $ACTION.
 Restarts in the last 6 hours, including this one: $(( RECENT + 1 )). Next restart allowed after $(( NEXT_COOLDOWN / 60 )) minutes.
 "
       _alert "$SUBJ" "$BODY"
-      if [ "$MODE" = "server-worker" ]; then
-        cd "$AK_DIR" && _ak_compose_locked "server-worker-restart" restart -t 30 server worker
-        # The outpost reconnects to the restarted server by itself; if it still cannot
-        # resolve groups, restart it too (the order the LDAP alert below recommends).
-        _ak_verify_ldap_groups "server-worker-restart"
-        if [ $? -eq 1 ]; then
-          cd "$AK_DIR" && _ak_compose_locked "ldap-restart" restart ldap
-          _ak_verify_ldap_groups "ldap-restart" || true
-        fi
-      else
-        # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
-        cd "$AK_DIR" && _ak_compose_restart_locked
-        # v10.1.64 W3 (GH #64): a full stack restart starts the outpost COLD too — same blind spot.
-        _ak_verify_ldap_groups "stack-restart" || true
-      fi
-      _record_restart
-      echo 0 > "$FAIL_HTTP"
-      echo 0 > "$FAIL_LDAP"
-      date +%s > "$COOLDOWN_HTTP"
-      date +%s > "$COOLDOWN_LDAP"
+      _ak_restart
       exit 0
     fi
   fi
@@ -420,6 +455,38 @@ Try, in order:
       esac
       echo 0 > "$FAIL_LDAP"
       date +%s > "$COOLDOWN_LDAP"
+    fi
+  fi
+fi
+
+# ── LDAP flow herd check (ops #38) ──
+# Only while HTTP and port 389 are OK: an unhealthy server is the HTTP check's to restart,
+# a closed port the LDAP check's (which may have just recreated the outpost). Shares that
+# check's cooldown and 6h backoff, so the two triggers can never stack restarts. There
+# is no CPU-starvation hold here (GH #111): the herd IS Authentik's own load, and a
+# server+worker restart does not touch the outpost's bind cache.
+if [ "$HTTP_OK" -eq 1 ] && [ "${LDAP_OK:-0}" -eq 1 ]; then
+  RECENT=$(_recent_restarts)
+  HTTP_COOLDOWN=$(_backoff_secs "$RECENT")
+  if _cooldown_ok "$COOLDOWN_HTTP" "$HTTP_COOLDOWN"; then
+    BUSY=$(_ldap_flow_busy_minutes)
+    if [ "${BUSY:-0}" -ge "$HERD_BUSY_MIN" ]; then
+      _ak_pick_restart_mode
+      NEXT_COOLDOWN=$(_backoff_secs $(( RECENT + 1 )))
+      _log "restart | LDAP flow herd not draining (${BUSY} of the last ${HERD_WINDOW_MIN} min ran >= ${HERD_PER_MIN} LDAP flows) — $MODE restart (restart $(( RECENT + 1 )) in 6h; next allowed after $(( NEXT_COOLDOWN / 60 )) min)"
+      _alert "Guard Dog: Authentik LDAP logins backed up, restarted on $SERVER_IDENTIFIER" \
+"Authentik's LDAP login flow has been running non-stop: ${BUSY} of the last ${HERD_WINDOW_MIN} minutes each ran ${HERD_PER_MIN} or more LDAP flows (a healthy box runs a short burst about once an hour).
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(_ts)
+
+This happens when the LDAP outpost's login cache expires while Authentik is slow: every TAK Server lookup then runs the full login flow, each one makes Authentik slower, and the backlog never clears. TAK logins and channel lookups slow down with it. The health check still passes, so nothing else catches it.
+
+Action: $ACTION.
+Restarts in the last 6 hours, including this one: $(( RECENT + 1 )). Next restart allowed after $(( NEXT_COOLDOWN / 60 )) minutes.
+"
+      _ak_restart
+      exit 0
     fi
   fi
 fi
