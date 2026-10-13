@@ -78110,7 +78110,11 @@ def run_takserver_deploy(config):
             # v10.3.0 W1.a: the policy id becomes two directory names under /etc and
             # /usr/share and is interpolated into shell commands below — a debsig
             # policy id is a 16-hex-digit key id, so accept nothing else.
-            if pid and not re.fullmatch(r'[0-9A-Fa-f]{16}', pid):
+            # NB `import re as …`: run_takserver_deploy does `import re` further down, which
+            # makes `re` a LOCAL for the whole function — a bare `re.` here is an
+            # UnboundLocalError (it was, on aws-noble's first W1.a redeploy).
+            import re as _re_pid
+            if pid and not _re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid):
                 log_step(f"⚠ Policy ID {pid[:40]!r} is not a 16-digit key id — skipping verification")
                 pid = ''
             if pid:

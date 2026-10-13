@@ -83,9 +83,27 @@ def test_debsig_verify_runs_with_a_system_path_and_no_shell():
 
 
 def test_policy_id_is_validated_before_use():
-    assert "re.fullmatch(r'[0-9A-Fa-f]{16}', pid)" in STEP3_CODE
-    assert STEP3_CODE.index("re.fullmatch(r'[0-9A-Fa-f]{16}', pid)") < STEP3_CODE.index('mkdir -p /usr/share/debsig/keyrings/')
+    assert "_re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid)" in STEP3_CODE
+    assert STEP3_CODE.index("_re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid)") < STEP3_CODE.index('mkdir -p /usr/share/debsig/keyrings/')
     for good in ('F06237936851F5B5', 'f06237936851f5b5'):
         assert re.fullmatch(r'[0-9A-Fa-f]{16}', good)
     for bad in ('F062379368', 'F06237936851F5B5; rm -rf /', '../../etc', ''):
         assert not re.fullmatch(r'[0-9A-Fa-f]{16}', bad)
+
+
+def test_step3_uses_no_module_name_the_function_makes_local():
+    """run_takserver_deploy does `import re` further down, so `re` is a LOCAL for the
+    whole function and a bare `re.` in Step 3 raises UnboundLocalError at runtime. That
+    is exactly how the first W1.a build failed on aws-noble (2026-10-13) while every
+    source-level test passed. Check the real scope table, not the text."""
+    import ast, symtable
+    tree = ast.parse(APP)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_takserver_deploy')
+    ns = symtable.symtable(ast.get_source_segment(APP, fn), 'app.py', 'exec').lookup('run_takserver_deploy').get_namespace()
+    used = set(re.findall(r'(?<![\w.])([a-z_][a-z0-9_]*)\.[a-z_]', STEP3_CODE))
+    for mod in sorted(used & {'re', 'os', 'shlex', 'subprocess', 'json', 'time', 'shutil'}):
+        try:
+            local = ns.lookup(mod).is_local()
+        except KeyError:
+            local = False
+        assert not local, f'Step 3 uses `{mod}.` but `{mod}` is local in run_takserver_deploy'
