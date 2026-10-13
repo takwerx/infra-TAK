@@ -292,9 +292,10 @@ EXEC_ALLOW = {
     # a flipped box). Tightly gated — see _check_git: -C <root-era module dir>
     # only; home-resident repos run git DIRECTLY as the console user, never here.
     'git',
-    # transient-unit launcher — a DIRECT root-exec primitive, so gated to the ONE
-    # fixed kernel-patch shape (see _check_systemd_run). No broader than the
-    # already-allowed `systemctl start <console-written-unit>`.
+    # transient-unit launcher — a DIRECT root-exec primitive, so gated to THREE
+    # fixed shapes (kernel-patch, non-root migrate, OS upgrade — see
+    # _check_systemd_run). No broader than the already-allowed
+    # `systemctl start <console-written-unit>`.
     'systemd-run',
     # v10.1.0 Leg 6 (WiFi Join) — these were MISSING, so the whole WiFi card
     # no-op'd on non-root boxes (scan denied → empty list; add denied at
@@ -417,6 +418,10 @@ PATH_ALLOW = (
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
+    # v10.3.0 W4: OS-upgrade job state (status file, baseline.json, pre/ snapshot).
+    # Root-owned; the console mkdirs it, writes the baseline + seeds the status,
+    # and reads the status back after each console restart/reboot.
+    '/var/lib/infratak-os-upgrade/',
     '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
@@ -462,6 +467,9 @@ PATH_ALLOW_EXACT = (
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
+    '/var/lib/infratak-os-upgrade.sh',           # v10.3.0 W4: OS-upgrade job script (same
+                                                 # pairing — written by the console, run only
+                                                 # by the third gated systemd-run shape)
     '/etc/default/takserver',                    # TAK Server JVM heap (snapshot/restore + deploy)
     # Relay tunnel config (Connectivity → Connect a Relay). _CONN_WG_IF is the
     # fleet constant 'wg0', so this is one fixed file — NOT the /etc/wireguard/
@@ -1347,13 +1355,38 @@ _MIGRATE_ALLOWED_PROPERTIES = {
     'SELinuxContext=system_u:system_r:unconfined_service_t:s0',
 }
 
+# v10.3.0 W4: THIRD fixed systemd-run shape — the console-driven in-place Ubuntu
+# 22.04 -> 24.04 upgrade (app.py _os_upgrade_start_job). Same inherent power as
+# the kernel-patch job (root runs a console-written script), pinned the same way:
+# this unit name, exactly `/bin/bash /var/lib/infratak-os-upgrade.sh`, the two
+# append-log properties, and the kernel-patch --setenv allowlist plus ONE extra
+# pinned by full KEY=VALUE: RELEASE_UPGRADER_NO_SCREEN=1. ubuntu-release-upgrader
+# re-execs itself inside GNU screen unless that variable is set
+# (DistUpgradeMain.py, ubuntu/noble), and a transient unit has no tty for screen.
+# Nothing else widens; a fourth unit or an unpinned --setenv fails
+# /redteam-selfaudit (REGRESSION:broker-systemd-run).
+_OSUP_UNIT_NAME = 'infratak-os-upgrade'
+_OSUP_SCRIPT = '/var/lib/infratak-os-upgrade.sh'
+_OSUP_LOG = '/var/log/infratak-os-upgrade.log'
+_OSUP_ALLOWED_PROPERTIES = {
+    'StandardOutput=append:' + _OSUP_LOG,
+    'StandardError=append:' + _OSUP_LOG,
+}
+_OSUP_ALLOWED_SETENV = _SYSTEMD_RUN_ALLOWED_SETENV | {
+    'RELEASE_UPGRADER_NO_SCREEN=1',
+}
+
 
 def _check_systemd_run(argv):
-    """Allow ONLY the two fixed transient-unit invocations: the kernel-patch job
-    and the non-root migration job. Everything else is denied."""
+    """Allow ONLY the three fixed transient-unit invocations: the kernel-patch job,
+    the non-root migration job and the OS-upgrade job (v10.3.0 W4). Everything
+    else is denied. --setenv values are pinned by FULL `KEY=VALUE` per unit — an
+    env var is enough to turn the fixed `/bin/bash <script>` into arbitrary root
+    exec (BASH_ENV, LD_PRELOAD, PATH), so the key alone is never enough."""
     saw_unit = None
     positionals = []
     props = []
+    setenvs = []
     for a in argv[1:]:
         if positionals:
             # past the launched command — the rest are ITS args (validated as
@@ -1364,9 +1397,9 @@ def _check_systemd_run(argv):
             continue
         if a.startswith('--unit='):
             unit = a.split('=', 1)[1]
-            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME):
+            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME, _OSUP_UNIT_NAME):
                 raise Denied(f'systemd-run: only units {_KPATCH_UNIT_NAME}/'
-                             f'{_MIGRATE_UNIT_NAME} allowed')
+                             f'{_MIGRATE_UNIT_NAME}/{_OSUP_UNIT_NAME} allowed')
             saw_unit = unit
             continue
         if a.startswith('--description='):
@@ -1375,20 +1408,30 @@ def _check_systemd_run(argv):
             props.append(a.split('=', 1)[1])
             continue
         if a.startswith('--setenv='):
-            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_SETENV:
-                raise Denied(f'systemd-run: setenv not allowed: {a}')
+            setenvs.append(a.split('=', 1)[1])   # the FULL KEY=VALUE, checked per unit below
             continue
         if a.startswith('-'):
             raise Denied(f'systemd-run: flag not allowed: {a}')
         positionals.append(a)
     if saw_unit is None:
         raise Denied('systemd-run: missing required --unit=')
+    allowed_setenv = _OSUP_ALLOWED_SETENV if saw_unit == _OSUP_UNIT_NAME else _SYSTEMD_RUN_ALLOWED_SETENV
+    for s in setenvs:
+        if s not in allowed_setenv:
+            raise Denied(f'systemd-run: setenv not allowed: --setenv={s}')
     if saw_unit == _KPATCH_UNIT_NAME:
         for p in props:
             if p not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
                 raise Denied(f'systemd-run: property not allowed: --property={p}')
         if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
             raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
+        return
+    if saw_unit == _OSUP_UNIT_NAME:
+        for p in props:
+            if p not in _OSUP_ALLOWED_PROPERTIES:
+                raise Denied(f'systemd-run: property not allowed: --property={p}')
+        if positionals != ['/bin/bash', _OSUP_SCRIPT]:
+            raise Denied(f'systemd-run: only `/bin/bash {_OSUP_SCRIPT}` allowed')
         return
     # migrate shape: /bin/bash <install>/scripts/migrate-console-nonroot.sh
     # --apply --auto-rollback. The install dir varies per box; the script is
