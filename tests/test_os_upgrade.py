@@ -106,7 +106,7 @@ def test_script_steps_in_plan_order(script):
 def test_script_names_the_step_before_doing_anything(script):
     # step() writes running:<name> to the status file; fail() writes failed:<name>
     assert 'step() { echo "running:$1" > "$STATUS";' in script
-    assert 'fail() { echo "failed:$1" > "$STATUS";' in script
+    assert 'fail() {\n  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"' in script
     # every fail call names the step it belongs to
     for m in re.finditer(r'\bfail (\S+) ', script):
         assert m.group(1) in STEPS, m.group(0)
@@ -208,7 +208,7 @@ class Box:
                  tak_installed=True, container=False, db_host='127.0.0.1', clusters=(('18', 'main', '5432', 'online'),),
                  root_free_gb=40, boot_free_mb=400, busy=(), systemd_run=True, broker=(True, 'root console'),
                  upgrader_ver='1:22.04.20', prompt='lts', containers=('authentik-server', 'tak-portal'),
-                 problems=(), docker_err=''):
+                 problems=(), docker_err='', pending=(), pending_err='', reboot_pkgs=()):
         calls = self.calls = []
         exists = {'/opt/tak/CoreConfig.xml': tak_installed, '/usr/bin/systemd-run': systemd_run,
                   '/bin/systemd-run': False, '/usr/bin/do-release-upgrade': bool(upgrader_ver),
@@ -247,6 +247,8 @@ class Box:
             _os_upgrade_running_jobs=lambda: list(busy),
             _os_upgrade_broker_current=lambda: broker,
             _os_upgrade_containers=lambda: (None if docker_err else list(containers), list(problems), docker_err),
+            _os_upgrade_pending_updates=lambda: ((None, pending_err) if pending_err else (list(pending), '')),
+            _os_upgrade_reboot_blockers=lambda: list(reboot_pkgs),
         )
         exec(compile(_fn('_os_upgrade_preflight'), 'app.py:_os_upgrade_preflight', 'exec'), self.ns)
 
@@ -262,7 +264,8 @@ def test_preflight_all_green_on_a_ready_box():
     pf = Box().run()
     assert pf['ok'] is True
     assert [c['name'] for c in pf['checks']] == ['os_type', 'takserver_58', 'tak_db_local', 'disk',
-                                                 'no_job_running', 'systemd_run', 'release_upgrader', 'containers']
+                                                 'no_job_running', 'systemd_run', 'release_upgrader',
+                                                 'os_up_to_date', 'no_reboot_pending', 'containers']
     assert all(c['pass'] for c in pf['checks'])
     assert pf['baseline']['containers'] == ['authentik-server', 'tak-portal']
     assert pf['baseline']['services'] == {'takserver': 'active', 'docker': 'active'}
@@ -690,3 +693,137 @@ def test_scan_wires_the_guard_for_the_broker_file(scan):
     src = SCAN_PY.read_text()
     i = src.index("if rel.endswith('takwerx_broker.py'):")
     assert '_regressions_broker_systemd_run(src, out)' in src[i:i + 300]
+
+
+# ---------------------------------------------------------------------------
+# W5 run 1 (aws-jammy, 2026-10-13): Ubuntu's own gates, asked the way it asks them
+# ---------------------------------------------------------------------------
+JAMMY_PENDING = ['libarchive13', 'libfreetype6', 'libpng16-16', 'libsgutils2-2', 'libx11-data', 'libxml2',
+                 'linux-tools-common', 'sg3-utils', 'sg3-utils-udev', 'snapd', 'sosreport', 'sudo']
+
+
+def test_preflight_refuses_pending_updates_like_do_release_upgrade():
+    pf = Box(pending=JAMMY_PENDING).run()
+    c = _check(pf, 'os_up_to_date')
+    assert pf['ok'] is False and c['pass'] is False
+    assert '12 update(s) pending' in c['detail'] and 'libarchive13' in c['detail'] and 'Install updates' in c['detail']
+    c = _check(Box(pending_err='E: could not open lock file').run(), 'os_up_to_date')
+    assert c['pass'] is False and 'could not ask apt' in c['detail']        # unknown is a refusal, never a pass
+    assert _check(Box(pending=()).run(), 'os_up_to_date')['pass'] is True
+
+
+def test_preflight_refuses_a_pending_reboot():
+    c = _check(Box(reboot_pkgs=['linux-image-6.8.0-1070-aws']).run(), 'no_reboot_pending')
+    assert c['pass'] is False and 'linux-image-6.8.0-1070-aws' in c['detail'] and 'Reboot' in c['detail']
+    assert _check(Box().run(), 'no_reboot_pending')['pass'] is True
+
+
+def test_pending_updates_uses_upstreams_rule_through_system_python():
+    consts = APP[APP.index('_OS_UPGRADE_PENDING_PY = ('):APP.index('\n\n\ndef _os_upgrade_pending_updates')]
+    ns = {}
+    exec(consts, ns)
+    py = ns['_OS_UPGRADE_PENDING_PY']
+    assert 'apt.Cache()' in py and 'p.is_upgradable' in py
+    assert "'Phased-Update-Percentage' not in p.candidate.record" in py      # upstream's phasing exemption
+    body = _fn('_os_upgrade_pending_updates')
+    assert "['/usr/bin/python3', '-I', '-c', _OS_UPGRADE_PENDING_PY]" in body  # system apt bindings, isolated
+    assert "env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'" in body
+    assert '_sudo_wrap' not in body                                          # read-only, unprivileged
+    compile(py, 'pending.py', 'exec')
+
+
+@pytest.mark.parametrize('content,want', [
+    (b'', []),
+    (b'libc6\n', ['libc6']),
+    (b'linux-base\nopenssh-server\n', ['linux-base']),
+    (b'linux-image-6.8.0-1070-aws\ndbus\nlinux-image-6.8.0-1070-aws\n', ['linux-image-6.8.0-1070-aws']),
+    (b'dbus\nopenssh-server\n', []),
+    (b'libc6-dev\nlinux-headers-6.8\n', []),            # exact name for libc6/linux-base, prefix only for linux-image-
+])
+def test_reboot_blockers_match_upstream(content, want):
+    import io
+    ns = {'open': lambda p, m='r': io.BytesIO(content) if p == '/var/run/reboot-required.pkgs' else open(p, m)}
+    exec(compile(_fn('_os_upgrade_reboot_blockers'), 'app.py', 'exec'), ns)
+    assert ns['_os_upgrade_reboot_blockers']() == want
+
+
+def test_reboot_blockers_absent_file_is_no_reboot():
+    def nope(p, m='r'):
+        raise FileNotFoundError(p)
+    ns = {'open': nope}
+    exec(compile(_fn('_os_upgrade_reboot_blockers'), 'app.py', 'exec'), ns)
+    assert ns['_os_upgrade_reboot_blockers']() == []
+
+
+def test_versions_recorded_first_thing_in_pre_snapshot(script):
+    s = _between(script, 'pre-snapshot', 'pin-pg16')
+    rec = s.index('dpkg-query -W -f=\'${Package} ${Version}\\n\' | sort > "$PRE/dpkg-versions.txt"')
+    assert s.index('rm -f "$PRE/dpkg-versions.txt"') < rec          # never compare against a previous run's list
+    assert rec < s.index('cp -a /etc/apt/sources.list.d/')           # before anything else in the step
+
+
+def _run_fail(tmp_path, *, changed, os_version='22.04'):
+    """Execute the script's real fail() in a sandbox: every absolute path it touches is
+    rewritten under tmp_path, dpkg-query is a stub on PATH."""
+    sc = _ns()['_os_upgrade_script']('/opt/infratak', 'takwerx', 5001)
+    i = sc.index('fail() {')
+    fn = sc[i:sc.index('exit 1\n}', i) + 8]
+    root = str(tmp_path)
+    assert '/var/' not in fn.replace('$PRE', '')   # fail() touches /etc only; nothing else to sandbox
+    fn = fn.replace('/etc/', root + '/etc/')
+    (tmp_path / 'bin').mkdir()
+    (tmp_path / 'pre').mkdir()
+    (tmp_path / 'pre' / 'dpkg-versions.txt').write_text('base-files 12ubuntu4.7\nsudo 1.9.9-1ubuntu2.6\n')
+    now = 'base-files 12ubuntu4.7\nsudo 1.9.9-1ubuntu2.7\n' if changed else 'sudo 1.9.9-1ubuntu2.6\nbase-files 12ubuntu4.7\n'
+    stub = tmp_path / 'bin' / 'dpkg-query'
+    stub.write_text('#!/bin/bash\nprintf "%s" "' + now + '"\n')
+    stub.chmod(0o755)
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+              'etc/update-manager/release-upgrades.d/infratak.cfg', 'etc/update-manager/release-upgrades'):
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_text('Prompt=lts\n' if f.endswith('release-upgrades') else 'x\n')
+    (tmp_path / 'pre' / 'release-upgrades').write_text('Prompt=never\n')
+    (tmp_path / 'etc' / 'os-release').write_text(f'ID=ubuntu\nVERSION_ID="{os_version}"\n')
+    prog = (f'STATUS={root}/status\nPRE={root}/pre\nTS() {{ echo T; }}\n' + fn + '\nfail release-upgrade "exited 1"\n')
+    r = subprocess.run(['bash', '-c', prog], capture_output=True, text=True,
+                       env={'PATH': f'{root}/bin:/usr/bin:/bin'})
+    return r, (tmp_path / 'status').read_text().strip()
+
+
+def test_fail_on_an_unchanged_box_undoes_the_jobs_settings(tmp_path):
+    r, status = _run_fail(tmp_path, changed=False)
+    assert r.returncode == 1 and status == 'failed:release-upgrade'
+    assert 'UNCHANGED' in r.stdout and 'run the upgrade again' in r.stdout
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+              'etc/update-manager/release-upgrades.d/infratak.cfg'):
+        assert not (tmp_path / f).exists(), f
+    assert (tmp_path / 'etc/update-manager/release-upgrades').read_text() == 'Prompt=never\n'   # restored
+
+
+def test_fail_on_a_partly_upgraded_box_keeps_the_pins_and_says_restore(tmp_path):
+    r, status = _run_fail(tmp_path, changed=True)
+    assert r.returncode == 1 and status == 'failed:release-upgrade'
+    assert 'PARTLY UPGRADED' in r.stdout and 'Restore your snapshot' in r.stdout and 'UNCHANGED' not in r.stdout
+    assert (tmp_path / 'etc/apt/preferences.d/infratak-no-pg16').exists()        # pins protect a manual recovery
+    assert (tmp_path / 'etc/apt/apt.conf.d/99infratak-os-upgrade').exists()
+
+
+def test_fail_after_the_flip_adds_nothing(tmp_path):
+    r, _ = _run_fail(tmp_path, changed=True, os_version='24.04')
+    assert 'PARTLY UPGRADED' not in r.stdout and 'UNCHANGED' not in r.stdout   # the step's own message stands
+
+
+def test_diagnostics_bundle_carries_the_upgrade_run():
+    i = APP.index('# v10.3.0 W4: the console-driven 22.04 -> 24.04 upgrade. Its status file names the step')
+    blk = APP[i:i + 2200]
+    assert '_os_upgrade_read_status()' in blk and '_diag_log_lines(_OS_UPGRADE_LOGFILE' in blk
+    assert "'/var/log/dist-upgrade/main.log'" in blk
+    for marker in ('FATAL', 'UNCHANGED', 'PARTLY UPGRADED', 'Please '):
+        assert marker in blk
+
+
+def test_console_labels_the_new_checks():
+    html = (REPO / 'templates' / 'console.html').read_text(encoding='utf-8')
+    assert "os_up_to_date:'All Ubuntu updates installed'" in html
+    assert "no_reboot_pending:'No reboot pending'" in html
+    assert 'UNCHANGED means nothing was touched' in html

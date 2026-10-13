@@ -1162,7 +1162,7 @@ checkKernelPatch();
 // gone — reload to the login page; the card re-renders from the status file.
 var _osupOsType='{{ settings.get("os_type","") }}';
 var _osupPollTimer=null,_osupGap=0,_osupLastState='',_osupSawGap=false,_osupStartBusy=false;
-var _OSUP_LABELS={os_type:'Operating system',takserver_58:'TAK Server 5.8 or newer (or not installed)',tak_db_local:'TAK database location',disk:'Free disk space',no_job_running:'No other job running',systemd_run:'Detached job runner (systemd-run / broker)',release_upgrader:'Ubuntu release upgrader',containers:'Containers (baseline for the after-reboot check)',acknowledge:'Snapshot acknowledgment'};
+var _OSUP_LABELS={os_type:'Operating system',takserver_58:'TAK Server 5.8 or newer (or not installed)',tak_db_local:'TAK database location',disk:'Free disk space',no_job_running:'No other job running',systemd_run:'Detached job runner (systemd-run / broker)',release_upgrader:'Ubuntu release upgrader',os_up_to_date:'All Ubuntu updates installed',no_reboot_pending:'No reboot pending',containers:'Containers (baseline for the after-reboot check)',acknowledge:'Snapshot acknowledgment'};
 var _OSUP_STEP_LABELS={'pre-snapshot':'snapshot','pin-pg16':'pin PG','release-upgrade':'release upgrade','repos-noble':'repos','venv-rebuild':'console venv','reassert':'re-assert','restart-console':'console restart','reboot':'reboot'};
 function _osupShow(which){
     var card=document.getElementById('os-upgrade-card'); if(!card)return;
@@ -1209,7 +1209,7 @@ function _osupRenderResult(d){
         head.innerHTML='&#10007; Upgrade FAILED at step '+_osupEsc(d.step||'?');
         var hint='';
         if(d.step==='verify')hint='The box rebooted into Ubuntu 24.04 but the after-reboot check found something missing: '+(d.detail||'')+'. Open the affected module page; the console itself is up.';
-        else if(d.step==='release-upgrade')hint='do-release-upgrade did not complete. If the log stops before any package was unpacked this box is unchanged and still on 22.04; otherwise restore the snapshot you took.';
+        else if(d.step==='release-upgrade')hint='Ubuntu\'s upgrader did not complete. The last lines of the log say which it is: UNCHANGED means nothing was touched, so fix the cause and run it again; PARTLY UPGRADED means restore the snapshot you took.';
         else if(d.step==='venv-rebuild')hint='The box is on Ubuntu 24.04 but the console\'s Python environment could not be rebuilt. If you can read this the pre-upgrade venv was restored; the log names the command to run.';
         else if(d.step==='pre-snapshot'||d.step==='pin-pg16')hint='Nothing was upgraded — this box is unchanged. Read the log, fix the cause and press Check & upgrade again.';
         else hint='The log below names the step and the reason. The box may be partly upgraded: read the log before doing anything else.';

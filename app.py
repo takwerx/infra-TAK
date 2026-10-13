@@ -8576,6 +8576,29 @@ def _diag_section_change_trail(settings):
         runs = sum('job starting' in l for l in kp)
         out.append(f"OS patch job log: {runs} run(s) in the recent tail; start/end, warnings and TAK/PostgreSQL/Java lines:")
         out.extend('  ' + l[:220] for l in keep[-40:])
+    # v10.3.0 W4: the console-driven 22.04 -> 24.04 upgrade. Its status file names the step, its
+    # log says why and whether the box is unchanged; Ubuntu's upgrader keeps its own log. A failed
+    # run must reach us in the report an operator sends, not only in a panel they closed.
+    try:
+        ou_status = _os_upgrade_read_status()
+    except Exception:
+        ou_status = ''
+    ou = _diag_log_lines(_OS_UPGRADE_LOGFILE, 1024 * 1024) if os.path.exists(_OS_UPGRADE_LOGFILE) else None
+    if ou_status or os.path.exists(_OS_UPGRADE_LOGFILE):
+        out.append(f"OS upgrade 22.04 -> 24.04 status: {ou_status or 'none recorded'}")
+        if ou is None:
+            out.append(f"OS upgrade job log: {_diag_unreadable(_OS_UPGRADE_LOGFILE)}")
+        else:
+            keep = [l for l in ou if re.search(r'=== |FATAL|WARN|UNCHANGED|PARTLY UPGRADED|re-enabled|'
+                                                r'pg_lsclusters|venv|rebooting|Please |^E: ', l)]
+            out.append(f"OS upgrade job log: {sum('upgrade 22.04 -> 24.04 starting' in l for l in ou)} run(s); "
+                       f"steps, failures and the upgrader's own refusals:")
+            out.extend('  ' + l[:220] for l in keep[-60:])
+        if os.path.exists('/var/log/dist-upgrade'):
+            dl = _diag_log_lines('/var/log/dist-upgrade/main.log', 256 * 1024)
+            if dl:
+                out.append("ubuntu-release-upgrader main.log (last 25 lines):")
+                out.extend('  ' + l[:220] for l in dl[-25:])
     boots = _diag_cmd(['journalctl', '--list-boots', '--no-pager', '-q'], timeout=20)
     bl = [l for l in boots.splitlines() if l.strip()]
     out.append(f"boots in the journal: {len(bl)} (newest last)")
@@ -80542,6 +80565,55 @@ def _os_upgrade_broker_current():
     return True, f'broker reachable on current source {want[:12]}'
 
 
+# Ubuntu's own refusal rule, verbatim in effect (do-release-upgrade __main__, ubuntu/jammy-updates):
+# open the apt cache, and if ANY package is upgradable whose candidate is not mid-phasing
+# ('Phased-Update-Percentage' in its record), print "Please install all available updates for
+# your release before upgrading." and exit 1. Run by the SYSTEM python3 (python3-apt ships with
+# the release upgrader; the console venv has no apt bindings), isolated (-I: no cwd/user site on
+# sys.path), read-only, as the console user.
+_OS_UPGRADE_PENDING_PY = (
+    "import apt, json\n"
+    "c = apt.Cache()\n"
+    "print(json.dumps(sorted(p.name for p in c if p.is_upgradable\n"
+    "                        and 'Phased-Update-Percentage' not in p.candidate.record)))\n"
+)
+
+
+def _os_upgrade_pending_updates():
+    """(names, error): the packages do-release-upgrade would refuse over — [] when none,
+    None + a reason when apt could not be asked. v10.3.0 W4, field 2026-10-13 (aws-jammy,
+    W5 run 1): the preflight was all green and the job died at release-upgrade with
+    "Please install all available updates" over 12 pending security updates."""
+    env = dict(os.environ)
+    env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+    try:
+        r = subprocess.run(['/usr/bin/python3', '-I', '-c', _OS_UPGRADE_PENDING_PY],
+                           capture_output=True, text=True, timeout=120, env=env)
+    except Exception as e:
+        return None, str(e)[:160]
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or '').strip().splitlines()
+        return None, (tail[-1][:200] if tail else f'exit {r.returncode}')
+    try:
+        names = json.loads((r.stdout or '').strip().splitlines()[-1])
+        return [str(n) for n in names], ''
+    except Exception as e:
+        return None, f'unreadable answer from apt: {str(e)[:100]}'
+
+
+def _os_upgrade_reboot_blockers():
+    """Packages that make do-release-upgrade say "You have not rebooted after updating a package
+    which requires a reboot" — same file and same match as upstream: a line in
+    /var/run/reboot-required.pkgs equal to libc6 or linux-base, or starting linux-image-."""
+    try:
+        with open('/var/run/reboot-required.pkgs', 'rb') as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return []
+    return sorted({l.decode('utf-8', 'replace') for l in lines
+                   if l in (b'libc6', b'linux-base') or l.startswith(b'linux-image-')})
+
+
 def _os_upgrade_preflight(for_start=False, data=None):
     """Every check in PLAN-v10.3.0 §4 W4. Returns {ok, checks:[{name,pass,detail,notice}],
     irreversible:[...], baseline:{...}, os_type, os_name}. Read-only: nothing here changes
@@ -80647,6 +80719,22 @@ def _os_upgrade_preflight(for_start=False, data=None):
     else:
         add('release_upgrader', True, f"ubuntu-release-upgrader-core {upg_ver}; Prompt={prompt or 'lts (default)'}")
 
+    # 7b. Ubuntu's own two gates, asked the way do-release-upgrade asks them — a green preflight
+    #     the upgrader then refuses is a lie (aws-jammy W5 run 1, 2026-10-13).
+    pend, perr = _os_upgrade_pending_updates()
+    if pend is None:
+        add('os_up_to_date', False, f'could not ask apt which updates are pending: {perr or "no answer"}')
+    elif pend:
+        add('os_up_to_date', False, f'{len(pend)} update(s) pending ({", ".join(pend[:6])}'
+            f'{", …" if len(pend) > 6 else ""}) — Ubuntu\'s upgrader refuses until every update is '
+            'installed. Use Install updates on this page, then Re-check')
+    else:
+        add('os_up_to_date', True, 'every available update is installed')
+    rb = _os_upgrade_reboot_blockers()
+    add('no_reboot_pending', not rb, 'no reboot pending' if not rb else
+        'a reboot is pending after updating ' + ', '.join(rb[:4]) +
+        ' — reboot first (the Reboot button on this page), then Re-check')
+
     # 8. Containers — the post-reboot comparison needs an honest baseline.
     running, problems, c_err = _os_upgrade_containers()
     if running is None:
@@ -80707,7 +80795,23 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
         f'PG_EXPECT={q(pg_expect)}\n'
         'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
         'step() { echo "running:$1" > "$STATUS"; echo "[$(TS)] === step $1 ==="; }\n'
-        'fail() { echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"; exit 1; }\n'
+        # A failure that left every package exactly as it was (compared against the version list
+        # taken first thing in pre-snapshot) undoes the job's own temporary settings and says the
+        # box is unchanged — fix the cause, run it again. Anything else that is still 22.04 is
+        # partly upgraded: say so plainly, keep the pins (they protect a manual recovery), and
+        # point at the snapshot. On 24.04 the failing step's own message already says what to do.
+        'fail() {\n'
+        '  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"\n'
+        '  if [ ! -s "$PRE/dpkg-versions.txt" ] || dpkg-query -W -f=\'${Package} ${Version}\\n\' 2>/dev/null | sort | cmp -s - "$PRE/dpkg-versions.txt"; then\n'
+        '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+        '    [ -f "$PRE/release-upgrades" ] && cp -a "$PRE/release-upgrades" /etc/update-manager/release-upgrades\n'
+        '    echo "[$(TS)] UNCHANGED: no package was touched — this box is exactly as it was and the upgrade\'s temporary settings were removed. Fix the cause above and run the upgrade again."\n'
+        '  else\n'
+        '    . /etc/os-release\n'
+        '    [ "$VERSION_ID" = "22.04" ] && echo "[$(TS)] PARTLY UPGRADED: packages changed before the failure. Restore your snapshot; do not run the upgrade again on this box."\n'
+        '  fi\n'
+        '  exit 1\n'
+        '}\n'
         'echo "[$(TS)] === infra-TAK OS upgrade 22.04 -> 24.04 starting (pid $$) ==="\n'
         '. /etc/os-release\n'
         '[ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "22.04" ] || fail pre-snapshot "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 22.04"\n'
@@ -80743,6 +80847,8 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
         # ---- 1. pre-snapshot ------------------------------------------------------
         'step pre-snapshot\n'
         'mkdir -p "$PRE/sources.list.d" "$PRE/apt" || fail pre-snapshot "cannot create $PRE"\n'
+        'rm -f "$PRE/dpkg-versions.txt"\n'
+        'dpkg-query -W -f=\'${Package} ${Version}\\n\' | sort > "$PRE/dpkg-versions.txt" || fail pre-snapshot "could not record the installed package versions"\n'
         'cp -a /etc/apt/sources.list.d/*.list "$PRE/sources.list.d/" 2>/dev/null || true\n'
         'cp -a /etc/apt/sources.list "$PRE/apt/sources.list" 2>/dev/null || true\n'
         'cp -a /etc/ssl/openssl.cnf "$PRE/openssl.cnf" 2>/dev/null || true\n'
@@ -80792,7 +80898,7 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
         'rc=$?\n'
         '. /etc/os-release\n'
         'if [ "$rc" -ne 0 ]; then\n'
-        '  fail release-upgrade "do-release-upgrade exited $rc; this box reports ${PRETTY_NAME:-unknown}. If the log above stops before any package was unpacked the box is unchanged — otherwise restore your snapshot"\n'
+        '  fail release-upgrade "do-release-upgrade exited $rc (its reason is the line above); this box reports ${PRETTY_NAME:-unknown}"\n'
         'fi\n'
         '[ "$VERSION_ID" = "24.04" ] || fail release-upgrade "do-release-upgrade exited 0 but /etc/os-release still says ${PRETTY_NAME:-unknown}"\n'
         'echo "[$(TS)] now running $PRETTY_NAME"\n'
