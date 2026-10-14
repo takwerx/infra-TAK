@@ -78263,9 +78263,15 @@ def run_takserver_deploy(config):
             # makes `re` a LOCAL for the whole function — a bare `re.` here is an
             # UnboundLocalError (it was, on aws-noble's first W1.a redeploy).
             import re as _re_pid
-            if pid and not _re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid):
-                log_step(f"⚠ Policy ID {pid[:40]!r} is not a 16-digit key id — skipping verification")
-                pid = ''
+            # v10.3.0 (operator decision 2026-10-13: "deploy should stop"): once a key and a
+            # policy were uploaded, verification is enforced — a policy that names no usable
+            # key id cannot verify anything, so it refuses instead of silently skipping
+            # (which is what an empty id used to do, without even a log line).
+            if not pid or not _re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid):
+                log_step(f"✗ FATAL: the uploaded policy file names no usable key id ({pid[:40]!r}) — "
+                         "the package cannot be verified. Refusing to install. Nothing has been installed.")
+                log_step("  Re-download the package, GPG key and deb_policy.pol from tak.gov and upload all three again.")
+                deploy_status.update({'error': True, 'running': False}); return
             if pid:
                 _kr = f'/usr/share/debsig/keyrings/{pid}/debsig.gpg'
                 run_cmd(f'mkdir -p /usr/share/debsig/keyrings/{pid}')
@@ -78305,13 +78311,23 @@ def run_takserver_deploy(config):
                     v = subprocess.CompletedProcess(['debsig-verify'], -1, '', f'debsig-verify could not run: {_dve}')
                 if v.returncode == 0: log_step("✓ Package signature VERIFIED")
                 else:
-                    log_step(f"⚠ Verification exit code {v.returncode} — installing anyway")
+                    # v10.3.0 (operator decision 2026-10-13: "deploy should stop"). Until W1.a this
+                    # branch printed "installing anyway" on EVERY non-root box because the check
+                    # itself could not run; now that it runs, a failure means the package does not
+                    # match the key and policy the operator supplied (corrupt, wrong file, or
+                    # tampered) — or that it could not be checked at all. Neither is installable
+                    # on a CJIS-class box. Refuse before Step 4 touches dpkg.
+                    log_step(f"✗ FATAL: package signature verification FAILED (debsig-verify exit "
+                             f"{v.returncode}) — refusing to install {os.path.basename(pkg)}.")
                     if v.stdout.strip():
                         for line in v.stdout.strip().split('\n'):
                             if line.strip(): log_step(f"  {line.strip()}")
                     if v.stderr.strip():
                         for line in v.stderr.strip().split('\n'):
                             if line.strip(): log_step(f"  {line.strip()}")
+                    log_step("  Nothing has been installed. The package does not match the GPG key and policy you "
+                             "uploaded: re-download all three from tak.gov, delete the old uploads, and upload them again.")
+                    deploy_status.update({'error': True, 'running': False}); return
         else:
             log_step("No GPG key/policy — skipping verification")
 

@@ -107,3 +107,33 @@ def test_step3_uses_no_module_name_the_function_makes_local():
         except KeyError:
             local = False
         assert not local, f'Step 3 uses `{mod}.` but `{mod}` is local in run_takserver_deploy'
+
+
+
+# ---------------------------------------------------------------------------
+# Operator decision 2026-10-13: "deploy should stop" — verification is enforced once a
+# key and a policy were uploaded; no key/policy at all still skips (logged, unchanged).
+# ---------------------------------------------------------------------------
+def test_a_failed_signature_stops_the_deploy_before_install():
+    assert 'installing anyway' not in STEP3_CODE
+    i = STEP3_CODE.index('if v.returncode == 0: log_step("✓ Package signature VERIFIED")')
+    fail = STEP3_CODE[i:STEP3_CODE.index("else:\n            log_step(\"No GPG key/policy", i)]
+    assert 'FATAL: package signature verification FAILED' in fail
+    assert "deploy_status.update({'error': True, 'running': False}); return" in fail
+    assert 'Nothing has been installed' in fail
+
+
+def test_a_policy_without_a_usable_key_id_stops_the_deploy():
+    i = STEP3_CODE.index("if not pid or not _re_pid.fullmatch(r'[0-9A-Fa-f]{16}', pid):")
+    blk = STEP3_CODE[i:STEP3_CODE.index("if pid:", i + 10)]
+    assert 'FATAL' in blk and "deploy_status.update({'error': True, 'running': False}); return" in blk
+    assert 'skipping verification' not in STEP3_CODE.split('No GPG key/policy')[0]   # only the no-upload case skips
+
+
+def test_no_key_and_policy_still_skips_with_a_log_line():
+    assert 'log_step("No GPG key/policy — skipping verification")' in STEP3_CODE
+
+
+def test_refusal_happens_before_anything_is_installed():
+    step3_end = APP.index('━━━ Step 4/9: Installing TAK Server ━━━')
+    assert APP.index('FATAL: package signature verification FAILED') < step3_end
