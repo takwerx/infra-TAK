@@ -163,6 +163,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="flex:1;min-width:260px">
 <div style="font-size:13px;font-weight:600;color:var(--cyan)">&#11014; Upgrade to Ubuntu 24.04 LTS</div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">This box runs Ubuntu 22.04, whose standard support ends in April 2027. The console can upgrade it in place: it checks the box first, shows you exactly what cannot be undone, then runs the whole upgrade &mdash; repositories, the console's Python environment, PostgreSQL, the reboot &mdash; with no SSH session. Take a VPS snapshot or an off-box backup first: there is no rollback.</div>
+<div style="font-size:11px;color:var(--yellow);margin-top:6px;line-height:1.5">Requires TAK Server 5.8 or newer. A box still on 5.7 runs the 5.8 update from the TAK Server page first, then comes back here.</div>
 </div>
 <div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
 <button type="button" onclick="osupOpenPreflight()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>

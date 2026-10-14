@@ -976,3 +976,11 @@ def test_baseline_skips_os_alias_links_and_snap_units():
     assert 'mediamtx.service' in asked and 'tak-health.service' in asked
     for os_unit in ('sshd.service', 'syslog.service', 'chronyd.service', 'snap.amazon-ssm-agent.amazon-ssm-agent.service'):
         assert os_unit not in asked, os_unit
+
+
+def test_card_states_the_58_requirement_before_the_click():
+    """Operator, 2026-10-14: a 5.7 box must be told up front, not only inside the check window."""
+    html = (REPO / 'templates' / 'console.html').read_text(encoding='utf-8')
+    i = html.index('id="osup-idle"')
+    card = html[i:html.index('id="osup-progress"', i)]
+    assert 'Requires TAK Server 5.8 or newer' in card and 'TAK Server page first' in card
