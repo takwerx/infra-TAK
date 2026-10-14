@@ -14,15 +14,16 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Docker TAK: a stale PostgreSQL socket lock no longer keeps takserver-db down after a reboot.
+"""Docker TAK: stale PostgreSQL lock files no longer keep takserver-db down after a restart.
 
-Field 2026-10-14: after a reboot the Docker TAK database container came up running but
+Field 2026-10-14: after a restart the Docker TAK database container came up running but
 PostgreSQL refused to start —
     FATAL: lock file "/run/postgresql/.s.PGSQL.5432.lock" already exists
     HINT: Is another postmaster (PID 9) using socket file "/run/postgresql/.s.PGSQL.5432"?
 TAK's db entrypoint does not pass the stop signal on, so PostgreSQL is always SIGKILLed and its
-lock stays in the container's writable layer. Two halves: new containers get /run/postgresql as
-a tmpfs (empty at every start), and existing containers are healed by the console.
+locks survive: $PGDATA/postmaster.pid, /run/postgresql/… and /tmp/… (the /tmp one was found live,
+when a first heal that cleared only /run/postgresql hit the identical refusal on /tmp). The
+console heals: no postgres process + any lock present -> remove them all, restart db, then TAK.
 """
 
 import pathlib
@@ -101,16 +102,14 @@ def test_started_at_parses_to_the_right_epoch():
     assert datetime(2026, 10, 14, 21, 31, 49, tzinfo=timezone.utc).timestamp() == T0
 
 
-# ── new containers: the lock cannot survive ────────────────────────────────────────────────────
+# ── container creation is TAK's own, unchanged ────────────────────────────────────────────────
 
-def test_tmpfs_flag_is_exactly_run_postgresql():
-    assert "TAK_DB_RUN_TMPFS = '--tmpfs /run/postgresql:rw,mode=1777'" in APP
-
-
-def test_both_database_container_creations_use_the_tmpfs():
+def test_database_container_creation_is_not_changed():
+    # A tmpfs over /run/postgresql was tried and dropped: it covers one of the three locks, and
+    # /tmp holds a file from TAK's image build (`buildarch`) that a tmpfs would hide.
     runs = re.findall(r"--name \{TAK_DB_CONTAINER\}[^\n]*-d takserver_db", APP)
     assert len(runs) == 2, runs          # deploy and update
-    assert all('{TAK_DB_RUN_TMPFS}' in r for r in runs)
+    assert all('tmpfs' not in r for r in runs)
 
 
 # ── existing containers: the heal ──────────────────────────────────────────────────────────────
@@ -153,7 +152,7 @@ def test_no_lock_means_no_restart():
 
 def test_stale_lock_heals_database_then_restarts_tak():
     audits = []
-    box = Box(f'true starting {STARTED}', probe='REMOVED')
+    box = Box(f'true starting {STARTED}', probe='REMOVED 2')
     out, logs = _run(box, audits=audits)
     assert out == 'healed'
     assert box.restarts() == ['takserver-db', 'takserver']
@@ -162,7 +161,7 @@ def test_stale_lock_heals_database_then_restarts_tak():
     i_tak = box.calls.index(['docker', 'restart', 'takserver'])
     healthy_polls = [i for i, c in enumerate(box.calls) if c[:2] == ['docker', 'inspect'] and i > i_db]
     assert i_db < healthy_polls[0] < healthy_polls[-1] < i_tak
-    assert any('stale socket lock' in m for m in logs)
+    assert any('stale lock files' in m for m in logs)
     assert audits and audits[0][0] == 'takdb:stale-lock-heal'
 
 
@@ -183,39 +182,61 @@ def test_every_docker_call_goes_through_sudo_wrap():
 
 # ── the probe itself, run in a real shell against a fake /proc and /run/postgresql ─────────────
 
-def _probe(tmp_path, procs, lock):
+LOCKS = ('pgdata/postmaster.pid', 'runpg/.s.PGSQL.5432.lock', 'tmp/.s.PGSQL.5432.lock')
+SOCKETS = ('runpg/.s.PGSQL.5432', 'tmp/.s.PGSQL.5432')
+
+
+def _probe(tmp_path, procs, locks=LOCKS, sockets=SOCKETS):
     proc = tmp_path / 'proc'
-    run_pg = tmp_path / 'runpg'
     proc.mkdir()
-    run_pg.mkdir()
+    for d in ('pgdata', 'runpg', 'tmp'):
+        (tmp_path / d).mkdir()
+    (tmp_path / 'tmp' / 'buildarch').write_text('amd64\n')       # TAK's own file in /tmp
+    (tmp_path / 'pgdata' / 'PG_VERSION').write_text('18\n')
     for pid, comm in procs.items():
         (proc / str(pid)).mkdir()
         (proc / str(pid) / 'comm').write_text(comm + '\n')
     (proc / 'self').mkdir()                      # non-numeric entries must be skipped
-    if lock:
-        (run_pg / '.s.PGSQL.5432.lock').write_text('9\n/var/lib/postgresql/data\n')
-        (run_pg / '.s.PGSQL.5432').write_text('')
+    for f in tuple(locks) + tuple(sockets):
+        (tmp_path / f).write_text('9\n/var/lib/postgresql/data\n')
     ns = {}
     exec(compile(_const('_TAK_DB_STALE_LOCK_PROBE'), 'app.py', 'exec'), ns)
-    script = ns['_TAK_DB_STALE_LOCK_PROBE'].replace('/proc/', f'{proc}/').replace('/run/postgresql', str(run_pg))
-    out = subprocess.run(['sh', '-c', script], capture_output=True, text=True, timeout=10).stdout.strip()
-    return out, sorted(p.name for p in run_pg.iterdir())
+    script = (ns['_TAK_DB_STALE_LOCK_PROBE'].replace('/proc/', f'{proc}/')
+              .replace('/run/postgresql/', f'{tmp_path}/runpg/').replace('/tmp/', f'{tmp_path}/tmp/'))
+    out = subprocess.run(['sh', '-c', script], capture_output=True, text=True, timeout=10,
+                         env={'PATH': '/usr/bin:/bin', 'PGDATA': str(tmp_path / 'pgdata')}).stdout.strip()
+    left = sorted(str(f.relative_to(tmp_path)) for d in ('pgdata', 'runpg', 'tmp')
+                  for f in (tmp_path / d).iterdir())
+    return out, left
 
 
-def test_probe_removes_a_lock_nobody_holds(tmp_path):
-    out, left = _probe(tmp_path, {1: 'bash', 9: 'sleep', 77: 'java'}, lock=True)
-    assert out == 'REMOVED' and left == []
+def test_probe_removes_all_three_locks_when_no_postgres_runs(tmp_path):
+    out, left = _probe(tmp_path, {1: 'configureInDock', 9: 'sleep', 77: 'sh'})
+    assert out == 'REMOVED 3'
+    # only the locks and sockets go — the data directory and TAK's own /tmp file stay
+    assert left == ['pgdata/PG_VERSION', 'tmp/buildarch']
+
+
+def test_probe_removes_the_tmp_lock_alone(tmp_path):
+    # the live case: /run/postgresql already cleared, /tmp lock still naming a live PID
+    out, left = _probe(tmp_path, {1: 'configureInDock', 9: 'sh'}, locks=LOCKS[2:], sockets=SOCKETS[1:])
+    assert out == 'REMOVED 1'
+    assert left == ['pgdata/PG_VERSION', 'tmp/buildarch']
 
 
 def test_probe_never_touches_a_lock_while_postgres_runs(tmp_path):
-    out, left = _probe(tmp_path, {1: 'bash', 9: 'postgres', 10: 'postgres'}, lock=True)
+    out, left = _probe(tmp_path, {1: 'configureInDock', 9: 'postgres', 10: 'postgres'})
     assert out == 'alive=1'
-    assert left == ['.s.PGSQL.5432', '.s.PGSQL.5432.lock']
+    assert left == sorted(['pgdata/PG_VERSION', 'tmp/buildarch'] + list(LOCKS) + list(SOCKETS))
 
 
 def test_probe_with_no_lock_does_nothing(tmp_path):
-    out, left = _probe(tmp_path, {1: 'bash'}, lock=False)
-    assert out == 'alive=0' and left == []
+    out, left = _probe(tmp_path, {1: 'configureInDock'}, locks=(), sockets=())
+    assert out == 'alive=0' and left == ['pgdata/PG_VERSION', 'tmp/buildarch']
+
+
+def test_probe_falls_back_to_the_hardened_pgdata_when_unset():
+    assert '${PGDATA:-/var/lib/postgresql/data}/postmaster.pid' in APP
 
 
 # ── wiring ─────────────────────────────────────────────────────────────────────────────────────
