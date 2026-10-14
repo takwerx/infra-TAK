@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.13-alpha)**
+**Current release: [v10.2.14-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.14-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -428,6 +428,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.14-alpha — 2026-10-14 — ATLAS deploys again; Caddyfile changes stick on non-root boxes
+
+**Headline: on non-root consoles with Caddy 2.11.7, new Caddyfiles are no longer rejected and rolled back, so the ATLAS deploy finishes with its :8449 device listener, and a console start, update or pull no longer drops ATLAS's sites ([#137](https://github.com/takwerx/infra-TAK/issues/137)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.14-alpha))
+
+**Caddy.** Run as a non-root user, `caddy validate` can't open Caddy's own access log. Caddy 2.11.7 reports that only as a JSON log line, which the console dropped, so it treated every good Caddyfile as broken and put the previous one back (journal: `Caddyfile REJECTED … caddy validate failed with no output`). The console reads that line again, so regenerated Caddyfiles stick for every module, and a real rejection now shows Caddy's own reason.
+
+**ATLAS.** The deploy no longer stops with *"The Caddyfile was rendered without the :8449 device listener"*. When Caddy does reject the file, ATLAS reports Caddy's error. On Caddy older than 2.8 (which can't load the device channel's certificate settings) ATLAS stops before building anything and tells you to update Caddy first, and the console leaves the :8449 site out instead of making the whole Caddyfile unloadable.
+
+**Console start.** The console waits until it knows which modules are installed before it rewrites the Caddyfile, so a console start, update or pull keeps the sites of ATLAS MDM, TAK Video Restreamer, Email Relay and the other add-on modules. If nothing changed, Caddy isn't reloaded.
+
+**Upgrade note.** Update the console. If ATLAS failed to deploy, deploy it again after the update. On Caddy older than 2.8, open the Caddy page and click **Update** first.
 
 ### v10.2.13-alpha — 2026-10-13 — Remote CloudTAK stays remote; Authentik reconfigure tells the truth; Guard Dog clears stuck LDAP logins
 

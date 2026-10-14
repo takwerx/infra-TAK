@@ -1069,7 +1069,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.14-alpha"
+VERSION = "10.2.15-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -32131,6 +32131,53 @@ def _inject_custom_cert_tls(lines, cert_path, key_path):
     return out
 
 
+# GH #137 follow-up: registry-resident modules (ATLAS MDM, TVR, Email Relay, Client Feed,
+# Simulator) only read as installed once mod_registry.load_all() has run at the bottom of
+# app.py, ~90 s into a console start. Every regen before that — the Hardened-posture
+# re-assert, the startup migrations, the post-update regen — wrote a Caddyfile WITHOUT those
+# modules' sites and reloaded Caddy. On test8 that dropped ATLAS's vhost and its :8449 device
+# listener on every console start (pull, restart, update). Until the registry is up,
+# generate_caddyfile() still builds and returns the file (the migrations check its content
+# before stamping their flags) but does not write it; ONE catch-up regen runs right after
+# the registry loads (_caddy_registry_loaded(), next to init_registry()).
+_CADDY_REGISTRY_READY = threading.Event()
+_CADDY_REGEN_DEFER_LOCK = threading.Lock()
+_CADDY_REGEN_DEFERRED = []   # who asked for a regen before the registry loaded
+
+
+def _caddy_defer_until_registry(who):
+    """True, and queue the post-registry catch-up regen, when the module registry has not
+    loaded yet. Check and queue under one lock so a daemon thread cannot slip a request in
+    after _caddy_registry_loaded() has taken the queue."""
+    with _CADDY_REGEN_DEFER_LOCK:
+        if _CADDY_REGISTRY_READY.is_set():
+            return False
+        _CADDY_REGEN_DEFERRED.append(who)
+        return True
+
+
+def _caddy_registry_loaded():
+    """Called once, right after init_registry(): from here on generate_caddyfile() writes.
+    If anything asked for a regen during import, do it now — once, with every module known —
+    and reload only if Caddy is not already running the result (GH #90)."""
+    with _CADDY_REGEN_DEFER_LOCK:
+        _CADDY_REGISTRY_READY.set()
+        who = list(_CADDY_REGEN_DEFERRED)
+        del _CADDY_REGEN_DEFERRED[:]
+    if not who:
+        return
+    try:
+        if generate_caddyfile() is None:
+            return   # no FQDN — nothing to write
+        ok, detail = _caddy_reload_if_changed()
+        print('[startup] Caddyfile regenerated now that the module registry is loaded '
+              '(%d early request(s): %s)%s' % (len(who), ', '.join(sorted(set(who))),
+                                               '' if ok else ' — reload issue: %s' % str(detail)[:160]),
+              flush=True)
+    except Exception as _e:
+        print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -32957,6 +33004,12 @@ def generate_caddyfile(settings=None):
                  + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
         caddyfile += '\n' + user_blocks + '\n'
+    # GH #137 follow-up: before the module registry loads, registry modules read as not
+    # installed — writing now would drop their sites. Return what was built; the
+    # post-registry catch-up writes the real file.
+    if _caddy_defer_until_registry('generate_caddyfile'):
+        print('[caddy] module registry not loaded yet — Caddyfile write deferred until it is', flush=True)
+        return caddyfile
     # v10.0.5 non-root: /etc/caddy may not exist yet (RHEL copr caddy doesn't
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
@@ -83435,6 +83488,13 @@ def _startup_ensure_hardening_posture():
             print('[startup-posture] hardened: re-closed public :%s (%s)' % (
                 port, 'STILL OPEN — check firewall/broker' if still else 'now localhost-only'), flush=True)
         if w1.get('caddy_login_locked'):
+            # GH #137 follow-up: this runs at import, before the module registry loads, so a
+            # regen here would drop ATLAS's sites and :8449. Queue it for the post-registry
+            # catch-up instead (the regen emits the /login lock from hardening.json either way).
+            if _caddy_defer_until_registry('hardening posture'):
+                print('[startup-posture] hardened: Caddy /login SSO-lock re-assert queued '
+                      'until the module registry loads', flush=True)
+                return
             try:
                 generate_caddyfile()
                 # GH #90: only when Caddy is not already running this file. An unconditional
@@ -90870,6 +90930,7 @@ _MODULE_CTX = {
 _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
+_caddy_registry_loaded()
 
 
 # ── TAK Client Feed — the ONE public, token-authed route family (v10.1.76) ──
