@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.12-alpha)**
+**Current release: [v10.2.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.13-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -428,6 +428,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.13-alpha — 2026-10-13 — Remote CloudTAK stays remote; Authentik reconfigure tells the truth; Guard Dog clears stuck LDAP logins
+
+**Headline: a CloudTAK deployed to a remote host no longer flips to local or "not installed", the Authentik reconfigure reports timed-out steps instead of saying "complete", Guard Dog restarts Authentik when LDAP logins back up and never drain, container TAK Server stops restarting on every console start, and NetBird finishes setup on non-root consoles.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.13-alpha))
+
+**Remote CloudTAK.** Update config, Remove and Save target settings keep the saved remote target, so the CloudTAK page no longer switches to local and reports "not installed" (and Remove can no longer tear down a local CloudTAK by mistake). A fresh remote deploy now gets its `map.` / `tiles.` / `video.` HTTPS sites and certificate. Update config on a remote host keeps the existing store and login secrets instead of rotating them (which crash-looped the store and logged everyone out), a redeploy stops the old stack before replacing it, and the remote host gets the UDP buffer size MediaMTX needs so `cloudtak-media` no longer crash-loops.
+
+**Authentik.** *Update config & reconnect* and the automatic reconfigure after a console update now end PARTIAL and list each step that timed out or failed, instead of always saying "✓ Reconfigure complete". Action items you do separately, like "redeploy WebODM to activate one-click login", show as a separate "Action needed" note and don't make the run PARTIAL.
+
+**Guard Dog.** When Authentik's LDAP logins back up and never drain (every bind running a full login flow, minute after minute), Guard Dog now restarts the Authentik server and worker and sends an alert. It shares the existing restart cooldown and backoff. The console's Authentik slowdown detector now also counts stuck database sessions on boxes that use PgBouncer.
+
+**Container TAK Server.** The Let's Encrypt certificate check reads the TAK keystore inside the container, so an unchanged certificate no longer re-imports and restarts TAK Server on every console start.
+
+**NetBird.** The account-store finalize step works on non-root consoles (it failed with `attempt to write a readonly database`), so the onboarding and approval gates are cleared.
+
+**Upgrade note.** Update the console. If a remote CloudTAK already shows "not installed", open the CloudTAK page, pick "On a remote host", check the host and click **Save target settings**; then run Update config.
 
 ### v10.2.12-alpha — 2026-10-12 — ATLAS enrollment on relayed boxes; TAK Deploy catches a missing database; big-database backups finish
 

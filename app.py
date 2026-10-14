@@ -1069,7 +1069,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.13-alpha"
+VERSION = "10.2.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -28543,6 +28543,19 @@ def _get_cloudtak_deployment_config(settings):
     return _normalize_cloudtak_deployment_config(settings.get('cloudtak_deployment', {}))
 
 
+def _cloudtak_cfg_for_installed_action(saved, incoming):
+    """Target for an action on an existing CloudTAK (Update config, Remove).
+
+    A deployed CloudTAK stays where it was deployed: the request cannot move it. The page
+    has no target form once CloudTAK is installed, and the old JS filled the gap with
+    target_mode "local", so Update config on a remote CloudTAK saved it as local and the
+    page went to "not installed" (ops #33). A page cached from before the fix still sends
+    that. Not deployed (a failed first install): the form is on the page, so it counts."""
+    if saved.get('deployed') or not isinstance(incoming, dict) or not incoming:
+        return saved
+    return _normalize_cloudtak_deployment_config(_deep_merge_dict(saved, incoming))
+
+
 # ---------------------------------------------------------------------------
 # Generic module deployment config (reused by TAK Portal, Authentik,
 # MediaMTX, Node-RED — anything that supports local/remote deploy)
@@ -33572,7 +33585,31 @@ def _selfheal_takserver_le_cert(plog=None):
                 shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
             tak_fp = ''
             tak_expired = True
-            if os.path.exists(jks):
+            if _tak_is_container():
+                # v10.2.13: container hosts have no Java — keytool lives only in the TAK
+                # image — so the host-side keytool below always came back empty, the
+                # keystore always looked stale, and every console start re-imported the
+                # same cert and restarted TAK (seen on arm64). Read it the way the
+                # container renewal script does: keytool via docker exec on the shared mount.
+                _run = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER]),
+                    capture_output=True, text=True, timeout=20)
+                if (_run.stdout or '').strip() != 'true':
+                    _log('takserver LE-cert self-heal: TAK container not running — '
+                         'skipping keystore check (the daily renewal timer re-checks)')
+                    return
+                _kr = subprocess.run(
+                    _sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'keytool', '-list', '-rfc',
+                                '-keystore', jks, '-storepass', cert_pass]),
+                    capture_output=True, text=True, timeout=30)
+                if _kr.returncode == 0 and _kr.stdout:
+                    tak_fp = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).stdout.strip()
+                    tak_expired = subprocess.run(
+                        ['openssl', 'x509', '-checkend', '0', '-noout'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
+            elif os.path.exists(jks):
                 kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
                 tak_fp = subprocess.run(
                     f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
@@ -39196,8 +39233,12 @@ def cloudtak_get_deployment_config():
 def cloudtak_save_deployment_config():
     data = request.get_json() or {}
     incoming = data.get('config', data)
-    cfg = _normalize_cloudtak_deployment_config(incoming)
     settings = load_settings()
+    # Merge onto what is saved, like every other CloudTAK config route: the form never
+    # sends `deployed`, so replacing the whole dict reset it to False (ops #33).
+    cfg = _normalize_cloudtak_deployment_config(
+        _deep_merge_dict(_get_cloudtak_deployment_config(settings),
+                         incoming if isinstance(incoming, dict) else {}))
     settings['cloudtak_deployment'] = cfg
     save_settings(settings)
     return jsonify({'success': True, 'config': cfg})
@@ -40140,9 +40181,9 @@ def cloudtak_redeploy_api():
     """Update .env and override, restart containers, re-apply nginx patch. Use when CloudTAK is already installed."""
     data = request.get_json() or {}
     settings = load_settings()
-    cfg = _get_cloudtak_deployment_config(settings)
-    if isinstance(data.get('config'), dict):
-        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    saved = _get_cloudtak_deployment_config(settings)
+    cfg = _cloudtak_cfg_for_installed_action(saved, data.get('config'))
+    if cfg != saved:
         settings['cloudtak_deployment'] = cfg
         save_settings(settings)
     with _cloudtak_deploy_lock:
@@ -40266,13 +40307,16 @@ def cloudtak_uninstall():
     if cloudtak_uninstall_status.get('running'):
         return jsonify({'error': 'Uninstall already in progress'}), 409
     # If UI sent an explicit target config, persist it first so uninstall uses
-    # the same target the user currently selected.
+    # the same target the user currently selected — unless CloudTAK is deployed, in
+    # which case it is removed from where it actually runs (ops #33).
     if req_cfg is not None:
         try:
             settings = load_settings()
-            merged = _normalize_cloudtak_deployment_config(req_cfg)
-            settings['cloudtak_deployment'] = merged
-            save_settings(settings)
+            saved = _get_cloudtak_deployment_config(settings)
+            merged = _cloudtak_cfg_for_installed_action(saved, req_cfg)
+            if merged != saved:
+                settings['cloudtak_deployment'] = merged
+                save_settings(settings)
         except Exception as e:
             return jsonify({'error': f'Could not save deployment target: {e}'}), 400
     cloudtak_uninstall_status.update({'running': True, 'done': False, 'error': None})
@@ -41990,6 +42034,23 @@ def _cloudtak_remote_garage_sh(legacy_image=''):
         f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
 
 
+def _cloudtak_remote_media_bufs(remote_cfg, plog):
+    """`_startup_media_kernel_bufs()` for a remote CloudTAK host. MediaMTX >= 1.19 needs a 4MB
+    kernel UDP read buffer, and net.core is a HOST sysctl: the startup migration only ever set
+    it on the console box, so cloudtak-media crash-looped on every fresh remote host ("unable to
+    set read buffer size to 4194304", ops #33 box test). Never raises."""
+    cmd = ("S=; [ \"$(id -u)\" -ne 0 ] && S=sudo; "
+           "printf 'net.core.rmem_max = 4194304\\nnet.core.wmem_max = 4194304\\n' "
+           "| $S tee /etc/sysctl.d/99-takwerx-media-bufs.conf >/dev/null && "
+           "$S sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304 >/dev/null")
+    try:
+        ok, out = _ssh_probe(remote_cfg, cmd, timeout=30)
+    except Exception as e:
+        ok, out = False, str(e)
+    plog("✓ Media kernel buffers set on remote (4 MB)" if ok
+         else f"  ⚠ Could not set media kernel buffers on remote: {(out or '')[:160]}")
+
+
 def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
     """`_cloudtak_garage_rollback()` over SSH. Never raises."""
     try:
@@ -42007,6 +42068,21 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
              else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
+def _cloudtak_env_secrets(env_text):
+    """(SigningSecret, store secret, POSTGRES_PASSWORD) from an existing CloudTAK .env; '' when absent.
+
+    The store secret is MINIO_ROOT_PASSWORD, else AWS_S3_SecretAccessKey: we write both with
+    the same value, and the Garage store reads the second (GARAGE_DEFAULT_SECRET_KEY)."""
+    vals = {}
+    for line in (env_text or '').splitlines():
+        key, sep, val = line.strip().partition('=')
+        if sep and key.strip() not in vals:
+            vals[key.strip()] = val.strip()
+    return (vals.get('SigningSecret', ''),
+            vals.get('MINIO_ROOT_PASSWORD') or vals.get('AWS_S3_SecretAccessKey', ''),
+            vals.get('POSTGRES_PASSWORD', ''))
 
 
 def _cloudtak_env_preserve_unknown(generated, existing_text):
@@ -42760,13 +42836,21 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Docker log limits (remote) ━━━")
             _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
+                # Stop a stack that is already there before deleting its tree. The Garage store
+                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+                # it came back during the rm -rf, Docker re-created the folder, and Garage
+                # initialized it with the OLD key; the new stack then crash-looped on a key
+                # mismatch (ops #33 box test, redeploy over an existing remote install).
                 prep_cmd = (
+                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
                     f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
                 )
@@ -42858,6 +42942,17 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog("✓ Containers built and restarted.")
+            # Persist deployed=True BEFORE the Caddyfile is generated (same as the local path):
+            # generate_caddyfile() only writes the map./tiles./video. sites when detect_modules()
+            # says CloudTAK is installed, and for a remote target that is this flag. Saving it
+            # after Caddy left a fresh remote install with no site at all — no certificate, so
+            # https://map.<fqdn> failed to connect even though the deploy said it worked (ops #33).
+            try:
+                cfg['deployed'] = True
+                settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+                save_settings(settings)
+            except Exception as _e:
+                plog(f"  ⚠ Could not persist deployment flag: {_e}")
             fw_cmd = (
                 "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
                 "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
@@ -42904,9 +42999,6 @@ def run_cloudtak_deploy(cfg=None):
                     plog(f"⚠ Caddy reload issue: {_d.strip()[:140]}")
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
-            cfg['deployed'] = True
-            settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
-            save_settings(settings)
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
@@ -43652,25 +43744,27 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             plog(f"  Updating remote CloudTAK config on {remote_host}...")
             domain = (settings.get('fqdn') or '').strip() or None
+            # Keep the secrets the remote .env already has, same as the local reconfig. Fresh
+            # ones every Update config broke a running install (ops #33, test on a fresh remote):
+            # the Garage store keeps the key it was first started with and refuses to start on a
+            # new AWS_S3_SecretAccessKey, and a new SigningSecret logs every user out. Read the
+            # whole .env (also for the unmanaged keys below); if it cannot be read, stop rather
+            # than write new secrets over a working install.
+            _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null; true', timeout=20)
+            if not _ok_env:
+                plog(f"✗ Could not read the remote CloudTAK .env: {(_rem_env or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            _rem_env = _rem_env or ''
+            signing_secret, minio_pass, postgres_pass = _cloudtak_env_secrets(_rem_env)
+            if signing_secret or minio_pass or postgres_pass:
+                plog("  Preserving existing secrets from the remote .env")
             import secrets as _secrets
-            signing_secret = _secrets.token_hex(32)
-            minio_pass = _secrets.token_hex(16)
-            # Preserve existing postgres password from remote .env so we don't break the
-            # DB connection on an existing install. If the remote .env doesn't have one
-            # (pre-v0.9.11), fall back to 'docker' (the upstream literal). New strong
-            # passwords are only generated on first install or full Remove+Reinstall.
-            postgres_pass = 'docker'
-            try:
-                _ok_pw, _pw_out = _ssh_probe(
-                    remote_cfg,
-                    "grep -E '^POSTGRES_PASSWORD=' ~/CloudTAK/.env 2>/dev/null | head -1 | cut -d= -f2-",
-                    timeout=15
-                )
-                if _ok_pw and (_pw_out or '').strip():
-                    postgres_pass = (_pw_out or '').strip()
-                    plog("  Preserving existing postgis password from remote .env")
-            except Exception:
-                pass
+            signing_secret = signing_secret or _secrets.token_hex(32)
+            minio_pass = minio_pass or _secrets.token_hex(16)
+            # No POSTGRES_PASSWORD (pre-v0.9.11): 'docker', the upstream literal the volume was
+            # initialized with. Strong passwords only land on first install or Remove+Reinstall.
+            postgres_pass = postgres_pass or 'docker'
             env_content = _cloudtak_build_env_content(
                 settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
                 remote_host=remote_host,
@@ -43678,16 +43772,12 @@ def run_cloudtak_redeploy(cfg=None):
             # Same rule as the local reconfig: keep any key we do not manage. Read the whole
             # remote .env rather than grepping one name at a time — we cannot grep for a key
             # whose name we do not know yet, which is the entire point.
-            try:
-                _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null', timeout=20)
-                if _ok_env and (_rem_env or '').strip():
-                    _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
-                    if _merged != env_content:
-                        plog("  Preserving %d unmanaged key(s) from the remote .env"
-                             % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
-                    env_content = _merged
-            except Exception:
-                pass
+            if _rem_env.strip():
+                _merged = _cloudtak_env_preserve_unknown(env_content, _rem_env)
+                if _merged != env_content:
+                    plog("  Preserving %d unmanaged key(s) from the remote .env"
+                         % (len(_merged.splitlines()) - len(env_content.splitlines()) - 4))
+                env_content = _merged
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
@@ -43705,6 +43795,7 @@ def run_cloudtak_redeploy(cfg=None):
                     return
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            _cloudtak_remote_media_bufs(remote_cfg, plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -44834,6 +44925,14 @@ def _webodm_deploy_log(msg, status=None):
         _webodm_deploy_status.update(status)
 
 
+# A ⚠ log line carrying this tag is an action item for the operator to do separately
+# (e.g. redeploy WebODM), not a step that failed: a retry can't clear it, so an Authentik
+# reconfigure lists it as a note and still ends complete (v10.2.13 T&E, ops #41).
+AK_ACTION_NEEDED = 'Action needed:'
+WEBODM_REDEPLOY_NOTE = ('  ⚠ ' + AK_ACTION_NEEDED + ' redeploy WebODM to activate one-click login '
+                        '(OIDC creds are written, but the running compose predates the local_settings mount)')
+
+
 WEBODM_LOCAL_SETTINGS_STUB = (
     '# Managed by infra-TAK. OIDC login config is written here after the\n'
     '# Authentik step of a WebODM deploy (GH #50). Do not edit by hand.\n'
@@ -44888,7 +44987,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
                 if mount_present:
                     log('  ✓ WebODM OIDC login already configured')
                 else:
-                    log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                    log(WEBODM_REDEPLOY_NOTE)
                 return True
             import tempfile as _tf
             with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tf:
@@ -44906,7 +45005,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
                 return False
             _module_run(deploy_cfg, f'chmod 600 {wo_dir}/local_settings.py', timeout=15)
             if not mount_present:
-                log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                log(WEBODM_REDEPLOY_NOTE)
                 return True
             _module_run(deploy_cfg, 'docker restart webapp wo_worker 2>&1', timeout=120)
             log('  ✓ WebODM native OIDC login configured (webapp restarted)')
@@ -44929,7 +45028,7 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
             return True
         _write_priv(ls_path, content, perm=0o600)
         if not mount_present:
-            log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+            log(WEBODM_REDEPLOY_NOTE)
             return True
         subprocess.run(_sudo_wrap(['docker', 'restart', 'webapp', 'wo_worker']),
                        capture_output=True, timeout=120)
@@ -48240,12 +48339,25 @@ def _netbird_finalize_account_store(plog=None):
     input, so there is no injection surface. The residual is schema-coupling to NetBird's
     internal `store.db` (account_onboardings / accounts / users), tolerated because the image
     is PINNED (NETBIRD_SERVER_IMAGE) — RE-VERIFY these tables/columns on any pin bump. Failure
-    is soft (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash."""
+    is soft (try/except → False), so at worst the admin-menu gates aren't cleared, never a crash.
+
+    Non-root: the NetBird container runs as root and creates store.db root:root 644
+    inside the console-owned ~/netbird/data, so a takwerx console opened it read-only and every
+    finalize failed with "attempt to write a readonly database" — the gates were never cleared.
+    Hand the store (and any rollback journal) to the console user through the broker first. No
+    new privilege: the console already owns the directory (it could replace the file outright),
+    and root in the container still writes a takwerx-owned file."""
     import sqlite3
     _log = plog or (lambda m: None)
     db_path = os.path.join(NETBIRD_INSTALL_DIR, 'data', 'store.db')
     if not os.path.isfile(db_path):
         return False
+    if os.getuid() != 0 and not os.access(db_path, os.W_OK):
+        _owner = f'{os.getuid()}:{os.getgid()}'
+        for _f in (db_path, db_path + '-journal', db_path + '-wal', db_path + '-shm'):
+            if os.path.exists(_f):
+                subprocess.run(_sudo_wrap(['chown', _owner, _f]),
+                               capture_output=True, text=True, timeout=30)
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         conn.execute(
@@ -50244,7 +50356,11 @@ window.logInterval = null;
 
 window.collectDeployConfig = function() {
   var modeEl = document.getElementById("cloudtak-target-mode");
-  var mode = modeEl ? modeEl.value : "local";
+  // The target form is only on the page before install. Once installed it is gone, and
+  // defaulting to "local" here made Update config / Remove flip a remote CloudTAK to
+  // local: the page then said "not installed" (ops #33). No form = keep the saved target.
+  if (!modeEl) return {};
+  var mode = modeEl.value;
   var cfg = { target_mode: mode };
   if (mode === "remote") {
     var host = (document.getElementById("cloudtak-remote-host") || {}).value || "";
@@ -50950,7 +51066,7 @@ window.doCloudtakResetConfig = function() {
 
 # Authentik module
 authentik_deploy_log = []
-authentik_deploy_status = {'running': False, 'complete': False, 'error': False, 'partial': False, 'issues': []}
+authentik_deploy_status = {'running': False, 'complete': False, 'error': False, 'partial': False, 'issues': [], 'notes': []}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v10.0.1: serialize Authentik `docker compose` operations against the deploy.
@@ -51520,7 +51636,8 @@ def authentik_deploy_log_api():
         'running': authentik_deploy_status['running'], 'complete': authentik_deploy_status['complete'],
         'error': authentik_deploy_status['error'],
         'partial': authentik_deploy_status.get('partial', False),
-        'issues': authentik_deploy_status.get('issues', [])})
+        'issues': authentik_deploy_status.get('issues', []),
+        'notes': authentik_deploy_status.get('notes', [])})
 
 @app.route('/api/authentik/remote-metrics')
 @login_required
@@ -53928,7 +54045,7 @@ networks:
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
 
-def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None):
+def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, notes=None):
     """Reconfigure Authentik on remote host: ensure up, then run API steps (cookie domain, apps, outpost, policies)."""
     remote = deploy_cfg.get('remote', {})
     host = (remote.get('host') or '').strip()
@@ -53984,27 +54101,32 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None):
     _authentik_enable_show_password(ak_url, ak_headers, plog)
     _sync_webadmin_after_authentik_reconfigure(plog)
     plog("")
-    _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)")
+    _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)", notes)
 
 
-def _authentik_reconfigure_finish(plog, issues, label):
+def _authentik_reconfigure_finish(plog, issues, label, notes=None):
     """End a reconfigure run. "\u2713 complete" only when no step logged \u26a0/\u2717; otherwise list
     the steps that did not finish and mark the run partial. Under load each Authentik
     API step times out on its own and logs a \u26a0, and the run used to end on "\u2713 complete"
-    after a dozen of them (v10.2.12 T&E)."""
+    after a dozen of them (v10.2.12 T&E). Notes (⚠ lines tagged AK_ACTION_NEEDED, e.g.
+    "redeploy WebODM") are for the operator to do separately: they are listed after the
+    verdict but never make the run partial, since no retry can clear them (v10.2.13 T&E)."""
     found = list(issues or [])
+    todo = list(notes or [])
     if not found:
         plog(f"\u2713 {label} complete.")
-        authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
-                                        'partial': False, 'issues': []})
-        return True
-    plog(f"\u26a0 {label} finished, but {len(found)} step(s) did not complete:")
-    for msg in found:
-        plog("    - " + msg.lstrip(' ⚠✗'))
-    plog("  Nothing was removed. Fix what is listed (timeouts usually clear on a retry), then run Update config & reconnect again.")
+    else:
+        plog(f"\u26a0 {label} finished, but {len(found)} step(s) did not complete:")
+        for msg in found:
+            plog("    - " + msg.lstrip(' ⚠✗'))
+        plog("  Nothing was removed. Fix what is listed (timeouts usually clear on a retry), then run Update config & reconnect again.")
+    if todo:
+        plog(f"  {AK_ACTION_NEEDED} {len(todo)} item(s) to do separately (not part of this run):")
+        for msg in todo:
+            plog("    - " + msg.lstrip(' ⚠').replace(AK_ACTION_NEEDED, '', 1).strip())
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False,
-                                    'partial': True, 'issues': found})
-    return False
+                                    'partial': bool(found), 'issues': found, 'notes': todo})
+    return not found
 
 
 def _ak_live_compose_dir():
@@ -62491,14 +62613,18 @@ def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
 def run_authentik_deploy(reconfigure=False):
     # Every ⚠/✗ line is a step that did not finish. Reconfigure collects them so it can
     # say so at the end instead of always printing "✓ Reconfigure complete."
+    # A ⚠ tagged AK_ACTION_NEEDED is a note for the operator, not a failed step.
     issues = []
-    authentik_deploy_status.update({'partial': False, 'issues': []})
+    notes = []
+    authentik_deploy_status.update({'partial': False, 'issues': [], 'notes': []})
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         authentik_deploy_log.append(entry)
         print(entry, flush=True)
-        if '⚠' in msg or '✗' in msg:
+        if '✗' in msg or ('⚠' in msg and AK_ACTION_NEEDED not in msg):
             issues.append(msg.strip())
+        elif '⚠' in msg and msg.strip() not in notes:
+            notes.append(msg.strip())
     try:
         ak_dir = os.path.expanduser('~/authentik')
         settings = load_settings()
@@ -62510,7 +62636,7 @@ def run_authentik_deploy(reconfigure=False):
         deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if deploy_cfg.get('target_mode') == 'remote':
             if reconfigure:
-                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues)
+                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues, notes)
                 return
             _run_authentik_deploy_remote(settings, deploy_cfg, plog)
             return
@@ -62719,7 +62845,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_recovery_flow_standalone(env_path, plog)
             _sync_webadmin_after_authentik_reconfigure(plog)
             plog("")
-            _authentik_reconfigure_finish(plog, issues, "Reconfigure")
+            _authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)
             return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
@@ -88390,6 +88516,9 @@ def _post_update_auto_deploy():
                             if authentik_deploy_status.get('partial'):
                                 print(f"Post-update: Authentik reconfigure PARTIAL — "
                                       f"{len(authentik_deploy_status.get('issues') or [])} step(s) did not complete (see above)")
+                            if authentik_deploy_status.get('notes'):
+                                print(f"Post-update: Authentik reconfigure — "
+                                      f"{len(authentik_deploy_status['notes'])} action item(s) for the operator (see above)")
                         except Exception as e:
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
