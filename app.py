@@ -80691,7 +80691,9 @@ def _os_upgrade_write_status(value):
 
 def _os_upgrade_tak_version_tuple(ver):
     """'5.8-RELEASE84' -> (5, 8); None when no major.minor can be read."""
-    m = re.match(r'\s*(\d+)\.(\d+)', ver or '')
+    # search, not match: a Docker TAK's version is read off the bundle folder and comes out as
+    # "hardened-5.8-RELEASE75" (aws-jammy2, 2026-10-14 — the preflight refused a 5.8 box).
+    m = re.search(r'(?<![\d.])(\d+)\.(\d+)', ver or '')
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
@@ -80866,15 +80868,21 @@ _OS_UPGRADE_NOT_BASELINE = {'infratak-os-upgrade', 'infratak-kernel-patch', 'inf
 _OS_UPGRADE_POSTSTART_WAIT_S = 1800
 
 
-def _os_upgrade_service_baseline(listdir=None, run=None):
+def _os_upgrade_service_baseline(listdir=None, run=None, islink=None):
     """{name: 'active'} for every non-oneshot service running now among the core list and
-    every unit in /etc/systemd/system (what infra-TAK and its modules installed)."""
+    every unit FILE in /etc/systemd/system (what infra-TAK and its modules installed).
+
+    Alias links there (sshd -> ssh, syslog -> rsyslog, chronyd, multipath-tools, …) and snap's
+    own units are the OS's, not ours: aws-jammy2 (2026-10-14) put ssh into the baseline that way,
+    and 24.04 starts ssh on demand, so a healthy box would have failed the verify."""
     listdir = listdir or os.listdir
     run = run or subprocess.run
+    islink = islink or os.path.islink
     names = set(_OS_UPGRADE_CORE_SERVICES)
     try:
         for f in listdir('/etc/systemd/system'):
-            if f.endswith('.service') and '@' not in f:
+            if (f.endswith('.service') and '@' not in f and not f.startswith('snap.')
+                    and not islink(os.path.join('/etc/systemd/system', f))):
                 names.add(f[:-len('.service')])
     except Exception:
         pass

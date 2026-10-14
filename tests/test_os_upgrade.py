@@ -80,7 +80,9 @@ def test_step_list_is_the_plan():
 
 @pytest.mark.parametrize('ver,want', [
     ('5.8-RELEASE84', (5, 8)), ('5.7-RELEASE43', (5, 7)), ('5.10-RELEASE1', (5, 10)),
-    ('4.10.0.68', (4, 10)), ('', None), ('garbage', None), (None, None)])
+    ('4.10.0.68', (4, 10)), ('', None), ('garbage', None), (None, None),
+    ('hardened-5.8-RELEASE75', (5, 8)),          # Docker TAK, read off the bundle folder name
+    ('hardened-5.7-RELEASE43', (5, 7))])
 def test_tak_version_tuple(ver, want):
     assert _ns()['_os_upgrade_tak_version_tuple'](ver) == want
 
@@ -864,7 +866,7 @@ def test_verify_post_start_wait_is_capped():
     assert '_OS_UPGRADE_POSTSTART_WAIT_S = 1800' in APP
 
 
-def _baseline(show_out, files):
+def _baseline(show_out, files, links=()):
     ns = {'os': __import__('os'), 'subprocess': subprocess}
     exec(compile(APP[APP.index('_OS_UPGRADE_CORE_SERVICES = ('):APP.index('def _os_upgrade_service_baseline(')]
                  + _fn('_os_upgrade_service_baseline'), 'app.py', 'exec'), ns)
@@ -873,7 +875,8 @@ def _baseline(show_out, files):
     def run(argv, **kw):
         calls.append(argv)
         return types.SimpleNamespace(stdout=show_out, returncode=0)
-    return ns['_os_upgrade_service_baseline'](listdir=lambda d: files, run=run), calls
+    return ns['_os_upgrade_service_baseline'](listdir=lambda d: files, run=run,
+                                              islink=lambda p: p.rsplit('/', 1)[-1] in links), calls
 
 
 def test_baseline_covers_every_long_running_infratak_service():
@@ -960,3 +963,16 @@ def test_editor_installer_uses_an_argv_not_a_shell_string():
     body = _fn('_mediamtx_editor_install_py_deps')
     assert 'shell=True' not in body
     assert "['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)" in body and "['--break-system-packages']" in body
+
+
+def test_baseline_skips_os_alias_links_and_snap_units():
+    """aws-jammy2: /etc/systemd/system holds alias LINKS for OS services (sshd -> ssh, syslog ->
+    rsyslog …) and snap units. They are not infra-TAK's, and 24.04 starts ssh on demand — counting
+    them would fail a healthy upgrade."""
+    files = ['sshd.service', 'syslog.service', 'chronyd.service', 'snap.amazon-ssm-agent.amazon-ssm-agent.service',
+             'mediamtx.service', 'tak-health.service']
+    _out, calls = _baseline('', files, links=('sshd.service', 'syslog.service', 'chronyd.service'))
+    asked = set(calls[0][calls[0].index('--') + 1:])
+    assert 'mediamtx.service' in asked and 'tak-health.service' in asked
+    for os_unit in ('sshd.service', 'syslog.service', 'chronyd.service', 'snap.amazon-ssm-agent.amazon-ssm-agent.service'):
+        assert os_unit not in asked, os_unit
