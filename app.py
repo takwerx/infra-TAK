@@ -2456,6 +2456,62 @@ _TAK_DOCKERFILES = (
 )
 
 
+def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
+    """Make TAK's hardened (UBI 10) images buildable while Red Hat's OpenSSL moves on. Idempotent.
+
+    Field 2026-10-14 (v10.3.0 W13, aws-noble — and NOT host-specific: it happens inside the image
+    build, so it breaks every new Docker TAK install on any host). TAK's
+    Dockerfile.hardened-takserver pins the base image's OpenSSL for the duration of its update:
+
+        RUN echo -e "\nexclude=openssl* openssl-fips-provider*" >> /etc/dnf/dnf.conf
+        RUN microdnf update -y --disableplugin=subscription-manager --nodocs && microdnf install …
+
+    Red Hat then published curl/libcurl-minimal 8.12.1-4.el10_2.7, which requires
+    openssl-libs >= 1:3.5.8 — excluded — so `microdnf update` refuses the whole transaction
+    ("Could not depsolve transaction … cannot install the best update candidate for package curl")
+    and `docker build` exits 1 at step 8/12.
+
+    Fix: `--nobest` on that update. Measured in TAK's exact base image
+    (eclipse-temurin:17.0.19_10-jdk-ubi10-minimal) and then in a full build of the RELEASE-75
+    bundle: the update completes, OpenSSL stays at the base image's 3.5.5 (TAK's intent is kept),
+    curl stays at el10_2.4 until a compatible one exists, every listed package installs, and the
+    image keeps tak uid 1001 / gid 0. Build 90 s. `--setopt=best=0` and a curl exclusion are both
+    rejected by this microdnf ("Unable to handle") — `--nobest` is the form it accepts.
+
+    Conservative like _patch_tak_db_dockerfile: only a `RUN microdnf update -y` line is touched,
+    nothing is removed, a Dockerfile without that line is left exactly as shipped, and a file we
+    cannot read or write is built as shipped rather than failing the deploy here.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    patched = []
+    for rel in dockerfiles or ():
+        if not rel:
+            continue
+        df = os.path.join(build_ctx, rel)
+        if not os.path.isfile(df):
+            continue
+        try:
+            with open(df) as f:
+                src = f.read()
+        except Exception as e:
+            _log(f"  (could not read {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        new = re.sub(r'(?m)^(RUN\s+microdnf\s+update\s+-y)(?![^\n]*--nobest)', r'\1 --nobest', src)
+        if new == src:
+            continue
+        try:
+            with open(df, 'w') as f:
+                f.write(new)
+        except Exception as e:
+            _log(f"  (could not patch {os.path.basename(rel)}: {str(e)[:120]} — building as shipped)")
+            continue
+        patched.append(os.path.basename(rel))
+    if patched:
+        _log(f"  Patched {', '.join(patched)}: `microdnf update --nobest` — Red Hat's newer curl needs an "
+             "OpenSSL that TAK's Dockerfile pins out; without this the image build fails on every host.")
+    return bool(patched)
+
+
 def _tak_bundle_dockerfiles(ctx):
     """(app_dockerfile, db_dockerfile) relative to `ctx`, newest naming first.
 
@@ -31470,6 +31526,13 @@ def _get_service_alias(settings, service_key):
 _CADDY_MIN_HEREDOC = (2, 7)      # heredoc (`respond <<TAG`) support landed here
 _CADDY_MIN_STREAM_CLOSE_DELAY = (2, 7)  # reverse_proxy `stream_close_delay` landed here
 _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
+# GH #137 — `client_auth { trust_pool file {…} }` landed in Caddy 2.8.0. On 2.7.x the whole
+# Caddyfile is rejected ("unknown subdirective for client_auth: trust_pool"), so one ATLAS
+# device site took every regeneration on the box down with it. Measured with the official
+# 2.7.6 and 2.8.4 builds, 2026-10-14. 2.7's `trusted_ca_cert_file` is no substitute: it
+# loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
+# fails the handshake (same measurement).
+_CADDY_MIN_TRUST_POOL = (2, 8)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31506,6 +31569,17 @@ def _caddy_supports_heredoc():
     """True only when the installed Caddy is >= 2.7. Unknown version => False (see above)."""
     v = _caddy_version_tuple()
     return bool(v) and v >= _CADDY_MIN_HEREDOC
+
+
+def _caddy_supports_trust_pool():
+    """True unless the installed Caddy is KNOWN to be older than 2.8 (GH #137).
+
+    ⚠️ Fails OPEN, unlike the heredoc gate, because here the safe directions are reversed:
+    omitting the block silently removes ATLAS's device channel from a working box whenever
+    `caddy version` has a bad moment, while emitting it onto a too-old Caddy is caught by
+    _caddy_validate_or_restore() and the previous file is kept."""
+    v = _caddy_version_tuple()
+    return not v or v >= _CADDY_MIN_TRUST_POOL
 
 
 def _caddy_stream_close_delay_lines(indent):
@@ -31600,9 +31674,29 @@ def _caddy_validate_clean(out):
     actual error, so a naive tail of the combined output reports a truncated fragment of a
     log line instead of the parse error. Field-observed on aws-arm 2026-08-18, where the
     message read `... does NOT parse: ided configuration","config_file":...`. Drop the JSON,
-    keep the diagnosis."""
-    keep = [ln.strip() for ln in (out or '').splitlines()
-            if ln.strip() and not ln.strip().startswith('{"level"')]
+    keep the diagnosis.
+
+    ⚠️ **Except an error-level JSON line, whose `msg` IS the diagnosis (GH #137).** Caddy
+    2.11.4 follows its JSON log with a plain `Error: …` line; 2.11.7 reports a log-writer
+    `permission denied` ONLY as `{"level":"error","msg":…}` and exits 1. Dropping that left
+    an empty string, so _caddy_validate_config() missed its own permission-denied carve-out,
+    judged a good config 'bad', and _caddy_validate_or_restore() reverted EVERY Caddyfile
+    regeneration on non-root boxes ("caddy validate failed with no output"). Measured on
+    non-root boxes running 2.11.7 and 2.11.4, 2026-10-14."""
+    keep = []
+    for ln in (out or '').splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if ln.startswith('{"level"'):
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if rec.get('level') in ('error', 'fatal', 'panic') and rec.get('msg'):
+                keep.append(str(rec['msg']))
+            continue
+        keep.append(ln)
     return ' '.join(keep).strip()
 
 
@@ -32746,7 +32840,16 @@ def generate_caddyfile(settings=None):
         lines.append("")
 
         # The device channel (TLS :8449), mutual TLS against ATLAS's own CA.
-        if at_ca:
+        # GH #137: never on a Caddy that cannot parse `trust_pool` — it would make the
+        # whole file unloadable and every regeneration on this box would be restored away.
+        # The ATLAS deploy refuses up front on such a box and names the fix.
+        if at_ca and not _caddy_supports_trust_pool():
+            print(f'Caddy: ATLAS device channel for {at_host}:8449 NOT emitted — Caddy '
+                  f'{".".join(map(str, _caddy_version_tuple()))} is older than 2.8 and has no '
+                  f'client_auth trust_pool. Update Caddy from the Caddy page.', flush=True)
+            lines.append(f"# ATLAS MDM — device channel :8449 omitted: needs Caddy 2.8+ (GH #137)")
+            lines.append("")
+        elif at_ca:
             lines.append(f"# ATLAS MDM — device management channel (TLS :8449, mutual TLS)")
             lines.append(f"{at_host}:8449 {{")
             lines.append(f"    tls {{")
@@ -75653,6 +75756,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
+        _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -77647,6 +77751,7 @@ def _deploy_takserver_container(config):
         log_step("  (first build pulls the bundle's base images — minutes on arm64)")
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
+        _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
@@ -90705,6 +90810,11 @@ _MODULE_CTX = {
     # own except-handler turns it into a failed deploy. /redteam-selfaudit fails the build
     # on a raw reload anywhere outside _caddy_reload_checked().
     '_caddy_reload': _caddy_reload,
+    # GH #137: ATLAS refuses to deploy onto a Caddy that cannot parse its device site,
+    # and names the real reason when generate_caddyfile's backstop restored the old file.
+    '_caddy_version_tuple': _caddy_version_tuple,
+    '_caddy_supports_trust_pool': _caddy_supports_trust_pool,
+    '_caddy_last_validate_error': _caddy_last_validate_error,
     'detect_modules': detect_modules,
     'probe_run': _probe_run,        # never-raise status probe (broker-shimmed)
     # emailrelay seams — these helpers stay in app.py this release (the Authentik

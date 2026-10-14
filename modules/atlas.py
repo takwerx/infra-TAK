@@ -3288,6 +3288,20 @@ def deploy(ctx, job, params):
     try:
         settings = ctx['load_settings']()
 
+        # ⚠️ **Before anything is built (GH #137).** The device site uses
+        # `client_auth { trust_pool … }`, which Caddy 2.7 does not have. On a
+        # 2.7 box the render was rejected, the previous Caddyfile was put back,
+        # and the deploy stopped at step 6 saying the listener "was rendered
+        # without" — after building everything, and naming the wrong cause.
+        _tp = ctx.get('_caddy_supports_trust_pool')
+        if _tp is not None and not _tp():
+            _cv = '.'.join(map(str, ctx['_caddy_version_tuple']()))
+            raise RuntimeError(
+                "ATLAS's device channel needs Caddy 2.8 or newer (it verifies "
+                'tablets with client_auth trust_pool, which Caddy %s does not '
+                'have). Open the Caddy page, click Update, then deploy ATLAS '
+                'again.' % _cv)
+
         # ── 1/7 Docker ────────────────────────────────────────────────────────
         plog('━━━ Step 1/7: Checking Docker ━━━')
         rc, version = ctx['_docker_probe']()
@@ -3560,16 +3574,14 @@ def deploy(ctx, job, params):
                 % device_ca_path(_inst))
         plog('✓ Device CA staged for Caddy at %s' % staged)
 
+        _rendered_at = time.time()
         ctx['generate_caddyfile'](s)
         # ⚠️ Read back. Staging the CA and rendering the listener are two
         # different questions, and on the first Rocky non-root deploy the first
         # was true while the second was false (see `_ca_is_staged`).
-        if not _caddyfile_has_device_listener(_me['host']):
+        if not _caddyfile_has_device_listener(_me['host'], ctx):
             raise RuntimeError(
-                'The Caddyfile was rendered without the :%d device listener for %s '
-                'although the device CA is staged at %s. Stopping here rather than '
-                'leaving the device channel silently missing.'
-                % (DEVICE_PORT, _me['host'], staged))
+                _device_listener_missing(ctx, _me['host'], staged, _rendered_at))
         plog('✓ Device listener :%d rendered for %s' % (DEVICE_PORT, _me['host']))
         if ctx['_caddy_reload'](plog):
             plog('✓ Caddy reloaded')
@@ -3798,16 +3810,37 @@ def _ca_is_staged(inst=None, ctx=None):
         return False
 
 
-def _caddyfile_has_device_listener(host):
-    """Did the render actually emit `<host>:8449 {`? Read back, never assumed."""
+def _caddyfile_has_device_listener(host, ctx=None):
+    """Did the render actually emit `<host>:8449 {`? Read back, never assumed.
+
+    ⚠️ A read the console cannot make is not "absent" — same lesson as
+    `_ca_is_staged`. On OSError ask the broker before concluding the listener
+    is missing (GH #137).
+    """
     if not host:
         return True
-    try:
-        with open('/etc/caddy/Caddyfile') as f:
-            body = f.read()
-    except OSError:
-        return False
-    return ('%s:%d {' % (host, DEVICE_PORT)) in body
+    body = _read_maybe_priv('/etc/caddy/Caddyfile', ctx)
+    return ('%s:%d {' % (host, DEVICE_PORT)) in (body or '')
+
+
+def _device_listener_missing(ctx, host, staged, since):
+    """Why the device listener is not in the Caddyfile on disk, for the deploy log.
+
+    ⚠️ **Name the real cause when there is one (GH #137).** When `caddy
+    validate` rejects the new file, the console puts the old one back — so the
+    listener *was* rendered and the file on disk simply is not it. Blaming the
+    render sent the reporter nowhere. `since` is when this deploy rendered, so
+    a rejection left over from an earlier write is not blamed.
+    """
+    rej = (ctx or {}).get('_caddy_last_validate_error') or {}
+    if rej.get('err') and rej.get('ts', 0) >= since:
+        return ('Caddy rejected the new Caddyfile, so the previous one was kept '
+                'and the :%d device listener for %s is not live. Caddy said: %s'
+                % (DEVICE_PORT, host, rej['err']))
+    return ('The Caddyfile was rendered without the :%d device listener for %s '
+            'although the device CA is staged at %s. Stopping here rather than '
+            'leaving the device channel silently missing.'
+            % (DEVICE_PORT, host, staged))
 
 
 def sync_device_ca_for_caddy(inst=None, ctx=None):
