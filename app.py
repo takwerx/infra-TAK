@@ -37715,9 +37715,10 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
-    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1', timeout=120)
+    _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
+    ok, _ = _module_run(deploy_cfg, f'pip3 install {_pkgs} --break-system-packages 2>&1', timeout=120)
     if not ok:
-        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
+        _module_run(deploy_cfg, f'pip3 install {_pkgs} 2>&1', timeout=120)
     plog("✓ Python packages installed")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
@@ -38305,11 +38306,7 @@ def run_mediamtx_deploy():
 
         # Install Python packages (try with --break-system-packages for newer pip, else without)
         plog("  Installing Python packages...")
-        r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
-            shell=True, capture_output=True, text=True, timeout=120)
-        if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-            subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120)
+        _mediamtx_editor_install_py_deps()
         plog("✓ Python packages installed")
 
         # v0.9.31: ensure `takwerx` system user exists before any chown / unit
@@ -38834,13 +38831,8 @@ WantedBy=multi-user.target
 
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
         if os.path.exists(editor_file):
-            r = subprocess.run(
-                'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-                r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
-                    shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
+            _ok_deps, _ = _mediamtx_editor_install_py_deps()
+            if not _ok_deps:
                 plog("  ⚠ pip install for web editor deps had issues (check logs); trying to start anyway")
             else:
                 plog("  ✓ Web editor Python deps installed")
@@ -80756,6 +80748,50 @@ def _os_upgrade_reboot_blockers():
                    if l in (b'libc6', b'linux-base') or l.startswith(b'linux-image-')})
 
 
+# The post-reboot verify compares against every long-running service that was up before
+# the flip — not a fixed five. Run 1 (2026-10-13) showed why: the MediaMTX web editor dies on
+# the Python change and a fixed list would never have noticed. One-shot units are excluded
+# (docker-stagger, tak-post-start…): they finish and stop by design.
+_OS_UPGRADE_CORE_SERVICES = ('takserver', 'docker', 'takwerx-broker', 'takwerx-console', 'caddy',
+                             'fail2ban', 'mediamtx', 'mediamtx-webeditor')
+_OS_UPGRADE_NOT_BASELINE = {'infratak-os-upgrade', 'infratak-kernel-patch', 'infratak-nonroot-migrate'}
+# Guard Dog's boot sequencer stops the heavy containers at boot; tak-post-start brings them back
+# once TAK answers — 9.5 minutes after boot on aws-jammy (2026-10-13). Wait for it to finish
+# before judging, then give everything _OS_UPGRADE_VERIFY_WAIT_S more.
+_OS_UPGRADE_POSTSTART_WAIT_S = 1800
+
+
+def _os_upgrade_service_baseline(listdir=None, run=None):
+    """{name: 'active'} for every non-oneshot service running now among the core list and
+    every unit in /etc/systemd/system (what infra-TAK and its modules installed)."""
+    listdir = listdir or os.listdir
+    run = run or subprocess.run
+    names = set(_OS_UPGRADE_CORE_SERVICES)
+    try:
+        for f in listdir('/etc/systemd/system'):
+            if f.endswith('.service') and '@' not in f:
+                names.add(f[:-len('.service')])
+    except Exception:
+        pass
+    names -= _OS_UPGRADE_NOT_BASELINE
+    out = {}
+    if not names:
+        return out
+    try:
+        r = run(['systemctl', 'show', '-p', 'Id,Type,ActiveState,SubState', '--']
+                + sorted(n + '.service' for n in names), capture_output=True, text=True, timeout=30)
+        for blk in (r.stdout or '').split('\n\n'):
+            d = dict(l.split('=', 1) for l in blk.splitlines() if '=' in l)
+            unit = d.get('Id', '')
+            if not unit.endswith('.service') or d.get('Type') == 'oneshot':
+                continue
+            if d.get('ActiveState') == 'active' and d.get('SubState') == 'running':
+                out[unit[:-len('.service')]] = 'active'
+    except Exception:
+        pass
+    return out
+
+
 def _os_upgrade_preflight(for_start=False, data=None):
     """Every check in PLAN-v10.3.0 §4 W4. Returns {ok, checks:[{name,pass,detail,notice}],
     irreversible:[...], baseline:{...}, os_type, os_name}. Read-only: nothing here changes
@@ -80811,8 +80847,16 @@ def _os_upgrade_preflight(for_start=False, data=None):
 
     # 3. Local DB — a split-box remote DB server has no console and is not touched.
     db_host = _tak_db_host_from_coreconfig() if tak_installed else ''
-    db_remote = bool(db_host) and _tak_db_is_remote(db_host)
-    if db_remote:
+    try:
+        tak_in_docker = tak_installed and _tak_is_container()
+    except Exception:
+        tak_in_docker = False
+    # v10.3.0 W4.d: a Docker TAK's CoreConfig names the `takserver-db` container, which the
+    # remote-host test would call "a separate box". It is on this box and comes back with it.
+    db_remote = (not tak_in_docker) and bool(db_host) and _tak_db_is_remote(db_host)
+    if tak_in_docker:
+        add('tak_db_local', True, 'the TAK database runs in the takserver-db container on this box')
+    elif db_remote:
         add('tak_db_local', True, f'your database server is a separate box ({db_host}) and is not upgraded — it stays as it is', notice=True)
     else:
         add('tak_db_local', True, 'the TAK database is on this box' if tak_installed else 'no TAK database')
@@ -80897,13 +80941,7 @@ def _os_upgrade_preflight(for_start=False, data=None):
         add('acknowledge', ack == _OS_UPGRADE_ACK, 'snapshot acknowledged' if ack == _OS_UPGRADE_ACK
             else f'type exactly "{_OS_UPGRADE_ACK}" to confirm a VPS snapshot or off-box backup exists')
 
-    services = {}
-    for svc in ('takserver', 'docker', 'takwerx-broker', 'caddy', 'postgresql'):
-        try:
-            r = subprocess.run(['systemctl', 'is-active', svc], capture_output=True, text=True, timeout=8)
-            services[svc] = (r.stdout or '').strip() or 'unknown'
-        except Exception:
-            services[svc] = 'unknown'
+    services = _os_upgrade_service_baseline()
     baseline = {
         'containers': running,
         'services': {k: v for k, v in services.items() if v == 'active'},
@@ -81281,6 +81319,15 @@ def _startup_os_upgrade_verify():
                 baseline = {}
             want_c = set(baseline.get('containers') or [])
             want_s = {k for k, v in (baseline.get('services') or {}).items() if v == 'active'}
+            # Guard Dog's tak-post-start (oneshot, RemainAfterExit) restarts the containers the
+            # boot sequencer stopped, after TAK answers. Until it has finished (active / failed)
+            # a missing container means "not yet", not "lost".
+            ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S
+            while time.time() < ps_deadline:
+                _ld, _act, _sub, _res, _pid = _kernel_patch_unit_state('tak-post-start.service')
+                if _ld != 'loaded' or _act in ('active', 'failed'):
+                    break
+                time.sleep(15)
             deadline = time.time() + _OS_UPGRADE_VERIFY_WAIT_S
             while True:
                 running, _p, _e = _os_upgrade_containers()
@@ -86241,6 +86288,77 @@ def _mediamtx_editor_grant_journal_access():
         return False
 
 
+# v10.3.0 W4.b — the MediaMTX web editor runs on the SYSTEM python3 with these packages
+# pip-installed for the console's user (`~takwerx/.local/lib/python3.X/site-packages` on a
+# non-root console, `/usr/local/lib/python3.X/dist-packages` as root). Both paths are named
+# after the Python version, so an Ubuntu 22.04 -> 24.04 upgrade (3.10 -> 3.12) leaves the
+# editor unable to import Flask and it never starts. One package list and one installer for
+# deploy, Patch, the remote deploy and the heal below.
+_MEDIAMTX_EDITOR_PY_PKGS = ('Flask', 'ruamel.yaml', 'requests', 'psutil')
+_MEDIAMTX_EDITOR_PY_IMPORTS = 'import flask, ruamel.yaml, requests, psutil'
+_MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
+_MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+
+
+def _mediamtx_editor_install_py_deps(timeout=120):
+    """(ok, output) — `pip3 install … --break-system-packages` (PEP 668 on 24.04 / Debian 12),
+    retried without the flag on an older pip that does not know it. Runs as the console
+    process, exactly as the deploy always has, so the packages land where the editor's
+    interpreter looks for them."""
+    base = ['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)
+    r = subprocess.run(base + ['--break-system-packages'], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    if r.returncode != 0 and 'no such option' in (r.stdout or ''):
+        r = subprocess.run(base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout)
+    return r.returncode == 0, (r.stdout or '')
+
+
+def _mediamtx_editor_python_ok():
+    """True when the editor's interpreter can import its packages in the console's own
+    context (the one deploy installed them in). Unknown -> True: never "heal" on a guess."""
+    try:
+        r = subprocess.run(['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
+def _startup_heal_mediamtx_editor_python():
+    """v10.3.0 W4.b: reinstall the editor's Python packages when its interpreter can no longer
+    import them, then restart it. Covers the console-driven upgrade AND a box upgraded by hand
+    (console-path delivery). No-op when MediaMTX is not installed or the editor imports fine.
+    Threaded: pip needs the network, and an offline box must not slow every boot."""
+    if not (os.path.exists(_MEDIAMTX_EDITOR_UNIT) and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        return False
+    if _mediamtx_editor_python_ok():
+        return False
+
+    def _heal():
+        try:
+            pyver = subprocess.run(['/usr/bin/python3', '-c', 'import sys;print("%d.%d" % sys.version_info[:2])'],
+                                   capture_output=True, text=True, timeout=10).stdout.strip() or '?'
+        except Exception:
+            pyver = '?'
+        print(f"Startup migration: MediaMTX web editor cannot import its packages on Python {pyver} "
+              f"(an OS upgrade moves Python) — reinstalling {', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}", flush=True)
+        try:
+            ok, out = _mediamtx_editor_install_py_deps()
+        except Exception as e:
+            ok, out = False, str(e)
+        if ok and _mediamtx_editor_python_ok():
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                           capture_output=True, timeout=60)
+            print("Startup migration: ✓ MediaMTX web editor packages reinstalled and editor restarted", flush=True)
+        else:
+            tail = (out or '').strip().splitlines()[-1:] or ['no output']
+            print(f"Startup migration: ✗ MediaMTX web editor packages could not be reinstalled: {tail[0][:200]}", flush=True)
+
+    threading.Thread(target=_heal, daemon=True, name='mediamtx-editor-python-heal').start()
+    return True
+
+
 def _startup_heal_mediamtx_editor_probe():
     """Make the GH #67 GStreamer fix actually reach boxes, instead of waiting for a click.
 
@@ -87948,6 +88066,13 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_probe()
         except Exception as _mx_err:
             print(f"Startup migration: MediaMTX editor heal error (non-fatal): {_mx_err}", flush=True)
+
+        # v10.3.0 W4.b: the editor's pip packages are tied to the Python version — after an
+        # OS upgrade it cannot start until they are reinstalled for the new interpreter.
+        try:
+            _startup_heal_mediamtx_editor_python()
+        except Exception as _mxp_err:
+            print(f"Startup migration: MediaMTX editor Python heal error (non-fatal): {_mxp_err}", flush=True)
 
         # v10.1.10: bring a stale relay up to the bootstrap this console ships
         # (console-path delivery — relay-side fixes can't require the operator to

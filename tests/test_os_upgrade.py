@@ -249,6 +249,7 @@ class Box:
             _os_upgrade_containers=lambda: (None if docker_err else list(containers), list(problems), docker_err),
             _os_upgrade_pending_updates=lambda: ((None, pending_err) if pending_err else (list(pending), '')),
             _os_upgrade_reboot_blockers=lambda: list(reboot_pkgs),
+            _os_upgrade_service_baseline=lambda: {'takserver': 'active', 'docker': 'active'},
         )
         exec(compile(_fn('_os_upgrade_preflight'), 'app.py:_os_upgrade_preflight', 'exec'), self.ns)
 
@@ -297,6 +298,14 @@ def test_preflight_tak_gate_L5():
     # container TAK: no host cluster to check
     pf = Box(container=True, clusters=()).run()
     assert _check(pf, 'takserver_58')['pass'] is True and pf['baseline']['pg_expect'] == ''
+
+
+def test_docker_tak_database_is_local_not_a_separate_box():
+    # W4.d: a Docker TAK's CoreConfig names the takserver-db container — not "a separate box"
+    pf = Box(container=True, clusters=(), db_host='takserver-db').run()
+    c = _check(pf, 'tak_db_local')
+    assert c['pass'] is True and c['notice'] is False and 'takserver-db container on this box' in c['detail']
+    assert pf['baseline']['db_remote'] is False
 
 
 def test_preflight_remote_db_is_a_notice_not_a_refusal():
@@ -410,8 +419,9 @@ def test_job_state_transitions(raw, unit, state, step):
 class Boot:
     def __init__(self, status='rebooting', os_release=('ubuntu-24.04', 'Ubuntu 24.04.1 LTS'),
                  baseline=None, running=('authentik-server', 'tak-portal'), active=('takserver', 'docker'),
-                 clusters=(('18', 'main', '5432', 'online'),)):
+                 clusters=(('18', 'main', '5432', 'online'),), poststart=None):
         self.writes = []
+        self.poststart = list(poststart or [('not-found', 'inactive', 'dead', '', 0)])
         baseline = baseline if baseline is not None else {
             'containers': ['authentik-server', 'tak-portal'], 'services': {'takserver': 'active', 'docker': 'active'},
             'pg_expect': '18'}
@@ -440,8 +450,10 @@ class Boot:
             _os_upgrade_pg_clusters=lambda: list(clusters),
             audit=lambda *a: self.audits.append(a),
             print=lambda *a, **k: None,
+            _kernel_patch_unit_state=lambda unit: (self.poststart.pop(0) if len(self.poststart) > 1 else self.poststart[0]),
         )
         self.ns['_OS_UPGRADE_VERIFY_WAIT_S'] = 0
+        self.ns['_OS_UPGRADE_POSTSTART_WAIT_S'] = 3600
         exec(compile(_fn('_startup_os_upgrade_verify'), 'app.py:_startup_os_upgrade_verify', 'exec'), self.ns)
 
     def go(self):
@@ -827,3 +839,124 @@ def test_console_labels_the_new_checks():
     assert "os_up_to_date:'All Ubuntu updates installed'" in html
     assert "no_reboot_pending:'No reboot pending'" in html
     assert 'UNCHANGED means nothing was touched' in html
+
+
+
+# ---------------------------------------------------------------------------
+# W4.b — verify waits for Guard Dog's post-start; baseline = every long-running service
+# ---------------------------------------------------------------------------
+def test_verify_waits_for_guard_dog_post_start_before_judging():
+    seq = [('loaded', 'activating', 'start', '', 0)] * 3 + [('loaded', 'active', 'exited', 'success', 0)]
+    b = Boot(poststart=seq)
+    b.go()
+    assert b.writes == ['verifying', 'done'] and b.poststart == [('loaded', 'active', 'exited', 'success', 0)]
+
+
+def test_verify_does_not_wait_when_post_start_failed_or_is_absent():
+    for st in (('loaded', 'failed', 'failed', 'timeout', 0), ('not-found', 'inactive', 'dead', '', 0)):
+        b = Boot(poststart=[st])
+        b.go()
+        assert b.writes == ['verifying', 'done']
+
+
+def test_verify_post_start_wait_is_capped():
+    assert 'ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S' in _fn('_startup_os_upgrade_verify')
+    assert '_OS_UPGRADE_POSTSTART_WAIT_S = 1800' in APP
+
+
+def _baseline(show_out, files):
+    ns = {'os': __import__('os'), 'subprocess': subprocess}
+    exec(compile(APP[APP.index('_OS_UPGRADE_CORE_SERVICES = ('):APP.index('def _os_upgrade_service_baseline(')]
+                 + _fn('_os_upgrade_service_baseline'), 'app.py', 'exec'), ns)
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return types.SimpleNamespace(stdout=show_out, returncode=0)
+    return ns['_os_upgrade_service_baseline'](listdir=lambda d: files, run=run), calls
+
+
+def test_baseline_covers_every_long_running_infratak_service():
+    show = "\n\n".join([
+        "Id=takserver.service\nType=forking\nActiveState=active\nSubState=running",
+        "Id=mediamtx-webeditor.service\nType=simple\nActiveState=active\nSubState=running",
+        "Id=tak-health.service\nType=simple\nActiveState=active\nSubState=running",
+        "Id=tak-post-start.service\nType=oneshot\nActiveState=active\nSubState=exited",     # oneshot: excluded
+        "Id=docker-stagger.service\nType=oneshot\nActiveState=active\nSubState=exited",
+        "Id=caddy.service\nType=notify\nActiveState=failed\nSubState=failed",              # not up now: excluded
+        "Id=fail2ban.service\nType=simple\nActiveState=inactive\nSubState=dead",
+    ])
+    files = ['mediamtx-webeditor.service', 'tak-health.service', 'tak-post-start.service', 'docker-stagger.service',
+             'infratak-os-upgrade.service', 'getty@tty1.service', 'something.timer']
+    out, calls = _baseline(show, files)
+    assert out == {'takserver': 'active', 'mediamtx-webeditor': 'active', 'tak-health': 'active'}
+    asked = set(calls[0][calls[0].index('--') + 1:])
+    assert 'infratak-os-upgrade.service' not in asked          # the job itself is never baseline
+    assert 'getty@tty1.service' not in asked and 'something.timer.service' not in asked
+    assert {'takserver.service', 'docker.service', 'mediamtx-webeditor.service'} <= asked
+
+
+# ---------------------------------------------------------------------------
+# W4.b — the MediaMTX web editor's Python packages after the flip
+# ---------------------------------------------------------------------------
+class EditorBox:
+    def __init__(self, installed=True, ok_seq=(False, True), install_ok=True):
+        self.ok_seq = list(ok_seq)
+        self.restarts, self.installs, self.logs = [], [], []
+        paths = {'/etc/systemd/system/mediamtx-webeditor.service', '/opt/mediamtx-webeditor/mediamtx_config_editor.py'}
+
+        class _T:
+            def __init__(s, target=None, daemon=None, name=None):
+                s.target = target
+
+            def start(s):
+                s.target()
+        ns = {
+            'os': types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda p: installed and p in paths)),
+            'subprocess': types.SimpleNamespace(run=lambda argv, **kw: (self.restarts.append(argv) if 'restart' in argv else None)
+                                                or types.SimpleNamespace(stdout='3.12\n', returncode=0)),
+            'threading': types.SimpleNamespace(Thread=_T),
+            '_sudo_wrap': lambda c: c,
+            '_mediamtx_editor_python_ok': lambda: self.ok_seq.pop(0) if self.ok_seq else True,
+            '_mediamtx_editor_install_py_deps': lambda: (self.installs.append(1) or (install_ok, 'ok' if install_ok else 'E: no network')),
+            'print': lambda *a, **k: self.logs.append(' '.join(map(str, a))),
+            '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
+            '_MEDIAMTX_EDITOR_UNIT': '/etc/systemd/system/mediamtx-webeditor.service',
+            '_MEDIAMTX_EDITOR_SRC': '/opt/mediamtx-webeditor/mediamtx_config_editor.py',
+        }
+        exec(compile(_fn('_startup_heal_mediamtx_editor_python'), 'app.py', 'exec'), ns)
+        self.fn = ns['_startup_heal_mediamtx_editor_python']
+
+
+def test_editor_heal_reinstalls_and_restarts_when_imports_fail():
+    e = EditorBox(ok_seq=(False, True))
+    assert e.fn() is True
+    assert e.installs == [1] and e.restarts == [['systemctl', 'restart', 'mediamtx-webeditor']]
+    assert any('Python 3.12' in l for l in e.logs) and any('✓' in l for l in e.logs)
+
+
+def test_editor_heal_is_a_no_op_when_fine_or_absent():
+    e = EditorBox(ok_seq=(True,))
+    assert e.fn() is False and e.installs == [] and e.restarts == []
+    e = EditorBox(installed=False)
+    assert e.fn() is False and e.installs == [] and e.restarts == []
+
+
+def test_editor_heal_never_restarts_on_a_failed_install():
+    e = EditorBox(ok_seq=(False, False), install_ok=False)
+    e.fn()
+    assert e.restarts == [] and any('could not be reinstalled' in l for l in e.logs)
+
+
+def test_one_package_list_everywhere():
+    """deploy, Patch and the remote deploy all install the same list through the constant."""
+    assert "pip3 install Flask" not in APP
+    assert APP.count('_mediamtx_editor_install_py_deps()') >= 3        # deploy, patch, heal
+    assert "f'pip3 install {_pkgs} --break-system-packages 2>&1'" in APP  # remote deploy
+    assert '_startup_heal_mediamtx_editor_python()' in _fn('_startup_migrations')
+
+
+def test_editor_installer_uses_an_argv_not_a_shell_string():
+    body = _fn('_mediamtx_editor_install_py_deps')
+    assert 'shell=True' not in body
+    assert "['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)" in body and "['--break-system-packages']" in body
