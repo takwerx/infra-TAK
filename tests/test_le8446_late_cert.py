@@ -59,10 +59,19 @@ def _heal(files, settings, keystore_fp=None, caddy_has_cert=True, install_result
                                                CADDY_PEM if caddy_has_cert else b'', b'')
         if 'openssl x509 -in' in txt:
             return subprocess.CompletedProcess(cmd, 0, 'sha256 Fingerprint=CADDY\n', '')
+        # the 8446 keystore read — either shape: a shell `keytool | openssl` pipeline, or
+        # `runuser -u tak -- keytool -list -rfc` (argv) followed by argv openssl on its PEM
         if 'keytool' in txt and '-fingerprint' in txt:
             return subprocess.CompletedProcess(cmd, 0, keystore_fp or '', '')
         if 'keytool' in txt and '-checkend' in txt:
             return subprocess.CompletedProcess(cmd, 0 if keystore_fp else 1, '', '')
+        if 'keytool' in txt:
+            return subprocess.CompletedProcess(cmd, 0 if keystore_fp else 1, 'KEYSTORE-PEM' if keystore_fp else '', '')
+        if txt.startswith('openssl x509') and kw.get('input') == 'KEYSTORE-PEM':
+            if '-fingerprint' in txt:
+                return subprocess.CompletedProcess(cmd, 0, keystore_fp, '')
+            if '-checkend' in txt:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
         raise AssertionError('unexpected command: ' + txt)
 
     def install(host, log, wait_for_cert=True):
