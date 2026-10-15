@@ -33670,6 +33670,57 @@ WantedBy=timers.target
     return True
 
 
+def _tak_coreconfig_give_to_tak():
+    """chown tak:tak /opt/tak/CoreConfig.xml. True on success. Never raises."""
+    try:
+        r = subprocess.run(_sudo_wrap(['chown', 'tak:tak', CORECONFIG_PATH]),
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _startup_heal_coreconfig_owner(plog=None, stat=None, getpwnam=None, chown=None):
+    """v10.2.15: give a root-owned /opt/tak/CoreConfig.xml back to `tak` on a native TAK box.
+
+    The external-database deploy seeds CoreConfig.xml from the example before TAK's first
+    start. On a non-root console the broker writes it, so the NEW file is owned by root — and
+    once it is 640 (TAK's normal mode) TAK, which runs as `tak`, cannot read its own config:
+        DistributedConfiguration - CoreConfig.xml (Permission denied)
+        Failed to find deployed service: distributed-configuration
+    TAK keeps running on what it loaded until the next restart, then cannot start at all.
+    Field 2026-10-15, two fresh managed-database installs (RDS), both broken the same way.
+
+    Native only: a container TAK's /opt/tak is the bundle, owned differently by design.
+    Never restarts TAK — a running TAK keeps working, and the next start reads it fine.
+    Returns True when it changed the owner."""
+    log = plog or (lambda m: print(m, flush=True))
+    stat = stat or os.stat
+    chown = chown or _tak_coreconfig_give_to_tak
+    if getpwnam is None:
+        import pwd
+        getpwnam = pwd.getpwnam
+    try:
+        if _tak_is_container():
+            return False
+        st = stat(CORECONFIG_PATH)
+    except OSError:
+        return False
+    try:
+        tak = getpwnam('tak')
+    except KeyError:
+        return False
+    if st.st_uid == tak.pw_uid:
+        return False
+    if not chown():
+        log("CoreConfig.xml is not owned by tak — could not chown it (TAK Server cannot read its "
+            "config on its next start)")
+        return False
+    log(f"CoreConfig.xml was owned by uid {st.st_uid}, not tak — gave it back to tak:tak so TAK Server "
+        f"can read its own config")
+    return True
+
+
 def _selfheal_takserver_le_cert(plog=None):
     """v0.9.44: re-sync TAK Server's 8446 Let's Encrypt cert when it has drifted from
     Caddy's current cert.
@@ -78725,6 +78776,10 @@ def run_takserver_deploy(config):
                                            capture_output=True, text=True, timeout=5).stdout or ''
                     if _seed.strip():
                         _write_priv('/opt/tak/CoreConfig.xml', _seed)
+                        # The broker creates a new file as root — TAK (user `tak`) could then
+                        # not read its own config once it is 640. The rpm and container seeds
+                        # chown it; this one did not (see _tak_coreconfig_give_to_tak).
+                        _tak_coreconfig_give_to_tak()
                         log_step("External DB: seeded CoreConfig.xml from CoreConfig.example.xml "
                                  "(TAK has not written one yet)")
                 except Exception as _e:
@@ -87999,6 +88054,13 @@ def _startup_migrations():
             )
         except Exception as tak_heal_err:
             print(f"Startup migration: takserver self-heal error (non-fatal): {tak_heal_err}")
+
+        # v10.2.15 — a root-owned CoreConfig.xml (external-DB seed on a non-root console)
+        # keeps TAK from reading its own config. Before the 8446 heal, which may restart TAK.
+        try:
+            _startup_heal_coreconfig_owner(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as cc_own_err:
+            print(f"Startup migration: CoreConfig owner heal error (non-fatal): {cc_own_err}")
 
         # v0.9.44 — re-sync TAK Server's 8446 Let's Encrypt cert if it drifted from
         # Caddy's current cert. Caddy auto-renews independently; the keystore used to
