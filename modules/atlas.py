@@ -4916,7 +4916,16 @@ def remove_instance(ctx, inst, plog=None):
     # the database, and it needs the compose file, so it runs before the
     # directory does.
     if os.path.isdir(dirpath):
-        _compose(ctx, 'down -v --remove-orphans', timeout=300, inst=inst)
+        # ⚠️ A compose that hangs past its timeout raises, and that escaped the
+        # whole uninstall as an HTML 500 (GH #137 follow-up). It is a failure of
+        # this deployment like any other: stop here, keep its record, re-runnable.
+        try:
+            _compose(ctx, 'down -v --remove-orphans', timeout=300, inst=inst)
+        except Exception as exc:
+            errs.append(f'{label}: docker compose down did not finish: {exc}')
+            note(f'{label}: STOPPED before removing anything else, so this '
+                 f'can be re-run once its containers have stopped.')
+            return steps, errs
         note(f'{label}: containers, network and database volume removed')
     else:
         note(f'{label}: no install directory — nothing to stop')
@@ -5120,9 +5129,16 @@ def uninstall(ctx, job, params):
         s_now.pop(key, None)
     s_now[f'{KEY}_enabled'] = False
     ctx['save_settings'](s_now)
-    ctx['generate_caddyfile'](s_now)
-    ctx['_caddy_reload']()
-    steps.append('Generated settings cleared and Caddy vhosts removed')
+    # ⚠️ Everything is already gone by this point, so a Caddy problem here is
+    # reported, not raised: raising turned a finished uninstall into an HTML 500
+    # the page could not read (GH #137 follow-up).
+    try:
+        ctx['generate_caddyfile'](s_now)
+        ctx['_caddy_reload']()
+        steps.append('Generated settings cleared and Caddy vhosts removed')
+    except Exception as exc:
+        steps.append('Generated settings cleared; Caddy could not be '
+                     f'regenerated ({exc}) — on the Caddy page, click Save & Reload Caddy')
 
     return {'success': True, 'steps': steps}
 

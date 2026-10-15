@@ -56,10 +56,12 @@ if [ "$NEW_PASS" != "$NEW_PASS_CONFIRM" ]; then
     exit 1
 fi
 
+# pbkdf2:sha256 = app.py PASSWORD_HASH_METHOD (GH #137). werkzeug's default, scrypt, is
+# missing from FIPS-mode OpenSSL — this script is the way out for a box stuck on one.
 PASS_HASH=$("$INSTALL_DIR/.venv/bin/python3" -c "
 from werkzeug.security import generate_password_hash
 import sys
-print(generate_password_hash(sys.argv[1]))
+print(generate_password_hash(sys.argv[1], method='pbkdf2:sha256'))
 " "$NEW_PASS")
 
 cat > "$AUTH_FILE" << EOF

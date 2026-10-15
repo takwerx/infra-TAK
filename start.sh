@@ -667,11 +667,12 @@ first_time_setup() {
         break
     done
 
-    # Hash the password using Python
+    # Hash the password using Python. pbkdf2:sha256 = app.py PASSWORD_HASH_METHOD (GH #137):
+    # werkzeug's default, scrypt, is missing from FIPS-mode OpenSSL.
     PASS_HASH=$("$INSTALL_DIR/.venv/bin/python3" -c "
 from werkzeug.security import generate_password_hash
 import sys
-print(generate_password_hash(sys.argv[1]))
+print(generate_password_hash(sys.argv[1], method='pbkdf2:sha256'))
 " "$ADMIN_PASS")
 
     # Save auth config

@@ -99,6 +99,8 @@ class _Box:
             return self._ok('true\n' if self.running else 'false\n')
         if cmd[:2] == ['docker', 'exec']:
             return self._ok(self.keystore_pem if self.exec_rc == 0 else '', self.exec_rc)
+        if cmd[:4] == ['runuser', '-u', 'tak', '--']:     # native: keytool as tak via the broker
+            return self._ok(self.keystore_pem if self.exec_rc == 0 else '', self.exec_rc)
         if cmd[0] == 'openssl':
             return subprocess.run(cmd, **kw)
         raise AssertionError(f'unexpected command: {cmd}')
@@ -159,3 +161,22 @@ def test_native_still_reads_the_host_keystore(certs, keystore, want):
     box.heal()
     assert box.installs == want
     assert box.execs == []
+
+
+def test_native_reads_the_keystore_as_tak_so_an_unchanged_cert_does_not_restart_tak(certs):
+    """v10.2.15: the keystore is tak:tak 640 — the non-root console's own keytool could not open
+    it, so every console start (boot + the daily restart) restarted TAK. Field 2026-10-15: that
+    restart landed mid-boot and TAK messaging died ("node left topology"), 8089 took 16 min."""
+    box = _Box(certs['caddy'], certs['caddy'], container=False)
+    box.heal()
+    assert box.installs == []
+    reads = [c for c in box.runs if isinstance(c, list) and c[:1] == ['runuser']]
+    assert reads == [['runuser', '-u', 'tak', '--', 'keytool', '-list', '-rfc',
+                      '-keystore', JKS, '-storepass', 'atakatak']]
+    assert not any(isinstance(c, str) and 'keytool' in c for c in box.runs), 'no shell keytool any more'
+
+
+def test_native_unreadable_keystore_is_resynced(certs):
+    box = _Box(certs['caddy'], certs['caddy'], container=False, exec_rc=1)
+    box.heal()
+    assert box.installs == ['tak.example.com']

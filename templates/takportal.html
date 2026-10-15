@@ -262,6 +262,7 @@ async function sshRepair(){
         var d=await r.json();
         if(log){log.style.display='block';log.textContent=(d.log||[]).join('\n')||'(no output)'}
         if(d.success&&d.verified){msg.style.color='var(--green)';msg.textContent='✓ Verified — privileged mode: '+d.probe}
+        else if(d.success&&d.note){msg.style.color='var(--text-secondary)';msg.textContent='ℹ '+d.note}
         else if(d.success){msg.style.color='var(--yellow)';msg.textContent='⚠ Not verified — privileged mode: '+(d.probe||'unknown')+(d.detail?' ('+d.detail+')':'')}
         else{msg.style.color='var(--red)';msg.textContent='✗ '+(d.error||'Repair failed')}
     }catch(e){msg.style.color='var(--red)';msg.textContent='✗ '+e.message}

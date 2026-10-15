@@ -1616,15 +1616,25 @@ async function doUninstall(){
       body: JSON.stringify({password: pw}),
       credentials: 'same-origin'
     });
-    const d = await r.json();
-    if (d.success) {
+    // GH #137 follow-up: anything that is not the console's JSON (a proxy's
+    // error page, a crash page) used to surface as a bare JSON.parse error.
+    // Say what came back instead, and that the removal may still have run.
+    const body = await r.text();
+    let d = null;
+    try { d = JSON.parse(body); } catch (_) {}
+    if (!d) {
+      err.textContent = 'The console answered with HTTP ' + r.status +
+        ' instead of an uninstall result, so it is not known how far the removal got. ' +
+        'Reload this page to see what is still installed, then try again if ATLAS is still listed.';
+    } else if (d.success) {
       busy.hidden = true;
       steps.hidden = false;
       steps.textContent = (d.steps || ['Removed.']).join(String.fromCharCode(10));
       setTimeout(function(){ location.reload(); }, 2500);
       return;
+    } else {
+      err.textContent = d.error || 'Uninstall failed.';
     }
-    err.textContent = d.error || 'Uninstall failed.';
   } catch (e) {
     err.textContent = 'Uninstall failed: ' + e;
   }

@@ -71,7 +71,11 @@ if __name__ == '__main__':
 
 from flask import (Flask, render_template, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
-from werkzeug.security import check_password_hash, generate_password_hash
+# GH #137: the werkzeug pair is wrapped below (verify_password / hash_password, next to
+# load_auth) and the plain names re-bound to the wrappers, so every existing
+# check_password_hash() call site gets the fail-closed check without being touched.
+from werkzeug.security import (check_password_hash as _werkzeug_check_password_hash,
+                               generate_password_hash as _werkzeug_generate_password_hash)
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib, socket
@@ -2206,6 +2210,91 @@ def save_auth(auth_dict):
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
 
+
+# GH #137: werkzeug's default hash is scrypt, and an OpenSSL without scrypt (FIPS mode
+# drops it) makes check_password_hash RAISE "[digital envelope routines] unsupported"
+# instead of answering — a 500 on login and on every admin-password gate. New hashes use
+# PBKDF2-HMAC-SHA256 (FIPS-approved, in every OpenSSL build; werkzeug's default
+# iterations). start.sh and reset-console-password.sh pass the same method.
+PASSWORD_HASH_METHOD = 'pbkdf2:sha256'
+
+
+def verify_password(pwhash, password):
+    """True only when `password` matches `pwhash`. Fails CLOSED: a hash this box cannot
+    compute (scrypt without OpenSSL scrypt), a malformed hash, or any other error is a
+    deny, never an allow and never a 500. stored_hash_unusable() explains the deny."""
+    if not pwhash:
+        return False
+    try:
+        return bool(_werkzeug_check_password_hash(pwhash, password or ''))
+    except Exception as e:
+        print(f"[auth] password check denied: stored hash cannot be checked on this box "
+              f"({type(e).__name__}: {str(e)[:120]})", flush=True)
+        return False
+
+
+def hash_password(password):
+    return _werkzeug_generate_password_hash(password, method=PASSWORD_HASH_METHOD)
+
+
+# Every existing call site keeps its name and gets the wrappers (see the import).
+check_password_hash = verify_password
+generate_password_hash = hash_password
+
+
+def _hash_method_error(method_spec):
+    """'' if this box can compute hashes of `method_spec` (the part of a werkzeug hash
+    before the first '$', e.g. 'scrypt:32768:8:1'), else the error it raises."""
+    try:
+        parts = method_spec.split(':')
+        if parts[0] == 'scrypt':
+            n, r, p = (int(x) for x in parts[1:4]) if len(parts) >= 4 else (2 ** 15, 8, 1)
+            hashlib.scrypt(b'x', salt=b'saltsaltsaltsalt', n=n, r=r, p=p,
+                           maxmem=132 * n * r * p, dklen=64)
+        elif parts[0] == 'pbkdf2':
+            hashlib.pbkdf2_hmac(parts[1] if len(parts) > 1 else 'sha256',
+                                b'x', b'saltsaltsaltsalt', 1000)
+        else:
+            return f'unknown hash method {parts[0]!r}'
+    except Exception as e:
+        return f'{type(e).__name__}: {str(e)[:120]}'
+    return ''
+
+
+_HASH_METHOD_ERRORS = {}
+
+
+def stored_hash_unusable(pwhash):
+    """Operator-facing reason when the stored console password hash cannot be checked on
+    this box at all (so typing the right password can never work), else None. Shown in
+    place of "Invalid password" so the operator resets instead of retyping."""
+    spec = (pwhash or '').split('$', 1)[0]
+    if not spec:
+        return None
+    if spec not in _HASH_METHOD_ERRORS:
+        _HASH_METHOD_ERRORS[spec] = _hash_method_error(spec)
+    err = _HASH_METHOD_ERRORS[spec]
+    if not err:
+        return None
+    return (f"This server cannot check the stored console password: its {spec.split(':')[0]} "
+            f"hash is not supported by this system's OpenSSL ({err}; FIPS mode removes scrypt). "
+            "Reset it on the server: cd to the infra-TAK install folder and run "
+            "sudo ./reset-console-password.sh")
+
+
+def _upgrade_password_hash(auth, password):
+    """Called right after a successful password login: re-hash a pre-#137 (scrypt) hash
+    with PASSWORD_HASH_METHOD so the box keeps working if scrypt later goes away (e.g.
+    FIPS enabled). Best-effort — a failed upgrade never affects the login."""
+    try:
+        if not (auth.get('password_hash') or '').startswith(PASSWORD_HASH_METHOD + ':'):
+            auth = dict(auth)
+            auth['password_hash'] = hash_password(password)
+            save_auth(auth)
+            print(f"[auth] console password hash upgraded to {PASSWORD_HASH_METHOD}", flush=True)
+    except Exception as e:
+        print(f"[auth] password hash upgrade skipped: {str(e)[:120]}", flush=True)
+
 # ==========================================================================
 # v10.0.1 — Platform detection (arch × distro × install-method)
 # ==========================================================================
@@ -3450,7 +3539,8 @@ def _require_admin_password(data=None):
     password = (data or {}).get('password', '')
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return jsonify({'success': False, 'error': 'Invalid admin password'}), 403
+        return jsonify({'success': False,
+                        'error': stored_hash_unusable(auth.get('password_hash')) or 'Invalid admin password'}), 403
     return None
 
 
@@ -5708,12 +5798,14 @@ def login():
                 error='Password not set or wrong install path. Use backdoor: https://YOUR_SERVER_IP:5001 and run ./reset-console-password.sh from the install directory.',
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            _upgrade_password_hash(auth, request.form.get('password', ''))
             session.clear()
             session['authenticated'] = True
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
-        return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
+        return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
+                               version=VERSION, login_logo_url=logo_url)
     return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
 
 @app.route('/logout', methods=['POST'])
@@ -5736,11 +5828,13 @@ def index():
                 error='Password not set or wrong install path. Use backdoor: https://YOUR_SERVER_IP:5001 and run ./reset-console-password.sh from the install directory.',
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            _upgrade_password_hash(auth, request.form.get('password', ''))
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
-        return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
+        return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
+                               version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
         return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
     return redirect(url_for('console_page'))
@@ -33827,13 +33921,24 @@ def _selfheal_takserver_le_cert(plog=None):
                         ['openssl', 'x509', '-checkend', '0', '-noout'],
                         input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             elif os.path.exists(jks):
-                kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
-                tak_fp = subprocess.run(
-                    f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
-                tak_expired = subprocess.run(
-                    f'{kt} | openssl x509 -checkend 0 -noout',
-                    shell=True, capture_output=True, timeout=20).returncode != 0
+                # v10.2.15: read the keystore AS `tak`, through the broker. It is tak:tak 640, so a
+                # bare `keytool` run by the non-root console (takwerx) could not open it: the
+                # fingerprint came back empty, the keystore always looked stale, and EVERY console
+                # start — boot and the daily console restart — re-imported the same cert and
+                # restarted TAK. On a reboot that restart lands mid-boot: field 2026-10-15 (Ubuntu
+                # 24.04 + RDS) TAK messaging died with Ignite "node left topology" and 8089 took
+                # 16 min instead of ~4. Same shape as the container branch above.
+                _kr = subprocess.run(
+                    _sudo_wrap(['runuser', '-u', 'tak', '--', 'keytool', '-list', '-rfc',
+                                '-keystore', jks, '-storepass', cert_pass]),
+                    capture_output=True, text=True, timeout=30)
+                if _kr.returncode == 0 and _kr.stdout:
+                    tak_fp = subprocess.run(
+                        ['openssl', 'x509', '-noout', '-fingerprint', '-sha256'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).stdout.strip()
+                    tak_expired = subprocess.run(
+                        ['openssl', 'x509', '-checkend', '0', '-noout'],
+                        input=_kr.stdout, capture_output=True, text=True, timeout=15).returncode != 0
             if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
                 return True  # keystore already matches Caddy and is valid — nothing to do
             _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
@@ -36288,6 +36393,18 @@ def _takportal_ssh_probe(timeout=20):
     return 'unreachable', ((r.stderr or r.stdout or 'no answer from sshd').strip()[:200])
 
 
+# GH #142: on containerized TAK, TAK Portal's privileged extras run host commands
+# (`sudo -u tak makeCert.sh`, `systemctl restart takserver`) that only exist with a
+# native install, so no grant from infra-TAK can make them work. Say which features
+# are missing instead of "SSH auto-setup failed — configure manually", which sent
+# operators to configure by hand something that cannot work.
+TAKPORTAL_CONTAINER_TAK_NOTE = (
+    "TAK Server runs in Docker, so TAK Portal can't issue integration-user certs, "
+    "restart TAK Server or sync plugins to the Update Server yet. Users and QR "
+    "enrollment work. Requested upstream: "
+    "https://github.com/AdventureSeeker423/TAK-Portal/issues/61")
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -36377,6 +36494,15 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # GH #142: containerized TAK. Whatever the probe says (a root console
+        # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
+        # tak user and takserver.service that do not exist. Not verified, and not
+        # a failure either: the caller reports it as a known limitation.
+        if _tak_is_container():
+            if log_fn:
+                log_fn(f"  ⏭ Privileged TAK Portal extras unavailable — {TAKPORTAL_CONTAINER_TAK_NOTE}")
+            return False
 
         # v10.1.53 (W6): prove it. This function used to return True here having
         # verified NOTHING beyond "docker cp did not error" — so a portal that
@@ -36813,9 +36939,7 @@ def takportal_ssh_status():
             'SSH from TAK Portal is configured by hand in the portal UI for a remote TAK Server.')
         return jsonify(out)
     if tak_container:
-        row('TAK Server', 'na', 'containerized install',
-            'No host `tak` user and no takserver.service — the portal SSH privilege grant '
-            'does not apply to a containerized TAK Server.')
+        row('TAK Server', 'na', 'containerized install', TAKPORTAL_CONTAINER_TAK_NOTE)
         return jsonify(out)
 
     portal = _takportal_get_existing_settings()
@@ -36925,8 +37049,10 @@ def takportal_ssh_repair():
     try:
         ok = _takportal_setup_ssh(log_fn=lambda m: log.append(m))
         verdict, detail = _takportal_ssh_probe()
+        note = TAKPORTAL_CONTAINER_TAK_NOTE if (not ok and os.path.isdir('/opt/tak')
+                                                and _tak_is_container()) else ''
         return jsonify({'success': True, 'verified': ok, 'probe': verdict,
-                        'detail': detail, 'log': log})
+                        'detail': detail, 'note': note, 'log': log})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300], 'log': log}), 500
 
@@ -37307,6 +37433,8 @@ def run_takportal_deploy():
         if _takportal_setup_ssh(log_fn=plog):
             plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:{portal_settings.get('TAK_SSH_PORT', '22')} as {portal_settings.get('TAK_SSH_USER', 'root')}")
             plog("\u2713 SSH ready (no handshake needed)")
+        elif os.path.isdir('/opt/tak') and _tak_is_container():
+            plog("\u2139 SSH key installed; privileged extras not available with Docker TAK Server (see above)")
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
@@ -69773,7 +69901,8 @@ def guarddog_cotdb_purge():
 
     # The one-copy admin-password gate (modules/__init__.py, allowlisted in
     # smoke.py AUTH_FUNCS) rather than a 19th inline check_password_hash.
-    if mod_registry._check_admin_password({'load_auth': load_auth}, data):
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
         return jsonify({'success': False, 'error': 'Incorrect console password.',
                         'need_password': True}), 403
 
@@ -91083,6 +91212,8 @@ _MODULE_CTX = {
     'load_settings': load_settings,
     'save_settings': save_settings,
     'load_auth': load_auth,
+    'verify_password': verify_password,            # GH #137: fail-closed password check
+    'stored_hash_unusable': stored_hash_unusable,
     '_read_priv': _read_priv,
     '_write_priv': _write_priv,
     '_pkg_install': _pkg_install,
