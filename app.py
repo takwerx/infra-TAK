@@ -33684,7 +33684,10 @@ def _selfheal_takserver_le_cert(plog=None):
     Here we compare the cert in TAK's keystore against Caddy's current cert and, if they
     differ or the keystore cert is expired/missing, re-run install_le_cert_on_8446() to
     repair. Runs daily via the console-restart timer; a no-op (no TAK restart) when the
-    keystore already matches Caddy."""
+    keystore already matches Caddy.
+
+    Returns True when 8446 ends up serving Caddy's current cert (already did, or was just
+    installed), falsy otherwise — _le8446_install_when_issued() polls on that."""
     def _log(m):
         if plog:
             plog(m)
@@ -33696,7 +33699,15 @@ def _selfheal_takserver_le_cert(plog=None):
         script_present = os.path.exists(_renew_script)
         unit_present   = os.path.exists(_renew_unit)
         if not script_present and not unit_present:
-            return  # box never had the LE-on-8446 setup
+            # v10.2.15: "no renewal script/unit" used to mean "box never had LE on 8446" and
+            # returned here. But install_le_cert_on_8446() is what WRITES them — so a TAK deploy
+            # that finished while Let's Encrypt was still issuing (it waits 120 s, then skips)
+            # left a box this heal would never touch: 8446 kept TAK's own cert for good and
+            # phones could not enroll by QR. Field 2026-10-15, two fresh installs at once while
+            # Let's Encrypt answered "503 Service busy". TAK installed + a domain is the setup the
+            # deploy meant to do; fall through, and the Caddy-cert / keystore checks below decide.
+            if not os.path.exists('/opt/tak/CoreConfig.xml') or not load_settings().get('fqdn'):
+                return  # no TAK Server, or no domain: there is no LE-on-8446 to set up
         settings = load_settings()
         host = _get_service_domain(settings, 'takserver')
         if not host:
@@ -33712,8 +33723,7 @@ def _selfheal_takserver_le_cert(plog=None):
             _log('takserver LE-cert self-heal: renewal script missing (a container '
                  'redeploy likely re-extracted /opt/tak) but box is LE-on-8446 — '
                  're-establishing renewal script + timer...')
-            install_le_cert_on_8446(host, _log, wait_for_cert=False)
-            return
+            return install_le_cert_on_8446(host, _log, wait_for_cert=False)
         # v0.9.51 — source cert is the uploaded PEM in custom mode, else Caddy's ACME store.
         # v10.0.5 non-root: the takwerx console can't stat/read Caddy's 0750 store, so stage a
         # readable copy via the broker (cat as root) before os.path.exists/openssl — otherwise
@@ -33774,10 +33784,10 @@ def _selfheal_takserver_le_cert(plog=None):
                     f'{kt} | openssl x509 -checkend 0 -noout',
                     shell=True, capture_output=True, timeout=20).returncode != 0
             if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
-                return  # keystore already matches Caddy and is valid — nothing to do
+                return True  # keystore already matches Caddy and is valid — nothing to do
             _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
                  '— re-syncing and restarting TAK Server...')
-            install_le_cert_on_8446(host, _log, wait_for_cert=False)
+            return install_le_cert_on_8446(host, _log, wait_for_cert=False)
         finally:
             if _heal_tmp:
                 try:
@@ -33786,6 +33796,47 @@ def _selfheal_takserver_le_cert(plog=None):
                     pass
     except Exception as e:
         _log(f'takserver LE-cert self-heal error (non-fatal): {e}')
+
+
+def _le8446_install_when_issued(log_fn=None, interval=60, max_s=1800, sleep=None, heal=None):
+    """The TAK deploy waits 120 s for Caddy's takserver.<domain> cert, then skips 8446. When
+    Let's Encrypt is slow (rate limits, "503 Service busy"), that left 8446 on TAK's own cert
+    until the next console restart. This finishes the job in the background: every `interval`
+    seconds, for up to `max_s`, run the 8446 self-heal; stop as soon as 8446 serves Caddy's
+    cert. Past `max_s` the daily console-restart heal still covers it. One TAK restart, at
+    the moment the cert arrives."""
+    sleep = sleep or time.sleep
+    heal = heal or _selfheal_takserver_le_cert
+    log = log_fn or (lambda m: print(m, flush=True))
+
+    def _run():
+        waited = 0
+        while waited < max_s:
+            sleep(interval)
+            waited += interval
+            try:
+                if heal(log):
+                    log(f"8446: trusted certificate installed once it was issued ({waited // 60} min after deploy)")
+                    return True
+            except Exception as e:
+                log(f"8446: late-certificate retry error (non-fatal): {e}")
+        log("8446: certificate still not issued after 30 min — the daily console heal will install it")
+        return False
+
+    threading.Thread(target=_run, daemon=True, name='le8446-when-issued').start()
+    return _run
+
+
+def _install_le_cert_on_8446_at_deploy(host, log_step):
+    """Deploy-time 8446 install. If the cert is not issued yet, hand off to
+    _le8446_install_when_issued() instead of leaving 8446 on TAK's own cert."""
+    ok = install_le_cert_on_8446(host, log_step, wait_for_cert=True)
+    if not ok and (load_settings().get('ssl_mode') or '') != 'custom':
+        log_step(f"  ↻ Let's Encrypt has not issued {host} yet — the console will put it on 8446 "
+                 f"automatically as soon as it arrives (checks every minute for 30 min). "
+                 f"Until then phones cannot enroll by QR.")
+        _le8446_install_when_issued(lambda m: print(m, flush=True))
+    return ok
 
 
 def run_caddy_deploy(domain):
@@ -78080,7 +78131,7 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             log_step(""); log_step("━━━ Installing trusted cert on 8446 (enrollment) ━━━")
             try:
-                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+                _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
             except Exception as _le:
                 log_step(f"  ⚠ LE cert on 8446 failed (non-fatal): {str(_le)[:120]}")
 
@@ -79261,7 +79312,7 @@ def run_takserver_deploy(config):
             if caddy_active.stdout.strip() == 'active':
                 log_step("")
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
-                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+                _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
 
         log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
         log_step(f"  WebGUI (cert):     https://{ip}:8443")
