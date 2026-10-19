@@ -20,6 +20,8 @@ ghcr, 2026-10-08: media-infra v9.7.0 is a single-arch amd64 manifest; v9.10.0 an
 image indexes with amd64 + arm64. So the ARM-only v9.1.1 pin (and its RTSP-lease caveat) and
 the on-box arm64 source build — which built CloudTAK's own tag, an image the override never
 ran — both go. v9.9.0 also fixes HLS proxy playback dying at 10 minutes.
+
+v10.2.21: the pin moves to v9.12.1 (MediaMTX 1.21.2), still an amd64 + arm64 index (2026-10-19).
 """
 
 import ast
@@ -36,7 +38,7 @@ def _func(name):
 
 
 def test_single_multiarch_pin():
-    assert "MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.11.0'" in APP
+    assert "MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'" in APP
     assert 'MEDIA_INFRA_MULTIARCH = True' in APP
     body = _func('_cloudtak_build_override_yml')
     assert 'media_image = MEDIA_INFRA_IMAGE' in body
@@ -54,7 +56,7 @@ def test_arm64_source_build_is_skipped_for_a_multiarch_pin():
         if isinstance(n, ast.FunctionDef) and n.name == '_cloudtak_build_arm64_media'))
     ran, logs = [], []
     ns = {'_host_arch': lambda: 'arm64', 'MEDIA_INFRA_MULTIARCH': True,
-          'MEDIA_INFRA_IMAGE': 'ghcr.io/dfpc-coe/media-infra:v9.11.0',
+          'MEDIA_INFRA_IMAGE': 'ghcr.io/dfpc-coe/media-infra:v9.12.1',
           'subprocess': types.SimpleNamespace(run=lambda *a, **k: ran.append(a))}
     exec(compile(src, 'app.py', 'exec'), ns)
     assert ns['_cloudtak_build_arm64_media']('/nonexistent', plog=logs.append) is False

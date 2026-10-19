@@ -41711,7 +41711,10 @@ MEDIA_PORT_SRT=18890
 # (amd64 + arm64 in the ghcr index — verified 2026-10-08), so no arch branch and no on-box
 # arm64 build. If a future pin is amd64-only again, set MEDIA_INFRA_MULTIARCH = False and the
 # arm64 source build (_cloudtak_build_arm64_media) comes back into play.
-MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.11.0'
+# v10.2.21: security update — v9.12.1 (2026-10-15) embeds MediaMTX 1.21.2 (was 1.20.0).
+# Upstream diff from v9.11.0 is the MediaMTX + Go builder bump only; mediamtx.yml and the
+# lease code we patch (persist/payload) are unchanged. Still multi-arch (checked 2026-10-19).
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
 MEDIA_INFRA_MULTIARCH = True
 
 
@@ -41881,6 +41884,7 @@ services:
     # playback dying with "403 Invalid or expired signed URL" after 10 minutes, and
     # MediaMTX 1.20.0. Our HLS tuning (mpegts, 3x500ms) is still applied over upstream's
     # new `hlsVariant: fmp4` by _CT_MEDIA_APPLY_SH — a deliberate divergence (June A/B).
+    # v10.2.21: now v9.12.1 (MediaMTX 1.21.2) — security update, same multi-arch index.
     # History: v10.1.8 W5 pinned past CloudTAK's v9.1.1 (its hls route 500'd every
     # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
