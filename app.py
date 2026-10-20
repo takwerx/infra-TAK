@@ -92,6 +92,14 @@ from collections import defaultdict, deque
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
 
+# v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
+# whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
+# and every respawn re-ran the startup migrations. Now only that connection drops,
+# and its peer address is logged. Must run before gunicorn calls worker.run().
+import gunicorn_tls_guard
+if gunicorn_tls_guard.install():
+    print("[tls-guard] gthread pre-handshake reset guard active", flush=True)
+
 # v0.9.12: ensure $HOME is set so child shells can expand ~/ in
 # subprocess.run('cd ~/authentik ...', shell=True). systemd does NOT inherit
 # HOME from login env, and takwerx-console.service historically did not pin
