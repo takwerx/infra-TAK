@@ -157,7 +157,8 @@ def test_client_is_stdlib_only_and_imports_nothing_from_the_daemon():
         elif isinstance(node, ast.ImportFrom):
             assert node.level == 0, 'relative import in the light client'
             mods.add(node.module.split('.')[0])
-    assert mods <= {'base64', 'json', 'os', 'socket', 'sys'}, mods
+    # subprocess + time: ops #113's restart wait (`systemctl is-active`, bounded poll).
+    assert mods <= {'base64', 'json', 'os', 'socket', 'subprocess', 'sys', 'time'}, mods
 
 
 # ---------------------------------------------------------------------------

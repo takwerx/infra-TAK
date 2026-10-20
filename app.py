@@ -216,22 +216,109 @@ def _broker_should_route():
     return os.getuid() != 0
 
 
-def _broker_available():
+def _broker_socket_present():
     try:
         return _stat.S_ISSOCK(os.stat(BROKER_SOCKET).st_mode)
     except OSError:
         return False
 
 
+# ops #113: the broker restarts itself once a day (its idle recycle) and whenever its source
+# changes, and for ~2-3 s its socket is gone. Every caller below that found it gone fell back
+# to `sudo -n` or the bare binary — which, on a non-root box, simply fails. test6 2026-10-20
+# 13:14:58Z: 46 `sudo -n` failures in the 3.3 s gap, mid post-update → "Node-RED container
+# not running" (flow sync skipped) and a false Authentik `FATAL: port conflict`. On a box that
+# routes through the broker, a broker systemd still has up or on its way back up is a broker
+# to wait for, not to route around. Bounded; a stopped or failed broker fails fast as before.
+# Same rule as takwerx_brokerctl.connect() and the PATH shims.
+BROKER_RESTART_WAIT_SECS = 30
+_BROKER_UNIT_SOCKET = '/run/takwerx-broker.sock'
+_BROKER_LIVE_STATES = ('active', 'activating', 'deactivating', 'reloading')
+_broker_wait_note_at = 0.0
+
+
+def _broker_restarting():
+    """True while systemd has takwerx-broker up or coming back. Real systemctl, not the
+    PATH shim (which would itself wait on the broker); False when it cannot tell."""
+    if BROKER_SOCKET != _BROKER_UNIT_SOCKET:
+        return False
+    sc = shutil.which('systemctl', path='/usr/bin:/bin')
+    if not sc:
+        return False
+    try:
+        r = subprocess.run([sc, 'is-active', 'takwerx-broker'], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (r.stdout or '').strip() in _BROKER_LIVE_STATES
+
+
+def _broker_wait(ready, max_secs=BROKER_RESTART_WAIT_SECS):
+    """Poll `ready()` while the broker is restarting, for at most `max_secs`. True once
+    `ready()` is; False at once when not routing or systemd says the broker is down."""
+    global _broker_wait_note_at
+    if not _broker_should_route():
+        return False
+    t0 = time.monotonic()
+    next_state_check = t0
+    while True:
+        now = time.monotonic()
+        if now >= next_state_check:
+            if not _broker_restarting():
+                return False
+            next_state_check = now + 1
+        if now - t0 >= max_secs:
+            print(f'Privileged broker still unreachable after {max_secs}s of waiting for its '
+                  'restart — this call falls back', flush=True)
+            return False
+        time.sleep(0.1)
+        if ready():
+            if now - _broker_wait_note_at >= 10:     # one line per restart, not per call
+                _broker_wait_note_at = now
+                print(f'Privileged broker was restarting — waited '
+                      f'{time.monotonic() - t0:.1f}s for it instead of falling back', flush=True)
+            return True
+
+
+def _broker_available():
+    return _broker_socket_present() or _broker_wait(_broker_socket_present)
+
+
+def _broker_connect(timeout):
+    """A socket connected to the broker. A missing/refusing socket while the broker restarts
+    is retried (_broker_wait) — nothing was sent yet, so a retry cannot run a command twice."""
+    def _try():
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(BROKER_SOCKET)
+            return s
+        except BaseException:
+            s.close()
+            raise
+    try:
+        return _try()
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        first = e
+    except OSError as e:
+        raise BrokerError(f'broker unreachable: {e}')
+    got = []
+
+    def _ready():
+        try:
+            got.append(_try())
+            return True
+        except OSError:
+            return False
+    if _broker_wait(_ready):
+        return got[0]
+    raise BrokerError(f'broker unreachable: {first}')
+
+
 def _broker_request(req, timeout=600):
     """Send one JSON request to the broker, return the parsed response dict.
     Raises BrokerError if the socket is unreachable."""
-    try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(BROKER_SOCKET)
-    except OSError as e:
-        raise BrokerError(f'broker unreachable: {e}')
+    s = _broker_connect(timeout)
     try:
         s.sendall(json.dumps(req).encode())
         s.shutdown(_socket.SHUT_WR)
