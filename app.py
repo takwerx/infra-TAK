@@ -41872,6 +41872,19 @@ MEDIA_PORT_SRT=18890
 MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
 MEDIA_INFRA_MULTIARCH = True
 
+# ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
+# Upstream's docker-compose.yml pins postgis/postgis:17-3.4-alpine, a tag Docker Hub stopped
+# rebuilding on 2024-10-14 — frozen at PostgreSQL 17.0 / PostGIS 3.4.3, without any PG 17
+# security minor since (CVE-2025-1094 fixed in 17.3, CVE-2026-14679 in 17.11, ...). 17-3.6 is
+# rebuilt on every PG minor. Same PG major, so the data volume is used as-is (no dump/restore,
+# no pg_upgrade); PostGIS 3.4 → 3.6 is an extension update, which
+# _cloudtak_postgis_extensions_upgrade() runs once the new container is up.
+# postgis/postgis publishes amd64 only; imresamu/postgis (the docker-postgis maintainer's
+# mirror, already what arm64 boxes ran via _patch_cloudtak_compose_ports) carries the same tag
+# with an arm64 build. Both checked on Docker Hub 2026-10-20.
+POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
+POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
+
 
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
@@ -41993,6 +42006,9 @@ def _cloudtak_build_override_yml(settings):
     # media-infra pin — one fleet constant for both architectures since v10.2.8 W2; see the
     # comment in the template below and MEDIA_INFRA_IMAGE.
     media_image = MEDIA_INFRA_IMAGE
+    # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
+    # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
+    postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -42048,6 +42064,9 @@ services:
     environment:
       API_URL: "http://api:5000"
   postgis:
+    # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
+    # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
+    image: {postgis_image}
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
 {_sim_networks_top}"""
@@ -44798,6 +44817,74 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         return False
 
 
+# ops #110: runs INSIDE the postgis container. Every database that has PostGIS at an older
+# version than the image ships gets postgis_extensions_upgrade() (postgis, topology, tiger
+# geocoder in one call). Check-before-apply, so on a converged box it is one query per DB.
+# Prints one UPGRADED/FAILED line per database it touched, then DONE.
+_CT_POSTGIS_EXT_UPGRADE_SH = r'''
+for i in $(seq 1 24); do pg_isready -h "$(hostname -i)" -U docker -q && break; sleep 5; done
+pg_isready -h "$(hostname -i)" -U docker -q || { echo NOTREADY; exit 0; }
+Q="SELECT string_agg(e.extname || ' ' || e.extversion || ' -> ' || a.default_version, ', ')
+   FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+   WHERE e.extname IN ('postgis', 'postgis_topology', 'postgis_tiger_geocoder', 'postgis_raster')
+   AND e.extversion <> a.default_version"
+for DB in $(psql -U docker -d postgres -tAc "SELECT datname FROM pg_database WHERE datallowconn"); do
+  V=$(psql -U docker -d "$DB" -tAc "$Q") || continue
+  [ -n "$V" ] || continue
+  for n in 1 2; do
+    psql -U docker -d "$DB" -v ON_ERROR_STOP=1 -qtAc "SELECT postgis_extensions_upgrade()" >/dev/null 2>&1
+    [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ] && break
+  done
+  if [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ]; then echo "UPGRADED $DB: $V"; else echo "FAILED $DB: $V"; fi
+done
+echo DONE
+'''
+
+
+def _cloudtak_postgis_extensions_upgrade(plog=None, remote_cfg=None):
+    """ops #110: bring CloudTAK's PostGIS extensions up to the version the postgis image ships.
+
+    Swapping the container to a newer PostGIS (POSTGIS_IMAGE) leaves the extension objects in
+    each database at the old version until ALTER EXTENSION / postgis_extensions_upgrade() runs.
+    Waits up to 2 min for the server, then upgrades only databases that are behind — a no-op
+    on a converged box. Unix-socket psql inside the official image is trust-authenticated, the
+    same path _cloudtak_sync_postgis_password() uses. Best-effort, never raises. Returns True
+    when nothing is left behind."""
+    _log = plog or (lambda m: None)
+    try:
+        if remote_cfg:
+            b64 = _b64.b64encode(_CT_POSTGIS_EXT_UPGRADE_SH.encode()).decode()
+            ok, out = _ssh_probe(
+                remote_cfg,
+                'CID=$(docker ps -q -f name=postgis | head -1); [ -n "$CID" ] || { echo SKIP; exit 0; }; '
+                f'docker exec "$CID" sh -c "$(echo {b64} | base64 -d)"',
+                timeout=200)
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=postgis']),
+                               capture_output=True, text=True, timeout=10)
+            cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+            if not cid:
+                return False
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'sh', '-c', _CT_POSTGIS_EXT_UPGRADE_SH]),
+                               capture_output=True, text=True, timeout=200)
+            out = r.stdout or ''
+        lines = [l.strip() for l in (out or '').splitlines() if l.strip()]
+        if 'DONE' not in lines:
+            _log(f"  ⚠ PostGIS extension check inconclusive ({(lines[-1] if lines else 'no output')[:120]})")
+            return False
+        failed = False
+        for l in lines:
+            if l.startswith('UPGRADED '):
+                _log(f"  ✓ PostGIS extensions updated in {l[len('UPGRADED '):]}")
+            elif l.startswith('FAILED '):
+                failed = True
+                _log(f"  ⚠ PostGIS extension update failed in {l[len('FAILED '):]}")
+        return not failed
+    except Exception as e:
+        _log(f"  ⚠ PostGIS extension update errored (non-fatal): {e}")
+        return False
+
+
 # Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
 # consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
 _CLOUDTAK_REMOTE_MEDIA_PERL = (
@@ -45330,6 +45417,8 @@ def run_cloudtak_update():
         # (from any past .env regeneration over the live volume) surfaces as
         # 'password authentication failed for user "docker"' (test12/test6 2026-07-13).
         _cloudtak_sync_postgis_password(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
+        # ops #110: the rebuild may have started a newer postgis image (POSTGIS_IMAGE).
+        _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
@@ -84742,6 +84831,12 @@ def _startup_harden_cloudtak_ports():
             except Exception:
                 pass
         if _needs_recreate:
+            if _override_changed:
+                # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
+                # Download it before the recreate so `up -d` doesn't spend its 240 s budget
+                # on the pull — the stack keeps running meanwhile.
+                _docker_compose_pull(None, _ct_dir, lambda m: print(f"Startup migration: {m}", flush=True),
+                                     timeout=600, label='CloudTAK postgis', services=['postgis'])
             r = subprocess.run(
                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
             )
@@ -89125,6 +89220,9 @@ def _post_update_auto_deploy():
                                 if ok:
                                     _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
                                     print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
+                                    # ops #110: the override may have moved postgis to POSTGIS_IMAGE.
+                                    _cloudtak_postgis_extensions_upgrade(
+                                        plog=lambda m: print(f"Post-update:{m}"), remote_cfg=remote_cfg)
                                 else:
                                     print("Post-update: could not SCP CloudTAK override to remote")
                             finally:
@@ -90971,6 +91069,9 @@ try:
         try:
             if os.path.isfile(os.path.expanduser('~/CloudTAK/.env')):
                 _cloudtak_sync_postgis_password(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
+                # ops #110: the startup override refresh just moved postgis to POSTGIS_IMAGE
+                # (console Update) — update the PostGIS extensions to match. No-op after.
+                _cloudtak_postgis_extensions_upgrade(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
         except Exception:
             pass
     _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
