@@ -27230,7 +27230,30 @@ def _caddy_acme_inner_lines(cfg=None):
     return out
 
 
-def _caddy_global_options_lines(cfg=None):
+def _caddy_read_body_idle_lines(grpc_streams):
+    """Turn off Caddy's request-body idle timeout when the box proxies long-lived gRPC streams.
+
+    Caddy 2.11.6 added a default 1-minute `read_body_idle`: a request body that makes no
+    progress for a minute gets the connection aborted. A bidirectional gRPC stream whose
+    client has nothing to say is exactly that — NetBird's signal and management streams
+    over `reverse_proxy h2c://`. Measured with the official builds, 2026-10-19: a 90 s quiet
+    HTTP/2 request body through 2.11.7 is cut at 60.0 s ("reading: i/o timeout"); the same
+    stream through 2.11.4, or through 2.11.7 with `read_body_idle -1s`, completes. HTTP/1.1
+    WebSockets (WebTAK, CloudTAK) are not affected and need nothing.
+
+    The per-route `timeouts` directive cannot lengthen it — the server-wide value takes
+    precedence (https://caddyserver.com/docs/caddyfile/directives/timeouts) — so this is the
+    server-wide option, emitted only on boxes with NetBird so every other box keeps the
+    hardening. Fails closed: an older or unknown Caddy rejects the whole file on an unknown
+    subdirective, so nothing is emitted unless Caddy is KNOWN to be >= 2.11.6."""
+    v = _caddy_version_tuple()
+    if not (grpc_streams and v and v >= _CADDY_MIN_READ_BODY_IDLE):
+        return []
+    return ['    servers {', '        timeouts {', '            read_body_idle -1s',
+            '        }', '    }']
+
+
+def _caddy_global_options_lines(cfg=None, grpc_streams=False):
     """The Caddyfile global options block. ALWAYS emitted, on every box.
 
     v10.1.50 — grace_period is the fix for a reload that hangs forever. Caddy's default
@@ -27251,6 +27274,7 @@ def _caddy_global_options_lines(cfg=None):
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
     out += _caddy_acme_inner_lines(cfg)
+    out += _caddy_read_body_idle_lines(grpc_streams)
     out.append('}')
     out.append('')
     return out
@@ -28429,11 +28453,16 @@ def caddy_update():
                 _ok = _caddy_install_github_deb(_gh_log.append)
                 r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
-            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
                 _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Package source short of the security floor (COPR lagging, Cloudsmith down): take the
+        # fallback build. Also covers the old < 2.7 static lift on dnf. We restart below.
+        _lift_log = []
+        _caddy_lift_to_secure_floor(_lift_log.append, restart=False)
+        if _lift_log:
+            r.stdout = ((r.stdout or '').rstrip() + '\n' + '\n'.join(_lift_log)).strip()
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
@@ -31583,6 +31612,17 @@ _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 # loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
 # fails the handshake (same measurement).
 _CADDY_MIN_TRUST_POOL = (2, 8)
+# Security floor, separate from the parse floor above: every Caddy below it carries published
+# advisories that reach the forward_auth + reverse_proxy vhosts this console writes for every
+# SSO-protected service. Caddy is not pinned (apt repo / COPR / static fallback), so a box
+# stays on whatever it got at install time unless something moves it — console Update
+# (_startup_caddy_selfheal), Caddy → Update and the deploy gate all lift it to this.
+# 2.11.7, not 2.11.6: 2.11.6's new idle timeouts crashed HTTP/2 proxying and cut streams.
+# Verified 2026-10-19: Cloudsmith apt and the @caddy/caddy COPR (epel-9 x86_64 + aarch64)
+# both carry 2.11.7.
+_CADDY_MIN_SECURE = (2, 11, 7)
+# `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
+_CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31712,6 +31752,72 @@ def _caddy_install_official_static(plog=None):
         except OSError:
             pass
         _caddy_version_cache['ver'] = None
+
+
+def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
+    """Move an installed Caddy below _CADDY_MIN_SECURE onto it. Returns (before, after).
+
+    Package manager first, so the binary stays package-managed: apt from the Cloudsmith repo,
+    dnf from the @caddy/caddy COPR. Only when that leaves the box short (repo not serving,
+    COPR lagging) does it fall back to the same sources deploy already uses — the SHA-512
+    checked GitHub .deb on apt, the official static build on dnf. A box with no Caddy, an
+    unreadable version, or one already at the floor is a no-op, so this is safe on every
+    console start.
+
+    After a version change the Caddyfile is regenerated (regenerate=True), because what it
+    emits depends on the version — e.g. read_body_idle for NetBird's gRPC streams, which a
+    2.11.4-era file lacks. generate_caddyfile() keeps the previous file if Caddy rejects the
+    new one. Deploy passes regenerate=False: its own Step 2 generates the file.
+
+    restart=True then restarts Caddy, but only once the Caddyfile on disk is confirmed to
+    load under the NEW binary. A file the new Caddy rejects is never restarted into — the
+    running process keeps serving its config. Callers that restart Caddy themselves
+    (deploy, Caddy → Update) pass restart=False."""
+    _log = log_fn or (lambda m: None)
+    _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+    before = _caddy_version_tuple(refresh=True)
+    if not before or before >= _CADDY_MIN_SECURE:
+        return before, before
+    _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
+    if _pkg_mgr() == 'dnf':
+        # Through the shim (Dependency Rule), so this is `dnf install`, which may or may not
+        # move an installed Caddy to the COPR's newest build. Either way the version is
+        # re-read below and anything still short gets the static build.
+        _pkg_install(['caddy'], log_fn=_log, timeout=300)
+        _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _log('  the COPR has no new enough Caddy — installing the official static build')
+            _caddy_install_official_static(_log)
+    else:
+        if _caddy_ensure_apt_repo(_log):
+            _pkg_install(['caddy'], log_fn=_log, timeout=300)
+            _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _caddy_install_github_deb(_log)
+    after = _caddy_version_tuple(refresh=True)
+    if not after or after < _CADDY_MIN_SECURE:
+        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(_CADDY_MIN_SECURE)}) — no newer Caddy '
+             'was reachable from this box. Retry with Caddy → Update.')
+    else:
+        _log(f'  ✓ Caddy {_vs(before)} → {_vs(after)}')
+    if after == before:
+        return before, after
+    if regenerate:
+        s = load_settings()
+        if (s.get('fqdn') or '').strip():
+            generate_caddyfile(s)
+    if not restart:
+        return before, after
+    verdict, out = _caddy_validate_config()
+    if verdict == 'bad':
+        _log('  ⚠ the Caddyfile still does not load under the new Caddy — NOT restarting; the '
+             f'running Caddy keeps serving its current config: {(out or "")[-200:]}')
+        return before, after
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=90)
+    _log('  ✓ Caddy restarted on the new version' if r.returncode == 0
+         else f'  ⚠ Caddy restart failed: {(r.stdout or "").strip()[-200:]}')
+    return before, after
 
 
 _caddy_last_validate_error = {'err': '', 'ts': 0.0}
@@ -31987,6 +32093,49 @@ def _startup_caddy_stream_close_delay_converge():
           flush=True)
 
 
+def _startup_caddy_read_body_idle_converge():
+    """Put read_body_idle into the Caddyfile on NetBird boxes already on Caddy >= 2.11.6.
+
+    A box lifted by _caddy_lift_to_secure_floor() is regenerated there. This covers the
+    one that got 2.11.6+ some other way (an OS patch run, a fresh deploy before this
+    release) and is cutting NetBird's gRPC streams every minute. Same shape as
+    _startup_caddy_stream_close_delay_converge(): one read on every box it does not apply to."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: read_body_idle converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'read_body_idle' in generated or '# NetBird VPN' not in generated:
+        return
+    if not _caddy_read_body_idle_lines(True):
+        return                      # Caddy older than 2.11.6 (or unknown): nothing to emit
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        # Startup migrations run before the module registry loads, so the write is deferred
+        # to the one catch-up regen + reload in _caddy_registry_loaded(). Seen on test6.
+        print('Startup migration: read_body_idle for NetBird queued — written with the '
+              'post-registry Caddyfile regen', flush=True)
+        return
+    try:
+        if 'read_body_idle' not in _read_priv(CADDYFILE_PATH):
+            print('Startup migration: ⚠ read_body_idle converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. Caddy keeps cutting quiet NetBird '
+                  'gRPC streams after one minute on this box.', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ Caddyfile now keeps NetBird gRPC streams open '
+          '(read_body_idle off) and Caddy %s' % ('reloaded' if _ok else
+                                                 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -32092,6 +32241,15 @@ def _startup_caddy_selfheal():
     except Exception as _cvE:
         print('Startup migration: Caddy version floor check error (non-fatal): %s'
               % str(_cvE)[:160], flush=True)
+
+    # Security floor (_CADDY_MIN_SECURE). Rides console Update the same way the 2.7 lift
+    # above does: nothing else moves an unpinned Caddy off the version it was installed at.
+    # No session invalidation here — a box above 2.7 compiles the auth headers correctly.
+    try:
+        _caddy_lift_to_secure_floor(lambda m: print('Startup migration: %s' % m, flush=True))
+    except Exception as _csE:
+        print('Startup migration: Caddy security floor error (non-fatal): %s'
+              % str(_csE)[:160], flush=True)
 
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
@@ -32245,7 +32403,8 @@ def generate_caddyfile(settings=None):
     # Emits nothing when unset, so a box that never touches this generates a byte-identical
     # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
-    lines += _caddy_global_options_lines()
+    lines += _caddy_global_options_lines(
+        grpc_streams=bool(modules.get('netbird', {}).get('installed')))
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
@@ -34096,6 +34255,12 @@ def run_caddy_deploy(domain):
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
                 _caddy_install_official_static(plog)
             _cv = _caddy_version_tuple(refresh=True)
+        if _cv and _cv < _CADDY_MIN_SECURE:
+            # A box that already had Caddy may keep it through Step 1 (the package step can
+            # leave an installed Caddy where it is), so lift it to the security floor too.
+            # Step 2 regenerates the Caddyfile and Step 4 restarts Caddy.
+            _caddy_lift_to_secure_floor(plog, restart=False, regenerate=False)
+            _cv = _caddy_version_tuple(refresh=True)
         if not _cv:
             plog(f"  ⚠ Could not read the Caddy version — treating it as older than {_min_s}. "
                  "The Caddyfile is generated without heredocs so it stays parseable (GH #59).")
@@ -35143,10 +35308,11 @@ def _get_fail2ban_version_info():
 
 
 def _get_webodm_version_info():
-    """Return {version, update_available, latest} for the running WebODM instance."""
+    """Return {version, update_available, latest} for the running WebODM instance. `latest`
+    is the pinned, tested WEBODM_VERSION — not upstream's newest release, which Update would
+    not install (ops #92)."""
     import subprocess as _sp
-    import json as _json
-    info = {'version': '', 'update_available': False, 'latest': None}
+    info = {'version': '', 'update_available': False, 'latest': WEBODM_VERSION}
     try:
         r = _sp.run(
             _sudo_wrap(['docker', 'exec', 'webapp', 'python3', '-c',
@@ -35157,22 +35323,11 @@ def _get_webodm_version_info():
             info['version'] = v
     except Exception:
         pass
-    try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/WebODM/WebODM/releases/latest',
-                          headers={'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        latest = data.get('tag_name', '').lstrip('v')
-        if latest:
-            info['latest'] = latest
-            if info['version']:
-                def _tv(s):
-                    try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
-                    except: return (0,)
-                info['update_available'] = _tv(latest) > _tv(info['version'])
-    except Exception:
-        pass
+    if info['version']:
+        def _tv(s):
+            try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
+            except: return (0,)
+        info['update_available'] = _tv(WEBODM_VERSION) > _tv(info['version'])
     return info
 
 
@@ -45584,25 +45739,56 @@ def _webodm_odm_limits(detected_cores, cfg):
     return cpus, max(2, mem)
 
 
+# Pinned WebODM stack (ops #92): the exact images we test, never a floating :latest — an
+# untested upstream release must not land on a box just because something ran `pull`.
+# Bump them together, and only after a deploy + Update on a test box (amd64 and arm64).
+#   wo_broker  — upstream WebODM still ships redis:7.0.10, end of life with open CVEs
+#                (CVE-2025-49844 Lua use-after-free, CVE-2025-21605, CVE-2025-32023, …).
+#                WebODM's Celery 4.4 / kombu 4.6 / redis-py 3.2 client runs against 8.x.
+#   wo_db      — upstream publishes only :latest (PostgreSQL 9.5 / PostGIS 2.3, an upstream
+#                limitation), so it is pinned by digest.
+WEBODM_VERSION = '3.3.1'
+WEBODM_IMAGES = {
+    'wo_db':      'webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_nodeodm': 'webodm/nodeodx:2.4.0',
+}
+
+
+def _webodm_pin_images(compose_txt, services=None):
+    """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
+    only those in `services`). Installs from before the pins carry the floating refs they were
+    deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
+    in place. Idempotent — an already-pinned file comes back unchanged."""
+    for svc, image in WEBODM_IMAGES.items():
+        if services and svc not in services:
+            continue
+        compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
+                             lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
+    return compose_txt
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
   wo_appmedia:
 services:
   wo_db:
-    image: webodm/webodm_db
+    image: {images[wo_db]}
     container_name: wo_db
     volumes:
       - {wo_dir}/db:/var/lib/postgresql/data:Z
     restart: unless-stopped
     oom_score_adj: -100
   wo_broker:
-    image: redis:7.0.10
+    image: {images[wo_broker]}
     container_name: wo_broker
     restart: unless-stopped
     oom_score_adj: -500
   wo_webapp:
-    image: webodm/webodm_webapp
+    image: {images[wo_webapp]}
     container_name: webapp
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
@@ -45625,7 +45811,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_worker:
-    image: webodm/webodm_webapp
+    image: {images[wo_worker]}
     container_name: wo_worker
     entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
@@ -45643,7 +45829,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_nodeodm:
-    image: webodm/nodeodx
+    image: {images[wo_nodeodm]}
     container_name: wo_nodeodm
     command: ["--max_concurrency", "{wo_odm_cpus}"]
     cpus: {wo_odm_cpus}
@@ -45850,7 +46036,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
-        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
+        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
     # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
@@ -46046,6 +46232,7 @@ def _run_webodm_deploy(settings):
             wo_secret=wo_secret,
             wo_odm_cpus=_odm_cpus,
             wo_odm_mem=_odm_mem,
+            images=WEBODM_IMAGES,
         )
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -46257,7 +46444,14 @@ def _run_webodm_update():
         log.append(msg)
         _webodm_update_status['log'] = list(log)
     try:
-        plog('Pulling latest WebODM images…')
+        # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        compose_txt = _read_priv(compose_path)
+        pinned = _webodm_pin_images(compose_txt)
+        if pinned != compose_txt:
+            _write_priv(compose_path, pinned)
+            plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
@@ -50389,6 +50583,17 @@ def _nodered_port_holders_as_conflicts(port=1880):
     return out
 
 
+# SECURITY: the old `nodered/node-red:4.0` tag is frozen at Node-RED 4.0.9 on Node.js 20
+# (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
+# 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
+# fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
+# 4.1.16-22 = Node-RED 4.1.16 on Node 22 (2026-10-08), amd64 + arm64. Exact tag on
+# purpose: the plain `4.1` tag is stale and there is no bare `4.1.16`. Fresh deploys
+# write it, and Update moves every existing box onto it (_auto_nodered).
+NODERED_IMAGE = 'nodered/node-red:4.1.16-22'
+_NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
     """Plain-English consequence of a foreign listener on 1880, for the deploy log.
 
@@ -50603,9 +50808,9 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
     # Port binding is 0.0.0.0:1880 for remote so Caddy on the console can reach it via
     # reverse_proxy. UFW source-scopes this to the console IP only (see below).
-    compose_yml = """services:
+    compose_yml = f"""services:
   node-red:
-    image: nodered/node-red:4.0
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -50867,8 +51072,8 @@ def run_nodered_deploy():
         with open(compose_yml, 'w') as f:
             f.write(f"""services:
   node-red:
-    # Pinned to Node-RED 4.0.x (minor pin — gets patches, no major-version drift).
-    image: nodered/node-red:4.0
+    # Pinned to an exact Node-RED tag (NODERED_IMAGE) — no drift between boxes.
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -87080,30 +87285,43 @@ def _startup_migrations():
                 _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
                 if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
                     _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
-                    _wo_nodeodm_block = (
-                        '  wo_nodeodm:\n'
-                        '    image: webodm/nodeodx\n'
-                        '    container_name: wo_nodeodm\n'
-                        f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
-                        f'    cpus: {_wo_cpus}\n'
-                        f'    mem_limit: {_wo_mem}g\n'
-                        '    restart: unless-stopped\n'
-                        '    oom_score_adj: 250\n'
-                    )
+
+                    def _wo_nodeodm_block(_m):
+                        # Keep the image the box already runs: moving NodeODX to the pin is a
+                        # large pull, so it happens on Update/redeploy, not on a console restart.
+                        _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
+                        return (
+                            '  wo_nodeodm:\n'
+                            f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
+                            '    container_name: wo_nodeodm\n'
+                            f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                            f'    cpus: {_wo_cpus}\n'
+                            f'    mem_limit: {_wo_mem}g\n'
+                            '    restart: unless-stopped\n'
+                            '    oom_score_adj: 250\n'
+                        )
                     _wo_before_cap = _wo_patched
                     _wo_patched = _re_wo.sub(
                         r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
-                        lambda _m: _wo_nodeodm_block,
+                        _wo_nodeodm_block,
                         _wo_patched,
                         count=1,
                     )
                     _wo_cap_changed = (_wo_patched != _wo_before_cap)
+                # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
+                # restart — a small image, and only wo_broker is recreated. The WebODM images
+                # move to their pins on Update/redeploy (large pulls + DB migrations).
+                _wo_before_redis = _wo_patched
+                _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
+                _wo_redis_changed = (_wo_patched != _wo_before_redis)
                 if _wo_patched != _wo_txt:
                     with open(_wo_compose, 'w') as _f:
                         _f.write(_wo_patched)
                     print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
                     if _wo_cap_changed:
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
+                    if _wo_redis_changed:
+                        print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
                     import subprocess as _sp_wo
                     _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
                                capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
@@ -88008,6 +88226,11 @@ def _startup_migrations():
             print(f"Startup migration: stream_close_delay converge error (non-fatal): {_scd_err}",
                   flush=True)
         try:
+            _startup_caddy_read_body_idle_converge()
+        except Exception as _rbi_err:
+            print(f"Startup migration: read_body_idle converge error (non-fatal): {_rbi_err}",
+                  flush=True)
+        try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
@@ -88778,9 +89001,16 @@ def _post_update_auto_deploy():
                         # Phase 2 hardening — pin image (drop :latest), add cap_drop / no-new-privileges /
                         # mem_limit / user / restart / env_file. Idempotent string-level patches that
                         # respect any operator overrides already in place.
-                        if 'image: nodered/node-red:latest' in content:
-                            content = content.replace('image: nodered/node-red:latest', 'image: nodered/node-red:4.0')
-                            print("Post-update: Node-RED image pinned to 4.0 (was :latest)")
+                        # Every box converges on NODERED_IMAGE (the same tag a Redeploy
+                        # writes) — :latest, the old 4.0 pin, or any other tag.
+                        _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
+                        _nr_img_changed = bool(_nr_img_m) and \
+                            _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
+                        if _nr_img_changed:
+                            content = _NODERED_IMAGE_LINE_RE.sub(
+                                lambda m: m.group(1) + NODERED_IMAGE, content, count=1)
+                            print(f"Post-update: Node-RED image → {NODERED_IMAGE} "
+                                  f"(was {_nr_img_m.group(0).strip()[len('image:'):].strip()})")
                         if 'restart:' not in content and 'container_name: nodered' in content:
                             content = content.replace(
                                 'container_name: nodered\n',
@@ -88827,6 +89057,14 @@ def _post_update_auto_deploy():
                                     print("Post-update: Node-RED .env file created (empty scaffold)")
                                 except Exception as ee:
                                     print(f"Post-update: Node-RED .env create warning: {ee}")
+                            if _nr_img_changed:
+                                # Pull on its own budget first: `up -d`'s 120 s cannot fit a
+                                # ~200 MB download on a slow link (see _docker_compose_pull).
+                                # On failure `up -d` below retries the pull and, if that fails
+                                # too, leaves the running container alone.
+                                if not _docker_compose_pull(None, nr_dir, lambda m: print(f"Post-update: {m}"),
+                                                            label='Node-RED image'):
+                                    print("Post-update: Node-RED image pull failed — Update Now again retries it")
                             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=nr_dir, capture_output=True, text=True, timeout=120)
                             print("Post-update: Node-RED recreated (compose patch)")
                         _nodered_malware_scan()
@@ -89439,9 +89677,39 @@ def _post_update_auto_deploy():
                 except Exception as _rake:
                     print(f"Post-update: remote Authentik hardening error (non-fatal): {_rake}")
 
+            def _auto_nodered_image_remote():
+                """Move a remote Node-RED onto NODERED_IMAGE, same as _auto_nodered does
+                locally. No-op unless Node-RED is deployed remote, and no recreate when
+                the remote compose is already on the pin."""
+                try:
+                    _nr_cfg = _get_module_deployment_config(load_settings(), 'nodered_deployment')
+                    if not _nr_cfg or _nr_cfg.get('target_mode') != 'remote':
+                        return
+                    if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
+                        return
+                    _cmd = (
+                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+                        'docker compose pull --quiet 2>&1 && '
+                        'docker compose up -d 2>&1'
+                    )
+                    print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
+                    _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
+                    for _line in (_out or '').strip().splitlines()[:10]:
+                        print(f"  remote-nr: {_line}")
+                    if not _ok:
+                        print("Post-update: remote Node-RED image move failed (non-fatal) — Update Now again retries it")
+                except Exception as _rnre:
+                    print(f"Post-update: remote Node-RED image error (non-fatal): {_rnre}")
+
             _auto_authentik_ports()
             _auto_authentik_ports_remote()
             _auto_nodered()
+            _auto_nodered_image_remote()
             _auto_harden_containers()
 
             # v0.9.25 hotfix: synchronous webadmin role re-assert after the YAML

@@ -78,9 +78,14 @@
 
 {% if tvr_vinfo.get('update_available') %}
 <div style="background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.3);border-radius:10px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px">
-  <span style="color:var(--cyan);font-size:13px;font-weight:600">⬆ Update available — commit {{ tvr_vinfo.get('latest') }}</span>
+  <span style="color:var(--cyan);font-size:13px;font-weight:600">{% if tvr_vinfo.get('security_update') %}⬆ Security update available for TAK Video Restreamer{% else %}⬆ Update available — commit {{ tvr_vinfo.get('latest') }}{% endif %}</span>
   <button class="btn btn-primary" style="font-size:11px;margin-left:auto" id="updateBtn" onclick="startUpdate()">Update Now</button>
 </div>
+{% if tvr_vinfo.get('publish_login_new') %}
+<div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:12px 18px;margin-bottom:16px;font-size:12px;color:var(--text-primary)">
+  After this update, cameras, drones and encoders need a login to <b>publish</b> video. The login appears under Stream Endpoints once the update finishes — add it to each publisher. Viewing stays open.
+</div>
+{% endif %}
 <div id="updateCard" style="display:none" class="card">
   <div class="card-title">Update Log</div>
   <div class="log-box" id="updateLogBox"></div>
@@ -125,9 +130,21 @@
 
 <div class="card">
   <div class="card-title">Stream Endpoints</div>
+  {% set pub_pass = settings.get('tak_video_restreamer_publish_password') %}
+  {% if pub_pass %}
+  <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Publish (send video) — needs a login</div>
+  <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Username: <span style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">publish</span> &nbsp; Password: <span id="pubPwField" style="font-family:'JetBrains Mono',monospace;color:var(--text-primary)">••••••••</span>
+    <button onclick="togglePubPw()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button>
+  </div>
+  <input type="hidden" id="pubPwValue" value="{{ pub_pass|e }}">
+  <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://publish:&lt;password&gt;@{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8554/&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8890?streamid=publish:&lt;stream&gt;:publish:&lt;password&gt;</span></div>
+  <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:1935/&lt;stream&gt;?user=publish&amp;pass=&lt;password&gt;</span></div>
+  <div style="font-size:12px;color:var(--text-dim);margin:12px 0 4px">View — no login</div>
+  {% endif %}
   <div class="url-row"><span class="url-label">RTSP</span><span class="url-val">rtsp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8554/&lt;stream&gt;</span></div>
   <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8555/&lt;stream&gt;</span></div>
-  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8890?streamid=publish:&lt;stream&gt;</span></div>
+  <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8890?streamid={% if pub_pass %}read{% else %}publish{% endif %}:&lt;stream&gt;</span></div>
   <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:1935/&lt;stream&gt;</span></div>
   {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
 </div>
@@ -202,6 +219,10 @@ function fetchLogs(){
 }
 function togglePw(){
   let f=document.getElementById('pwField'), v=document.getElementById('pwValue');
+  f.textContent = f.textContent.startsWith('•') ? v.value : '••••••••';
+}
+function togglePubPw(){
+  let f=document.getElementById('pubPwField'), v=document.getElementById('pubPwValue');
   f.textContent = f.textContent.startsWith('•') ? v.value : '••••••••';
 }
 function submitChangePw(){
