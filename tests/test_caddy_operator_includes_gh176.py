@@ -190,10 +190,9 @@ def test_generate_caddyfile_wires_the_fallback():
     assert '_inject_operator_includes(lines)' in seg
     assert '_caddy_validate_operator_includes(caddyfile, caddyfile_plain)' in seg
     assert '_caddy_ensure_include_dirs()' in seg
-    # The new help line is re-emitted on every regen; it must not pile up as user content.
-    assert "+ '# Directives INSIDE a generated site:" in seg
-    prefixes = seg[seg.index('_help_prefixes'):seg.index('user_lines')]
-    assert "'# Directives INSIDE a generated site'" in prefixes
+    # The new hint must sit ABOVE the marker: below it, older versions keep it as user content.
+    hint = seg.index('# Directives INSIDE a generated site')
+    assert hint < seg.index("+ CADDYFILE_USER_BLOCKS_MARKER + '\\n'")
 
 
 def test_summary_reads_hooked_hosts_from_the_generated_part_only():

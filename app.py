@@ -33379,17 +33379,19 @@ def generate_caddyfile(settings=None):
                 # Drop our own help comments (re-emitted fresh below on every regen — they must
                 # not accumulate as "user content"); keep everything else verbatim.
                 _help_prefixes = ('# Anything below this line survives',
-                                  '# Add custom site blocks here',
-                                  '# Directives INSIDE a generated site')
+                                  '# Add custom site blocks here')
                 user_lines = [l for l in after.splitlines()
                               if not l.strip().startswith(_help_prefixes)]
                 user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
-    tail = ('\n\n' + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+    # GH #176: this hint sits ABOVE the marker, in the generated part, so no version's
+    # user-block capture can ever keep it as operator content.
+    tail = ('\n\n# Directives INSIDE a generated site: ' + CADDY_SITES_INCLUDE_DIR
+            + '/<host>/*.caddy (see README there).\n'
+            + CADDYFILE_USER_BLOCKS_MARKER + '\n'
             + '# Anything below this line survives every infra-TAK regeneration.\n'
-            + '# Add custom site blocks here (extra domains, redirects, monitors).\n'
-            + '# Directives INSIDE a generated site: /etc/caddy/sites.d/<host>/*.caddy (see README there).\n')
+            + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
         tail += '\n' + user_blocks + '\n'
     caddyfile = caddyfile.rstrip() + tail
