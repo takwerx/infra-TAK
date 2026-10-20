@@ -92,6 +92,14 @@ from collections import defaultdict, deque
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
 
+# v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
+# whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
+# and every respawn re-ran the startup migrations. Now only that connection drops,
+# and its peer address is logged. Must run before gunicorn calls worker.run().
+import gunicorn_tls_guard
+if gunicorn_tls_guard.install():
+    print("[tls-guard] gthread pre-handshake reset guard active", flush=True)
+
 # v0.9.12: ensure $HOME is set so child shells can expand ~/ in
 # subprocess.run('cd ~/authentik ...', shell=True). systemd does NOT inherit
 # HOME from login env, and takwerx-console.service historically did not pin
@@ -1073,7 +1081,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.21-alpha"
+VERSION = "10.2.22-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -41872,6 +41880,19 @@ MEDIA_PORT_SRT=18890
 MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
 MEDIA_INFRA_MULTIARCH = True
 
+# ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
+# Upstream's docker-compose.yml pins postgis/postgis:17-3.4-alpine, a tag Docker Hub stopped
+# rebuilding on 2024-10-14 — frozen at PostgreSQL 17.0 / PostGIS 3.4.3, without any PG 17
+# security minor since (CVE-2025-1094 fixed in 17.3, CVE-2026-14679 in 17.11, ...). 17-3.6 is
+# rebuilt on every PG minor. Same PG major, so the data volume is used as-is (no dump/restore,
+# no pg_upgrade); PostGIS 3.4 → 3.6 is an extension update, which
+# _cloudtak_postgis_extensions_upgrade() runs once the new container is up.
+# postgis/postgis publishes amd64 only; imresamu/postgis (the docker-postgis maintainer's
+# mirror, already what arm64 boxes ran via _patch_cloudtak_compose_ports) carries the same tag
+# with an arm64 build. Both checked on Docker Hub 2026-10-20.
+POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
+POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
+
 
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
@@ -41993,6 +42014,9 @@ def _cloudtak_build_override_yml(settings):
     # media-infra pin — one fleet constant for both architectures since v10.2.8 W2; see the
     # comment in the template below and MEDIA_INFRA_IMAGE.
     media_image = MEDIA_INFRA_IMAGE
+    # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
+    # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
+    postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -42048,6 +42072,9 @@ services:
     environment:
       API_URL: "http://api:5000"
   postgis:
+    # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
+    # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
+    image: {postgis_image}
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
 {_sim_networks_top}"""
@@ -44798,6 +44825,74 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         return False
 
 
+# ops #110: runs INSIDE the postgis container. Every database that has PostGIS at an older
+# version than the image ships gets postgis_extensions_upgrade() (postgis, topology, tiger
+# geocoder in one call). Check-before-apply, so on a converged box it is one query per DB.
+# Prints one UPGRADED/FAILED line per database it touched, then DONE.
+_CT_POSTGIS_EXT_UPGRADE_SH = r'''
+for i in $(seq 1 24); do pg_isready -h "$(hostname -i)" -U docker -q && break; sleep 5; done
+pg_isready -h "$(hostname -i)" -U docker -q || { echo NOTREADY; exit 0; }
+Q="SELECT string_agg(e.extname || ' ' || e.extversion || ' -> ' || a.default_version, ', ')
+   FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+   WHERE e.extname IN ('postgis', 'postgis_topology', 'postgis_tiger_geocoder', 'postgis_raster')
+   AND e.extversion <> a.default_version"
+for DB in $(psql -U docker -d postgres -tAc "SELECT datname FROM pg_database WHERE datallowconn"); do
+  V=$(psql -U docker -d "$DB" -tAc "$Q") || continue
+  [ -n "$V" ] || continue
+  for n in 1 2; do
+    psql -U docker -d "$DB" -v ON_ERROR_STOP=1 -qtAc "SELECT postgis_extensions_upgrade()" >/dev/null 2>&1
+    [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ] && break
+  done
+  if [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ]; then echo "UPGRADED $DB: $V"; else echo "FAILED $DB: $V"; fi
+done
+echo DONE
+'''
+
+
+def _cloudtak_postgis_extensions_upgrade(plog=None, remote_cfg=None):
+    """ops #110: bring CloudTAK's PostGIS extensions up to the version the postgis image ships.
+
+    Swapping the container to a newer PostGIS (POSTGIS_IMAGE) leaves the extension objects in
+    each database at the old version until ALTER EXTENSION / postgis_extensions_upgrade() runs.
+    Waits up to 2 min for the server, then upgrades only databases that are behind — a no-op
+    on a converged box. Unix-socket psql inside the official image is trust-authenticated, the
+    same path _cloudtak_sync_postgis_password() uses. Best-effort, never raises. Returns True
+    when nothing is left behind."""
+    _log = plog or (lambda m: None)
+    try:
+        if remote_cfg:
+            b64 = _b64.b64encode(_CT_POSTGIS_EXT_UPGRADE_SH.encode()).decode()
+            ok, out = _ssh_probe(
+                remote_cfg,
+                'CID=$(docker ps -q -f name=postgis | head -1); [ -n "$CID" ] || { echo SKIP; exit 0; }; '
+                f'docker exec "$CID" sh -c "$(echo {b64} | base64 -d)"',
+                timeout=200)
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=postgis']),
+                               capture_output=True, text=True, timeout=10)
+            cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+            if not cid:
+                return False
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'sh', '-c', _CT_POSTGIS_EXT_UPGRADE_SH]),
+                               capture_output=True, text=True, timeout=200)
+            out = r.stdout or ''
+        lines = [l.strip() for l in (out or '').splitlines() if l.strip()]
+        if 'DONE' not in lines:
+            _log(f"  ⚠ PostGIS extension check inconclusive ({(lines[-1] if lines else 'no output')[:120]})")
+            return False
+        failed = False
+        for l in lines:
+            if l.startswith('UPGRADED '):
+                _log(f"  ✓ PostGIS extensions updated in {l[len('UPGRADED '):]}")
+            elif l.startswith('FAILED '):
+                failed = True
+                _log(f"  ⚠ PostGIS extension update failed in {l[len('FAILED '):]}")
+        return not failed
+    except Exception as e:
+        _log(f"  ⚠ PostGIS extension update errored (non-fatal): {e}")
+        return False
+
+
 # Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
 # consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
 _CLOUDTAK_REMOTE_MEDIA_PERL = (
@@ -45330,6 +45425,8 @@ def run_cloudtak_update():
         # (from any past .env regeneration over the live volume) surfaces as
         # 'password authentication failed for user "docker"' (test12/test6 2026-07-13).
         _cloudtak_sync_postgis_password(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
+        # ops #110: the rebuild may have started a newer postgis image (POSTGIS_IMAGE).
+        _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
@@ -57947,9 +58044,16 @@ def _authentik_apply_official_tunings(plog):
 
 # Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
 # scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
-# env vars. v1.25.1-p0 is the latest stable release as of Dec 2025 — pinning
-# rather than :latest avoids surprise version bumps on `docker compose pull`
-# during Update Now. Image is ~15MB so the pull cost is negligible.
+# env vars. Pinning rather than :latest avoids surprise version bumps on
+# `docker compose pull` during Update Now. Image is ~15MB so the pull cost is
+# negligible.
+#
+# v10.2.21: v1.25.1-p0 → v1.26.1-p0 (edoburu build of 2026-10-19, amd64+arm64)
+# for the PgBouncer security releases 1.25.2 / 1.26.0 / 1.26.1 — pre-auth
+# crashes and hangs in SCRAM/packet parsing, KILL_CLIENT authz, and a SCRAM
+# login-as-another-user flaw. https://www.pgbouncer.org/changelog.html
+# Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
+# (the install path only writes it when it first adds the service).
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -57957,7 +58061,7 @@ def _authentik_apply_official_tunings(plog):
 # for that pgbouncer version. Tags MUST be the exact DockerHub tag —
 # `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.26.1-p0'
 
 
 def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
@@ -59274,7 +59378,7 @@ def _ensure_authentik_pgbouncer(plog):
     # tag) get distinct errors from container-start issues (compose YAML
     # errors, depends_on chain breaks, port conflicts). Without this split,
     # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
-    # docker compose versions while only printing "Image edoburu/pgbouncer:v1.25.1-p0 Pulling"
+    # docker compose versions while only printing "Image edoburu/pgbouncer:<tag> Pulling"
     # to stdout — the actual error gets buried (tak-10, May 2026).
     # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
     # can show both streams distinctly.
@@ -59606,6 +59710,139 @@ def _ensure_authentik_worker_direct_pg(plog):
         return None
     plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
          f"server unchanged on PgBouncer")
+    _record('applied')
+    return True
+
+
+def _ensure_authentik_pgbouncer_image(plog):
+    """v10.2.21: move an existing PgBouncer sidecar onto `_AUTHENTIK_PGBOUNCER_IMAGE`.
+
+    `_ensure_authentik_pgbouncer` writes the image only when it first adds the service
+    and is an idempotent no-op afterwards, so bumping the pin never reached a box that
+    already had PgBouncer — every box installed since v0.9.23 was still on v1.25.1-p0.
+    This converges the compose `image:` to the pin (fleet constant, either direction).
+
+    Only an `edoburu/pgbouncer:*` image is managed; any other image is somebody's
+    deliberate swap with different env semantics and is left alone.
+
+    Pulls first (nothing is mutated if the pull fails), then rewrites compose and
+    recreates pgbouncer only — never server, worker or the LDAP outpost. The server's
+    client connections drop for the few seconds the container takes to come back,
+    the same blip as a pool-size reconcile. Verifies the RUNTIME (the container's
+    image and health), and rolls compose back to the old image if it doesn't come up.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer image: PyYAML unavailable — skipped (the pgbouncer step bootstraps it; next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+    except Exception as e:
+        plog(f"  pgbouncer image: compose unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    pgb = services.get('pgbouncer') if isinstance(services, dict) else None
+    if not isinstance(pgb, dict):
+        return False
+    target = _AUTHENTIK_PGBOUNCER_IMAGE
+    cur = str(pgb.get('image') or '').strip()
+    if cur == target:
+        return False
+    if not cur.startswith('edoburu/pgbouncer:'):
+        plog(f"  pgbouncer image: compose image {cur!r} is not edoburu/pgbouncer — left alone")
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-pgbouncer-image.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pgbouncer') or {}
+            if outcome == 'applied':
+                cfg['image'] = target
+            cfg['image_last_outcome'] = outcome
+            cfg['image_last_attempt_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['image_compose_backup'] = compose_bak
+            s['authentik_pgbouncer'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_pgbouncer():
+        return subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
+            cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    def _rollback(why):
+        plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
+        with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
+            if _locked:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+                _compose_up_pgbouncer()
+            else:
+                plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
+                     f"restore {compose_bak} by hand")
+
+    plog(f"  pgbouncer image: {cur} → {target} (PgBouncer security fixes) — pulling first...")
+    p = subprocess.run(_sudo_wrap(['docker', 'pull', target]), capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        plog(f"  ✗ pgbouncer image: pull failed, nothing changed (next boot retries): "
+             f"{((p.stderr or '') + (p.stdout or ''))[-300:]}")
+        _record('pull-failed')
+        return None
+
+    pgb['image'] = target
+    with _authentik_compose_lock('pgbouncer-image', plog=plog) as _locked:
+        if not _locked:
+            plog("  pgbouncer image: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(compose_bak, 'w') as f:
+                f.write(raw_compose)
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+        except Exception as e:
+            plog(f"  ✗ pgbouncer image: compose write failed ({e}) — restoring")
+            try:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_pgbouncer()
+    if r.returncode != 0:
+        _rollback(f"recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+        _record('recreate-failed')
+        return None
+
+    # Same 120s window the install path gives it; the healthcheck is pg_isready every 30s.
+    status = ''
+    for _ in range(24):
+        time.sleep(5)
+        h = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{.Config.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=10)
+        status = (h.stdout or '').strip()
+        parts = status.split()
+        if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
+            break
+    if status != f"{target} running healthy":
+        _rollback(f"container is {status or 'state unknown'}")
+        _record('rolled-back')
+        return None
+    plog(f"  ✓ pgbouncer image: running {target} (healthy); server+worker untouched")
     _record('applied')
     return True
 
@@ -71030,6 +71267,67 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     return names
 
 
+def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
+    """`makeCert.sh <kind> NAME` that really replaces NAME.p12 and NAME.jks. Returns True on success.
+
+    makeCert.sh writes both keystores with `keytool -importkeystore -alias NAME`, which on an
+    existing store asks "Existing entry alias NAME exists, overwrite? [no]" on stdin. The one
+    `echo "y"` piped in is read by the first keytool (the .jks); the second (the .p12) reads EOF
+    and keeps the OLD cert. So every rotation left NAME.pem/.jks on the new CA and NAME.p12 on
+    the one it was first made with, and whatever loads the .p12 (TAK Portal's admin.p12,
+    CloudTAK's bootstrap cert, Guard Dog's Marti scrape) kept presenting it until a later
+    rotation dropped that CA from the truststore — then 8089 "peer not verified" (ops #96,
+    test8: admin.p12 still on INT-CA-08 three rotations later). Moving both keystores aside
+    first means makeCert creates them fresh, with no prompt; they are put back if it does not.
+    `run` is the rotation's own runner: run(cmd) -> bool, container-aware, logs failures."""
+    aside = []
+    for ext in ('.p12', '.jks'):
+        p = os.path.join(cert_dir, name + ext)
+        if _exists_priv(p) and run(f'mv -f {shlex.quote(p)} {shlex.quote(p + ".reissue")}'):
+            aside.append(p)
+    ok = run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh {kind} {shlex.quote(name)} 2>&1')
+    for p in aside:
+        if _exists_priv(p):
+            run(f'rm -f {shlex.quote(p + ".reissue")}')
+        else:
+            run(f'mv -f {shlex.quote(p + ".reissue")} {shlex.quote(p)}')
+            ok = False
+    return ok
+
+
+def _rotate_refresh_integrations(log):
+    """After a rotation's TAK Server restart: integrations that cache a client cert in memory.
+
+    Node-RED's TLS config reads /certs/admin.pem once, when the flows start, so it presents the
+    previous cert until it restarts — fine while that CA is still in the truststore, and an 8089
+    failure from the next rotation on (test8, 3:01 PM PT Oct 19, until a console update happened
+    to resync the flows). CloudTAK keeps its TAK cert in its own database; the existing W11d heal
+    swaps it only when the connection is dead because its CA is gone, which is exactly the state
+    the rotation that drops that CA leaves behind.
+
+    makeCert.sh writes the new admin.key 600 (tak-owned), and Node-RED reads it as uid 1000
+    through the bind mount, so the restart alone came back with EACCES on /certs/admin.key and
+    connected to 8089 with no client cert at all (test8, 7:59 PM PT Oct 19). The boot-time heal
+    puts the pair back to 644 first."""
+    try:
+        _heal_nodered_cert_read_access(lambda m: log(f"  {m}"))
+    except Exception as e:
+        log(f"  ⚠ Node-RED cert read heal skipped: {str(e)[:160]}")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
+                           capture_output=True, text=True, timeout=15)
+        if (r.stdout or '').strip():
+            r = subprocess.run(_sudo_wrap(['docker', 'restart', 'nodered']),
+                               capture_output=True, text=True, timeout=120)
+            log(f"  {'✓ Node-RED restarted (reloads admin.pem)' if r.returncode == 0 else '⚠ Node-RED restart failed: ' + (r.stderr or r.stdout or '').strip()[:160]}")
+    except Exception as e:
+        log(f"  ⚠ Node-RED restart skipped: {str(e)[:160]}")
+    try:
+        _cloudtak_tak_cert_heal(log=log)
+    except Exception as e:
+        log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+
+
 @app.route('/api/takserver/rotate-intca', methods=['POST'])
 @login_required
 def takserver_rotate_intca():
@@ -71152,7 +71450,7 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
 
@@ -71160,11 +71458,16 @@ def takserver_rotate_intca():
             log("Step 4/7: Regenerating all client certificates...")
             run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             regen_count = 0
+            regen_failed = []
             for name in _rotate_client_cert_names(cert_dir, skip=(old_ca_name, new_ca_name)):
                 log(f"  Regenerating: {name}")
-                run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh client {name} 2>&1')
-                regen_count += 1
+                if _rotate_reissue_cert('client', name, run, cert_dir):
+                    regen_count += 1
+                else:
+                    regen_failed.append(name)
             log(f"✓ {regen_count} client certificate(s) regenerated (signed by new CA)")
+            if regen_failed:
+                log(f"  ⚠ {len(regen_failed)} not regenerated: {', '.join(regen_failed[:10])}{' …' if len(regen_failed) > 10 else ''}")
 
             log("")
             log("Step 5/7: Updating truststore...")
@@ -71219,6 +71522,10 @@ def takserver_rotate_intca():
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
             log("✓ TAK Server restarted")
+
+            log("")
+            log("Refreshing integrations that hold a client certificate...")
+            _rotate_refresh_integrations(log)
 
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
@@ -84532,6 +84839,12 @@ def _startup_harden_cloudtak_ports():
             except Exception:
                 pass
         if _needs_recreate:
+            if _override_changed:
+                # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
+                # Download it before the recreate so `up -d` doesn't spend its 240 s budget
+                # on the pull — the stack keeps running meanwhile.
+                _docker_compose_pull(None, _ct_dir, lambda m: print(f"Startup migration: {m}", flush=True),
+                                     timeout=600, label='CloudTAK postgis', services=['postgis'])
             r = subprocess.run(
                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
             )
@@ -87185,12 +87498,22 @@ def _startup_migrations():
 
         # Harden existing WebODM installs: patch compose port bindings + UFW deny
         # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
-        _wo_compose = os.path.expanduser('~/webodm/docker-compose.yml')
-        if os.path.exists(_wo_compose):
+        # ops #92 / #101 W5: a box flipped from root keeps WebODM in /root/webodm, which the
+        # console can't read or stat — resolve it with _webodm_dir() and go through the broker
+        # there, or the flipped box is skipped and keeps EOL redis until someone presses Update.
+        _wo_dir = _webodm_dir()
+        # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
+        _wo_priv = (_wo_dir == '/root/webodm'
+                    and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
+        _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
+        if _wo_priv or os.path.exists(_wo_compose):
             try:
                 import re as _re_wo
-                with open(_wo_compose) as _f:
-                    _wo_txt = _f.read()
+                if _wo_priv:
+                    _wo_txt = _read_priv(_wo_compose)
+                else:
+                    with open(_wo_compose) as _f:
+                        _wo_txt = _f.read()
                 # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
                 _wo_patched = _re_wo.sub(
                     r'- "(\d+):8000"',
@@ -87254,16 +87577,23 @@ def _startup_migrations():
                 _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
                 _wo_redis_changed = (_wo_patched != _wo_before_redis)
                 if _wo_patched != _wo_txt:
-                    with open(_wo_compose, 'w') as _f:
-                        _f.write(_wo_patched)
-                    print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    if _wo_priv:
+                        _write_priv(_wo_compose, _wo_patched)
+                    else:
+                        with open(_wo_compose, 'w') as _f:
+                            _f.write(_wo_patched)
+                    print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
                     if _wo_cap_changed:
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     if _wo_redis_changed:
                         print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
-                    import subprocess as _sp_wo
-                    _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
-                               capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
+                    if _wo_priv:
+                        # root's dir: no cwd into /root, so compose runs via the broker
+                        _webodm_compose(_wo_dir, 'up -d', timeout=120)
+                    else:
+                        import subprocess as _sp_wo
+                        _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                                   capture_output=True, timeout=120, cwd=_wo_dir)
             except Exception as _wo_e:
                 print(f"Startup migration: webodm compose harden warning: {_wo_e}")
         # UFW deny belt-and-braces for WebODM ports
@@ -87616,6 +87946,14 @@ def _startup_migrations():
             _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_wd_err:
             print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
+
+        # v10.2.21: the install step above only writes the PgBouncer image when it first
+        # adds the service, so existing boxes never left v1.25.1-p0. Converge them onto
+        # _AUTHENTIK_PGBOUNCER_IMAGE (PgBouncer security fixes); recreates pgbouncer only.
+        try:
+            _ensure_authentik_pgbouncer_image(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_img_err:
+            print(f"Startup migration: pgbouncer image error (non-fatal): {ak_pgb_img_err}")
 
         # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
         # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
@@ -88890,6 +89228,9 @@ def _post_update_auto_deploy():
                                 if ok:
                                     _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
                                     print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
+                                    # ops #110: the override may have moved postgis to POSTGIS_IMAGE.
+                                    _cloudtak_postgis_extensions_upgrade(
+                                        plog=lambda m: print(f"Post-update:{m}"), remote_cfg=remote_cfg)
                                 else:
                                     print("Post-update: could not SCP CloudTAK override to remote")
                             finally:
@@ -90736,6 +91077,9 @@ try:
         try:
             if os.path.isfile(os.path.expanduser('~/CloudTAK/.env')):
                 _cloudtak_sync_postgis_password(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
+                # ops #110: the startup override refresh just moved postgis to POSTGIS_IMAGE
+                # (console Update) — update the PostGIS extensions to match. No-op after.
+                _cloudtak_postgis_extensions_upgrade(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
         except Exception:
             pass
     _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
