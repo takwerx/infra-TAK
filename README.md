@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.21-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.21-alpha)**
+**Current release: [v10.2.22-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.22-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -432,6 +432,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.22-alpha — 2026-10-20 — Security release: CloudTAK PostgreSQL 17.11 + PostGIS 3.6, Authentik PgBouncer 1.26.1; console survives early connection resets; Rotate Intermediate CA really renews .p12 client certs
+
+**Headline: CloudTAK's database moves from PostgreSQL 17.0 (October 2024, two years of security fixes behind) to 17.11 with PostGIS 3.6, data kept in place; the Authentik PgBouncer sidecar moves to 1.26.1 and existing boxes are moved on restart; a client that drops its connection before the TLS handshake no longer crashes the console; Rotate Intermediate CA now really rewrites client .p12 files and refreshes Node-RED and CloudTAK; the WebODM redis update now reaches boxes moved to the takwerx user.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.22-alpha))
+
+**CloudTAK database.** Upstream's `postgis/postgis:17-3.4-alpine` tag stopped being rebuilt in October 2024, so every CloudTAK box ran PostgreSQL 17.0 / PostGIS 3.4.3. infra-TAK now pins `17-3.6-alpine` (PostgreSQL 17.11, PostGIS 3.6) and upgrades the PostGIS extensions in place. Same major version, so the data volume is reused as-is. Existing boxes move at the console restart after Update Now. Don't roll an upgraded box back to an older infra-TAK: PostGIS 3.4 can't run against a 3.6 catalog.
+
+**Authentik PgBouncer.** `v1.25.1-p0` → `v1.26.1-p0` (PgBouncer 1.25.2–1.26.1 security fixes: pre-auth crashes and hangs, a KILL_CLIENT authorization flaw, a CPU spin). Earlier pin bumps never reached existing boxes; now a console restart pulls the new image, recreates only PgBouncer, and rolls back if it isn't healthy.
+
+**Console stability.** A client that connected and reset before the TLS handshake could crash the console worker (seen most on Rocky 9), taking the console down for about 50 seconds each time. Those connections are now dropped and logged, and the worker stays up.
+
+**Rotate Intermediate CA.** Rotate re-issued `.pem`/`.jks` but left each client `.p12` on the old CA, so TAK Portal, CloudTAK and Guard Dog kept presenting old certs and failed once that CA left the truststore. Rotate now rebuilds the `.p12` files, then restarts Node-RED (after fixing its read access to the new key) and refreshes CloudTAK's cert if its CA is gone.
+
+**WebODM.** The restart-time move of the WebODM broker to redis 8.10.2 now also reaches boxes moved from root to the takwerx user, where WebODM stays in `/root/webodm`.
 
 ### v10.2.21-alpha — 2026-10-19 — Security release: CloudTAK video, TAK Video Restreamer, Caddy, WebODM and Node-RED updates; Rotate Intermediate CA leaves CA files alone
 
