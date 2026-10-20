@@ -87395,12 +87395,22 @@ def _startup_migrations():
 
         # Harden existing WebODM installs: patch compose port bindings + UFW deny
         # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
-        _wo_compose = os.path.expanduser('~/webodm/docker-compose.yml')
-        if os.path.exists(_wo_compose):
+        # ops #92 / #101 W5: a box flipped from root keeps WebODM in /root/webodm, which the
+        # console can't read or stat — resolve it with _webodm_dir() and go through the broker
+        # there, or the flipped box is skipped and keeps EOL redis until someone presses Update.
+        _wo_dir = _webodm_dir()
+        # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
+        _wo_priv = (_wo_dir == '/root/webodm'
+                    and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
+        _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
+        if _wo_priv or os.path.exists(_wo_compose):
             try:
                 import re as _re_wo
-                with open(_wo_compose) as _f:
-                    _wo_txt = _f.read()
+                if _wo_priv:
+                    _wo_txt = _read_priv(_wo_compose)
+                else:
+                    with open(_wo_compose) as _f:
+                        _wo_txt = _f.read()
                 # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
                 _wo_patched = _re_wo.sub(
                     r'- "(\d+):8000"',
@@ -87464,16 +87474,23 @@ def _startup_migrations():
                 _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
                 _wo_redis_changed = (_wo_patched != _wo_before_redis)
                 if _wo_patched != _wo_txt:
-                    with open(_wo_compose, 'w') as _f:
-                        _f.write(_wo_patched)
-                    print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    if _wo_priv:
+                        _write_priv(_wo_compose, _wo_patched)
+                    else:
+                        with open(_wo_compose, 'w') as _f:
+                            _f.write(_wo_patched)
+                    print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
                     if _wo_cap_changed:
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     if _wo_redis_changed:
                         print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
-                    import subprocess as _sp_wo
-                    _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
-                               capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
+                    if _wo_priv:
+                        # root's dir: no cwd into /root, so compose runs via the broker
+                        _webodm_compose(_wo_dir, 'up -d', timeout=120)
+                    else:
+                        import subprocess as _sp_wo
+                        _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                                   capture_output=True, timeout=120, cwd=_wo_dir)
             except Exception as _wo_e:
                 print(f"Startup migration: webodm compose harden warning: {_wo_e}")
         # UFW deny belt-and-braces for WebODM ports
