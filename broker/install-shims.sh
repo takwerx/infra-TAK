@@ -33,13 +33,27 @@ ALWAYS=(docker systemctl systemd-run journalctl loginctl ufw firewall-cmd dnf ap
         debconf-set-selections newaliases runuser)
 PATHAWARE=(mkdir rmdir mv cp chmod chown install tee ln rm touch)
 
+# ops #113: the broker restarts itself once a day (idle recycle) and on every source
+# change, and for ~2-3 s the socket is gone. A shim that fell through to the real binary
+# then failed as takwerx (`docker ps` -> permission denied -> "Node-RED container not
+# running", test6 2026-10-20). So a missing socket is waited for, up to 30 s, while systemd
+# says the broker is up or on its way back; a stopped or failed broker falls through at
+# once, as before. Real systemctl, resolved now: the systemctl SHIM would wait on itself.
+_SYSTEMCTL="$(PATH=/usr/bin:/bin command -v systemctl 2>/dev/null || echo /usr/bin/systemctl)"
+_WAIT="_w=0
+while [ ! -S /run/takwerx-broker.sock ] && [ \$_w -lt 120 ]; do
+  case \"\$($_SYSTEMCTL is-active takwerx-broker 2>/dev/null)\" in active|activating|deactivating|reloading) ;; *) break ;; esac
+  sleep 0.25; _w=\$((_w+1))
+done"
+
 # --- always-route binaries (docker handled specially below) ---
 for c in "${ALWAYS[@]}"; do
   [ "$c" = "docker" ] && continue
   cat > "$SHIM_DIR/$c" <<EOF
 #!/bin/bash
-if [ "\$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$BROKER" ]; then
-  exec python3 -I -S "$BROKER" exec -- $c "\$@"
+if [ "\$(id -u)" -ne 0 ] && [ -f "$BROKER" ]; then
+$_WAIT
+  if [ -S /run/takwerx-broker.sock ]; then exec python3 -I -S "$BROKER" exec -- $c "\$@"; fi
 fi
 exec $(command -v "$c" 2>/dev/null || echo "/usr/bin/$c") "\$@"
 EOF
@@ -57,7 +71,9 @@ _REALCP="$(PATH=/usr/bin:/bin command -v cp || echo /usr/bin/cp)"
 cat > "$SHIM_DIR/docker" <<EOF
 #!/bin/bash
 _real() { exec $(command -v docker 2>/dev/null || echo /usr/bin/docker) "\$@"; }
-if [ "\$(id -u)" -eq 0 ] || [ ! -S /run/takwerx-broker.sock ] || [ ! -f "$BROKER" ]; then _real "\$@"; fi
+if [ "\$(id -u)" -eq 0 ] || [ ! -f "$BROKER" ]; then _real "\$@"; fi
+$_WAIT
+if [ ! -S /run/takwerx-broker.sock ]; then _real "\$@"; fi
 if [ "\${1:-}" = "cp" ]; then
   _a=( "\$@" ); _n=\${#_a[@]}; _src="\${_a[_n-2]}"; _dst="\${_a[_n-1]}"
   if [[ "\$_src" == *:* && "\$_dst" != *:* ]]; then
@@ -74,11 +90,13 @@ for c in "${PATHAWARE[@]}"; do
   cat > "$SHIM_DIR/$c" <<EOF
 #!/bin/bash
 _real="$(command -v "$c" 2>/dev/null || echo "/usr/bin/$c")"
-if [ "\$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$BROKER" ]; then
+if [ "\$(id -u)" -ne 0 ] && [ -f "$BROKER" ]; then
   for _a in "\$@"; do
     case "\$_a" in
       /etc/*|/opt/*|/usr/*|/var/*|/run/*|/boot/*|/swapfile)
-        exec python3 -I -S "$BROKER" exec -- $c "\$@" ;;
+$_WAIT
+        if [ -S /run/takwerx-broker.sock ]; then exec python3 -I -S "$BROKER" exec -- $c "\$@"; fi
+        break ;;
     esac
   done
 fi
