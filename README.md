@@ -361,6 +361,15 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 CloudTAK **Update** checks out a clean release, so any edit you made to `~/CloudTAK`'s source is wiped before the rebuild. To have it put back every time, put a script in `.config/cloudtak-hooks/pre-build.d/` inside the infra-TAK folder. Executable files there run in name order (`10-…`, `20-…`) right before every CloudTAK build: on Update, on a plugin install/update/remove, and on the tree a failed update rolls back to. They run as the console user, with `~/CloudTAK` as the working directory and `INFRATAK_HOOK_PHASE` (`update` / `plugin` / `revert`), `INFRATAK_CLOUDTAK_DIR`, `INFRATAK_CLOUDTAK_TAG` and `INFRATAK_CLOUDTAK_PREV_SHA` set. If a hook exits non-zero or runs over 5 minutes, the build does not start: the update rolls back and CloudTAK keeps running, and the log names the hook and shows its output. Hooks must be safe to run twice and should fail loudly when the code they patch has moved. The folders and scripts must be owned by the console user and not writable by anyone else, or nothing runs; `chmod -x` a script to turn it off. Hooks run only for a CloudTAK on the same server as the console, not for a remote CloudTAK host or a fresh Deploy.
 
+### Caddy: your own lines inside a generated site
+
+infra-TAK rewrites `/etc/caddy/Caddyfile` on every deploy, domain change and Update, so a line you add inside a generated site block is lost. New sites go below the `# --- User-added blocks (do not remove) ---` line at the bottom. For lines that must sit inside a generated site (an extra route on the CloudTAK map host, for example), use the include folders, which infra-TAK never writes:
+
+- `/etc/caddy/sites.d/<host>/*.caddy` is imported as the first line of that host's site block. `<host>` is the site address exactly as the Caddyfile shows it, e.g. `/etc/caddy/sites.d/map.example.com/10-print.caddy`.
+- `/etc/caddy/snippets.d/*.caddy` is imported at the top of the file, right after the global options, for named snippets you use from a site file.
+
+Only files ending in `.caddy` are read, so a `.bak` copy is ignored. Files must be readable by caddy (`0644`). Press **Reload** on the Caddy page to apply them; the page lists the files in use. If an include makes the Caddyfile invalid, infra-TAK writes it without any includes so every site keeps working, and the Caddy page names the files and Caddy's error. Fix the file and press **Reload** again.
+
 ### General Rules
 
 - **Deploy order matters:** Caddy → Authentik → Email Relay → TAK Server → TAK Portal → everything else

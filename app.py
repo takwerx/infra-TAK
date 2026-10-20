@@ -1246,6 +1246,11 @@ CADDY_CERT_STORE = "/var/lib/caddy/.local/share/caddy/certificates"
 CADDY_LE_ISSUER_DIR = "acme-v02.api.letsencrypt.org-directory"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
+# GH #176: operator-owned Caddy includes, outside the generated file so no regeneration
+# can touch them. snippets.d/*.caddy is imported at the top level right after the global
+# options; sites.d/<host>/*.caddy is imported as the first line of that host's site block.
+CADDY_SNIPPETS_INCLUDE_DIR = "/etc/caddy/snippets.d"
+CADDY_SITES_INCLUDE_DIR = "/etc/caddy/sites.d"
 # CloudTAK official icon (SVG data URL)
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
@@ -27004,6 +27009,26 @@ def _caddy_configured_urls(settings, modules):
         urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
+def _caddy_includes_summary(caddyfile_text):
+    """What the Caddy page shows about the GH #176 include hooks: the folders, the per-site
+    folders the live Caddyfile actually imports, the files in use, and the last rejection."""
+    pat = re.compile(r'^\s*import ' + re.escape(CADDY_SITES_INCLUDE_DIR) + r'/([^/\s]+)/\*\.caddy\s*$')
+    hosts = []
+    for ln in (caddyfile_text or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0].splitlines():
+        m = pat.match(ln)
+        if m and m.group(1) not in hosts:
+            hosts.append(m.group(1))
+    rej = _caddy_include_rejected
+    return {
+        'sites_dir': CADDY_SITES_INCLUDE_DIR,
+        'snippets_dir': CADDY_SNIPPETS_INCLUDE_DIR,
+        'hosts': hosts,
+        'files': _caddy_operator_include_files(),
+        'rejected_err': rej.get('err') or '',
+        'rejected_files': list(rej.get('files') or []),
+    }
+
+
 @app.route('/caddy')
 @login_required
 def caddy_page():
@@ -27036,6 +27061,7 @@ def caddy_page():
         caddy_update_available=caddy_update_available,
         caddy_version=caddy_version,
         caddy_last_action=_caddy_last_action_summary(),
+        caddy_includes=_caddy_includes_summary(caddyfile_content),
         service_subdomains=_service_subdomain_labels(settings),
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
@@ -32434,6 +32460,147 @@ def _inject_custom_cert_tls(lines, cert_path, key_path):
     return out
 
 
+# GH #176: a plain host address only. `http://…`, `host:port` and anything with a wildcard
+# or a second address are skipped: Caddy allows one wildcard per import pattern, and the
+# extra listeners (ATLAS :8449, Remote Assist device port) must not pick up the 443 site's
+# directives.
+_CADDY_INCLUDE_HOST_RE = re.compile(r'^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$')
+
+
+def _inject_operator_includes(lines, sites_dir=CADDY_SITES_INCLUDE_DIR,
+                              snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """Add the operator's include hooks to a rendered Caddyfile (GH #176).
+
+    Every regeneration rewrites the generated part of the file, so a line an operator added
+    inside a generated site block (the reporter's `import cloudtak_print` in the CloudTAK
+    map site) is gone after the next deploy or Update Now. The user-blocks marker at the
+    bottom cannot hold it: a second block for the same host is "ambiguous site definition".
+    So the generated file points at files it never writes:
+
+      * `import <snippets_dir>/*.caddy` right after the global options block, for snippet
+        definitions (a snippet must be defined above the line that imports it);
+      * `import <sites_dir>/<host>/*.caddy` as the FIRST line of each plain-host site block.
+
+    A glob that matches nothing is only a warning in Caddy ("No files matching import glob
+    pattern"), so a box without operator files serves exactly what it served before. A
+    per-host folder with `*.caddy` (not `<host>.caddy*`) so an editor backup or a
+    `cp x.caddy x.caddy.bak` is never imported twice. Pure function on the line list."""
+    flat = '\n'.join(lines).split('\n')
+    out = []
+    in_global = None   # None = not seen yet, True = inside it, False = done
+    for ln in flat:
+        out.append(ln)
+        s = ln.rstrip()
+        if in_global is None and s == '{':
+            in_global = True
+            continue
+        if in_global is True:
+            if s == '}':
+                in_global = False
+                out.append(f"import {snippets_dir}/*.caddy")
+            continue
+        if not s.endswith(' {') or s[0].isspace() or s.startswith(('#', '(')):
+            continue
+        addr = s[:-2].strip().lower()
+        if not _CADDY_INCLUDE_HOST_RE.match(addr):
+            continue
+        out.append(f"    import {sites_dir}/{addr}/*.caddy")
+    return out
+
+
+def _caddy_operator_include_files(sites_dir=CADDY_SITES_INCLUDE_DIR,
+                                  snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """The operator include files the generated Caddyfile would import, sorted. Both folders
+    are root-owned 755 (see _caddy_ensure_include_dirs), so the console can list them."""
+    found = []
+    try:
+        found += [os.path.join(snippets_dir, n) for n in os.listdir(snippets_dir)
+                  if n.endswith('.caddy')]
+    except OSError:
+        pass
+    try:
+        hosts = os.listdir(sites_dir)
+    except OSError:
+        hosts = []
+    for h in hosts:
+        d = os.path.join(sites_dir, h)
+        if not os.path.isdir(d):
+            continue
+        try:
+            found += [os.path.join(d, n) for n in os.listdir(d) if n.endswith('.caddy')]
+        except OSError:
+            pass
+    return sorted(found)
+
+
+_CADDY_INCLUDE_README = {
+    CADDY_SNIPPETS_INCLUDE_DIR: (
+        "# Caddy snippets that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in this folder is imported at the top of /etc/caddy/Caddyfile,\n"
+        "# right after the global options. Define named snippets here, e.g.\n"
+        "#   (cloudtak_print) {\n"
+        "#       @cloudtak_print path /print-api /print-api/*\n"
+        "#       handle @cloudtak_print {\n"
+        "#           reverse_proxy 127.0.0.1:5010\n"
+        "#       }\n"
+        "#   }\n"
+        "# and use them from a per-site file in /etc/caddy/sites.d/<host>/.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"),
+    CADDY_SITES_INCLUDE_DIR: (
+        "# Per-site Caddy directives that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in /etc/caddy/sites.d/<host>/ is imported as the FIRST line of that\n"
+        "# host's site block, e.g. /etc/caddy/sites.d/map.example.com/10-print.caddy:\n"
+        "#   @cloudtak_print path /print-api /print-api/*\n"
+        "#   handle @cloudtak_print {\n"
+        "#       reverse_proxy 127.0.0.1:5010\n"
+        "#   }\n"
+        "# <host> is the site address exactly as it appears in /etc/caddy/Caddyfile.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"
+        "# If a file here makes the Caddyfile invalid, infra-TAK's next regeneration leaves\n"
+        "# ALL includes out (so every site keeps working) and says why on the Caddy page.\n"),
+}
+
+
+def _caddy_ensure_include_dirs():
+    """Create the two include folders (root-owned 0755) with a README, once. Non-fatal."""
+    for d, text in _CADDY_INCLUDE_README.items():
+        try:
+            if not os.path.isdir(d):
+                _makedirs_priv(d, mode=0o755)
+            readme = os.path.join(d, 'README')
+            if not os.path.exists(readme):
+                _write_priv(readme, text, perm=0o644)
+        except Exception as e:
+            print(f'Caddy: could not prepare {d} (non-fatal): {str(e)[:160]}', flush=True)
+
+
+# Set when the last regeneration had to leave the operator includes out (GH #176).
+_caddy_include_rejected = {'err': '', 'ts': 0.0, 'files': []}
+
+
+def _caddy_validate_operator_includes(with_includes, plain):
+    """The Caddyfile with operator imports is on disk; check it. Returns (text_on_disk, done).
+
+    If Caddy rejects it and the same file WITHOUT the imports is fine, the operator's files
+    are the cause: keep the plain file so a typo in one include cannot take every proxied
+    service down, and record why for the Caddy page. `done` False means the plain file is
+    on disk and still needs the normal GH #59 validate-or-restore."""
+    verdict, out = _caddy_validate_config()
+    if verdict != 'bad':
+        _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        return with_includes, True
+    _write_priv(CADDYFILE_PATH, plain)
+    verdict2, _ = _caddy_validate_config()
+    if verdict2 == 'bad':
+        return plain, False
+    files = _caddy_operator_include_files()
+    err = (out or 'caddy validate failed with no output')[-400:]
+    _caddy_include_rejected.update({'err': err, 'ts': time.time(), 'files': files})
+    print('Caddy: operator include files REJECTED by `caddy validate` — Caddyfile written '
+          'WITHOUT them (%s): %s' % (', '.join(files) or 'none found', err), flush=True)
+    return plain, True
+
+
 # GH #137 follow-up: registry-resident modules (ATLAS MDM, TVR, Email Relay, Client Feed,
 # Simulator) only read as installed once mod_registry.load_all() has run at the bottom of
 # app.py, ~90 s into a console start. Every regen before that — the Hardened-posture
@@ -33279,7 +33446,10 @@ def generate_caddyfile(settings=None):
         if cert_path and key_path:
             lines = _inject_custom_cert_tls(lines, cert_path, key_path)
 
-    caddyfile = '\n'.join(lines)
+    # GH #176: operator include hooks. The file WITHOUT them is kept as the fallback for an
+    # include that does not parse (_caddy_validate_operator_includes).
+    caddyfile_plain = '\n'.join(lines)
+    caddyfile = '\n'.join(_inject_operator_includes(lines))
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     # v10.1.0: the marker is now ALWAYS emitted at the end of the generated file. It used to
     # exist only if an operator already knew the magic string and typed it in by hand — so in
@@ -33302,12 +33472,17 @@ def generate_caddyfile(settings=None):
                 user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
-    caddyfile = (caddyfile.rstrip() + '\n\n'
-                 + CADDYFILE_USER_BLOCKS_MARKER + '\n'
-                 + '# Anything below this line survives every infra-TAK regeneration.\n'
-                 + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
+    # GH #176: this hint sits ABOVE the marker, in the generated part, so no version's
+    # user-block capture can ever keep it as operator content.
+    tail = ('\n\n# Directives INSIDE a generated site: ' + CADDY_SITES_INCLUDE_DIR
+            + '/<host>/*.caddy (see README there).\n'
+            + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+            + '# Anything below this line survives every infra-TAK regeneration.\n'
+            + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
-        caddyfile += '\n' + user_blocks + '\n'
+        tail += '\n' + user_blocks + '\n'
+    caddyfile = caddyfile.rstrip() + tail
+    caddyfile_plain = caddyfile_plain.rstrip() + tail
     # GH #137 follow-up: before the module registry loads, registry modules read as not
     # installed — writing now would drop their sites. Return what was built; the
     # post-registry catch-up writes the real file.
@@ -33318,6 +33493,7 @@ def generate_caddyfile(settings=None):
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
     _makedirs_priv(os.path.dirname(CADDYFILE_PATH))
+    _caddy_ensure_include_dirs()
     # v10.1.39 (GH #59): keep the outgoing file so a config that does not parse can be put
     # back. Must be read BEFORE the write — after it there is nothing left to restore.
     _caddy_prev = None
@@ -33332,7 +33508,13 @@ def generate_caddyfile(settings=None):
     # than left on disk to strand the box at its next restart (GH #59). Same single choke
     # point as _selinux_sync_caddy_ports() below.
     try:
-        _caddy_validate_or_restore(_caddy_prev)
+        _inc_done = False
+        if caddyfile != caddyfile_plain and _caddy_operator_include_files():
+            caddyfile, _inc_done = _caddy_validate_operator_includes(caddyfile, caddyfile_plain)
+        else:
+            _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        if not _inc_done:
+            _caddy_validate_or_restore(_caddy_prev)
     except Exception as _cv_err:
         print(f'Caddy: validate/restore step errored (non-fatal): {_cv_err}', flush=True)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
