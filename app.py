@@ -71066,7 +71066,16 @@ def _rotate_refresh_integrations(log):
     failure from the next rotation on (test8, 3:01 PM PT Oct 19, until a console update happened
     to resync the flows). CloudTAK keeps its TAK cert in its own database; the existing W11d heal
     swaps it only when the connection is dead because its CA is gone, which is exactly the state
-    the rotation that drops that CA leaves behind."""
+    the rotation that drops that CA leaves behind.
+
+    makeCert.sh writes the new admin.key 600 (tak-owned), and Node-RED reads it as uid 1000
+    through the bind mount, so the restart alone came back with EACCES on /certs/admin.key and
+    connected to 8089 with no client cert at all (test8, 7:59 PM PT Oct 19). The boot-time heal
+    puts the pair back to 644 first."""
+    try:
+        _heal_nodered_cert_read_access(lambda m: log(f"  {m}"))
+    except Exception as e:
+        log(f"  ⚠ Node-RED cert read heal skipped: {str(e)[:160]}")
     try:
         r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
                            capture_output=True, text=True, timeout=15)

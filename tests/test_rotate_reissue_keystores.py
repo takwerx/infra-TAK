@@ -167,7 +167,8 @@ def _refresh(nodered_running, heal=None):
         run = staticmethod(fake_run)
     healed = []
     ns = {'subprocess': _SP, '_sudo_wrap': lambda a: list(a),
-          '_cloudtak_tak_cert_heal': heal or (lambda log=None: healed.append(True))}
+          '_cloudtak_tak_cert_heal': heal or (lambda log=None: healed.append(True)),
+          '_heal_nodered_cert_read_access': lambda plog=None: calls.append(['nodered-cert-heal'])}
     exec(compile(_func('_rotate_refresh_integrations'), 'app.py', 'exec'), ns)
     logs = []
     ns['_rotate_refresh_integrations'](logs.append)
@@ -178,6 +179,12 @@ def test_a_running_nodered_is_restarted_and_cloudtak_checked():
     calls, healed, logs = _refresh(True)
     assert ['docker', 'restart', 'nodered'] in calls
     assert healed == [True]
+
+
+def test_nodered_cert_read_is_healed_before_the_restart():
+    # makeCert leaves admin.key 600; Node-RED (uid 1000) then restarts into EACCES.
+    calls, _, _ = _refresh(True)
+    assert calls.index(['nodered-cert-heal']) < calls.index(['docker', 'restart', 'nodered'])
 
 
 def test_no_nodered_no_restart():
