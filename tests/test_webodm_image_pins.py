@@ -125,6 +125,51 @@ def test_startup_migration_pins_redis_and_keeps_the_nodeodx_image():
     assert 'image: webodm/nodeodx' not in block
 
 
+def _run_startup_block(wo_dir, home, files):
+    """Exec the startup WebODM harden block as a console whose home is `home`, with
+    `_webodm_dir()` resolving to `wo_dir`. `files` is what the console can open() itself;
+    everything under /root goes through the (stubbed) broker. Returns the broker calls."""
+    import os
+    import textwrap
+    import types
+    i = APP.index('        # Harden existing WebODM installs')
+    block = textwrap.dedent(APP[i:APP.index('        # UFW deny belt-and-braces for WebODM ports', i)])
+    ns, calls = _ns(), []
+    fake_os = types.SimpleNamespace(
+        path=types.SimpleNamespace(join=os.path.join, exists=lambda p: p in files,
+                                   expanduser=lambda p: p.replace('~', home, 1)),
+        cpu_count=lambda: 4)
+    ns.update({
+        'os': fake_os, 's': {}, 'print': lambda *a, **k: None,
+        '_webodm_dir': lambda: wo_dir,
+        '_read_priv': lambda p: calls.append(('read', p)) or LEGACY,
+        '_write_priv': lambda p, c: calls.append(('write', p, c)),
+        '_webodm_compose': lambda d, a, timeout=300: calls.append(('compose', d, a)),
+        '_get_module_deployment_config': lambda s, k: {},
+        '_webodm_odm_limits': lambda cpus, cfg: (2, 4),
+    })
+    exec(compile(block, 'app.py', 'exec'), ns)
+    return calls, ns
+
+
+def test_startup_migration_reaches_a_flipped_box_in_root_webodm():
+    # ops #101 W5: test6/test8 keep WebODM in /root/webodm after the takwerx flip; the restart
+    # migration read only ~/webodm, so they stayed on redis 7.0.10 until Update was pressed.
+    calls, ns = _run_startup_block('/root/webodm', '/home/takwerx', files=set())
+    assert calls[0] == ('read', '/root/webodm/docker-compose.yml')
+    writes = [c for c in calls if c[0] == 'write']
+    assert len(writes) == 1 and writes[0][1] == '/root/webodm/docker-compose.yml'
+    assert _images(writes[0][2])['wo_broker'] == ns['WEBODM_IMAGES']['wo_broker']
+    assert ('compose', '/root/webodm', 'up -d') in calls
+
+
+def test_startup_migration_skips_a_root_box_without_webodm():
+    # a root console's ~/webodm IS /root/webodm: no compose file there means no WebODM, so no
+    # broker read (which would fail and log a warning on every boot)
+    calls, _ = _run_startup_block('/root/webodm', '/root', files=set())
+    assert calls == []
+
+
 def test_update_writes_the_pins_before_pulling():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update'))
