@@ -71170,6 +71170,67 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     return names
 
 
+def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
+    """`makeCert.sh <kind> NAME` that really replaces NAME.p12 and NAME.jks. Returns True on success.
+
+    makeCert.sh writes both keystores with `keytool -importkeystore -alias NAME`, which on an
+    existing store asks "Existing entry alias NAME exists, overwrite? [no]" on stdin. The one
+    `echo "y"` piped in is read by the first keytool (the .jks); the second (the .p12) reads EOF
+    and keeps the OLD cert. So every rotation left NAME.pem/.jks on the new CA and NAME.p12 on
+    the one it was first made with, and whatever loads the .p12 (TAK Portal's admin.p12,
+    CloudTAK's bootstrap cert, Guard Dog's Marti scrape) kept presenting it until a later
+    rotation dropped that CA from the truststore — then 8089 "peer not verified" (ops #96,
+    test8: admin.p12 still on INT-CA-08 three rotations later). Moving both keystores aside
+    first means makeCert creates them fresh, with no prompt; they are put back if it does not.
+    `run` is the rotation's own runner: run(cmd) -> bool, container-aware, logs failures."""
+    aside = []
+    for ext in ('.p12', '.jks'):
+        p = os.path.join(cert_dir, name + ext)
+        if _exists_priv(p) and run(f'mv -f {shlex.quote(p)} {shlex.quote(p + ".reissue")}'):
+            aside.append(p)
+    ok = run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh {kind} {shlex.quote(name)} 2>&1')
+    for p in aside:
+        if _exists_priv(p):
+            run(f'rm -f {shlex.quote(p + ".reissue")}')
+        else:
+            run(f'mv -f {shlex.quote(p + ".reissue")} {shlex.quote(p)}')
+            ok = False
+    return ok
+
+
+def _rotate_refresh_integrations(log):
+    """After a rotation's TAK Server restart: integrations that cache a client cert in memory.
+
+    Node-RED's TLS config reads /certs/admin.pem once, when the flows start, so it presents the
+    previous cert until it restarts — fine while that CA is still in the truststore, and an 8089
+    failure from the next rotation on (test8, 3:01 PM PT Oct 19, until a console update happened
+    to resync the flows). CloudTAK keeps its TAK cert in its own database; the existing W11d heal
+    swaps it only when the connection is dead because its CA is gone, which is exactly the state
+    the rotation that drops that CA leaves behind.
+
+    makeCert.sh writes the new admin.key 600 (tak-owned), and Node-RED reads it as uid 1000
+    through the bind mount, so the restart alone came back with EACCES on /certs/admin.key and
+    connected to 8089 with no client cert at all (test8, 7:59 PM PT Oct 19). The boot-time heal
+    puts the pair back to 644 first."""
+    try:
+        _heal_nodered_cert_read_access(lambda m: log(f"  {m}"))
+    except Exception as e:
+        log(f"  ⚠ Node-RED cert read heal skipped: {str(e)[:160]}")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
+                           capture_output=True, text=True, timeout=15)
+        if (r.stdout or '').strip():
+            r = subprocess.run(_sudo_wrap(['docker', 'restart', 'nodered']),
+                               capture_output=True, text=True, timeout=120)
+            log(f"  {'✓ Node-RED restarted (reloads admin.pem)' if r.returncode == 0 else '⚠ Node-RED restart failed: ' + (r.stderr or r.stdout or '').strip()[:160]}")
+    except Exception as e:
+        log(f"  ⚠ Node-RED restart skipped: {str(e)[:160]}")
+    try:
+        _cloudtak_tak_cert_heal(log=log)
+    except Exception as e:
+        log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+
+
 @app.route('/api/takserver/rotate-intca', methods=['POST'])
 @login_required
 def takserver_rotate_intca():
@@ -71292,7 +71353,7 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
 
@@ -71300,11 +71361,16 @@ def takserver_rotate_intca():
             log("Step 4/7: Regenerating all client certificates...")
             run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             regen_count = 0
+            regen_failed = []
             for name in _rotate_client_cert_names(cert_dir, skip=(old_ca_name, new_ca_name)):
                 log(f"  Regenerating: {name}")
-                run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh client {name} 2>&1')
-                regen_count += 1
+                if _rotate_reissue_cert('client', name, run, cert_dir):
+                    regen_count += 1
+                else:
+                    regen_failed.append(name)
             log(f"✓ {regen_count} client certificate(s) regenerated (signed by new CA)")
+            if regen_failed:
+                log(f"  ⚠ {len(regen_failed)} not regenerated: {', '.join(regen_failed[:10])}{' …' if len(regen_failed) > 10 else ''}")
 
             log("")
             log("Step 5/7: Updating truststore...")
@@ -71359,6 +71425,10 @@ def takserver_rotate_intca():
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
             log("✓ TAK Server restarted")
+
+            log("")
+            log("Refreshing integrations that hold a client certificate...")
+            _rotate_refresh_integrations(log)
 
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
