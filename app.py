@@ -15795,6 +15795,29 @@ def _remote_assist_deploy_log(msg):
     _remote_assist_deploy_status['log'].append(msg)
 
 
+# ops #135: `compose up -d --build` never pulls. A FROM image already on the box (e.g.
+# `node:22-alpine`) is reused as-is, so a rebuild or Update kept shipping the base it was
+# first built on: Remote Assist sat on Node 22.23.0 on test6 while Docker Hub had 22.23.4.
+# `build --pull` checks the registry for every FROM image first; the `up -d --build` that
+# follows then hits the fresh layer cache. A pull that fails (registry unreachable, rate
+# limit) must not stop a build that worked yesterday, so it falls back to the cached base
+# and says so. A timeout is not a pull failure: the build itself is slow, and the same
+# build without --pull would only time out again.
+# https://docs.docker.com/reference/cli/docker/compose/build/
+def _compose_build_pull(argv, cwd, plog=None, timeout=900):
+    """Run `argv` (a `docker compose ... build --pull` command). Returns (ok, error).
+    Raises subprocess.TimeoutExpired; any other failure is logged and returned."""
+    _log = plog or (lambda m: print(m, flush=True))
+    _log('  Refreshing base images (docker compose build --pull)...')
+    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode == 0:
+        _log('  ✓ Base images current')
+        return True, ''
+    err = (r.stderr or r.stdout or '').strip()[-300:]
+    _log(f'  ⚠ Could not refresh base images, building on the cached base instead: {err}')
+    return False, err
+
+
 def _remote_assist_compose_files(ra_dir):
     return os.path.join(ra_dir, 'docker-compose.yml')
 
@@ -16146,6 +16169,7 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        _compose_build_pull(_remote_assist_compose_cmd(ra_dir, 'build', '--pull'), ra_dir, plog=plog)
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         if r.returncode != 0:
@@ -16400,6 +16424,7 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        _compose_build_pull(_remote_assist_compose_cmd(ra_dir, 'build', '--pull'), ra_dir, plog=plog)
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
@@ -37598,12 +37623,15 @@ def _takportal_run_update(portal_dir):
     # v10.1.60 (W4): the recreate at the end of this build takes the web container
     # down for 10-15 s. Open a window that outlives the build's own timeout; it is
     # shrunk to a short grace as soon as the route knows the outcome (below).
-    _gd_maintenance_begin('takportal', 900 + 180)
+    _gd_maintenance_begin('takportal', 2 * 900 + 180)
     # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
     # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
     # time out here on a slower box, and TimeoutExpired was not caught, so it
     # surfaced as an unhandled 500 with no explanation at all.
+    # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
+    # a Node security release when TAK Portal itself has not changed.
     try:
+        _compose_build_pull(_sudo_wrap(['docker', 'compose', 'build', '--pull']), portal_dir)
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
                                cwd=portal_dir, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
@@ -38149,7 +38177,8 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
-        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _compose_build_pull(_sudo_wrap(['docker', 'compose', 'build', '--pull']), portal_dir, plog=plog)  # ops #135
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
