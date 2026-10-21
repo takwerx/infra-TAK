@@ -27681,6 +27681,10 @@ def _caddy_port_option_lines(settings=None):
     hp, cp = _caddy_https_port(s), _caddy_http_port(s)
     if hp != CADDY_HTTPS_PORT_DEFAULT:
         out.append(f'    https_port {hp}')
+        # Caddy's own per-host redirects drop a moved https_port from the Location and
+        # outrank a catch-all; generate_caddyfile emits a port-aware one instead.
+        # https://caddyserver.com/docs/caddyfile/options#auto-https
+        out.append('    auto_https disable_redirects')
     if cp != CADDY_HTTP_PORT_DEFAULT:
         out.append(f'    http_port {cp}')
     return out

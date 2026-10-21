@@ -74,13 +74,14 @@ def test_moved_ports_reach_urls_and_the_global_block():
     assert ns['_pub_http_hostport']('atlas.example.com') == 'atlas.example.com:8081'
     assert ns['_pub_url']('tak.example.com') == 'https://tak.example.com:4443'
     assert ns['_caddy_global_options_lines']() == [
-        '{', '    grace_period 10s', '    https_port 4443', '    http_port 8081', '}', '']
+        '{', '    grace_period 10s', '    https_port 4443', '    auto_https disable_redirects',
+        '    http_port 8081', '}', '']
     assert ns['_caddy_ports_custom']()
 
 
 def test_only_the_moved_port_is_emitted():
     ns = _load({'caddy_https_port': 4443})
-    assert ns['_caddy_port_option_lines']() == ['    https_port 4443']
+    assert ns['_caddy_port_option_lines']() == ['    https_port 4443', '    auto_https disable_redirects']
     assert ns['_pub_http_hostport']('a.example.com') == 'a.example.com'
 
 
