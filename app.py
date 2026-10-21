@@ -27082,6 +27082,7 @@ def caddy_deploy():
     # boxes behind a WAF / where ACME can't reach — the whole reason for custom mode).
     cert_pem = key_pem = ''
     if request.files or (request.form and request.form.get('domain')):
+        data = request.form
         domain = (request.form.get('domain') or '').strip().lower()
         ssl_mode = (request.form.get('ssl_mode') or 'fqdn').strip()
         cf = request.files.get('cert_file')
@@ -27110,6 +27111,14 @@ def caddy_deploy():
     settings = load_settings()
     settings['fqdn'] = domain
     warnings = []
+    # ops #125 — and refuse before Caddy asks Let's Encrypt for names that do not point
+    # here (nothing written yet, so Retry is a clean re-run).
+    blocked, dns = _dns_precheck_gate(settings, data, ssl_mode)
+    if blocked:
+        return blocked
+    if dns and not dns['ok']:
+        warnings.append("DNS pre-check overridden (continue anyway): "
+                        + dns['message'].rsplit('\n', 1)[0].replace('\n', ' '))
     if ssl_mode == 'custom':
         if not cert_pem or not key_pem:
             return jsonify({'success': False, 'error': 'Custom certificate selected — upload both a certificate (full-chain PEM) and a private key (PEM).'}), 400
@@ -28192,6 +28201,9 @@ def caddy_update_domain():
     settings = load_settings()
     old_fqdn = settings.get('fqdn', '')
     settings['fqdn'] = domain
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — before anything is saved
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     modules = detect_modules(fresh=True)
@@ -28714,10 +28726,31 @@ def caddy_save_domains():
                 settings[alias_key] = av
             elif alias_key in settings:
                 del settings[alias_key]
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — a changed host is a new cert request
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     return jsonify({'success': True, 'domains': _get_all_service_domains(settings)})
+
+
+@app.route('/api/caddy/dns-check')
+@login_required
+def caddy_dns_check():
+    """ops #125 — the DNS pre-check on its own, for the Caddy page's DNS card (Recheck)."""
+    settings = load_settings()
+    domain = (request.args.get('domain') or '').strip().lower()
+    if domain:
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
+            return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'}), 400
+        settings['fqdn'] = domain
+    if not settings.get('fqdn'):
+        return jsonify({'success': False, 'error': 'No domain set'}), 400
+    res = _dns_precheck(settings, detect_modules())
+    res['success'] = True
+    res['ssl_mode'] = settings.get('ssl_mode') or 'fqdn'
+    return jsonify(res)
 
 SERVICE_DOMAIN_DEFAULTS = {
     'infratak': 'infratak',
@@ -28754,6 +28787,108 @@ def _get_service_domain(settings, service_key):
 def _get_all_service_domains(settings):
     """Return dict of service_key → current domain for all services."""
     return {k: _get_service_domain(settings, k) for k in SERVICE_DOMAIN_DEFAULTS}
+
+
+# v10.2.24 (ops #125) — DNS pre-check. A fresh install whose A records all pointed at a
+# typo'd IP (168.x for a 198.x box) went straight into Let's Encrypt: Caddy got no
+# certificate, every FQDN URL failed, and only Diagnostics noticed. Resolve the names
+# before Caddy asks for certificates and compare them to server_ip. Behind NAT or a proxy
+# the public IP can legitimately differ, so every caller offers "continue anyway" — this
+# stops an install, it never hard-blocks one.
+DNS_PRECHECK_TIMEOUT = 8   # seconds for the whole batch; getaddrinfo has no timeout of its own
+
+
+def _dns_resolve_ipv4(host):
+    """(sorted IPv4 list, problem). problem is None, 'missing' (no A record), or
+    'error: …' (the lookup itself failed — this box's resolver, not the record)."""
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)}), None
+    except socket.gaierror as e:
+        if e.errno in (socket.EAI_NONAME, getattr(socket, 'EAI_NODATA', socket.EAI_NONAME)):
+            return [], 'missing'
+        return [], f'error: {e}'
+    except Exception as e:
+        return [], f'error: {e}'
+
+
+def _dns_precheck_hosts(settings, modules):
+    """{host: needed_now} for every subdomain this box uses, in SERVICE_DOMAIN_DEFAULTS
+    order. needed_now = Caddy serves it now, so it is about to ask Let's Encrypt for it:
+    infra-TAK always, the rest once their module is installed (mediamtx and the video
+    restreamer share `stream`, hence the OR)."""
+    hosts = {}
+    for key in SERVICE_DOMAIN_DEFAULTS:
+        host = _get_service_domain(settings, key)
+        if not host:
+            continue
+        mod = 'cloudtak' if key.startswith('cloudtak_') else key
+        needed = key == 'infratak' or bool((modules.get(mod) or {}).get('installed'))
+        hosts[host] = hosts.get(host, False) or needed
+    return hosts
+
+
+def _dns_precheck_message(blocking, server_ip):
+    lines = []
+    for r in blocking:
+        if r['status'] == 'mismatch':
+            lines.append(f"{r['host']} points to {', '.join(r['ips'])}, but this server is {server_ip}.")
+        else:
+            lines.append(f"{r['host']} has no DNS A record. Create one pointing to {server_ip}.")
+    lines.append(f"Fix the A record{'s' if len(blocking) > 1 else ''} at your DNS provider, "
+                 "wait a few minutes, then press Retry.")
+    return '\n'.join(lines)
+
+
+def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT):
+    """Compare each subdomain's A record to server_ip. Only names Caddy is about to request
+    certificates for (needed_now) can block; the rest are reported so the operator sees a
+    bad record before installing that module. A lookup that fails on this box, or an
+    unknown server_ip, is reported but never blocks — neither says the record is wrong."""
+    resolve = resolve or _dns_resolve_ipv4
+    sip = str(settings.get('server_ip') or '').strip()
+    hosts = _dns_precheck_hosts(settings, modules)
+    answers = {}
+
+    def _one(h):
+        answers[h] = resolve(h)
+    threads = [threading.Thread(target=_one, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    rows = []
+    for host, needed in hosts.items():
+        ips, problem = answers.get(host) or ([], 'error: lookup timed out')
+        if problem == 'missing':
+            status = 'missing'
+        elif problem:
+            status = 'error'
+        elif not sip:
+            status = 'unknown'
+        elif sip in ips:
+            status = 'ok'
+        else:
+            status = 'mismatch'
+        rows.append({'host': host, 'needed': needed, 'ips': ips, 'status': status,
+                     'error': problem if status == 'error' else ''})
+    blocking = [r for r in rows if r['needed'] and r['status'] in ('missing', 'mismatch')]
+    return {'ok': not blocking, 'server_ip': sip, 'hosts': rows,
+            'problems': [r['host'] for r in blocking],
+            'message': _dns_precheck_message(blocking, sip) if blocking else ''}
+
+
+def _dns_precheck_gate(settings, data, ssl_mode=None):
+    """Run the pre-check for a save/deploy. Returns (blocked_response_or_None, result).
+    Skipped for a custom certificate (Caddy never asks Let's Encrypt). With
+    skip_dns_check (the operator chose "continue anyway" — NAT / proxy) the result is
+    still returned so the caller can log it."""
+    if (ssl_mode or settings.get('ssl_mode') or 'fqdn') == 'custom' or not settings.get('fqdn'):
+        return None, None
+    res = _dns_precheck(settings, detect_modules())
+    if res['ok'] or str(data.get('skip_dns_check') or '').lower() in ('1', 'true', 'yes', 'on'):
+        return None, res
+    return (jsonify({'success': False, 'error': res['message'], 'dns_check': res}), 409), res
 
 
 def _service_subdomain_labels(settings):
