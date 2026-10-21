@@ -117,12 +117,14 @@ class Box:
 
     # ── TAK's own LDAP lookup for a cert user (X509Authenticator) ──
     def _tak_lookup(self, cn):
+        """None = the lookup failed (silently); [] = it worked, LDAP gives the user no groups
+        (TAK still names the connection, with __ANON__ only)."""
         if self.dead_pool:
             self.dead_pool -= 1
-            return None                # failed, silently
-        if not self.tak_ldap_ok or not self.ldap_users.get(cn, 0):
             return None
-        return ['OPS']
+        if not self.tak_ldap_ok:
+            return None
+        return ['OPS'] if self.ldap_users.get(cn, 0) else []
 
     def _materialize(self):
         for at, s in list(self.reconnects):
@@ -157,8 +159,10 @@ class Box:
                 old = gone[0]
                 cn = old['_cn']
                 g = self._tak_lookup(cn)
-                new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'], unmapped=not g),
+                new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'], unmapped=g is None),
                            callsign=f'tls:{self.next_uid}')     # no callsign before its first SA
+                if g == []:
+                    new['groups'] = [{'name': '__ANON__', 'direction': d} for d in ('IN', 'OUT')]
                 self.next_uid += 1
                 self.reconnects.append((self.t + 15, new))
             return {'data': f'Successfully deleted subscription with uid: {uid}'}, None
@@ -330,10 +334,64 @@ def test_everyone_named_is_reauthenticated_but_file_users_never():
 
 def test_users_ldap_gives_no_groups_and_file_users_are_never_dropped():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
-    box.subs += [sess(30, 'nogroups', ()), sess(31, 'admin', ()),
-                 sess(32, 'stranger', (), unmapped=True)]     # no DN, device never seen as anyone
+    box.subs += [sess(30, 'nogroups', ()), sess(31, 'admin', ())]
+    box.subs[-2]['groups'] = [{'name': '__ANON__', 'direction': 'IN'}]   # TAK's anon fallback
     assert box.recycle() is False
     assert box.drops() == [] and box.restarts() == []
+
+
+# ── ops #131: a client that reconnected during the outage, which client history hides ──
+
+def test_reconnect_during_outage_hidden_from_client_history_is_found_and_healed():
+    # test12 2026-10-21: the emulator reconnected while the outpost was down (no DN, no
+    # username, 0 groups) and TAK's client history doesn't list its device. v10.2.24's heal
+    # said "all clients have their groups"; the live connection list alone must find it.
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, history={})
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:16']
+    [now] = box.live('takdev-emu')
+    assert now['username'] == 'takdev-emu' and now['groups']
+    assert any('1 with no groups' in l and '1 with no user at all' in l for l in box.log)
+    assert any('dropped 1 connection(s)' in l and 'TAKDEV-EMU (no user)' in l for l in box.log)
+    assert any('got their groups back: TAKDEV-EMU (takdev-emu)' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
+
+
+def test_reconnect_is_judged_by_its_device_uid_when_nothing_named_it():
+    # Another client's new connection must not be taken for the dropped one.
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, history={}, online=False)
+    box.reconnects.append((T0 + 20, sess(200, 'aj5cacor')))
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any("1 didn't reconnect within" in l for l in box.log)
+    assert not any('got their groups back' in l for l in box.log)
+
+
+def test_no_user_connection_is_dropped_even_if_history_names_a_user_without_groups():
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR,
+                     history={'ANDROID-takdev-emu': 'nogroups'})
+    assert box.recycle() is False
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    assert box.live('takdev-emu')[0]['groups']
+
+
+def test_no_user_connection_that_comes_back_as_a_user_without_ldap_groups_is_left_alone():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, history={})
+    box.subs.append(sess(32, 'stranger', (), unmapped=True))    # lookup failed during the outage
+    assert box.recycle() is False
+    assert box.drops() == ['tls:32'] and box.restarts() == []   # one drop, no second round
+    [now] = box.live('stranger')
+    assert now['username'] == 'stranger'
+    assert any("reconnected as user(s) LDAP gives no TAK groups, left as is: STRANGER" in l for l in box.log)
+
+
+def test_no_user_connection_back_with_no_user_twice_falls_back_to_one_restart():
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, history={}, tak_ldap_ok=False)
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert len(box.drops()) == _const('_TAK_LDAP_HEAL_ROUNDS')
+    assert any('still with no groups although LDAP is healthy' in l and '(no user)' in l for l in box.log)
 
 
 def test_unmapped_connection_is_identified_by_its_device_history():
@@ -391,7 +449,7 @@ def test_client_back_empty_twice_falls_back_to_one_restart_and_waits_for_the_por
     assert box.recycle() is True
     assert box.restarts() == [['systemctl', 'restart', 'takserver']]
     assert len(box.drops()) == _const('_TAK_LDAP_HEAL_ROUNDS')
-    assert any('still with no groups although LDAP has them' in l and 'falling back to restarting' in l
+    assert any('still with no groups although LDAP is healthy' in l and 'falling back to restarting' in l
                for l in box.log)
     assert any('8089 accepting connections' in l for l in box.log)
     assert any('API (8443) up' in l for l in box.log)
