@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.22-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.22-alpha)**
+**Current release: [v10.2.23-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.23-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.23-alpha — 2026-10-20 — Hotfix: ATAK users keep their LDAP groups after updating; Caddy keeps your own lines inside generated sites; ATLAS installs only signed releases
+
+**Headline: after updating to v10.2.22, ATAK clients that reconnected could get no LDAP groups and see no one on the map. This hotfix puts the Authentik PgBouncer sidecar back on 1.25.1, stops the update from restarting Authentik over and over, and checks LDAP groups after the swap. Also: your own lines inside a generated Caddy site block now survive regeneration, ATLAS installs and updates only signed releases, and non-root boxes no longer fail privileged calls while the broker restarts.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.23-alpha))
+
+**LDAP groups after update (hotfix).** v10.2.22's PgBouncer move rewrote Authentik's `docker-compose.yml` in a way the post-update hardening step read as a change, so Authentik's server, worker and LDAP outpost were recreated several times. Right after each LDAP outpost restart, users briefly had no group memberships, and TAK clients that connected then got no groups. Now PgBouncer goes back to `v1.25.1-p0` (boxes on 1.26.1 move back at their next console start), the swap edits only the image line, hardening ignores formatting-only differences, and after a swap the console checks a live LDAP bind and users' `tak_` groups before resyncing TAK Server's LDAP credential. If LDAP doesn't come back healthy, it does one ordered restart and otherwise rolls back. The PgBouncer security bump returns as its own change.
+
+**Caddy.** A line you add inside a generated site block (for example `import cloudtak_print`) was lost on every deploy, domain change or Update. The generated Caddyfile now imports `/etc/caddy/snippets.d/*.caddy` and `/etc/caddy/sites.d/<host>/*.caddy`, which infra-TAK never writes. If your file breaks the config, the Caddyfile is written without the includes so every site stays up, and the Caddy page shows the error. See "Caddy: your own lines inside a generated site" above. (GH #176)
+
+**ATLAS.** Install and Update now check that the ATLAS release tag is signed by a trusted key, names the version being installed and points at the channel's commit, before any code is checked out. A refused update leaves the running deployment untouched.
+
+**Non-root boxes.** The privileged broker's daily recycle could land in the middle of the post-update work, and for those few seconds privileged calls failed (false "Node-RED container not running", a false Authentik port-conflict error). The broker now waits for a quiet window, and callers wait for a restarting broker instead of failing.
 
 ### v10.2.22-alpha — 2026-10-20 — Security release: CloudTAK PostgreSQL 17.11 + PostGIS 3.6, Authentik PgBouncer 1.26.1; console survives early connection resets; Rotate Intermediate CA really renews .p12 client certs
 
