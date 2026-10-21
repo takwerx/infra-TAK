@@ -1168,7 +1168,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.23-alpha"
+VERSION = "10.2.24-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -2070,6 +2070,23 @@ def _mod_result_step(module, step):
             last = (d.get(module) or {}).get('last')
             if last and last.get('outcome') == 'running':
                 last['step'] = str(step)[:120]
+                _mod_results_save(d)
+    except Exception:
+        pass
+
+
+def _mod_result_versions(module, frm=None, to=None):
+    """Fill in from/to on an in-flight record once the job itself knows them (ops #129: the
+    CloudTAK update only learns both after it starts, so its card said "? -> ?")."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            last = (d.get(module) or {}).get('last')
+            if last and last.get('outcome') == 'running':
+                if frm:
+                    last['from'] = str(frm)[:60]
+                if to:
+                    last['to'] = str(to)[:60]
                 _mod_results_save(d)
     except Exception:
         pass
@@ -15778,6 +15795,75 @@ def _remote_assist_deploy_log(msg):
     _remote_assist_deploy_status['log'].append(msg)
 
 
+# ops #135: `compose up -d --build` never pulls. A FROM image already on the box (e.g.
+# `node:22-alpine`) is reused as-is, so a rebuild or Update kept shipping the base it was
+# first built on: Remote Assist sat on Node 22.23.0 on test6 while Docker Hub had 22.23.4.
+# So every Deploy and Update first `docker pull`s each FROM image, then builds WITHOUT
+# --pull. A pull that fails (registry unreachable, rate limit, hang) must not stop a build
+# that worked yesterday, so it is logged and the build goes on with the copy on the box.
+# Why not `build --pull`: with Docker's containerd image store (the default on fresh
+# Docker 29 installs, and on every fleet box) a base BuildKit fetched itself is not a tagged image, so a build resolves its FROM
+# against the registry even without --pull, and with the registry down it fails. A
+# `docker pull` tags the base in the store, so the next build resolves it locally
+# (T&E round 3, ops #136, test8 with Docker Hub blocked).
+# https://docs.docker.com/reference/cli/docker/image/pull/
+# https://docs.docker.com/engine/storage/containerd/
+_DOCKERFILE_FROM_RE = re.compile(r'^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(\S+)(?:[ \t]+AS[ \t]+(\S+))?',
+                                 re.IGNORECASE | re.MULTILINE)
+
+
+def _dockerfile_base_images(build_dir):
+    """FROM images of the Dockerfiles in build_dir and its direct subdirectories, in order,
+    deduplicated. Skips build-stage names, `scratch` and ARG-templated names (`$X`), none
+    of which can be pulled as written."""
+    paths = [os.path.join(build_dir, 'Dockerfile')]
+    try:
+        paths += [os.path.join(build_dir, d, 'Dockerfile') for d in sorted(os.listdir(build_dir))]
+    except OSError:
+        pass
+    images = []
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        stages = set()
+        for m in _DOCKERFILE_FROM_RE.finditer(text):
+            img, stage = m.group(1), m.group(2)
+            if img.lower() not in stages and img.lower() != 'scratch' and '$' not in img and img not in images:
+                images.append(img)
+            if stage:
+                stages.add(stage.lower())
+    return images
+
+
+def _pull_base_images(build_dir, wrap=None, plog=None, timeout=300):
+    """`docker pull` every FROM image under build_dir (argv passed through `wrap`, e.g.
+    _sudo_wrap). Returns the images that could not be pulled. Never raises: a failed or
+    timed-out pull only means the build uses the copy already on the box."""
+    _log = plog or (lambda m: print(m, flush=True))
+    _wrap = wrap or (lambda argv: argv)
+    failed = []
+    for img in _dockerfile_base_images(build_dir):
+        _log(f'  Pulling base image {img}...')
+        try:
+            r = subprocess.run(_wrap(['docker', 'pull', img]), cwd=build_dir,
+                               capture_output=True, text=True, timeout=timeout)
+            lines = (r.stderr or r.stdout or '').strip().splitlines()
+            err = '' if r.returncode == 0 else (lines[-1] if lines else f'rc={r.returncode}')[-300:]
+        except subprocess.TimeoutExpired:
+            err = f'timed out after {timeout}s'
+        except OSError as e:
+            err = str(e)[-300:] or 'could not run docker pull'
+        if err:
+            failed.append(img)
+            _log(f'  ⚠ Could not pull {img}, building on the copy already on this box: {err}')
+        else:
+            _log(f'  ✓ {img} current')
+    return failed
+
+
 def _remote_assist_compose_files(ra_dir):
     return os.path.join(ra_dir, 'docker-compose.yml')
 
@@ -16065,9 +16151,124 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     os.chmod(env_path, 0o600)
 
 
+# ops #138: Postgres reads POSTGRES_PASSWORD once, when the data volume is first created; the
+# password then lives in the volume and the env var is ignored. Deploy and Update used to take
+# the saved password or make a random one (since v0.9.59), so a box with none saved got a .env
+# its own database had never seen, and Remote Assist could no longer log in. A new password is
+# now made only when there is no database yet; otherwise the one in use is adopted and saved.
+# https://hub.docker.com/_/postgres (POSTGRES_PASSWORD: "only used if you start the container
+# with an empty data directory")
+def _remote_assist_env_value(ra_dir, key):
+    """`key` from Remote Assist's .env, or ''."""
+    try:
+        with open(os.path.join(ra_dir, '.env')) as f:
+            for line in f:
+                k, sep, v = line.strip().partition('=')
+                if sep and k.strip() == key:
+                    return v.strip().strip('"\'')
+    except OSError:
+        pass
+    return ''
+
+
+def _remote_assist_db_state(ra_dir):
+    """(exists, password) for the database of the compose project in `ra_dir`: whether its
+    postgres container or data volume exists, and the POSTGRES_PASSWORD its container was
+    created with ('' if unknown). Plain docker, not compose: compose refuses to parse the
+    file at all when .env is missing (POSTGRES_PASSWORD is `:?` required)."""
+    project = re.sub(r'[^a-z0-9_-]', '', os.path.basename(os.path.normpath(ra_dir)).lower())
+    try:
+        r = subprocess.run(['docker', 'ps', '-a', '-q',
+                            '--filter', f'label=com.docker.compose.project.working_dir={ra_dir}',
+                            '--filter', 'label=com.docker.compose.service=postgres'],
+                           capture_output=True, text=True, timeout=30)
+        cids = (r.stdout or '').split() if r.returncode == 0 else []
+        if cids:
+            r = subprocess.run(['docker', 'inspect', '--format',
+                                '{{range .Config.Env}}{{println .}}{{end}}', cids[0]],
+                               capture_output=True, text=True, timeout=30)
+            for line in (r.stdout or '').splitlines():
+                k, sep, v = line.partition('=')
+                if sep and k == 'POSTGRES_PASSWORD':
+                    return True, v.strip()
+            return True, ''
+        r = subprocess.run(['docker', 'volume', 'ls', '-q',
+                            '--filter', f'label=com.docker.compose.project={project}',
+                            '--filter', 'label=com.docker.compose.volume=postgres_data'],
+                           capture_output=True, text=True, timeout=30)
+        return bool(r.returncode == 0 and (r.stdout or '').strip()), ''
+    except Exception:
+        return False, ''
+
+
+def _remote_assist_pg_password(ra_dir, settings, plog):
+    """The DB password to write to .env. Saved setting first, then the existing .env, then the
+    running postgres container. A new one only when there is no database: with a database and
+    no password anywhere, the new one is applied to the database by _remote_assist_sync_db_password."""
+    saved = settings.get('remote_assist_pg_password')
+    if saved:
+        return saved
+    from_env = _remote_assist_env_value(ra_dir, 'POSTGRES_PASSWORD')
+    if from_env:
+        plog('  No DB password saved in the console; using the one in .env')
+        return from_env
+    exists, from_container = _remote_assist_db_state(ra_dir)
+    if from_container:
+        plog('  No DB password saved in the console; using the one the database container runs with')
+        return from_container
+    if exists:
+        plog('  ⚠ Existing database but no password found anywhere; setting a new one on the database')
+    return secrets.token_hex(24)
+
+
+def _remote_assist_pw_matches(verifier, password, user):
+    """True if `password` matches a pg_authid.rolpassword verifier (SCRAM-SHA-256 or md5)."""
+    verifier = (verifier or '').strip()
+    if verifier.startswith('SCRAM-SHA-256$'):
+        try:
+            iters_salt, keys = verifier[len('SCRAM-SHA-256$'):].split('$', 1)
+            iters, salt = iters_salt.split(':', 1)
+            stored_key = keys.split(':', 1)[0]
+            salted = hashlib.pbkdf2_hmac('sha256', password.encode(), _b64.b64decode(salt), int(iters))
+            client_key = hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+            return hmac.compare_digest(hashlib.sha256(client_key).digest(), _b64.b64decode(stored_key))
+        except Exception:
+            return False
+    if verifier.startswith('md5'):
+        return hmac.compare_digest(verifier, 'md5' + hashlib.md5((password + user).encode()).hexdigest())
+    return False
+
+
+def _remote_assist_sync_db_password(ra_dir, pg_password, plog):
+    """Make the database role's password match .env, over the container's local socket (trust
+    in the official image, so the old password is not needed). A no-op when they already match.
+    Also repairs installs an earlier Update already broke. Returns True if it changed anything."""
+    user = _remote_assist_env_value(ra_dir, 'POSTGRES_USER') or 'cfd'
+    psql = _remote_assist_compose_cmd(ra_dir, 'exec', '-T', 'postgres',
+                                      'psql', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', 'postgres', '-tA')
+    r = subprocess.run(psql + ['-c', 'SELECT rolpassword FROM pg_authid WHERE rolname = current_user'],
+                       capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        plog(f'  ⚠ Could not check the database password: {(r.stderr or r.stdout).strip()[-200:]}')
+        return False
+    if _remote_assist_pw_matches(r.stdout, pg_password, user):
+        plog('  ✓ Database password matches .env')
+        return False
+    # The password goes in on stdin, not argv, so it never shows in a process list.
+    sql = "ALTER ROLE CURRENT_USER PASSWORD '%s';\n" % pg_password.replace("'", "''")
+    r = subprocess.run(psql, input=sql, capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        # Not psql's output: an error echoes the statement, password included.
+        plog(f'  ⚠ Could not set the database password (psql exit {r.returncode})')
+        return False
+    subprocess.run(_remote_assist_compose_cmd(ra_dir, 'restart', 'server'),
+                   capture_output=True, text=True, timeout=120, cwd=ra_dir)
+    plog('  ✓ Database password did not match .env; set it and restarted the server')
+    return True
+
+
 def _run_remote_assist_deploy(settings):
     import subprocess as _sp
-    import secrets as _sec
     plog = _remote_assist_deploy_log
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     try:
@@ -16119,7 +16320,7 @@ def _run_remote_assist_deploy(settings):
 
         plog('')
         plog('━━━ Step 4/6: Writing Configuration ━━━')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (NGINX_BIND_ADDR=127.0.0.1 HTTP_PORT={REMOTE_ASSIST_PORT})')
@@ -16129,11 +16330,13 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up --build failed:\n{(r.stderr or r.stdout)[-600:]}')
         plog('✓ Containers built and started')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
@@ -16339,7 +16542,6 @@ _remote_assist_update_status = {'running': False, 'complete': False, 'error': Fa
 
 def _run_remote_assist_update():
     import subprocess as _sp
-    import secrets as _sec
     global _remote_assist_update_status
     log = []
     def plog(msg):
@@ -16374,7 +16576,7 @@ def _run_remote_assist_update():
             client_id, _ = _ensure_authentik_remote_assist_app(settings, plog=plog)
         if not client_id:
             raise RuntimeError('Authentik OIDC client_id missing')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (loopback nginx → 127.0.0.1:{REMOTE_ASSIST_PORT})')
@@ -16383,11 +16585,13 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
@@ -17225,6 +17429,40 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     if not ok or 'AGENT_OK' not in (out or ''):
         return False, f'Setup failed: {(out or "")[:150]}'
     return True, 'Health agent deployed (port 8080/health for Guard Dog).'
+
+
+def _refresh_health_agent_on_server_one(s1_cfg):
+    """Guard Dog Update: replace an INSTALLED Server One health agent whose code differs from
+    this console's, and restart it. Returns (changed, message).
+
+    v10.2.25 (ops #132): only a full deploy or the agent's own button ever copied the agent, so
+    a fix to it (here: pg_isready logging `role "root" does not exist` on every poll) never
+    reached a split box on Update. Not installed -> nothing to do. No firewall changes: the
+    deploy already scoped 8080, and an Update click is not the place to re-converge it."""
+    agent_src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-db-health-agent.py')
+    if not os.path.isfile(agent_src):
+        return False, 'tak-db-health-agent.py not found'
+    with open(agent_src, 'rb') as f:
+        want = hashlib.sha256(f.read()).hexdigest()
+    dest = '/opt/tak-guarddog/tak-db-health-agent.py'
+    ok, out = _ssh_probe(s1_cfg, f'sha256sum {dest} 2>/dev/null || echo NOT_INSTALLED', timeout=15)
+    out = (out or '').strip()
+    if not ok:
+        return False, f'could not check the agent on Server One: {out[:150]}'
+    if 'NOT_INSTALLED' in out:
+        return False, 'not installed on Server One'
+    if out.split()[0:1] == [want]:
+        return False, 'already current'
+    scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/tmp/', timeout=30)
+    if not scp_ok:
+        return False, f'SCP failed: {(scp_out or "")[:150]}'
+    ok, out = _ssh_probe(s1_cfg, (
+        f'sudo mv /tmp/tak-db-health-agent.py {dest} && sudo chmod 644 {dest} && '
+        '{ command -v restorecon >/dev/null 2>&1 && sudo restorecon -F ' + dest + ' 2>/dev/null; true; } && '
+        'sudo systemctl restart tak-db-health.service && echo AGENT_OK'), timeout=30)
+    if not ok or 'AGENT_OK' not in (out or ''):
+        return False, f'restart failed: {(out or "")[:150]}'
+    return True, 'health agent updated on Server One'
 
 
 def _find_ssh_key_for_server_one(s1_cfg):
@@ -23867,6 +24105,17 @@ def guarddog_update():
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
         _auto_update_guarddog()
+        # v10.2.25 (ops #132): two-server — the Server One health agent rides the Update too.
+        try:
+            _ha_cfg = _get_tak_deployment_config(load_settings())
+            _ha_s1 = _ha_cfg.get('server_one', {})
+            _ha_key = (_ha_s1.get('ssh_key_path') or '').strip()
+            if (_ha_cfg.get('mode') == 'two_server' and (_ha_s1.get('host') or '').strip()
+                    and _ha_key and os.path.exists(os.path.expanduser(_ha_key))):
+                _ha_changed, _ha_msg = _refresh_health_agent_on_server_one(_ha_s1)
+                print(f'[guarddog] Server One health agent: {_ha_msg}', flush=True)
+        except Exception as _ha_err:
+            print(f'[guarddog] Server One health agent refresh failed (non-fatal): {_ha_err}', flush=True)
         # Ensure update-check units exist and are enabled.
         # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer. It now
         # removes them — see _startup_retire_updates_timer(), which is the primary path
@@ -27082,6 +27331,7 @@ def caddy_deploy():
     # boxes behind a WAF / where ACME can't reach — the whole reason for custom mode).
     cert_pem = key_pem = ''
     if request.files or (request.form and request.form.get('domain')):
+        data = request.form
         domain = (request.form.get('domain') or '').strip().lower()
         ssl_mode = (request.form.get('ssl_mode') or 'fqdn').strip()
         cf = request.files.get('cert_file')
@@ -27110,6 +27360,14 @@ def caddy_deploy():
     settings = load_settings()
     settings['fqdn'] = domain
     warnings = []
+    # ops #125 — and refuse before Caddy asks Let's Encrypt for names that do not point
+    # here (nothing written yet, so Retry is a clean re-run).
+    blocked, dns = _dns_precheck_gate(settings, data, ssl_mode)
+    if blocked:
+        return blocked
+    if dns and not dns['ok']:
+        warnings.append("DNS pre-check overridden (continue anyway): "
+                        + dns['message'].rsplit('\n', 1)[0].replace('\n', ' '))
     if ssl_mode == 'custom':
         if not cert_pem or not key_pem:
             return jsonify({'success': False, 'error': 'Custom certificate selected — upload both a certificate (full-chain PEM) and a private key (PEM).'}), 400
@@ -28192,6 +28450,9 @@ def caddy_update_domain():
     settings = load_settings()
     old_fqdn = settings.get('fqdn', '')
     settings['fqdn'] = domain
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — before anything is saved
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     modules = detect_modules(fresh=True)
@@ -28714,10 +28975,31 @@ def caddy_save_domains():
                 settings[alias_key] = av
             elif alias_key in settings:
                 del settings[alias_key]
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — a changed host is a new cert request
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     return jsonify({'success': True, 'domains': _get_all_service_domains(settings)})
+
+
+@app.route('/api/caddy/dns-check')
+@login_required
+def caddy_dns_check():
+    """ops #125 — the DNS pre-check on its own, for the Caddy page's DNS card (Recheck)."""
+    settings = load_settings()
+    domain = (request.args.get('domain') or '').strip().lower()
+    if domain:
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
+            return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'}), 400
+        settings['fqdn'] = domain
+    if not settings.get('fqdn'):
+        return jsonify({'success': False, 'error': 'No domain set'}), 400
+    res = _dns_precheck(settings, detect_modules())
+    res['success'] = True
+    res['ssl_mode'] = settings.get('ssl_mode') or 'fqdn'
+    return jsonify(res)
 
 SERVICE_DOMAIN_DEFAULTS = {
     'infratak': 'infratak',
@@ -28754,6 +29036,108 @@ def _get_service_domain(settings, service_key):
 def _get_all_service_domains(settings):
     """Return dict of service_key → current domain for all services."""
     return {k: _get_service_domain(settings, k) for k in SERVICE_DOMAIN_DEFAULTS}
+
+
+# v10.2.24 (ops #125) — DNS pre-check. A fresh install whose A records all pointed at a
+# typo'd IP (168.x for a 198.x box) went straight into Let's Encrypt: Caddy got no
+# certificate, every FQDN URL failed, and only Diagnostics noticed. Resolve the names
+# before Caddy asks for certificates and compare them to server_ip. Behind NAT or a proxy
+# the public IP can legitimately differ, so every caller offers "continue anyway" — this
+# stops an install, it never hard-blocks one.
+DNS_PRECHECK_TIMEOUT = 8   # seconds for the whole batch; getaddrinfo has no timeout of its own
+
+
+def _dns_resolve_ipv4(host):
+    """(sorted IPv4 list, problem). problem is None, 'missing' (no A record), or
+    'error: …' (the lookup itself failed — this box's resolver, not the record)."""
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)}), None
+    except socket.gaierror as e:
+        if e.errno in (socket.EAI_NONAME, getattr(socket, 'EAI_NODATA', socket.EAI_NONAME)):
+            return [], 'missing'
+        return [], f'error: {e}'
+    except Exception as e:
+        return [], f'error: {e}'
+
+
+def _dns_precheck_hosts(settings, modules):
+    """{host: needed_now} for every subdomain this box uses, in SERVICE_DOMAIN_DEFAULTS
+    order. needed_now = Caddy serves it now, so it is about to ask Let's Encrypt for it:
+    infra-TAK always, the rest once their module is installed (mediamtx and the video
+    restreamer share `stream`, hence the OR)."""
+    hosts = {}
+    for key in SERVICE_DOMAIN_DEFAULTS:
+        host = _get_service_domain(settings, key)
+        if not host:
+            continue
+        mod = 'cloudtak' if key.startswith('cloudtak_') else key
+        needed = key == 'infratak' or bool((modules.get(mod) or {}).get('installed'))
+        hosts[host] = hosts.get(host, False) or needed
+    return hosts
+
+
+def _dns_precheck_message(blocking, server_ip):
+    lines = []
+    for r in blocking:
+        if r['status'] == 'mismatch':
+            lines.append(f"{r['host']} points to {', '.join(r['ips'])}, but this server is {server_ip}.")
+        else:
+            lines.append(f"{r['host']} has no DNS A record. Create one pointing to {server_ip}.")
+    lines.append(f"Fix the A record{'s' if len(blocking) > 1 else ''} at your DNS provider, "
+                 "wait a few minutes, then press Retry.")
+    return '\n'.join(lines)
+
+
+def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT):
+    """Compare each subdomain's A record to server_ip. Only names Caddy is about to request
+    certificates for (needed_now) can block; the rest are reported so the operator sees a
+    bad record before installing that module. A lookup that fails on this box, or an
+    unknown server_ip, is reported but never blocks — neither says the record is wrong."""
+    resolve = resolve or _dns_resolve_ipv4
+    sip = str(settings.get('server_ip') or '').strip()
+    hosts = _dns_precheck_hosts(settings, modules)
+    answers = {}
+
+    def _one(h):
+        answers[h] = resolve(h)
+    threads = [threading.Thread(target=_one, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    rows = []
+    for host, needed in hosts.items():
+        ips, problem = answers.get(host) or ([], 'error: lookup timed out')
+        if problem == 'missing':
+            status = 'missing'
+        elif problem:
+            status = 'error'
+        elif not sip:
+            status = 'unknown'
+        elif sip in ips:
+            status = 'ok'
+        else:
+            status = 'mismatch'
+        rows.append({'host': host, 'needed': needed, 'ips': ips, 'status': status,
+                     'error': problem if status == 'error' else ''})
+    blocking = [r for r in rows if r['needed'] and r['status'] in ('missing', 'mismatch')]
+    return {'ok': not blocking, 'server_ip': sip, 'hosts': rows,
+            'problems': [r['host'] for r in blocking],
+            'message': _dns_precheck_message(blocking, sip) if blocking else ''}
+
+
+def _dns_precheck_gate(settings, data, ssl_mode=None):
+    """Run the pre-check for a save/deploy. Returns (blocked_response_or_None, result).
+    Skipped for a custom certificate (Caddy never asks Let's Encrypt). With
+    skip_dns_check (the operator chose "continue anyway" — NAT / proxy) the result is
+    still returned so the caller can log it."""
+    if (ssl_mode or settings.get('ssl_mode') or 'fqdn') == 'custom' or not settings.get('fqdn'):
+        return None, None
+    res = _dns_precheck(settings, detect_modules())
+    if res['ok'] or str(data.get('skip_dns_check') or '').lower() in ('1', 'true', 'yes', 'on'):
+        return None, res
+    return (jsonify({'success': False, 'error': res['message'], 'dns_check': res}), 409), res
 
 
 def _service_subdomain_labels(settings):
@@ -37401,11 +37785,14 @@ def _takportal_run_update(portal_dir):
     # v10.1.60 (W4): the recreate at the end of this build takes the web container
     # down for 10-15 s. Open a window that outlives the build's own timeout; it is
     # shrunk to a short grace as soon as the route knows the outcome (below).
-    _gd_maintenance_begin('takportal', 900 + 180)
+    _gd_maintenance_begin('takportal', 2 * 900 + 180)
     # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
     # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
     # time out here on a slower box, and TimeoutExpired was not caught, so it
     # surfaced as an unhandled 500 with no explanation at all.
+    # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
+    # a Node security release when TAK Portal itself has not changed.
+    _pull_base_images(portal_dir, wrap=_sudo_wrap)
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
                                cwd=portal_dir, capture_output=True, text=True, timeout=900)
@@ -37952,7 +38339,8 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
-        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
@@ -38025,6 +38413,10 @@ def run_takportal_deploy():
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             plog(f"\u26a0 Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            plog(f"\u26a0 Bootstrap cert group-cache sync (non-fatal): {_bce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -41166,6 +41558,27 @@ def cloudtak_coreevents_identity_api():
     })
 
 
+@app.route('/api/cloudtak/bootstrap-channels')
+@login_required
+def cloudtak_bootstrap_channels_api():
+    """ops #127: read-only — channels the bootstrap cert's live TAK connection cannot send Core
+    Events to (see _tak_bootstrap_channel_state). The CloudTAK page warns when any are missing."""
+    return jsonify(dict(_tak_bootstrap_channel_state(), success=True))
+
+
+@app.route('/api/cloudtak/bootstrap-channels/fix', methods=['POST'])
+@login_required
+def cloudtak_bootstrap_channels_fix_api():
+    """ops #127: "Fix now" — run the bootstrap cert channel sync immediately, then re-check."""
+    lines = []
+    try:
+        res = _tak_sync_bootstrap_group_cache(plog=lines.append)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    return jsonify({'success': True, 'result': res, 'log': lines[-5:],
+                    'after': _tak_bootstrap_channel_state()})
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -41575,7 +41988,12 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     leaves the tag pointing at the new image even though the source gets rolled
     back — the next unrelated `compose up -d` then silently ships the
     rolled-back plugin. The running container still references the pre-build
-    image, so capture both here and retag on rollback."""
+    image, so capture both here and retag on rollback.
+
+    ops #133: and PIN it. On Docker 29 (containerd image store) the build moving the tag
+    makes the old image ID unusable for `docker tag` at once, running container or not
+    (test8, Docker 29.9.1), so the retag above failed and the new image stayed. The pin
+    (`cloudtak-api:infratak-rollback`, same helper as the CloudTAK Update) keeps it."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
     routes = _cloudtak_server_routes_dir(ct_dir)
@@ -41584,19 +42002,8 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    api_image_tag = api_image_id = ''
-    try:
-        cid = subprocess.run(['docker', 'compose', 'ps', '-q', 'api'], cwd=ct_dir,
-                             capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
-        if cid:
-            insp = subprocess.run(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}', cid[0]],
-                                  capture_output=True, text=True, timeout=30).stdout.split()
-            if len(insp) == 2:
-                api_image_tag, api_image_id = insp[0], insp[1]
-    except Exception:
-        pass
     return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes,
-            'api_image_tag': api_image_tag, 'api_image_id': api_image_id}
+            'api_images': _cloudtak_snapshot_images(ct_dir, services=['api'])}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -41621,26 +42028,31 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
         plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
     # v10.1.8: if the failed rebuild already advanced the image tag, point it back
     # at the pre-build image so the next `compose up -d` can't ship the rolled-back
-    # plugin. The old image is still referenced by the running container (and by
-    # this retag), so it can't have been pruned out from under us.
-    tag, old_id = snap_info.get('api_image_tag'), snap_info.get('api_image_id')
-    if tag and old_id:
+    # plugin. ops #133: from the pin taken before the build (see the snapshot), and
+    # only claimed when the retag actually worked.
+    images = snap_info.get('api_images') or []
+    moved = []
+    for ref, old_id in images:
         try:
-            cur = subprocess.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', tag],
-                                 capture_output=True, text=True, timeout=30).stdout.strip()
-            if cur and cur != old_id:
-                subprocess.run(['docker', 'tag', old_id, tag],
-                               capture_output=True, text=True, timeout=30)
-                if plog:
-                    plog(f'  ↩ Re-pointed image tag {tag} back at the pre-build image.')
+            _rc, cur, _err = _cloudtak_docker(['docker', 'image', 'inspect', '-f', '{{.Id}}', ref], timeout=30)
+            if cur.strip() != old_id:
+                moved.append((ref, old_id))
         except Exception:
-            pass
+            moved.append((ref, old_id))
+    if moved:
+        # Drops the pin only when the tag is back; a failed restore keeps it, so the
+        # previous image is still on the box (it is named in the warning above).
+        _cloudtak_restore_images(moved, plog or (lambda m: None))
+    _cloudtak_drop_rollback_pins([i for i in images if i not in moved])
+    snap_info['api_images'] = []
 
 
 def _cleanup_snapshot(snap_info):
     import shutil
     if snap_info and snap_info.get('snap'):
         shutil.rmtree(snap_info['snap'], ignore_errors=True)
+    if snap_info and snap_info.get('api_images'):
+        _cloudtak_drop_rollback_pins(snap_info['api_images'])   # ops #133: never leave a pin behind
 
 
 def _detect_cloudtak_plugins():
@@ -45338,6 +45750,263 @@ def _cloudtak_update_failed_note(plog):
     plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
+def _cloudtak_docker(argv, remote_cfg=None, timeout=60):
+    """(returncode, stdout, error text) for one docker argv: on this box through the broker, or
+    on the remote CloudTAK host over SSH (ops #133 — the rollback helpers below serve both).
+    The remote side gets the argv shell-quoted, the same user as every other remote CloudTAK
+    docker command."""
+    if remote_cfg is not None:
+        ok, out = _ssh_probe(remote_cfg, ' '.join(shlex.quote(a) for a in argv), timeout=timeout)
+        return (0, out or '', '') if ok else (1, '', out or '')
+    r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout or '', r.stderr or ''
+
+
+def _cloudtak_compose_at(cloudtak_dir, args, remote_cfg=None, timeout=600):
+    """`_cloudtak_compose_run()` here, or the same compose args in ~/CloudTAK on the remote host.
+    Returns (rc, output)."""
+    if remote_cfg is None:
+        return _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+    dcc = _compose_cmd(remote_cfg=remote_cfg) or 'docker compose'
+    ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} " + ' '.join(shlex.quote(a) for a in args),
+                         timeout=timeout)
+    return (0 if ok else 1), out or ''
+
+
+def _cloudtak_running_version(cloudtak_dir, container_only=False, remote_cfg=None):
+    """The CloudTAK version the api container is RUNNING, else the tree's api/package.json.
+
+    ops #129: the container first, because a failed update can leave the tree at a newer tag
+    than the images that are serving. container_only: never fall back to the tree (a rollback
+    check — the tree is reverted, so it would always "match"). remote_cfg: ask the remote
+    CloudTAK host (ops #133). Never raises; '' = no answer."""
+    try:
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-q', 'api'], remote_cfg=remote_cfg, timeout=30)
+        cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
+        if re.fullmatch(r'[0-9a-f]{12,64}', cid):
+            rc, out, _err = _cloudtak_docker(['docker', 'exec', cid, 'node', '-e',
+                                              "process.stdout.write(require('/home/etl/api/package.json').version)"],
+                                             remote_cfg=remote_cfg, timeout=15)
+            v = out.strip()
+            if rc == 0 and re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v):
+                return v
+    except Exception:
+        pass
+    if container_only:
+        return ''
+    try:
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, "cat ~/CloudTAK/api/package.json", timeout=30)
+            v = str((json.loads(out or '{}') or {}).get('version') or '').strip() if ok else ''
+        else:
+            with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
+                v = str((json.load(f) or {}).get('version') or '').strip()
+        return v if re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v) else ''
+    except Exception:
+        return ''
+
+
+_CT_ROLLBACK_TAG = 'infratak-rollback'
+
+
+def _cloudtak_rollback_ref(ref):
+    """cloudtak-api[:latest] -> cloudtak-api:infratak-rollback (refs here never carry a registry)."""
+    return ref.rsplit(':', 1)[0] + ':' + _CT_ROLLBACK_TAG
+
+
+def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None, services=()):
+    """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now,
+    each pinned under a `:infratak-rollback` tag so it still exists when it is needed.
+    remote_cfg: the same on the remote CloudTAK host, which builds its own images (ops #133).
+    services: only these compose services (the plugin rebuild touches `api` alone).
+
+    ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
+    old containers keep serving by image ID, but the moment anything recreates them (a failed
+    or partial `up -d`, the next boot heal) they come back on the NEW image with the OLD
+    compose. Taking these refs back is what makes a rollback a rollback. The pin is required:
+    with Docker's containerd image store (default since Docker 29) an image that has lost its
+    tag is deleted as soon as its last container is replaced — measured on the box test, every
+    old image was gone the moment `up -d` recreated its container. Registry images (postgis,
+    media, garage — refs with a '/') are pinned by tag already and left alone.
+
+    ops #133 box test (test8, Docker 29.9.1): it is earlier than that. The moment a build moves
+    the tag, the old image ID is gone for `docker tag` / `image inspect` — while its container
+    is still running on it. So the pin has to be taken BEFORE the build; afterwards there is
+    nothing left to point the tag back at."""
+    snap = []
+    try:
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-a', '-q'] + list(services),
+                                       remote_cfg=remote_cfg, timeout=60)
+        ids = [l.strip() for l in out.splitlines() if re.fullmatch(r'[0-9a-f]{12,64}', l.strip())] if rc == 0 else []
+        if not ids:
+            return snap
+        _rc, insp, _err = _cloudtak_docker(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}'] + ids,
+                                           remote_cfg=remote_cfg, timeout=60)
+        for ln in insp.splitlines():
+            parts = ln.split()
+            if len(parts) != 2:
+                continue
+            ref, iid = parts
+            if ('/' not in ref and _CT_IMAGE_REF_RE.match(ref)
+                    and re.fullmatch(r'sha256:[0-9a-f]{64}', iid) and (ref, iid) not in snap):
+                prc, _o, _e = _cloudtak_docker(['docker', 'tag', iid, _cloudtak_rollback_ref(ref)],
+                                               remote_cfg=remote_cfg, timeout=60)
+                if prc == 0:
+                    snap.append((ref, iid))
+    except Exception:
+        pass
+    return snap
+
+
+def _cloudtak_drop_rollback_pins(snap, remote_cfg=None):
+    """Remove the `:infratak-rollback` tags (only the tag — an image still tagged or in use
+    stays). Never raises."""
+    for ref, _iid in snap or []:
+        try:
+            _cloudtak_docker(['docker', 'image', 'rm', _cloudtak_rollback_ref(ref)],
+                             remote_cfg=remote_cfg, timeout=120)
+        except Exception:
+            pass
+
+
+def _cloudtak_restore_images(snap, plog, remote_cfg=None):
+    """Point each snapshotted ref back at the image it named before the build, then drop the
+    rollback pins. Returns True only if EVERY ref was put back. Never raises."""
+    n, ok = 0, True
+    for ref, iid in snap or []:
+        try:
+            rc, _out, err = _cloudtak_docker(['docker', 'tag', iid, ref], remote_cfg=remote_cfg, timeout=60)
+            if rc == 0:
+                n += 1
+            else:
+                ok = False
+                plog(f"  ⚠ Could not point {ref} back at the previous image: {err.strip()[:160]}")
+        except Exception as e:
+            ok = False
+            plog(f"  ⚠ Could not point {ref} back at the previous image: {str(e)[:160]}")
+    if n:
+        plog(f"↩ Image tags put back on the previous build ({n} image(s))")
+    if ok:
+        _cloudtak_drop_rollback_pins(snap, remote_cfg=remote_cfg)
+    return ok
+
+
+def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expect_version='', remote_cfg=None):
+    """ops #129: the build succeeded, then `docker compose up -d` failed. Put the WHOLE stack
+    back on the previous version — tree, image tags, and any container the failed `up -d`
+    already replaced — instead of leaving the new tree over the old containers.
+
+    Order: revert the tree, re-tag the old images, then `up -d --no-build` from the reverted
+    compose. Containers `up -d` never reached match that compose + image exactly and are left
+    running untouched; any it stopped or replaced are recreated from the old image. If any old
+    image cannot be put back, `up -d` is NOT run (it would start new images on the old tree).
+    Returns True only when the api container is running `expect_version` (when known).
+    remote_cfg: the same on the remote CloudTAK host (ops #133). Never raises."""
+    try:
+        if not snap:
+            plog("  ⚠ No record of the previous images — cannot roll the containers back")
+            return False
+        if remote_cfg is not None:
+            _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+        else:
+            _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        if not _cloudtak_restore_images(snap, plog, remote_cfg=remote_cfg):
+            plog("  ⚠ Not every previous image could be put back — containers left as they are")
+            return False
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['up', '-d', '--no-build'], remote_cfg=remote_cfg, timeout=900)
+        if rc != 0:
+            plog(f"  ⚠ Restarting the previous CloudTAK failed too: {_update_error_line(out) or out.strip()[-300:]}")
+            return False
+        running = ''
+        for _i in range(6):                  # the api container needs a moment to answer exec
+            running = _cloudtak_running_version(cloudtak_dir, container_only=True, remote_cfg=remote_cfg)
+            if running:
+                break
+            time.sleep(5)
+        if not running:
+            plog("  ⚠ The previous CloudTAK did not come back up — check the CloudTAK page")
+            return False
+        if expect_version and running != expect_version:
+            plog(f"  ⚠ CloudTAK is running {running}, not the previous {expect_version} — check the CloudTAK page")
+            return False
+        plog(f"↩ CloudTAK is running on the previous version again ({running})")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+        return False
+
+
+_CT_DATA_ARG_RE = re.compile(r'^\s*ARG\s+DATA_SOURCE_URL\s*=\s*"?(https://[^\s"]+)"?\s*$', re.M)
+_CT_LOCAL_ZIP_ARG_RE = re.compile(r'^\s*ARG\s+USE_LOCAL_ZIP\b', re.M)
+_CT_DATA_TRIES = (0, 10, 30)   # seconds to wait before each attempt
+
+
+def _cloudtak_prefetch_build_data(cloudtak_dir, plog):
+    """Download CloudTAK's map data (CloudTAK-Data zip) on the host, BEFORE the build.
+
+    ops #129: the api Dockerfile's first stage wgets this zip from GitHub (codeload) inside the
+    build. One dropped download there fails the whole 90-minute build (ops1, twice in an hour),
+    and buildkit only says "process ... did not complete successfully". Upstream's Dockerfile
+    takes a local copy instead (`COPY api/data.zip*` + USE_LOCAL_ZIP=true), so fetch it here
+    with retries and a zip check, at the URL the checked-out Dockerfile pins.
+
+    Returns (ok, use_local, error). use_local=False with ok=True means this tree's Dockerfile
+    has no such step (nothing to do). ok=False: the data could not be fetched — the caller
+    stops before anything is built or restarted. Never raises."""
+    import zipfile
+    import urllib.request
+    try:
+        with open(os.path.join(cloudtak_dir, 'Dockerfile')) as f:
+            df = f.read()
+    except OSError:
+        return True, False, ''
+    m = _CT_DATA_ARG_RE.search(df)
+    if not m or not _CT_LOCAL_ZIP_ARG_RE.search(df):
+        return True, False, ''
+    url = m.group(1)
+    dest = os.path.join(cloudtak_dir, 'api', 'data.zip')
+    tmp = dest + '.part'
+    last = ''
+    plog(f"  Downloading CloudTAK map data before the build: {url}")
+    for i, wait in enumerate(_CT_DATA_TRIES, 1):
+        if wait:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': f'infra-TAK/{VERSION}'})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            with zipfile.ZipFile(tmp) as z:
+                names = z.namelist()
+                bad = z.testzip()
+            if bad is not None:
+                raise ValueError(f'the download is damaged ({bad})')
+            if not any(n.startswith('CloudTAK-Data-') for n in names):
+                raise ValueError('the download is not the CloudTAK-Data archive')
+            os.replace(tmp, dest)
+            plog(f"  ✓ Map data downloaded ({os.path.getsize(dest) // 1024} KB) — the build uses this copy")
+            return True, True, ''
+        except Exception as e:
+            last = str(e)[:200]
+            plog(f"  ⚠ Map data download attempt {i}/{len(_CT_DATA_TRIES)} failed: {last}")
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False, False, f'could not download CloudTAK map data from {url} ({last})'
+
+
+def _cloudtak_drop_build_data(cloudtak_dir):
+    try:
+        os.remove(os.path.join(cloudtak_dir, 'api', 'data.zip'))
+    except OSError:
+        pass
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -45375,6 +46044,18 @@ def run_cloudtak_update():
         # enforced separately at plugin-install time.
         release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
+        # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
+        from_ver = ''
+        if is_remote:
+            # ops #133: the running container first, as locally — it is what a rollback checks.
+            from_ver = _cloudtak_running_version(None, remote_cfg=remote_cfg) if remote_host else ''
+        else:
+            from_ver = _cloudtak_running_version(os.path.expanduser('~/CloudTAK'))
+        if not re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', from_ver or ''):
+            from_ver = ''
+        if from_ver:
+            plog(f"  Running now: {from_ver}")
+        _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -45578,6 +46259,10 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #133: the remote host builds its own images, so it has the same Docker 29 trap
+            # the local branch closed in ops #129 — pin what is serving now, so every failure
+            # below can put the image tags (and, after a failed `up -d`, the containers) back.
+            _ct_snap = _cloudtak_snapshot_images(None, remote_cfg=remote_cfg)
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
@@ -45585,9 +46270,12 @@ def run_cloudtak_update():
             if not ok:
                 plog(f"✗ Build failed on remote: {(out or '')[:600]}")
                 _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _r_store_sh = "test -d ~/CloudTAK/.docker-store && echo yes"
+            _had_minio_store = _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -45597,14 +46285,33 @@ def run_cloudtak_update():
                 if not _gok:
                     plog("✗ Garage store setup failed on the remote host (output above)")
                     _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            _migrated_now = _had_minio_store and not _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} up -d", timeout=1800)
             if not ok:
-                plog(f"✗ Restart failed on remote: {(out or '')[:600]}")
+                # ops #133: same rollback as the local branch (ops #129), over SSH.
+                _why = _update_error_line(out) or 'docker compose up -d failed'
+                plog(f"✗ Restart failed on remote: {_why}")
+                if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    if _cloudtak_rollback_after_failed_up(None, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver, remote_cfg=remote_cfg):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
             dcc = _compose_cmd()
@@ -45615,6 +46322,22 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #129: fetch the map-data zip on the host with retries; a dropped download
+            # inside the build used to fail it after the long npm steps. Nothing is built or
+            # stopped yet, so a failure here leaves CloudTAK exactly as it was.
+            _dok, _use_local_zip, _derr = _cloudtak_prefetch_build_data(cloudtak_dir, plog)
+            if not _dok:
+                plog(f"✗ Update stopped before the build: {_derr}")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous version — nothing was built or restarted.")
+                plog("  This server could not download from GitHub (codeload.github.com). Check its internet/DNS")
+                plog("  access to github.com and codeload.github.com, or wait if GitHub is having an outage,")
+                plog("  then press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            # ops #129: what is serving NOW (pinned), so any failure from here on can put it back.
+            _ct_snap = _cloudtak_snapshot_images(cloudtak_dir)
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
@@ -45628,7 +46351,7 @@ def run_cloudtak_update():
             # test6, 2026-10-08) must leave the box exactly as it was, and it does only if
             # nothing has been stopped or migrated yet.
             proc = subprocess.Popen(
-                f'{dcc} build --no-cache',
+                f'{dcc} build --no-cache' + (' --build-arg USE_LOCAL_ZIP=true' if _use_local_zip else ''),
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
@@ -45647,21 +46370,27 @@ def run_cloudtak_update():
             try:
                 proc.wait(timeout=5400)  # 90 min (same as deploy)
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 if proc.returncode != 0:
                     plog(f"✗ Build failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
                     _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                    # ops #129: services that DID build were re-tagged; take the tags back so the
+                    # next recreate (boot heal, Update config) cannot start a new image on the old tree.
+                    _cloudtak_restore_images(_ct_snap, plog)
                     _cloudtak_update_failed_note(plog)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
                 proc.kill()
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 plog("✗ Build timed out after 90 minutes")
                 _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_restore_images(_ct_snap, plog)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
@@ -45670,6 +46399,7 @@ def run_cloudtak_update():
             # containers kept serving through the build, and if the move fails they are started
             # again as they were (_cloudtak_garage_rollback). A MinIO-era tree skips this; an
             # already-migrated one only re-checks .env.
+            _had_minio_store = os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
             if _cloudtak_compose_is_garage(cloudtak_dir):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -45678,16 +46408,39 @@ def run_cloudtak_update():
                     plog(f"✗ Garage store setup failed: {_gerr}")
                     _undo_plugin_moves()
                     _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            # A MinIO -> Garage move THIS run archived .docker-store: the previous (MinIO) tree
+            # can no longer read the files, so a failed start below must not roll back to it.
+            _migrated_now = _had_minio_store and not os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             _urc, _uout = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)
             for _l in _uout.strip().splitlines()[-12:]:
                 plog(f"  {_l}")
             if _urc != 0:
-                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}")
+                # ops #129 (ops1): this used to stop here — new tree, new image tags, old containers,
+                # and nothing put back. Name the cause, then roll the whole stack back.
+                _why = _update_error_line(_uout) or f'exit code {_urc}'
+                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}: {_why}")
+                if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap)
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    _undo_plugin_moves()
+                    if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap)
         plog("✓ Containers rebuilt and restarted")
         # Converge the postgis role password to .env BEFORE declaring success — the
         # rebuild restarts the API, which is exactly when a latent password mismatch
@@ -52218,7 +52971,9 @@ window.ctLoadCoreEventsIdentity = function() {
           '<div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-radius:10px;margin-bottom:20px;' +
           'font-size:12.5px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.18);color:var(--green)">' +
           '<span style="width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0"></span>' +
-          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>';
+          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>' +
+          '<div id="ct-bootstrap-channels"></div>';
+        window.ctLoadBootstrapChannels();
         return;
       }
       var fix = d.p12_exists
@@ -52237,6 +52992,49 @@ window.ctLoadCoreEventsIdentity = function() {
     .catch(function() { /* fail-quiet status probe */ });
 };
 document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEventsIdentity(); });
+
+// ops #127: warn when the bootstrap cert's live TAK connection is missing channels — Core Events
+// sent to those channels are dropped by TAK with no error anywhere. Fail-quiet like the above.
+window.ctLoadBootstrapChannels = function() {
+  var host = document.getElementById('ct-bootstrap-channels');
+  if (!host) return;
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  fetch('/api/cloudtak/bootstrap-channels', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.success || d.state !== 'missing' || !d.missing || !d.missing.length) { host.innerHTML = ''; return; }
+      var names = d.missing.slice(0, 12).map(esc).join(', ') + (d.missing.length > 12 ? ' and ' + (d.missing.length - 12) + ' more' : '');
+      host.innerHTML =
+        '<div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.4);border-radius:12px;padding:14px 20px;margin-bottom:20px">' +
+        '<div style="font-weight:600;font-size:13px;margin-bottom:4px;color:var(--yellow)">Core Events will not reach ' + d.missing.length + ' channel' + (d.missing.length === 1 ? '' : 's') + '</div>' +
+        '<div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">' +
+        'CloudTAK’s TAK Server connection is not in: <strong style="color:var(--text-primary)">' + names + '</strong>. ' +
+        'Events on those channels are never delivered, with no error. infra-TAK fixes this by itself within a minute of a channel change; Fix now does it immediately.' +
+        '</div>' +
+        '<div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button class="control-btn" id="ct-bootstrap-channels-fix">Fix now</button>' +
+        '<span id="ct-bootstrap-channels-msg" style="font-size:12px;color:var(--text-dim)"></span></div></div>';
+      document.getElementById('ct-bootstrap-channels-fix').addEventListener('click', window.ctFixBootstrapChannels);
+    })
+    .catch(function() { /* fail-quiet status probe */ });
+};
+
+window.ctFixBootstrapChannels = function() {
+  var btn = document.getElementById('ct-bootstrap-channels-fix');
+  var msg = document.getElementById('ct-bootstrap-channels-msg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Fixing…'; }
+  fetch('/api/cloudtak/bootstrap-channels/fix', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var after = d && d.after;
+      if (d && d.success && after && after.state === 'ok') { window.ctLoadBootstrapChannels(); return; }
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = (d && d.error) ? d.error : ('Still missing ' + ((after && after.missing) ? after.missing.length : '?') + ' — see the console log; it retries on the next sync.');
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+    });
+};
 
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
@@ -56175,6 +56973,15 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             return
         plog(f"  routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN")
 
+        ok, problem, _cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            # ops #128: the move would fail TLS and roll back — two outpost restarts for nothing.
+            # Recorded as an attempt so the monitor's 6 h rate limit applies.
+            plog(f"  ⚠ routing repair: {problem} — not moving the outpost (it would fail TLS and roll back); "
+                 f"fix DNS/certificate for {fqdn}")
+            _record_spiral_repair_attempt('precheck_failed', evidence)
+            return
+
         try:
             _probe = subprocess.run(
                 _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
@@ -56273,7 +57080,69 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
-def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
+# ops #128 — the FQDN move recreates the LDAP outpost, and a move that fails validation
+# recreates it again to roll back. On a box whose DNS or certificate for that name is broken
+# the move can only fail (Caddy has no certificate to offer: `tls: internal error`), yet it was
+# retried on every deploy, update and 10-minute spiral-monitor tick — two outpost restarts each
+# time, and TAK clients that connect during one get no groups (ops #126). So the name is
+# checked first, and a move that failed anyway backs off before the next automatic try.
+_LDAP_FQDN_MOVE_BACKOFF_S = 3600        # after the first failed move; doubles per failure
+_LDAP_FQDN_MOVE_BACKOFF_MAX_S = 86400
+
+
+def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
+    """Can the outpost reach Authentik on https://<fqdn> through this box's Caddy?
+    Returns (ok, problem, cert_sha256). Needs a DNS A record for the name (Caddy can't get or
+    renew its Let's Encrypt certificate without one; a lookup that fails on this box's own
+    resolver doesn't count against it) and Caddy on this host's 443 — where the outpost lands
+    through `extra_hosts: <fqdn>:host-gateway` — completing TLS for the name with a valid
+    certificate. Touches no container."""
+    _ips, problem = _dns_resolve_ipv4(fqdn)
+    if problem == 'missing':
+        return False, f"{fqdn} has no DNS A record", ''
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection(('127.0.0.1', 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
+                der = tls.getpeercert(binary_form=True) or b''
+    except ssl.SSLCertVerificationError as e:
+        return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+    except (ssl.SSLError, OSError) as e:
+        return False, f"Caddy has no working certificate for {fqdn} ({e})", ''
+    return True, '', hashlib.sha256(der).hexdigest()
+
+
+def _ldap_fqdn_move_backoff(fqdn, cert_sha256, now=None):
+    """(seconds until the next automatic move may be tried — 0 = go, recorded state). A
+    different FQDN or certificate starts over: that is what fixing the box changes."""
+    st = load_settings().get('authentik_proactive_routing_migration') or {}
+    if (st.get('outcome') == 'success' or not st.get('fails')
+            or st.get('fqdn') != fqdn or st.get('cert') != cert_sha256):
+        return 0, st
+    return max(0, int(float(st.get('retry_after') or 0) - (now or time.time()))), st
+
+
+def _ldap_fqdn_move_failed(fqdn, cert_sha256, outcome, now=None):
+    """Record a failed move; returns the back-off (seconds) before the next automatic try."""
+    now = now or time.time()
+    try:
+        s = load_settings()
+        prev = s.get('authentik_proactive_routing_migration') or {}
+        same = (prev.get('outcome') != 'success' and prev.get('fqdn') == fqdn
+                and prev.get('cert') == cert_sha256)
+        fails = (int(prev.get('fails') or 0) if same else 0) + 1
+        wait = min(_LDAP_FQDN_MOVE_BACKOFF_S * 2 ** min(fails - 1, 10), _LDAP_FQDN_MOVE_BACKOFF_MAX_S)
+        s['authentik_proactive_routing_migration'] = {
+            'ts': int(now), 'outcome': outcome, 'fqdn': fqdn, 'cert': cert_sha256,
+            'fails': fails, 'retry_after': int(now + wait),
+        }
+        save_settings(s)
+        return wait
+    except Exception:
+        return 0
+
+
+def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, quiet_repeats=False):
     """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
     (reactive) by migrating any box where the LDAP outpost is on internal direct routing
     (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
@@ -56294,23 +57163,36 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
          Waived with require_tak=False — used by the Authentik deploy's final SA-bind verify,
          which runs BEFORE TAK exists and deadlocks on internal routing (2026.x flow recursion
          kills every bind regardless of password; field-confirmed 2026-07-08 on a fresh deploy).
+      6. (ops #128) the FQDN has a DNS A record and Caddy serves a valid certificate for it
+         (`_ldap_outpost_fqdn_precheck`) — otherwise the move can only fail and roll back.
+      7. (ops #128) no back-off from a failed move with this FQDN + certificate
+         (`_ldap_fqdn_move_backoff`). force=True — the operator's "Resync LDAP to TAK Server"
+         button — skips this one only.
 
     Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
+    quiet_repeats (the 10-min spiral monitor): a skip reason is logged once, not every tick.
 
     Cardinal rule: NEVER restart the LDAP outpost unless something is wrong. "Wrong routing
     + heavy load + healthy FQDN target available" qualifies — the alternative is waiting for
     the user to hit the spiral and lose webadmin access.
     """
+    def _skip(msg):
+        if quiet_repeats:
+            if getattr(_ensure_authentik_ldap_outpost_on_fqdn, '_last_skip', None) == msg:
+                return
+            _ensure_authentik_ldap_outpost_on_fqdn._last_skip = msg
+        plog(msg)
+
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(compose_path) or not os.path.exists(env_path):
-        plog("  proactive routing: ~/authentik not installed — skipping")
+        _skip("  proactive routing: ~/authentik not installed — skipping")
         return
 
     try:
         if require_tak and not os.path.exists('/opt/tak'):
-            plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
+            _skip("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
             return
 
         fqdn = ''
@@ -56321,14 +57203,29 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
                     fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
                     break
         if not fqdn:
-            plog("  proactive routing: no FQDN in .env — skipping (no migration target)")
+            _skip("  proactive routing: no FQDN in .env — skipping (no migration target)")
             return
 
         with open(compose_path) as _f:
             compose_text = _f.read()
         if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
-            plog("  proactive routing: outpost already on FQDN — skipping (already correct)")
+            _skip("  proactive routing: outpost already on FQDN — skipping (already correct)")
             return
+
+        ok, problem, cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            _skip(f"  proactive routing: {problem} — leaving the outpost on internal routing, not "
+                  f"recreating it (the move would fail TLS and roll back); retried once DNS/certificate are fixed")
+            return
+        if not force:
+            left, st = _ldap_fqdn_move_backoff(fqdn, cert_sha)
+            if left:
+                _skip(f"  proactive routing: moving the outpost to https://{fqdn} failed {st.get('fails')}x with "
+                      f"this certificate — backing off until "
+                      f"{time.strftime('%a %H:%M %Z', time.localtime(float(st.get('retry_after') or 0)))} "
+                      f"('Resync LDAP to TAK Server' tries now)")
+                return
+        _ensure_authentik_ldap_outpost_on_fqdn._last_skip = None  # an attempt: log the next skip again
 
         try:
             _probe = subprocess.run(
@@ -56357,7 +57254,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             # automatic rollback (below) be the real safety net for boxes where FQDN truly won't work.
             _caddy_up = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True, timeout=10)
             if (_caddy_up.stdout or '').strip() != 'active':
-                plog(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
+                _skip(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
                 return
             plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
                  f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
@@ -56388,6 +57285,8 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
+            _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'recreate_failed')
+            plog(f"  proactive routing: next automatic try in {_wait // 3600}h")
             return
 
         # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
@@ -56424,7 +57323,9 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
-        plog("  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; will retry later)")
+        _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'validation_failed')
+        plog(f"  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; "
+             f"next automatic try in {_wait // 3600}h)")
     except Exception as e:
         plog(f"  ⚠ proactive routing error (no changes applied): {e}")
 
@@ -60102,15 +61003,26 @@ def _ensure_authentik_pgbouncer_image(plog):
                 plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
                      f"restore {compose_bak} by hand")
                 return
-        if check_ldap and not _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback'):
+        if not check_ldap:
+            return
+        ok = _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback', stats=ldap_seen)
+        if not ok:
             _restart_ak(f"LDAP failing after rolling back to {cur}")
-            _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback + restart')
+            ok = _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback + restart',
+                                                  stats=ldap_seen)
+        # ops #126: only if TAK actually lost LDAP during this run (a failed probe, or the
+        # Authentik restart, which is an outage by itself) and LDAP is good again now.
+        if ok and (restarted or ldap_seen.get('fails')):
+            _tak_ldap_recycle_request(f"PgBouncer image rolled back to {cur} after an LDAP outage", base_groups > 0)
+            plog("  pgbouncer image: TAK client check requested (LDAP dropped during this run) — "
+                 "it runs once LDAP is settled, at the end of this update")
 
     # Baseline the LDAP path TAK Server uses BEFORE touching anything, so the post-swap
     # check knows what "working" looks like on this box (and whether it already wasn't).
     ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
     can_probe = bool(ldap_pass) and _ensure_ldapsearch()
     base_ok, base_groups = False, 0
+    ldap_seen = {}          # failed post-swap probes = TAK lost LDAP during this run
     if can_probe:
         base_ok, base_groups, base_detail = _authentik_ldap_sa_group_probe(ldap_pass)
         plog(f"  pgbouncer image: LDAP before the swap: "
@@ -60188,24 +61100,32 @@ def _ensure_authentik_pgbouncer_image(plog):
         return True
 
     def _resync_tak():
-        # TAK Server binds per request with CoreConfig's SA credential; make sure it
-        # still matches .env now that LDAP is verified (same step as 'Resync LDAP to TAK
-        # Server'). Java reads CoreConfig at start, so a change needs a TAK restart.
+        # TAK Server binds with CoreConfig's SA credential; make sure it still matches
+        # .env now that LDAP is verified (same step as 'Resync LDAP to TAK Server').
+        changed = False
         try:
             changed, msg = _resync_ldap_credential_to_coreconfig()
             plog(f"  pgbouncer image: LDAP → TAK Server credential resync: "
-                 f"{'UPDATED — TAK Server restart needed to load it' if changed else 'already in sync'} ({msg})")
+                 f"{'UPDATED' if changed else 'already in sync'} ({msg})")
         except Exception as e:
             plog(f"  pgbouncer image: LDAP → TAK Server credential resync error: {str(e)[:120]}")
+        # ops #126: heal TAK's clients either way. The swap dropped Authentik's DB under the
+        # outpost while TAK kept running: clients that connected meanwhile hold empty groups,
+        # in sync credential or not. A changed credential needs a TAK restart (Java reads
+        # CoreConfig at start). Requested, not done here: the update run does it once, at its end.
+        _tak_ldap_recycle_request(f"PgBouncer image swap to {target}", need_groups,
+                                  restart=bool(changed))
+        plog(f"  pgbouncer image: {'TAK Server restart' if changed else 'TAK client check'} requested — it runs "
+             "once LDAP is settled, at the end of this update (once, even if later steps touch Authentik too)")
 
     need_groups = base_groups > 0
-    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap'):
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap', stats=ldap_seen):
         plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified")
         _resync_tak()
         _record('applied')
         return True
     _restart_ak('LDAP check failed after the swap')
-    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart'):
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart', stats=ldap_seen):
         plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified after restart")
         _resync_tak()
         _record('applied')
@@ -60300,11 +61220,12 @@ def _authentik_ldap_sa_group_probe(ldap_pass):
     return bound, groups, detail
 
 
-def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label):
+def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='pgbouncer image', stats=None):
     """Poll `_authentik_ldap_sa_group_probe` until it has passed continuously for
     `_PGB_SWAP_LDAP_STABLE_S`, giving up after `_PGB_SWAP_LDAP_WINDOW_S` plus the hold.
     Passing = SA bind works and, if the box had tak_ memberships before (`need_groups`),
-    at least one comes back. Every failed probe is logged. Returns True when stable."""
+    at least one comes back. Every failed probe is logged (and counted into
+    `stats['fails']` when given). Returns True when stable."""
     start = time.time()
     good_since = None
     fails = 0
@@ -60316,16 +61237,534 @@ def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label):
                 good_since = now
             if now - good_since >= _PGB_SWAP_LDAP_STABLE_S:
                 note = f" ({fails} failed probe(s) before it settled)" if fails else ''
-                plog(f"  ✓ pgbouncer image: LDAP {label}: {detail}, held {_PGB_SWAP_LDAP_STABLE_S}s{note}")
+                plog(f"  ✓ {tag}: LDAP {label}: {detail}, held {_PGB_SWAP_LDAP_STABLE_S}s{note}")
                 return True
         else:
             fails += 1
+            if stats is not None:
+                stats['fails'] = stats.get('fails', 0) + 1
             good_since = None
-            plog(f"  pgbouncer image: LDAP {label}: {'SA bind ok but NO tak_ groups' if ok else 'SA bind FAILED'} — {detail}")
+            plog(f"  {tag}: LDAP {label}: {'SA bind ok but NO tak_ groups' if ok else 'SA bind FAILED'} — {detail}")
             if now - start >= _PGB_SWAP_LDAP_WINDOW_S:
-                plog(f"  ✗ pgbouncer image: LDAP {label}: not passing after {_PGB_SWAP_LDAP_WINDOW_S}s")
+                plog(f"  ✗ {tag}: LDAP {label}: not passing after {_PGB_SWAP_LDAP_WINDOW_S}s")
                 return False
         time.sleep(_PGB_SWAP_LDAP_EVERY_S)
+
+
+# ops #126 (GH #189): anything that takes the LDAP path down under a RUNNING TAK Server
+# (outpost restart/recreate, a PgBouncer swap, an Authentik restart) leaves TAK with what
+# it got during the outage. A cert client's groups come from ONE LDAP lookup when it
+# connects (X509Authenticator); a failed lookup silently gives no user and no groups, and
+# nothing repeats it on that connection — TAK's 30 s LDAP refresh doesn't touch streaming
+# clients. So a client that reconnected during the outage stays connected with EMPTY groups
+# (test6 2026-10-20: `user=None`, 0 groups, still empty 75 s after LDAP was back). Field
+# (Amos, TAK 5.8, v10.2.22 → v10.2.23): ATAK and CloudTAK connected, no CoT, Client
+# Dashboard groups empty / __ANON__ until `systemctl restart takserver`.
+#
+# One helper for every path: check LDAP the way TAK uses it (SA bind + memberOf, held),
+# then heal the connections WITHOUT a TAK restart (_tak_heal_ldap_sessions): re-authenticate
+# the named ones, and drop only the ones LDAP says should have groups but TAK gave none, so
+# the client reconnects and is looked up again. Only if a client comes back empty again does
+# TAK's own LDAP path count as broken (e.g. dead pooled connections), and then TAK is
+# restarted once, waiting for 8089 and the API. A step that causes an outage mid-run
+# REQUESTS the heal (persisted in settings); the update run carries it out once, at its very
+# end, after every other Authentik step. A TAK that already restarted after the outage is
+# left alone (that restart is reused).
+#
+# TAK core always runs on THIS host: in two_server mode Server One holds only the
+# database (Server Two = here), so the restart is local (docker or systemd) and a remote
+# DB is untouched. With remote Authentik there is no local outpost container to compare.
+#
+# The outpost must have (re)started at least this long after TAK did for TAK to count as
+# having run through it. TAK opens 8089 ~100-180 s after start; before that it has no
+# sessions to lose. It also keeps a box BOOT — Authentik and TAK coming up together, the
+# boot-time bind heal recreating the outpost ~100 s in — from restarting TAK (GH #83).
+_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
+_TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
+_TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
+_tak_ldap_recycle_lock = threading.Lock()
+
+
+def _epoch_from_rfc3339(ts):
+    """`2026-10-21T01:41:16.534837635Z` (docker, nanoseconds) → epoch seconds, or None."""
+    m = re.match(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$', (ts or '').strip())
+    if not m:
+        return None
+    try:
+        base = (datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S') - datetime(1970, 1, 1)).total_seconds()
+    except ValueError:
+        return None
+    off = 0
+    if m.group(3) != 'Z':
+        tz = m.group(3)
+        off = (1 if tz[0] == '+' else -1) * (int(tz[1:3]) * 3600 + int(tz[4:6]) * 60)
+    return base + (float('0.' + m.group(2)) if m.group(2) else 0.0) - off
+
+
+def _docker_started_epoch(container):
+    """When `container` last started (epoch seconds), or None if it isn't running."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}} {{.State.StartedAt}}', container]),
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    parts = (r.stdout or '').split()
+    if r.returncode != 0 or len(parts) != 2 or parts[0] != 'true':
+        return None
+    return _epoch_from_rfc3339(parts[1])
+
+
+def _tak_started_epoch():
+    """When the local TAK Server last started (epoch seconds), or None if it isn't running."""
+    if _tak_is_container():
+        return _docker_started_epoch(TAK_CONTAINER)
+    # Monotonic µs since boot, converted with this process's CLOCK_MONOTONIC (the clock
+    # systemd stamps with), so there's no date string to parse: `--timestamp=unix` needs
+    # a newer systemd than Ubuntu 22.04's 249. Read-only, no privilege needed.
+    try:
+        r = subprocess.run(['systemctl', 'show', 'takserver', '-p', 'ActiveState',
+                            '-p', 'ActiveEnterTimestampMonotonic'], capture_output=True, text=True, timeout=10)
+        vals = dict(l.split('=', 1) for l in (r.stdout or '').splitlines() if '=' in l)
+        mono = int(vals.get('ActiveEnterTimestampMonotonic') or 0)
+    except Exception:
+        return None
+    if vals.get('ActiveState') != 'active' or mono <= 0:
+        return None
+    return time.time() - (time.monotonic() - mono / 1e6)
+
+
+def _tcp_accepts(port, host='127.0.0.1'):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def _tak_wait_ready(plog, tag):
+    """After a TAK restart: wait for 8089 (messaging) and then 8443 (the api JVM, which
+    comes up later; Guard Dog's tak-post-start.sh waits the same way). True when both."""
+    t0 = time.time()
+    for port, limit, what in ((8089, _TAK_RECYCLE_8089_TIMEOUT_S, '8089 accepting connections'),
+                              (8443, _TAK_RECYCLE_8089_TIMEOUT_S + _TAK_RECYCLE_API_TIMEOUT_S, 'API (8443) up')):
+        while not _tcp_accepts(port):
+            if time.time() - t0 >= limit:
+                plog(f"  ✗ {tag}: TAK Server {what.split(' ')[0]} not up {int(time.time() - t0)}s after the restart — "
+                     f"check journalctl -u takserver / docker logs takserver")
+                return False
+            time.sleep(5)
+        plog(f"  {tag}: TAK Server {what} ({int(time.time() - t0)}s after the restart)")
+    return True
+
+
+# How long a dropped client gets to reconnect (ATAK came back in ~15 s on test6), and how
+# many drop rounds before TAK's own LDAP path counts as broken: a lookup through a dead
+# pooled LDAP connection fails once and the pool discards that connection, so a second
+# round gets a fresh one.
+_TAK_LDAP_HEAL_WAIT_S = 90
+_TAK_LDAP_HEAL_ROUNDS = 2
+_TAK_MARTI_API = 'https://127.0.0.1:8443/Marti/api'
+
+
+def _ldap_filter_escape(v):
+    """RFC 4515 escaping for a value in an LDAP search filter."""
+    return ''.join('\\%02x' % ord(c) if c in '\\*()\x00' else c for c in v)
+
+
+def _ldap_users_tak_group_counts(ldap_pass, cns):
+    """{cn (lower case): number of tak_ memberOf} for these users, read through the local
+    outpost as adm_ldapservice, the way TAK looks them up. A user LDAP doesn't have is left
+    out. None when LDAP can't be read. Password is never logged."""
+    out = {}
+    cns = sorted({c for c in cns if c})
+    for i in range(0, len(cns), 50):
+        flt = '(|' + ''.join(f'(cn={_ldap_filter_escape(c)})' for c in cns[i:i + 50]) + ')'
+        try:
+            r = subprocess.run(
+                ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
+                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
+                 '-b', 'ou=users,dc=takldap', '-s', 'one', flt, 'memberOf'],
+                capture_output=True, text=True, timeout=20)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode not in (0, 4):
+            return None
+        cur = None
+        for line in (r.stdout or '').splitlines():
+            low = line.lower()
+            if low.startswith('dn:'):
+                m = re.match(r'dn:\s*cn=([^,]+),', line, re.I)
+                cur = m.group(1).strip().lower() if m else None
+                if cur is not None:
+                    out.setdefault(cur, 0)
+            elif cur is not None and low.startswith('memberof: cn=tak_'):
+                out[cur] += 1
+    return out
+
+
+def _subscription_num(uid):
+    try:
+        return int(str(uid).rsplit(':', 1)[-1])
+    except ValueError:
+        return -1
+
+
+def _tak_device_usernames():
+    """{device uid: last username TAK recorded for it} from TAK's client history (last 30
+    days). A connection TAK couldn't match to a user has no DN and no username at all
+    (test6: `dn: null, username: null`), but its device has connected before as someone."""
+    data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/clientEndPoints?secago=2592000', timeout=30)
+    items = data.get('data') if isinstance(data, dict) else None
+    return {e['uid']: e['username'] for e in (items or [])
+            if isinstance(e, dict) and e.get('uid') and e.get('username')}
+
+
+def _tak_client_sessions(devices=None):
+    """TAK's live cert-authenticated streaming connections (tls/ssl: ATAK, WinTAK, CloudTAK
+    users, service certs) as {uid, cn, client, callsign, username, groups}; `groups` is
+    every group name in either direction minus __ANON__. `cn` is the cert DN's CN, else
+    TAK's username, else the device's last username from `devices` — so it is there even
+    when TAK couldn't match the cert to a user. `unnamed` = TAK put neither a DN nor a
+    username on it. None when the Marti API can't be read."""
+    data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
+    subs = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        return None
+    out = []
+    for s in subs:
+        if not isinstance(s, dict):
+            continue
+        uid = str(s.get('subscriptionUid') or '')
+        if not uid.startswith(('tls:', 'ssl:')):
+            continue  # plain TCP/UDP inputs and static subscriptions have no LDAP user
+        m = re.search(r'(?:^|,)\s*CN=([^,]+)', s.get('dn') or '', re.I)
+        cn = (m.group(1) if m else (s.get('username') or (devices or {}).get(s.get('clientUid') or '') or '')).strip()
+        groups = {g.get('name') for g in (s.get('groups') or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
+        out.append({'uid': uid, 'cn': cn, 'client': s.get('clientUid') or '',
+                    'callsign': s.get('callsign') or uid, 'username': s.get('username') or None,
+                    'unnamed': not (m or s.get('username')), 'groups': groups})
+    return out
+
+
+def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
+    """Give TAK's live client connections their LDAP groups back after an LDAP outage,
+    without restarting TAK Server (ops #126). LDAP must already be verified healthy.
+
+    1. Re-authenticate every named LDAP user's connections in one call (POST
+       /Marti/api/groups/update — TAK repeats the LDAP lookup on the live connection, what
+       TAK Portal does after a group edit). This also cycles TAK's pooled LDAP connections:
+       a lookup on a dead one fails harmlessly (TAK keeps the groups it had) and the pool
+       drops it.
+    2. A connection that still has no groups while LDAP gives its cert's user tak_ groups
+       is dropped (DELETE /subscriptions/delete/<uid>, the Client Dashboard's delete), and
+       the client reconnects and is looked up again. A re-authenticate can't reach these:
+       TAK never put a username (or DN) on them, so the user is the device's last username
+       in TAK's client history. Users LDAP gives no groups and file users
+       (UserAuthenticationFile.xml) are never touched.
+       A connection with no groups AND no user at all is dropped too, even when client
+       history can't name it (test12, ops #131: the history left that device out). TAK names
+       every cert connection whose lookup completes — a user LDAP doesn't know still gets
+       its name and __ANON__ — so "no user, no groups" is a lookup that failed.
+    3. Wait for those clients to reconnect (same device uid); repeat once for any that came
+       back empty. One that comes back named, with no groups, as a user LDAP gives none is
+       fine: that is what it is.
+
+    Returns (verdict, summary): 'ok' (nothing needed), 'healed', 'broken' (a client came
+    back empty again, as a user LDAP has groups for or with no user at all, with LDAP
+    healthy: TAK's own LDAP path is bad, restart TAK) or
+    'unknown' (couldn't read TAK or LDAP)."""
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return 'unknown', "can't read TAK Server's client connections (Marti API)"
+    devices = {}
+    if any(not s['cn'] and s['client'] for s in sessions):
+        devices = _tak_device_usernames()
+        sessions = _tak_client_sessions(devices) or sessions
+    try:
+        file_users = {u.lower() for u in re.findall(r'identifier="([^"]+)"',
+                                                    _read_priv('/opt/tak/UserAuthenticationFile.xml') or '')}
+    except Exception:
+        file_users = set()
+    ldap_cns = sorted({s['cn'] for s in sessions if s['cn'] and s['cn'].lower() not in file_users})
+    counts = _ldap_users_tak_group_counts(ldap_pass, ldap_cns)
+    if counts is None:
+        return 'unknown', "can't read the users' groups from LDAP"
+
+    def _owed(s):
+        if s['groups'] or s['cn'].lower() in file_users:
+            return False
+        # unnamed: TAK's lookup for it failed, whatever client history says (or doesn't)
+        return s['unnamed'] or counts.get(s['cn'].lower(), 0) > 0
+
+    def _label(s):
+        if not s['cn']:
+            return f"{s['callsign']} (no user)"
+        return s['callsign'] if s['callsign'] == s['cn'] else f"{s['callsign']} ({s['cn']})"
+
+    def _same_client(d, s):
+        """Is live connection `s` the client of dropped connection `d`, reconnected?"""
+        if _subscription_num(s['uid']) <= _subscription_num(d['uid']):
+            return False
+        if not d['cn']:   # nothing named it: only its device uid can tell
+            return bool(d['client']) and s['client'] == d['client']
+        return (s['cn'].lower() == d['cn'].lower()
+                and (not d['client'] or s['client'] in (d['client'], '')))
+
+    def _reauth(conns):
+        names = sorted({s['username'] for s in conns if s['username'] and s['cn'].lower() not in file_users})
+        if not names:
+            return False
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/groups/update', timeout=60,
+                                       method='POST', json_body=names)
+        plog(f"  {tag}: re-authenticated {len(names)} LDAP user(s) on their live connections"
+             + (f" — failed ({err})" if ok is None else ''))
+        return True
+
+    owed = [s for s in sessions if _owed(s)]
+    nameless = sum(1 for s in owed if not s['cn'])
+    plog(f"  {tag}: {len(sessions)} client connection(s), {len(owed)} with no groups that LDAP says should have them"
+         + (f" ({nameless} with no user at all: TAK's lookup for them failed)" if nameless else ''))
+    if not owed:
+        _reauth(sessions)  # still cycles any dead pooled LDAP connections before the next login
+        return 'ok', f"all {len(sessions)} client connection(s) have their groups"
+
+    healed, gone, undroppable, no_ldap_groups = [], [], [], []
+    for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
+        if _reauth(sessions if rnd == 1 else owed):
+            time.sleep(3)
+            now = _tak_client_sessions(devices) or []
+            fixed = {s['uid'] for s in now if s['groups']}
+            healed += [s for s in owed if s['uid'] in fixed]
+            owed = [s for s in owed if s['uid'] not in fixed]
+        dropped = []
+        for s in owed:
+            ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                           timeout=20, method='DELETE')
+            if ok is None:
+                plog(f"  {tag}: couldn't drop {_label(s)} ({s['uid']}): {err}")
+                undroppable.append(s)
+            else:
+                dropped.append(s)
+        if dropped:
+            plog(f"  {tag}: dropped {len(dropped)} connection(s) with no groups so they reconnect and get them: "
+                 + ', '.join(_label(s) for s in dropped[:15]) + (' …' if len(dropped) > 15 else ''))
+        # Wait for each dropped client's NEXT connection (same cert CN, same device uid when
+        # it had one; only the device uid when nothing named it) and judge that one.
+        waiting = {s['uid']: s for s in dropped}
+        back = {}
+        t0 = time.time()
+        while waiting and time.time() - t0 < _TAK_LDAP_HEAL_WAIT_S:
+            time.sleep(5)
+            now = _tak_client_sessions(devices)
+            if now is None:
+                continue
+            for uid, d in list(waiting.items()):
+                nxt = [s for s in now if _same_client(d, s)]
+                if not nxt:
+                    continue
+                n = max(nxt, key=lambda s: _subscription_num(s['uid']))
+                if n['callsign'] == n['uid']:   # no callsign until its first position report
+                    n = dict(n, callsign=d['callsign'])
+                if not n['groups'] and not n['unnamed'] and n['cn'].lower() not in counts:
+                    counts.update(_ldap_users_tak_group_counts(ldap_pass, [n['cn']]) or {})
+                if n['groups']:
+                    healed.append(n)
+                    waiting.pop(uid)
+                elif not _owed(n):
+                    # looked up fine this time, as a user LDAP gives no groups: nothing owed
+                    no_ldap_groups.append(n)
+                    back.pop(uid, None)
+                    waiting.pop(uid)
+                else:
+                    back[uid] = n  # keep waiting: TAK may still be assigning
+        gone += [d for uid, d in waiting.items() if uid not in back]
+        owed = [back[uid] for uid in waiting if uid in back]
+        if not owed:
+            break
+        plog(f"  {tag}: round {rnd}: {len(owed)} client(s) reconnected still with no groups: "
+             + ', '.join(_label(s) for s in owed[:15]))
+    stuck = owed + undroppable
+    healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
+
+    parts = []
+    if healed:
+        parts.append(f"{len(healed)} client(s) got their groups back: "
+                     + ', '.join(_label(s) for s in healed[:15]) + (' …' if len(healed) > 15 else ''))
+    if gone:
+        parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
+                     "they get their groups when they do")
+    if no_ldap_groups:
+        parts.append(f"{len(no_ldap_groups)} reconnected as user(s) LDAP gives no TAK groups, left as is: "
+                     + ', '.join(_label(s) for s in no_ldap_groups[:15]))
+    if stuck:
+        parts.append(f"{len(stuck)} still with no groups although LDAP is healthy: "
+                     + ', '.join(_label(s) for s in stuck[:15]))
+        return 'broken', '; '.join(parts)
+    return 'healed', '; '.join(parts) or 'nothing left to heal'
+
+
+def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
+    """Ask for one TAK client heal (TAK restart only as the fallback) once LDAP is healthy
+    again; `restart` = TAK must restart regardless (CoreConfig's LDAP credential changed).
+    Persisted, so it is carried out at the end of this run, or by the next console start if
+    this run dies."""
+    try:
+        s = load_settings()
+        st = dict(s.get('tak_ldap_recycle') or {})
+        prev = [p for p in (st.get('pending') or []) if p != reason]
+        st['need_groups'] = bool(need_groups or (prev and st.get('need_groups')))
+        st['restart'] = bool(restart or (prev and st.get('restart')))
+        st['pending'] = (prev + [reason])[-5:]
+        st['requested_epoch'] = time.time()
+        s['tak_ldap_recycle'] = st
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _console_update_in_progress():
+    """True while this console's post-update run hasn't finished (it saves
+    last_console_version/sha only at its end) — the same test `_post_update_auto_deploy`
+    uses to decide whether to run it."""
+    try:
+        s = load_settings()
+        if s.get('last_console_version', '') != VERSION:
+            return True
+        sha = subprocess.run(['git', f'--git-dir={os.path.join(BASE_DIR, ".git")}', 'rev-parse', 'HEAD'],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(sha) and s.get('last_console_sha', '') != sha
+    except Exception:
+        return False
+
+
+def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=False):
+    """Once LDAP is healthy again after TAK Server ran through an LDAP outage (see above),
+    give its client connections their groups back without a restart
+    (`_tak_heal_ldap_sessions`); restart TAK ONCE only if that heal reports TAK's own LDAP
+    path broken or can't run. Reasons it acts on:
+      - a pending `_tak_ldap_recycle_request` made after TAK last started;
+      - (`check_outpost`) the local outpost having (re)started at least
+        `_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S` after TAK did — this is also the one-time
+        catch-up for boxes already on v10.2.23 whose outpost was recreated under TAK.
+    While a console update is still running, a non-`final` caller only records its reasons;
+    the update's own final call carries them out after every other Authentik step.
+    Verifies SA bind + memberOf first and never heals or restarts into a broken LDAP.
+    Returns True only when TAK was restarted."""
+    tag = 'TAK LDAP recycle'
+    with _tak_ldap_recycle_lock:
+        st = dict(load_settings().get('tak_ldap_recycle') or {})
+        pending = list(st.get('pending') or [])
+        req_at = float(st.get('requested_epoch') or 0)
+        need_groups = bool(st.get('need_groups', True)) if pending else True
+        must_restart = False
+
+        def _finish(outcome, keep=None, healed_ldap_start=None):
+            try:
+                s = load_settings()
+                cur = dict(s.get('tak_ldap_recycle') or {})
+                if keep:
+                    cur['pending'] = list(dict.fromkeys((cur.get('pending') or []) + keep))[-5:]
+                    cur['requested_epoch'] = max(float(cur.get('requested_epoch') or 0), time.time())
+                    cur.setdefault('need_groups', need_groups)
+                    cur['restart'] = bool(cur.get('restart') or must_restart)
+                elif float(cur.get('requested_epoch') or 0) <= req_at:
+                    # a request made while we worked stays pending for the next caller
+                    for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
+                        cur.pop(k, None)
+                if healed_ldap_start is not None:
+                    cur['healed_ldap_start'] = healed_ldap_start
+                cur.update({'last_outcome': outcome, 'last_trigger': trigger,
+                            'last_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')})
+                s['tak_ldap_recycle'] = cur
+                save_settings(s)
+            except Exception:
+                pass
+
+        if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+            if pending:
+                _finish('skipped: TAK Server not installed / not on LDAP')
+            return False
+        tak_start = _tak_started_epoch()
+        if tak_start is None:
+            if pending:
+                plog(f"  {tag}: TAK Server is not running — nothing to restart")
+                _finish('skipped: TAK Server not running')
+            return False
+        reasons = []
+        if pending:
+            if req_at > tak_start:
+                reasons.extend(pending)
+                must_restart = bool(st.get('restart'))
+            else:
+                plog(f"  {tag}: TAK Server already restarted after: {'; '.join(pending)} — reusing that restart")
+        ldap_start = None
+        if check_outpost:
+            ldap_start = _docker_started_epoch('authentik-ldap-1')
+            # Once healed for a given outpost start, that start is done with — every later
+            # update or boot would otherwise run the heal again for the same outage.
+            if (ldap_start is not None and ldap_start - tak_start >= _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                    and ldap_start > float(st.get('healed_ldap_start') or 0) + 1):
+                up = int(ldap_start - tak_start)
+                reasons.append(f"LDAP outpost restarted while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+        if not reasons:
+            if pending:
+                _finish('not needed')
+            return False
+        if not final and _console_update_in_progress():
+            plog(f"  {tag} ({trigger}): {'; '.join(reasons)} — client check deferred to the end of "
+                 f"the console update, after its other Authentik steps")
+            _finish('deferred to the end of the update', keep=reasons)
+            return False
+
+        plog(f"  {tag} ({trigger}): TAK Server ran through an LDAP outage — {'; '.join(reasons)}. "
+             f"Clients that connected during it have NO groups until they are looked up again; checking LDAP first...")
+        s = load_settings()
+        ldap_pass = _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        if not ldap_pass or not _ensure_ldapsearch():
+            plog(f"  ✗ {tag}: can't check LDAP (no ldapsearch or no adm_ldapservice password) — TAK Server "
+                 f"NOT restarted. If clients show no groups, restart TAK Server once.")
+            _finish('skipped: LDAP not checkable')
+            return False
+        if not _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'before healing TAK clients', tag=tag):
+            plog(f"  ✗ {tag}: LDAP is not healthy — TAK clients NOT healed, TAK Server NOT restarted (it "
+                 f"would reload the same broken LDAP). Kept pending: the next console start retries.")
+            _finish('deferred: LDAP not healthy', keep=reasons)
+            return False
+
+        # ops #126: heal the connections first; restart TAK only if that can't work, or if
+        # CoreConfig's LDAP credential changed (TAK reads it only at start).
+        if must_restart:
+            verdict, summary = 'restart', "CoreConfig's LDAP credential changed; TAK Server loads it only at start"
+        else:
+            try:
+                verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
+            except Exception as e:
+                verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
+        if verdict in ('ok', 'healed'):
+            plog(f"  ✓ {tag}: {summary} — no TAK Server restart needed")
+            _finish('clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart',
+                    healed_ldap_start=ldap_start)
+            return False
+
+        native = not _tak_is_container()
+        plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
+             f"({'systemd' if native else 'container'})...")
+        cmd = ['systemctl', 'restart', 'takserver'] if native else ['docker', 'restart', TAK_CONTAINER]
+        try:
+            # Native `systemctl restart` blocks until ExecStart returns (100 s+ observed);
+            # same 240 s cap as _apply_ldap_to_coreconfig.
+            r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
+            if r.returncode != 0:
+                plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+                _finish('restart failed', keep=reasons)
+                return False
+        except subprocess.TimeoutExpired:
+            plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
+        ready = _tak_wait_ready(plog, tag)
+        if ready:
+            plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
+        _finish('restarted' if ready else 'restarted, ports not up in time')
+        return True
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
@@ -62943,25 +64382,41 @@ def _takportal_mapsync_watchdog_loop():
     This is what picks up channels created later in the portal with no operator action,
     and heals a UAF admin entry reset to __ANON__ by a TAK redeploy — within one tick.
     Idempotent (no UAF write / no portal restart when membership already matches; never
-    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true."""
+    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true.
+
+    ops #127: checks the channel list every minute (one /groups/all read) and runs the syncs as
+    soon as it changes — a channel created or renamed in TAK Portal reaches the map bridge and
+    the CloudTAK bootstrap cert within a minute, not up to 10. The full syncs still run every
+    10 min regardless."""
     import time as _wt
     _wt.sleep(150)  # let startup migrations + first cert sync settle
-    _ok_interval = 6  # ~1h between liveness lines
-    _ok_counter = 0
+    _full_every = 10  # ticks (1 min each) between unconditional syncs
+    _ok_interval = 60  # ~1h between liveness lines
+    _tick = 0
+    _last_channels = None
     while True:
         try:
             if not load_settings().get('takportal_mapsync_disabled'):
-                _takportal_sync_map_channels()
-                # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
-                # too — a channel created later reaches the cache as inactive
-                # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
-                _tak_sync_admin_group_cache()
-            _ok_counter += 1
-            if _ok_counter % _ok_interval == 0:
+                _items = _tak_channel_items()
+                _now = None if _items is None else frozenset(g['name'] for g in _items)
+                if _tick % _full_every == 0 or (_now is not None and _now != _last_channels):
+                    if _now is not None and _last_channels is not None and _now != _last_channels:
+                        print(f"[takportal-map-sync] channel list changed "
+                              f"(+{len(_now - _last_channels)} / -{len(_last_channels - _now)}) — syncing now", flush=True)
+                    if _now is not None:
+                        _last_channels = _now  # before the syncs: a failing sync retries on the 10-min tick, not every minute
+                    _takportal_sync_map_channels()
+                    # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
+                    # too — a channel created later reaches the cache as inactive
+                    # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
+                    _tak_sync_admin_group_cache()
+                    _tak_sync_bootstrap_group_cache()
+            _tick += 1
+            if _tick % _ok_interval == 0:
                 print("[takportal-map-sync] watchdog alive", flush=True)
         except Exception as _e:
             print(f"[takportal-map-sync] watchdog error (non-fatal): {_e}", flush=True)
-        _wt.sleep(600)
+        _wt.sleep(60)
 
 
 def _start_takportal_mapsync_watchdog():
@@ -64118,6 +65573,21 @@ def _authentik_fix_pg_idle_timeout(plog):
     return True
 
 
+def _spiral_monitor_tak_recycle(ldap_started_before, plog):
+    """ops #128: the monitor's routing passes recreate the LDAP outpost (a move, or a move
+    plus its rollback). TAK clients that connected meanwhile hold no groups, and nothing else
+    would heal them before the next console start — so heal them now, the same way the other
+    callers do (`_tak_recycle_after_ldap_outage` checks LDAP first, restarts TAK only as the
+    fallback, and leaves it to the end of a running console update)."""
+    after = _docker_started_epoch('authentik-ldap-1')
+    if after is None or after == ldap_started_before:
+        return
+    try:
+        _tak_recycle_after_ldap_outage(plog, 'spiral monitor LDAP routing', check_outpost=True)
+    except Exception as e:
+        plog(f"TAK LDAP recycle error (non-fatal): {e}")
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -64212,10 +65682,13 @@ def _authentik_spiral_monitor():
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
+            _mon_log = lambda m: print(f"[spiral monitor] {m}", flush=True)
+            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
             try:
-                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"[spiral monitor] {m}", flush=True))
+                _ensure_authentik_ldap_outpost_on_fqdn(_mon_log, quiet_repeats=True)
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
 
             s = load_settings()
 
@@ -64231,7 +65704,9 @@ def _authentik_spiral_monitor():
 
             print(f"[spiral monitor] spiral signature detected: {evidence['reason']}", flush=True)
             print(f"[spiral monitor] running idempotent routing repair...", flush=True)
-            _apply_authentik_ldap_routing_repair(ak_dir, lambda m: print(f"[spiral monitor] {m}", flush=True))
+            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
+            _apply_authentik_ldap_routing_repair(ak_dir, _mon_log)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
         except Exception as e:
             try:
                 print(f"[spiral monitor] iteration error (will retry in 10 min): {e}", flush=True)
@@ -70101,8 +71576,9 @@ def takserver_connect_ldap():
     # operator's "Resync LDAP" click never actually moved the outpost off the spiral-prone path.
     # The migration is self-contained (recreates only the ldap container, validates the websocket
     # connection, auto-rolls-back if FQDN isn't viable), so it's safe to invoke here. Visible output.
+    # force: an operator click skips the failed-move back-off (ops #128), not the DNS/cert check.
     try:
-        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()))
+        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()), force=True)
     except Exception as _e:
         diag.append(f'Proactive routing: skipped ({str(_e)[:80]})')
     # Diagnostic: compare passwords and check outpost health
@@ -70201,6 +71677,19 @@ def takserver_connect_ldap():
     else:
         overall_ok = bool(ok and verify.get('ready', True))
         diag.append('Final: READY' if overall_ok else 'Final: NOT READY (verification failed)')
+    # ops #126: the webadmin/FQDN steps above can recreate the LDAP outpost under a TAK
+    # Server that _apply_ldap_to_coreconfig left running (CoreConfig already correct). If
+    # so, heal TAK's clients once LDAP settles (restart only as the fallback) — in the
+    # background, it takes minutes.
+    if not is_remote_ak:
+        threading.Thread(
+            target=lambda: _tak_recycle_after_ldap_outage(
+                lambda m: print(f"Resync LDAP to TAK Server:{m}", flush=True),
+                'Resync LDAP to TAK Server', check_outpost=True),
+            daemon=True, name='tak-ldap-recycle').start()
+        diag.append('TAK clients: if the outpost was restarted under TAK Server, clients left with no '
+                    'groups are re-checked in the background once LDAP settles (TAK restart only if that '
+                    'fails; console log: "TAK LDAP recycle")')
     return jsonify({'success': overall_ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
@@ -81089,7 +82578,9 @@ def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
         _body_file = None
-        cmd = ['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key,
+        # curl's own limit follows the caller's (ops #126: a bulk re-authenticate or the
+        # client history on a big server takes longer than the old fixed 8 s).
+        cmd = ['curl', '-sk', '--max-time', str(max(8, int(timeout) - 2)), '--cert', _pem, '--key', _key,
                '-w', '\n__HTTP_CODE:%{http_code}']
         if method != 'GET':
             cmd += ['-X', method]
@@ -81340,6 +82831,191 @@ def _tak_sync_admin_group_cache(plog=None):
     _log("cache still had inactive entries after 3 passes — will retry on next watchdog tick")
 
 
+# System groups never required of the bootstrap cert (ROLE_ADMIN is a role; __ANON__ is not a channel).
+_TAK_NON_CHANNEL_GROUPS = ('ROLE_ADMIN', '__ANON__')
+_bootstrap_groupcache_splitbox_logged = False
+
+
+def _tak_core_is_remote():
+    """True on a split deploy whose TAK core is another host (Marti is not on 127.0.0.1 here).
+    A split deploy with TAK on this box and only Postgres remote (test8's layout) is local."""
+    try:
+        return _cloudtak_bootstrap_cert_target(load_settings())[0] == 'remote'
+    except Exception:
+        return False
+
+
+def _tak_channel_items():
+    """The box's TAK channels as Marti Group records (name, bitpos, …) from
+    /Marti/api/groups/all, minus ROLE_ADMIN/__ANON__. None when TAK is not on this box or on any
+    fetch error — callers treat None as "unknown", never as "no channels"."""
+    if _tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return None
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
+    if data is None:
+        return None
+    items = data.get('data', data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    out = {}
+    for g in items:
+        n = ((g.get('name') if isinstance(g, dict) else '') or '').strip()
+        if n and n not in _TAK_NON_CHANNEL_GROUPS:
+            out[n] = g
+    return list(out.values())
+
+
+def _tak_bootstrap_cert_present():
+    """True when this TAK has the CloudTAK bootstrap cert (its p12 or its UAF entry)."""
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    if os.path.exists(f'/opt/tak/certs/files/{cn}.p12'):
+        return True
+    try:
+        return f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+    except Exception:
+        return False
+
+
+def _tak_bootstrap_channel_state(channels=None):
+    """ops #127 detector (read-only): which TAK channels the CloudTAK bootstrap cert's LIVE 8089
+    subscription cannot deliver Core Events to. CloudTAK reposts them over that connection with a
+    marti dest per channel; a channel the connection lacks IN is never delivered (test12
+    2026-10-20), with no error anywhere. A channel counts as missing unless it is there IN and OUT
+    — what _tak_sync_bootstrap_group_cache converges to.
+    Returns {'state', 'missing', 'channels', 'connected'}; state is one of
+      absent        TAK not on this box, or no bootstrap cert — nothing to check
+      unknown       TAK down or an API error — say nothing
+      disconnected  the cert has no live connection (CloudTAK stopped or on another cert)
+      ok | missing  compared its newest subscription's groups with /groups/all"""
+    res = {'state': 'absent', 'missing': [], 'channels': 0, 'connected': False}
+    if (_tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml')
+            or not _tak_bootstrap_cert_present()):
+        return res
+    if channels is None:
+        channels = _tak_channel_items()
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/subscriptions/all', timeout=20)
+    subs = data.get('data') if isinstance(data, dict) else None
+    if channels is None or not isinstance(subs, list):
+        res['state'] = 'unknown'
+        return res
+    res['channels'] = len(channels)
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mine = [s for s in subs if isinstance(s, dict) and (s.get('username') or '').lower() == cn]
+    if not mine:
+        res['state'] = 'disconnected'
+        return res
+
+    def _num(s):
+        try:
+            return int(str(s.get('subscriptionUid', '')).rsplit(':', 1)[-1])
+        except ValueError:
+            return -1
+    # After a reconnect the old subscription can linger with its old groups: judge the newest.
+    newest = max(mine, key=_num)
+    have = {(g.get('name'), g.get('direction')) for g in (newest.get('groups') or []) if isinstance(g, dict)}
+    res['connected'] = True
+    res['missing'] = sorted(g['name'] for g in channels
+                            if (g.get('name'), 'IN') not in have or (g.get('name'), 'OUT') not in have)
+    res['state'] = 'missing' if res['missing'] else 'ok'
+    return res
+
+
+def _tak_sync_bootstrap_group_cache(plog=None):
+    """ops #127: make sure the CloudTAK CoreEvents bootstrap cert (cloudtak-svc-bootstrap) can deliver
+    Core Events to every channel, including channels created after it connected. Core Events sent to a channel
+    it is not in are dropped by TAK with no error anywhere (nuc 2026-10-20: RAPID-SOS).
+
+    Two independent ways a new channel goes missing, so two steps:
+
+    1. The x509 group cache. Since v0.9.21 CoreConfig carries
+       x509useGroupCacheRequiresExtKeyUsage="false", so makeCert certs like this one ARE cached;
+       a channel created later reaches the cache inactive (IN and OUT), or not at all — the trap
+       _tak_sync_admin_group_cache() fixes for `admin`. Every channel's IN and OUT entries are
+       made active (inactive ones activated, missing ones added). IN is the one that decides
+       delivery — measured on test12 2026-10-20 by toggling one entry at a time: IN off / OUT on,
+       a Core Event on that channel never reaches a member; IN on / OUT off, it does. OUT is
+       kept active too, the same as the admin sync and as an uncached admin cert gets. Entries
+       for non-channels (ROLE_ADMIN, __ANON__) are passed back unchanged. One activeForce PUT
+       (TAK 5.5+) stores the list and re-authenticates the live connection.
+    2. The live connection. ROLE_ADMIN + x509assignAdminAllGroups grants "every group" only when
+       the connection AUTHENTICATES, so even an uncached cert misses later channels (test8
+       2026-10-20: live subscription missing TAKDEV-EMU, no cache entry at all). When the newest
+       subscription still lacks a channel, GET /Marti/api/groups/update/<cn> re-authenticates it
+       in place — measured on test8: same tls:5 session, 24 -> 25 channels, no reconnect.
+
+    Same rules as the admin sync: idempotent (no PUT / re-auth when converged), never-shrink (never
+    deactivates or drops an entry; a failed /groups/all read changes nothing), no-op when the cert
+    is absent or not connected, split box with a remote TAK core logs once and skips.
+    Returns {'changed', 'activated', 'added', 'reauth', 'missing'}."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[tak-groupcache-sync] {m}", flush=True)
+    res = {'changed': False, 'activated': 0, 'added': 0, 'reauth': False, 'missing': []}
+    if _tak_core_is_remote():
+        global _bootstrap_groupcache_splitbox_logged
+        if not _bootstrap_groupcache_splitbox_logged:
+            _bootstrap_groupcache_splitbox_logged = True
+            _log("split-box (TAK core on another host): bootstrap cert channel sync not supported yet — Marti is on the remote box; parked")
+        return res
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _tak_bootstrap_cert_present():
+        return res
+    channels = _tak_channel_items()
+    if not channels:
+        return res  # TAK down / fetch failed / no channels — never act on an empty list
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    base = 'https://127.0.0.1:8443/Marti/api/groups'
+    # Step 1 — the group cache.
+    enabled, _err = _tak_admin_marti_get(f'{base}/groupCacheEnabled')
+    for _pass in range(3 if (isinstance(enabled, dict) and enabled.get('data') is True) else 0):
+        data, err = _tak_admin_marti_get(f'{base}/user?username={cn}')
+        entries = data.get('data') if isinstance(data, dict) else None
+        if data is None or not entries:
+            break  # read failed, or not cached (never connected / makeCert EKU bypass): step 2 decides
+        entries = [e for e in entries if isinstance(e, dict)]
+        names = {g.get('name') for g in channels}
+        have = {(e.get('name'), e.get('direction')) for e in entries}
+        inactive = [e for e in entries if e.get('name') in names
+                    and e.get('direction') in ('IN', 'OUT') and not e.get('active')]
+        added = [dict(g, direction=d, active=True) for g in channels for d in ('IN', 'OUT')
+                 if (g.get('name'), d) not in have]
+        if not inactive and not added:
+            break
+        for e in inactive:
+            e['active'] = True
+        ok, perr = _tak_admin_marti_req(f'{base}/activeForce?username={cn}',
+                                        timeout=15, method='PUT', json_body=entries + added)
+        if ok is None:
+            _log(f"bootstrap cert activeForce PUT failed ({perr}) — cache left as-is")
+            break
+        res['changed'] = True
+        res['activated'] += len(inactive)
+        res['added'] += len(added)
+        _log(f"bootstrap cert: cache — activated {len(inactive)}, added {len(added)} channel entr(y/ies) (IN+OUT)"
+             + (f" ({', '.join(sorted({g['name'] for g in inactive + added})[:10])})" if inactive or added else '')
+             + f" (pass {_pass + 1})")
+        time.sleep(2)  # activeForce re-authenticates the live connection
+    # Step 2 — the live connection.
+    state = _tak_bootstrap_channel_state(channels)
+    if state['state'] == 'missing':
+        _ok, rerr = _tak_admin_marti_get(f'{base}/update/{cn}')
+        if _ok is None and rerr != 'empty_body':  # 200 with no body is this endpoint's success
+            _log(f"bootstrap cert re-authenticate failed ({rerr}) — still missing {len(state['missing'])} channel(s)")
+            res['missing'] = state['missing']
+            return res
+        res['changed'] = res['reauth'] = True
+        time.sleep(2)
+        after = _tak_bootstrap_channel_state(channels)
+        res['missing'] = after['missing'] if after['state'] == 'missing' else []
+        _log(f"bootstrap cert: re-authenticated its TAK connection — {len(state['missing'])} channel(s) were missing"
+             + f" ({', '.join(state['missing'][:10])})"
+             + (f"; still missing {len(res['missing'])} — retrying on the next sync" if res['missing'] else '; now in all'))
+    elif not res['changed'] and state['state'] == 'ok':
+        _log(f"bootstrap cert: live connection in all {len(channels)} channels — no change")
+    return res
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -81482,6 +83158,10 @@ def _takportal_sync_certs(plog=None, restart=False):
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             _log(f"  ⚠ Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            _log(f"  ⚠ Bootstrap cert group-cache sync (non-fatal): {_bce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -85685,8 +87365,16 @@ def _startup_resync_ldap_service_account():
         # Gate strictly on final_verdict='ok' so we never restart into a still-
         # broken state.
         if healing_performed and final_verdict == 'ok' and not coreconfig_changed:
-            print("Startup migration: LDAP healed on the Authentik side — TAK Server not "
-                  "restarted (its CoreConfig credential was already correct; nothing to reload)")
+            # ops #126 (GH #189): "TAK keeps no such state" is not true — clients that
+            # connected while the bind was failing hold empty groups. The shared helper
+            # acts only if the outpost was restarted under a TAK that had been up 5+ min
+            # (never at box boot, the GH #83 case), after LDAP has settled, and leaves it
+            # to the end of a running console update. It heals those clients without a
+            # TAK restart; restart is only its fallback.
+            print("Startup migration: LDAP healed on the Authentik side (CoreConfig credential "
+                  "already correct) — checking whether TAK Server ran through the outage")
+            _tak_recycle_after_ldap_outage(lambda m: print(f"Startup migration:{m}", flush=True),
+                                           'boot LDAP service-account heal', check_outpost=True)
         elif (coreconfig_changed
                 and final_verdict == 'ok'
                 and os.path.exists('/opt/tak/CoreConfig.xml')):
@@ -88877,6 +90565,11 @@ def _startup_migrations():
             _tak_sync_admin_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _gce:
             print(f"Startup migration: TAK group-cache sync error (non-fatal): {_gce}", flush=True)
+        # ops #127: and the CloudTAK bootstrap cert's, so Core Events reach every channel.
+        try:
+            _tak_sync_bootstrap_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _bce:
+            print(f"Startup migration: bootstrap cert group-cache sync error (non-fatal): {_bce}", flush=True)
 
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
@@ -88910,7 +90603,7 @@ def _startup_migrations():
         # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
         try:
             _start_takportal_mapsync_watchdog()
-            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+            print("Startup: TAK Portal map-channel watchdog started (channel check 1 min, full sync 10 min)", flush=True)
         except Exception as _mwe:
             print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
@@ -89269,6 +90962,18 @@ def _post_update_auto_deploy():
                         print(f"Post-update (same-version): webadmin role re-assert error (non-fatal): {_wre}", flush=True)
             except Exception as _shce:
                 print(f"Post-update (same-version): compose self-heal error (non-fatal): {_shce}", flush=True)
+
+            # ops #126: no update run follows, so carry out a pending TAK client heal request
+            # here (e.g. a PgBouncer swap the startup migrations retried, or one an earlier run
+            # couldn't finish). Pending only — a plain console restart never touches TAK on
+            # its own. Background: it waits for LDAP (and TAK's ports, if it falls back to a
+            # restart).
+            if (load_settings().get('tak_ldap_recycle') or {}).get('pending'):
+                threading.Thread(
+                    target=lambda: _tak_recycle_after_ldap_outage(
+                        lambda m: print(f"Post-update (same-version):{m}", flush=True),
+                        'console start', check_outpost=False, final=True),
+                    daemon=True, name='tak-ldap-recycle').start()
 
             # v0.9.24 Item 2 (lock itself now cleared at startup above): a lock
             # present on a same-version restart means the previous deploy was
@@ -91118,6 +92823,18 @@ def _post_update_auto_deploy():
                 )
             except Exception as _se:
                 print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
+
+            # ops #126 (GH #189): LAST, after every step above that can restart or recreate
+            # Authentik / the LDAP outpost: if TAK Server ran through an LDAP outage (a
+            # step requested it, or the outpost restarted under TAK — including before this
+            # update, the one-time catch-up for boxes already on v10.2.23), heal TAK's clients
+            # once LDAP is settled: clients that connected during the outage hold empty groups
+            # until they are looked up again. TAK restart only as the fallback.
+            try:
+                _tak_recycle_after_ldap_outage(lambda m: print(f"Post-update:{m}", flush=True),
+                                               'end of console update', check_outpost=True, final=True)
+            except Exception as _tre:
+                print(f"Post-update: TAK LDAP recycle error (non-fatal): {_tre}", flush=True)
 
             print("Post-update: auto-deploy complete")
 

@@ -264,8 +264,15 @@ EXPIRED_WHERE="cr.servertime < now() - interval '${RETENTION_HOURS} hours' AND c
 
 # ── Step 4: Quick count of expired rows ──
 EXPIRED_WHERE_QUOTED=$(printf '%s' "$EXPIRED_WHERE" | sed "s/'/''/g")
-EXPIRED_EST=$(psql_scalar "SELECT count_estimate('SELECT 1 FROM cot_router cr WHERE ${EXPIRED_WHERE_QUOTED}');" 2>/dev/null)
-# count_estimate may not exist; fall back to real COUNT with a LIMIT-based estimate
+# ops #129: count_estimate() is not part of TAK's schema. Calling it where it does not
+# exist logged "function count_estimate(unknown) does not exist" in the PostgreSQL log on
+# every run (every 15 min, ~96 lines a day). Ask pg_proc first; only call it if present.
+EXPIRED_EST=''
+HAS_COUNT_EST=$(psql_scalar "SELECT 1 FROM pg_proc WHERE proname = 'count_estimate' LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+if [ "$HAS_COUNT_EST" = "1" ]; then
+  EXPIRED_EST=$(psql_scalar "SELECT count_estimate('SELECT 1 FROM cot_router cr WHERE ${EXPIRED_WHERE_QUOTED}');" 2>/dev/null)
+fi
+# No count_estimate (or it failed): fall back to real COUNT with a LIMIT-based estimate
 if ! [[ "$EXPIRED_EST" =~ ^[0-9]+$ ]]; then
   EXPIRED_EST=$(psql_scalar "SELECT COUNT(*) FROM (SELECT 1 FROM cot_router cr WHERE ${EXPIRED_WHERE} LIMIT 100001) sub;")
 fi
