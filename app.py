@@ -1209,7 +1209,7 @@ def inject_source_url():
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.5.7"   # v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release. Previous: 2026.5.6 — v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
+AUTHENTIK_VETTED_RELEASE = "2026.8.4"   # v10.2.25: promoted to the 2026.8 line (there is no 2026.6/2026.7 upstream). 8.4 is the first 8.x that parses list env vars (our AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS) correctly (#26081), and it carries the 8.2 security backports plus the LDAP cached-searcher memory-leak fix (8.3). 2026.8 only honours X-Forwarded-* from trusted proxies, so remote-Authentik installs now also trust the console IP (_authentik_trusted_proxy_cidrs). Previous: 2026.5.7 — v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release.
 
 # Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
 # AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
@@ -1226,7 +1226,14 @@ AUTHENTIK_VETTED_RELEASE = "2026.5.7"   # v10.2.7: SECURITY — 2026.5.7 fixes f
 # MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
 # streaming box is a crash-loop, not a warning.
 MEDIAMTX_VETTED_RELEASE = "1.21.1"      # v10.2.8 W7: SECURITY — GHSA-w334-5mp5-h897 (CRITICAL, 2026-10-08): CSRF on the Control API → runOnInit command execution, fixed in 1.21.1 (plus RTMP publisher panics GHSA-7498/-5jgv, fixed 1.21.0). FRESH installs only — existing boxes are told by the upstream badge and update in the web editor. Previous 1.20.0 — v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
-AUTHENTIK_DEV_RELEASE    = "2026.5.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+# Authentik 2026.8+ refuses to start on a database more than one release family behind it
+# (upstream lifecycle/migrate.py ensure_allowed_version: "Major version skips are not
+# allowed") — server and worker crash-loop before migrations, and TAK's LDAP goes with
+# them. An install older than a step below is updated to that step first; the next Update
+# takes it the rest of the way (_ak_upgrade_hop). Each entry is the last vetted patch of a
+# family. Add the outgoing family's last vetted patch here whenever a new family is promoted.
+AUTHENTIK_UPGRADE_STEPS = ("2026.5.7",)
+AUTHENTIK_DEV_RELEASE    = "2026.8.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
@@ -35309,8 +35316,11 @@ def _get_authentik_latest_release_tag(use_cache=True):
         return _authentik_release_cache.get('tag')
 
 
-def _get_authentik_target_release(settings=None):
+def _get_authentik_target_release(settings=None, installed=None):
     """Return the Authentik version this box's channel is allowed to update to.
+
+    Pass `installed` (the running version) for an EXISTING install: the answer is then the
+    next safe hop toward the channel target, never a family skip (_ak_upgrade_hop).
 
     Dev channel (update_channel='dev'): whatever Authentik has shipped LATEST upstream.
     Dev simply tracks the newest release — an update shows up the moment upstream ships
@@ -35325,8 +35335,10 @@ def _get_authentik_target_release(settings=None):
         settings = load_settings()
     channel = (settings.get('update_channel') or 'main').strip().lower()
     if channel == 'dev':
-        return _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
-    return AUTHENTIK_VETTED_RELEASE
+        target = _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
+    else:
+        target = AUTHENTIK_VETTED_RELEASE
+    return _ak_upgrade_hop(installed, target) if installed else target
 
 
 def _ak_tag_is_sane(tag):
@@ -35348,6 +35360,24 @@ def _ak_ver_tuple(v):
     Returns () when there is nothing numeric, which sorts BELOW any real version, so an
     unparseable value never wins a > test (never triggers a downgrade refusal by accident)."""
     return tuple(int(x) for x in re.findall(r'\d+', (v or '')))
+
+
+def _ak_upgrade_hop(installed, target):
+    """The release an install on `installed` should update to on the way to `target`.
+
+    Usually `target` itself. When a step in AUTHENTIK_UPGRADE_STEPS sits strictly between
+    the installed family and the target family (2026.2.x → 2026.8.x skips 2026.5), it is
+    that step instead: 2026.8 refuses to migrate a database that skipped a family, so going
+    straight there leaves Authentik crash-looping. Families compare on (year, month) only.
+    An unreadable version on either side returns `target` unchanged (nothing installed =
+    fresh database, which upstream's check lets through)."""
+    inst, tgt = _ak_ver_tuple(installed)[:2], _ak_ver_tuple(target)[:2]
+    if len(inst) < 2 or len(tgt) < 2:
+        return target
+    for step in AUTHENTIK_UPGRADE_STEPS:
+        if inst < _ak_ver_tuple(step)[:2] < tgt:
+            return step
+    return target
 
 
 def _ak_env_path(ak_dir=None):
@@ -35553,15 +35583,20 @@ def _get_authentik_version_info():
     # update_available is only True when target > installed (never show a downgrade badge).
     _s = load_settings()
     _channel = (_s.get('update_channel') or 'main').strip().lower()
-    target = _get_authentik_target_release(_s)
+    if out['version']:
+        out['version'] = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
+    # v10.2.25: an install a whole family behind is offered the intermediate step, not the
+    # channel target — 2026.8 will not start on a database that skipped 2026.5.
+    out['final_target'] = _get_authentik_target_release(_s)
+    target = _ak_upgrade_hop(out['version'], out['final_target']) if out['version'] else out['final_target']
+    out['upgrade_step'] = target != out['final_target']
     out['latest'] = target
     out['vetted_release'] = AUTHENTIK_VETTED_RELEASE
     out['dev_release'] = AUTHENTIK_DEV_RELEASE
     out['channel'] = _channel
     out['ahead_of_vetted'] = False
     if out['version']:
-        installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
-        out['version'] = installed
+        installed = out['version']
         if installed and installed != target:
             # Only flag as update_available if target is strictly newer (no downgrade badge)
             try:
@@ -53377,7 +53412,8 @@ def authentik_page():
     'authentik',
     when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
     from_fn=lambda: (_get_authentik_version_info().get('version') or ''),
-    to_fn=lambda: _get_authentik_target_release(load_settings()))
+    to_fn=lambda: _get_authentik_target_release(
+        load_settings(), installed=_get_authentik_version_info().get('version')))
 def authentik_control():
     action = request.json.get('action')
     settings = load_settings()
@@ -53398,7 +53434,9 @@ def authentik_control():
             # v10.1.39: same fix as the local branch — the compose `:-` default alone is a
             # no-op whenever .env defines AUTHENTIK_TAG, so converge .env too, verify with
             # `docker compose config`, and check what is actually running afterwards.
-            latest = _get_authentik_target_release(settings)
+            # v10.2.25: next safe hop from what is running (no family skips — 2026.8).
+            latest = _get_authentik_target_release(
+                settings, installed=_get_authentik_version_info().get('version'))
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
@@ -53431,6 +53469,17 @@ def authentik_control():
                                              f'{", ".join(sorted(_ctags))}, not {latest} alone. '
                                              f'Something outside docker-compose.yml and .env is '
                                              f'pinning the tag.'}), 500
+            # v10.2.25: 2026.8 ignores Caddy's X-Forwarded-* unless the console IP is a trusted
+            # proxy (_authentik_remote_trusted_proxy_cidrs). Converge the line before the
+            # recreate so the new image starts with it. The value is built only from
+            # ipaddress-validated parts (no operator text reaches this shell string).
+            _tpc = _authentik_remote_trusted_proxy_cidrs(settings)
+            if _tpc:
+                _mod_result_step('authentik', 'trust the console as a proxy (remote)')
+                _tpk = 'AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS'
+                _ssh_probe(remote, f"cd {ak_dir} && if grep -qE '^[ \t]*{_tpk}[ \t]*=' .env; then "
+                                   f"sed -i 's|^[ \t]*{_tpk}[ \t]*=.*|{_tpk}={_tpc}|' .env; "
+                                   f"else printf '\\n{_tpk}={_tpc}\\n' >> .env; fi", timeout=15)
             _mod_result_step('authentik', 'pull + recreate (remote)')
             _pok, _pout = _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=360)
             if not _pok:
@@ -53482,12 +53531,14 @@ def authentik_control():
         # interpolation contract, verify with `docker compose config` BEFORE pulling, and
         # confirm the running image afterwards instead of assuming.
         import re as _re
-        latest = _get_authentik_target_release(settings)
+        _inst = (_get_authentik_version_info().get('version') or '').strip()
+        # v10.2.25: the next safe hop from what is running — a box on 2026.2.x goes to
+        # 2026.5.7 first, because 2026.8 will not start on a database that skipped 2026.5.
+        latest = _get_authentik_target_release(settings, installed=_inst)
         if not _ak_tag_is_sane(latest):
             return jsonify({'error': f'Refusing to update: target release '
                                      f'"{latest}" is not a valid Authentik version.'}), 500
         cp = os.path.join(ak_dir, 'docker-compose.yml')
-        _inst = (_get_authentik_version_info().get('version') or '').strip()
         # Never walk a box BACKWARDS. The badge only offers Update when target > running,
         # but the button is always live — and now that the .env pin actually converges, a
         # downgrade would TAKE where before .env silently absorbed it.
@@ -55476,6 +55527,12 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     ak_base = _get_authentik_base_url(settings)
     fqdn = settings.get('fqdn', '')
     cookie_line = f"\nAUTHENTIK_COOKIE_DOMAIN=.{fqdn.split(':')[0]}" if fqdn else ""
+    # v10.2.25: Caddy on the console reaches this host from the console IP — trust it too.
+    _trusted_cidrs = _authentik_remote_trusted_proxy_cidrs(settings)
+    if not _trusted_cidrs:
+        _trusted_cidrs = AK_TRUSTED_PROXY_CIDRS
+        plog("⚠ No console Server IP set (Settings → Server IP): Authentik 2026.8+ will ignore "
+             "Caddy's X-Forwarded headers from the console. Set it, then run Update on this card.")
 
     env_content = f"""PG_DB=authentik
 PG_USER=authentik
@@ -55494,7 +55551,7 @@ AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=DC=takldap
 AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST=http://authentik-server-1:9000/
 AUTHENTIK_HOST={ak_base}
 AUTHENTIK_TOKEN={bootstrap_token}
-AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128{cookie_line}
+AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS={_trusted_cidrs}{cookie_line}
 """
 
     with open('/tmp/authentik_remote.env', 'w') as f:
@@ -64990,6 +65047,36 @@ def _auto_remove_stale_docker_service_connections(label='Post-update'):
         print(f"{label}: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
 
 
+AK_TRUSTED_PROXY_CIDRS = '172.16.0.0/12,127.0.0.1/32,::1/128'
+
+
+def _authentik_remote_trusted_proxy_cidrs(settings):
+    """AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS for a REMOTE Authentik host, or None when the
+    console IP is unknown.
+
+    v10.2.25: Authentik 2026.8 honours X-Forwarded-Proto/-Host/-For ONLY from a trusted
+    proxy (2026.8 release notes, "Forwarded headers are now restricted to trusted
+    proxies"); 2026.5 took Proto/Host from anyone. A local install is unaffected — Caddy
+    reaches 127.0.0.1:9090 through the Docker gateway (172.16/12). On a remote install
+    Caddy on the CONSOLE connects to remote:9090 from the console's own address, which is
+    in none of those ranges: Authentik would read every request as plain HTTP and drop the
+    forward_auth host, which upstream says shows up as mixed content, an endless loader or
+    auth errors. So the remote host also trusts exactly the console IP — the same address
+    its firewall admits to 9090 (_fedhub_caddy_source_ip), and nothing wider: a blanket
+    range would let any client forge its IP into the audit log and fail2ban."""
+    _ip = _fedhub_caddy_source_ip(settings)
+    if not _ip:
+        return None
+    try:
+        import ipaddress as _ipa
+        _addr = _ipa.ip_address(_ip.strip())
+    except ValueError:
+        return None
+    if any(_addr in _ipa.ip_network(n) for n in AK_TRUSTED_PROXY_CIDRS.split(',')):
+        return AK_TRUSTED_PROXY_CIDRS
+    return f'{AK_TRUSTED_PROXY_CIDRS},{_addr}/32'
+
+
 def _authentik_fix_trusted_proxy_cidrs(plog):
     """v0.8.9: Fix Authentik recording Docker bridge gateway IP instead of real client IP.
 
@@ -65033,7 +65120,7 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
         return False
 
     key = 'AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS'
-    value = '172.16.0.0/12,127.0.0.1/32,::1/128'
+    value = AK_TRUSTED_PROXY_CIDRS
 
     existing = next((ln for ln in content.splitlines() if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
     if existing is not None:
@@ -66617,7 +66704,10 @@ entries:
         # Pin AUTHENTIK_TAG to the channel-appropriate vetted release.
         # Fresh download: always force to vetted — upstream may ship newer than our vetted release.
         # Existing install: only upgrade (target > current); never silently downgrade an operator-upgraded install.
-        ak_tag = _get_authentik_target_release()
+        # v10.2.25: an existing install moves one family at a time (2026.8 refuses a skip).
+        # A fresh compose download is a fresh database — straight to the channel target.
+        ak_tag = _get_authentik_target_release(
+            installed=None if _compose_fresh_download else _get_authentik_version_info().get('version'))
         plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
             m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)

@@ -442,6 +442,14 @@ overrides, so treat that list as authoritative over this table.
 
 ## Changelog
 
+### v10.2.25-alpha — Authentik moves to 2026.8.4
+
+**Authentik 2026.8.4.** Authentik moves from 2026.5.7 to 2026.8.4, the current patch of the 2026.8 line. It carries the same security fixes as 2026.5.7, fixes a memory leak in the LDAP outpost, and reads list settings such as the trusted proxy ranges correctly. After updating the console, press **Update** on the Authentik card.
+
+**Older Authentik installs update in two steps.** Authentik 2026.8 will not start on a database that skipped a release. A server still on Authentik 2026.2 or older is updated to 2026.5.7 first (the Update button says so); press **Update** again to reach 2026.8.4.
+
+**Authentik on a separate server.** Authentik 2026.8 accepts Caddy's forwarded headers only from addresses it trusts. When Authentik runs on its own server, Update now adds the console's IP to that list. Set **Settings → Server IP** before you update.
+
 ### v10.2.24-alpha — 2026-10-21 — Security: TAK Portal and Remote Assist on the newest Node 22; TAK clients get their LDAP groups back without a restart; Remote Assist Update keeps its database password
 
 **Headline: Update now rebuilds TAK Portal and EUD Remote Assist on the newest Node 22 base image (the Oct 21 Node.js security release), and still builds from the copy on the box if Docker Hub is down. After an LDAP outage, TAK clients that connected during it get their groups back without restarting TAK Server. Remote Assist Update no longer changes its database password, and repairs installs an earlier Update broke. Plus: a DNS check before Let's Encrypt, a safer LDAP outpost move, CloudTAK Update rollbacks that work on Docker 29, and quieter PostgreSQL logs.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha))
