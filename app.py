@@ -38160,6 +38160,10 @@ def run_takportal_deploy():
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             plog(f"\u26a0 Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            plog(f"\u26a0 Bootstrap cert group-cache sync (non-fatal): {_bce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -41299,6 +41303,27 @@ def cloudtak_coreevents_identity_api():
         'p12_exists': p12_exists,
         'uaf_entry': uaf_entry,
     })
+
+
+@app.route('/api/cloudtak/bootstrap-channels')
+@login_required
+def cloudtak_bootstrap_channels_api():
+    """ops #127: read-only — channels the bootstrap cert's live TAK connection cannot send Core
+    Events to (see _tak_bootstrap_channel_state). The CloudTAK page warns when any are missing."""
+    return jsonify(dict(_tak_bootstrap_channel_state(), success=True))
+
+
+@app.route('/api/cloudtak/bootstrap-channels/fix', methods=['POST'])
+@login_required
+def cloudtak_bootstrap_channels_fix_api():
+    """ops #127: "Fix now" — run the bootstrap cert channel sync immediately, then re-check."""
+    lines = []
+    try:
+        res = _tak_sync_bootstrap_group_cache(plog=lines.append)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    return jsonify({'success': True, 'result': res, 'log': lines[-5:],
+                    'after': _tak_bootstrap_channel_state()})
 
 
 @app.route('/api/cloudtak/deploy', methods=['POST'])
@@ -52353,7 +52378,9 @@ window.ctLoadCoreEventsIdentity = function() {
           '<div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-radius:10px;margin-bottom:20px;' +
           'font-size:12.5px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.18);color:var(--green)">' +
           '<span style="width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0"></span>' +
-          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>';
+          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>' +
+          '<div id="ct-bootstrap-channels"></div>';
+        window.ctLoadBootstrapChannels();
         return;
       }
       var fix = d.p12_exists
@@ -52372,6 +52399,49 @@ window.ctLoadCoreEventsIdentity = function() {
     .catch(function() { /* fail-quiet status probe */ });
 };
 document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEventsIdentity(); });
+
+// ops #127: warn when the bootstrap cert's live TAK connection is missing channels — Core Events
+// sent to those channels are dropped by TAK with no error anywhere. Fail-quiet like the above.
+window.ctLoadBootstrapChannels = function() {
+  var host = document.getElementById('ct-bootstrap-channels');
+  if (!host) return;
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  fetch('/api/cloudtak/bootstrap-channels', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.success || d.state !== 'missing' || !d.missing || !d.missing.length) { host.innerHTML = ''; return; }
+      var names = d.missing.slice(0, 12).map(esc).join(', ') + (d.missing.length > 12 ? ' and ' + (d.missing.length - 12) + ' more' : '');
+      host.innerHTML =
+        '<div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.4);border-radius:12px;padding:14px 20px;margin-bottom:20px">' +
+        '<div style="font-weight:600;font-size:13px;margin-bottom:4px;color:var(--yellow)">Core Events will not reach ' + d.missing.length + ' channel' + (d.missing.length === 1 ? '' : 's') + '</div>' +
+        '<div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">' +
+        'CloudTAK’s TAK Server connection is not in: <strong style="color:var(--text-primary)">' + names + '</strong>. ' +
+        'Events on those channels are never delivered, with no error. infra-TAK fixes this by itself within a minute of a channel change; Fix now does it immediately.' +
+        '</div>' +
+        '<div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button class="control-btn" id="ct-bootstrap-channels-fix">Fix now</button>' +
+        '<span id="ct-bootstrap-channels-msg" style="font-size:12px;color:var(--text-dim)"></span></div></div>';
+      document.getElementById('ct-bootstrap-channels-fix').addEventListener('click', window.ctFixBootstrapChannels);
+    })
+    .catch(function() { /* fail-quiet status probe */ });
+};
+
+window.ctFixBootstrapChannels = function() {
+  var btn = document.getElementById('ct-bootstrap-channels-fix');
+  var msg = document.getElementById('ct-bootstrap-channels-msg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Fixing…'; }
+  fetch('/api/cloudtak/bootstrap-channels/fix', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var after = d && d.after;
+      if (d && d.success && after && after.state === 'ok') { window.ctLoadBootstrapChannels(); return; }
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = (d && d.error) ? d.error : ('Still missing ' + ((after && after.missing) ? after.missing.length : '?') + ' — see the console log; it retries on the next sync.');
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+    });
+};
 
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
@@ -63688,25 +63758,41 @@ def _takportal_mapsync_watchdog_loop():
     This is what picks up channels created later in the portal with no operator action,
     and heals a UAF admin entry reset to __ANON__ by a TAK redeploy — within one tick.
     Idempotent (no UAF write / no portal restart when membership already matches; never
-    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true."""
+    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true.
+
+    ops #127: checks the channel list every minute (one /groups/all read) and runs the syncs as
+    soon as it changes — a channel created or renamed in TAK Portal reaches the map bridge and
+    the CloudTAK bootstrap cert within a minute, not up to 10. The full syncs still run every
+    10 min regardless."""
     import time as _wt
     _wt.sleep(150)  # let startup migrations + first cert sync settle
-    _ok_interval = 6  # ~1h between liveness lines
-    _ok_counter = 0
+    _full_every = 10  # ticks (1 min each) between unconditional syncs
+    _ok_interval = 60  # ~1h between liveness lines
+    _tick = 0
+    _last_channels = None
     while True:
         try:
             if not load_settings().get('takportal_mapsync_disabled'):
-                _takportal_sync_map_channels()
-                # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
-                # too — a channel created later reaches the cache as inactive
-                # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
-                _tak_sync_admin_group_cache()
-            _ok_counter += 1
-            if _ok_counter % _ok_interval == 0:
+                _items = _tak_channel_items()
+                _now = None if _items is None else frozenset(g['name'] for g in _items)
+                if _tick % _full_every == 0 or (_now is not None and _now != _last_channels):
+                    if _now is not None and _last_channels is not None and _now != _last_channels:
+                        print(f"[takportal-map-sync] channel list changed "
+                              f"(+{len(_now - _last_channels)} / -{len(_last_channels - _now)}) — syncing now", flush=True)
+                    if _now is not None:
+                        _last_channels = _now  # before the syncs: a failing sync retries on the 10-min tick, not every minute
+                    _takportal_sync_map_channels()
+                    # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
+                    # too — a channel created later reaches the cache as inactive
+                    # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
+                    _tak_sync_admin_group_cache()
+                    _tak_sync_bootstrap_group_cache()
+            _tick += 1
+            if _tick % _ok_interval == 0:
                 print("[takportal-map-sync] watchdog alive", flush=True)
         except Exception as _e:
             print(f"[takportal-map-sync] watchdog error (non-fatal): {_e}", flush=True)
-        _wt.sleep(600)
+        _wt.sleep(60)
 
 
 def _start_takportal_mapsync_watchdog():
@@ -82121,6 +82207,191 @@ def _tak_sync_admin_group_cache(plog=None):
     _log("cache still had inactive entries after 3 passes — will retry on next watchdog tick")
 
 
+# System groups never required of the bootstrap cert (ROLE_ADMIN is a role; __ANON__ is not a channel).
+_TAK_NON_CHANNEL_GROUPS = ('ROLE_ADMIN', '__ANON__')
+_bootstrap_groupcache_splitbox_logged = False
+
+
+def _tak_core_is_remote():
+    """True on a split deploy whose TAK core is another host (Marti is not on 127.0.0.1 here).
+    A split deploy with TAK on this box and only Postgres remote (test8's layout) is local."""
+    try:
+        return _cloudtak_bootstrap_cert_target(load_settings())[0] == 'remote'
+    except Exception:
+        return False
+
+
+def _tak_channel_items():
+    """The box's TAK channels as Marti Group records (name, bitpos, …) from
+    /Marti/api/groups/all, minus ROLE_ADMIN/__ANON__. None when TAK is not on this box or on any
+    fetch error — callers treat None as "unknown", never as "no channels"."""
+    if _tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return None
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
+    if data is None:
+        return None
+    items = data.get('data', data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    out = {}
+    for g in items:
+        n = ((g.get('name') if isinstance(g, dict) else '') or '').strip()
+        if n and n not in _TAK_NON_CHANNEL_GROUPS:
+            out[n] = g
+    return list(out.values())
+
+
+def _tak_bootstrap_cert_present():
+    """True when this TAK has the CloudTAK bootstrap cert (its p12 or its UAF entry)."""
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    if os.path.exists(f'/opt/tak/certs/files/{cn}.p12'):
+        return True
+    try:
+        return f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+    except Exception:
+        return False
+
+
+def _tak_bootstrap_channel_state(channels=None):
+    """ops #127 detector (read-only): which TAK channels the CloudTAK bootstrap cert's LIVE 8089
+    subscription cannot deliver Core Events to. CloudTAK reposts them over that connection with a
+    marti dest per channel; a channel the connection lacks IN is never delivered (test12
+    2026-10-20), with no error anywhere. A channel counts as missing unless it is there IN and OUT
+    — what _tak_sync_bootstrap_group_cache converges to.
+    Returns {'state', 'missing', 'channels', 'connected'}; state is one of
+      absent        TAK not on this box, or no bootstrap cert — nothing to check
+      unknown       TAK down or an API error — say nothing
+      disconnected  the cert has no live connection (CloudTAK stopped or on another cert)
+      ok | missing  compared its newest subscription's groups with /groups/all"""
+    res = {'state': 'absent', 'missing': [], 'channels': 0, 'connected': False}
+    if (_tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml')
+            or not _tak_bootstrap_cert_present()):
+        return res
+    if channels is None:
+        channels = _tak_channel_items()
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/subscriptions/all', timeout=20)
+    subs = data.get('data') if isinstance(data, dict) else None
+    if channels is None or not isinstance(subs, list):
+        res['state'] = 'unknown'
+        return res
+    res['channels'] = len(channels)
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mine = [s for s in subs if isinstance(s, dict) and (s.get('username') or '').lower() == cn]
+    if not mine:
+        res['state'] = 'disconnected'
+        return res
+
+    def _num(s):
+        try:
+            return int(str(s.get('subscriptionUid', '')).rsplit(':', 1)[-1])
+        except ValueError:
+            return -1
+    # After a reconnect the old subscription can linger with its old groups: judge the newest.
+    newest = max(mine, key=_num)
+    have = {(g.get('name'), g.get('direction')) for g in (newest.get('groups') or []) if isinstance(g, dict)}
+    res['connected'] = True
+    res['missing'] = sorted(g['name'] for g in channels
+                            if (g.get('name'), 'IN') not in have or (g.get('name'), 'OUT') not in have)
+    res['state'] = 'missing' if res['missing'] else 'ok'
+    return res
+
+
+def _tak_sync_bootstrap_group_cache(plog=None):
+    """ops #127: make sure the CloudTAK CoreEvents bootstrap cert (cloudtak-svc-bootstrap) can deliver
+    Core Events to every channel, including channels created after it connected. Core Events sent to a channel
+    it is not in are dropped by TAK with no error anywhere (nuc 2026-10-20: RAPID-SOS).
+
+    Two independent ways a new channel goes missing, so two steps:
+
+    1. The x509 group cache. Since v0.9.21 CoreConfig carries
+       x509useGroupCacheRequiresExtKeyUsage="false", so makeCert certs like this one ARE cached;
+       a channel created later reaches the cache inactive (IN and OUT), or not at all — the trap
+       _tak_sync_admin_group_cache() fixes for `admin`. Every channel's IN and OUT entries are
+       made active (inactive ones activated, missing ones added). IN is the one that decides
+       delivery — measured on test12 2026-10-20 by toggling one entry at a time: IN off / OUT on,
+       a Core Event on that channel never reaches a member; IN on / OUT off, it does. OUT is
+       kept active too, the same as the admin sync and as an uncached admin cert gets. Entries
+       for non-channels (ROLE_ADMIN, __ANON__) are passed back unchanged. One activeForce PUT
+       (TAK 5.5+) stores the list and re-authenticates the live connection.
+    2. The live connection. ROLE_ADMIN + x509assignAdminAllGroups grants "every group" only when
+       the connection AUTHENTICATES, so even an uncached cert misses later channels (test8
+       2026-10-20: live subscription missing TAKDEV-EMU, no cache entry at all). When the newest
+       subscription still lacks a channel, GET /Marti/api/groups/update/<cn> re-authenticates it
+       in place — measured on test8: same tls:5 session, 24 -> 25 channels, no reconnect.
+
+    Same rules as the admin sync: idempotent (no PUT / re-auth when converged), never-shrink (never
+    deactivates or drops an entry; a failed /groups/all read changes nothing), no-op when the cert
+    is absent or not connected, split box with a remote TAK core logs once and skips.
+    Returns {'changed', 'activated', 'added', 'reauth', 'missing'}."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[tak-groupcache-sync] {m}", flush=True)
+    res = {'changed': False, 'activated': 0, 'added': 0, 'reauth': False, 'missing': []}
+    if _tak_core_is_remote():
+        global _bootstrap_groupcache_splitbox_logged
+        if not _bootstrap_groupcache_splitbox_logged:
+            _bootstrap_groupcache_splitbox_logged = True
+            _log("split-box (TAK core on another host): bootstrap cert channel sync not supported yet — Marti is on the remote box; parked")
+        return res
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _tak_bootstrap_cert_present():
+        return res
+    channels = _tak_channel_items()
+    if not channels:
+        return res  # TAK down / fetch failed / no channels — never act on an empty list
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    base = 'https://127.0.0.1:8443/Marti/api/groups'
+    # Step 1 — the group cache.
+    enabled, _err = _tak_admin_marti_get(f'{base}/groupCacheEnabled')
+    for _pass in range(3 if (isinstance(enabled, dict) and enabled.get('data') is True) else 0):
+        data, err = _tak_admin_marti_get(f'{base}/user?username={cn}')
+        entries = data.get('data') if isinstance(data, dict) else None
+        if data is None or not entries:
+            break  # read failed, or not cached (never connected / makeCert EKU bypass): step 2 decides
+        entries = [e for e in entries if isinstance(e, dict)]
+        names = {g.get('name') for g in channels}
+        have = {(e.get('name'), e.get('direction')) for e in entries}
+        inactive = [e for e in entries if e.get('name') in names
+                    and e.get('direction') in ('IN', 'OUT') and not e.get('active')]
+        added = [dict(g, direction=d, active=True) for g in channels for d in ('IN', 'OUT')
+                 if (g.get('name'), d) not in have]
+        if not inactive and not added:
+            break
+        for e in inactive:
+            e['active'] = True
+        ok, perr = _tak_admin_marti_req(f'{base}/activeForce?username={cn}',
+                                        timeout=15, method='PUT', json_body=entries + added)
+        if ok is None:
+            _log(f"bootstrap cert activeForce PUT failed ({perr}) — cache left as-is")
+            break
+        res['changed'] = True
+        res['activated'] += len(inactive)
+        res['added'] += len(added)
+        _log(f"bootstrap cert: cache — activated {len(inactive)}, added {len(added)} channel entr(y/ies) (IN+OUT)"
+             + (f" ({', '.join(sorted({g['name'] for g in inactive + added})[:10])})" if inactive or added else '')
+             + f" (pass {_pass + 1})")
+        time.sleep(2)  # activeForce re-authenticates the live connection
+    # Step 2 — the live connection.
+    state = _tak_bootstrap_channel_state(channels)
+    if state['state'] == 'missing':
+        _ok, rerr = _tak_admin_marti_get(f'{base}/update/{cn}')
+        if _ok is None and rerr != 'empty_body':  # 200 with no body is this endpoint's success
+            _log(f"bootstrap cert re-authenticate failed ({rerr}) — still missing {len(state['missing'])} channel(s)")
+            res['missing'] = state['missing']
+            return res
+        res['changed'] = res['reauth'] = True
+        time.sleep(2)
+        after = _tak_bootstrap_channel_state(channels)
+        res['missing'] = after['missing'] if after['state'] == 'missing' else []
+        _log(f"bootstrap cert: re-authenticated its TAK connection — {len(state['missing'])} channel(s) were missing"
+             + f" ({', '.join(state['missing'][:10])})"
+             + (f"; still missing {len(res['missing'])} — retrying on the next sync" if res['missing'] else '; now in all'))
+    elif not res['changed'] and state['state'] == 'ok':
+        _log(f"bootstrap cert: live connection in all {len(channels)} channels — no change")
+    return res
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -82263,6 +82534,10 @@ def _takportal_sync_certs(plog=None, restart=False):
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             _log(f"  ⚠ Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            _log(f"  ⚠ Bootstrap cert group-cache sync (non-fatal): {_bce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -89666,6 +89941,11 @@ def _startup_migrations():
             _tak_sync_admin_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _gce:
             print(f"Startup migration: TAK group-cache sync error (non-fatal): {_gce}", flush=True)
+        # ops #127: and the CloudTAK bootstrap cert's, so Core Events reach every channel.
+        try:
+            _tak_sync_bootstrap_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _bce:
+            print(f"Startup migration: bootstrap cert group-cache sync error (non-fatal): {_bce}", flush=True)
 
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
@@ -89699,7 +89979,7 @@ def _startup_migrations():
         # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
         try:
             _start_takportal_mapsync_watchdog()
-            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+            print("Startup: TAK Portal map-channel watchdog started (channel check 1 min, full sync 10 min)", flush=True)
         except Exception as _mwe:
             print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
