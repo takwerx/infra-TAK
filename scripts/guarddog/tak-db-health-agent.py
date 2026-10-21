@@ -33,9 +33,12 @@ class DBHealthHandler(BaseHTTPRequestHandler):
 
     def _check(self):
         checks = {}
-        # PostgreSQL cluster running
+        # PostgreSQL cluster running. As postgres, like the psql below: run as this service's
+        # user (root) it connected as role "root", which does not exist, and the server logged
+        # `FATAL: role "root" does not exist` on every /health poll (ops #132).
         try:
-            r = subprocess.run([_PG_ISREADY, '-q'], capture_output=True, timeout=5)
+            r = subprocess.run(['sudo', '-u', 'postgres', _PG_ISREADY, '-q'],
+                               capture_output=True, timeout=5, cwd='/')
             checks['pg_ready'] = r.returncode == 0
         except Exception as e:
             checks['pg_ready'] = False

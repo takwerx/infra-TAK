@@ -47,6 +47,15 @@
 #     (for a DB_HOST that does not route back to itself). Its output is logged.
 #   - restarts.log gets a line when something changes or an alert goes out, not every run.
 #     The email was already capped hourly → daily; the log line was not.
+#
+# v10.2.25 (ops #132 — a split box's Server One logged `FATAL: no pg_hba.conf entry for
+# host "<its own IP>", user "root", database "root"` on every run):
+#   - pg_isready ran as the SSH user, so it connected as a ROLE of that name. There is no
+#     such role and no pg_hba line for it, and the server logs every refused connection.
+#     It now asks first as the postgres OS user over the local socket on DB_PORT (peer
+#     auth: it authenticates, so nothing is logged). Only when that is not "up" does it
+#     also ask DB_HOST:DB_PORT, and, if this SSH user cannot sudo to postgres, the local
+#     socket as itself, as before. Same livelier-answer rule.
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
@@ -91,17 +100,21 @@ SSH_DETAIL=""
 PR=""   # pg_isready rc ON Server One: 0 up, 1 rejecting (starting), 2 no response, 3 no attempt
 PG_OUT=""
 if [ "$EXTERNAL_DB" != "true" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
-  # Ask the endpoint TAK uses (DB_HOST:DB_PORT); if that is not up, ask the local socket on
-  # the same port, and keep the livelier answer (0 up > 1 rejecting > 2 no response).
+  # Ask the cluster on DB_PORT as postgres over the local socket (silent in the server log);
+  # if that is not up, ask the endpoint TAK uses (DB_HOST:DB_PORT), and without sudo to
+  # postgres also the local socket as this user. Keep the livelier answer
+  # (0 up > 1 rejecting > 2 no response). A sudo refusal is not a pg_isready answer.
   PROBE=$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
-    "H=$(printf '%q' "$DB_HOST"); P=$(printf '%q' "$DB_PORT"); "'PR=127; PO=""; \
-     if command -v pg_isready >/dev/null 2>&1; then \
-       PO=$(pg_isready -h "$H" -p "$P" 2>&1); PR=$?; \
-       if [ "$PR" != 0 ]; then \
-         LO=$(pg_isready -p "$P" 2>&1); LR=$?; \
-         if [ "$LR" = 0 ] || { [ "$LR" = 1 ] && [ "$PR" != 1 ]; }; then PR=$LR; PO=$LO; \
-         else PO="$PO / local socket: $LO"; fi; \
-       fi; \
+    "H=$(printf '%q' "$DB_HOST"); P=$(printf '%q' "$DB_PORT"); "'PR=127; PO=""; AS_PG=""; \
+     pick() { if [ "$PR" = 127 ] || [ "$2" = 0 ] || { [ "$2" = 1 ] && [ "$PR" != 1 ]; }; then PR=$2; PO=$1; \
+              else PO="$PO / $1"; fi; }; \
+     PGI=$(command -v pg_isready 2>/dev/null); \
+     if [ -n "$PGI" ]; then \
+       O=$(sudo -n -u postgres "$PGI" -p "$P" 2>&1); R=$?; \
+       case "$O" in *" - accepting"*|*" - rejecting"*|*" - no response"*|*" - no attempt"*) \
+         AS_PG=1; pick "$O" "$R" ;; esac; \
+       if [ "$PR" != 0 ]; then O=$("$PGI" -h "$H" -p "$P" 2>&1); pick "$O" "$?"; fi; \
+       if [ "$PR" != 0 ] && [ -z "$AS_PG" ]; then O=$("$PGI" -p "$P" 2>&1); pick "$O" "$?"; fi; \
      fi; \
      sudo -n -u postgres psql -lqt >/dev/null 2>&1; SU=$?; echo "SSHOK PR=$PR SU=$SU"; \
      echo "PGOUT $PO" | tr "\n" " "' 2>&1)
@@ -195,7 +208,7 @@ This is a MONITORING/ACCESS issue on Guard Dog's SSH health check — NOT a data
 outage. No restart was attempted and none is needed.
 
 Reproduce from this server:
-  ssh ${SSH_USER}@${DB_HOST} 'pg_isready -h $DB_HOST -p $DB_PORT; sudo -n -u postgres psql -lqt'
+  ssh ${SSH_USER}@${DB_HOST} 'sudo -n -u postgres pg_isready -p $DB_PORT; pg_isready -h $DB_HOST -p $DB_PORT; sudo -n -u postgres psql -lqt'
 
 Fix on Server One ($DB_HOST): ensure the Guard Dog SSH user ($SSH_USER) has
 pg_isready in PATH and passwordless sudo for the postgres user, e.g.:

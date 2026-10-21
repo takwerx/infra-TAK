@@ -17244,6 +17244,40 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     return True, 'Health agent deployed (port 8080/health for Guard Dog).'
 
 
+def _refresh_health_agent_on_server_one(s1_cfg):
+    """Guard Dog Update: replace an INSTALLED Server One health agent whose code differs from
+    this console's, and restart it. Returns (changed, message).
+
+    v10.2.25 (ops #132): only a full deploy or the agent's own button ever copied the agent, so
+    a fix to it (here: pg_isready logging `role "root" does not exist` on every poll) never
+    reached a split box on Update. Not installed -> nothing to do. No firewall changes: the
+    deploy already scoped 8080, and an Update click is not the place to re-converge it."""
+    agent_src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-db-health-agent.py')
+    if not os.path.isfile(agent_src):
+        return False, 'tak-db-health-agent.py not found'
+    with open(agent_src, 'rb') as f:
+        want = hashlib.sha256(f.read()).hexdigest()
+    dest = '/opt/tak-guarddog/tak-db-health-agent.py'
+    ok, out = _ssh_probe(s1_cfg, f'sha256sum {dest} 2>/dev/null || echo NOT_INSTALLED', timeout=15)
+    out = (out or '').strip()
+    if not ok:
+        return False, f'could not check the agent on Server One: {out[:150]}'
+    if 'NOT_INSTALLED' in out:
+        return False, 'not installed on Server One'
+    if out.split()[0:1] == [want]:
+        return False, 'already current'
+    scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/tmp/', timeout=30)
+    if not scp_ok:
+        return False, f'SCP failed: {(scp_out or "")[:150]}'
+    ok, out = _ssh_probe(s1_cfg, (
+        f'sudo mv /tmp/tak-db-health-agent.py {dest} && sudo chmod 644 {dest} && '
+        '{ command -v restorecon >/dev/null 2>&1 && sudo restorecon -F ' + dest + ' 2>/dev/null; true; } && '
+        'sudo systemctl restart tak-db-health.service && echo AGENT_OK'), timeout=30)
+    if not ok or 'AGENT_OK' not in (out or ''):
+        return False, f'restart failed: {(out or "")[:150]}'
+    return True, 'health agent updated on Server One'
+
+
 def _find_ssh_key_for_server_one(s1_cfg):
     """Return path to a usable SSH private key: from config if set and exists, else first of default paths that exists."""
     p = (s1_cfg.get('ssh_key_path') or '').strip()
@@ -23884,6 +23918,17 @@ def guarddog_update():
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
         _auto_update_guarddog()
+        # v10.2.25 (ops #132): two-server — the Server One health agent rides the Update too.
+        try:
+            _ha_cfg = _get_tak_deployment_config(load_settings())
+            _ha_s1 = _ha_cfg.get('server_one', {})
+            _ha_key = (_ha_s1.get('ssh_key_path') or '').strip()
+            if (_ha_cfg.get('mode') == 'two_server' and (_ha_s1.get('host') or '').strip()
+                    and _ha_key and os.path.exists(os.path.expanduser(_ha_key))):
+                _ha_changed, _ha_msg = _refresh_health_agent_on_server_one(_ha_s1)
+                print(f'[guarddog] Server One health agent: {_ha_msg}', flush=True)
+        except Exception as _ha_err:
+            print(f'[guarddog] Server One health agent refresh failed (non-fatal): {_ha_err}', flush=True)
         # Ensure update-check units exist and are enabled.
         # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer. It now
         # removes them — see _startup_retire_updates_timer(), which is the primary path
