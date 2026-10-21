@@ -492,7 +492,7 @@ function takPurgeFailed(){
 <span id="rotate-ca-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
 </div>
 <div id="rotate-ca-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA stays in the truststore; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA, and every earlier CA still in the truststore, stays trusted; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
 <div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
 <div id="rotate-ca-controls" style="display:none">
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">

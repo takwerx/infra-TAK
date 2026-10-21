@@ -448,7 +448,7 @@ async function rotateIntCA(){
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
   if(!/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/.test(newName)){alert('CA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-02).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
-  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected via the old CA in the truststore.\n\nContinue?'))return;
+  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected: the old CA and every earlier CA in the truststore stay trusted.\n\nContinue?'))return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
   if(isNaN(validityDays)||validityDays<1)validityDays=730;

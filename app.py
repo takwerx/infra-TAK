@@ -73521,6 +73521,205 @@ def _rotate_refresh_integrations(log):
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
 
 
+def _rotate_sh(cmd, timeout=120):
+    """Container-aware shell runner that keeps the output: (ok, stdout+stderr)."""
+    try:
+        r = subprocess.run(_rotate_tak_cert_cmd(cmd), shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+    except Exception as e:
+        return False, str(e)
+
+
+def _rotate_coreconfig_truststore(cc_text):
+    """(absolute truststoreFile, truststorePass) from CoreConfig's <tls> element, or ('', '').
+    This is the truststore TAK Server is enforcing right now. Federation has a <tls> of its own
+    (fed-truststore.jks), so read the one under <security>."""
+    sec = re.search(r'<security\b.*?</security>', cc_text or '', re.S)
+    m = re.search(r'<tls\b[^>]*>', sec.group(0) if sec else (cc_text or ''))
+    if not m:
+        return '', ''
+    f = re.search(r'\btruststoreFile="([^"]*)"', m.group(0))
+    p = re.search(r'\btruststorePass="([^"]*)"', m.group(0))
+    path = (f.group(1) if f else '').strip()
+    if path and not path.startswith('/'):
+        path = os.path.join('/opt/tak', path)
+    return path, html.unescape(p.group(1)) if p else ''
+
+
+def _pem_key(pem):
+    """The base64 body of a PEM cert, whitespace-free: equal for the same cert in any store."""
+    m = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', pem or '', re.S)
+    return re.sub(r'\s+', '', m.group(1) if m else (pem or ''))
+
+
+def _rotate_truststore_entries(ts_path, storepass, sh):
+    """[(alias, pem)] for every trustedCertEntry in a truststore, via `keytool -list -rfc`.
+    None if keytool cannot read it. sh(cmd) -> (ok, output)."""
+    ok, out = sh(f'runuser -u tak -- keytool -list -rfc -keystore {shlex.quote(ts_path)} '
+                 f'-storepass {shlex.quote(storepass)} 2>&1')
+    if not ok or 'Alias name:' not in out:
+        return None
+    entries = []
+    for block in out.split('Alias name:')[1:]:
+        alias = block.split('\n', 1)[0].strip()
+        pem = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', block, re.S)
+        if alias and pem and 'trustedCertEntry' in block:
+            entries.append((alias, pem.group(0)))
+    return entries
+
+
+def _pem_cn_and_expiry(pem):
+    """(subject CN, notAfter datetime or None) of a PEM cert, via openssl."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-enddate'], input=pem,
+                           capture_output=True, text=True, timeout=10)
+        out = r.stdout or ''
+    except Exception:
+        return '', None
+    cn = re.search(r'^subject\s*=.*?CN\s*=\s*([^,/\n]+)', out, re.M)
+    end = re.search(r'^notAfter=(.+)$', out, re.M)
+    try:
+        not_after = datetime.strptime(end.group(1).strip(), '%b %d %H:%M:%S %Y %Z') if end else None
+    except ValueError:
+        not_after = None
+    return (cn.group(1).strip() if cn else ''), not_after
+
+
+def _tak_live_certs_by_issuer(query):
+    """{issuer CN lower: count} of the client certs in TAK Server's certificate table that are
+    still live (not revoked, not expired), or None if the table can't be read.
+    query(sql) -> (ok, text), e.g. _cotdb_psql bound to the box's deployment config."""
+    ok, out = query("SELECT replace(replace(certificate, chr(13), ''), chr(10), '') FROM certificate "
+                    "WHERE revocation_date IS NULL AND (expiration_date IS NULL OR expiration_date > now())")
+    if not ok:
+        return None
+    pems = []
+    for line in (out or '').splitlines():
+        body = re.sub(r'-----(BEGIN|END) CERTIFICATE-----|\s', '', line)
+        if body:
+            pems.append('-----BEGIN CERTIFICATE-----\n'
+                        + '\n'.join(body[i:i + 64] for i in range(0, len(body), 64))
+                        + '\n-----END CERTIFICATE-----\n')
+    counts = {}
+    if not pems:
+        return counts
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.pem') as f:
+            f.write(''.join(pems))
+            f.flush()
+            p7 = subprocess.run(['openssl', 'crl2pkcs7', '-nocrl', '-certfile', f.name],
+                                capture_output=True, text=True, timeout=60)
+            r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-noout'], input=p7.stdout,
+                               capture_output=True, text=True, timeout=60)
+        if p7.returncode != 0 or r.returncode != 0:
+            return None
+    except Exception:
+        return None
+    for m in re.finditer(r'^issuer\s*=.*?CN\s*=\s*([^,/\n]+)', r.stdout or '', re.M):
+        k = m.group(1).strip().lower()
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _rotate_tak_live_certs_by_issuer():
+    try:
+        tak_cfg = _get_tak_deployment_config(load_settings())
+        return _tak_live_certs_by_issuer(lambda sql: _cotdb_psql(tak_cfg, sql))
+    except Exception:
+        return None
+
+
+def _live_count_text(live, cn):
+    if live is None:
+        return 'live cert count unknown'
+    n = live.get((cn or '').lower(), 0)
+    return f"{n} live client cert{'' if n == 1 else 's'}"
+
+
+def _rotate_carry_forward_truststore(new_ts, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
+                                     live, run, sh, log, now=None):
+    """Rotate Intermediate CA Step 5: the new truststore keeps every CA the live one trusts.
+
+    It used to get only the root, the new CA and the CA being replaced, so the CA from two
+    rotations back left the truststore and every client cert it signed (ATAK enrollments,
+    bridges, TAKX) was refused without a word (infra-TAK #204: test8 lost INT-CA-08 with 82
+    live certs). Every trusted entry of the truststore CoreConfig points at now is copied over;
+    only an expired CA is dropped, and that is logged with the live certs that still name it.
+    A CA that is no longer in the truststore is not brought back (Revoke Old CA may have removed
+    it on purpose); if live certs still depend on it, that is logged as a warning.
+    Returns the CNs of every CA in the new truststore."""
+    now = now or datetime.utcnow()
+    have = _rotate_truststore_entries(new_ts, cert_pass, sh) or []
+    have_keys = {_pem_key(p) for _, p in have}
+    have_aliases = {a.lower() for a, _ in have}
+    trusted = {_pem_cn_and_expiry(p)[0].lower() for _, p in have}
+    prev = None
+    if prev_ts and os.path.realpath(prev_ts) != os.path.realpath(new_ts):
+        prev = _rotate_truststore_entries(prev_ts, prev_pass or cert_pass, sh)
+    if prev is None:
+        log(f"  ⚠ Could not read the current truststore ({os.path.basename(prev_ts or '') or 'none'}); "
+            f"only {old_ca_name} is carried forward")
+        prev = []
+    kept, dropped = [], []
+    for alias, pem in prev:
+        key = _pem_key(pem)
+        if key in have_keys:
+            continue
+        cn, not_after = _pem_cn_and_expiry(pem)
+        if not_after and not_after < now:
+            dropped.append(alias)
+            log(f"  ⚠ Dropped {alias}: expired {not_after:%Y-%m-%d} ({_live_count_text(live, cn or alias)} signed by it)")
+            continue
+        # makeCert.sh puts each new CA in its truststore as `mykey`, so the CA being replaced
+        # clashes with the new one on every rotation: carry it under its CN, which is also the
+        # alias Revoke Old CA lists it by.
+        dest = alias
+        if dest.lower() in have_aliases and cn:
+            dest = cn
+        while dest.lower() in have_aliases:
+            dest = f'{dest}-prev'
+        if run(f'runuser -u tak -- keytool -importkeystore -srckeystore {shlex.quote(prev_ts)} '
+               f'-srcstorepass {shlex.quote(prev_pass or cert_pass)} -srcalias {shlex.quote(alias)} '
+               f'-destkeystore {shlex.quote(new_ts)} -deststorepass {shlex.quote(cert_pass)} '
+               f'-destalias {shlex.quote(dest)} -noprompt 2>&1'):
+            have_keys.add(key)
+            have_aliases.add(dest.lower())
+            trusted.add((cn or alias).lower())
+            kept.append(dest)
+        else:
+            log(f"  ⚠ Could not carry {alias} forward; {_live_count_text(live, cn or alias)} depend on it")
+    # The CA being replaced signed every client cert issued up to now: it must stay trusted
+    # even when the old truststore could not be read or did not hold it.
+    if old_ca_name.lower() not in trusted and os.path.exists(old_pem):
+        if run(f'runuser -u tak -- keytool -import -trustcacerts -file {shlex.quote(old_pem)} '
+               f'-keystore {shlex.quote(new_ts)} -alias {shlex.quote(old_ca_name)} '
+               f'-deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'):
+            trusted.add(old_ca_name.lower())
+            kept.append(old_ca_name)
+    if old_ca_name.lower() not in trusted:
+        log(f"  ⚠ {old_ca_name} is NOT in the new truststore; {_live_count_text(live, old_ca_name)} depend on it")
+    log(f"  Carried forward: {', '.join(kept) if kept else 'none'}")
+    for cn, n in sorted((live or {}).items()):
+        if n and cn not in trusted:
+            log(f"  ⚠ {n} live client cert{'' if n == 1 else 's'} signed by {cn}, which is not in the truststore: "
+                f"those clients are refused. Not re-added (Revoke Old CA may have removed it); "
+                f"re-import its .pem if it was dropped by mistake")
+    return trusted
+
+
+def _rotate_log_dropped_cas(ts_path, storepass, live, sh, log):
+    """Rotate Root CA replaces the whole PKI, so every CA in the live truststore goes. Say which,
+    and how many live client certs each one signed, before the cert dir is wiped."""
+    entries = _rotate_truststore_entries(ts_path, storepass, sh) if ts_path else None
+    if entries is None:
+        log(f"  ⚠ Could not read the current truststore ({os.path.basename(ts_path or '') or 'none'})")
+        return
+    log("  CAs leaving the truststore (their clients must re-enroll):")
+    for alias, pem in entries:
+        cn = _pem_cn_and_expiry(pem)[0] or alias
+        log(f"    {alias}: {_live_count_text(live, cn)}")
+
+
 @app.route('/api/takserver/rotate-intca', methods=['POST'])
 @login_required
 def takserver_rotate_intca():
@@ -73671,13 +73870,17 @@ def takserver_rotate_intca():
                 f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
-            if os.path.exists(old_pem):
-                run(f'runuser -u tak -- keytool -import -trustcacerts -file {old_pem} '
-                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
-                    check=False)
-                log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
-            else:
-                log(f"  ⚠ {old_ca_name}.pem not found — old CA NOT added to truststore")
+            try:
+                prev_ts, prev_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
+            except Exception:
+                prev_ts, prev_pass = '', ''
+            if not prev_ts:
+                prev_ts = os.path.join(cert_dir, f'truststore-{old_ca_name}.jks')
+            live = _rotate_tak_live_certs_by_issuer()
+            if live is None:
+                log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
+            _rotate_carry_forward_truststore(ts_jks, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
+                                             live, run, _rotate_sh, log)
             log("✓ Truststore updated")
 
             log("")
@@ -73724,7 +73927,7 @@ def takserver_rotate_intca():
             log("━━━ ROTATION COMPLETE ━━━")
             log(f"  New CA: {new_ca_name}")
             log(f"  Server cert + all client certs signed by new CA")
-            log(f"  Old CA ({old_ca_name}) in truststore — server still accepts old client certs during transition")
+            log(f"  Old CA ({old_ca_name}) and earlier CAs kept in truststore — server still accepts their client certs")
             log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
             log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
@@ -73904,6 +74107,14 @@ def takserver_rotate_rootca():
             log(f"  Old Intermediate CA: {old_int_name}")
             log(f"  New Root CA: {new_root_name}")
             log(f"  New Intermediate CA: {new_int_name}")
+            try:
+                _ts, _ts_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
+            except Exception:
+                _ts, _ts_pass = '', ''
+            _live = _rotate_tak_live_certs_by_issuer()
+            if _live is None:
+                log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
+            _rotate_log_dropped_cas(_ts, _ts_pass or cert_pass, _live, _rotate_sh, log)
             log("")
 
             log("Step 1/8: Removing old certificate files...")
