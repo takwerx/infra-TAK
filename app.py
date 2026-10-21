@@ -60776,6 +60776,8 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
                 if not nxt:
                     continue
                 n = max(nxt, key=lambda s: _subscription_num(s['uid']))
+                if n['callsign'] == n['uid']:   # no callsign until its first position report
+                    n = dict(n, callsign=d['callsign'])
                 if n['groups']:
                     healed.append(n)
                     waiting.pop(uid)

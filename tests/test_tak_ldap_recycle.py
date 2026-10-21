@@ -158,7 +158,7 @@ class Box:
                 cn = old['_cn']
                 g = self._tak_lookup(cn)
                 new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'], unmapped=not g),
-                           callsign=old['callsign'])
+                           callsign=f'tls:{self.next_uid}')     # no callsign before its first SA
                 self.next_uid += 1
                 self.reconnects.append((self.t + 15, new))
             return {'data': f'Successfully deleted subscription with uid: {uid}'}, None
