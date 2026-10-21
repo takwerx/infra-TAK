@@ -367,5 +367,10 @@ def test_monitor_does_not_heal_when_nothing_was_recreated(load):
 def test_callers_are_wired():
     monitor = _segment('_authentik_spiral_monitor')
     assert 'quiet_repeats=True' in monitor
-    assert monitor.count('_spiral_monitor_tak_recycle(') == 2   # after the proactive and the reactive pass
+    # GH #207: after the proactive pass the heal check runs every tick (it covers that pass's
+    # own outpost moves too); the reactive repair still heals straight after itself
+    assert monitor.count('_spiral_monitor_tak_recycle(') == 1
+    periodic = monitor.index("_tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)")
+    assert monitor.index('_ensure_authentik_ldap_outpost_on_fqdn(_mon_log') < periodic \
+        < monitor.index('_spiral_monitor_tak_recycle(')
     assert "_ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()), force=True)" in APP

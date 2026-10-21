@@ -61315,6 +61315,26 @@ def _docker_started_epoch(container):
     return _epoch_from_rfc3339(parts[1])
 
 
+# GH #207: Guard Dog's tak-authentik-watch.sh restarts Authentik on its own (HTTP down, or
+# an LDAP flow herd) and appends the epoch of each restart here (_record_restart, root,
+# 0644). Its first restart in 6 h touches only server+worker, so the outpost's start time
+# doesn't move, but LDAP lookups still fail while the server is down. Field: a restart ~35
+# min after a console update left Node-RED feeds and devices on __ANON__ and nothing healed
+# them.
+_GD_AUTHENTIK_RESTART_HIST = '/var/lib/takguard/authentik_restart_history'
+
+
+def _guarddog_authentik_restart_epoch():
+    """When Guard Dog last restarted Authentik (epoch seconds), or None (none recorded,
+    Guard Dog not installed, file unreadable)."""
+    try:
+        with open(_GD_AUTHENTIK_RESTART_HIST) as f:
+            stamps = [int(l.split()[0]) for l in f if l.strip() and l.split()[0].isdigit()]
+    except (OSError, ValueError):
+        return None
+    return float(max(stamps)) if stamps else None
+
+
 def _tak_started_epoch():
     """When the local TAK Server last started (epoch seconds), or None if it isn't running."""
     if _tak_is_container():
@@ -61444,16 +61464,18 @@ def _tak_device_usernames():
             if isinstance(e, dict) and e.get('uid') and e.get('username')}
 
 
-def _tak_client_sessions(devices=None):
+def _tak_client_sessions(devices=None, errs=None):
     """TAK's live cert-authenticated streaming connections (tls/ssl: ATAK, WinTAK, CloudTAK
     users, service certs) as {uid, cn, client, callsign, username, groups}; `groups` is
     every group name in either direction minus __ANON__. `cn` is the cert DN's CN, else
     TAK's username, else the device's last username from `devices` — so it is there even
     when TAK couldn't match the cert to a user. `unnamed` = TAK put neither a DN nor a
-    username on it. None when the Marti API can't be read."""
-    data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
+    username on it. None when the Marti API can't be read (why goes into `errs`)."""
+    data, err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
     subs = data.get('data') if isinstance(data, dict) else None
     if not isinstance(subs, list):
+        if errs is not None:
+            errs.append(err or 'no subscription list in the answer')
         return None
     out = []
     for s in subs:
@@ -61469,6 +61491,38 @@ def _tak_client_sessions(devices=None):
                     'callsign': s.get('callsign') or uid, 'username': s.get('username') or None,
                     'unnamed': not (m or s.get('username')), 'groups': groups})
     return out
+
+
+# GH #207: one unanswered read of the client list went straight to a TAK restart. Field
+# (Amos, v10.2.23 → v10.2.24): LDAP had just settled after the update's Authentik restart
+# and the subscriptions call didn't answer in time; TAK was restarted although its API was
+# only briefly busy. The read is now retried, backing off, for this long before the heal
+# gives up on it.
+_TAK_MARTI_READ_WAIT_S = 300
+_TAK_MARTI_READ_RETRY_MAX_S = 60
+
+
+def _tak_client_sessions_wait(plog, tag):
+    """`_tak_client_sessions`, retried 10, 20, 40, then every 60 s for up to
+    `_TAK_MARTI_READ_WAIT_S`. Returns (sessions, None), or (None, the last error)."""
+    t0 = time.time()
+    delay, retried = 10, False
+    while True:
+        errs = []
+        sessions = _tak_client_sessions(errs=errs)
+        if sessions is not None:
+            if retried:
+                plog(f"  {tag}: TAK Server's Marti API answered after {int(time.time() - t0)}s")
+            return sessions, None
+        err = errs[-1] if errs else 'no answer'
+        left = _TAK_MARTI_READ_WAIT_S - (time.time() - t0)
+        if left <= 0:
+            return None, err
+        wait = int(min(delay, left))
+        plog(f"  {tag}: can't read TAK Server's client connections yet (Marti API: {err}) — "
+             f"trying again in {wait}s")
+        time.sleep(wait)
+        delay, retried = min(delay * 2, _TAK_MARTI_READ_RETRY_MAX_S), True
 
 
 def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
@@ -61498,9 +61552,10 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     back empty again, as a user LDAP has groups for or with no user at all, with LDAP
     healthy: TAK's own LDAP path is bad, restart TAK) or
     'unknown' (couldn't read TAK or LDAP)."""
-    sessions = _tak_client_sessions()
+    sessions, err = _tak_client_sessions_wait(plog, tag)
     if sessions is None:
-        return 'unknown', "can't read TAK Server's client connections (Marti API)"
+        return 'unknown', (f"can't read TAK Server's client connections (Marti API: {err}) "
+                           f"for {_TAK_MARTI_READ_WAIT_S // 60} min")
     devices = {}
     if any(not s['cn'] and s['client'] for s in sessions):
         devices = _tak_device_usernames()
@@ -61549,7 +61604,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         _reauth(sessions)  # still cycles any dead pooled LDAP connections before the next login
         return 'ok', f"all {len(sessions)} streaming (8089) client connection(s) have their groups"
 
-    healed, gone, undroppable, no_ldap_groups = [], [], [], []
+    healed, gone, undroppable, no_ldap_groups, blind = [], [], [], [], []
     for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
         if _reauth(sessions if rnd == 1 else owed):
             time.sleep(3)
@@ -61571,7 +61626,11 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
                  + ', '.join(_label(s) for s in dropped[:15]) + (' …' if len(dropped) > 15 else ''))
         # Wait for each dropped client's NEXT connection (same cert CN, same device uid when
         # it had one; only the device uid when nothing named it) and judge that one.
-        waiting = {s['uid']: s for s in dropped}
+        # GH #207: one with neither (a Node-RED feed TAK's lookup failed for has no user and
+        # no device uid) can't be told apart from any other new connection, so it isn't
+        # waited for; it reconnects by itself and is looked up again like any other.
+        blind += [s for s in dropped if not (s['cn'] or s['client'])]
+        waiting = {s['uid']: s for s in dropped if s['cn'] or s['client']}
         back = {}
         t0 = time.time()
         while waiting and time.time() - t0 < _TAK_LDAP_HEAL_WAIT_S:
@@ -61614,6 +61673,9 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     if gone:
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
+    if blind:
+        parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
+                     "they reconnect by themselves and are looked up again")
     if no_ldap_groups:
         parts.append(f"{len(no_ldap_groups)} reconnected as user(s) LDAP gives no TAK groups, left as is: "
                      + ', '.join(_label(s) for s in no_ldap_groups[:15]))
@@ -61839,7 +61901,9 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
       - a pending `_tak_ldap_recycle_request` made after TAK last started;
       - (`check_outpost`) the local outpost having (re)started at least
         `_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S` after TAK did — this is also the one-time
-        catch-up for boxes already on v10.2.23 whose outpost was recreated under TAK.
+        catch-up for boxes already on v10.2.23 whose outpost was recreated under TAK;
+      - (`check_outpost`) Guard Dog having restarted Authentik that long after TAK started
+        (GH #207; the console's 10-min monitor checks for both).
     While a console update is still running, a non-`final` caller only records its reasons;
     the update's own final call carries them out after every other Authentik step.
     Verifies SA bind + memberOf first and never heals or restarts into a broken LDAP.
@@ -61852,7 +61916,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         need_groups = bool(st.get('need_groups', True)) if pending else True
         must_restart = False
 
-        def _finish(outcome, keep=None, healed_ldap_start=None):
+        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None):
             try:
                 s = load_settings()
                 cur = dict(s.get('tak_ldap_recycle') or {})
@@ -61867,6 +61931,8 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                         cur.pop(k, None)
                 if healed_ldap_start is not None:
                     cur['healed_ldap_start'] = healed_ldap_start
+                if healed_gd_restart is not None:
+                    cur['healed_gd_restart'] = healed_gd_restart
                 cur.update({'last_outcome': outcome, 'last_trigger': trigger,
                             'last_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')})
                 s['tak_ldap_recycle'] = cur
@@ -61891,7 +61957,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 must_restart = bool(st.get('restart'))
             else:
                 plog(f"  {tag}: TAK Server already restarted after: {'; '.join(pending)} — reusing that restart")
-        ldap_start = None
+        ldap_start = gd_restart = None
         if check_outpost:
             ldap_start = _docker_started_epoch('authentik-ldap-1')
             # Once healed for a given outpost start, that start is done with — every later
@@ -61900,6 +61966,14 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     and ldap_start > float(st.get('healed_ldap_start') or 0) + 1):
                 up = int(ldap_start - tak_start)
                 reasons.append(f"LDAP outpost restarted while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+            # Only with a local outpost: with remote Authentik a local Guard Dog restart
+            # history says nothing about the LDAP TAK uses.
+            gd_restart = _guarddog_authentik_restart_epoch() if ldap_start is not None else None
+            if (gd_restart is not None and gd_restart - tak_start >= _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                    and gd_restart > float(st.get('healed_gd_restart') or 0) + 1):
+                up = int(gd_restart - tak_start)
+                reasons.append(f"Guard Dog restarted Authentik while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+        reasons = list(dict.fromkeys(reasons))   # a kept reason is also found again above
         if not reasons:
             if pending:
                 _finish('not needed')
@@ -61917,11 +61991,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         if not ldap_pass or not _ensure_ldapsearch():
             plog(f"  ✗ {tag}: can't check LDAP (no ldapsearch or no adm_ldapservice password) — TAK Server "
                  f"NOT restarted. If clients show no groups, restart TAK Server once.")
-            _finish('skipped: LDAP not checkable')
+            # said once per outage: the 10-min monitor would otherwise repeat it every tick
+            _finish('skipped: LDAP not checkable', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
             return False
         if not _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'before healing TAK clients', tag=tag):
             plog(f"  ✗ {tag}: LDAP is not healthy — TAK clients NOT healed, TAK Server NOT restarted (it "
-                 f"would reload the same broken LDAP). Kept pending: the next console start retries.")
+                 f"would reload the same broken LDAP). Kept pending: the console retries within 10 min.")
             _finish('deferred: LDAP not healthy', keep=reasons)
             return False
 
@@ -61943,11 +62018,11 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             outcome = 'clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
             if api_verdict == 'ok':
                 plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
-                _finish(outcome, healed_ldap_start=ldap_start)
+                _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
             if api_verdict == 'unknown':
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
-                _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start)
+                _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
             plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
                  f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
@@ -65906,12 +65981,18 @@ def _authentik_spiral_monitor():
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
             _mon_log = lambda m: print(f"[spiral monitor] {m}", flush=True)
-            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
             try:
                 _ensure_authentik_ldap_outpost_on_fqdn(_mon_log, quiet_repeats=True)
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
-            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
+            # GH #207: every tick, not only after this pass moved the outpost. Guard Dog's
+            # authentik-watch restarts Authentik on its own, and a request kept because LDAP
+            # wasn't healthy yet waited for the next console start. Silent and cheap when
+            # there is nothing to heal (two start times, one file).
+            try:
+                _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
+            except Exception as _tr_e:
+                print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
 
             s = load_settings()
 
@@ -65929,7 +66010,7 @@ def _authentik_spiral_monitor():
             print(f"[spiral monitor] running idempotent routing repair...", flush=True)
             _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
             _apply_authentik_ldap_routing_repair(ak_dir, _mon_log)
-            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)   # now, not at the next tick
         except Exception as e:
             try:
                 print(f"[spiral monitor] iteration error (will retry in 10 min): {e}", flush=True)
