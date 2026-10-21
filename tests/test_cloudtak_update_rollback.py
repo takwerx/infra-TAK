@@ -41,7 +41,7 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _FUNCS = {
     '_cloudtak_running_version', '_cloudtak_snapshot_images', '_cloudtak_restore_images',
     '_cloudtak_rollback_after_failed_up', '_cloudtak_prefetch_build_data',
-    '_cloudtak_drop_build_data',
+    '_cloudtak_drop_build_data', '_cloudtak_rollback_ref', '_cloudtak_drop_rollback_pins',
 }
 DOCKERFILE = '''FROM alpine:3.24 AS data
 
@@ -88,21 +88,19 @@ class Urlopen:
 
 
 class Run:
-    """Stand-in for subprocess.run: records argv, answers `docker inspect` from a table."""
-    def __init__(self, inspect_out='', tag_rc=0, running='true'):
-        self.calls, self.inspect_out, self.tag_rc, self.running = [], inspect_out, tag_rc, running
+    """Stand-in for subprocess.run: records argv, answers `docker inspect`/`exec` from a table."""
+    def __init__(self, inspect_out='', tag_rc=0, version='13.109.3'):
+        self.calls, self.inspect_out, self.tag_rc, self.version = [], inspect_out, tag_rc, version
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
         out, rc = '', 0
-        if argv[:2] == ['docker', 'inspect'] and '{{.State.Running}}' in argv:
-            out = self.running
-        elif argv[:2] == ['docker', 'inspect']:
+        if argv[:2] == ['docker', 'inspect']:
             out = self.inspect_out
         elif argv[:2] == ['docker', 'tag']:
             rc = self.tag_rc
         elif argv[:2] == ['docker', 'exec']:
-            out = '13.109.3'
+            out = self.version
         return type('R', (), {'returncode': rc, 'stdout': out, 'stderr': ''})()
 
 
@@ -220,20 +218,39 @@ def test_drop_build_data_removes_the_zip(ct):
 # image snapshot / restore / rollback
 # --------------------------------------------------------------------------- #
 
-def test_snapshot_keeps_only_locally_built_images(ct):
-    run = Run(inspect_out=f'cloudtak-api {API_ID}\ncloudtak-events {EV_ID}\n'
+def test_snapshot_keeps_only_locally_built_images_and_pins_them(ct):
+    run = Run(inspect_out=f'cloudtak-api {API_ID}\ncloudtak-events:latest {EV_ID}\n'
                           f'postgis/postgis:17-3.6-alpine sha256:{"c" * 64}\n'
                           f'dxflrs/garage:v2.4.1 sha256:{"d" * 64}\n')
     snap = _ns(run=run)['_cloudtak_snapshot_images'](str(ct))
-    assert snap == [('cloudtak-api', API_ID), ('cloudtak-events', EV_ID)]
+    assert snap == [('cloudtak-api', API_ID), ('cloudtak-events:latest', EV_ID)]
+    # Docker 29's containerd store deletes an untagged image once its container is replaced
+    # (box test, ops #129) — the old images must hold a real tag until the update is over.
+    assert ['docker', 'tag', API_ID, 'cloudtak-api:infratak-rollback'] in run.calls
+    assert ['docker', 'tag', EV_ID, 'cloudtak-events:infratak-rollback'] in run.calls
+    assert not [c for c in run.calls if c[:2] == ['docker', 'tag'] and 'postgis' in ' '.join(c)]
 
 
-def test_restore_points_each_tag_back(ct):
+def test_an_image_that_cannot_be_pinned_is_not_in_the_snapshot(ct):
+    run = Run(inspect_out=f'cloudtak-api {API_ID}\n', tag_rc=1)
+    assert _ns(run=run)['_cloudtak_snapshot_images'](str(ct)) == []
+
+
+def test_restore_points_each_tag_back_then_drops_the_pins(ct):
     run, log = Run(), []
-    n = _ns(run=run)['_cloudtak_restore_images']([('cloudtak-api', API_ID), ('cloudtak-events', EV_ID)], log.append)
-    assert n == 2
-    assert ['docker', 'tag', API_ID, 'cloudtak-api'] in run.calls
+    ok = _ns(run=run)['_cloudtak_restore_images']([('cloudtak-api', API_ID), ('cloudtak-events', EV_ID)], log.append)
+    assert ok
+    i_tag = run.calls.index(['docker', 'tag', API_ID, 'cloudtak-api'])
     assert ['docker', 'tag', EV_ID, 'cloudtak-events'] in run.calls
+    i_rm = run.calls.index(['docker', 'image', 'rm', 'cloudtak-api:infratak-rollback'])
+    assert i_tag < i_rm
+
+
+def test_a_failed_restore_keeps_the_pins_and_says_so(ct):
+    run, log = Run(tag_rc=1), []
+    assert _ns(run=run)['_cloudtak_restore_images']([('cloudtak-api', API_ID)], log.append) is False
+    assert not [c for c in run.calls if c[:3] == ['docker', 'image', 'rm']]
+    assert any('Could not point cloudtak-api back' in l for l in log)
 
 
 def test_rollback_reverts_tree_then_tags_then_starts_without_building(ct):
@@ -250,12 +267,34 @@ def test_rollback_reverts_tree_then_tags_then_starts_without_building(ct):
         return real_compose(d, args, timeout)
     ns['_cloudtak_compose_run'] = _c
     log = []
-    ok = ns['_cloudtak_rollback_after_failed_up'](str(ct), 'f' * 40, [('cloudtak-api', API_ID)], log.append)
+    ok = ns['_cloudtak_rollback_after_failed_up'](str(ct), 'f' * 40, [('cloudtak-api', API_ID)], log.append,
+                                                  expect_version='13.109.3')
     assert ok, log
     assert order == ['revert', 'tags', 'up']
     assert ['up', '-d', '--no-build'] in compose.calls
     assert ['up', '-d'] not in compose.calls                   # never a plain up (would build/recreate new)
-    assert any('running on the previous version' in l for l in log)
+    assert any('running on the previous version again (13.109.3)' in l for l in log)
+
+
+def test_rollback_is_judged_by_the_version_actually_running(ct):
+    # Box test, first cut: "running on the previous version" was printed while the NEW images
+    # served — the check only asked whether api was up.
+    ns = _ns(run=Run(version='13.111.3'))
+    ns['_cloudtak_revert_checkout'] = lambda *a, **k: True
+    log = []
+    assert ns['_cloudtak_rollback_after_failed_up'](str(ct), 'f' * 40, [('cloudtak-api', API_ID)], log.append,
+                                                    expect_version='13.109.3') is False
+    assert any('running 13.111.3, not the previous 13.109.3' in l for l in log)
+    assert not any('previous version again' in l for l in log)
+
+
+def test_rollback_does_not_start_anything_when_an_old_image_is_missing(ct):
+    compose = Compose()
+    ns = _ns(compose=compose, run=Run(tag_rc=1))
+    ns['_cloudtak_revert_checkout'] = lambda *a, **k: True
+    log = []
+    assert ns['_cloudtak_rollback_after_failed_up'](str(ct), 'f' * 40, [('cloudtak-api', API_ID)], log.append) is False
+    assert not [c for c in compose.calls if c[:1] == ['up']]   # would start NEW images on the OLD tree
 
 
 def test_rollback_without_a_snapshot_does_not_touch_anything(ct):
@@ -291,17 +330,25 @@ def _update_body():
     return re.sub(r'#.*', '', body[:body.index('\ndef ', 1)])
 
 
-def test_update_snapshots_and_prefetches_before_the_build():
+def test_update_prefetches_then_snapshots_before_the_build():
     b = _update_body()
-    i_snap = b.index('_ct_snap = _cloudtak_snapshot_images(cloudtak_dir)')
     i_pre = b.index('_cloudtak_prefetch_build_data(cloudtak_dir, plog)')
+    i_snap = b.index('_ct_snap = _cloudtak_snapshot_images(cloudtak_dir)')
     i_build = b.index("f'{dcc} build --no-cache'")
-    assert i_snap < i_pre < i_build
+    assert i_pre < i_snap < i_build          # a failed prefetch leaves no rollback pins behind
     assert "' --build-arg USE_LOCAL_ZIP=true' if _use_local_zip" in b
     # a failed prefetch stops before anything is built and reverts the checkout
-    stop = b[i_pre:i_build]
+    stop = b[i_pre:i_snap]
     assert '_cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)' in stop
     assert 'return' in stop
+
+
+def test_a_successful_update_drops_the_rollback_pins():
+    b = _update_body()
+    i_up = b.index("_cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)")
+    i_ok = b.index('plog("✓ Containers rebuilt and restarted")')
+    assert '_cloudtak_drop_rollback_pins(_ct_snap)' in b[i_up:i_ok]
+    assert 'expect_version=from_ver' in b[i_up:i_ok]
 
 
 def test_every_local_failure_after_the_build_puts_the_image_tags_back():
@@ -313,7 +360,7 @@ def test_every_local_failure_after_the_build_puts_the_image_tags_back():
     # up -d failed: the full rollback, and the reason on the ✗ line
     i_up = tail.index("_cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)")
     after = tail[i_up:]
-    assert '_cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog)' in after
+    assert '_cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog,' in after
     assert '_why = _update_error_line(_uout)' in after
     assert after.index('_cloudtak_rollback_after_failed_up(') < after.index("plog(\"✓ Containers rebuilt and restarted\")")
 

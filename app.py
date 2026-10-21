@@ -45490,11 +45490,12 @@ def _cloudtak_update_failed_note(plog):
     plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
-def _cloudtak_running_version(cloudtak_dir):
+def _cloudtak_running_version(cloudtak_dir, container_only=False):
     """The CloudTAK version the api container is RUNNING, else the tree's api/package.json.
 
     ops #129: the container first, because a failed update can leave the tree at a newer tag
-    than the images that are serving. Never raises; '' when neither answers."""
+    than the images that are serving. container_only: never fall back to the tree (a rollback
+    check — the tree is reverted, so it would always "match"). Never raises; '' = no answer."""
     try:
         rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-q', 'api'], timeout=30)
         cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
@@ -45507,6 +45508,8 @@ def _cloudtak_running_version(cloudtak_dir):
                 return v
     except Exception:
         pass
+    if container_only:
+        return ''
     try:
         with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
             v = str((json.load(f) or {}).get('version') or '').strip()
@@ -45515,14 +45518,26 @@ def _cloudtak_running_version(cloudtak_dir):
         return ''
 
 
+_CT_ROLLBACK_TAG = 'infratak-rollback'
+
+
+def _cloudtak_rollback_ref(ref):
+    """cloudtak-api[:latest] -> cloudtak-api:infratak-rollback (refs here never carry a registry)."""
+    return ref.rsplit(':', 1)[0] + ':' + _CT_ROLLBACK_TAG
+
+
 def _cloudtak_snapshot_images(cloudtak_dir):
-    """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now.
+    """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now,
+    each pinned under a `:infratak-rollback` tag so it still exists when it is needed.
 
     ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
     old containers keep serving by image ID, but the moment anything recreates them (a failed
     or partial `up -d`, the next boot heal) they come back on the NEW image with the OLD
-    compose. Taking these refs back is what makes a rollback a rollback. Registry images
-    (postgis, media, garage — refs with a '/') are pinned by tag and left alone."""
+    compose. Taking these refs back is what makes a rollback a rollback. The pin is required:
+    with Docker's containerd image store (default since Docker 29) an image that has lost its
+    tag is deleted as soon as its last container is replaced — measured on the box test, every
+    old image was gone the moment `up -d` recreated its container. Registry images (postgis,
+    media, garage — refs with a '/') are pinned by tag already and left alone."""
     snap = []
     try:
         rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-a', '-q'], timeout=60)
@@ -45538,58 +45553,85 @@ def _cloudtak_snapshot_images(cloudtak_dir):
             ref, iid = parts
             if ('/' not in ref and _CT_IMAGE_REF_RE.match(ref)
                     and re.fullmatch(r'sha256:[0-9a-f]{64}', iid) and (ref, iid) not in snap):
-                snap.append((ref, iid))
+                p = subprocess.run(_sudo_wrap(['docker', 'tag', iid, _cloudtak_rollback_ref(ref)]),
+                                   capture_output=True, text=True, timeout=60)
+                if p.returncode == 0:
+                    snap.append((ref, iid))
     except Exception:
         pass
     return snap
 
 
+def _cloudtak_drop_rollback_pins(snap):
+    """Remove the `:infratak-rollback` tags (only the tag — an image still tagged or in use
+    stays). Never raises."""
+    for ref, _iid in snap or []:
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'image', 'rm', _cloudtak_rollback_ref(ref)]),
+                           capture_output=True, text=True, timeout=120)
+        except Exception:
+            pass
+
+
 def _cloudtak_restore_images(snap, plog):
-    """Point each snapshotted ref back at the image it named before the build. Never raises."""
-    n = 0
+    """Point each snapshotted ref back at the image it named before the build, then drop the
+    rollback pins. Returns True only if EVERY ref was put back. Never raises."""
+    n, ok = 0, True
     for ref, iid in snap or []:
         try:
             r = subprocess.run(_sudo_wrap(['docker', 'tag', iid, ref]), capture_output=True, text=True, timeout=60)
             if r.returncode == 0:
                 n += 1
             else:
+                ok = False
                 plog(f"  ⚠ Could not point {ref} back at the previous image: {(r.stderr or '').strip()[:160]}")
         except Exception as e:
+            ok = False
             plog(f"  ⚠ Could not point {ref} back at the previous image: {str(e)[:160]}")
     if n:
         plog(f"↩ Image tags put back on the previous build ({n} image(s))")
-    return n
+    if ok:
+        _cloudtak_drop_rollback_pins(snap)
+    return ok
 
 
-def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog):
+def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expect_version=''):
     """ops #129: the build succeeded, then `docker compose up -d` failed. Put the WHOLE stack
     back on the previous version — tree, image tags, and any container the failed `up -d`
     already replaced — instead of leaving the new tree over the old containers.
 
     Order: revert the tree, re-tag the old images, then `up -d --no-build` from the reverted
     compose. Containers `up -d` never reached match that compose + image exactly and are left
-    running untouched; any it stopped or replaced are recreated from the old image.
-    Returns True when the api container is running afterwards. Never raises."""
+    running untouched; any it stopped or replaced are recreated from the old image. If any old
+    image cannot be put back, `up -d` is NOT run (it would start new images on the old tree).
+    Returns True only when the api container is running `expect_version` (when known).
+    Never raises."""
     try:
         if not snap:
             plog("  ⚠ No record of the previous images — cannot roll the containers back")
             return False
         _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
-        _cloudtak_restore_images(snap, plog)
+        if not _cloudtak_restore_images(snap, plog):
+            plog("  ⚠ Not every previous image could be put back — containers left as they are")
+            return False
         rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d', '--no-build'], timeout=900)
         if rc != 0:
             plog(f"  ⚠ Restarting the previous CloudTAK failed too: {_update_error_line(out) or out.strip()[-300:]}")
             return False
-        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-q', 'api'], timeout=60)
-        cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
-        if re.fullmatch(r'[0-9a-f]{12,64}', cid):
-            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', cid]),
-                               capture_output=True, text=True, timeout=30)
-            if (r.stdout or '').strip() == 'true':
-                plog("↩ CloudTAK is running on the previous version again")
-                return True
-        plog("  ⚠ The previous CloudTAK did not come back up — check the CloudTAK page")
-        return False
+        running = ''
+        for _i in range(6):                  # the api container needs a moment to answer exec
+            running = _cloudtak_running_version(cloudtak_dir, container_only=True)
+            if running:
+                break
+            time.sleep(5)
+        if not running:
+            plog("  ⚠ The previous CloudTAK did not come back up — check the CloudTAK page")
+            return False
+        if expect_version and running != expect_version:
+            plog(f"  ⚠ CloudTAK is running {running}, not the previous {expect_version} — check the CloudTAK page")
+            return False
+        plog(f"↩ CloudTAK is running on the previous version again ({running})")
+        return True
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
         return False
@@ -45958,8 +46000,6 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            # ops #129: what is serving NOW, so any failure from here on can put it back.
-            _ct_snap = _cloudtak_snapshot_images(cloudtak_dir)
             # ops #129: fetch the map-data zip on the host with retries; a dropped download
             # inside the build used to fail it after the long npm steps. Nothing is built or
             # stopped yet, so a failure here leaves CloudTAK exactly as it was.
@@ -45974,6 +46014,8 @@ def run_cloudtak_update():
                 plog("  then press Update again.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #129: what is serving NOW (pinned), so any failure from here on can put it back.
+            _ct_snap = _cloudtak_snapshot_images(cloudtak_dir)
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
@@ -46062,11 +46104,13 @@ def run_cloudtak_update():
                 _why = _update_error_line(_uout) or f'exit code {_urc}'
                 plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}: {_why}")
                 if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap)
                     plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
                     plog("  which the previous version cannot read. Fix the cause above and press Update again.")
                 else:
                     _undo_plugin_moves()
-                    if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog):
+                    if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver):
                         plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
                     else:
                         plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
@@ -46074,6 +46118,7 @@ def run_cloudtak_update():
                     plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap)
         plog("✓ Containers rebuilt and restarted")
         # Converge the postgis role password to .env BEFORE declaring success — the
         # rebuild restarts the API, which is exactly when a latent password mismatch
