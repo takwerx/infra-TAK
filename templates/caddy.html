@@ -108,6 +108,27 @@
 </div>
 </div>
 </details>
+<details id="caddy-ports-section" style="margin-bottom:24px"{% if caddy_https_port != 443 or caddy_http_port != 80 %} open{% endif %}>
+<summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--text-secondary);padding:12px 0;user-select:none">Ports <span style="font-size:11px;color:var(--text-dim);font-weight:400">— HTTPS {{ caddy_https_port }} · HTTP {{ caddy_http_port }}{% if caddy_https_port != 443 or caddy_http_port != 80 %} (custom){% endif %}</span></summary>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-top:8px">
+<div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+<div style="flex:1;min-width:140px"><label class="input-label">HTTPS port</label>
+<input type="number" min="1" max="65535" id="caddy-https-port" class="input-field" value="{{ caddy_https_port }}" placeholder="443"></div>
+<div style="flex:1;min-width:140px"><label class="input-label">HTTP port <span style="color:var(--text-dim);font-weight:400">(redirect + ACME)</span></label>
+<input type="number" min="1" max="65535" id="caddy-http-port" class="input-field" value="{{ caddy_http_port }}" placeholder="80"></div>
+<button onclick="saveCaddyPorts()" id="save-ports-btn" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Save &amp; Restart Caddy</button>
+<button onclick="resetCaddyPorts()" class="control-btn">Back to 443 / 80</button>
+</div>
+<div id="save-ports-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:10px;white-space:pre-wrap"></div>
+<div style="margin-top:12px;padding:12px 16px;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.6">
+<strong style="color:var(--yellow)">⚠ Only change these if you know you need to</strong> — for example, another program on this server already uses 443 or 80. With a moved port:
+<br>• Every link becomes <span style="font-family:'JetBrains Mono',monospace">https://name:PORT</span>. Users, bookmarks, TAK clients and QR codes must use the new port.
+<br>• <strong style="color:var(--text-primary)">Let's Encrypt only checks the standard ports 80/443.</strong> Use a Custom Certificate, or have your router/firewall forward public 80 → the HTTP port (and 443 → the HTTPS port). Otherwise certificates will not issue or renew.
+<br>• Modules that save their own copy of a URL (TAK Portal's public URL, NetBird, Remote Assist, ATLAS, CloudTAK) keep the old one until you update or redeploy them. Setting the ports before deploying other modules avoids this.
+<br>• Allow the new ports in any cloud security group or router in front of this server.
+</div>
+</div>
+</details>
 <div class="section-title">SSL Certificate</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 {% set _sslmode = settings.get('ssl_mode','') %}
@@ -234,6 +255,22 @@
 </div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.5">Validated (key match, not expired, hostname coverage) before deploy. If TAK Server is later installed, its 8446 enrollment cert uses this too.</div>
 </div>
+<details id="setup-ports" style="margin-top:16px"{% if caddy_https_port != 443 or caddy_http_port != 80 %} open{% endif %}>
+<summary style="cursor:pointer;font-weight:600;color:var(--text-secondary);font-size:13px;user-select:none">Ports <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced: only if something else on this server already uses 443 or 80</span></summary>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px">
+<div><label class="input-label">HTTPS port</label>
+<input type="number" min="1" max="65535" id="setup-https-port" class="input-field" value="{{ caddy_https_port }}" placeholder="443"></div>
+<div><label class="input-label">HTTP port <span style="color:var(--text-dim);font-weight:400">(redirect + ACME)</span></label>
+<input type="number" min="1" max="65535" id="setup-http-port" class="input-field" value="{{ caddy_http_port }}" placeholder="80"></div>
+</div>
+<div style="margin-top:12px;padding:12px 16px;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.6">
+<strong style="color:var(--yellow)">⚠ Only change these if you know you need to</strong> — for example, another program on this server already uses 443 or 80. With a moved port:
+<br>• Every link becomes <span style="font-family:'JetBrains Mono',monospace">https://name:PORT</span>. Users, bookmarks, TAK clients and QR codes must use the new port.
+<br>• <strong style="color:var(--text-primary)">Let's Encrypt only checks the standard ports 80/443.</strong> Use a Custom Certificate, or have your router/firewall forward public 80 → the HTTP port (and 443 → the HTTPS port). Otherwise certificates will not issue or renew.
+<br>• Modules that save their own copy of a URL (TAK Portal's public URL, NetBird, Remote Assist, ATLAS, CloudTAK) keep the old one until you update or redeploy them. Setting the ports before deploying other modules avoids this.
+<br>• Allow the new ports in any cloud security group or router in front of this server.
+</div>
+</details>
 <div style="text-align:center;margin-top:20px">
 <button onclick="deployCaddy()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;cursor:pointer">🚀 Deploy Caddy</button>
 </div>
@@ -274,6 +311,10 @@ async function deployCaddy(opts){
     var modeEl=document.querySelector('input[name="setup-ssl-mode"]:checked');
     var mode=modeEl?modeEl.value:'fqdn';
     var req;
+    // GH #206 — custom Caddy ports (blank = the standard 443/80).
+    var ports={https_port:(document.getElementById('setup-https-port')||{}).value||'443',
+               http_port:(document.getElementById('setup-http-port')||{}).value||'80'};
+    if((ports.https_port!=='443'||ports.http_port!=='80')&&!opts.retry&&!confirm('Caddy will listen on HTTPS '+ports.https_port+' and HTTP '+ports.http_port+' instead of 443/80.\n\nEvery link will need :'+ports.https_port+', and Let\u2019s Encrypt only works if public 80/443 are forwarded to these ports (or use a Custom Certificate).\n\nContinue?')){return}
     var dnsPanel=document.getElementById('dns-check-panel');
     if(dnsPanel)dnsPanel.style.display='none';
     if(mode==='custom'){
@@ -281,10 +322,11 @@ async function deployCaddy(opts){
         if(!cf.files.length||!kf.files.length){alert('Custom Certificate selected — choose both a certificate and a private key file.');return}
         if(!confirm('Deploy Caddy for '+domain+' with your custom certificate?\n\nCaddy will serve your cert on all subdomains and will not attempt Let\'s Encrypt.')){return}
         var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
+        fd.append('https_port',ports.https_port);fd.append('http_port',ports.http_port);
         req={method:'POST',body:fd};
     }else{
         if(!opts.retry&&!confirm('Deploy Caddy with domain: '+domain+'?\n\nMake sure DNS is pointing to this server.')){return}
-        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn',skip_dns_check:!!opts.skipDns})};
+        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn',skip_dns_check:!!opts.skipDns,https_port:ports.https_port,http_port:ports.http_port})};
     }
     var btn=document.getElementById('deploy-btn');
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
@@ -676,6 +718,31 @@ async function saveDomains(){
         btn.disabled=false;btn.textContent='Save & Reload Caddy';btn.style.opacity='1';
     }
 }
+// GH #206 — move Caddy off 443/80. The page itself may be served through the old port,
+// so on success it moves to the console's URL on the new one.
+async function saveCaddyPorts(hp,cp){
+    var btn=document.getElementById('save-ports-btn'),status=document.getElementById('save-ports-status');
+    hp=String(hp||document.getElementById('caddy-https-port').value||'').trim();
+    cp=String(cp||document.getElementById('caddy-http-port').value||'').trim();
+    if(!hp||!cp){status.style.color='var(--red)';status.textContent='Enter both ports.';return}
+    var msg=(hp==='443'&&cp==='80')?'Move Caddy back to the standard ports 443/80?'
+        :'Move Caddy to HTTPS '+hp+' and HTTP '+cp+'?\n\nEvery link will need :'+hp+'. Let\u2019s Encrypt only works if public 80/443 are forwarded to these ports (or use a Custom Certificate). Modules that saved their own URL keep the old one until you update them.';
+    if(!confirm(msg))return;
+    btn.disabled=true;btn.style.opacity='0.7';status.style.color='var(--text-dim)';status.textContent='Saving…';
+    try{
+        var r=await fetch('/api/caddy/ports',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({https_port:hp,http_port:cp})});
+        var d=await r.json();
+        if(!d.success){status.style.color='var(--red)';status.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.style.opacity='1';return}
+        if(!d.changed){status.style.color='var(--green)';status.textContent='No change.';btn.disabled=false;btn.style.opacity='1';return}
+        status.style.color='var(--green)';
+        status.textContent='Saved — Caddy is restarting on '+d.https_port+'/'+d.http_port+'.'+(d.console_url?'\nOpening '+d.console_url+'/caddy …':'');
+        setTimeout(function(){
+            if(d.console_url&&location.port!==String(window.CONSOLE_PORT)){location.href=d.console_url+'/caddy'}else{location.reload()}
+        },6000);
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.style.opacity='1'}
+}
+function resetCaddyPorts(){saveCaddyPorts('443','80')}
+window.CONSOLE_PORT={{ (settings.console_port or 5001)|tojson }};
 loadServiceDomains();
 {% if deploying %}pollCaddyLog();{% endif %}
 </script>

@@ -87,8 +87,8 @@
   </div>
   <div style="font-size:12px;color:var(--text-secondary);line-height:1.7">
     Each agency gets its own URL. ArcGIS Online and ArcGIS Pro need the first form; plain REST and GeoJSON consumers can use the shorter second one:
-    <div class="url-box" style="margin-top:8px">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/rest/services/TAKClients/FeatureServer &nbsp;<span style="color:var(--text-dim)">— ArcGIS Online / Pro</span></div>
-    <div class="url-box" style="margin-top:6px;color:var(--text-secondary)">https://{{ feed_host }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer &nbsp;<span style="color:var(--text-dim)">— plain REST / GeoJSON</span></div>
+    <div class="url-box" style="margin-top:8px">https://{{ pub_host(feed_host) }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/rest/services/TAKClients/FeatureServer &nbsp;<span style="color:var(--text-dim)">— ArcGIS Online / Pro</span></div>
+    <div class="url-box" style="margin-top:6px;color:var(--text-secondary)">https://{{ pub_host(feed_host) }}/feed/<span style="color:var(--text-dim)">&lt;token&gt;</span>/FeatureServer &nbsp;<span style="color:var(--text-dim)">— plain REST / GeoJSON</span></div>
     <div class="fmt-row">
       <span class="fmt">/FeatureServer/0/query?where=1=1&amp;outFields=*&amp;f=json &nbsp;— ArcGIS REST</span>
       <span class="fmt">&amp;f=geojson &nbsp;— GeoJSON</span>
@@ -171,7 +171,7 @@
 {% endif %}
 
 <script>
-const FEED_HOST = {{ feed_host|tojson }};
+const FEED_HOST = {{ pub_host(feed_host)|tojson }};
 function closeModal(id){ document.getElementById(id).classList.remove('open'); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function ago(iso){

@@ -1019,6 +1019,9 @@ def inject_cloudtak_icon():
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
+        # GH #206: the same host with Caddy's port once the operator moved it off 443.
+        d['pub_host'] = lambda host: _pub_hostport(host, _settings)
+        d['service_url'] = lambda key: _pub_url(_get_service_domain(_settings, key), _settings)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3312,6 +3315,9 @@ def _selinux_sync_caddy_ports(log=None):
     # (e.g. "    reverse_proxy 127.0.0.1:5000 {"), which are not Caddy listeners
     # and must not be relabeled (they belong to other services).
     for m in _re_cp.finditer(r'(?m)^\S[^#\n]*?:(\d{2,5})\s*\{', cad):
+        ports.add(int(m.group(1)))
+    # GH #206: a moved https_port/http_port names no site address, so read the globals too.
+    for m in _re_cp.finditer(r'(?m)^\s+https?_port\s+(\d{2,5})\s*$', cad):
         ports.add(int(m.group(1)))
     _default_http = {80, 81, 443, 488, 2019, 8008, 8009, 8443, 9000}
     n = 0
@@ -5889,7 +5895,7 @@ def forward_auth():
     # hardcoded infratak.<fqdn>.
     host = _console_public_host(load_settings())
     if host:
-        return redirect(f"https://{host}/login", code=302)
+        return redirect(f"{_pub_url(host)}/login", code=302)
     return '', 401
 
 @app.route('/console')
@@ -6004,7 +6010,7 @@ def _console_public_host(settings=None):
 def _console_signout_url(settings=None):
     """Absolute forward_auth sign-out URL on the console's public host, or ''."""
     host = _console_public_host(settings)
-    return f'https://{host}{AK_FORWARD_AUTH_SIGNOUT}' if host else ''
+    return f'{_pub_url(host, settings)}{AK_FORWARD_AUTH_SIGNOUT}' if host else ''
 
 def _widle_sso_logout_active(h):
     """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
@@ -6125,7 +6131,7 @@ def _hardening_control_widle():
             if ak_url and console_host:
                 for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
                     eh = (p.get('external_host') or '').rstrip('/')
-                    if eh and eh.lower() == ('https://' + console_host).lower():
+                    if eh and eh.lower() == _pub_url(console_host, settings).lower():
                         signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
                         break
                 else:
@@ -8330,7 +8336,8 @@ def _diag_section_connectivity(settings):
     # Certificate expiry of what the box actually presents. openssl s_client is an inspection
     # tool: it shows the certificate whether or not it would verify — which is the point, since an
     # expired or self-signed certificate is what this line exists to catch. Nothing is sent.
-    for label, port, sni in ((f'infratak.{fqdn}:443', 443, f'infratak.{fqdn}'), ('8446 (TAK web)', 8446, None)):
+    _hp = _caddy_https_port(settings)
+    for label, port, sni in ((f'infratak.{fqdn}:{_hp}', _hp, f'infratak.{fqdn}'), ('8446 (TAK web)', 8446, None)):
         if label.startswith('infratak.:'):
             continue
         argv = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}'] + (['-servername', sni] if sni else [])
@@ -13541,7 +13548,7 @@ def netbird_page():
         _netbird_deploy_status.update({'complete': False, 'error': False})
         
     netbird_domain = _get_service_domain(settings, 'netbird')
-    netbird_url = f"https://{netbird_domain}" if netbird_domain else ""
+    netbird_url = f"https://{_pub_hostport(netbird_domain)}" if netbird_domain else ""
     nb_vinfo = _get_netbird_version_info() if netbird_status.get('installed') else {}
     
     return render_template(
@@ -13898,10 +13905,10 @@ def _conn_hairpin_probe(settings, log):
         return {'tested': False}
     try:
         r = subprocess.run(['curl', '-skm', '6', '-o', '/dev/null', '-w', '%{http_code}',
-                            'https://%s/' % fqdn], capture_output=True, text=True, timeout=12)
+                            'https://%s/' % _pub_hostport(fqdn, settings)], capture_output=True, text=True, timeout=12)
         code = (r.stdout or '').strip()
         ok = code.isdigit() and code != '000'
-        log('Hairpin: https://%s/ → %s' % (fqdn, code if ok else 'unreachable (hairpin NAT likely)'))
+        log('Hairpin: https://%s/ → %s' % (_pub_hostport(fqdn, settings), code if ok else 'unreachable (hairpin NAT likely)'))
         return {'tested': True, 'ok': ok, 'http_code': code}
     except Exception as ex:
         return {'tested': True, 'ok': False, 'error': str(ex)[:120]}
@@ -14553,7 +14560,9 @@ def _conn_verify_ports(settings):
     Only ports whose module is actually deployed are added — probing 8448 on a box
     with no Remote Assist would be a permanent red that means nothing.
     """
-    ports = list(_CONN_VERIFY_PORTS)
+    # GH #206: Caddy's web/ACME ports follow the operator's setting.
+    _cmap = {443: _caddy_https_port(settings), 80: _caddy_http_port(settings)}
+    ports = [(_cmap.get(p, p), label, req) for p, label, req in _CONN_VERIFY_PORTS]
     try:
         # v10.1.52 (GH #62 follow-up): detect Remote Assist the same belt-and-braces way the
         # rest of this file does -- `remote_assist_enabled` alone is NOT a reliable signal.
@@ -15427,7 +15436,7 @@ def _conn_setup_ap_write_conf(ssid, password, auto):
         if _fqdn and _ssl_mode in ('fqdn', 'custom'):
             _ihost = _get_all_service_domains(_st).get('infratak')
             if _ihost:
-                _console_url = 'https://%s/' % _ihost
+                _console_url = 'https://%s/' % _pub_hostport(_ihost, _st)
     except Exception:
         _console_port = 5001
     lines = ['# infra-TAK Setup AP config (managed by the console)\n',
@@ -15892,7 +15901,7 @@ def _ensure_authentik_remote_assist_app(settings, plog=None):
     slug = REMOTE_ASSIST_OIDC_SLUG
     provider_name = 'EUD Remote Assist'
     portal_domain = _get_service_domain(settings, 'remote_assist')
-    portal_base = f'https://{portal_domain}'
+    portal_base = f'https://{_pub_hostport(portal_domain)}'
     device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
     redirect_uris_obj = [
         {'matching_mode': 'strict', 'url': portal_base},
@@ -16121,9 +16130,9 @@ def _takportal_latest_tag(plog=None):
 def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     ak_domain = _get_service_domain(settings, 'authentik')
     portal_domain = _get_service_domain(settings, 'remote_assist')
-    portal_base = f'https://{portal_domain}'
+    portal_base = f'https://{_pub_hostport(portal_domain)}'
     device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
-    oidc_issuer = f'https://{ak_domain}/application/o/{REMOTE_ASSIST_OIDC_SLUG}/'
+    oidc_issuer = f'https://{_pub_hostport(ak_domain)}/application/o/{REMOTE_ASSIST_OIDC_SLUG}/'
     oidc_jwks = f'{oidc_issuer.rstrip("/")}/jwks/'
     env_lines = [
         f'POSTGRES_USER=cfd',
@@ -16368,7 +16377,7 @@ def _run_remote_assist_deploy(settings):
         _sp.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         plog('✓ Caddy restarted (8448 listener requires full restart)')
 
-        portal_url = f'https://{_get_service_domain(s, "remote_assist")}'
+        portal_url = f'https://{_pub_hostport(_get_service_domain(s, "remote_assist"))}'
         device_url = f'{portal_url}:{REMOTE_ASSIST_DEVICE_PORT}'
         plog('')
         plog('🎉 Remote Assist deployed successfully!')
@@ -16664,7 +16673,7 @@ def remote_assist_page():
     if ra.get('installed') and not _remote_assist_deploy_status.get('running', False):
         _remote_assist_deploy_status.update({'complete': False, 'error': False})
     ra_host = _get_service_domain(settings, 'remote_assist')
-    ra_url = f'https://{ra_host}' if ra_host else ''
+    ra_url = f'https://{_pub_hostport(ra_host)}' if ra_host else ''
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
     coturn_ip = settings.get('coturn_ip', '')
@@ -17082,9 +17091,9 @@ def _guarddog_health_url(settings):
     if fqdn:
         try:
             sd = _get_all_service_domains(settings)
-            return f"https://{sd['infratak']}/health"
+            return f"{_pub_url(sd['infratak'], settings)}/health"
         except Exception:
-            return f"https://{fqdn.split(':')[0]}/health"
+            return f"{_pub_url(fqdn.split(':')[0], settings)}/health"
     if server_ip:
         return f"http://{server_ip}:8080/health"
     return "http://YOUR_SERVER_IP:8080/health"
@@ -18129,8 +18138,9 @@ def _firewall_status_local():
 # module = detect_modules() key (None = always shown). port=None → resolved live.
 PORT_EXPOSURE_POLICY = [
     {'module': None,        'label': 'infra-TAK Console',   'port': None, 'tier': 1, 'why': 'Operator web UI (direct-IP backdoor)'},
-    {'module': 'caddy',     'label': 'Caddy HTTP',          'port': 80,   'tier': 1, 'why': 'ACME + redirect to 443'},
-    {'module': 'caddy',     'label': 'Caddy HTTPS',         'port': 443,  'tier': 1, 'why': 'TLS terminator + auth gate'},
+    # GH #206: port_setting = the operator may move it; _policy_port() resolves the live value.
+    {'module': 'caddy',     'label': 'Caddy HTTP',          'port': 80,   'tier': 1, 'why': 'ACME + redirect to HTTPS', 'port_setting': 'caddy_http_port'},
+    {'module': 'caddy',     'label': 'Caddy HTTPS',         'port': 443,  'tier': 1, 'why': 'TLS terminator + auth gate', 'port_setting': 'caddy_https_port'},
     {'module': 'takserver', 'label': 'TAK Server (mTLS)',   'port': 8089, 'tier': 1, 'why': 'TAK client mutual-TLS'},
     {'module': 'takserver', 'label': 'TAK Admin WebGUI',    'port': 8443, 'tier': 1, 'why': 'Admin WebGUI (client-cert)'},
     {'module': 'takserver', 'label': 'TAK Admin (LE cert)', 'port': 8446, 'tier': 1, 'why': 'Admin WebGUI (LE cert)'},
@@ -18356,7 +18366,7 @@ def _exposure_report(force=False):
         mod = ent['module']
         if mod is not None and mod not in installed:
             continue
-        port = ent['port'] if ent['port'] is not None else console_port
+        port = _policy_port(ent, settings, console_port)
         if mod == 'remote_assist' and ent['port'] == 3478:
             port = coturn_port  # CoTURN can run on an alternate port beside NetBird
         bind = _exposure_bind_of(port, listen_map)
@@ -18374,7 +18384,8 @@ def _exposure_report(force=False):
     # not reachable (e.g. rpcbind :111, which start.sh never opens), so it's not an
     # exposure — only flag listeners that are firewall-open, or where there's no
     # enabled host firewall to stop them.
-    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22, coturn_port}
+    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22, coturn_port,
+                                        _caddy_https_port(settings), _caddy_http_port(settings)}
     fw_enabled = bool(fwstatus.get('enabled'))
     blocked = 0
     undeclared = []
@@ -18578,6 +18589,16 @@ def _preflight_port_holders(port):
     return holders
 
 
+def _policy_port(ent, settings, console_port):
+    """The live port for a PORT_EXPOSURE_POLICY row: None = the console's port, and a row
+    with port_setting follows that settings key (GH #206 — Caddy moved off 80/443)."""
+    if ent.get('port') is None:
+        return console_port
+    if ent.get('port_setting'):
+        return _caddy_port_value(settings, ent['port_setting'], ent['port'])
+    return ent['port']
+
+
 def _preflight_port_conflicts(module_key, extra_ports=None, only_ports=None):
     """Ports this module is about to claim that something ELSE already holds.
 
@@ -18591,15 +18612,16 @@ def _preflight_port_conflicts(module_key, extra_ports=None, only_ports=None):
                  sub-service is being restarted, not the whole module)."""
     try:
         targets = []
+        _pf_settings = load_settings() or {}
         try:
-            console_port = int((load_settings() or {}).get('console_port') or 5001)
+            console_port = int(_pf_settings.get('console_port') or 5001)
         except Exception:
             console_port = 5001
         for ent in PORT_EXPOSURE_POLICY:
             if ent.get('module') != module_key:
                 continue
             # port None = resolved live (the console's own port, 5001 by default)
-            targets.append((ent['port'] if ent['port'] is not None else console_port, ent['label']))
+            targets.append((_policy_port(ent, _pf_settings, console_port), ent['label']))
         for p in (extra_ports or []):
             if isinstance(p, (list, tuple)):
                 targets.append((int(p[0]), str(p[1])))
@@ -25820,7 +25842,7 @@ def federation_hub_page():
         fedhub_rotate_status.update({'complete': False})
     _fqdn = (settings.get('fqdn') or '').strip()
     _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
-    _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
+    _fedhub_public_url = f'https://{_pub_hostport(_fedhub_host)}' if _fedhub_host else ''
     _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
     _ak = modules.get('authentik', {})
     _fedhub_ver = _get_fedhub_version_info().get('version', '') if fh.get('installed') else ''
@@ -26078,16 +26100,16 @@ def fedhub_enable_authentik_api():
     fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
     # Fed Hub OAuth callback is handled by backend API endpoint, not SPA route.
-    redirect_uri = f'https://{fh_host}/api/oauth/login/redirect' if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
+    redirect_uri = f'https://{_pub_hostport(fh_host)}/api/oauth/login/redirect' if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
 
     # Generate keycloak.der — Fed Hub needs this to trust the OAuth provider's TLS cert
     # Use the same Authentik host for cert generation and OIDC URLs (consistency prevents domain mismatch)
     ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
-    ak_public = f'https://{ak_host}'
+    ak_public = f'https://{_pub_hostport(ak_host)}'
     der_cmd = (
         f'sudo mkdir -p /opt/tak/certs && '
         f'sudo chown tak:tak /opt/tak/certs && '
-        f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
+        f'echo | openssl s_client -connect {ak_host}:{_caddy_https_port(settings)} -servername {ak_host} 2>/dev/null '
         f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
         f'chown tak:tak /opt/tak/certs/keycloak.der && '
         f'chmod 644 /opt/tak/certs/keycloak.der && '
@@ -26157,7 +26179,7 @@ def fedhub_enable_authentik_api():
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     steps.append('  ✓ Caddyfile regenerated (forward_auth + proxy) + Caddy reloading')
 
-    fedhub_url = f'https://{fh_domain}' if fh_domain else f'https://{fh_host}:9100'
+    fedhub_url = f'https://{_pub_hostport(fh_domain)}' if fh_domain else f'https://{fh_host}:9100'
     return jsonify({
         'success': True,
         'steps': steps,
@@ -26481,11 +26503,11 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     fh_domain = _get_service_domain(settings, 'fedhub')
                     fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
                     redirect_uri = (
-                        f'https://{fh_host}/api/oauth/login/redirect'
+                        f'https://{_pub_hostport(fh_host)}/api/oauth/login/redirect'
                         if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
                     )
                     ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
-                    ak_public = f'https://{ak_host}'
+                    ak_public = f'https://{_pub_hostport(ak_host)}'
                     oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
                     auth_endpoint_url = f'{ak_public}/application/o/authorize/'
                     token_endpoint_url = f'{ak_public}/application/o/token/'
@@ -26493,7 +26515,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     der_cmd = (
                         f'sudo mkdir -p /opt/tak/certs && '
                         f'sudo chown tak:tak /opt/tak/certs && '
-                        f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
+                        f'echo | openssl s_client -connect {ak_host}:{_caddy_https_port(settings)} -servername {ak_host} 2>/dev/null '
                         f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
                         f'chown tak:tak /opt/tak/certs/keycloak.der && '
                         f'chmod 644 /opt/tak/certs/keycloak.der'
@@ -26610,7 +26632,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         else:
             fh_domain = _get_service_domain(settings, 'fedhub')
             if fh_domain:
-                plog(f'Federation Hub UI: https://{fh_domain}  (via Caddy on this console)')
+                plog(f'Federation Hub UI: https://{_pub_hostport(fh_domain)}  (via Caddy on this console)')
             else:
                 plog('Federation Hub UI: https://localhost:9100 (set FQDN + Caddy SSL for a public URL)')
         plog('Import webadmin-fed.p12 (in $HOME/ on this host) into your browser to log in.')
@@ -27130,7 +27152,7 @@ def _caddy_letsencrypt_days_left(settings):
             continue
         try:
             cmd = (
-                f'echo | openssl s_client -connect localhost:443 -servername {shlex.quote(servername)} 2>/dev/null '
+                f'echo | openssl s_client -connect localhost:{_caddy_https_port(settings)} -servername {shlex.quote(servername)} 2>/dev/null '
                 '| openssl x509 -noout -enddate 2>/dev/null'
             )
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
@@ -27233,29 +27255,29 @@ def _caddy_configured_urls(settings, modules):
     urls = []
     ak = modules.get('authentik', {})
     infratak_desc = 'Console (Authentik when enabled)' if ak.get('installed') else 'Console (after login)'
-    urls.append({'name': 'infra-TAK', 'host': sd['infratak'], 'url': f'https://{sd["infratak"]}', 'desc': infratak_desc})
+    urls.append({'name': 'infra-TAK', 'host': sd['infratak'], 'url': f'https://{_pub_hostport(sd["infratak"])}', 'desc': infratak_desc})
     tak = modules.get('takserver', {})
     if tak.get('installed'):
-        urls.append({'name': 'TAK Server', 'host': sd['takserver'], 'url': f'https://{sd["takserver"]}', 'desc': 'WebGUI, Marti API'})
+        urls.append({'name': 'TAK Server', 'host': sd['takserver'], 'url': f'https://{_pub_hostport(sd["takserver"])}', 'desc': 'WebGUI, Marti API'})
     if ak.get('installed'):
-        urls.append({'name': 'Authentik', 'host': sd['authentik'], 'url': f'https://{sd["authentik"]}', 'desc': 'Identity provider'})
+        urls.append({'name': 'Authentik', 'host': sd['authentik'], 'url': f'https://{_pub_hostport(sd["authentik"])}', 'desc': 'Identity provider'})
     portal = modules.get('takportal', {})
     if portal.get('installed'):
-        urls.append({'name': 'TAK Portal', 'host': sd['takportal'], 'url': f'https://{sd["takportal"]}', 'desc': 'User & cert management'})
+        urls.append({'name': 'TAK Portal', 'host': sd['takportal'], 'url': f'https://{_pub_hostport(sd["takportal"])}', 'desc': 'User & cert management'})
     nodered = modules.get('nodered', {})
     if nodered.get('installed'):
-        urls.append({'name': 'Node-RED', 'host': sd['nodered'], 'url': f'https://{sd["nodered"]}', 'desc': 'Flow editor (Authentik when enabled)'})
+        urls.append({'name': 'Node-RED', 'host': sd['nodered'], 'url': f'https://{_pub_hostport(sd["nodered"])}', 'desc': 'Flow editor (Authentik when enabled)'})
     cloudtak = modules.get('cloudtak', {})
     if cloudtak.get('installed'):
-        urls.append({'name': 'CloudTAK (map)', 'host': sd['cloudtak_map'], 'url': f'https://{sd["cloudtak_map"]}', 'desc': 'Browser TAK client'})
-        urls.append({'name': 'CloudTAK (tiles)', 'host': sd['cloudtak_tiles'], 'url': f'https://{sd["cloudtak_tiles"]}', 'desc': 'Tile server'})
-        urls.append({'name': 'CloudTAK (video)', 'host': sd['cloudtak_video'], 'url': f'https://{sd["cloudtak_video"]}', 'desc': 'Map video / HLS'})
+        urls.append({'name': 'CloudTAK (map)', 'host': sd['cloudtak_map'], 'url': f'https://{_pub_hostport(sd["cloudtak_map"])}', 'desc': 'Browser TAK client'})
+        urls.append({'name': 'CloudTAK (tiles)', 'host': sd['cloudtak_tiles'], 'url': f'https://{_pub_hostport(sd["cloudtak_tiles"])}', 'desc': 'Tile server'})
+        urls.append({'name': 'CloudTAK (video)', 'host': sd['cloudtak_video'], 'url': f'https://{_pub_hostport(sd["cloudtak_video"])}', 'desc': 'Map video / HLS'})
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
-        urls.append({'name': 'MediaMTX', 'host': sd['mediamtx'], 'url': f'https://{sd["mediamtx"]}', 'desc': 'Stream web console & HLS'})
+        urls.append({'name': 'MediaMTX', 'host': sd['mediamtx'], 'url': f'https://{_pub_hostport(sd["mediamtx"])}', 'desc': 'Stream web console & HLS'})
     fedhub = modules.get('fedhub', {})
     if fedhub.get('installed'):
-        urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
+        urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{_pub_hostport(sd["fedhub"])}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
 def _caddy_includes_summary(caddyfile_text):
@@ -27304,6 +27326,7 @@ def caddy_page():
     caddy_version = caddy_ver_info.get('version', '')
     return render_template('caddy.html',
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
+        caddy_https_port=_caddy_https_port(settings), caddy_http_port=_caddy_http_port(settings),
         configured_urls=configured_urls,
         cert_days_left=cert_days, cert_days_color=cert_days_color,
         cert_days_fmt=cert_days_fmt,
@@ -27348,6 +27371,22 @@ def caddy_deploy():
         return jsonify({'success': False, 'error': 'Domain is required'})
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
+
+    # GH #206 — optional ports, for a host where something else already owns 443/80.
+    # Saved before the pre-flight below so it checks the ports Caddy will really claim.
+    if data.get('https_port') or data.get('http_port'):
+        _ps = load_settings()
+        ok, err, ports = _validate_caddy_ports(data.get('https_port') or CADDY_HTTPS_PORT_DEFAULT,
+                                               data.get('http_port') or CADDY_HTTP_PORT_DEFAULT, _ps)
+        if not ok:
+            return jsonify({'success': False, 'error': err}), 400
+        for key, val, default in (('caddy_https_port', ports[0], CADDY_HTTPS_PORT_DEFAULT),
+                                  ('caddy_http_port', ports[1], CADDY_HTTP_PORT_DEFAULT)):
+            if val == default:
+                _ps.pop(key, None)
+            else:
+                _ps[key] = val
+        save_settings(_ps)
 
     # v10.1.27 — pre-flight: refuse BEFORE we write settings/certs if something
     # else on this box already owns 80/443/9997. Previously Caddy just failed to
@@ -27632,7 +27671,22 @@ def _caddy_read_body_idle_lines(grpc_streams):
             '        }', '    }']
 
 
-def _caddy_global_options_lines(cfg=None, grpc_streams=False):
+def _caddy_port_option_lines(settings=None):
+    """GH #206 — `https_port` / `http_port` when the operator moved Caddy off 443/80.
+    Emitted only for a port that differs from the default, so an untouched box keeps a
+    byte-identical global block. Both options move every site without an explicit port,
+    and the automatic HTTP→HTTPS redirect follows https_port."""
+    s = load_settings() if settings is None else settings
+    out = []
+    hp, cp = _caddy_https_port(s), _caddy_http_port(s)
+    if hp != CADDY_HTTPS_PORT_DEFAULT:
+        out.append(f'    https_port {hp}')
+    if cp != CADDY_HTTP_PORT_DEFAULT:
+        out.append(f'    http_port {cp}')
+    return out
+
+
+def _caddy_global_options_lines(cfg=None, grpc_streams=False, settings=None):
     """The Caddyfile global options block. ALWAYS emitted, on every box.
 
     v10.1.50 — grace_period is the fix for a reload that hangs forever. Caddy's default
@@ -27652,6 +27706,7 @@ def _caddy_global_options_lines(cfg=None, grpc_streams=False):
     That is intended: the grace period is not opt-in.
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
+    out += _caddy_port_option_lines(settings)
     out += _caddy_acme_inner_lines(cfg)
     out += _caddy_read_body_idle_lines(grpc_streams)
     out.append('}')
@@ -28143,10 +28198,10 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
             for line in env_lines:
                 k = line.split('=', 1)[0].strip()
                 if k == 'AUTHENTIK_HOST':
-                    new_val = f'https://{ak_host}/\n'
-                    if line.rstrip('\n') != f'AUTHENTIK_HOST=https://{ak_host}/':
+                    new_val = f'{_pub_url(ak_host, settings)}/\n'
+                    if line.rstrip('\n') != f'AUTHENTIK_HOST={_pub_url(ak_host, settings)}/':
                         env_changed = True
-                    new_lines.append(f'AUTHENTIK_HOST=https://{ak_host}/\n')
+                    new_lines.append(f'AUTHENTIK_HOST={_pub_url(ak_host, settings)}/\n')
                     found_host = True
                 elif k == 'AUTHENTIK_COOKIE_DOMAIN':
                     if line.rstrip('\n') != f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}':
@@ -28156,14 +28211,14 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 else:
                     new_lines.append(line)
             if not found_host:
-                new_lines.append(f'AUTHENTIK_HOST=https://{ak_host}/\n')
+                new_lines.append(f'AUTHENTIK_HOST={_pub_url(ak_host, settings)}/\n')
                 env_changed = True
             if not found_cookie:
                 new_lines.append(f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}\n')
                 env_changed = True
             with open(env_path, 'w') as _f:
                 _f.writelines(new_lines)
-            _log(f"✓ .env: AUTHENTIK_HOST=https://{ak_host}/ AUTHENTIK_COOKIE_DOMAIN={cookie_domain}")
+            _log(f"✓ .env: AUTHENTIK_HOST={_pub_url(ak_host, settings)}/ AUTHENTIK_COOKIE_DOMAIN={cookie_domain}")
         except Exception as e:
             _log(f"⚠ .env update: {e}")
 
@@ -28204,7 +28259,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
     else:
         ak_url = _get_authentik_api_url(settings)
         ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-        _ak_pub_url = f'https://{ak_host}'
+        _ak_pub_url = _pub_url(ak_host, settings)
 
         # 3. PATCH default brand
         try:
@@ -28251,7 +28306,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 op_pk = embedded.get('pk')
                 full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=10).read().decode())
                 cfg = full.get('config') or {}
-                _emb_host = _get_authentik_base_url(settings) or f'https://{ak_host}'
+                _emb_host = _get_authentik_base_url(settings) or f'https://{_pub_hostport(ak_host)}'
                 cfg['authentik_host'] = _emb_host
                 cfg['authentik_host_insecure'] = False
                 _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
@@ -28283,7 +28338,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                     ext_host = full_prov.get('external_host') or ''
                     _ehm = re.match(r'https?://([^/]+)', ext_host) if ext_host else None
                     if _ehm:
-                        ext_host = f'https://{_ehm.group(1).split(".")[0]}.{fqdn}'
+                        ext_host = _pub_url(f'{_ehm.group(1).split(".")[0]}.{fqdn}', settings)
                     # Update redirect_uris — replace old domain in all URL entries
                     uris = full_prov.get('redirect_uris') or []
                     new_uris = []
@@ -28299,7 +28354,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                                 # Derive new host: keep subdomain prefix, replace base domain
                                 subdomain = old_host_part.split('.')[0] if '.' in old_host_part else old_host_part
                                 new_host = f'{subdomain}.{fqdn}'
-                                url = 'https://' + new_host + ('/' + '/'.join(rest.split('/')[1:]) if '/' in rest else '')
+                                url = _pub_url(new_host, settings) + ('/' + '/'.join(rest.split('/')[1:]) if '/' in rest else '')
                         new_uris.append({'url': url, 'matching_mode': uri.get('matching_mode', 'strict')})
                     patch = {
                         'external_host': ext_host,
@@ -28482,6 +28537,85 @@ def caddy_update_domain():
             pass
     threading.Thread(target=_restart, daemon=True).start()
     return jsonify({'success': True, 'domain': domain, 'output': 'Caddy restart scheduled. Authentik domain sync running in background.'})
+
+def _caddy_resync_public_urls(settings):
+    """After the public URL of every service changed (base domain or Caddy port), point
+    Authentik at the new URLs: brand, embedded outpost, every proxy provider's
+    external_host and redirect URIs, the console app and TAK Portal's provider."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    _authentik_sync_all_domain_refs(fqdn, settings)
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if ak_token:
+        _ensure_authentik_console_app(fqdn, ak_token)
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
+    if _is_module_deployed(settings, 'takportal'):
+        _sync_authentik_takportal_provider_url(settings)
+    _ensure_authentik_proxy_external_hosts_canonical(lambda m: print(f"[caddy-ports] {m}", flush=True))
+
+
+@app.route('/api/caddy/ports', methods=['GET'])
+@login_required
+def caddy_get_ports():
+    """GH #206 — the ports Caddy listens on, and the ones it may not be moved onto."""
+    settings = load_settings()
+    return jsonify({'success': True,
+                    'https_port': _caddy_https_port(settings), 'http_port': _caddy_http_port(settings),
+                    'default_https_port': CADDY_HTTPS_PORT_DEFAULT,
+                    'default_http_port': CADDY_HTTP_PORT_DEFAULT,
+                    'reserved': sorted(_caddy_reserved_ports(settings))})
+
+
+@app.route('/api/caddy/ports', methods=['POST'])
+@login_required
+def caddy_set_ports():
+    """GH #206 — move Caddy off 443/80 when something else on the host owns them.
+
+    Refuses a port the stack itself uses and a port another process already holds, then
+    saves, opens the firewall, regenerates the Caddyfile (which labels the ports for SELinux
+    on RHEL), restarts Caddy after the response, and re-points Authentik at the new URLs.
+    The old ports are closed only if they were themselves custom: 80/443 are left open,
+    because the reason to move is usually that something else serves them."""
+    data = request.get_json(silent=True) or {}
+    settings = load_settings()
+    ok, err, ports = _validate_caddy_ports(data.get('https_port'), data.get('http_port'), settings)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    hp, cp = ports
+    old = (_caddy_https_port(settings), _caddy_http_port(settings))
+    if (hp, cp) == old:
+        return jsonify({'success': True, 'changed': False, 'https_port': hp, 'http_port': cp})
+    conflicts = _preflight_port_conflicts('caddy', extra_ports=[(hp, 'Caddy HTTPS'), (cp, 'Caddy HTTP')],
+                                          only_ports=[hp, cp])
+    if conflicts:
+        return jsonify({'success': False, 'error': _preflight_conflict_message('Caddy', conflicts),
+                        'port_conflicts': conflicts}), 409
+    for key, val, default in (('caddy_https_port', hp, CADDY_HTTPS_PORT_DEFAULT),
+                              ('caddy_http_port', cp, CADDY_HTTP_PORT_DEFAULT)):
+        if val == default:
+            settings.pop(key, None)
+        else:
+            settings[key] = val
+    save_settings(settings)
+    for p in (hp, cp):
+        _fw_allow(p, 'tcp')
+    for p in old:
+        if p not in (hp, cp, CADDY_HTTPS_PORT_DEFAULT, CADDY_HTTP_PORT_DEFAULT):
+            _fw_remove(p, 'tcp')
+    print(f"[caddy-ports] Caddy ports {old[0]}/{old[1]} -> {hp}/{cp}", flush=True)
+    threading.Thread(target=_caddy_restart_after_response, args=('ports', 'restart'), daemon=True).start()
+    if detect_modules().get('authentik', {}).get('installed'):
+        def _sync_ak_after_ports():
+            time.sleep(8)   # after Caddy is back on the new port
+            try:
+                _caddy_resync_public_urls(load_settings())
+            except Exception as _e:
+                print(f"[caddy-ports] Authentik URL sync error: {_e}", flush=True)
+        threading.Thread(target=_sync_ak_after_ports, daemon=True).start()
+    return jsonify({'success': True, 'changed': True, 'https_port': hp, 'http_port': cp,
+                    'console_url': _pub_url(_console_public_host(settings), settings)})
+
 
 @app.route('/api/caddy/caddyfile')
 @login_required
@@ -29036,6 +29170,99 @@ def _get_service_domain(settings, service_key):
 def _get_all_service_domains(settings):
     """Return dict of service_key → current domain for all services."""
     return {k: _get_service_domain(settings, k) for k in SERVICE_DOMAIN_DEFAULTS}
+
+
+# GH #206 — the ports Caddy listens on. 443/80 unless the operator moved them because
+# something else on the host already owns them. Unset keys mean the defaults, and every
+# helper below returns exactly what the code produced before (no `:443` suffix anywhere),
+# so a box that never touches this setting generates byte-identical config and URLs.
+# Caddy's global `https_port`/`http_port` options move every site that names no port
+# (all of ours) — https://caddyserver.com/docs/caddyfile/options#http-port.
+CADDY_HTTPS_PORT_DEFAULT = 443
+CADDY_HTTP_PORT_DEFAULT = 80
+CADDY_PORT_SETTING_KEYS = ('caddy_https_port', 'caddy_http_port')
+
+
+def _caddy_reserved_ports(settings=None):
+    """Ports Caddy may not be moved onto: they belong to TAK Server, the console, Caddy's
+    own admin API, or another module this console deploys. {port: who}."""
+    s = load_settings() if settings is None else settings
+    try:
+        console_port = int(s.get('console_port') or 5001)
+    except Exception:
+        console_port = 5001
+    reserved = {22: 'SSH', 2019: 'Caddy admin API', 9997: 'Caddy video listener',
+                console_port: 'infra-TAK console', 8444: 'TAK Server (aux HTTPS)',
+                REMOTE_ASSIST_DEVICE_PORT: 'Remote Assist device API',
+                ATLAS_DEVICE_PORT: 'ATLAS MDM device channel', 9100: 'Federation Hub UI'}
+    for ent in PORT_EXPOSURE_POLICY:
+        if ent.get('module') != 'caddy' and ent.get('port'):
+            reserved.setdefault(int(ent['port']), ent['label'])
+    return reserved
+
+
+def _caddy_port_value(settings, key, default):
+    try:
+        p = int((settings or {}).get(key) or default)
+    except Exception:
+        return default
+    return p if 1 <= p <= 65535 else default
+
+
+def _caddy_https_port(settings=None):
+    return _caddy_port_value(load_settings() if settings is None else settings,
+                             'caddy_https_port', CADDY_HTTPS_PORT_DEFAULT)
+
+
+def _caddy_http_port(settings=None):
+    return _caddy_port_value(load_settings() if settings is None else settings,
+                             'caddy_http_port', CADDY_HTTP_PORT_DEFAULT)
+
+
+def _caddy_ports_custom(settings=None):
+    s = load_settings() if settings is None else settings
+    return (_caddy_https_port(s), _caddy_http_port(s)) != (CADDY_HTTPS_PORT_DEFAULT, CADDY_HTTP_PORT_DEFAULT)
+
+
+def _pub_hostport(host, settings=None):
+    """`host` as a browser must type it to reach Caddy: bare on 443, `host:PORT` otherwise.
+    Empty in, empty out, so callers keep their own `if host` fallbacks."""
+    if not host:
+        return host
+    port = _caddy_https_port(settings)
+    return host if port == CADDY_HTTPS_PORT_DEFAULT else f'{host}:{port}'
+
+
+def _pub_http_hostport(host, settings=None):
+    """Like _pub_hostport, for Caddy's plain-HTTP listener (80 unless moved)."""
+    if not host:
+        return host
+    port = _caddy_http_port(settings)
+    return host if port == CADDY_HTTP_PORT_DEFAULT else f'{host}:{port}'
+
+
+def _pub_url(host, settings=None):
+    """https://<host>[:port] — the public URL Caddy serves `host` on. '' when host is empty."""
+    return f'https://{_pub_hostport(host, settings)}' if host else ''
+
+
+def _validate_caddy_ports(https_port, http_port, settings=None):
+    """(ok, error, (https, http)). Refuses non-integers, out-of-range, the same port twice,
+    and ports the stack itself uses."""
+    try:
+        hp, cp = int(https_port), int(http_port)
+    except Exception:
+        return False, 'Ports must be whole numbers.', None
+    for p in (hp, cp):
+        if not 1 <= p <= 65535:
+            return False, f'Port {p} is out of range (1-65535).', None
+    if hp == cp:
+        return False, 'HTTPS and HTTP must be different ports.', None
+    reserved = _caddy_reserved_ports(settings)
+    for p in (hp, cp):
+        if p in reserved:
+            return False, f'Port {p} is used by {reserved[p]} on this box. Pick another.', None
+    return True, '', (hp, cp)
 
 
 # v10.2.24 (ops #125) — DNS pre-check. A fresh install whose A records all pointed at a
@@ -30157,7 +30384,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         emit_strip("        ")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
-        emit_rescue(f"https://{mtx_host}/")
+        emit_rescue(f"{_pub_url(mtx_host)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         lines.append(f"        forward_auth {ak_up} {{")
         lines.append("            uri /outpost.goauthentik.io/auth/caddy")
@@ -30234,7 +30461,7 @@ def _cloudtak_api_base_urls(settings, cfg):
             sd = _get_all_service_domains(settings)
             ct_host = (sd.get('cloudtak_map') or '').strip()
             if ct_host:
-                urls.append(f'https://{ct_host}')
+                urls.append(f'https://{_pub_hostport(ct_host)}')
         except Exception:
             pass
     out = []
@@ -31127,7 +31354,7 @@ def _get_takserver_base_url(settings):
     """Return https://<takserver_host> or https://<server_ip> for TAK Server (no port)."""
     host = _get_takserver_host(settings)
     if host:
-        return f'https://{host}'
+        return _pub_url(host, settings)
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     return f'https://{server_ip}'
 
@@ -31135,7 +31362,7 @@ def _get_authentik_base_url(settings):
     """Return the full base URL for Authentik (for links, AUTHENTIK_PUBLIC_URL, brand, outposts)."""
     host = _get_authentik_host(settings)
     if host:
-        return f'https://{host}'
+        return _pub_url(host, settings)
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     return f'http://{server_ip}:9090'
 
@@ -33050,7 +33277,7 @@ def generate_caddyfile(settings=None):
     # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
     lines += _caddy_global_options_lines(
-        grpc_streams=bool(modules.get('netbird', {}).get('installed')))
+        grpc_streams=bool(modules.get('netbird', {}).get('installed')), settings=settings)
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
@@ -33059,7 +33286,7 @@ def generate_caddyfile(settings=None):
             return
         lines.append(f"# Alias → redirect to canonical {canonical}")
         lines.append(f"{alias} {{")
-        lines.append(f"    redir https://{canonical}{{uri}} permanent")
+        lines.append(f"    redir {_pub_url(canonical, settings)}{{uri}} permanent")
         lines.append(f"}}")
         lines.append("")
     ak_up = _get_authentik_upstream(settings)
@@ -33188,7 +33415,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         lines.append(f"    route {{")
         _emit_ak_header_strip("        ")
-        _emit_outpost_callback_rescue(f"https://{infratak_host}/")
+        _emit_outpost_callback_rescue(f"{_pub_url(infratak_host, settings)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
         # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
@@ -33247,7 +33474,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{nodered_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
-            _emit_outpost_callback_rescue(f"https://{nodered_host}/")
+            _emit_outpost_callback_rescue(f"{_pub_url(nodered_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        @nodered_public {{")
             lines.append(f"            path /ipaws/alerts.kml /icons/ipaws/*")
@@ -33298,14 +33525,17 @@ def generate_caddyfile(settings=None):
         # — but they are the same root cause seen from the response side: TAK was emitting
         # Location headers naming 127.0.0.1:8446 because that is the Host it was handed.
         # Kept as belt-and-braces; removing them is a separate, evidence-free change.
-        lines.append(f"        header_up Host {{host}}")
+        # GH #206: on a moved https_port the browser's Origin carries the port, so TAK must
+        # be handed it too — {host} drops the port, {hostport} keeps it.
+        _host_ph = '{hostport}' if _caddy_https_port(settings) != CADDY_HTTPS_PORT_DEFAULT else '{host}'
+        lines.append(f"        header_up Host {_host_ph}")
         # GH #90: a Caddy reload no longer cuts WebTAK's socket on the spot.
         lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
         lines.append(f"            tls")
         lines.append(f"            tls_insecure_skip_verify")
         lines.append(f"        }}")
-        lines.append(f"        header_down Location 127.0.0.1:8446 {tak_host}")
+        lines.append(f"        header_down Location 127.0.0.1:8446 {_pub_hostport(tak_host, settings)}")
         lines.append(f"        header_down Location http:// https://")
         lines.append(f"    }}")
         lines.append(f"}}")
@@ -33362,7 +33592,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
-            _emit_outpost_callback_rescue(f"https://{portal_host}/")
+            _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"")
             lines.append(f"        @public {{")
@@ -33489,10 +33719,11 @@ def generate_caddyfile(settings=None):
             fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
             fh_rp_block = []
             fh_rp_block.append(f"reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
-            fh_rp_block.append(f"    header_up X-Forwarded-Port 443")
+            _fh_hp = '{hostport}' if _caddy_https_port(settings) != CADDY_HTTPS_PORT_DEFAULT else '{host}'
+            fh_rp_block.append(f"    header_up X-Forwarded-Port {_caddy_https_port(settings)}")
             fh_rp_block.append(f"    header_up X-Forwarded-Proto https")
-            fh_rp_block.append(f"    header_up X-Forwarded-Host {{host}}")
-            fh_rp_block.append(f"    header_up Host {{host}}")
+            fh_rp_block.append(f"    header_up X-Forwarded-Host {_fh_hp}")
+            fh_rp_block.append(f"    header_up Host {_fh_hp}")
             fh_rp_block.append(f"    transport http {{")
             if fh_upstream_scheme == 'https':
                 fh_rp_block.append(f"        tls")
@@ -33519,7 +33750,7 @@ def generate_caddyfile(settings=None):
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
                 lines.append(f"        handle {{")
-                _emit_outpost_callback_rescue(f"https://{fh_host}/")
+                _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
                 lines.append(f"            forward_auth {ak_up} {{")
                 lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
@@ -33566,7 +33797,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{wo_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
-            _emit_outpost_callback_rescue(f"https://{wo_host}/")
+            _emit_outpost_callback_rescue(f"{_pub_url(wo_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
@@ -33676,7 +33907,7 @@ def generate_caddyfile(settings=None):
             # is an administrator, so a client that could set them itself would
             # own the fleet. Same reasoning as the mTLS certificate header.
             _emit_ak_header_strip("        ")
-            _emit_outpost_callback_rescue(f"https://{at_host}/")
+            _emit_outpost_callback_rescue(f"{_pub_url(at_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             # Refused before authentication, not after: a tablet cannot complete
             # an interactive login, so sending it into the SSO round-trip would
@@ -33736,7 +33967,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"        reverse_proxy {at_up}")
         lines.append(f"    }}")
         lines.append(f"    handle {{")
-        lines.append(f"        redir https://{{host}}{{uri}} permanent")
+        lines.append(f"        redir https://{_pub_hostport('{host}', settings)}{{uri}} permanent")
         lines.append(f"    }}")
         lines.append(f"}}")
         lines.append("")
@@ -34948,10 +35179,11 @@ def run_caddy_deploy(domain):
         # Debian box would wrongly drive firewalld (and a RHEL box ufw) → FileNotFound
         # ERROR in the broker audit. _fw_allow()/_fw_backend() gate on _distro_family().
         be = _fw_backend()
-        for _p in (80, 443, 5001):
+        _cports = (_caddy_http_port(settings), _caddy_https_port(settings))
+        for _p in (*_cports, 5001):
             _fw_allow(_p, 'tcp')
         if be:
-            plog(f"  ✓ {be}: ports 80, 443, 5001 (backdoor) opened")
+            plog(f"  ✓ {be}: ports {_cports[0]}, {_cports[1]}, 5001 (backdoor) opened")
         plog("✓ Firewall configured")
 
         plog("")
@@ -35011,7 +35243,7 @@ def run_caddy_deploy(domain):
         plog("")
         plog("=" * 50)
         plog(f"✓ Caddy deployed successfully!")
-        plog(f"  Domain: https://{domain}")
+        plog(f"  Domain: https://{_pub_hostport(domain)}")
         if custom_mode:
             plog(f"  SSL: Custom certificate (your uploaded cert — no ACME)")
         else:
@@ -36845,7 +37077,7 @@ def _takportal_build_settings_dict(settings):
         "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
         "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
         "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
-        "TAK_PORTAL_PUBLIC_URL": f"https://{_get_service_domain(settings, 'takportal')}" if settings.get('fqdn') else f"http://{server_ip}:3000",
+        "TAK_PORTAL_PUBLIC_URL": f"https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}" if settings.get('fqdn') else f"http://{server_ip}:3000",
         "TAK_URL": f"https://{tak_url_host}:8443/Marti",
         "TAK_API_P12_PATH": "data/certs/tak-client.p12",
         "TAK_API_P12_PASSPHRASE": cert_pass,
@@ -36853,7 +37085,7 @@ def _takportal_build_settings_dict(settings):
         "TAK_REVOKE_ON_DISABLE": "true",
         "TAK_DEBUG": "false",
         "TAK_BYPASS_ENABLED": "false",
-        "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
+        "CLOUDTAK_URL": f"https://{_pub_hostport(cloudtak_host)}" if cloudtak_host else "",
         **_portal_email_settings(settings),
         "BRAND_THEME": "dark",
         "BRAND_LOGO_URL": "",
@@ -38555,7 +38787,7 @@ def run_takportal_deploy():
                 provider_pk = None
                 if flow_pk and inv_flow_pk:
                     try:
-                        _tp_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{fqdn}"}'
+                        _tp_host = f'https://{_pub_hostport(_get_service_domain(settings, "takportal") or f"takportal.{fqdn}")}'
                         _tp_cookie = f'.{fqdn.split(":")[0]}'
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
@@ -38660,7 +38892,7 @@ def run_takportal_deploy():
             generate_caddyfile(settings)
             _caddy_reload()
             plog(f"  \u2713 Caddy config updated for TAK Portal")
-            plog(f"  Open: https://{_get_service_domain(settings, 'takportal')}")
+            plog(f"  Open: https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}")
         plog("=" * 50)
         plog("")
         plog("  Waiting 2 minutes for Authentik to fully sync...")
@@ -39415,7 +39647,7 @@ paths:
                 for _line in _f:
                     if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token_val = _line.strip().split('=', 1)[1].strip()
-        ak_public_url = f'https://{_get_authentik_host(settings)}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
+        ak_public_url = f'https://{_pub_hostport(_get_authentik_host(settings))}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
         ldap_env_lines = (
             f'Environment=LDAP_ENABLED=1\n'
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
@@ -40504,8 +40736,8 @@ WantedBy=multi-user.target
             plog(f"🎉 MediaMTX v{version} deployed successfully!")
             if domain:
                 mtx_display_domain = f"stream.{domain}"
-                plog(f"   Web Console: https://{mtx_display_domain}")
-                plog(f"   HLS streams: https://{mtx_display_domain}/[stream]/index.m3u8")
+                plog(f"   Web Console: https://{_pub_hostport(mtx_display_domain)}")
+                plog(f"   HLS streams: https://{_pub_hostport(mtx_display_domain)}/[stream]/index.m3u8")
             else:
                 plog(f"   Web Editor: http://{settings.get('server_ip','server')}:5080")
             plog(f"   RTSP: rtsp://[server]:8554/[stream]")
@@ -42500,9 +42732,9 @@ def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, po
     ct_video_host = (_get_service_domain(settings, 'cloudtak_video') or '').strip()
 
     if ct_map_host and ct_tiles_host and ct_video_host:
-        api_url = f"https://{ct_map_host}"
-        pmtiles_url = f"https://{ct_tiles_host}"
-        media_url = f"https://{ct_video_host}"
+        api_url = f"https://{_pub_hostport(ct_map_host)}"
+        pmtiles_url = f"https://{_pub_hostport(ct_tiles_host)}"
+        media_url = f"https://{_pub_hostport(ct_video_host)}"
     elif domain:
         api_url = f"https://map.{domain}"
         pmtiles_url = f"https://tiles.map.{domain}"
@@ -46583,7 +46815,7 @@ def _cesium_list_datasets(settings):
     if not os.path.isdir(ct_dir):
         return []
     fqdn = (settings.get('fqdn') or '').strip()
-    base_url = f"https://{_get_service_domain(settings, 'cesium_tiles')}" if fqdn else ''
+    base_url = f"https://{_pub_hostport(_get_service_domain(settings, 'cesium_tiles'))}" if fqdn else ''
     datasets = []
     try:
         for name in sorted(os.listdir(ct_dir)):
@@ -47443,7 +47675,7 @@ def webodm_page():
     modules = detect_modules()
     wo = modules.get('webodm', {})
     wo_host = _get_service_domain(settings, 'webodm')
-    wo_url = f'https://{wo_host}' if wo_host else ''
+    wo_url = f'https://{_pub_hostport(wo_host)}' if wo_host else ''
     wo_vinfo = _get_webodm_version_info() if wo.get('installed') else {}
     wo_deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
     r = make_response(render_template('webodm.html',
@@ -47620,7 +47852,7 @@ def webodm_ready():
     import urllib.request as _ur
     settings = load_settings()
     wo_host = _get_service_domain(settings, 'webodm')
-    wo_url = f'https://{wo_host}' if wo_host else ''
+    wo_url = f'https://{_pub_hostport(wo_host)}' if wo_host else ''
 
     # 1. Container health — 'healthy' state means Django is answering its own healthcheck
     try:
@@ -47708,7 +47940,7 @@ def tvr_page():
     tvr = modules.get('tak_video_restreamer', {})
     mediamtx_conflict = modules.get('mediamtx', {}).get('installed', False)
     tvr_host = _get_service_domain(settings, 'tak_video_restreamer')
-    tvr_url = f'https://{tvr_host}' if tvr_host else ''
+    tvr_url = f'https://{_pub_hostport(tvr_host)}' if tvr_host else ''
     tvr_admin_pass = settings.get('tak_video_restreamer_admin_password', '')
     tvr_commit = settings.get('tak_video_restreamer_commit_sha', '')
     fqdn = settings.get('fqdn', '')
@@ -47805,7 +48037,7 @@ def simulator_page():
         settings=settings, modules=modules, sim=sim, sim_vinfo=sim_vinfo,
         sim_lanes=list(settings.get('simulator_lanes') or []),
         default_channel=settings.get('simulator_default_channel') or 'tak_simulation',
-        takportal_url=f'https://{_tp_host}' if _tp_host else '',
+        takportal_url=f'https://{_pub_hostport(_tp_host)}' if _tp_host else '',
         preflight=preflight, preflight_ok=preflight_ok,
         fqdn=settings.get('fqdn', ''), server_ip=settings.get('server_ip', ''),
         deploying=_job.get('running', False), deploy_log=_job.get('log', []), deploy_error=_job.get('error', False),
@@ -48936,7 +49168,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         # Create proxy provider (same payload structure as TAK Portal)
         provider_pk = None
         try:
-            _nr_host = f'https://{_get_service_domain(settings, "nodered") if settings else f"nodered.{fqdn}"}'
+            _nr_host = f'https://{_pub_hostport(_get_service_domain(settings, "nodered") if settings else f"nodered.{fqdn}")}'
             _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'Node-RED Proxy', 'authorization_flow': flow_pk,
@@ -49045,7 +49277,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
 
         provider_pk = None
         try:
-            _wo_host = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+            _wo_host = f'https://{_pub_hostport(_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}")}'
             _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
@@ -49114,7 +49346,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
         if not ak_public.startswith('https://'):
             log('  ⚠ No public https Authentik URL — skipping WebODM OIDC login setup')
             return True
-        wo_base = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+        wo_base = f'https://{_pub_hostport(_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}")}'
         redirect_uris_obj = [{'matching_mode': 'strict', 'url': f'{wo_base}/oidc/callback/'}]
 
         # Signing key + openid/email/profile scope mappings (NetBird pattern —
@@ -49284,7 +49516,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
 
         provider_pk = None
         try:
-            _tvr_host = f'https://{_get_service_domain(settings, "tak_video_restreamer") if settings else f"stream.{fqdn}"}'
+            _tvr_host = f'https://{_pub_hostport(_get_service_domain(settings, "tak_video_restreamer") if settings else f"stream.{fqdn}")}'
             _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'TAK Video Restreamer Proxy', 'authorization_flow': flow_pk,
@@ -49386,7 +49618,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
-                    'external_host': f'https://{fedhub_domain}', 'mode': 'forward_single',
+                    'external_host': f'https://{_pub_hostport(fedhub_domain)}', 'mode': 'forward_single',
                     'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
@@ -49401,7 +49633,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                     provider_pk = results[0]['pk']
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                            data=json.dumps({'external_host': f'https://{fedhub_domain}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                            data=json.dumps({'external_host': f'https://{_pub_hostport(fedhub_domain)}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -49475,12 +49707,12 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             log("  ⚠ No authorization/invalidation flow — skipping infra-TAK Console proxy providers")
             return False
 
-        entries = [('infra-TAK', 'infratak', f'https://{_get_service_domain(load_settings(), "infratak")}')]
+        entries = [('infra-TAK', 'infratak', f'https://{_pub_hostport(_get_service_domain(load_settings(), "infratak"))}')]
         try:
             s = load_settings()
             if _is_module_deployed(s, 'mediamtx'):
                 mtx_domain = _get_service_domain(s, 'mediamtx')
-                entries.append(('MediaMTX', 'stream', f'https://{mtx_domain}'))
+                entries.append(('MediaMTX', 'stream', f'https://{_pub_hostport(mtx_domain)}'))
         except Exception:
             pass
         # open_in_new_tab is set from the catalog when an app is created, never on an
@@ -49674,13 +49906,15 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
         redirect_host = fh_domain or fh_host or 'localhost'
         if fh_domain:
-            base = f'https://{fh_domain}'
-            redirect_uris_obj = [
-                {'matching_mode': 'strict', 'url': f'{base}/api/oauth/login/redirect'},
-                {'matching_mode': 'strict', 'url': f'{base}:443/api/oauth/login/redirect'},
-                {'matching_mode': 'strict', 'url': f'{base}/login/redirect'},
-                {'matching_mode': 'strict', 'url': f'{base}:443/login/redirect'},
-            ]
+            base = f'https://{_pub_hostport(fh_domain)}'
+            # GH #206: the explicit-port variant names Caddy's real port (443 unless moved,
+            # in which case it equals `base` and is dropped as a duplicate).
+            port_base = f'https://{fh_domain}:{_caddy_https_port(settings)}'
+            redirect_uris_obj = []
+            for _u in (f'{base}/api/oauth/login/redirect', f'{port_base}/api/oauth/login/redirect',
+                       f'{base}/login/redirect', f'{port_base}/login/redirect'):
+                if all(_o['url'] != _u for _o in redirect_uris_obj):
+                    redirect_uris_obj.append({'matching_mode': 'strict', 'url': _u})
         else:
             # Direct IP: Fed Hub OAuth callback is backend API endpoint; port 9100.
             redirect_uri = f'https://{redirect_host}:9100/api/oauth/login/redirect'
@@ -49893,7 +50127,7 @@ def _ensure_authentik_netbird_app(settings, plog=None):
         # Dashboard uses hash callbacks /#callback (netbird#5933); Authentik connector
         # uses /oauth2/callback on the NetBird domain. All strict — no regex URIs.
         netbird_domain = _get_service_domain(settings, 'netbird')
-        nb_base = f'https://{netbird_domain}'
+        nb_base = f'https://{_pub_hostport(netbird_domain)}'
         redirect_uris_obj = [
             {'matching_mode': 'strict', 'url': nb_base},
             {'matching_mode': 'strict', 'url': f'{nb_base}/'},
@@ -49997,7 +50231,7 @@ def _ensure_authentik_netbird_app(settings, plog=None):
             'name': provider_name,
             'slug': slug,
             'provider': provider_pk,
-            'meta_launch_url': f'https://{netbird_domain}',
+            'meta_launch_url': f'https://{_pub_hostport(netbird_domain)}',
         }
         try:
             req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
@@ -50009,7 +50243,7 @@ def _ensure_authentik_netbird_app(settings, plog=None):
             if hasattr(e, 'code') and e.code == 400:
                 try:
                     req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
-                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': f'https://{netbird_domain}'}).encode(),
+                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': f'https://{_pub_hostport(netbird_domain)}'}).encode(),
                         headers=_ak_headers, method='PATCH')
                     _urlreq.urlopen(req, timeout=10)
                 except Exception:
@@ -50580,7 +50814,7 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
 
     netbird_domain = _get_service_domain(settings, 'netbird')
     if not idp_redirect:
-        idp_redirect = f'https://{netbird_domain}/oauth2/callback'
+        idp_redirect = f'https://{_pub_hostport(netbird_domain)}/oauth2/callback'
     plog(f'  IDP callback URI: {idp_redirect}')
     _netbird_patch_authentik_idp_redirect(settings, idp_redirect, plog=plog)
     return True
@@ -50597,7 +50831,7 @@ def _netbird_patch_authentik_idp_redirect(settings, callback_url, plog=None):
         return
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     netbird_domain = _get_service_domain(settings, 'netbird')
-    nb_base = f'https://{netbird_domain}'
+    nb_base = f'https://{_pub_hostport(netbird_domain)}'
     wanted = [
         {'matching_mode': 'strict', 'url': callback_url},
         {'matching_mode': 'strict', 'url': f'{nb_base}/oauth2/callback'},
@@ -50652,25 +50886,25 @@ def _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enable
     config_content = f"""# NetBird self-hosted (embedded IdP + Authentik external login)
 server:
   listenAddress: ":443"
-  exposedAddress: "https://{netbird_domain}:443"
+  exposedAddress: "https://{netbird_domain}:{_caddy_https_port()}"
   metricsPort: 9090
   healthcheckAddress: ":9000"
   auth:
-    issuer: "https://{netbird_domain}/oauth2"
+    issuer: "https://{_pub_hostport(netbird_domain)}/oauth2"
     audience: "netbird-dashboard"
     userIDClaim: "sub"
     dashboardRedirectURIs:
-      - "https://{netbird_domain}"
-      - "https://{netbird_domain}/"
-      - "https://{netbird_domain}/#callback"
-      - "https://{netbird_domain}/#silent-callback"
-      - "https://{netbird_domain}/nb-auth"
-      - "https://{netbird_domain}/nb-silent-auth"
-      - "https://{netbird_domain}/peers"
-      - "https://{netbird_domain}/silent-callback"
+      - "https://{_pub_hostport(netbird_domain)}"
+      - "https://{_pub_hostport(netbird_domain)}/"
+      - "https://{_pub_hostport(netbird_domain)}/#callback"
+      - "https://{_pub_hostport(netbird_domain)}/#silent-callback"
+      - "https://{_pub_hostport(netbird_domain)}/nb-auth"
+      - "https://{_pub_hostport(netbird_domain)}/nb-silent-auth"
+      - "https://{_pub_hostport(netbird_domain)}/peers"
+      - "https://{_pub_hostport(netbird_domain)}/silent-callback"
     dashboardPostLogoutRedirectURIs:
-      - "https://{netbird_domain}"
-      - "https://{netbird_domain}/"
+      - "https://{_pub_hostport(netbird_domain)}"
+      - "https://{_pub_hostport(netbird_domain)}/"
   dataDir: "/var/lib/netbird/"
   authSecret: "{auth_secret}"
 """
@@ -50714,12 +50948,12 @@ server:
       # 127.0.0.1:8642); bind 127.0.0.1 so it isn't publicly exposed on firewalld.
       - "127.0.0.1:8642:80"
     environment:
-      - NETBIRD_MGMT_API_ENDPOINT=https://{netbird_domain}
-      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{netbird_domain}
+      - NETBIRD_MGMT_API_ENDPOINT=https://{_pub_hostport(netbird_domain)}
+      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://{_pub_hostport(netbird_domain)}
       - AUTH_AUDIENCE=netbird-dashboard
       - AUTH_CLIENT_ID=netbird-dashboard
       - AUTH_CLIENT_SECRET=
-      - AUTH_AUTHORITY=https://{netbird_domain}/oauth2
+      - AUTH_AUTHORITY=https://{_pub_hostport(netbird_domain)}/oauth2
       - USE_AUTH0=false
       - AUTH_SUPPORTED_SCOPES=openid profile email offline_access
       - AUTH_REDIRECT_URI=/#callback
@@ -50806,7 +51040,7 @@ def _run_netbird_deploy(settings):
 
         netbird_domain = _get_service_domain(settings, 'netbird')
         authentik_domain = _get_service_domain(settings, 'authentik') or settings.get('fqdn', '').strip()
-        authentik_issuer = f'https://{authentik_domain}/application/o/netbird/'
+        authentik_issuer = f'https://{_pub_hostport(authentik_domain)}/application/o/netbird/'
         auth_secret = _netbird_read_auth_secret(nb_dir) or _sec.token_hex(32)
 
         # Always allow the setup PAT during bootstrap (#72). Keying this off "no PAT in
@@ -50818,7 +51052,7 @@ def _run_netbird_deploy(settings):
         _nb_target_srv, _ = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
         _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
-        plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{netbird_domain}/oauth2)')
+        plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{_pub_hostport(netbird_domain)}/oauth2)')
 
         plog('  Pulling images...')
         _sp.run(_sudo_wrap(['docker', 'compose', 'pull']), capture_output=True, text=True, cwd=nb_dir)
@@ -50881,8 +51115,8 @@ def _run_netbird_deploy(settings):
         fqdn = settings.get('fqdn', 'localhost')
         plog('')
         plog('🎉 NetBird deployed successfully!')
-        plog(f'Dashboard: https://{netbird_domain}')
-        plog(f'Login: Authentik button on https://{netbird_domain} (embedded IdP + external SSO)')
+        plog(f'Dashboard: https://{_pub_hostport(netbird_domain)}')
+        plog(f'Login: Authentik button on https://{_pub_hostport(netbird_domain)} (embedded IdP + external SSO)')
         plog(f'Bootstrap owner: akadmin@{fqdn}')
         _netbird_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
@@ -51165,7 +51399,7 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
         return
     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     base = fqdn.split(':')[0].split('/')[0]
-    desired_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{base}"}'
+    desired_host = f'https://{_pub_hostport(_get_service_domain(settings, "takportal") or f"takportal.{base}")}'
     desired_cookie = f'.{base}'
     provider_pk = None
     try:
@@ -56917,7 +57151,7 @@ def _rewrite_ldap_compose_to_fqdn(compose_text, fqdn):
             continue
         if 'AUTHENTIK_HOST:' in line:
             indent = line[:len(line) - len(line.lstrip())]
-            new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
+            new_lines.append(f'{indent}AUTHENTIK_HOST: {_pub_url(fqdn)}\n')
             continue
         new_lines.append(line)
     return ''.join(new_lines), True
@@ -56956,7 +57190,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             for _l in _f:
                 _ls = _l.strip()
                 if _ls.startswith('AUTHENTIK_HOST=') and 'https://' in _ls:
-                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
+                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip().split(':')[0]
                     break
         if not fqdn:
             plog("  routing repair: no FQDN in .env (need AUTHENTIK_HOST=https://...) — skipping")
@@ -56986,7 +57220,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
         try:
             _probe = subprocess.run(
                 _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
-                            '--timeout=5', '-q', f'https://{fqdn}/-/health/live/']),
+                            '--timeout=5', '-q', f'{_pub_url(fqdn)}/-/health/live/']),
                 capture_output=True, text=True, timeout=15
             )
             _direct_ok = (_probe.returncode == 0)
@@ -57006,7 +57240,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
                 return
             plog(f"  routing repair: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — migrating via host-gateway")
         else:
-            plog(f"  routing repair: caddy probe https://{fqdn}/-/health/live/ OK — migrating routing")
+            plog(f"  routing repair: caddy probe https://{_pub_hostport(fqdn)}/-/health/live/ OK — migrating routing")
 
         import time as _t
         backup_path = f'{compose_path}.bak.routing-repair.{int(_t.time())}'
@@ -57021,7 +57255,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
 
         with open(compose_path, 'w') as _f:
             _f.write(new_text)
-        plog(f"  routing repair: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
+        plog(f"  routing repair: rewrote LDAP service → AUTHENTIK_HOST=https://{_pub_hostport(fqdn)} + extra_hosts:host-gateway")
 
         plog("  routing repair: recreating LDAP container only (server/worker/db untouched)...")
         _r = subprocess.run(
@@ -57052,7 +57286,7 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
                 break
 
         if connected and not has_tls_err and not has_route_err:
-            plog(f"  ✓ routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
+            plog(f"  ✓ routing repair: LDAP outpost healthy on https://{_pub_hostport(fqdn)} via Caddy (spiral broken)")
             _record_spiral_repair_attempt('success', evidence)
             return
 
@@ -57103,7 +57337,7 @@ def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
         return False, f"{fqdn} has no DNS A record", ''
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection(('127.0.0.1', 443), timeout=timeout) as raw:
+        with socket.create_connection(('127.0.0.1', _caddy_https_port()), timeout=timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
                 der = tls.getpeercert(binary_form=True) or b''
     except ssl.SSLCertVerificationError as e:
@@ -57201,7 +57435,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, 
             for _l in _f:
                 _ls = _l.strip()
                 if _ls.startswith('AUTHENTIK_HOST=') and 'https://' in _ls:
-                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
+                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip().split(':')[0]
                     break
         if not fqdn:
             _skip("  proactive routing: no FQDN in .env — skipping (no migration target)")
@@ -57221,7 +57455,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, 
         if not force:
             left, st = _ldap_fqdn_move_backoff(fqdn, cert_sha)
             if left:
-                _skip(f"  proactive routing: moving the outpost to https://{fqdn} failed {st.get('fails')}x with "
+                _skip(f"  proactive routing: moving the outpost to https://{_pub_hostport(fqdn)} failed {st.get('fails')}x with "
                       f"this certificate — backing off until "
                       f"{time.strftime('%a %H:%M %Z', time.localtime(float(st.get('retry_after') or 0)))} "
                       f"('Resync LDAP to TAK Server' tries now)")
@@ -57231,7 +57465,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, 
         try:
             _probe = subprocess.run(
                 _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
-                            '--timeout=5', '-q', f'https://{fqdn}/-/health/live/']),
+                            '--timeout=5', '-q', f'{_pub_url(fqdn)}/-/health/live/']),
                 capture_output=True, text=True, timeout=15
             )
             _direct_ok = (_probe.returncode == 0)
@@ -57275,7 +57509,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, 
 
         with open(compose_path, 'w') as _f:
             _f.write(new_text)
-        plog(f"  proactive routing: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
+        plog(f"  proactive routing: rewrote LDAP service → AUTHENTIK_HOST=https://{_pub_hostport(fqdn)} + extra_hosts:host-gateway")
 
         plog("  proactive routing: recreating LDAP container only (server/worker/db untouched)...")
         _r = subprocess.run(
@@ -57307,7 +57541,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, 
                 break
 
         if connected and not has_tls_err and not has_route_err:
-            plog(f"  ✓ proactive routing: LDAP outpost healthy on https://{fqdn} via Caddy")
+            plog(f"  ✓ proactive routing: LDAP outpost healthy on https://{_pub_hostport(fqdn)} via Caddy")
             try:
                 s = load_settings()
                 s['authentik_proactive_routing_migration'] = {
@@ -62754,7 +62988,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                 summary[module_key] = {'provider': 'failed:no-domain', 'app': '-', 'outpost': '-'}
                 _log(f"  ⚠ {prov_name}: cannot resolve service domain — skip")
                 continue
-            desired_host = f'https://{service_domain}'
+            desired_host = f'https://{_pub_hostport(service_domain)}'
 
             result = {'provider': 'ok', 'app': 'ok', 'outpost': 'ok'}
 
@@ -63029,12 +63263,13 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
         # portal.<fqdn> instead of takportal.<fqdn>) is honored. Hardcoding the
         # default prefix here used to revert the operator's external_host on every
         # startup, breaking forward auth on the custom host (GH #41).
+        # GH #206: _pub_hostport adds Caddy's port when the operator moved it off 443.
         canonical = {
-            'TAK Portal Proxy': f"https://{_get_service_domain(_settings, 'takportal')}",
-            'Node-RED Proxy':   f"https://{_get_service_domain(_settings, 'nodered')}",
-            'MediaMTX':         f"https://{_get_service_domain(_settings, 'mediamtx')}",
-            'infra-TAK':        f"https://{_get_service_domain(_settings, 'infratak')}",
-            'Federation Hub Proxy': f"https://{_get_service_domain(_settings, 'fedhub')}",
+            'TAK Portal Proxy': f"https://{_pub_hostport(_get_service_domain(_settings, 'takportal'), _settings)}",
+            'Node-RED Proxy':   f"https://{_pub_hostport(_get_service_domain(_settings, 'nodered'), _settings)}",
+            'MediaMTX':         f"https://{_pub_hostport(_get_service_domain(_settings, 'mediamtx'), _settings)}",
+            'infra-TAK':        f"https://{_pub_hostport(_get_service_domain(_settings, 'infratak'), _settings)}",
+            'Federation Hub Proxy': f"https://{_pub_hostport(_get_service_domain(_settings, 'fedhub'), _settings)}",
         }
 
         _token = (
@@ -67374,7 +67609,7 @@ entries:
                                 'name': 'TAK Portal Proxy',
                                 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk or flow_pk,
-                                'external_host': f"https://{_get_service_domain(settings, 'takportal')}",
+                                'external_host': f"https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}",
                                 'mode': 'forward_single',
                                 'token_validity': 'hours=24',
                                 'cookie_domain': f'.{base_domain}'
@@ -67602,7 +67837,7 @@ entries:
                         ctx = ssl.create_default_context()
                         with ctx.wrap_socket(socket.socket(), server_hostname=_ak_tls_hostname) as s:
                             s.settimeout(5)
-                            s.connect((_ak_tls_hostname, 443))
+                            s.connect((_ak_tls_hostname, _caddy_https_port(settings)))
                         _tls_ready = True
                         plog(f"  ✓ TLS cert ready for {_ak_tls_hostname} ({_tls_attempt * 5}s)")
                         break
@@ -86419,9 +86654,11 @@ def _startup_ensure_console_ports():
                 _fw_allow(_cport, 'tcp')
         # 80 + 443: Caddy fronts the FQDN/console vhost whenever ssl is fqdn/custom —
         # needed on BOTH postures (a Hardened box reaches the console via Caddy 443).
-        if (load_settings().get('ssl_mode') or '') in ('fqdn', 'custom'):
-            _fw_allow(80, 'tcp')
-            _fw_allow(443, 'tcp')
+        # GH #206: on whatever ports Caddy was moved to.
+        _s = load_settings()
+        if (_s.get('ssl_mode') or '') in ('fqdn', 'custom'):
+            _fw_allow(_caddy_http_port(_s), 'tcp')
+            _fw_allow(_caddy_https_port(_s), 'tcp')
     except Exception as _e:
         print('[startup-ports] console-ports ensure warning (non-fatal): %s' % str(_e)[:160], flush=True)
 
@@ -93940,6 +94177,10 @@ _MODULE_CTX = {
     # default, or the operator's {service}_domain override. Modules must not rebuild it
     # from fqdn: that is exactly how the TVR deploy log came to print the apex.
     '_get_service_domain': _get_service_domain,
+    # GH #206: a service host as a browser must type it — `host:PORT` once the operator
+    # has moved Caddy off 443 (or 80 for the plain-HTTP form), the bare host otherwise.
+    '_pub_hostport': _pub_hostport,
+    '_pub_http_hostport': _pub_http_hostport,
     # v10.1.50: the ONLY sanctioned way for a module to reload Caddy. A module that
     # hand-rolls subprocess.run(_sudo_wrap(['systemctl','reload','caddy'])) reopens the
     # eternal-grace-period hang inside the module registry, where the deploy-job runner's
