@@ -17,7 +17,8 @@
 """Node-RED image moved off 4.0 (Node-RED 4.0.9 on end-of-life Node 20).
 
 The 4.0 tag carried jsonata 2.0.5 (CVE-2026-77413/14/15), multer 1.4.5-lts.1 and
-ws 7.5.10 (CVE-2026-48779). 4.1.16-22 is Node-RED 4.1.16 on Node 22.
+ws 7.5.10 (CVE-2026-48779). 4.1.16-22 is Node-RED 4.1.16 on Node 22.23.3;
+4.1.17-22 (2026-10-21) moved to Node 22.23.4, Node's October 2026 security release.
 """
 
 import pathlib
@@ -47,7 +48,8 @@ def test_pin_is_exact_and_past_the_advisories():
     # exact Node-RED version + Node major, never a moving tag like 4.1 or latest
     m = re.fullmatch(r'(\d+\.\d+\.\d+)-(\d+)', tag)
     assert m, tag
-    assert _v(m.group(1)) >= (4, 1, 16)
+    # 4.1.17-22 is the first 4.1.x-22 build on Node 22.23.4
+    assert _v(m.group(1)) >= (4, 1, 17)
     assert int(m.group(2)) >= 22
 
 

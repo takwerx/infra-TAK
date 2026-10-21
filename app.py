@@ -51706,10 +51706,11 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
 # 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
 # fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
-# 4.1.16-22 = Node-RED 4.1.16 on Node 22 (2026-10-08), amd64 + arm64. Exact tag on
-# purpose: the plain `4.1` tag is stale and there is no bare `4.1.16`. Fresh deploys
+# 4.1.17-22 = Node-RED 4.1.17 on Node 22.23.4 (2026-10-21), amd64 + arm64. 22.23.4 is
+# Node's October 2026 security release (4.1.16-22 shipped Node 22.23.3). Exact tag on
+# purpose: the plain `4.1` tag is stale and there is no bare `4.1.17`. Fresh deploys
 # write it, and Update moves every existing box onto it (_auto_nodered).
-NODERED_IMAGE = 'nodered/node-red:4.1.16-22'
+NODERED_IMAGE = 'nodered/node-red:4.1.17-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
 
 
