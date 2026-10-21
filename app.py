@@ -15798,24 +15798,70 @@ def _remote_assist_deploy_log(msg):
 # ops #135: `compose up -d --build` never pulls. A FROM image already on the box (e.g.
 # `node:22-alpine`) is reused as-is, so a rebuild or Update kept shipping the base it was
 # first built on: Remote Assist sat on Node 22.23.0 on test6 while Docker Hub had 22.23.4.
-# `build --pull` checks the registry for every FROM image first; the `up -d --build` that
-# follows then hits the fresh layer cache. A pull that fails (registry unreachable, rate
-# limit) must not stop a build that worked yesterday, so it falls back to the cached base
-# and says so. A timeout is not a pull failure: the build itself is slow, and the same
-# build without --pull would only time out again.
-# https://docs.docker.com/reference/cli/docker/compose/build/
-def _compose_build_pull(argv, cwd, plog=None, timeout=900):
-    """Run `argv` (a `docker compose ... build --pull` command). Returns (ok, error).
-    Raises subprocess.TimeoutExpired; any other failure is logged and returned."""
+# So every Deploy and Update first `docker pull`s each FROM image, then builds WITHOUT
+# --pull. A pull that fails (registry unreachable, rate limit, hang) must not stop a build
+# that worked yesterday, so it is logged and the build goes on with the copy on the box.
+# Why not `build --pull`: with Docker's containerd image store (the default on fresh
+# Docker 29 installs, and on every fleet box) a base BuildKit fetched itself is not a tagged image, so a build resolves its FROM
+# against the registry even without --pull, and with the registry down it fails. A
+# `docker pull` tags the base in the store, so the next build resolves it locally
+# (T&E round 3, ops #136, test8 with Docker Hub blocked).
+# https://docs.docker.com/reference/cli/docker/image/pull/
+# https://docs.docker.com/engine/storage/containerd/
+_DOCKERFILE_FROM_RE = re.compile(r'^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(\S+)(?:[ \t]+AS[ \t]+(\S+))?',
+                                 re.IGNORECASE | re.MULTILINE)
+
+
+def _dockerfile_base_images(build_dir):
+    """FROM images of the Dockerfiles in build_dir and its direct subdirectories, in order,
+    deduplicated. Skips build-stage names, `scratch` and ARG-templated names (`$X`), none
+    of which can be pulled as written."""
+    paths = [os.path.join(build_dir, 'Dockerfile')]
+    try:
+        paths += [os.path.join(build_dir, d, 'Dockerfile') for d in sorted(os.listdir(build_dir))]
+    except OSError:
+        pass
+    images = []
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        stages = set()
+        for m in _DOCKERFILE_FROM_RE.finditer(text):
+            img, stage = m.group(1), m.group(2)
+            if img.lower() not in stages and img.lower() != 'scratch' and '$' not in img and img not in images:
+                images.append(img)
+            if stage:
+                stages.add(stage.lower())
+    return images
+
+
+def _pull_base_images(build_dir, wrap=None, plog=None, timeout=300):
+    """`docker pull` every FROM image under build_dir (argv passed through `wrap`, e.g.
+    _sudo_wrap). Returns the images that could not be pulled. Never raises: a failed or
+    timed-out pull only means the build uses the copy already on the box."""
     _log = plog or (lambda m: print(m, flush=True))
-    _log('  Refreshing base images (docker compose build --pull)...')
-    r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    if r.returncode == 0:
-        _log('  ✓ Base images current')
-        return True, ''
-    err = (r.stderr or r.stdout or '').strip()[-300:]
-    _log(f'  ⚠ Could not refresh base images, building on the cached base instead: {err}')
-    return False, err
+    _wrap = wrap or (lambda argv: argv)
+    failed = []
+    for img in _dockerfile_base_images(build_dir):
+        _log(f'  Pulling base image {img}...')
+        try:
+            r = subprocess.run(_wrap(['docker', 'pull', img]), cwd=build_dir,
+                               capture_output=True, text=True, timeout=timeout)
+            lines = (r.stderr or r.stdout or '').strip().splitlines()
+            err = '' if r.returncode == 0 else (lines[-1] if lines else f'rc={r.returncode}')[-300:]
+        except subprocess.TimeoutExpired:
+            err = f'timed out after {timeout}s'
+        except OSError as e:
+            err = str(e)[-300:] or 'could not run docker pull'
+        if err:
+            failed.append(img)
+            _log(f'  ⚠ Could not pull {img}, building on the copy already on this box: {err}')
+        else:
+            _log(f'  ✓ {img} current')
+    return failed
 
 
 def _remote_assist_compose_files(ra_dir):
@@ -16169,7 +16215,7 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
-        _compose_build_pull(_remote_assist_compose_cmd(ra_dir, 'build', '--pull'), ra_dir, plog=plog)
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         if r.returncode != 0:
@@ -16424,7 +16470,7 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
-        _compose_build_pull(_remote_assist_compose_cmd(ra_dir, 'build', '--pull'), ra_dir, plog=plog)
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
@@ -37630,8 +37676,8 @@ def _takportal_run_update(portal_dir):
     # surfaced as an unhandled 500 with no explanation at all.
     # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
     # a Node security release when TAK Portal itself has not changed.
+    _pull_base_images(portal_dir, wrap=_sudo_wrap)
     try:
-        _compose_build_pull(_sudo_wrap(['docker', 'compose', 'build', '--pull']), portal_dir)
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
                                cwd=portal_dir, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
@@ -38178,7 +38224,7 @@ def run_takportal_deploy():
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
         _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
-        _compose_build_pull(_sudo_wrap(['docker', 'compose', 'build', '--pull']), portal_dir, plog=plog)  # ops #135
+        _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
