@@ -33,6 +33,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 
 import pytest
 
@@ -166,7 +167,9 @@ def test_confirmed_down_is_still_restarted(watch):
 # ─── tak-db-health-agent.py ───────────────────────────────────────────────────
 
 def test_health_agent_runs_pg_isready_as_postgres(monkeypatch):
-    spec = importlib.util.spec_from_file_location('tak_db_health_agent_t', GD / 'tak-db-health-agent.py')
+    # No __pycache__ in scripts/guarddog: other tests read every file in that directory.
+    monkeypatch.setattr(sys, 'dont_write_bytecode', True)
+    spec =importlib.util.spec_from_file_location('tak_db_health_agent_t', GD / 'tak-db-health-agent.py')
     agent = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(agent)
     seen = []
