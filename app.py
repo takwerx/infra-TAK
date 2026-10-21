@@ -89183,7 +89183,7 @@ def _startup_migrations():
         # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
         try:
             _start_takportal_mapsync_watchdog()
-            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+            print("Startup: TAK Portal map-channel watchdog started (channel check 1 min, full sync 10 min)", flush=True)
         except Exception as _mwe:
             print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
