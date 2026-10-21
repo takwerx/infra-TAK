@@ -92,6 +92,14 @@ from collections import defaultdict, deque
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
 
+# v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
+# whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
+# and every respawn re-ran the startup migrations. Now only that connection drops,
+# and its peer address is logged. Must run before gunicorn calls worker.run().
+import gunicorn_tls_guard
+if gunicorn_tls_guard.install():
+    print("[tls-guard] gthread pre-handshake reset guard active", flush=True)
+
 # v0.9.12: ensure $HOME is set so child shells can expand ~/ in
 # subprocess.run('cd ~/authentik ...', shell=True). systemd does NOT inherit
 # HOME from login env, and takwerx-console.service historically did not pin
@@ -208,22 +216,109 @@ def _broker_should_route():
     return os.getuid() != 0
 
 
-def _broker_available():
+def _broker_socket_present():
     try:
         return _stat.S_ISSOCK(os.stat(BROKER_SOCKET).st_mode)
     except OSError:
         return False
 
 
+# ops #113: the broker restarts itself once a day (its idle recycle) and whenever its source
+# changes, and for ~2-3 s its socket is gone. Every caller below that found it gone fell back
+# to `sudo -n` or the bare binary — which, on a non-root box, simply fails. test6 2026-10-20
+# 13:14:58Z: 46 `sudo -n` failures in the 3.3 s gap, mid post-update → "Node-RED container
+# not running" (flow sync skipped) and a false Authentik `FATAL: port conflict`. On a box that
+# routes through the broker, a broker systemd still has up or on its way back up is a broker
+# to wait for, not to route around. Bounded; a stopped or failed broker fails fast as before.
+# Same rule as takwerx_brokerctl.connect() and the PATH shims.
+BROKER_RESTART_WAIT_SECS = 30
+_BROKER_UNIT_SOCKET = '/run/takwerx-broker.sock'
+_BROKER_LIVE_STATES = ('active', 'activating', 'deactivating', 'reloading')
+_broker_wait_note_at = 0.0
+
+
+def _broker_restarting():
+    """True while systemd has takwerx-broker up or coming back. Real systemctl, not the
+    PATH shim (which would itself wait on the broker); False when it cannot tell."""
+    if BROKER_SOCKET != _BROKER_UNIT_SOCKET:
+        return False
+    sc = shutil.which('systemctl', path='/usr/bin:/bin')
+    if not sc:
+        return False
+    try:
+        r = subprocess.run([sc, 'is-active', 'takwerx-broker'], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (r.stdout or '').strip() in _BROKER_LIVE_STATES
+
+
+def _broker_wait(ready, max_secs=BROKER_RESTART_WAIT_SECS):
+    """Poll `ready()` while the broker is restarting, for at most `max_secs`. True once
+    `ready()` is; False at once when not routing or systemd says the broker is down."""
+    global _broker_wait_note_at
+    if not _broker_should_route():
+        return False
+    t0 = time.monotonic()
+    next_state_check = t0
+    while True:
+        now = time.monotonic()
+        if now >= next_state_check:
+            if not _broker_restarting():
+                return False
+            next_state_check = now + 1
+        if now - t0 >= max_secs:
+            print(f'Privileged broker still unreachable after {max_secs}s of waiting for its '
+                  'restart — this call falls back', flush=True)
+            return False
+        time.sleep(0.1)
+        if ready():
+            if now - _broker_wait_note_at >= 10:     # one line per restart, not per call
+                _broker_wait_note_at = now
+                print(f'Privileged broker was restarting — waited '
+                      f'{time.monotonic() - t0:.1f}s for it instead of falling back', flush=True)
+            return True
+
+
+def _broker_available():
+    return _broker_socket_present() or _broker_wait(_broker_socket_present)
+
+
+def _broker_connect(timeout):
+    """A socket connected to the broker. A missing/refusing socket while the broker restarts
+    is retried (_broker_wait) — nothing was sent yet, so a retry cannot run a command twice."""
+    def _try():
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(BROKER_SOCKET)
+            return s
+        except BaseException:
+            s.close()
+            raise
+    try:
+        return _try()
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        first = e
+    except OSError as e:
+        raise BrokerError(f'broker unreachable: {e}')
+    got = []
+
+    def _ready():
+        try:
+            got.append(_try())
+            return True
+        except OSError:
+            return False
+    if _broker_wait(_ready):
+        return got[0]
+    raise BrokerError(f'broker unreachable: {first}')
+
+
 def _broker_request(req, timeout=600):
     """Send one JSON request to the broker, return the parsed response dict.
     Raises BrokerError if the socket is unreachable."""
-    try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(BROKER_SOCKET)
-    except OSError as e:
-        raise BrokerError(f'broker unreachable: {e}')
+    s = _broker_connect(timeout)
     try:
         s.sendall(json.dumps(req).encode())
         s.shutdown(_socket.SHUT_WR)
@@ -1073,7 +1168,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.15-alpha"
+VERSION = "10.2.25-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1151,6 +1246,11 @@ CADDY_CERT_STORE = "/var/lib/caddy/.local/share/caddy/certificates"
 CADDY_LE_ISSUER_DIR = "acme-v02.api.letsencrypt.org-directory"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
+# GH #176: operator-owned Caddy includes, outside the generated file so no regeneration
+# can touch them. snippets.d/*.caddy is imported at the top level right after the global
+# options; sites.d/<host>/*.caddy is imported as the first line of that host's site block.
+CADDY_SNIPPETS_INCLUDE_DIR = "/etc/caddy/snippets.d"
+CADDY_SITES_INCLUDE_DIR = "/etc/caddy/sites.d"
 # CloudTAK official icon (SVG data URL)
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
@@ -2000,6 +2100,23 @@ def _mod_result_step(module, step):
             last = (d.get(module) or {}).get('last')
             if last and last.get('outcome') == 'running':
                 last['step'] = str(step)[:120]
+                _mod_results_save(d)
+    except Exception:
+        pass
+
+
+def _mod_result_versions(module, frm=None, to=None):
+    """Fill in from/to on an in-flight record once the job itself knows them (ops #129: the
+    CloudTAK update only learns both after it starts, so its card said "? -> ?")."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            last = (d.get(module) or {}).get('last')
+            if last and last.get('outcome') == 'running':
+                if frm:
+                    last['from'] = str(frm)[:60]
+                if to:
+                    last['to'] = str(to)[:60]
                 _mod_results_save(d)
     except Exception:
         pass
@@ -6943,10 +7060,10 @@ def _record_mfa_reset(username, user_pk, removed, sessions_killed, method='conso
         pass
 
 
-# --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
+# --- Authentik login/MFA copy (clearer than the stock "authentik" text) -------------
 # Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
-# wording on every box. Independent of hardening posture — login screens should always read
-# clearly. Idempotent; applied by a startup migration when Authentik is present.
+# wording. Independent of hardening posture. Seeded ONCE by a startup migration when
+# Authentik is present; after that the operator owns these fields (#151).
 AK_BRAND_TITLE = 'infra-TAK'
 AK_AUTH_FLOW_TITLE = 'Sign in'
 AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
@@ -6996,45 +7113,74 @@ TAK_LDAP_UPDATE_INTERVAL_MS = '30000'
 AK_TASK_EXPIRATION = 'days=3'
 
 def _ensure_authentik_login_copy(log=None):
-    """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
-    header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
-    (so it's a no-op on subsequent boots). Never raises. Returns True if anything changed."""
+    """Seed clear login/MFA wording ONCE: brand title, the authentication-flow header, and the
+    TOTP/WebAuthn enrollment button labels. Never raises. Returns True if anything changed.
+
+    #151: these are operator-owned Authentik settings (CLAUDE.md "Third-party app config is
+    operator-owned"). Through v10.2.15 this re-applied the copy on every console boot, and the
+    console restarts daily (RuntimeMaxSec=24h), so an operator's own brand title was put back
+    within a day. Now it writes once and records `authentik_login_copy_seeded`; after that the
+    fields are never touched again.
+
+    Upgrade from a release that re-applied the copy: if any field already carries our wording,
+    that release seeded this box, and anything that differs now is the operator's change since.
+    Record the marker and write nothing. The marker is only recorded once every read and write
+    succeeded, so an unreachable Authentik is retried on the next boot."""
     def _l(m):
         if log:
             log(m)
+    if load_settings().get('authentik_login_copy_seeded'):
+        return False
     ak_url, ak_headers, _ = _w1_ak_ctx()
     if not ak_url:
         return False
-    changed = False
     try:
         brands = _w1_ak_get(ak_url, 'core/brands/', ak_headers).get('results', [])
-        if brands and brands[0].get('branding_title') != AK_BRAND_TITLE:
-            bid = brands[0].get('brand_uuid') or brands[0].get('pk')
-            _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
-                         data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
-    except Exception as e:
-        _l('Authentik brand title copy: %s' % str(e)[:100])
-    try:
         flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
-        if flows and flows[0].get('title') != AK_AUTH_FLOW_TITLE:
-            _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
-                         data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
-                         method='PATCH', headers=ak_headers)
-            changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
-    except Exception as e:
-        _l('Authentik flow title copy: %s' % str(e)[:100])
-    for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
-        try:
+        stages = []
+        for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
             for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
-                if s.get('friendly_name') != friendly:
-                    _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
-                                 data=json.dumps({'friendly_name': friendly}).encode(),
-                                 method='PATCH', headers=ak_headers)
-                    changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+                stages.append((kind, friendly, s))
+    except Exception as e:
+        _l('Authentik login copy: %s' % str(e)[:100])
+        return False
+    already = ((brands and brands[0].get('branding_title') == AK_BRAND_TITLE)
+               or (flows and flows[0].get('title') == AK_AUTH_FLOW_TITLE)
+               or any(s.get('friendly_name') == friendly for _k, friendly, s in stages))
+    changed = False
+    ok = True
+    if not already:
+        try:
+            if brands:
+                bid = brands[0].get('brand_uuid') or brands[0].get('pk')
+                _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
+                             data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
         except Exception as e:
-            _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+            ok = False; _l('Authentik brand title copy: %s' % str(e)[:100])
+        try:
+            if flows:
+                _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
+                             data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
+        except Exception as e:
+            ok = False; _l('Authentik flow title copy: %s' % str(e)[:100])
+        for kind, friendly, s in stages:
+            try:
+                _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
+                             data=json.dumps({'friendly_name': friendly}).encode(),
+                             method='PATCH', headers=ak_headers)
+                changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+            except Exception as e:
+                ok = False; _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+    if ok and (brands or flows):
+        s_cfg = load_settings()
+        s_cfg['authentik_login_copy_seeded'] = True
+        save_settings(s_cfg)
+        _l('Authentik login copy: %s — operator-owned from here on'
+           % ('seeded' if changed else 'already seeded by an earlier release'))
     return changed
 
 def _ensure_authentik_event_retention(log=None):
@@ -8401,7 +8547,8 @@ def _diag_section_takserver(settings):
     except Exception as e:
         cc = ''
         out.append(f"CoreConfig.xml not readable ({str(e)[:80]})")
-    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN')),
+    for tag, attrs in (('ldap', ('url', 'adminGroup', 'groupprefix', 'style', 'serviceAccountDN',
+                                 'enableConnectionPool')),
                        ('auth', ('default', 'x509groups', 'x509useGroupCache')),
                        ('connector', ('port', 'clientAuth', '_name')),
                        # v10.2.11: where TAK looks for its database and as whom (never the password)
@@ -8776,6 +8923,7 @@ def _diag_section_takportal(settings):
     out.extend('  ' + l[:260] for l in hits[-20:])
     # v10.2.8 W12: the addresses Portal uses for TAK, its own links and Authentik — the bcg-tak
     # report could not show that Portal was still on the server's IP.
+    existing = {}
     try:
         existing = _takportal_get_existing_settings() or {}
         out.append('addresses: ' + ', '.join(f"{k}={existing.get(k) or '(unset)'}" for k in TAKPORTAL_DOMAIN_KEYS))
@@ -8785,6 +8933,66 @@ def _diag_section_takportal(settings):
                        + ', '.join(f"{f['key']} (should be {f['suggested']})" for f in stale))
     except Exception as e:
         out.append(f'addresses: could not read ({str(e)[:100]})')
+    out.extend(_diag_takportal_authentik(settings, existing))
+    return out
+
+
+def _diag_takportal_token_state(token, infratak_token):
+    """'BLANK' / 'TEMPLATE PLACEHOLDER' / 'set (N chars, …)' for Portal's AUTHENTIK_TOKEN.
+    Never the value — only its length and whether it equals the token infra-TAK would push."""
+    t = str(token or '').strip()
+    if not t:
+        return 'BLANK'
+    if t == TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_TOKEN']:
+        return 'TEMPLATE PLACEHOLDER'
+    if not infratak_token:
+        same = "infra-TAK's Authentik .env has no token to compare"
+    elif hmac.compare_digest(t, infratak_token):
+        same = "same as infra-TAK's Authentik token"
+    else:
+        same = "DIFFERENT from infra-TAK's Authentik token"
+    return f'set ({len(t)} chars, {same})'
+
+
+def _diag_takportal_authentik(settings, existing):
+    """ops #71: TAK Portal's side of every Authentik write — the URL and token it calls with,
+    and its authentik_outbox queue, whose last_error is the real Authentik error behind
+    "Authentik operation failed and remains queued for retry". Read-only SELECTs."""
+    out = []
+    raw_url = str((existing or {}).get('AUTHENTIK_URL') or '').strip()
+    try:
+        p = urllib.parse.urlsplit(raw_url)
+        url = f'{p.scheme}://{p.hostname}{":" + str(p.port) if p.port else ""}' if p.hostname else raw_url
+    except ValueError:
+        url = raw_url
+    if raw_url == TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_URL']:
+        url += '  <-- TAK Portal template placeholder'
+    infratak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                      or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
+    out.append(f"authentik as TAK Portal calls it: AUTHENTIK_URL={url or '(unset)'}  "
+               f"AUTHENTIK_TOKEN={_diag_takportal_token_state((existing or {}).get('AUTHENTIK_TOKEN'), infratak_token)}")
+    db = next((c['name'] for c in _takportal_project_containers() if c['service'] == 'postgres'),
+              'tak-portal-postgres')
+
+    def q(sql):
+        return _diag_cmd(['docker', 'exec', db, 'psql', '-U', 'takportal', '-d', 'takportal',
+                          '-tA', '-F', '|', '-c', sql])
+    count = q('SELECT count(*) FROM authentik_outbox')
+    if not count.strip().isdigit():
+        out.append(f'authentik_outbox: could not read ({count.strip()[:160] or "no output"})')
+        return out
+    out.append(f'authentik_outbox: {count.strip()} queued row(s) (0 = every Authentik write applied)')
+    rows = q("SELECT id, kind, attempts, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI'), "
+             "regexp_replace(coalesce(last_error, ''), '\\s+', ' ', 'g') "
+             "FROM authentik_outbox ORDER BY id DESC LIMIT 5")
+    for ln in rows.splitlines():
+        f = ln.split('|', 4)
+        if len(f) == 5:
+            out.append(f"  id={f[0]} {f[1]} attempts={f[2]} queued {f[3]} UTC  "
+                       f"last_error: {f[4][:240] or '(none yet)'}")
+    # A row that fails 20 times is dead-lettered: deleted, its error kept only here.
+    dead = q("SELECT regexp_replace(coalesce(last_error, ''), '\\s+', ' ', 'g') FROM directory_sync WHERE id = 1").strip()
+    out.append(f"directory_sync last_error: {dead[:300] or '(none)'}")
     return out
 
 
@@ -8827,6 +9035,12 @@ def _diag_section_guarddog(settings):
               and 'fail2ban: Banned' not in l]
         out.append(f"restarts.log: {len(ev)} restart/alert line(s) in the recent tail")
         out.extend('  ' + l[:240] for l in ev[-15:])
+        # The weekly repack logs why it failed or skipped here, but a chatty watcher pushes
+        # it out of the last 15 (ops #74: takdbrepack `failed`, reason nowhere in the report).
+        rp = [l for l in lines if 'DB-REPACK:' in l]
+        if rp:
+            out.append(f"last DB-REPACK line(s), {len(rp)} in the recent tail:")
+            out.extend('  ' + l[:240] for l in rp[-3:])
     return out
 
 
@@ -15686,6 +15900,75 @@ def _remote_assist_deploy_log(msg):
     _remote_assist_deploy_status['log'].append(msg)
 
 
+# ops #135: `compose up -d --build` never pulls. A FROM image already on the box (e.g.
+# `node:22-alpine`) is reused as-is, so a rebuild or Update kept shipping the base it was
+# first built on: Remote Assist sat on Node 22.23.0 on test6 while Docker Hub had 22.23.4.
+# So every Deploy and Update first `docker pull`s each FROM image, then builds WITHOUT
+# --pull. A pull that fails (registry unreachable, rate limit, hang) must not stop a build
+# that worked yesterday, so it is logged and the build goes on with the copy on the box.
+# Why not `build --pull`: with Docker's containerd image store (the default on fresh
+# Docker 29 installs, and on every fleet box) a base BuildKit fetched itself is not a tagged image, so a build resolves its FROM
+# against the registry even without --pull, and with the registry down it fails. A
+# `docker pull` tags the base in the store, so the next build resolves it locally
+# (T&E round 3, ops #136, test8 with Docker Hub blocked).
+# https://docs.docker.com/reference/cli/docker/image/pull/
+# https://docs.docker.com/engine/storage/containerd/
+_DOCKERFILE_FROM_RE = re.compile(r'^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(\S+)(?:[ \t]+AS[ \t]+(\S+))?',
+                                 re.IGNORECASE | re.MULTILINE)
+
+
+def _dockerfile_base_images(build_dir):
+    """FROM images of the Dockerfiles in build_dir and its direct subdirectories, in order,
+    deduplicated. Skips build-stage names, `scratch` and ARG-templated names (`$X`), none
+    of which can be pulled as written."""
+    paths = [os.path.join(build_dir, 'Dockerfile')]
+    try:
+        paths += [os.path.join(build_dir, d, 'Dockerfile') for d in sorted(os.listdir(build_dir))]
+    except OSError:
+        pass
+    images = []
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            continue
+        stages = set()
+        for m in _DOCKERFILE_FROM_RE.finditer(text):
+            img, stage = m.group(1), m.group(2)
+            if img.lower() not in stages and img.lower() != 'scratch' and '$' not in img and img not in images:
+                images.append(img)
+            if stage:
+                stages.add(stage.lower())
+    return images
+
+
+def _pull_base_images(build_dir, wrap=None, plog=None, timeout=300):
+    """`docker pull` every FROM image under build_dir (argv passed through `wrap`, e.g.
+    _sudo_wrap). Returns the images that could not be pulled. Never raises: a failed or
+    timed-out pull only means the build uses the copy already on the box."""
+    _log = plog or (lambda m: print(m, flush=True))
+    _wrap = wrap or (lambda argv: argv)
+    failed = []
+    for img in _dockerfile_base_images(build_dir):
+        _log(f'  Pulling base image {img}...')
+        try:
+            r = subprocess.run(_wrap(['docker', 'pull', img]), cwd=build_dir,
+                               capture_output=True, text=True, timeout=timeout)
+            lines = (r.stderr or r.stdout or '').strip().splitlines()
+            err = '' if r.returncode == 0 else (lines[-1] if lines else f'rc={r.returncode}')[-300:]
+        except subprocess.TimeoutExpired:
+            err = f'timed out after {timeout}s'
+        except OSError as e:
+            err = str(e)[-300:] or 'could not run docker pull'
+        if err:
+            failed.append(img)
+            _log(f'  ⚠ Could not pull {img}, building on the copy already on this box: {err}')
+        else:
+            _log(f'  ✓ {img} current')
+    return failed
+
+
 def _remote_assist_compose_files(ra_dir):
     return os.path.join(ra_dir, 'docker-compose.yml')
 
@@ -15973,9 +16256,124 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     os.chmod(env_path, 0o600)
 
 
+# ops #138: Postgres reads POSTGRES_PASSWORD once, when the data volume is first created; the
+# password then lives in the volume and the env var is ignored. Deploy and Update used to take
+# the saved password or make a random one (since v0.9.59), so a box with none saved got a .env
+# its own database had never seen, and Remote Assist could no longer log in. A new password is
+# now made only when there is no database yet; otherwise the one in use is adopted and saved.
+# https://hub.docker.com/_/postgres (POSTGRES_PASSWORD: "only used if you start the container
+# with an empty data directory")
+def _remote_assist_env_value(ra_dir, key):
+    """`key` from Remote Assist's .env, or ''."""
+    try:
+        with open(os.path.join(ra_dir, '.env')) as f:
+            for line in f:
+                k, sep, v = line.strip().partition('=')
+                if sep and k.strip() == key:
+                    return v.strip().strip('"\'')
+    except OSError:
+        pass
+    return ''
+
+
+def _remote_assist_db_state(ra_dir):
+    """(exists, password) for the database of the compose project in `ra_dir`: whether its
+    postgres container or data volume exists, and the POSTGRES_PASSWORD its container was
+    created with ('' if unknown). Plain docker, not compose: compose refuses to parse the
+    file at all when .env is missing (POSTGRES_PASSWORD is `:?` required)."""
+    project = re.sub(r'[^a-z0-9_-]', '', os.path.basename(os.path.normpath(ra_dir)).lower())
+    try:
+        r = subprocess.run(['docker', 'ps', '-a', '-q',
+                            '--filter', f'label=com.docker.compose.project.working_dir={ra_dir}',
+                            '--filter', 'label=com.docker.compose.service=postgres'],
+                           capture_output=True, text=True, timeout=30)
+        cids = (r.stdout or '').split() if r.returncode == 0 else []
+        if cids:
+            r = subprocess.run(['docker', 'inspect', '--format',
+                                '{{range .Config.Env}}{{println .}}{{end}}', cids[0]],
+                               capture_output=True, text=True, timeout=30)
+            for line in (r.stdout or '').splitlines():
+                k, sep, v = line.partition('=')
+                if sep and k == 'POSTGRES_PASSWORD':
+                    return True, v.strip()
+            return True, ''
+        r = subprocess.run(['docker', 'volume', 'ls', '-q',
+                            '--filter', f'label=com.docker.compose.project={project}',
+                            '--filter', 'label=com.docker.compose.volume=postgres_data'],
+                           capture_output=True, text=True, timeout=30)
+        return bool(r.returncode == 0 and (r.stdout or '').strip()), ''
+    except Exception:
+        return False, ''
+
+
+def _remote_assist_pg_password(ra_dir, settings, plog):
+    """The DB password to write to .env. Saved setting first, then the existing .env, then the
+    running postgres container. A new one only when there is no database: with a database and
+    no password anywhere, the new one is applied to the database by _remote_assist_sync_db_password."""
+    saved = settings.get('remote_assist_pg_password')
+    if saved:
+        return saved
+    from_env = _remote_assist_env_value(ra_dir, 'POSTGRES_PASSWORD')
+    if from_env:
+        plog('  No DB password saved in the console; using the one in .env')
+        return from_env
+    exists, from_container = _remote_assist_db_state(ra_dir)
+    if from_container:
+        plog('  No DB password saved in the console; using the one the database container runs with')
+        return from_container
+    if exists:
+        plog('  ⚠ Existing database but no password found anywhere; setting a new one on the database')
+    return secrets.token_hex(24)
+
+
+def _remote_assist_pw_matches(verifier, password, user):
+    """True if `password` matches a pg_authid.rolpassword verifier (SCRAM-SHA-256 or md5)."""
+    verifier = (verifier or '').strip()
+    if verifier.startswith('SCRAM-SHA-256$'):
+        try:
+            iters_salt, keys = verifier[len('SCRAM-SHA-256$'):].split('$', 1)
+            iters, salt = iters_salt.split(':', 1)
+            stored_key = keys.split(':', 1)[0]
+            salted = hashlib.pbkdf2_hmac('sha256', password.encode(), _b64.b64decode(salt), int(iters))
+            client_key = hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+            return hmac.compare_digest(hashlib.sha256(client_key).digest(), _b64.b64decode(stored_key))
+        except Exception:
+            return False
+    if verifier.startswith('md5'):
+        return hmac.compare_digest(verifier, 'md5' + hashlib.md5((password + user).encode()).hexdigest())
+    return False
+
+
+def _remote_assist_sync_db_password(ra_dir, pg_password, plog):
+    """Make the database role's password match .env, over the container's local socket (trust
+    in the official image, so the old password is not needed). A no-op when they already match.
+    Also repairs installs an earlier Update already broke. Returns True if it changed anything."""
+    user = _remote_assist_env_value(ra_dir, 'POSTGRES_USER') or 'cfd'
+    psql = _remote_assist_compose_cmd(ra_dir, 'exec', '-T', 'postgres',
+                                      'psql', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', 'postgres', '-tA')
+    r = subprocess.run(psql + ['-c', 'SELECT rolpassword FROM pg_authid WHERE rolname = current_user'],
+                       capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        plog(f'  ⚠ Could not check the database password: {(r.stderr or r.stdout).strip()[-200:]}')
+        return False
+    if _remote_assist_pw_matches(r.stdout, pg_password, user):
+        plog('  ✓ Database password matches .env')
+        return False
+    # The password goes in on stdin, not argv, so it never shows in a process list.
+    sql = "ALTER ROLE CURRENT_USER PASSWORD '%s';\n" % pg_password.replace("'", "''")
+    r = subprocess.run(psql, input=sql, capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        # Not psql's output: an error echoes the statement, password included.
+        plog(f'  ⚠ Could not set the database password (psql exit {r.returncode})')
+        return False
+    subprocess.run(_remote_assist_compose_cmd(ra_dir, 'restart', 'server'),
+                   capture_output=True, text=True, timeout=120, cwd=ra_dir)
+    plog('  ✓ Database password did not match .env; set it and restarted the server')
+    return True
+
+
 def _run_remote_assist_deploy(settings):
     import subprocess as _sp
-    import secrets as _sec
     plog = _remote_assist_deploy_log
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     try:
@@ -16027,7 +16425,7 @@ def _run_remote_assist_deploy(settings):
 
         plog('')
         plog('━━━ Step 4/6: Writing Configuration ━━━')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (NGINX_BIND_ADDR=127.0.0.1 HTTP_PORT={REMOTE_ASSIST_PORT})')
@@ -16037,11 +16435,13 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up --build failed:\n{(r.stderr or r.stdout)[-600:]}')
         plog('✓ Containers built and started')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
@@ -16247,7 +16647,6 @@ _remote_assist_update_status = {'running': False, 'complete': False, 'error': Fa
 
 def _run_remote_assist_update():
     import subprocess as _sp
-    import secrets as _sec
     global _remote_assist_update_status
     log = []
     def plog(msg):
@@ -16282,7 +16681,7 @@ def _run_remote_assist_update():
             client_id, _ = _ensure_authentik_remote_assist_app(settings, plog=plog)
         if not client_id:
             raise RuntimeError('Authentik OIDC client_id missing')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (loopback nginx → 127.0.0.1:{REMOTE_ASSIST_PORT})')
@@ -16291,11 +16690,13 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
@@ -16861,7 +17262,7 @@ def guarddog_page():
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server messaging + API logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert naming the process that tripped.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 85%+ it reclaims ALL unused cache to rescue a filling disk. Never touches images, containers, or volumes.'},
+        {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 80%+ (the disk warning) it reclaims ALL unused cache, removes images no container uses (skipped while an install or update is pulling/building), and trims the system journal. Caps the journal at 500 MB. Never touches containers, volumes, or images a container uses.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
         {'name': 'JVM', 'id': 'jvm', 'interval': '15 min', 'desc': 'Reads the JVM the running TAK Server API process is actually on. TAK reaches into a JDK-internal class that Java 21 removed, so on any JVM but 17 every NEW client enrollment fails with HTTP 500 while everything else — 8089, federation, existing clients, the map — stays green. Grey means the JVM could not be read, never a silent pass.'},
@@ -17133,6 +17534,40 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     if not ok or 'AGENT_OK' not in (out or ''):
         return False, f'Setup failed: {(out or "")[:150]}'
     return True, 'Health agent deployed (port 8080/health for Guard Dog).'
+
+
+def _refresh_health_agent_on_server_one(s1_cfg):
+    """Guard Dog Update: replace an INSTALLED Server One health agent whose code differs from
+    this console's, and restart it. Returns (changed, message).
+
+    v10.2.25 (ops #132): only a full deploy or the agent's own button ever copied the agent, so
+    a fix to it (here: pg_isready logging `role "root" does not exist` on every poll) never
+    reached a split box on Update. Not installed -> nothing to do. No firewall changes: the
+    deploy already scoped 8080, and an Update click is not the place to re-converge it."""
+    agent_src = os.path.join(BASE_DIR, 'scripts', 'guarddog', 'tak-db-health-agent.py')
+    if not os.path.isfile(agent_src):
+        return False, 'tak-db-health-agent.py not found'
+    with open(agent_src, 'rb') as f:
+        want = hashlib.sha256(f.read()).hexdigest()
+    dest = '/opt/tak-guarddog/tak-db-health-agent.py'
+    ok, out = _ssh_probe(s1_cfg, f'sha256sum {dest} 2>/dev/null || echo NOT_INSTALLED', timeout=15)
+    out = (out or '').strip()
+    if not ok:
+        return False, f'could not check the agent on Server One: {out[:150]}'
+    if 'NOT_INSTALLED' in out:
+        return False, 'not installed on Server One'
+    if out.split()[0:1] == [want]:
+        return False, 'already current'
+    scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/tmp/', timeout=30)
+    if not scp_ok:
+        return False, f'SCP failed: {(scp_out or "")[:150]}'
+    ok, out = _ssh_probe(s1_cfg, (
+        f'sudo mv /tmp/tak-db-health-agent.py {dest} && sudo chmod 644 {dest} && '
+        '{ command -v restorecon >/dev/null 2>&1 && sudo restorecon -F ' + dest + ' 2>/dev/null; true; } && '
+        'sudo systemctl restart tak-db-health.service && echo AGENT_OK'), timeout=30)
+    if not ok or 'AGENT_OK' not in (out or ''):
+        return False, f'restart failed: {(out or "")[:150]}'
+    return True, 'health agent updated on Server One'
 
 
 def _find_ssh_key_for_server_one(s1_cfg):
@@ -23775,6 +24210,17 @@ def guarddog_update():
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
         _auto_update_guarddog()
+        # v10.2.25 (ops #132): two-server — the Server One health agent rides the Update too.
+        try:
+            _ha_cfg = _get_tak_deployment_config(load_settings())
+            _ha_s1 = _ha_cfg.get('server_one', {})
+            _ha_key = (_ha_s1.get('ssh_key_path') or '').strip()
+            if (_ha_cfg.get('mode') == 'two_server' and (_ha_s1.get('host') or '').strip()
+                    and _ha_key and os.path.exists(os.path.expanduser(_ha_key))):
+                _ha_changed, _ha_msg = _refresh_health_agent_on_server_one(_ha_s1)
+                print(f'[guarddog] Server One health agent: {_ha_msg}', flush=True)
+        except Exception as _ha_err:
+            print(f'[guarddog] Server One health agent refresh failed (non-fatal): {_ha_err}', flush=True)
         # Ensure update-check units exist and are enabled.
         # v10.1.69 W5: this block used to WRITE takupdatesguard.service/.timer. It now
         # removes them — see _startup_retire_updates_timer(), which is the primary path
@@ -26917,6 +27363,26 @@ def _caddy_configured_urls(settings, modules):
         urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
+def _caddy_includes_summary(caddyfile_text):
+    """What the Caddy page shows about the GH #176 include hooks: the folders, the per-site
+    folders the live Caddyfile actually imports, the files in use, and the last rejection."""
+    pat = re.compile(r'^\s*import ' + re.escape(CADDY_SITES_INCLUDE_DIR) + r'/([^/\s]+)/\*\.caddy\s*$')
+    hosts = []
+    for ln in (caddyfile_text or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0].splitlines():
+        m = pat.match(ln)
+        if m and m.group(1) not in hosts:
+            hosts.append(m.group(1))
+    rej = _caddy_include_rejected
+    return {
+        'sites_dir': CADDY_SITES_INCLUDE_DIR,
+        'snippets_dir': CADDY_SNIPPETS_INCLUDE_DIR,
+        'hosts': hosts,
+        'files': _caddy_operator_include_files(),
+        'rejected_err': rej.get('err') or '',
+        'rejected_files': list(rej.get('files') or []),
+    }
+
+
 @app.route('/caddy')
 @login_required
 def caddy_page():
@@ -26949,6 +27415,7 @@ def caddy_page():
         caddy_update_available=caddy_update_available,
         caddy_version=caddy_version,
         caddy_last_action=_caddy_last_action_summary(),
+        caddy_includes=_caddy_includes_summary(caddyfile_content),
         service_subdomains=_service_subdomain_labels(settings),
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
@@ -26969,6 +27436,7 @@ def caddy_deploy():
     # boxes behind a WAF / where ACME can't reach — the whole reason for custom mode).
     cert_pem = key_pem = ''
     if request.files or (request.form and request.form.get('domain')):
+        data = request.form
         domain = (request.form.get('domain') or '').strip().lower()
         ssl_mode = (request.form.get('ssl_mode') or 'fqdn').strip()
         cf = request.files.get('cert_file')
@@ -26997,6 +27465,14 @@ def caddy_deploy():
     settings = load_settings()
     settings['fqdn'] = domain
     warnings = []
+    # ops #125 — and refuse before Caddy asks Let's Encrypt for names that do not point
+    # here (nothing written yet, so Retry is a clean re-run).
+    blocked, dns = _dns_precheck_gate(settings, data, ssl_mode)
+    if blocked:
+        return blocked
+    if dns and not dns['ok']:
+        warnings.append("DNS pre-check overridden (continue anyway): "
+                        + dns['message'].rsplit('\n', 1)[0].replace('\n', ' '))
     if ssl_mode == 'custom':
         if not cert_pem or not key_pem:
             return jsonify({'success': False, 'error': 'Custom certificate selected — upload both a certificate (full-chain PEM) and a private key (PEM).'}), 400
@@ -27238,7 +27714,30 @@ def _caddy_acme_inner_lines(cfg=None):
     return out
 
 
-def _caddy_global_options_lines(cfg=None):
+def _caddy_read_body_idle_lines(grpc_streams):
+    """Turn off Caddy's request-body idle timeout when the box proxies long-lived gRPC streams.
+
+    Caddy 2.11.6 added a default 1-minute `read_body_idle`: a request body that makes no
+    progress for a minute gets the connection aborted. A bidirectional gRPC stream whose
+    client has nothing to say is exactly that — NetBird's signal and management streams
+    over `reverse_proxy h2c://`. Measured with the official builds, 2026-10-19: a 90 s quiet
+    HTTP/2 request body through 2.11.7 is cut at 60.0 s ("reading: i/o timeout"); the same
+    stream through 2.11.4, or through 2.11.7 with `read_body_idle -1s`, completes. HTTP/1.1
+    WebSockets (WebTAK, CloudTAK) are not affected and need nothing.
+
+    The per-route `timeouts` directive cannot lengthen it — the server-wide value takes
+    precedence (https://caddyserver.com/docs/caddyfile/directives/timeouts) — so this is the
+    server-wide option, emitted only on boxes with NetBird so every other box keeps the
+    hardening. Fails closed: an older or unknown Caddy rejects the whole file on an unknown
+    subdirective, so nothing is emitted unless Caddy is KNOWN to be >= 2.11.6."""
+    v = _caddy_version_tuple()
+    if not (grpc_streams and v and v >= _CADDY_MIN_READ_BODY_IDLE):
+        return []
+    return ['    servers {', '        timeouts {', '            read_body_idle -1s',
+            '        }', '    }']
+
+
+def _caddy_global_options_lines(cfg=None, grpc_streams=False):
     """The Caddyfile global options block. ALWAYS emitted, on every box.
 
     v10.1.50 — grace_period is the fix for a reload that hangs forever. Caddy's default
@@ -27259,6 +27758,7 @@ def _caddy_global_options_lines(cfg=None):
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
     out += _caddy_acme_inner_lines(cfg)
+    out += _caddy_read_body_idle_lines(grpc_streams)
     out.append('}')
     out.append('')
     return out
@@ -28055,6 +28555,9 @@ def caddy_update_domain():
     settings = load_settings()
     old_fqdn = settings.get('fqdn', '')
     settings['fqdn'] = domain
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — before anything is saved
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     modules = detect_modules(fresh=True)
@@ -28437,11 +28940,16 @@ def caddy_update():
                 _ok = _caddy_install_github_deb(_gh_log.append)
                 r = subprocess.CompletedProcess([], 0 if _ok else 1, '\n'.join(_gh_log), '')
         else:
-            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
                 _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Package source short of the security floor (COPR lagging, Cloudsmith down): take the
+        # fallback build. Also covers the old < 2.7 static lift on dnf. We restart below.
+        _lift_log = []
+        _caddy_lift_to_secure_floor(_lift_log.append, restart=False)
+        if _lift_log:
+            r.stdout = ((r.stdout or '').rstrip() + '\n' + '\n'.join(_lift_log)).strip()
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
@@ -28572,10 +29080,31 @@ def caddy_save_domains():
                 settings[alias_key] = av
             elif alias_key in settings:
                 del settings[alias_key]
+    blocked, _dns = _dns_precheck_gate(settings, data)   # ops #125 — a changed host is a new cert request
+    if blocked:
+        return blocked
     save_settings(settings)
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     return jsonify({'success': True, 'domains': _get_all_service_domains(settings)})
+
+
+@app.route('/api/caddy/dns-check')
+@login_required
+def caddy_dns_check():
+    """ops #125 — the DNS pre-check on its own, for the Caddy page's DNS card (Recheck)."""
+    settings = load_settings()
+    domain = (request.args.get('domain') or '').strip().lower()
+    if domain:
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
+            return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'}), 400
+        settings['fqdn'] = domain
+    if not settings.get('fqdn'):
+        return jsonify({'success': False, 'error': 'No domain set'}), 400
+    res = _dns_precheck(settings, detect_modules())
+    res['success'] = True
+    res['ssl_mode'] = settings.get('ssl_mode') or 'fqdn'
+    return jsonify(res)
 
 SERVICE_DOMAIN_DEFAULTS = {
     'infratak': 'infratak',
@@ -28612,6 +29141,108 @@ def _get_service_domain(settings, service_key):
 def _get_all_service_domains(settings):
     """Return dict of service_key → current domain for all services."""
     return {k: _get_service_domain(settings, k) for k in SERVICE_DOMAIN_DEFAULTS}
+
+
+# v10.2.24 (ops #125) — DNS pre-check. A fresh install whose A records all pointed at a
+# typo'd IP (168.x for a 198.x box) went straight into Let's Encrypt: Caddy got no
+# certificate, every FQDN URL failed, and only Diagnostics noticed. Resolve the names
+# before Caddy asks for certificates and compare them to server_ip. Behind NAT or a proxy
+# the public IP can legitimately differ, so every caller offers "continue anyway" — this
+# stops an install, it never hard-blocks one.
+DNS_PRECHECK_TIMEOUT = 8   # seconds for the whole batch; getaddrinfo has no timeout of its own
+
+
+def _dns_resolve_ipv4(host):
+    """(sorted IPv4 list, problem). problem is None, 'missing' (no A record), or
+    'error: …' (the lookup itself failed — this box's resolver, not the record)."""
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)}), None
+    except socket.gaierror as e:
+        if e.errno in (socket.EAI_NONAME, getattr(socket, 'EAI_NODATA', socket.EAI_NONAME)):
+            return [], 'missing'
+        return [], f'error: {e}'
+    except Exception as e:
+        return [], f'error: {e}'
+
+
+def _dns_precheck_hosts(settings, modules):
+    """{host: needed_now} for every subdomain this box uses, in SERVICE_DOMAIN_DEFAULTS
+    order. needed_now = Caddy serves it now, so it is about to ask Let's Encrypt for it:
+    infra-TAK always, the rest once their module is installed (mediamtx and the video
+    restreamer share `stream`, hence the OR)."""
+    hosts = {}
+    for key in SERVICE_DOMAIN_DEFAULTS:
+        host = _get_service_domain(settings, key)
+        if not host:
+            continue
+        mod = 'cloudtak' if key.startswith('cloudtak_') else key
+        needed = key == 'infratak' or bool((modules.get(mod) or {}).get('installed'))
+        hosts[host] = hosts.get(host, False) or needed
+    return hosts
+
+
+def _dns_precheck_message(blocking, server_ip):
+    lines = []
+    for r in blocking:
+        if r['status'] == 'mismatch':
+            lines.append(f"{r['host']} points to {', '.join(r['ips'])}, but this server is {server_ip}.")
+        else:
+            lines.append(f"{r['host']} has no DNS A record. Create one pointing to {server_ip}.")
+    lines.append(f"Fix the A record{'s' if len(blocking) > 1 else ''} at your DNS provider, "
+                 "wait a few minutes, then press Retry.")
+    return '\n'.join(lines)
+
+
+def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT):
+    """Compare each subdomain's A record to server_ip. Only names Caddy is about to request
+    certificates for (needed_now) can block; the rest are reported so the operator sees a
+    bad record before installing that module. A lookup that fails on this box, or an
+    unknown server_ip, is reported but never blocks — neither says the record is wrong."""
+    resolve = resolve or _dns_resolve_ipv4
+    sip = str(settings.get('server_ip') or '').strip()
+    hosts = _dns_precheck_hosts(settings, modules)
+    answers = {}
+
+    def _one(h):
+        answers[h] = resolve(h)
+    threads = [threading.Thread(target=_one, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    rows = []
+    for host, needed in hosts.items():
+        ips, problem = answers.get(host) or ([], 'error: lookup timed out')
+        if problem == 'missing':
+            status = 'missing'
+        elif problem:
+            status = 'error'
+        elif not sip:
+            status = 'unknown'
+        elif sip in ips:
+            status = 'ok'
+        else:
+            status = 'mismatch'
+        rows.append({'host': host, 'needed': needed, 'ips': ips, 'status': status,
+                     'error': problem if status == 'error' else ''})
+    blocking = [r for r in rows if r['needed'] and r['status'] in ('missing', 'mismatch')]
+    return {'ok': not blocking, 'server_ip': sip, 'hosts': rows,
+            'problems': [r['host'] for r in blocking],
+            'message': _dns_precheck_message(blocking, sip) if blocking else ''}
+
+
+def _dns_precheck_gate(settings, data, ssl_mode=None):
+    """Run the pre-check for a save/deploy. Returns (blocked_response_or_None, result).
+    Skipped for a custom certificate (Caddy never asks Let's Encrypt). With
+    skip_dns_check (the operator chose "continue anyway" — NAT / proxy) the result is
+    still returned so the caller can log it."""
+    if (ssl_mode or settings.get('ssl_mode') or 'fqdn') == 'custom' or not settings.get('fqdn'):
+        return None, None
+    res = _dns_precheck(settings, detect_modules())
+    if res['ok'] or str(data.get('skip_dns_check') or '').lower() in ('1', 'true', 'yes', 'on'):
+        return None, res
+    return (jsonify({'success': False, 'error': res['message'], 'dns_check': res}), 409), res
 
 
 def _service_subdomain_labels(settings):
@@ -30221,6 +30852,26 @@ def _sanitize_cert_field(value, field_name):
     return value
 
 
+# A CA name is both the CA's CN and a filename under /opt/tak/certs/files, so it gets a
+# stricter set than _sanitize_cert_field. Underscores are the trap: `_` is not a
+# PrintableString char, so under our string_mask=nombstr openssl encodes the CA's CN as
+# T61String, while TAK's Java signer writes the issuer of every enrolled client cert as
+# UTF8String. Java's path builder compares the encodings, never matches, and rejects
+# every enrolled device on 8089 ("peer not verified") — while openssl-made certs (admin)
+# still work. Field case: ROOT_CA_03 / INTERMEDIATE_CA_03, GH #128.
+_CA_NAME_RE = _re_module.compile(r'^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$')
+
+
+def _validate_ca_name(value, field_name):
+    """Return the stripped CA name, or raise ValueError if it can't be used as a TAK CA name."""
+    value = (value or '').strip()
+    if not _CA_NAME_RE.match(value):
+        raise ValueError(f'{field_name} "{value}" is not allowed — use only letters, numbers, '
+                         f'hyphens and dots (e.g. INTERMEDIATE-CA-01), no underscores or spaces, '
+                         f'up to 64 characters')
+    return value
+
+
 # v10.2.8 W11a/b — the cert-subject variables makeCert.sh needs from cert-metadata.sh.
 _CERT_META_VARS = ('COUNTRY', 'STATE', 'CITY', 'ORGANIZATION', 'ORGANIZATIONAL_UNIT')
 _CERT_META_REQUIRED = ('STATE', 'CITY', 'ORGANIZATIONAL_UNIT')   # what makeCert.sh refuses without
@@ -31152,62 +31803,6 @@ def _get_authentik_env_value(settings, key):
     return None
 
 
-def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug, plog=None):
-    """PATCH Authentik application so My applications uses target=_blank for the launch URL.
-    Logs HTTP/parse failures via plog when provided (previously all errors were swallowed)."""
-    import urllib.request as _ur
-    import urllib.error as _ue
-    import urllib.parse as _uparse
-    _log = plog or (lambda _m: None)
-    if not ak_url or not ak_headers or not slug:
-        return
-    slug = str(slug).strip().strip('/')
-    if not slug:
-        return
-    enc = _uparse.quote(slug, safe='')
-    url = f'{ak_url.rstrip("/")}/api/v3/core/applications/{enc}/'
-    headers = dict(ak_headers)
-    headers.setdefault('Accept', 'application/json')
-    try:
-        req = _ur.Request(
-            url,
-            data=json.dumps({'open_in_new_tab': True}).encode(),
-            headers=headers, method='PATCH')
-        with _ur.urlopen(req, timeout=10) as resp:
-            raw = (resp.read() or b'').decode()
-        data = {}
-        if raw.strip():
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                _log(f"  ⚠ open_in_new_tab ({slug}): PATCH response not JSON ({raw[:80]!r})")
-                return
-        else:
-            try:
-                gr = _ur.Request(url, headers=headers, method='GET')
-                with _ur.urlopen(gr, timeout=10) as grsp:
-                    data = json.loads((grsp.read() or b'{}').decode())
-            except Exception as ge:
-                _log(f"  ⚠ open_in_new_tab ({slug}): empty PATCH body, GET verify failed: {str(ge)[:100]}")
-                return
-        oint = data.get('open_in_new_tab')
-        if oint is None:
-            oint = data.get('openInNewTab')
-        if oint is not True:
-            _log(
-                f"  ⚠ open_in_new_tab ({slug}): field still false after PATCH "
-                f"(got {oint!r}) — check Authentik version / API token permissions"
-            )
-    except _ue.HTTPError as e:
-        try:
-            err_body = (e.read() or b'').decode()[:400]
-        except Exception:
-            err_body = ''
-        _log(f"  ⚠ open_in_new_tab ({slug}): HTTP {e.code} {err_body}")
-    except Exception as ex:
-        _log(f"  ⚠ open_in_new_tab ({slug}): {str(ex)[:160]}")
-
-
 def _tak_deployment_defaults():
     """Default TAK deployment shape (single-server by default, optional two-server fields)."""
     return {
@@ -31627,6 +32222,17 @@ _CADDY_MIN_SUPPORTED = (2, 7)    # the floor the generated Caddyfile targets
 # loads only the FIRST certificate of a bundle, so a device issued by ATLAS's intermediate
 # fails the handshake (same measurement).
 _CADDY_MIN_TRUST_POOL = (2, 8)
+# Security floor, separate from the parse floor above: every Caddy below it carries published
+# advisories that reach the forward_auth + reverse_proxy vhosts this console writes for every
+# SSO-protected service. Caddy is not pinned (apt repo / COPR / static fallback), so a box
+# stays on whatever it got at install time unless something moves it — console Update
+# (_startup_caddy_selfheal), Caddy → Update and the deploy gate all lift it to this.
+# 2.11.7, not 2.11.6: 2.11.6's new idle timeouts crashed HTTP/2 proxying and cut streams.
+# Verified 2026-10-19: Cloudsmith apt and the @caddy/caddy COPR (epel-9 x86_64 + aarch64)
+# both carry 2.11.7.
+_CADDY_MIN_SECURE = (2, 11, 7)
+# `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
+_CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -31756,6 +32362,72 @@ def _caddy_install_official_static(plog=None):
         except OSError:
             pass
         _caddy_version_cache['ver'] = None
+
+
+def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
+    """Move an installed Caddy below _CADDY_MIN_SECURE onto it. Returns (before, after).
+
+    Package manager first, so the binary stays package-managed: apt from the Cloudsmith repo,
+    dnf from the @caddy/caddy COPR. Only when that leaves the box short (repo not serving,
+    COPR lagging) does it fall back to the same sources deploy already uses — the SHA-512
+    checked GitHub .deb on apt, the official static build on dnf. A box with no Caddy, an
+    unreadable version, or one already at the floor is a no-op, so this is safe on every
+    console start.
+
+    After a version change the Caddyfile is regenerated (regenerate=True), because what it
+    emits depends on the version — e.g. read_body_idle for NetBird's gRPC streams, which a
+    2.11.4-era file lacks. generate_caddyfile() keeps the previous file if Caddy rejects the
+    new one. Deploy passes regenerate=False: its own Step 2 generates the file.
+
+    restart=True then restarts Caddy, but only once the Caddyfile on disk is confirmed to
+    load under the NEW binary. A file the new Caddy rejects is never restarted into — the
+    running process keeps serving its config. Callers that restart Caddy themselves
+    (deploy, Caddy → Update) pass restart=False."""
+    _log = log_fn or (lambda m: None)
+    _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+    before = _caddy_version_tuple(refresh=True)
+    if not before or before >= _CADDY_MIN_SECURE:
+        return before, before
+    _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
+    if _pkg_mgr() == 'dnf':
+        # Through the shim (Dependency Rule), so this is `dnf install`, which may or may not
+        # move an installed Caddy to the COPR's newest build. Either way the version is
+        # re-read below and anything still short gets the static build.
+        _pkg_install(['caddy'], log_fn=_log, timeout=300)
+        _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _log('  the COPR has no new enough Caddy — installing the official static build')
+            _caddy_install_official_static(_log)
+    else:
+        if _caddy_ensure_apt_repo(_log):
+            _pkg_install(['caddy'], log_fn=_log, timeout=300)
+            _caddy_version_cache['ver'] = None
+        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+            _caddy_install_github_deb(_log)
+    after = _caddy_version_tuple(refresh=True)
+    if not after or after < _CADDY_MIN_SECURE:
+        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(_CADDY_MIN_SECURE)}) — no newer Caddy '
+             'was reachable from this box. Retry with Caddy → Update.')
+    else:
+        _log(f'  ✓ Caddy {_vs(before)} → {_vs(after)}')
+    if after == before:
+        return before, after
+    if regenerate:
+        s = load_settings()
+        if (s.get('fqdn') or '').strip():
+            generate_caddyfile(s)
+    if not restart:
+        return before, after
+    verdict, out = _caddy_validate_config()
+    if verdict == 'bad':
+        _log('  ⚠ the Caddyfile still does not load under the new Caddy — NOT restarting; the '
+             f'running Caddy keeps serving its current config: {(out or "")[-200:]}')
+        return before, after
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=90)
+    _log('  ✓ Caddy restarted on the new version' if r.returncode == 0
+         else f'  ⚠ Caddy restart failed: {(r.stdout or "").strip()[-200:]}')
+    return before, after
 
 
 _caddy_last_validate_error = {'err': '', 'ts': 0.0}
@@ -32031,6 +32703,49 @@ def _startup_caddy_stream_close_delay_converge():
           flush=True)
 
 
+def _startup_caddy_read_body_idle_converge():
+    """Put read_body_idle into the Caddyfile on NetBird boxes already on Caddy >= 2.11.6.
+
+    A box lifted by _caddy_lift_to_secure_floor() is regenerated there. This covers the
+    one that got 2.11.6+ some other way (an OS patch run, a fresh deploy before this
+    release) and is cutting NetBird's gRPC streams every minute. Same shape as
+    _startup_caddy_stream_close_delay_converge(): one read on every box it does not apply to."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: read_body_idle converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if 'read_body_idle' in generated or '# NetBird VPN' not in generated:
+        return
+    if not _caddy_read_body_idle_lines(True):
+        return                      # Caddy older than 2.11.6 (or unknown): nothing to emit
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        # Startup migrations run before the module registry loads, so the write is deferred
+        # to the one catch-up regen + reload in _caddy_registry_loaded(). Seen on test6.
+        print('Startup migration: read_body_idle for NetBird queued — written with the '
+              'post-registry Caddyfile regen', flush=True)
+        return
+    try:
+        if 'read_body_idle' not in _read_priv(CADDYFILE_PATH):
+            print('Startup migration: ⚠ read_body_idle converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. Caddy keeps cutting quiet NetBird '
+                  'gRPC streams after one minute on this box.', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ Caddyfile now keeps NetBird gRPC streams open '
+          '(read_body_idle off) and Caddy %s' % ('reloaded' if _ok else
+                                                 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -32137,6 +32852,15 @@ def _startup_caddy_selfheal():
         print('Startup migration: Caddy version floor check error (non-fatal): %s'
               % str(_cvE)[:160], flush=True)
 
+    # Security floor (_CADDY_MIN_SECURE). Rides console Update the same way the 2.7 lift
+    # above does: nothing else moves an unpinned Caddy off the version it was installed at.
+    # No session invalidation here — a box above 2.7 compiles the auth headers correctly.
+    try:
+        _caddy_lift_to_secure_floor(lambda m: print('Startup migration: %s' % m, flush=True))
+    except Exception as _csE:
+        print('Startup migration: Caddy security floor error (non-fatal): %s'
+              % str(_csE)[:160], flush=True)
+
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
         return
@@ -32225,6 +32949,147 @@ def _inject_custom_cert_tls(lines, cert_path, key_path):
     return out
 
 
+# GH #176: a plain host address only. `http://…`, `host:port` and anything with a wildcard
+# or a second address are skipped: Caddy allows one wildcard per import pattern, and the
+# extra listeners (ATLAS :8449, Remote Assist device port) must not pick up the 443 site's
+# directives.
+_CADDY_INCLUDE_HOST_RE = re.compile(r'^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$')
+
+
+def _inject_operator_includes(lines, sites_dir=CADDY_SITES_INCLUDE_DIR,
+                              snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """Add the operator's include hooks to a rendered Caddyfile (GH #176).
+
+    Every regeneration rewrites the generated part of the file, so a line an operator added
+    inside a generated site block (the reporter's `import cloudtak_print` in the CloudTAK
+    map site) is gone after the next deploy or Update Now. The user-blocks marker at the
+    bottom cannot hold it: a second block for the same host is "ambiguous site definition".
+    So the generated file points at files it never writes:
+
+      * `import <snippets_dir>/*.caddy` right after the global options block, for snippet
+        definitions (a snippet must be defined above the line that imports it);
+      * `import <sites_dir>/<host>/*.caddy` as the FIRST line of each plain-host site block.
+
+    A glob that matches nothing is only a warning in Caddy ("No files matching import glob
+    pattern"), so a box without operator files serves exactly what it served before. A
+    per-host folder with `*.caddy` (not `<host>.caddy*`) so an editor backup or a
+    `cp x.caddy x.caddy.bak` is never imported twice. Pure function on the line list."""
+    flat = '\n'.join(lines).split('\n')
+    out = []
+    in_global = None   # None = not seen yet, True = inside it, False = done
+    for ln in flat:
+        out.append(ln)
+        s = ln.rstrip()
+        if in_global is None and s == '{':
+            in_global = True
+            continue
+        if in_global is True:
+            if s == '}':
+                in_global = False
+                out.append(f"import {snippets_dir}/*.caddy")
+            continue
+        if not s.endswith(' {') or s[0].isspace() or s.startswith(('#', '(')):
+            continue
+        addr = s[:-2].strip().lower()
+        if not _CADDY_INCLUDE_HOST_RE.match(addr):
+            continue
+        out.append(f"    import {sites_dir}/{addr}/*.caddy")
+    return out
+
+
+def _caddy_operator_include_files(sites_dir=CADDY_SITES_INCLUDE_DIR,
+                                  snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """The operator include files the generated Caddyfile would import, sorted. Both folders
+    are root-owned 755 (see _caddy_ensure_include_dirs), so the console can list them."""
+    found = []
+    try:
+        found += [os.path.join(snippets_dir, n) for n in os.listdir(snippets_dir)
+                  if n.endswith('.caddy')]
+    except OSError:
+        pass
+    try:
+        hosts = os.listdir(sites_dir)
+    except OSError:
+        hosts = []
+    for h in hosts:
+        d = os.path.join(sites_dir, h)
+        if not os.path.isdir(d):
+            continue
+        try:
+            found += [os.path.join(d, n) for n in os.listdir(d) if n.endswith('.caddy')]
+        except OSError:
+            pass
+    return sorted(found)
+
+
+_CADDY_INCLUDE_README = {
+    CADDY_SNIPPETS_INCLUDE_DIR: (
+        "# Caddy snippets that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in this folder is imported at the top of /etc/caddy/Caddyfile,\n"
+        "# right after the global options. Define named snippets here, e.g.\n"
+        "#   (cloudtak_print) {\n"
+        "#       @cloudtak_print path /print-api /print-api/*\n"
+        "#       handle @cloudtak_print {\n"
+        "#           reverse_proxy 127.0.0.1:5010\n"
+        "#       }\n"
+        "#   }\n"
+        "# and use them from a per-site file in /etc/caddy/sites.d/<host>/.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"),
+    CADDY_SITES_INCLUDE_DIR: (
+        "# Per-site Caddy directives that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in /etc/caddy/sites.d/<host>/ is imported as the FIRST line of that\n"
+        "# host's site block, e.g. /etc/caddy/sites.d/map.example.com/10-print.caddy:\n"
+        "#   @cloudtak_print path /print-api /print-api/*\n"
+        "#   handle @cloudtak_print {\n"
+        "#       reverse_proxy 127.0.0.1:5010\n"
+        "#   }\n"
+        "# <host> is the site address exactly as it appears in /etc/caddy/Caddyfile.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"
+        "# If a file here makes the Caddyfile invalid, infra-TAK's next regeneration leaves\n"
+        "# ALL includes out (so every site keeps working) and says why on the Caddy page.\n"),
+}
+
+
+def _caddy_ensure_include_dirs():
+    """Create the two include folders (root-owned 0755) with a README, once. Non-fatal."""
+    for d, text in _CADDY_INCLUDE_README.items():
+        try:
+            if not os.path.isdir(d):
+                _makedirs_priv(d, mode=0o755)
+            readme = os.path.join(d, 'README')
+            if not os.path.exists(readme):
+                _write_priv(readme, text, perm=0o644)
+        except Exception as e:
+            print(f'Caddy: could not prepare {d} (non-fatal): {str(e)[:160]}', flush=True)
+
+
+# Set when the last regeneration had to leave the operator includes out (GH #176).
+_caddy_include_rejected = {'err': '', 'ts': 0.0, 'files': []}
+
+
+def _caddy_validate_operator_includes(with_includes, plain):
+    """The Caddyfile with operator imports is on disk; check it. Returns (text_on_disk, done).
+
+    If Caddy rejects it and the same file WITHOUT the imports is fine, the operator's files
+    are the cause: keep the plain file so a typo in one include cannot take every proxied
+    service down, and record why for the Caddy page. `done` False means the plain file is
+    on disk and still needs the normal GH #59 validate-or-restore."""
+    verdict, out = _caddy_validate_config()
+    if verdict != 'bad':
+        _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        return with_includes, True
+    _write_priv(CADDYFILE_PATH, plain)
+    verdict2, _ = _caddy_validate_config()
+    if verdict2 == 'bad':
+        return plain, False
+    files = _caddy_operator_include_files()
+    err = (out or 'caddy validate failed with no output')[-400:]
+    _caddy_include_rejected.update({'err': err, 'ts': time.time(), 'files': files})
+    print('Caddy: operator include files REJECTED by `caddy validate` — Caddyfile written '
+          'WITHOUT them (%s): %s' % (', '.join(files) or 'none found', err), flush=True)
+    return plain, True
+
+
 # GH #137 follow-up: registry-resident modules (ATLAS MDM, TVR, Email Relay, Client Feed,
 # Simulator) only read as installed once mod_registry.load_all() has run at the bottom of
 # app.py, ~90 s into a console start. Every regen before that — the Hardened-posture
@@ -32289,7 +33154,8 @@ def generate_caddyfile(settings=None):
     # Emits nothing when unset, so a box that never touches this generates a byte-identical
     # file to before.
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
-    lines += _caddy_global_options_lines()
+    lines += _caddy_global_options_lines(
+        grpc_streams=bool(modules.get('netbird', {}).get('installed')))
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
@@ -33069,7 +33935,10 @@ def generate_caddyfile(settings=None):
         if cert_path and key_path:
             lines = _inject_custom_cert_tls(lines, cert_path, key_path)
 
-    caddyfile = '\n'.join(lines)
+    # GH #176: operator include hooks. The file WITHOUT them is kept as the fallback for an
+    # include that does not parse (_caddy_validate_operator_includes).
+    caddyfile_plain = '\n'.join(lines)
+    caddyfile = '\n'.join(_inject_operator_includes(lines))
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     # v10.1.0: the marker is now ALWAYS emitted at the end of the generated file. It used to
     # exist only if an operator already knew the magic string and typed it in by hand — so in
@@ -33092,12 +33961,17 @@ def generate_caddyfile(settings=None):
                 user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
-    caddyfile = (caddyfile.rstrip() + '\n\n'
-                 + CADDYFILE_USER_BLOCKS_MARKER + '\n'
-                 + '# Anything below this line survives every infra-TAK regeneration.\n'
-                 + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
+    # GH #176: this hint sits ABOVE the marker, in the generated part, so no version's
+    # user-block capture can ever keep it as operator content.
+    tail = ('\n\n# Directives INSIDE a generated site: ' + CADDY_SITES_INCLUDE_DIR
+            + '/<host>/*.caddy (see README there).\n'
+            + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+            + '# Anything below this line survives every infra-TAK regeneration.\n'
+            + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
-        caddyfile += '\n' + user_blocks + '\n'
+        tail += '\n' + user_blocks + '\n'
+    caddyfile = caddyfile.rstrip() + tail
+    caddyfile_plain = caddyfile_plain.rstrip() + tail
     # GH #137 follow-up: before the module registry loads, registry modules read as not
     # installed — writing now would drop their sites. Return what was built; the
     # post-registry catch-up writes the real file.
@@ -33108,6 +33982,7 @@ def generate_caddyfile(settings=None):
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
     _makedirs_priv(os.path.dirname(CADDYFILE_PATH))
+    _caddy_ensure_include_dirs()
     # v10.1.39 (GH #59): keep the outgoing file so a config that does not parse can be put
     # back. Must be read BEFORE the write — after it there is nothing left to restore.
     _caddy_prev = None
@@ -33122,7 +33997,13 @@ def generate_caddyfile(settings=None):
     # than left on disk to strand the box at its next restart (GH #59). Same single choke
     # point as _selinux_sync_caddy_ports() below.
     try:
-        _caddy_validate_or_restore(_caddy_prev)
+        _inc_done = False
+        if caddyfile != caddyfile_plain and _caddy_operator_include_files():
+            caddyfile, _inc_done = _caddy_validate_operator_includes(caddyfile, caddyfile_plain)
+        else:
+            _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        if not _inc_done:
+            _caddy_validate_or_restore(_caddy_prev)
     except Exception as _cv_err:
         print(f'Caddy: validate/restore step errored (non-fatal): {_cv_err}', flush=True)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
@@ -34139,6 +35020,12 @@ def run_caddy_deploy(domain):
             else:
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
                 _caddy_install_official_static(plog)
+            _cv = _caddy_version_tuple(refresh=True)
+        if _cv and _cv < _CADDY_MIN_SECURE:
+            # A box that already had Caddy may keep it through Step 1 (the package step can
+            # leave an installed Caddy where it is), so lift it to the security floor too.
+            # Step 2 regenerates the Caddyfile and Step 4 restarts Caddy.
+            _caddy_lift_to_secure_floor(plog, restart=False, regenerate=False)
             _cv = _caddy_version_tuple(refresh=True)
         if not _cv:
             plog(f"  ⚠ Could not read the Caddy version — treating it as older than {_min_s}. "
@@ -35187,10 +36074,11 @@ def _get_fail2ban_version_info():
 
 
 def _get_webodm_version_info():
-    """Return {version, update_available, latest} for the running WebODM instance."""
+    """Return {version, update_available, latest} for the running WebODM instance. `latest`
+    is the pinned, tested WEBODM_VERSION — not upstream's newest release, which Update would
+    not install (ops #92)."""
     import subprocess as _sp
-    import json as _json
-    info = {'version': '', 'update_available': False, 'latest': None}
+    info = {'version': '', 'update_available': False, 'latest': WEBODM_VERSION}
     try:
         r = _sp.run(
             _sudo_wrap(['docker', 'exec', 'webapp', 'python3', '-c',
@@ -35201,22 +36089,11 @@ def _get_webodm_version_info():
             info['version'] = v
     except Exception:
         pass
-    try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/WebODM/WebODM/releases/latest',
-                          headers={'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        latest = data.get('tag_name', '').lstrip('v')
-        if latest:
-            info['latest'] = latest
-            if info['version']:
-                def _tv(s):
-                    try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
-                    except: return (0,)
-                info['update_available'] = _tv(latest) > _tv(info['version'])
-    except Exception:
-        pass
+    if info['version']:
+        def _tv(s):
+            try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
+            except: return (0,)
+        info['update_available'] = _tv(WEBODM_VERSION) > _tv(info['version'])
     return info
 
 
@@ -35604,6 +36481,30 @@ def _takportal_stale_address_fields(settings, existing=None, built=None):
     return out
 
 
+# v10.2.20 — keys the operator's "Turn Portal login back on" button may adopt. TAK Portal's own
+# settings.example.json ships PORTAL_AUTH_ENABLED="false", and with that TAK Portal treats every
+# visitor as a bootstrap GLOBAL ADMIN (services/portalAuth.middleware.js). A GH #158 reset left
+# portals there, and the merge rightly never touches it on its own — "false" is a value an
+# operator can choose. So we only surface it, and write it only on the operator's click.
+# PORTAL_AUTH_REQUIRED_GROUP is not adopted: the reset blanked it, and blank keys already seed.
+TAKPORTAL_AUTH_ADOPT_KEYS = ('PORTAL_AUTH_ENABLED',)
+
+
+def _takportal_auth_disabled(settings, existing=None):
+    """True when TAK Portal's login is off on a box where infra-TAK would have turned it on
+    (it has a domain — see _takportal_build_settings_dict), i.e. every signed-in user is a
+    TAK Portal Global admin."""
+    if not (settings.get('fqdn') or '').strip():
+        return False
+    if existing is None:
+        existing = _takportal_get_existing_settings()
+    if not isinstance(existing, dict) or not existing:
+        return False
+    # Read it the way TAK Portal does (getBool in services/env.js): only 1/true/yes/on is on.
+    # Anything else, blank or a value it doesn't recognise (" true", "enabled"), falls back to off.
+    return str(existing.get('PORTAL_AUTH_ENABLED', '')).lower() not in ('1', 'true', 'yes', 'on')
+
+
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
 # EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
@@ -35618,14 +36519,24 @@ def _takportal_get_existing_settings():
     v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
     container; cp works on a created/stopped one. The deploy path seeds settings.json into a
     created-but-not-started container — without this fallback that seed read {} and rewrote
-    the whole file from our defaults, clobbering operator values on any redeploy."""
-    try:
-        r = subprocess.run(
-            _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-        if r.returncode == 0 and (r.stdout or '').strip():
-            return json.loads(r.stdout.strip())
-    except Exception:
-        pass
+    the whole file from our defaults, clobbering operator values on any redeploy.
+
+    v10.2.16 (GH #158): TAK Portal rewrites this file itself, in place, whenever it reloads it
+    (settings.service.js loadSettingsFromDisk), so a read can land on a half-written file. {}
+    makes the merge rebuild the file from our seeds alone, so a torn read is retried first."""
+    for _attempt in range(3):
+        try:
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+        except Exception:
+            break
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            break
+        try:
+            return json.loads(body)
+        except ValueError:
+            time.sleep(0.5)
     # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
     # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
     # would land root-owned and a non-root console could not read it back.
@@ -35963,7 +36874,8 @@ def _takportal_build_settings_dict(settings):
     if not (ak_token or '').strip():
         _existing = _takportal_get_existing_settings()
         _prev_tok = (_existing.get('AUTHENTIK_TOKEN') or '').strip() if isinstance(_existing, dict) else ''
-        if _prev_tok:
+        # v10.2.18 (ops #71): the template's token is not a good token — never carry it forward.
+        if _prev_tok and _prev_tok != TAKPORTAL_TEMPLATE_PLACEHOLDERS['AUTHENTIK_TOKEN']:
             ak_token = _prev_tok
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
@@ -36092,12 +37004,60 @@ def _takportal_settings_value_is_blank(v):
 
     A blank value is not a choice — seeding over it is safe, and it is what un-sticks a key that
     was written as "" before its source existed (e.g. AUTHENTIK_PUBLIC_URL seeded before an FQDN
-    was set). Any non-empty value — including False / 0 — is treated as the operator's."""
+    was set). Any non-empty value — including False / 0 — is treated as the operator's.
+    See also _takportal_template_placeholder_keys(): TAK Portal's template sentinels are blank too."""
     if v is None:
         return True
     if isinstance(v, str):
         return not v.strip()
     return False
+
+
+# v10.2.18 (ops #71): the values TAK Portal's own settings.example.json ships for these keys.
+# Before v10.2.17, GH #158 could leave a portal's settings.json reset to that template, and on
+# such a box every Authentik call fails ("Authentik operation failed and remains queued for
+# retry"; last_error `getaddrinfo EAI_AGAIN your-authentik-url`) and the dashboard's TAK stats
+# go missing. Copied byte-for-byte from TAK Portal 2.0.12's settings.example.json.
+TAKPORTAL_TEMPLATE_PLACEHOLDERS = {
+    'AUTHENTIK_URL': 'http://your-authentik-url:9000',
+    'AUTHENTIK_TOKEN': 'your-real-token-here',
+    'TAK_URL': 'https://your-tak-server:8443/Marti',
+}
+# The rest of the template's TAK connection block. These look like real values (`atakatak` is a
+# real TAK default), so they never count as placeholders on their own — only while TAK_URL is
+# still the template's, i.e. the TAK connection was never configured after the reset.
+TAKPORTAL_TEMPLATE_TAK_CONNECTION = {
+    'TAK_API_P12_PATH': './data/certs/webadmin.p12',
+    'TAK_API_P12_PASSPHRASE': 'atakatak',
+    'TAK_CA_PATH': './data/certs/tak-ca.pem',
+}
+
+
+def _takportal_template_placeholder_keys(existing):
+    """The keys in TAK Portal's settings.json still holding a TAK Portal template placeholder.
+
+    The merge seeds these exactly as it seeds a blank key. This is NOT the value-based ownership
+    test CLAUDE.md forbids ("overwrite it if it equals what we would have written" — the
+    TAK_SSH_USER=root bug): that compared against OUR defaults, values an operator can choose
+    too. These are TAK Portal's fill-in-the-blank sentinels (`your-authentik-url`,
+    `your-real-token-here`, `your-tak-server`). They point at hosts that do not exist and a token
+    Authentik rejects; nobody sets them on purpose, so like "" they carry no operator intent.
+    Only an exact match counts.
+
+    The template's P12 path / passphrase / CA path are real-looking values, so they count only
+    while TAK_URL is still the sentinel and each still equals the template value — they arrived
+    with the reset in one file. An operator who typed a real TAK_URL owns the whole block."""
+    if not isinstance(existing, dict):
+        return frozenset()
+
+    def _is(k, template):
+        v = existing.get(k)
+        return isinstance(v, str) and v.strip() == template
+
+    keys = {k for k, t in TAKPORTAL_TEMPLATE_PLACEHOLDERS.items() if _is(k, t)}
+    if 'TAK_URL' in keys:
+        keys |= {k for k, t in TAKPORTAL_TEMPLATE_TAK_CONNECTION.items() if _is(k, t)}
+    return frozenset(keys)
 
 
 def _takportal_merged_settings_json(settings, adopt=()):
@@ -36120,7 +37080,7 @@ def _takportal_merged_settings_json(settings, adopt=()):
 
     v10.2.8 W12: `adopt` — keys the operator explicitly asked to move to this box's domain
     (the "Use the domain" button). Intersected with TAKPORTAL_DOMAIN_KEYS; nothing else passes it."""
-    adopt = frozenset(adopt or ()) & frozenset(TAKPORTAL_DOMAIN_KEYS)
+    adopt = frozenset(adopt or ()) & (frozenset(TAKPORTAL_DOMAIN_KEYS) | frozenset(TAKPORTAL_AUTH_ADOPT_KEYS))
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
@@ -36130,8 +37090,10 @@ def _takportal_merged_settings_json(settings, adopt=()):
     # everything else, so a hand-configured portal SMTP survives every settings push.
     _relay = settings.get('email_relay') or {}
     _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
+    # v10.2.18 (ops #71): a TAK Portal template placeholder is not the operator's value either.
+    placeholders = _takportal_template_placeholder_keys(merged)
     for k, v in our.items():
-        if _takportal_settings_value_is_blank(merged.get(k)):
+        if k in placeholders or _takportal_settings_value_is_blank(merged.get(k)):
             merged[k] = v  # seed — the portal has no value of its own for this key
             continue
         if k in TAKPORTAL_AUTHORITATIVE_KEYS:
@@ -36147,6 +37109,44 @@ def _takportal_merged_settings_json(settings, adopt=()):
     return json.dumps(merged, indent=2)
 
 
+TAKPORTAL_SETTINGS_BACKUP_KEEP = 10
+
+
+def _takportal_backup_settings(plog=None):
+    """v10.2.16 (GH #158): copy TAK Portal's settings.json, as it is right now, to the host
+    before infra-TAK writes over it — the field report had no copy to go back to and re-entered
+    ~120 settings by hand. CONFIG_DIR/takportal-settings-backups, mode 600 (the file holds the
+    Authentik token and the P12 passphrase), newest TAKPORTAL_SETTINGS_BACKUP_KEEP kept. A copy
+    identical to the newest is not written again, so repeated guardrail pushes do not rotate a
+    good copy out. Returns the backup path, or '' when there was nothing to keep. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        current = _takportal_get_existing_settings()
+        if not isinstance(current, dict) or not current:
+            return ''
+        body = json.dumps(current, indent=2)
+        bdir = os.path.join(CONFIG_DIR, 'takportal-settings-backups')
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        kept = sorted(f for f in os.listdir(bdir) if f.startswith('settings-') and f.endswith('.json'))
+        if kept:
+            with open(os.path.join(bdir, kept[-1])) as f:
+                if f.read() == body:
+                    return os.path.join(bdir, kept[-1])
+        name = f"settings-{datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        fd = os.open(os.path.join(bdir, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(body)
+        for old in (kept + [name])[:-TAKPORTAL_SETTINGS_BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except OSError:
+                pass
+        return os.path.join(bdir, name)
+    except Exception as e:
+        _log(f"  takportal settings backup failed (non-fatal): {str(e)[:200]}")
+        return ''
+
+
 def _takportal_write_settings_json(settings_json, plog=None):
     """v10.1.42 (W-P2): the ONE and ONLY writer of TAK Portal's settings.json.
 
@@ -36156,13 +37156,40 @@ def _takportal_write_settings_json(settings_json, plog=None):
     own read-modify-write straight into the container and bypassed every rule. If you are about
     to add another `docker cp ... tak-portal:/usr/src/app/data/settings.json` — don't; call this.
 
+    v10.2.16 (GH #158): into a RUNNING portal the file is staged next to settings.json and
+    renamed over it. `docker cp` straight onto settings.json deletes it and rewrites it in place,
+    and TAK Portal reloads the file whenever its mtime changes (web AND worker): a read in that
+    window parses as {}, its template merge fills every key from settings.example.json, and it
+    writes that over the file — TAK_URL, the P12 and ~120 settings gone, on a 2.0.10 -> 2.0.11
+    update. A rename is atomic, so a reader sees the old file or the new one, never a torn one.
+
     Returns (ok, error_message). Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
+    _takportal_backup_settings(plog=_log)
     try:
         fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-settings-')
         try:
             with os.fdopen(fd, 'w') as f:
                 f.write(settings_json)
+            web = _takportal_web_container()
+            if web:
+                staged = '/usr/src/app/data/.settings.json.infratak'
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f"{web['id']}:{staged}"]),
+                                    capture_output=True, text=True, timeout=20)
+                if cp.returncode == 0:
+                    mv = subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'mv', '-f', staged,
+                                                    '/usr/src/app/data/settings.json']),
+                                        capture_output=True, text=True, timeout=20)
+                    if mv.returncode == 0:
+                        return True, ''
+                    subprocess.run(_sudo_wrap(['docker', 'exec', web['id'], 'rm', '-f', staged]),
+                                   capture_output=True, text=True, timeout=20)
+                    why = (mv.stderr or mv.stdout or 'mv failed').strip()[:200]
+                else:
+                    why = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]
+                _log(f"  takportal settings: atomic replace failed ({why}) — writing in place")
+            # Not running (the deploy path seeds a created-but-not-started container), so nothing
+            # is reading the file — or the rename was refused and the old file is still whole.
             cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{_takportal_ref()}:/usr/src/app/data/settings.json']),
                                 capture_output=True, text=True, timeout=20)
         finally:
@@ -36214,27 +37241,41 @@ def _heal_takportal_authentik_token(plog=None):
     was never rebuilt. This re-pushes a valid token on the next console boot so an affected box
     self-heals through the normal update (pull + restart) path — no manual 'Update config'.
 
-    Idempotent: skips when the token is already present, TAK Portal isn't running, or no valid
-    token can be read. Best-effort; never raises."""
+    v10.2.18 (ops #71): also heals a settings.json still holding TAK Portal's template placeholders
+    (_takportal_template_placeholder_keys) — GH #158 could reset the file to settings.example.json
+    before v10.2.17, and nothing pushed settings on console start, so those boxes stayed broken
+    (every group change "remains queued for retry", no TAK stats). The push goes through the
+    normal merge, which re-seeds exactly those keys and leaves every operator value alone.
+
+    Idempotent: skips when nothing is blank or a placeholder, or TAK Portal isn't running. A token
+    that needs healing but cannot be read yet is skipped; the other placeholders still heal.
+    Best-effort; never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
         if not _takportal_web_running():
             return False  # container not running — nothing to heal / can't push
         existing = _takportal_get_existing_settings()
-        if not isinstance(existing, dict):
+        if not isinstance(existing, dict) or not existing:
             return False
-        if (existing.get('AUTHENTIK_TOKEN') or '').strip():
-            return False  # token present — healthy box, leave it alone
-        settings = load_settings()
-        new_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                   or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
-        if not new_tok:
-            _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
-            return False
-        _log("  takportal: AUTHENTIK_TOKEN blank in settings.json — re-pushing valid token (non-root flip-window heal)")
+        heal = set(_takportal_template_placeholder_keys(existing))
+        if not (existing.get('AUTHENTIK_TOKEN') or '').strip():
+            heal.add('AUTHENTIK_TOKEN')
+        if not heal:
+            return False  # healthy box, leave it alone
+        if 'AUTHENTIK_TOKEN' in heal:
+            settings = load_settings()
+            new_tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                       or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '').strip()
+            if not new_tok:
+                heal.discard('AUTHENTIK_TOKEN')
+                if not heal:
+                    _log("  takportal: AUTHENTIK_TOKEN blank but none readable from Authentik .env yet — skip heal")
+                    return False
+                _log("  takportal: AUTHENTIK_TOKEN not readable from Authentik .env yet — healing the other keys")
+        _log(f"  takportal: blank or template-placeholder settings ({', '.join(sorted(heal))}) — re-pushing settings")
         if not _takportal_push_settings(plog=_log):
             return False
-        _log("  ✓ takportal: AUTHENTIK_TOKEN restored + container restarted")
+        _log(f"  ✓ takportal: {', '.join(sorted(heal))} restored + container restarted")
         return True
     except Exception as e:
         _log(f"  takportal: AUTHENTIK_TOKEN heal error (non-fatal): {e}")
@@ -36541,10 +37582,36 @@ def takportal_address_check_api():
     """v10.2.8 W12 — TAK Portal fields still on this server's IP while the box has a domain."""
     settings = load_settings()
     try:
-        fields = _takportal_stale_address_fields(settings)
+        existing = _takportal_get_existing_settings()
+        fields = _takportal_stale_address_fields(settings, existing=existing)
+        auth_off = _takportal_auth_disabled(settings, existing=existing)
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200], 'fields': []}), 500
-    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields})
+    return jsonify({'success': True, 'fqdn': settings.get('fqdn') or '', 'fields': fields,
+                    'auth_off': auth_off})
+
+
+@app.route('/api/takportal/enable-auth', methods=['POST'])
+@login_required
+def takportal_enable_auth_api():
+    """v10.2.20 — the operator's one-click recovery for a TAK Portal whose login is off (every
+    signed-in user a Global admin). Writes PORTAL_AUTH_ENABLED through the single merge + single
+    writer as an operator adopt, restarts the app services, and reads it back."""
+    settings = load_settings()
+    if not _takportal_auth_disabled(settings):
+        return jsonify({'success': True, 'message': 'TAK Portal login is already on.'})
+    ok, err = _takportal_write_settings_json(
+        _takportal_merged_settings_json(settings, adopt=TAKPORTAL_AUTH_ADOPT_KEYS))
+    if not ok:
+        return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
+    print("[takportal] enable-auth: PORTAL_AUTH_ENABLED turned back on (operator)", flush=True)
+    restarted = bool(_takportal_restart())
+    after = _takportal_get_existing_settings() or {}
+    verified = not _takportal_auth_disabled(settings, existing=after)
+    group = after.get('PORTAL_AUTH_REQUIRED_GROUP') or ''
+    return jsonify({'success': verified, 'restarted': restarted, 'group': group,
+                    'message': f'TAK Portal login is on. Admin group: {group or "(none set)"}' if verified else '',
+                    'error': '' if verified else 'TAK Portal did not keep the setting — check its Settings page'})
 
 
 @app.route('/api/takportal/use-domain', methods=['POST'])
@@ -36593,10 +37660,6 @@ def takportal_use_domain_api():
 
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
-@_records_module_update(  # v10.2.8 W10
-    'takportal',
-    when=lambda: (request.get_json(silent=True) or {}).get('action') == 'update',
-    from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -36722,145 +37785,206 @@ def takportal_control():
                         'message': msg, 'warnings': warnings, 'tak_local': tak_local,
                         'chain_summary': chain_summary})
     elif action == 'update':
-        # v10.1.55: channel-aware, and it no longer pulls a branch.
-        #
-        # This used to be `git pull --rebase` on whatever branch the clone tracked —
-        # a different code path from Deploy, which has pinned to a published release
-        # tag since v10.1.49. On a main-tracking box the button therefore shipped
-        # unreleased TAK Portal code, and the returncode was never checked, so a
-        # checkout that could not fetch at all rebuilt the OLD tree behind a green
-        # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
-        # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
-        # hard 500 with the git error in it.
-        gitr = _takportal_update_git(portal_dir)
-        if not gitr['ok']:
-            return jsonify({'success': False, 'error': gitr['error'],
-                            'channel': gitr['channel']}), 500
-        pull_msg = gitr['message']
-        # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
-        # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
-        # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
-        # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
-        # the build below, never after: "after" means the container comes up exposed and
-        # stays that way until something recreates it. This is also why we do not shell
-        # out to upstream's `./takportal update`, which fuses the checkout and the build.
-        _write_takportal_override()
-        _patch_takportal_compose_ports(portal_dir)
-        for _ep in _takportal_compose_exposed_ports(portal_dir):
-            print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
-        # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
-        # build, not after. Both live under /usr/src/app/data, which is the project's named
-        # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
-        # the CURRENT container is exactly what the NEW containers read on their first boot,
-        # and nothing has to be restarted afterwards. The old order (build, cp, then a
-        # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
-        # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
-        # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
-        # one boot that must not be interrupted. Verified after the build (below), never
-        # assumed. [[takportal-main-postgres-three-container]]
-        settings_synced = False
-        settings_sync_error = ''
-        cloudtak_url = ''
-        settings_json = ''
-        try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            try:
-                cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
-            except Exception:
-                pass
-            # `docker cp` works on a stopped container; it needs SOME container to exist.
-            if _takportal_project_containers(all_states=True):
-                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-                if cp_ok:
-                    settings_synced = True
-                    _takportal_setup_ssh()
-                else:
-                    settings_sync_error = cp_err or 'docker cp failed'
-        except Exception as e:
-            settings_sync_error = str(e)[:300]
-        # v10.1.60 (W4): the recreate at the end of this build takes the web container
-        # down for 10-15 s. Open a window that outlives the build's own timeout; it is
-        # shrunk to a short grace as soon as the route knows the outcome (below).
-        _gd_maintenance_begin('takportal', 900 + 180)
-        # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
-        # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
-        # time out here on a slower box, and TimeoutExpired was not caught, so it
-        # surfaced as an unhandled 500 with no explanation at all.
-        try:
-            build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
-                                   cwd=portal_dir, capture_output=True, text=True, timeout=900)
-        except subprocess.TimeoutExpired:
-            plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
-            print(f'[takportal] update: {plog_msg}', flush=True)
-            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
-            return jsonify({'success': False, 'error': plog_msg}), 500
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
-        if build.returncode != 0:
-            # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
-            # said only "Build failed. Container may have stopped", and nothing was
-            # logged, so the actual reason existed nowhere. On test12 the real message
-            # was one line ("env file .env not found") and it took a manual re-run of
-            # the build to see it. Report what the build actually said, and journal it.
-            err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
-            print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
-            _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
-            return jsonify({'success': False,
-                            'error': f'Build failed: {err}',
-                            'hint': 'The previous container may still be running the old version. '
-                                    'Check the container logs, fix the cause, and press Update again.'}), 500
-        # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
-        # them back from the new web container and compare every authoritative key we set.
-        # A miss (no container existed before the build, or a checkout whose data dir is a
-        # bind mount rather than the named volume) is the ONLY case that writes again and
-        # restarts — and that restart is app-services-only (W2): Postgres is never touched.
-        try:
-            _want = json.loads(settings_json) if settings_json else {}
-            _have = _takportal_get_existing_settings() or {}
-            _keys = [k for k in TAKPORTAL_AUTHORITATIVE_KEYS if _want.get(k)]
-            # An unreadable file after a successful pre-build write is a read failure, not
-            # evidence the write was lost — do not restart a booting stack over it.
-            _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
-                      if _have else ([] if settings_synced else list(_keys)))
-            if settings_json and _have == {} and settings_synced:
-                print('[takportal] update: could not read settings.json back from the new web '
-                      'container — leaving the stack alone (pre-build write succeeded)', flush=True)
-            if settings_json and (not settings_synced or _stale):
-                cp_ok, cp_err = _takportal_write_settings_json(settings_json)
-                if cp_ok:
-                    settings_synced = True
-                    settings_sync_error = ''
-                    _takportal_setup_ssh()
-                    _takportal_restart()  # app services only — never Postgres (W2)
-                    print('[takportal] update: settings were not on the data volume after the build '
-                          f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
-                          'and restarted the app services', flush=True)
-                else:
-                    settings_sync_error = cp_err or 'docker cp failed'
-        except Exception as e:
-            settings_sync_error = settings_sync_error or str(e)[:300]
-        subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
-        _update_boot_stagger_service()  # v10.1.59: the project may have gained services
-        time.sleep(3)
-        vinfo = _get_takportal_version_info()
-        new_version = vinfo['version'] or ''
-        running = _takportal_web_running()
-        # W4: the build is over — shrink the window to a boot grace (the app itself takes
-        # a few seconds to answer), then Guard Dog's own verdict rules again.
-        _gd_maintenance_begin('takportal', 90 if running else 15)
-        if not running:
-            return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
-        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
-                        'version': new_version, 'settings_synced': settings_synced,
-                        'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
-                        'channel': gitr['channel'], 'ref': gitr['ref'],
-                        'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']})
+        # ops #72: Update runs as a background job and this request returns at once.
+        # It used to BE the update — one request lasting as long as the checkout + image build
+        # (135 s for 1.4.8 -> 2.0.12 on test8). A gateway in front of the console gives up long
+        # before that: Azure Application Gateway's default request timeout is 20 s
+        # (https://learn.microsoft.com/en-us/azure/application-gateway/configuration-http-settings#request-timeout).
+        # On CORAZ (2026-10-17) the page therefore said "Update failed" over a portal that had
+        # already come up on the new release. The page polls /api/takportal/update/status.
+        with _TAKPORTAL_UPDATE_LOCK:
+            if _takportal_update_job.get('running'):
+                return jsonify({'success': False, 'running': True, 'job': _takportal_update_job.get('id'),
+                                'error': 'A TAK Portal update is already running. Wait for it to finish.'}), 409
+            job_id = secrets.token_hex(6)
+            _takportal_update_job.update({'running': True, 'id': job_id, 'result': None, 'code': None})
+        threading.Thread(target=_takportal_update_worker, args=(portal_dir, job_id), daemon=True).start()
+        return jsonify({'success': True, 'started': True, 'job': job_id, 'action': action}), 202
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
     running = _takportal_web_running()
     return jsonify({'success': True, 'running': running, 'action': action})
+
+
+# ops #72: TAK Portal Update as a background job (see the 'update' branch of takportal_control()).
+# One job at a time; its response stays here for the page to read until the next update starts.
+_TAKPORTAL_UPDATE_LOCK = threading.Lock()
+_takportal_update_job = {'running': False, 'id': '', 'result': None, 'code': None}
+
+
+def _takportal_update_worker(portal_dir, job_id):
+    """Thread target: run the update, then publish its response for /api/takportal/update/status."""
+    try:
+        result, code = _takportal_run_update(portal_dir)
+    except Exception as e:
+        # _records_module_update has already recorded the failure; the page needs it too.
+        result, code = {'success': False, 'error': f'{type(e).__name__}: {e}'[:300]}, 500
+    with _TAKPORTAL_UPDATE_LOCK:
+        if _takportal_update_job.get('id') == job_id:
+            _takportal_update_job.update({'running': False, 'result': result, 'code': code})
+
+
+@_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
+    'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
+def _takportal_run_update(portal_dir):
+    """The TAK Portal Update itself. Returns (response dict, HTTP code), never a Flask response:
+    it runs on a worker thread, outside any request context."""
+    # v10.1.55: channel-aware, and it no longer pulls a branch.
+    #
+    # This used to be `git pull --rebase` on whatever branch the clone tracked —
+    # a different code path from Deploy, which has pinned to a published release
+    # tag since v10.1.49. On a main-tracking box the button therefore shipped
+    # unreleased TAK Portal code, and the returncode was never checked, so a
+    # checkout that could not fetch at all rebuilt the OLD tree behind a green
+    # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
+    # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
+    # hard 500 with the git error in it.
+    gitr = _takportal_update_git(portal_dir)
+    if not gitr['ok']:
+        return {'success': False, 'error': gitr['error'],
+                'channel': gitr['channel']}, 500
+    pull_msg = gitr['message']
+    # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
+    # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
+    # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
+    # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
+    # the build below, never after: "after" means the container comes up exposed and
+    # stays that way until something recreates it. This is also why we do not shell
+    # out to upstream's `./takportal update`, which fuses the checkout and the build.
+    _write_takportal_override()
+    _patch_takportal_compose_ports(portal_dir)
+    for _ep in _takportal_compose_exposed_ports(portal_dir):
+        print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+    # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
+    # build, not after. Both live under /usr/src/app/data, which is the project's named
+    # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
+    # the CURRENT container is exactly what the NEW containers read on their first boot,
+    # and nothing has to be restarted afterwards. The old order (build, cp, then a
+    # whole-project `compose restart`) bounced Postgres ~3 s into the new stack's first
+    # boot; on nuc (2026-09-06) that landed mid JSON->Postgres import (file 6/13) and only
+    # upstream's per-file checkpointing made boot 2 finish it. A first migration is the
+    # one boot that must not be interrupted. Verified after the build (below), never
+    # assumed. [[takportal-main-postgres-three-container]]
+    settings_synced = False
+    settings_sync_error = ''
+    cloudtak_url = ''
+    settings_json = ''
+    try:
+        settings = load_settings()
+        settings_json = _takportal_merged_settings_json(settings)
+        try:
+            cloudtak_url = (json.loads(settings_json) or {}).get('CLOUDTAK_URL', '')
+        except Exception:
+            pass
+        # `docker cp` works on a stopped container; it needs SOME container to exist.
+        if _takportal_project_containers(all_states=True):
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
+                settings_synced = True
+                _takportal_setup_ssh()
+            else:
+                settings_sync_error = cp_err or 'docker cp failed'
+    except Exception as e:
+        settings_sync_error = str(e)[:300]
+    # v10.1.60 (W4): the recreate at the end of this build takes the web container
+    # down for 10-15 s. Open a window that outlives the build's own timeout; it is
+    # shrunk to a short grace as soon as the route knows the outcome (below).
+    _gd_maintenance_begin('takportal', 2 * 900 + 180)
+    # timeout=900, matching DEPLOY's build of this same tree (:31777). Update used to
+    # allow 180s for identical work — a Node/Vite build that Deploy tolerates would
+    # time out here on a slower box, and TimeoutExpired was not caught, so it
+    # surfaced as an unhandled 500 with no explanation at all.
+    # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
+    # a Node security release when TAK Portal itself has not changed.
+    _pull_base_images(portal_dir, wrap=_sudo_wrap)
+    try:
+        build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
+                               cwd=portal_dir, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+        print(f'[takportal] update: {plog_msg}', flush=True)
+        _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
+        return {'success': False, 'error': plog_msg}, 500
+    _ensure_infratak_network_for_portal()
+    _ensure_infratak_network_for_authentik()
+    if build.returncode != 0:
+        # v10.1.57 W9: `err` was computed here and then THROWN AWAY — the response
+        # said only "Build failed. Container may have stopped", and nothing was
+        # logged, so the actual reason existed nowhere. On test12 the real message
+        # was one line ("env file .env not found") and it took a manual re-run of
+        # the build to see it. Report what the build actually said, and journal it.
+        err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+        print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
+        _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
+        return {'success': False,
+                'error': f'Build failed: {err}',
+                'hint': 'The previous container may still be running the old version. '
+                        'Check the container logs, fix the cause, and press Update again.'}, 500
+    # v10.1.60 (W1): verify the NEW stack booted on the settings written above — read
+    # them back from the new web container and compare every authoritative key we set.
+    # A miss (no container existed before the build, or a checkout whose data dir is a
+    # bind mount rather than the named volume) is the ONLY case that writes again and
+    # restarts — and that restart is app-services-only (W2): Postgres is never touched.
+    try:
+        _want = json.loads(settings_json) if settings_json else {}
+        _have = _takportal_get_existing_settings() or {}
+        # v10.2.16 (GH #158): and the TAK Server connection keys. These are not ours to change,
+        # but the file was written seconds ago, so if they differ now the file was reset under
+        # us (TAK Portal's template fallback) and the write below puts the operator's file back.
+        _keys = [k for k in sorted(TAKPORTAL_AUTHORITATIVE_KEYS) + ['TAK_URL', 'TAK_API_P12_PATH',
+                 'TAK_API_P12_PASSPHRASE', 'TAK_CA_PATH'] if _want.get(k)]
+        # An unreadable file after a successful pre-build write is a read failure, not
+        # evidence the write was lost — do not restart a booting stack over it.
+        _stale = ([k for k in _keys if str(_have.get(k) or '') != str(_want.get(k) or '')]
+                  if _have else ([] if settings_synced else list(_keys)))
+        if settings_json and _have == {} and settings_synced:
+            print('[takportal] update: could not read settings.json back from the new web '
+                  'container — leaving the stack alone (pre-build write succeeded)', flush=True)
+        if settings_json and (not settings_synced or _stale):
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
+                settings_synced = True
+                settings_sync_error = ''
+                _takportal_setup_ssh()
+                _takportal_restart()  # app services only — never Postgres (W2)
+                print('[takportal] update: settings were not on the data volume after the build '
+                      f'(stale: {", ".join(_stale) or "no pre-build write"}) — wrote them again '
+                      'and restarted the app services', flush=True)
+            else:
+                settings_sync_error = cp_err or 'docker cp failed'
+    except Exception as e:
+        settings_sync_error = settings_sync_error or str(e)[:300]
+    subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
+    _update_boot_stagger_service()  # v10.1.59: the project may have gained services
+    time.sleep(3)
+    vinfo = _get_takportal_version_info()
+    new_version = vinfo['version'] or ''
+    running = _takportal_web_running()
+    # W4: the build is over — shrink the window to a boot grace (the app itself takes
+    # a few seconds to answer), then Guard Dog's own verdict rules again.
+    _gd_maintenance_begin('takportal', 90 if running else 15)
+    if not running:
+        # The controls sit ABOVE the status line this lands in (ops #72: the old text said "below").
+        return {'success': False, 'error': 'Container not running after update — press Start in Controls above.'}, 500
+    return {'success': True, 'running': running, 'action': 'update', 'pull': pull_msg,
+            'version': new_version, 'settings_synced': settings_synced,
+            'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
+            'channel': gitr['channel'], 'ref': gitr['ref'],
+            'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']}, 200
+
+
+@app.route('/api/takportal/update/status')
+@login_required
+def takportal_update_status():
+    """ops #72: where the background Update stands. `last` is the recorded outcome — all that is
+    left when the console restarted mid-update (the in-memory job is gone; `last` says 'interrupted')."""
+    with _TAKPORTAL_UPDATE_LOCK:
+        job = dict(_takportal_update_job)
+    return jsonify({'running': bool(job.get('running')), 'job': job.get('id') or '',
+                    'result': job.get('result'), 'code': job.get('code'),
+                    'last': _mod_result_last('takportal')})
+
 
 @app.route('/api/takportal/deploy', methods=['POST'])
 @login_required
@@ -37320,7 +38444,8 @@ def run_takportal_deploy():
         # install. We seed real settings.json into the created container below, then
         # start — so the first boot already has live config. No-op-safe on redeploy
         # (an already-running container just gets re-seeded + restarted in Step 6).
-        _gd_maintenance_begin('takportal', 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
+        _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
@@ -37393,6 +38518,10 @@ def run_takportal_deploy():
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             plog(f"\u26a0 Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            plog(f"\u26a0 Bootstrap cert group-cache sync (non-fatal): {_bce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -37583,7 +38712,6 @@ def run_takportal_deploy():
                                 time.sleep(5)
                             else:
                                 plog(f"  \u26a0 Application error: {str(e)[:80]}")
-                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
@@ -40527,6 +41655,27 @@ def cloudtak_coreevents_identity_api():
     })
 
 
+@app.route('/api/cloudtak/bootstrap-channels')
+@login_required
+def cloudtak_bootstrap_channels_api():
+    """ops #127: read-only — channels the bootstrap cert's live TAK connection cannot send Core
+    Events to (see _tak_bootstrap_channel_state). The CloudTAK page warns when any are missing."""
+    return jsonify(dict(_tak_bootstrap_channel_state(), success=True))
+
+
+@app.route('/api/cloudtak/bootstrap-channels/fix', methods=['POST'])
+@login_required
+def cloudtak_bootstrap_channels_fix_api():
+    """ops #127: "Fix now" — run the bootstrap cert channel sync immediately, then re-check."""
+    lines = []
+    try:
+        res = _tak_sync_bootstrap_group_cache(plog=lines.append)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    return jsonify({'success': True, 'result': res, 'log': lines[-5:],
+                    'after': _tak_bootstrap_channel_state()})
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -40936,7 +42085,12 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     leaves the tag pointing at the new image even though the source gets rolled
     back — the next unrelated `compose up -d` then silently ships the
     rolled-back plugin. The running container still references the pre-build
-    image, so capture both here and retag on rollback."""
+    image, so capture both here and retag on rollback.
+
+    ops #133: and PIN it. On Docker 29 (containerd image store) the build moving the tag
+    makes the old image ID unusable for `docker tag` at once, running container or not
+    (test8, Docker 29.9.1), so the retag above failed and the new image stayed. The pin
+    (`cloudtak-api:infratak-rollback`, same helper as the CloudTAK Update) keeps it."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
     routes = _cloudtak_server_routes_dir(ct_dir)
@@ -40945,19 +42099,8 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    api_image_tag = api_image_id = ''
-    try:
-        cid = subprocess.run(['docker', 'compose', 'ps', '-q', 'api'], cwd=ct_dir,
-                             capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
-        if cid:
-            insp = subprocess.run(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}', cid[0]],
-                                  capture_output=True, text=True, timeout=30).stdout.split()
-            if len(insp) == 2:
-                api_image_tag, api_image_id = insp[0], insp[1]
-    except Exception:
-        pass
     return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes,
-            'api_image_tag': api_image_tag, 'api_image_id': api_image_id}
+            'api_images': _cloudtak_snapshot_images(ct_dir, services=['api'])}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -40982,26 +42125,31 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
         plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
     # v10.1.8: if the failed rebuild already advanced the image tag, point it back
     # at the pre-build image so the next `compose up -d` can't ship the rolled-back
-    # plugin. The old image is still referenced by the running container (and by
-    # this retag), so it can't have been pruned out from under us.
-    tag, old_id = snap_info.get('api_image_tag'), snap_info.get('api_image_id')
-    if tag and old_id:
+    # plugin. ops #133: from the pin taken before the build (see the snapshot), and
+    # only claimed when the retag actually worked.
+    images = snap_info.get('api_images') or []
+    moved = []
+    for ref, old_id in images:
         try:
-            cur = subprocess.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', tag],
-                                 capture_output=True, text=True, timeout=30).stdout.strip()
-            if cur and cur != old_id:
-                subprocess.run(['docker', 'tag', old_id, tag],
-                               capture_output=True, text=True, timeout=30)
-                if plog:
-                    plog(f'  ↩ Re-pointed image tag {tag} back at the pre-build image.')
+            _rc, cur, _err = _cloudtak_docker(['docker', 'image', 'inspect', '-f', '{{.Id}}', ref], timeout=30)
+            if cur.strip() != old_id:
+                moved.append((ref, old_id))
         except Exception:
-            pass
+            moved.append((ref, old_id))
+    if moved:
+        # Drops the pin only when the tag is back; a failed restore keeps it, so the
+        # previous image is still on the box (it is named in the warning above).
+        _cloudtak_restore_images(moved, plog or (lambda m: None))
+    _cloudtak_drop_rollback_pins([i for i in images if i not in moved])
+    snap_info['api_images'] = []
 
 
 def _cleanup_snapshot(snap_info):
     import shutil
     if snap_info and snap_info.get('snap'):
         shutil.rmtree(snap_info['snap'], ignore_errors=True)
+    if snap_info and snap_info.get('api_images'):
+        _cloudtak_drop_rollback_pins(snap_info['api_images'])   # ops #133: never leave a pin behind
 
 
 def _detect_cloudtak_plugins():
@@ -41284,6 +42432,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
         # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
+        _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
+        if not _hok:
+            plog(f'✗ Pre-build hook {_hname} failed — rolling back without rebuilding...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
         if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=5400):
             plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
             _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
@@ -41496,8 +42652,24 @@ MEDIA_PORT_SRT=18890
 # (amd64 + arm64 in the ghcr index — verified 2026-10-08), so no arch branch and no on-box
 # arm64 build. If a future pin is amd64-only again, set MEDIA_INFRA_MULTIARCH = False and the
 # arm64 source build (_cloudtak_build_arm64_media) comes back into play.
-MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.11.0'
+# v10.2.21: security update — v9.12.1 (2026-10-15) embeds MediaMTX 1.21.2 (was 1.20.0).
+# Upstream diff from v9.11.0 is the MediaMTX + Go builder bump only; mediamtx.yml and the
+# lease code we patch (persist/payload) are unchanged. Still multi-arch (checked 2026-10-19).
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
 MEDIA_INFRA_MULTIARCH = True
+
+# ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
+# Upstream's docker-compose.yml pins postgis/postgis:17-3.4-alpine, a tag Docker Hub stopped
+# rebuilding on 2024-10-14 — frozen at PostgreSQL 17.0 / PostGIS 3.4.3, without any PG 17
+# security minor since (CVE-2025-1094 fixed in 17.3, CVE-2026-14679 in 17.11, ...). 17-3.6 is
+# rebuilt on every PG minor. Same PG major, so the data volume is used as-is (no dump/restore,
+# no pg_upgrade); PostGIS 3.4 → 3.6 is an extension update, which
+# _cloudtak_postgis_extensions_upgrade() runs once the new container is up.
+# postgis/postgis publishes amd64 only; imresamu/postgis (the docker-postgis maintainer's
+# mirror, already what arm64 boxes ran via _patch_cloudtak_compose_ports) carries the same tag
+# with an arm64 build. Both checked on Docker Hub 2026-10-20.
+POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
+POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
 
 def _cloudtak_build_override_yml(settings):
@@ -41620,6 +42792,9 @@ def _cloudtak_build_override_yml(settings):
     # media-infra pin — one fleet constant for both architectures since v10.2.8 W2; see the
     # comment in the template below and MEDIA_INFRA_IMAGE.
     media_image = MEDIA_INFRA_IMAGE
+    # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
+    # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
+    postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -41666,6 +42841,7 @@ services:
     # playback dying with "403 Invalid or expired signed URL" after 10 minutes, and
     # MediaMTX 1.20.0. Our HLS tuning (mpegts, 3x500ms) is still applied over upstream's
     # new `hlsVariant: fmp4` by _CT_MEDIA_APPLY_SH — a deliberate divergence (June A/B).
+    # v10.2.21: now v9.12.1 (MediaMTX 1.21.2) — security update, same multi-arch index.
     # History: v10.1.8 W5 pinned past CloudTAK's v9.1.1 (its hls route 500'd every
     # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
@@ -41674,6 +42850,9 @@ services:
     environment:
       API_URL: "http://api:5000"
   postgis:
+    # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
+    # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
+    image: {postgis_image}
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
 {_sim_networks_top}"""
@@ -42321,7 +43500,7 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
     aside so the next attempt starts clean. Never raises."""
     try:
         _cloudtak_compose_run(cloudtak_dir, ['--profile', 'migrate', 'rm', '-sf', 'minio-legacy', 'store'], timeout=120)
-        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        _reverted = _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir, run_hooks=False)
         if not _cloudtak_compose_is_garage(cloudtak_dir):
             env_path = os.path.join(cloudtak_dir, '.env')
             if os.path.isfile(env_path):
@@ -42343,6 +43522,9 @@ def _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog):
             rc, out = _cloudtak_compose_run(cloudtak_dir, ['start', 'api', 'events', 'tiles', 'retention'], timeout=300)
         plog("↩ CloudTAK restarted on the previous version and its MinIO store" if rc == 0
              else f"  ⚠ Could not restart the previous CloudTAK: {out.strip()[-300:]}")
+        # #150: re-patch the reverted tree only now — CloudTAK is down until the start above.
+        if _reverted:
+            _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
 
@@ -44421,6 +45603,74 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         return False
 
 
+# ops #110: runs INSIDE the postgis container. Every database that has PostGIS at an older
+# version than the image ships gets postgis_extensions_upgrade() (postgis, topology, tiger
+# geocoder in one call). Check-before-apply, so on a converged box it is one query per DB.
+# Prints one UPGRADED/FAILED line per database it touched, then DONE.
+_CT_POSTGIS_EXT_UPGRADE_SH = r'''
+for i in $(seq 1 24); do pg_isready -h "$(hostname -i)" -U docker -q && break; sleep 5; done
+pg_isready -h "$(hostname -i)" -U docker -q || { echo NOTREADY; exit 0; }
+Q="SELECT string_agg(e.extname || ' ' || e.extversion || ' -> ' || a.default_version, ', ')
+   FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+   WHERE e.extname IN ('postgis', 'postgis_topology', 'postgis_tiger_geocoder', 'postgis_raster')
+   AND e.extversion <> a.default_version"
+for DB in $(psql -U docker -d postgres -tAc "SELECT datname FROM pg_database WHERE datallowconn"); do
+  V=$(psql -U docker -d "$DB" -tAc "$Q") || continue
+  [ -n "$V" ] || continue
+  for n in 1 2; do
+    psql -U docker -d "$DB" -v ON_ERROR_STOP=1 -qtAc "SELECT postgis_extensions_upgrade()" >/dev/null 2>&1
+    [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ] && break
+  done
+  if [ -z "$(psql -U docker -d "$DB" -tAc "$Q")" ]; then echo "UPGRADED $DB: $V"; else echo "FAILED $DB: $V"; fi
+done
+echo DONE
+'''
+
+
+def _cloudtak_postgis_extensions_upgrade(plog=None, remote_cfg=None):
+    """ops #110: bring CloudTAK's PostGIS extensions up to the version the postgis image ships.
+
+    Swapping the container to a newer PostGIS (POSTGIS_IMAGE) leaves the extension objects in
+    each database at the old version until ALTER EXTENSION / postgis_extensions_upgrade() runs.
+    Waits up to 2 min for the server, then upgrades only databases that are behind — a no-op
+    on a converged box. Unix-socket psql inside the official image is trust-authenticated, the
+    same path _cloudtak_sync_postgis_password() uses. Best-effort, never raises. Returns True
+    when nothing is left behind."""
+    _log = plog or (lambda m: None)
+    try:
+        if remote_cfg:
+            b64 = _b64.b64encode(_CT_POSTGIS_EXT_UPGRADE_SH.encode()).decode()
+            ok, out = _ssh_probe(
+                remote_cfg,
+                'CID=$(docker ps -q -f name=postgis | head -1); [ -n "$CID" ] || { echo SKIP; exit 0; }; '
+                f'docker exec "$CID" sh -c "$(echo {b64} | base64 -d)"',
+                timeout=200)
+        else:
+            r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=postgis']),
+                               capture_output=True, text=True, timeout=10)
+            cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+            if not cid:
+                return False
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'sh', '-c', _CT_POSTGIS_EXT_UPGRADE_SH]),
+                               capture_output=True, text=True, timeout=200)
+            out = r.stdout or ''
+        lines = [l.strip() for l in (out or '').splitlines() if l.strip()]
+        if 'DONE' not in lines:
+            _log(f"  ⚠ PostGIS extension check inconclusive ({(lines[-1] if lines else 'no output')[:120]})")
+            return False
+        failed = False
+        for l in lines:
+            if l.startswith('UPGRADED '):
+                _log(f"  ✓ PostGIS extensions updated in {l[len('UPGRADED '):]}")
+            elif l.startswith('FAILED '):
+                failed = True
+                _log(f"  ⚠ PostGIS extension update failed in {l[len('FAILED '):]}")
+        return not failed
+    except Exception as e:
+        _log(f"  ⚠ PostGIS extension update errored (non-fatal): {e}")
+        return False
+
+
 # Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
 # consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
 _CLOUDTAK_REMOTE_MEDIA_PERL = (
@@ -44431,7 +45681,127 @@ _CLOUDTAK_REMOTE_MEDIA_PERL = (
 )
 
 
-def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None):
+# v10.2.15 (#150): operator pre-build hooks. Update's `checkout -f` wipes any local edit to
+# CloudTAK's source, so an operator who carries one (a video-service.ts fix, say) lost it on
+# every Update. Scripts in this folder run right before every CloudTAK build and put it back.
+# The folder is in the console's own config dir, NOT in ~/CloudTAK: hooks run as the console
+# user (root on a root box), and a folder inside the upstream checkout is one a future
+# CloudTAK release could ship files into.
+_CLOUDTAK_HOOK_TIMEOUT = 300
+_CLOUDTAK_HOOK_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_hooks_dir():
+    return os.path.join(CONFIG_DIR, 'cloudtak-hooks', 'pre-build.d')
+
+
+def _cloudtak_hook_untrusted(st):
+    """Why a hook (or its folder) must not be run, or '' when it is owned by the console
+    user and writable by no one else."""
+    if st.st_uid != os.geteuid():
+        return f"owned by uid {st.st_uid}, not the console user (uid {os.geteuid()})"
+    if st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH):
+        return "writable by group or others"
+    return ''
+
+
+def _run_cloudtak_prebuild_hooks(cloudtak_dir, phase, plog, tag='', prev_sha=''):
+    """Run the operator's pre-build hooks in name order, cwd = the CloudTAK checkout.
+
+    Returns (ok, name). ok=False means do NOT build: a hook exited non-zero, timed out, or
+    is not safe to run, and `name` says which. Fail loud rather than skip — a skipped hook
+    means building stock source the operator did not want. Non-executable files are
+    skipped (run-parts semantics: chmod -x disables a hook). No folder: nothing runs."""
+    import signal as _signal
+    hooks_dir = _cloudtak_hooks_dir()
+    if not os.path.lexists(hooks_dir):
+        plog("  no pre-build hooks")
+        return True, ''
+    # The folders must be ours too, or someone else could swap a hook in.
+    for d in (os.path.dirname(hooks_dir), hooks_dir):
+        try:
+            st = os.lstat(d)
+        except OSError as e:
+            plog(f"✗ Cannot read the pre-build hooks folder {d}: {e}")
+            return False, d
+        why = _cloudtak_hook_untrusted(st) if _stat.S_ISDIR(st.st_mode) else 'not a real folder'
+        if why:
+            plog(f"✗ Refusing to run pre-build hooks: {d} is {why}")
+            return False, d
+    if not tag:
+        try:
+            _r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                                 'describe', '--tags', '--exact-match', 'HEAD'],
+                                capture_output=True, text=True, timeout=30)
+            tag = _r.stdout.strip() if _r.returncode == 0 else ''
+        except Exception:
+            tag = ''
+    env = {k: os.environ[k] for k in ('PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ')
+           if k in os.environ}
+    env.update({'INFRATAK_HOOK_PHASE': phase, 'INFRATAK_CLOUDTAK_DIR': cloudtak_dir,
+                'INFRATAK_CLOUDTAK_TAG': tag or '', 'INFRATAK_CLOUDTAK_PREV_SHA': prev_sha or ''})
+    ran, name = 0, hooks_dir
+    # Any error here (a hook removed mid-run, a full /tmp, an unreadable folder) must fail
+    # closed, not escape: the callers revert on (False, name) and would skip that on a raise.
+    try:
+        for name in sorted(os.listdir(hooks_dir)):
+            if not _CLOUDTAK_HOOK_NAME_RE.fullmatch(name):
+                continue   # dotfiles, editor backups (name~)
+            path = os.path.join(hooks_dir, name)
+            st = os.lstat(path)
+            if _stat.S_ISLNK(st.st_mode):
+                plog(f"✗ Refusing to run pre-build hook {name}: it is a symlink — put the script itself in {hooks_dir}")
+                return False, name
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            if not st.st_mode & _stat.S_IXUSR:
+                plog(f"  skipped pre-build hook {name} (not executable)")
+                continue
+            why = _cloudtak_hook_untrusted(st)
+            if why:
+                plog(f"✗ Refusing to run pre-build hook {name}: it is {why}")
+                return False, name
+            plog(f"  running pre-build hook {name} ({phase})…")
+            with tempfile.TemporaryFile() as out:
+                p = subprocess.Popen([path], cwd=cloudtak_dir, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    rc = p.wait(timeout=_CLOUDTAK_HOOK_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    rc = None
+                # Always: nothing a hook left in the background may keep editing during the build.
+                try: os.killpg(p.pid, _signal.SIGKILL)
+                except OSError: pass
+                if rc is None:
+                    p.wait(timeout=30)
+                out.seek(max(0, out.seek(0, os.SEEK_END) - 65536))
+                lines = out.read().decode('utf-8', 'replace').splitlines()
+            for _l in lines[-40:]:
+                plog(f"    │ {_l}")
+            if rc is None:
+                plog(f"✗ Pre-build hook {name} timed out after {_CLOUDTAK_HOOK_TIMEOUT // 60} minutes")
+                return False, name
+            if rc != 0:
+                plog(f"✗ Pre-build hook {name} failed (exit {rc})")
+                return False, name
+            ran += 1
+    except Exception as e:
+        plog(f"✗ Pre-build hook {name} could not run: {str(e)[:200]}")
+        return False, name
+    plog(f"  ran {ran} pre-build hook(s)" if ran else "  no pre-build hooks")
+    return True, ''
+
+
+def _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog):
+    """#150: a revert's checkout -f wipes the operator's patch too — put it back, or the next
+    plugin rebuild bakes stock source. Never fails the caller."""
+    _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert', plog, prev_sha=prev_sha)
+    if not _hok:
+        plog(f"  ⚠ Pre-build hook {_hname} failed on the reverted tree — the running "
+             f"containers are unchanged, but fix it before the next plugin install")
+
+
+def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None, run_hooks=True):
     """Put ~/CloudTAK back on the commit it was on before a failed update's checkout.
 
     v10.1.85 (PWC incident, 2026-09-21): a build that died on a transient GitHub 504
@@ -44462,6 +45832,8 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
                     plog(f"  ⚠ Port-hardening re-apply after revert failed (non-fatal): {_pe}")
         if ok:
             plog(f"↩ Reverted the checkout to {prev_sha[:10]} — the tree matches the images that are still running")
+            if remote_cfg is None and run_hooks:
+                _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog)
         else:
             plog(f"  ⚠ Could not revert the checkout: {(out or '').strip()[:200]}")
         return bool(ok)
@@ -44473,6 +45845,263 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
 def _cloudtak_update_failed_note(plog):
     plog("  CloudTAK is still running on the previous build — nothing was removed.")
     plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
+
+
+def _cloudtak_docker(argv, remote_cfg=None, timeout=60):
+    """(returncode, stdout, error text) for one docker argv: on this box through the broker, or
+    on the remote CloudTAK host over SSH (ops #133 — the rollback helpers below serve both).
+    The remote side gets the argv shell-quoted, the same user as every other remote CloudTAK
+    docker command."""
+    if remote_cfg is not None:
+        ok, out = _ssh_probe(remote_cfg, ' '.join(shlex.quote(a) for a in argv), timeout=timeout)
+        return (0, out or '', '') if ok else (1, '', out or '')
+    r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout or '', r.stderr or ''
+
+
+def _cloudtak_compose_at(cloudtak_dir, args, remote_cfg=None, timeout=600):
+    """`_cloudtak_compose_run()` here, or the same compose args in ~/CloudTAK on the remote host.
+    Returns (rc, output)."""
+    if remote_cfg is None:
+        return _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+    dcc = _compose_cmd(remote_cfg=remote_cfg) or 'docker compose'
+    ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} " + ' '.join(shlex.quote(a) for a in args),
+                         timeout=timeout)
+    return (0 if ok else 1), out or ''
+
+
+def _cloudtak_running_version(cloudtak_dir, container_only=False, remote_cfg=None):
+    """The CloudTAK version the api container is RUNNING, else the tree's api/package.json.
+
+    ops #129: the container first, because a failed update can leave the tree at a newer tag
+    than the images that are serving. container_only: never fall back to the tree (a rollback
+    check — the tree is reverted, so it would always "match"). remote_cfg: ask the remote
+    CloudTAK host (ops #133). Never raises; '' = no answer."""
+    try:
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-q', 'api'], remote_cfg=remote_cfg, timeout=30)
+        cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
+        if re.fullmatch(r'[0-9a-f]{12,64}', cid):
+            rc, out, _err = _cloudtak_docker(['docker', 'exec', cid, 'node', '-e',
+                                              "process.stdout.write(require('/home/etl/api/package.json').version)"],
+                                             remote_cfg=remote_cfg, timeout=15)
+            v = out.strip()
+            if rc == 0 and re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v):
+                return v
+    except Exception:
+        pass
+    if container_only:
+        return ''
+    try:
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, "cat ~/CloudTAK/api/package.json", timeout=30)
+            v = str((json.loads(out or '{}') or {}).get('version') or '').strip() if ok else ''
+        else:
+            with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
+                v = str((json.load(f) or {}).get('version') or '').strip()
+        return v if re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v) else ''
+    except Exception:
+        return ''
+
+
+_CT_ROLLBACK_TAG = 'infratak-rollback'
+
+
+def _cloudtak_rollback_ref(ref):
+    """cloudtak-api[:latest] -> cloudtak-api:infratak-rollback (refs here never carry a registry)."""
+    return ref.rsplit(':', 1)[0] + ':' + _CT_ROLLBACK_TAG
+
+
+def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None, services=()):
+    """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now,
+    each pinned under a `:infratak-rollback` tag so it still exists when it is needed.
+    remote_cfg: the same on the remote CloudTAK host, which builds its own images (ops #133).
+    services: only these compose services (the plugin rebuild touches `api` alone).
+
+    ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
+    old containers keep serving by image ID, but the moment anything recreates them (a failed
+    or partial `up -d`, the next boot heal) they come back on the NEW image with the OLD
+    compose. Taking these refs back is what makes a rollback a rollback. The pin is required:
+    with Docker's containerd image store (default since Docker 29) an image that has lost its
+    tag is deleted as soon as its last container is replaced — measured on the box test, every
+    old image was gone the moment `up -d` recreated its container. Registry images (postgis,
+    media, garage — refs with a '/') are pinned by tag already and left alone.
+
+    ops #133 box test (test8, Docker 29.9.1): it is earlier than that. The moment a build moves
+    the tag, the old image ID is gone for `docker tag` / `image inspect` — while its container
+    is still running on it. So the pin has to be taken BEFORE the build; afterwards there is
+    nothing left to point the tag back at."""
+    snap = []
+    try:
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-a', '-q'] + list(services),
+                                       remote_cfg=remote_cfg, timeout=60)
+        ids = [l.strip() for l in out.splitlines() if re.fullmatch(r'[0-9a-f]{12,64}', l.strip())] if rc == 0 else []
+        if not ids:
+            return snap
+        _rc, insp, _err = _cloudtak_docker(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}'] + ids,
+                                           remote_cfg=remote_cfg, timeout=60)
+        for ln in insp.splitlines():
+            parts = ln.split()
+            if len(parts) != 2:
+                continue
+            ref, iid = parts
+            if ('/' not in ref and _CT_IMAGE_REF_RE.match(ref)
+                    and re.fullmatch(r'sha256:[0-9a-f]{64}', iid) and (ref, iid) not in snap):
+                prc, _o, _e = _cloudtak_docker(['docker', 'tag', iid, _cloudtak_rollback_ref(ref)],
+                                               remote_cfg=remote_cfg, timeout=60)
+                if prc == 0:
+                    snap.append((ref, iid))
+    except Exception:
+        pass
+    return snap
+
+
+def _cloudtak_drop_rollback_pins(snap, remote_cfg=None):
+    """Remove the `:infratak-rollback` tags (only the tag — an image still tagged or in use
+    stays). Never raises."""
+    for ref, _iid in snap or []:
+        try:
+            _cloudtak_docker(['docker', 'image', 'rm', _cloudtak_rollback_ref(ref)],
+                             remote_cfg=remote_cfg, timeout=120)
+        except Exception:
+            pass
+
+
+def _cloudtak_restore_images(snap, plog, remote_cfg=None):
+    """Point each snapshotted ref back at the image it named before the build, then drop the
+    rollback pins. Returns True only if EVERY ref was put back. Never raises."""
+    n, ok = 0, True
+    for ref, iid in snap or []:
+        try:
+            rc, _out, err = _cloudtak_docker(['docker', 'tag', iid, ref], remote_cfg=remote_cfg, timeout=60)
+            if rc == 0:
+                n += 1
+            else:
+                ok = False
+                plog(f"  ⚠ Could not point {ref} back at the previous image: {err.strip()[:160]}")
+        except Exception as e:
+            ok = False
+            plog(f"  ⚠ Could not point {ref} back at the previous image: {str(e)[:160]}")
+    if n:
+        plog(f"↩ Image tags put back on the previous build ({n} image(s))")
+    if ok:
+        _cloudtak_drop_rollback_pins(snap, remote_cfg=remote_cfg)
+    return ok
+
+
+def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expect_version='', remote_cfg=None):
+    """ops #129: the build succeeded, then `docker compose up -d` failed. Put the WHOLE stack
+    back on the previous version — tree, image tags, and any container the failed `up -d`
+    already replaced — instead of leaving the new tree over the old containers.
+
+    Order: revert the tree, re-tag the old images, then `up -d --no-build` from the reverted
+    compose. Containers `up -d` never reached match that compose + image exactly and are left
+    running untouched; any it stopped or replaced are recreated from the old image. If any old
+    image cannot be put back, `up -d` is NOT run (it would start new images on the old tree).
+    Returns True only when the api container is running `expect_version` (when known).
+    remote_cfg: the same on the remote CloudTAK host (ops #133). Never raises."""
+    try:
+        if not snap:
+            plog("  ⚠ No record of the previous images — cannot roll the containers back")
+            return False
+        if remote_cfg is not None:
+            _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+        else:
+            _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        if not _cloudtak_restore_images(snap, plog, remote_cfg=remote_cfg):
+            plog("  ⚠ Not every previous image could be put back — containers left as they are")
+            return False
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['up', '-d', '--no-build'], remote_cfg=remote_cfg, timeout=900)
+        if rc != 0:
+            plog(f"  ⚠ Restarting the previous CloudTAK failed too: {_update_error_line(out) or out.strip()[-300:]}")
+            return False
+        running = ''
+        for _i in range(6):                  # the api container needs a moment to answer exec
+            running = _cloudtak_running_version(cloudtak_dir, container_only=True, remote_cfg=remote_cfg)
+            if running:
+                break
+            time.sleep(5)
+        if not running:
+            plog("  ⚠ The previous CloudTAK did not come back up — check the CloudTAK page")
+            return False
+        if expect_version and running != expect_version:
+            plog(f"  ⚠ CloudTAK is running {running}, not the previous {expect_version} — check the CloudTAK page")
+            return False
+        plog(f"↩ CloudTAK is running on the previous version again ({running})")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+        return False
+
+
+_CT_DATA_ARG_RE = re.compile(r'^\s*ARG\s+DATA_SOURCE_URL\s*=\s*"?(https://[^\s"]+)"?\s*$', re.M)
+_CT_LOCAL_ZIP_ARG_RE = re.compile(r'^\s*ARG\s+USE_LOCAL_ZIP\b', re.M)
+_CT_DATA_TRIES = (0, 10, 30)   # seconds to wait before each attempt
+
+
+def _cloudtak_prefetch_build_data(cloudtak_dir, plog):
+    """Download CloudTAK's map data (CloudTAK-Data zip) on the host, BEFORE the build.
+
+    ops #129: the api Dockerfile's first stage wgets this zip from GitHub (codeload) inside the
+    build. One dropped download there fails the whole 90-minute build (ops1, twice in an hour),
+    and buildkit only says "process ... did not complete successfully". Upstream's Dockerfile
+    takes a local copy instead (`COPY api/data.zip*` + USE_LOCAL_ZIP=true), so fetch it here
+    with retries and a zip check, at the URL the checked-out Dockerfile pins.
+
+    Returns (ok, use_local, error). use_local=False with ok=True means this tree's Dockerfile
+    has no such step (nothing to do). ok=False: the data could not be fetched — the caller
+    stops before anything is built or restarted. Never raises."""
+    import zipfile
+    import urllib.request
+    try:
+        with open(os.path.join(cloudtak_dir, 'Dockerfile')) as f:
+            df = f.read()
+    except OSError:
+        return True, False, ''
+    m = _CT_DATA_ARG_RE.search(df)
+    if not m or not _CT_LOCAL_ZIP_ARG_RE.search(df):
+        return True, False, ''
+    url = m.group(1)
+    dest = os.path.join(cloudtak_dir, 'api', 'data.zip')
+    tmp = dest + '.part'
+    last = ''
+    plog(f"  Downloading CloudTAK map data before the build: {url}")
+    for i, wait in enumerate(_CT_DATA_TRIES, 1):
+        if wait:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': f'infra-TAK/{VERSION}'})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            with zipfile.ZipFile(tmp) as z:
+                names = z.namelist()
+                bad = z.testzip()
+            if bad is not None:
+                raise ValueError(f'the download is damaged ({bad})')
+            if not any(n.startswith('CloudTAK-Data-') for n in names):
+                raise ValueError('the download is not the CloudTAK-Data archive')
+            os.replace(tmp, dest)
+            plog(f"  ✓ Map data downloaded ({os.path.getsize(dest) // 1024} KB) — the build uses this copy")
+            return True, True, ''
+        except Exception as e:
+            last = str(e)[:200]
+            plog(f"  ⚠ Map data download attempt {i}/{len(_CT_DATA_TRIES)} failed: {last}")
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False, False, f'could not download CloudTAK map data from {url} ({last})'
+
+
+def _cloudtak_drop_build_data(cloudtak_dir):
+    try:
+        os.remove(os.path.join(cloudtak_dir, 'api', 'data.zip'))
+    except OSError:
+        pass
 
 
 def run_cloudtak_update():
@@ -44512,6 +46141,18 @@ def run_cloudtak_update():
         # enforced separately at plugin-install time.
         release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
+        # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
+        from_ver = ''
+        if is_remote:
+            # ops #133: the running container first, as locally — it is what a rollback checks.
+            from_ver = _cloudtak_running_version(None, remote_cfg=remote_cfg) if remote_host else ''
+        else:
+            from_ver = _cloudtak_running_version(os.path.expanduser('~/CloudTAK'))
+        if not re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', from_ver or ''):
+            from_ver = ''
+        if from_ver:
+            plog(f"  Running now: {from_ver}")
+        _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -44678,6 +46319,8 @@ def run_cloudtak_update():
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            if os.path.isdir(_cloudtak_hooks_dir()):
+                plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
             try:
                 if _patch_cloudtak_tiles_arm64(cloudtak_dir):
@@ -44690,6 +46333,18 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+            # #150: the operator's own source patches, after ours and before the build.
+            # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
+            _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
+                                                        tag=release_tag, prev_sha=prev_sha)
+            if not _hok:
+                plog(f"✗ Update stopped before the build: pre-build hook {_hname} failed (output above)")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous build — nothing was removed.")
+                plog(f"  Fix or remove {_hname} in {_cloudtak_hooks_dir()}, then run Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
@@ -44701,6 +46356,10 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #133: the remote host builds its own images, so it has the same Docker 29 trap
+            # the local branch closed in ops #129 — pin what is serving now, so every failure
+            # below can put the image tags (and, after a failed `up -d`, the containers) back.
+            _ct_snap = _cloudtak_snapshot_images(None, remote_cfg=remote_cfg)
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
@@ -44708,9 +46367,12 @@ def run_cloudtak_update():
             if not ok:
                 plog(f"✗ Build failed on remote: {(out or '')[:600]}")
                 _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _r_store_sh = "test -d ~/CloudTAK/.docker-store && echo yes"
+            _had_minio_store = _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -44720,14 +46382,33 @@ def run_cloudtak_update():
                 if not _gok:
                     plog("✗ Garage store setup failed on the remote host (output above)")
                     _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            _migrated_now = _had_minio_store and not _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} up -d", timeout=1800)
             if not ok:
-                plog(f"✗ Restart failed on remote: {(out or '')[:600]}")
+                # ops #133: same rollback as the local branch (ops #129), over SSH.
+                _why = _update_error_line(out) or 'docker compose up -d failed'
+                plog(f"✗ Restart failed on remote: {_why}")
+                if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    if _cloudtak_rollback_after_failed_up(None, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver, remote_cfg=remote_cfg):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
             dcc = _compose_cmd()
@@ -44738,6 +46419,22 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #129: fetch the map-data zip on the host with retries; a dropped download
+            # inside the build used to fail it after the long npm steps. Nothing is built or
+            # stopped yet, so a failure here leaves CloudTAK exactly as it was.
+            _dok, _use_local_zip, _derr = _cloudtak_prefetch_build_data(cloudtak_dir, plog)
+            if not _dok:
+                plog(f"✗ Update stopped before the build: {_derr}")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous version — nothing was built or restarted.")
+                plog("  This server could not download from GitHub (codeload.github.com). Check its internet/DNS")
+                plog("  access to github.com and codeload.github.com, or wait if GitHub is having an outage,")
+                plog("  then press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            # ops #129: what is serving NOW (pinned), so any failure from here on can put it back.
+            _ct_snap = _cloudtak_snapshot_images(cloudtak_dir)
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
@@ -44751,7 +46448,7 @@ def run_cloudtak_update():
             # test6, 2026-10-08) must leave the box exactly as it was, and it does only if
             # nothing has been stopped or migrated yet.
             proc = subprocess.Popen(
-                f'{dcc} build --no-cache',
+                f'{dcc} build --no-cache' + (' --build-arg USE_LOCAL_ZIP=true' if _use_local_zip else ''),
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
@@ -44770,21 +46467,27 @@ def run_cloudtak_update():
             try:
                 proc.wait(timeout=5400)  # 90 min (same as deploy)
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 if proc.returncode != 0:
                     plog(f"✗ Build failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
                     _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                    # ops #129: services that DID build were re-tagged; take the tags back so the
+                    # next recreate (boot heal, Update config) cannot start a new image on the old tree.
+                    _cloudtak_restore_images(_ct_snap, plog)
                     _cloudtak_update_failed_note(plog)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
                 proc.kill()
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 plog("✗ Build timed out after 90 minutes")
                 _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_restore_images(_ct_snap, plog)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
@@ -44793,6 +46496,7 @@ def run_cloudtak_update():
             # containers kept serving through the build, and if the move fails they are started
             # again as they were (_cloudtak_garage_rollback). A MinIO-era tree skips this; an
             # already-migrated one only re-checks .env.
+            _had_minio_store = os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
             if _cloudtak_compose_is_garage(cloudtak_dir):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -44801,22 +46505,47 @@ def run_cloudtak_update():
                     plog(f"✗ Garage store setup failed: {_gerr}")
                     _undo_plugin_moves()
                     _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            # A MinIO -> Garage move THIS run archived .docker-store: the previous (MinIO) tree
+            # can no longer read the files, so a failed start below must not roll back to it.
+            _migrated_now = _had_minio_store and not os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             _urc, _uout = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)
             for _l in _uout.strip().splitlines()[-12:]:
                 plog(f"  {_l}")
             if _urc != 0:
-                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}")
+                # ops #129 (ops1): this used to stop here — new tree, new image tags, old containers,
+                # and nothing put back. Name the cause, then roll the whole stack back.
+                _why = _update_error_line(_uout) or f'exit code {_urc}'
+                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}: {_why}")
+                if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap)
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    _undo_plugin_moves()
+                    if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap)
         plog("✓ Containers rebuilt and restarted")
         # Converge the postgis role password to .env BEFORE declaring success — the
         # rebuild restarts the API, which is exactly when a latent password mismatch
         # (from any past .env regeneration over the live volume) surfaces as
         # 'password authentication failed for user "docker"' (test12/test6 2026-07-13).
         _cloudtak_sync_postgis_password(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
+        # ops #110: the rebuild may have started a newer postgis image (POSTGIS_IMAGE).
+        _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
@@ -45226,25 +46955,56 @@ def _webodm_odm_limits(detected_cores, cfg):
     return cpus, max(2, mem)
 
 
+# Pinned WebODM stack (ops #92): the exact images we test, never a floating :latest — an
+# untested upstream release must not land on a box just because something ran `pull`.
+# Bump them together, and only after a deploy + Update on a test box (amd64 and arm64).
+#   wo_broker  — upstream WebODM still ships redis:7.0.10, end of life with open CVEs
+#                (CVE-2025-49844 Lua use-after-free, CVE-2025-21605, CVE-2025-32023, …).
+#                WebODM's Celery 4.4 / kombu 4.6 / redis-py 3.2 client runs against 8.x.
+#   wo_db      — upstream publishes only :latest (PostgreSQL 9.5 / PostGIS 2.3, an upstream
+#                limitation), so it is pinned by digest.
+WEBODM_VERSION = '3.3.1'
+WEBODM_IMAGES = {
+    'wo_db':      'webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
+    'wo_nodeodm': 'webodm/nodeodx:2.4.0',
+}
+
+
+def _webodm_pin_images(compose_txt, services=None):
+    """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
+    only those in `services`). Installs from before the pins carry the floating refs they were
+    deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
+    in place. Idempotent — an already-pinned file comes back unchanged."""
+    for svc, image in WEBODM_IMAGES.items():
+        if services and svc not in services:
+            continue
+        compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
+                             lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
+    return compose_txt
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
   wo_appmedia:
 services:
   wo_db:
-    image: webodm/webodm_db
+    image: {images[wo_db]}
     container_name: wo_db
     volumes:
       - {wo_dir}/db:/var/lib/postgresql/data:Z
     restart: unless-stopped
     oom_score_adj: -100
   wo_broker:
-    image: redis:7.0.10
+    image: {images[wo_broker]}
     container_name: wo_broker
     restart: unless-stopped
     oom_score_adj: -500
   wo_webapp:
-    image: webodm/webodm_webapp
+    image: {images[wo_webapp]}
     container_name: webapp
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
@@ -45267,7 +47027,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_worker:
-    image: webodm/webodm_webapp
+    image: {images[wo_worker]}
     container_name: wo_worker
     entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
@@ -45285,7 +47045,7 @@ services:
       - WEB_CONCURRENCY=2
     restart: unless-stopped
   wo_nodeodm:
-    image: webodm/nodeodx
+    image: {images[wo_nodeodm]}
     container_name: wo_nodeodm
     command: ["--max_concurrency", "{wo_odm_cpus}"]
     cpus: {wo_odm_cpus}
@@ -45492,7 +47252,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog(f'  ODM cap: {_odm_cpus} cores / {_odm_mem}g / max_concurrency {_odm_cpus} (host {_cores} cores, ceiling {ODM_MAX_CORES})')
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
-        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem)
+        wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
     # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
@@ -45688,6 +47448,7 @@ def _run_webodm_deploy(settings):
             wo_secret=wo_secret,
             wo_odm_cpus=_odm_cpus,
             wo_odm_mem=_odm_mem,
+            images=WEBODM_IMAGES,
         )
         with open(compose_path, 'w') as f:
             f.write(compose_content)
@@ -45899,7 +47660,14 @@ def _run_webodm_update():
         log.append(msg)
         _webodm_update_status['log'] = list(log)
     try:
-        plog('Pulling latest WebODM images…')
+        # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        compose_txt = _read_priv(compose_path)
+        pinned = _webodm_pin_images(compose_txt)
+        if pinned != compose_txt:
+            _write_priv(compose_path, pinned)
+            plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
@@ -47307,7 +49075,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/node-red/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47318,7 +49086,6 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
 
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
             # 6) Restrict to authentik Admins — MUST run here, not only in the
             # Authentik deploy/reconfigure paths. Fleet deploy order is
             # Caddy → Authentik → … → Node-RED, so at Authentik-deploy time
@@ -47416,7 +49183,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47426,7 +49193,6 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'webodm', plog=log)
         else:
             log("  ⚠ Could not create or find WebODM proxy provider")
     except Exception as e:
@@ -47656,7 +49422,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/tak-video-restreamer/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47666,7 +49432,6 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-video-restreamer', plog=log)
         else:
             log("  ⚠ Could not create or find TAK Video Restreamer proxy provider")
     except Exception as e:
@@ -47754,7 +49519,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/federation-hub/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -47764,7 +49529,6 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'federation-hub', plog=log)
         else:
             log("  ⚠ Could not create or find Federation Hub proxy provider")
     except Exception as e:
@@ -47816,6 +49580,10 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 entries.append(('MediaMTX', 'stream', f'https://{mtx_domain}'))
         except Exception:
             pass
+        # open_in_new_tab is set from the catalog when an app is created, never on an
+        # existing one: it is the operator's launch preference (#151), and this runs on
+        # every console update via the Authentik reconfigure.
+        new_tab = {e[2]: e[5] for e in _AUTHENTIK_PROXY_CHAIN_SERVICES}
         provider_pks = []
         base_domain = fqdn.split(':')[0]
         cookie_domain = f'.{base_domain}'
@@ -47877,7 +49645,8 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 try:
                     _ak_api_call(
                         f'{_ak_url}/api/v3/core/applications/',
-                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
+                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk,
+                                         'open_in_new_tab': new_tab.get(slug, True)}).encode(),
                         method='POST', headers=_ak_headers, max_retries=3, timeout=30
                     )
                     log(f"  ✓ Application created: {name}")
@@ -47885,7 +49654,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     if hasattr(e, 'code') and e.code == 400:
                         try:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/{slug}/',
-                                data=json.dumps({'provider': pk, 'open_in_new_tab': True}).encode(),
+                                data=json.dumps({'provider': pk}).encode(),
                                 headers=_ak_headers, method='PATCH')
                             _urlreq.urlopen(req, timeout=10)
                         except Exception:
@@ -47908,7 +49677,8 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         if results:
                             pk = results[0]['pk']
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
+                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk,
+                                                 'open_in_new_tab': new_tab.get(slug, True)}).encode(),
                                 headers=_ak_headers, method='POST')
                             _urlreq.urlopen(req, timeout=10)
                             if pk not in provider_pks:
@@ -47917,8 +49687,6 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     except Exception:
                         pass
 
-        for _name, _slug, _host in entries:
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, _slug, plog=log)
         if provider_pks:
             _outpost_add_providers_safe(_ak_url, _ak_headers, provider_pks, plog=log)
         return True
@@ -49483,7 +51251,6 @@ def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
 
 def _sync_authentik_takportal_provider_url(settings, plog=None):
     """Set TAK Portal Proxy external_host/cookie_domain, ensure provider+app exist and are on embedded outpost (fixes 404 on takportal.fqdn)."""
-    _tp_log = plog or (lambda _m: None)
     import urllib.request as _req
     import urllib.error
     fqdn = (settings.get('fqdn') or '').strip()
@@ -49558,10 +51325,9 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-        # Always PATCH open_in_new_tab when the proxy exists (was only done inside the
-        # "create provider" branch, so existing installs never got tak-portal updated).
+        # open_in_new_tab is only set when the app is created above: it is the
+        # operator's launch preference, and this runs on every console update (#151).
         if provider_pk is not None:
-            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
             _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
         # Ensure all deployed apps (infra-TAK, MediaMTX, Node-RED, TAK Portal) are on the outpost
         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
@@ -50033,6 +51799,18 @@ def _nodered_port_holders_as_conflicts(port=1880):
     return out
 
 
+# SECURITY: the old `nodered/node-red:4.0` tag is frozen at Node-RED 4.0.9 on Node.js 20
+# (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
+# 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
+# fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
+# 4.1.17-22 = Node-RED 4.1.17 on Node 22.23.4 (2026-10-21), amd64 + arm64. 22.23.4 is
+# Node's October 2026 security release (4.1.16-22 shipped Node 22.23.3). Exact tag on
+# purpose: the plain `4.1` tag is stale and there is no bare `4.1.17`. Fresh deploys
+# write it, and Update moves every existing box onto it (_auto_nodered).
+NODERED_IMAGE = 'nodered/node-red:4.1.17-22'
+_NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
     """Plain-English consequence of a foreign listener on 1880, for the deploy log.
 
@@ -50247,9 +52025,9 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
     # Port binding is 0.0.0.0:1880 for remote so Caddy on the console can reach it via
     # reverse_proxy. UFW source-scopes this to the console IP only (see below).
-    compose_yml = """services:
+    compose_yml = f"""services:
   node-red:
-    image: nodered/node-red:4.0
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -50511,8 +52289,8 @@ def run_nodered_deploy():
         with open(compose_yml, 'w') as f:
             f.write(f"""services:
   node-red:
-    # Pinned to Node-RED 4.0.x (minor pin — gets patches, no major-version drift).
-    image: nodered/node-red:4.0
+    # Pinned to an exact Node-RED tag (NODERED_IMAGE) — no drift between boxes.
+    image: {NODERED_IMAGE}
     container_name: nodered
     restart: unless-stopped
     user: "1000:1000"
@@ -51291,7 +53069,9 @@ window.ctLoadCoreEventsIdentity = function() {
           '<div style="display:flex;align-items:center;gap:10px;padding:10px 18px;border-radius:10px;margin-bottom:20px;' +
           'font-size:12.5px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.18);color:var(--green)">' +
           '<span style="width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0"></span>' +
-          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>';
+          'TAK Server connection identity: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">' + esc(d.cn) + '</code> — Bootstrap Admin certificate in use ✓</div>' +
+          '<div id="ct-bootstrap-channels"></div>';
+        window.ctLoadBootstrapChannels();
         return;
       }
       var fix = d.p12_exists
@@ -51310,6 +53090,49 @@ window.ctLoadCoreEventsIdentity = function() {
     .catch(function() { /* fail-quiet status probe */ });
 };
 document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEventsIdentity(); });
+
+// ops #127: warn when the bootstrap cert's live TAK connection is missing channels — Core Events
+// sent to those channels are dropped by TAK with no error anywhere. Fail-quiet like the above.
+window.ctLoadBootstrapChannels = function() {
+  var host = document.getElementById('ct-bootstrap-channels');
+  if (!host) return;
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  fetch('/api/cloudtak/bootstrap-channels', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.success || d.state !== 'missing' || !d.missing || !d.missing.length) { host.innerHTML = ''; return; }
+      var names = d.missing.slice(0, 12).map(esc).join(', ') + (d.missing.length > 12 ? ' and ' + (d.missing.length - 12) + ' more' : '');
+      host.innerHTML =
+        '<div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.4);border-radius:12px;padding:14px 20px;margin-bottom:20px">' +
+        '<div style="font-weight:600;font-size:13px;margin-bottom:4px;color:var(--yellow)">Core Events will not reach ' + d.missing.length + ' channel' + (d.missing.length === 1 ? '' : 's') + '</div>' +
+        '<div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">' +
+        'CloudTAK’s TAK Server connection is not in: <strong style="color:var(--text-primary)">' + names + '</strong>. ' +
+        'Events on those channels are never delivered, with no error. infra-TAK fixes this by itself within a minute of a channel change; Fix now does it immediately.' +
+        '</div>' +
+        '<div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button class="control-btn" id="ct-bootstrap-channels-fix">Fix now</button>' +
+        '<span id="ct-bootstrap-channels-msg" style="font-size:12px;color:var(--text-dim)"></span></div></div>';
+      document.getElementById('ct-bootstrap-channels-fix').addEventListener('click', window.ctFixBootstrapChannels);
+    })
+    .catch(function() { /* fail-quiet status probe */ });
+};
+
+window.ctFixBootstrapChannels = function() {
+  var btn = document.getElementById('ct-bootstrap-channels-fix');
+  var msg = document.getElementById('ct-bootstrap-channels-msg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Fixing…'; }
+  fetch('/api/cloudtak/bootstrap-channels/fix', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var after = d && d.after;
+      if (d && d.success && after && after.state === 'ok') { window.ctLoadBootstrapChannels(); return; }
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = (d && d.error) ? d.error : ('Still missing ' + ((after && after.missing) ? after.missing.length : '?') + ' — see the console log; it retries on the next sync.');
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
+      if (msg) msg.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+    });
+};
 
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
@@ -55248,6 +57071,15 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             return
         plog(f"  routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN")
 
+        ok, problem, _cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            # ops #128: the move would fail TLS and roll back — two outpost restarts for nothing.
+            # Recorded as an attempt so the monitor's 6 h rate limit applies.
+            plog(f"  ⚠ routing repair: {problem} — not moving the outpost (it would fail TLS and roll back); "
+                 f"fix DNS/certificate for {fqdn}")
+            _record_spiral_repair_attempt('precheck_failed', evidence)
+            return
+
         try:
             _probe = subprocess.run(
                 _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
@@ -55346,7 +57178,69 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
-def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
+# ops #128 — the FQDN move recreates the LDAP outpost, and a move that fails validation
+# recreates it again to roll back. On a box whose DNS or certificate for that name is broken
+# the move can only fail (Caddy has no certificate to offer: `tls: internal error`), yet it was
+# retried on every deploy, update and 10-minute spiral-monitor tick — two outpost restarts each
+# time, and TAK clients that connect during one get no groups (ops #126). So the name is
+# checked first, and a move that failed anyway backs off before the next automatic try.
+_LDAP_FQDN_MOVE_BACKOFF_S = 3600        # after the first failed move; doubles per failure
+_LDAP_FQDN_MOVE_BACKOFF_MAX_S = 86400
+
+
+def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
+    """Can the outpost reach Authentik on https://<fqdn> through this box's Caddy?
+    Returns (ok, problem, cert_sha256). Needs a DNS A record for the name (Caddy can't get or
+    renew its Let's Encrypt certificate without one; a lookup that fails on this box's own
+    resolver doesn't count against it) and Caddy on this host's 443 — where the outpost lands
+    through `extra_hosts: <fqdn>:host-gateway` — completing TLS for the name with a valid
+    certificate. Touches no container."""
+    _ips, problem = _dns_resolve_ipv4(fqdn)
+    if problem == 'missing':
+        return False, f"{fqdn} has no DNS A record", ''
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection(('127.0.0.1', 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
+                der = tls.getpeercert(binary_form=True) or b''
+    except ssl.SSLCertVerificationError as e:
+        return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+    except (ssl.SSLError, OSError) as e:
+        return False, f"Caddy has no working certificate for {fqdn} ({e})", ''
+    return True, '', hashlib.sha256(der).hexdigest()
+
+
+def _ldap_fqdn_move_backoff(fqdn, cert_sha256, now=None):
+    """(seconds until the next automatic move may be tried — 0 = go, recorded state). A
+    different FQDN or certificate starts over: that is what fixing the box changes."""
+    st = load_settings().get('authentik_proactive_routing_migration') or {}
+    if (st.get('outcome') == 'success' or not st.get('fails')
+            or st.get('fqdn') != fqdn or st.get('cert') != cert_sha256):
+        return 0, st
+    return max(0, int(float(st.get('retry_after') or 0) - (now or time.time()))), st
+
+
+def _ldap_fqdn_move_failed(fqdn, cert_sha256, outcome, now=None):
+    """Record a failed move; returns the back-off (seconds) before the next automatic try."""
+    now = now or time.time()
+    try:
+        s = load_settings()
+        prev = s.get('authentik_proactive_routing_migration') or {}
+        same = (prev.get('outcome') != 'success' and prev.get('fqdn') == fqdn
+                and prev.get('cert') == cert_sha256)
+        fails = (int(prev.get('fails') or 0) if same else 0) + 1
+        wait = min(_LDAP_FQDN_MOVE_BACKOFF_S * 2 ** min(fails - 1, 10), _LDAP_FQDN_MOVE_BACKOFF_MAX_S)
+        s['authentik_proactive_routing_migration'] = {
+            'ts': int(now), 'outcome': outcome, 'fqdn': fqdn, 'cert': cert_sha256,
+            'fails': fails, 'retry_after': int(now + wait),
+        }
+        save_settings(s)
+        return wait
+    except Exception:
+        return 0
+
+
+def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, quiet_repeats=False):
     """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
     (reactive) by migrating any box where the LDAP outpost is on internal direct routing
     (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
@@ -55367,23 +57261,36 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
          Waived with require_tak=False — used by the Authentik deploy's final SA-bind verify,
          which runs BEFORE TAK exists and deadlocks on internal routing (2026.x flow recursion
          kills every bind regardless of password; field-confirmed 2026-07-08 on a fresh deploy).
+      6. (ops #128) the FQDN has a DNS A record and Caddy serves a valid certificate for it
+         (`_ldap_outpost_fqdn_precheck`) — otherwise the move can only fail and roll back.
+      7. (ops #128) no back-off from a failed move with this FQDN + certificate
+         (`_ldap_fqdn_move_backoff`). force=True — the operator's "Resync LDAP to TAK Server"
+         button — skips this one only.
 
     Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
+    quiet_repeats (the 10-min spiral monitor): a skip reason is logged once, not every tick.
 
     Cardinal rule: NEVER restart the LDAP outpost unless something is wrong. "Wrong routing
     + heavy load + healthy FQDN target available" qualifies — the alternative is waiting for
     the user to hit the spiral and lose webadmin access.
     """
+    def _skip(msg):
+        if quiet_repeats:
+            if getattr(_ensure_authentik_ldap_outpost_on_fqdn, '_last_skip', None) == msg:
+                return
+            _ensure_authentik_ldap_outpost_on_fqdn._last_skip = msg
+        plog(msg)
+
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(compose_path) or not os.path.exists(env_path):
-        plog("  proactive routing: ~/authentik not installed — skipping")
+        _skip("  proactive routing: ~/authentik not installed — skipping")
         return
 
     try:
         if require_tak and not os.path.exists('/opt/tak'):
-            plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
+            _skip("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
             return
 
         fqdn = ''
@@ -55394,14 +57301,29 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
                     fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
                     break
         if not fqdn:
-            plog("  proactive routing: no FQDN in .env — skipping (no migration target)")
+            _skip("  proactive routing: no FQDN in .env — skipping (no migration target)")
             return
 
         with open(compose_path) as _f:
             compose_text = _f.read()
         if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
-            plog("  proactive routing: outpost already on FQDN — skipping (already correct)")
+            _skip("  proactive routing: outpost already on FQDN — skipping (already correct)")
             return
+
+        ok, problem, cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            _skip(f"  proactive routing: {problem} — leaving the outpost on internal routing, not "
+                  f"recreating it (the move would fail TLS and roll back); retried once DNS/certificate are fixed")
+            return
+        if not force:
+            left, st = _ldap_fqdn_move_backoff(fqdn, cert_sha)
+            if left:
+                _skip(f"  proactive routing: moving the outpost to https://{fqdn} failed {st.get('fails')}x with "
+                      f"this certificate — backing off until "
+                      f"{time.strftime('%a %H:%M %Z', time.localtime(float(st.get('retry_after') or 0)))} "
+                      f"('Resync LDAP to TAK Server' tries now)")
+                return
+        _ensure_authentik_ldap_outpost_on_fqdn._last_skip = None  # an attempt: log the next skip again
 
         try:
             _probe = subprocess.run(
@@ -55430,7 +57352,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             # automatic rollback (below) be the real safety net for boxes where FQDN truly won't work.
             _caddy_up = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True, timeout=10)
             if (_caddy_up.stdout or '').strip() != 'active':
-                plog(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
+                _skip(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
                 return
             plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
                  f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
@@ -55461,6 +57383,8 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
+            _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'recreate_failed')
+            plog(f"  proactive routing: next automatic try in {_wait // 3600}h")
             return
 
         # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
@@ -55497,7 +57421,9 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
-        plog("  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; will retry later)")
+        _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'validation_failed')
+        plog(f"  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; "
+             f"next automatic try in {_wait // 3600}h)")
     except Exception as e:
         plog(f"  ⚠ proactive routing error (no changes applied): {e}")
 
@@ -57386,9 +59312,21 @@ def _authentik_apply_official_tunings(plog):
 
 # Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
 # scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
-# env vars. v1.25.1-p0 is the latest stable release as of Dec 2025 — pinning
-# rather than :latest avoids surprise version bumps on `docker compose pull`
-# during Update Now. Image is ~15MB so the pull cost is negligible.
+# env vars. Pinning rather than :latest avoids surprise version bumps on
+# `docker compose pull` during Update Now. Image is ~15MB so the pull cost is
+# negligible.
+#
+# v10.2.21: v1.25.1-p0 → v1.26.1-p0 (edoburu build of 2026-10-19, amd64+arm64)
+# for the PgBouncer security releases 1.25.2 / 1.26.0 / 1.26.1 — pre-auth
+# crashes and hangs in SCRAM/packet parsing, KILL_CLIENT authz, and a SCRAM
+# login-as-another-user flaw. https://www.pgbouncer.org/changelog.html
+# v10.2.23: back to v1.25.1-p0 (ops #123). After the v10.2.22 swap a field box's
+# LDAP SA bind never came back and TAK users reconnected with no groups; test12
+# showed every user at memberOf=0 for ~10 s after the swap. The security bump
+# returns as its own change once the swap is verified end to end.
+# Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
+# (the install path only writes it when it first adds the service), in either
+# direction, so boxes already on v1.26.1-p0 move back on their next console start.
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -58713,7 +60651,7 @@ def _ensure_authentik_pgbouncer(plog):
     # tag) get distinct errors from container-start issues (compose YAML
     # errors, depends_on chain breaks, port conflicts). Without this split,
     # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
-    # docker compose versions while only printing "Image edoburu/pgbouncer:v1.25.1-p0 Pulling"
+    # docker compose versions while only printing "Image edoburu/pgbouncer:<tag> Pulling"
     # to stdout — the actual error gets buried (tak-10, May 2026).
     # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
     # can show both streams distinctly.
@@ -59047,6 +60985,1181 @@ def _ensure_authentik_worker_direct_pg(plog):
          f"server unchanged on PgBouncer")
     _record('applied')
     return True
+
+
+def _ensure_authentik_pgbouncer_image(plog):
+    """v10.2.21: move an existing PgBouncer sidecar onto `_AUTHENTIK_PGBOUNCER_IMAGE`.
+
+    `_ensure_authentik_pgbouncer` writes the image only when it first adds the service
+    and is an idempotent no-op afterwards, so bumping the pin never reached a box that
+    already had PgBouncer — every box installed since v0.9.23 was still on v1.25.1-p0.
+    This converges the compose `image:` to the pin (fleet constant, either direction).
+
+    Only an `edoburu/pgbouncer:*` image is managed; any other image is somebody's
+    deliberate swap with different env semantics and is left alone.
+
+    Pulls first (nothing is mutated if the pull fails), then rewrites compose and
+    recreates pgbouncer only. The server's client connections drop for the few seconds
+    the container takes to come back, the same blip as a pool-size reconcile. Verifies
+    the RUNTIME (the container's image and health), and rolls compose back to the old
+    image if it doesn't come up.
+
+    v10.2.23 (ops #123): a healthy container is not proof TAK can read groups. After the
+    v10.2.22 swap, test12's outpost served memberOf=0 for every user for ~10 s, starting
+    ~25 s after pg_isready said healthy, and a field box's SA bind never came back. So
+    the swap must also pass what TAK Server depends on: a live adm_ldapservice bind plus
+    users' memberOf through the outpost, held for `_PGB_SWAP_LDAP_STABLE_S`. If it
+    doesn't, server+worker+ldap are restarted (fresh DB pools, fresh outpost cache) and
+    it is checked again; still failing → roll back. A box whose LDAP was already failing
+    BEFORE the swap is not rolled back for it (the swap didn't break it).
+
+    Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer image: PyYAML unavailable — skipped (the pgbouncer step bootstraps it; next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+    except Exception as e:
+        plog(f"  pgbouncer image: compose unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    pgb = services.get('pgbouncer') if isinstance(services, dict) else None
+    if not isinstance(pgb, dict):
+        return False
+    target = _AUTHENTIK_PGBOUNCER_IMAGE
+    cur = str(pgb.get('image') or '').strip()
+    if cur == target:
+        return False
+    if not cur.startswith('edoburu/pgbouncer:'):
+        plog(f"  pgbouncer image: compose image {cur!r} is not edoburu/pgbouncer — left alone")
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-pgbouncer-image.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pgbouncer') or {}
+            if outcome == 'applied':
+                cfg['image'] = target
+            cfg['image_last_outcome'] = outcome
+            cfg['image_last_attempt_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['image_compose_backup'] = compose_bak
+            s['authentik_pgbouncer'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_pgbouncer():
+        return subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
+            cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    restarted = []
+
+    def _restart_ak(why):
+        # The restart is itself an LDAP outage, so at most ONE per run, and the outpost
+        # only after the server is healthy (ops #30: an outpost that starts against a
+        # server that goes away mid start-up panics).
+        if restarted:
+            plog(f"  pgbouncer image: {why} — Authentik already restarted once this run, not again")
+            return
+        restarted.append(why)
+        plog(f"  pgbouncer image: {why} — restarting Authentik server+worker, then ldap "
+             f"(fresh DB pools, fresh outpost cache)...")
+        with _authentik_compose_lock('pgbouncer-image-restart', plog=plog) as _locked:
+            if not _locked:
+                plog("  ✗ pgbouncer image: compose lock busy — restart NOT done")
+                return
+            rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=300)
+            _wait_for_authentik_stack_healthy(plog, timeout=180)
+            rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=120)
+        for res in (rr, rl):
+            if res.returncode != 0:
+                plog(f"  ✗ pgbouncer image: restart failed: {((res.stderr or '') + (res.stdout or ''))[-300:]}")
+
+    def _rollback(why, check_ldap=False):
+        plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
+        with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
+            if _locked:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+                _compose_up_pgbouncer()
+            else:
+                plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
+                     f"restore {compose_bak} by hand")
+                return
+        if not check_ldap:
+            return
+        ok = _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback', stats=ldap_seen)
+        if not ok:
+            _restart_ak(f"LDAP failing after rolling back to {cur}")
+            ok = _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback + restart',
+                                                  stats=ldap_seen)
+        # ops #126: only if TAK actually lost LDAP during this run (a failed probe, or the
+        # Authentik restart, which is an outage by itself) and LDAP is good again now.
+        if ok and (restarted or ldap_seen.get('fails')):
+            _tak_ldap_recycle_request(f"PgBouncer image rolled back to {cur} after an LDAP outage", base_groups > 0)
+            plog("  pgbouncer image: TAK client check requested (LDAP dropped during this run) — "
+                 "it runs once LDAP is settled, at the end of this update")
+
+    # Baseline the LDAP path TAK Server uses BEFORE touching anything, so the post-swap
+    # check knows what "working" looks like on this box (and whether it already wasn't).
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    can_probe = bool(ldap_pass) and _ensure_ldapsearch()
+    base_ok, base_groups = False, 0
+    ldap_seen = {}          # failed post-swap probes = TAK lost LDAP during this run
+    if can_probe:
+        base_ok, base_groups, base_detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        plog(f"  pgbouncer image: LDAP before the swap: "
+             f"{'SA bind ok' if base_ok else 'SA bind FAILING'}, {base_detail}")
+    else:
+        plog("  pgbouncer image: no ldapsearch or no adm_ldapservice password — "
+             "can only check container health after the swap")
+
+    plog(f"  pgbouncer image: {cur} → {target} — pulling first...")
+    p = subprocess.run(_sudo_wrap(['docker', 'pull', target]), capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        plog(f"  ✗ pgbouncer image: pull failed, nothing changed (next boot retries): "
+             f"{((p.stderr or '') + (p.stdout or ''))[-300:]}")
+        _record('pull-failed')
+        return None
+
+    # ops #123: change the image LINE only. v10.2.22 re-dumped the whole file
+    # (safe_dump width=200), which re-wrapped long lines; the post-update harden step
+    # saw a text diff and force-recreated server/worker/ldap — three LDAP outages on
+    # test6 in 2.5 min, each followed by memberOf=0.
+    new_compose = _compose_set_service_image(raw_compose, 'pgbouncer', target)
+    pgb['image'] = target
+    try:
+        same_otherwise = new_compose is not None and _yaml.safe_load(new_compose) == data
+    except Exception:
+        same_otherwise = False
+    if not same_otherwise:
+        plog("  ✗ pgbouncer image: couldn't change just the image line in compose — "
+             "nothing changed (the whole file is never re-dumped)")
+        _record('write-failed')
+        return None
+    with _authentik_compose_lock('pgbouncer-image', plog=plog) as _locked:
+        if not _locked:
+            plog("  pgbouncer image: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(compose_bak, 'w') as f:
+                f.write(raw_compose)
+            with open(compose_path, 'w') as f:
+                f.write(new_compose)
+        except Exception as e:
+            plog(f"  ✗ pgbouncer image: compose write failed ({e}) — restoring")
+            try:
+                with open(compose_path, 'w') as f:
+                    f.write(raw_compose)
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_pgbouncer()
+    if r.returncode != 0:
+        _rollback(f"recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+        _record('recreate-failed')
+        return None
+
+    # Same 120s window the install path gives it; the healthcheck is pg_isready every 30s.
+    status = ''
+    for _ in range(24):
+        time.sleep(5)
+        h = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{.Config.Image}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-pgbouncer-1']), capture_output=True, text=True, timeout=10)
+        status = (h.stdout or '').strip()
+        parts = status.split()
+        if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
+            break
+    if status != f"{target} running healthy":
+        _rollback(f"container is {status or 'state unknown'}", check_ldap=can_probe and base_ok)
+        _record('rolled-back')
+        return None
+    plog(f"  pgbouncer image: container running {target} (healthy) — now checking LDAP as TAK Server does...")
+    if not can_probe:
+        plog(f"  ✓ pgbouncer image: running {target} (healthy); LDAP not checked (see above)")
+        _record('applied')
+        return True
+
+    def _resync_tak():
+        # TAK Server binds with CoreConfig's SA credential; make sure it still matches
+        # .env now that LDAP is verified (same step as 'Resync LDAP to TAK Server').
+        changed = False
+        try:
+            changed, msg = _resync_ldap_credential_to_coreconfig()
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync: "
+                 f"{'UPDATED' if changed else 'already in sync'} ({msg})")
+        except Exception as e:
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync error: {str(e)[:120]}")
+        # ops #126: heal TAK's clients either way. The swap dropped Authentik's DB under the
+        # outpost while TAK kept running: clients that connected meanwhile hold empty groups,
+        # in sync credential or not. A changed credential needs a TAK restart (Java reads
+        # CoreConfig at start). Requested, not done here: the update run does it once, at its end.
+        _tak_ldap_recycle_request(f"PgBouncer image swap to {target}", need_groups,
+                                  restart=bool(changed))
+        plog(f"  pgbouncer image: {'TAK Server restart' if changed else 'TAK client check'} requested — it runs "
+             "once LDAP is settled, at the end of this update (once, even if later steps touch Authentik too)")
+
+    need_groups = base_groups > 0
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap', stats=ldap_seen):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified")
+        _resync_tak()
+        _record('applied')
+        return True
+    _restart_ak('LDAP check failed after the swap')
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart', stats=ldap_seen):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified after restart")
+        _resync_tak()
+        _record('applied')
+        return True
+    if not base_ok:
+        # LDAP was failing before we touched anything, so the old image is no better —
+        # keep the pin and say so plainly rather than roll back into the same failure.
+        plog(f"  ✗ pgbouncer image: kept {target}, but LDAP is STILL failing (it was failing "
+             f"before the swap too). TAK users get no groups until adm_ldapservice binds: "
+             f"check docker logs authentik-ldap-1, then 'Resync LDAP to TAK Server'.")
+        _record('applied-ldap-failing')
+        return True
+    _rollback('LDAP SA bind / memberOf still failing after restart', check_ldap=True)
+    _record('rolled-back-ldap')
+    return None
+
+
+def _compose_set_service_image(raw, service, image):
+    """Return compose text `raw` with `services.<service>.image` set to `image`, every other
+    byte untouched (quotes on the value are kept). None if the line can't be found
+    unambiguously — callers must then change nothing rather than re-dump the file."""
+    lines = raw.splitlines(keepends=True)
+    svc_indent = key_indent = None     # indent of the services, and of one service's keys
+    in_services = in_svc = False
+    hits = []
+    for i, l in enumerate(lines):
+        body = l.rstrip('\r\n')
+        stripped = body.lstrip(' ')
+        if not stripped or stripped.startswith('#'):
+            continue
+        ind = len(body) - len(stripped)
+        if ind == 0:
+            in_services = stripped.split('#', 1)[0].strip() == 'services:'
+            in_svc = False
+            continue
+        if not in_services:
+            continue
+        if svc_indent is None:
+            svc_indent = ind
+        if ind == svc_indent:
+            in_svc = stripped.split('#', 1)[0].strip() == f'{service}:'
+            key_indent = None
+            continue
+        if in_svc and ind > svc_indent:
+            if key_indent is None:
+                key_indent = ind       # the service's own keys; deeper lines are values
+            if ind == key_indent and re.match(r'image:\s', stripped):
+                hits.append(i)
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    m = re.match(r'^(\s*image:\s*)([\'"]?)([^\'"\s#]+)\2(.*?)(\r?\n?)$', lines[i])
+    if not m:
+        return None
+    lines[i] = f"{m.group(1)}{m.group(2)}{image}{m.group(2)}{m.group(4)}{m.group(5)}"
+    return ''.join(lines)
+
+
+# ops #123: how long the post-swap LDAP check must hold, and how long it may take.
+# test12's memberOf=0 window opened ~25 s after the swap looked healthy and lasted ~10 s,
+# so a single passing probe proves nothing; it has to stay green for a while.
+_PGB_SWAP_LDAP_WINDOW_S = 120
+_PGB_SWAP_LDAP_STABLE_S = 45
+_PGB_SWAP_LDAP_EVERY_S = 5
+
+
+def _authentik_ldap_sa_group_probe(ldap_pass):
+    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
+    adm_ldapservice and read every user's memberOf. Password is never logged.
+
+    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
+    size limit hit, which still means both worked); `tak_groups` counts memberOf values
+    naming a tak_ group.
+    """
+    try:
+        r = subprocess.run(
+            ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+             '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
+             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', '500', '(objectClass=*)', 'memberOf'],
+            capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, 0, f"ldapsearch {type(e).__name__}"
+    lines = (r.stdout or '').splitlines()
+    users = sum(1 for l in lines if l.startswith('dn: '))
+    groups = sum(1 for l in lines if l.lower().startswith('memberof: cn=tak_'))
+    bound = r.returncode in (0, 4)
+    detail = f"ldapsearch rc={r.returncode}, {users} users, {groups} tak_ memberOf"
+    if not bound:
+        err = (r.stderr or '').strip().splitlines()
+        if err:
+            detail += f" ({err[-1][:80]})"
+    return bound, groups, detail
+
+
+def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='pgbouncer image', stats=None):
+    """Poll `_authentik_ldap_sa_group_probe` until it has passed continuously for
+    `_PGB_SWAP_LDAP_STABLE_S`, giving up after `_PGB_SWAP_LDAP_WINDOW_S` plus the hold.
+    Passing = SA bind works and, if the box had tak_ memberships before (`need_groups`),
+    at least one comes back. Every failed probe is logged (and counted into
+    `stats['fails']` when given). Returns True when stable."""
+    start = time.time()
+    good_since = None
+    fails = 0
+    while True:
+        ok, groups, detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        now = time.time()
+        if ok and (groups > 0 or not need_groups):
+            if good_since is None:
+                good_since = now
+            if now - good_since >= _PGB_SWAP_LDAP_STABLE_S:
+                note = f" ({fails} failed probe(s) before it settled)" if fails else ''
+                plog(f"  ✓ {tag}: LDAP {label}: {detail}, held {_PGB_SWAP_LDAP_STABLE_S}s{note}")
+                return True
+        else:
+            fails += 1
+            if stats is not None:
+                stats['fails'] = stats.get('fails', 0) + 1
+            good_since = None
+            plog(f"  {tag}: LDAP {label}: {'SA bind ok but NO tak_ groups' if ok else 'SA bind FAILED'} — {detail}")
+            if now - start >= _PGB_SWAP_LDAP_WINDOW_S:
+                plog(f"  ✗ {tag}: LDAP {label}: not passing after {_PGB_SWAP_LDAP_WINDOW_S}s")
+                return False
+        time.sleep(_PGB_SWAP_LDAP_EVERY_S)
+
+
+# ops #126 (GH #189): anything that takes the LDAP path down under a RUNNING TAK Server
+# (outpost restart/recreate, a PgBouncer swap, an Authentik restart) leaves TAK with what
+# it got during the outage. A cert client's groups come from ONE LDAP lookup when it
+# connects (X509Authenticator); a failed lookup silently gives no user and no groups, and
+# nothing repeats it on that connection — TAK's 30 s LDAP refresh doesn't touch streaming
+# clients. So a client that reconnected during the outage stays connected with EMPTY groups
+# (test6 2026-10-20: `user=None`, 0 groups, still empty 75 s after LDAP was back). Field
+# (Amos, TAK 5.8, v10.2.22 → v10.2.23): ATAK and CloudTAK connected, no CoT, Client
+# Dashboard groups empty / __ANON__ until `systemctl restart takserver`.
+#
+# One helper for every path: check LDAP the way TAK uses it (SA bind + memberOf, held),
+# then heal the connections WITHOUT a TAK restart (_tak_heal_ldap_sessions): re-authenticate
+# the named ones, and drop only the ones LDAP says should have groups but TAK gave none, so
+# the client reconnects and is looked up again. Only if a client comes back empty again does
+# TAK's own LDAP path count as broken (e.g. dead pooled connections), and then TAK is
+# restarted once, waiting for 8089 and the API. A step that causes an outage mid-run
+# REQUESTS the heal (persisted in settings); the update run carries it out once, at its very
+# end, after every other Authentik step. A TAK that already restarted after the outage is
+# left alone (that restart is reused).
+#
+# TAK core always runs on THIS host: in two_server mode Server One holds only the
+# database (Server Two = here), so the restart is local (docker or systemd) and a remote
+# DB is untouched. With remote Authentik there is no local outpost container to compare.
+#
+# The outpost must have (re)started at least this long after TAK did for TAK to count as
+# having run through it. TAK opens 8089 ~100-180 s after start; before that it has no
+# sessions to lose. It also keeps a box BOOT — Authentik and TAK coming up together, the
+# boot-time bind heal recreating the outpost ~100 s in — from restarting TAK (GH #83).
+_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
+_TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
+_TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
+_tak_ldap_recycle_lock = threading.Lock()
+
+
+def _epoch_from_rfc3339(ts):
+    """`2026-10-21T01:41:16.534837635Z` (docker, nanoseconds) → epoch seconds, or None."""
+    m = re.match(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$', (ts or '').strip())
+    if not m:
+        return None
+    try:
+        base = (datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S') - datetime(1970, 1, 1)).total_seconds()
+    except ValueError:
+        return None
+    off = 0
+    if m.group(3) != 'Z':
+        tz = m.group(3)
+        off = (1 if tz[0] == '+' else -1) * (int(tz[1:3]) * 3600 + int(tz[4:6]) * 60)
+    return base + (float('0.' + m.group(2)) if m.group(2) else 0.0) - off
+
+
+def _docker_started_epoch(container):
+    """When `container` last started (epoch seconds), or None if it isn't running."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}} {{.State.StartedAt}}', container]),
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    parts = (r.stdout or '').split()
+    if r.returncode != 0 or len(parts) != 2 or parts[0] != 'true':
+        return None
+    return _epoch_from_rfc3339(parts[1])
+
+
+# GH #207: Guard Dog's tak-authentik-watch.sh restarts Authentik on its own (HTTP down, or
+# an LDAP flow herd) and appends the epoch of each restart here (_record_restart, root,
+# 0644). Its first restart in 6 h touches only server+worker, so the outpost's start time
+# doesn't move, but LDAP lookups still fail while the server is down. Field: a restart ~35
+# min after a console update left Node-RED feeds and devices on __ANON__ and nothing healed
+# them.
+_GD_AUTHENTIK_RESTART_HIST = '/var/lib/takguard/authentik_restart_history'
+
+
+def _guarddog_authentik_restart_epoch():
+    """When Guard Dog last restarted Authentik (epoch seconds), or None (none recorded,
+    Guard Dog not installed, file unreadable)."""
+    try:
+        with open(_GD_AUTHENTIK_RESTART_HIST) as f:
+            stamps = [int(l.split()[0]) for l in f if l.strip() and l.split()[0].isdigit()]
+    except (OSError, ValueError):
+        return None
+    return float(max(stamps)) if stamps else None
+
+
+def _tak_started_epoch():
+    """When the local TAK Server last started (epoch seconds), or None if it isn't running."""
+    if _tak_is_container():
+        return _docker_started_epoch(TAK_CONTAINER)
+    # Monotonic µs since boot, converted with this process's CLOCK_MONOTONIC (the clock
+    # systemd stamps with), so there's no date string to parse: `--timestamp=unix` needs
+    # a newer systemd than Ubuntu 22.04's 249. Read-only, no privilege needed.
+    try:
+        r = subprocess.run(['systemctl', 'show', 'takserver', '-p', 'ActiveState',
+                            '-p', 'ActiveEnterTimestampMonotonic'], capture_output=True, text=True, timeout=10)
+        vals = dict(l.split('=', 1) for l in (r.stdout or '').splitlines() if '=' in l)
+        mono = int(vals.get('ActiveEnterTimestampMonotonic') or 0)
+    except Exception:
+        return None
+    if vals.get('ActiveState') != 'active' or mono <= 0:
+        return None
+    return time.time() - (time.monotonic() - mono / 1e6)
+
+
+def _tcp_accepts(port, host='127.0.0.1'):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def _tak_wait_ready(plog, tag):
+    """After a TAK restart: wait for 8089 (messaging) and then 8443 (the api JVM, which
+    comes up later; Guard Dog's tak-post-start.sh waits the same way). True when both."""
+    t0 = time.time()
+    for port, limit, what in ((8089, _TAK_RECYCLE_8089_TIMEOUT_S, '8089 accepting connections'),
+                              (8443, _TAK_RECYCLE_8089_TIMEOUT_S + _TAK_RECYCLE_API_TIMEOUT_S, 'API (8443) up')):
+        while not _tcp_accepts(port):
+            if time.time() - t0 >= limit:
+                plog(f"  ✗ {tag}: TAK Server {what.split(' ')[0]} not up {int(time.time() - t0)}s after the restart — "
+                     f"check journalctl -u takserver / docker logs takserver")
+                return False
+            time.sleep(5)
+        plog(f"  {tag}: TAK Server {what} ({int(time.time() - t0)}s after the restart)")
+    return True
+
+
+# How long a dropped client gets to reconnect (ATAK came back in ~15 s on test6), and how
+# many drop rounds before TAK's own LDAP path counts as broken: a lookup through a dead
+# pooled LDAP connection fails once and the pool discards that connection, so a second
+# round gets a fresh one.
+_TAK_LDAP_HEAL_WAIT_S = 90
+_TAK_LDAP_HEAL_ROUNDS = 2
+_TAK_MARTI_API = 'https://127.0.0.1:8443/Marti/api'
+
+
+def _ldap_filter_escape(v):
+    """RFC 4515 escaping for a value in an LDAP search filter."""
+    return ''.join('\\%02x' % ord(c) if c in '\\*()\x00' else c for c in v)
+
+
+def _ldap_users_tak_groups(ldap_pass, cns=None):
+    """{cn as LDAP has it: [its TAK group names]} for these users (or the first 500 users
+    when `cns` is None), read through the local outpost as adm_ldapservice, the way TAK
+    looks them up; a group name is what CoreConfig's groupNameExtractorRegex takes from a
+    tak_ memberOf. A user LDAP doesn't have is left out. None when LDAP can't be read.
+    Password is never logged."""
+    out = {}
+    if cns is None:
+        searches = [['-z', '500', '(objectClass=*)']]
+    else:
+        cns = sorted({c for c in cns if c})
+        searches = [['(|' + ''.join(f'(cn={_ldap_filter_escape(c)})' for c in cns[i:i + 50]) + ')']
+                    for i in range(0, len(cns), 50)]
+    for search in searches:
+        try:
+            r = subprocess.run(
+                ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
+                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
+                 '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
+                capture_output=True, text=True, timeout=20)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode not in (0, 4):
+            return None
+        cur = None
+        for line in (r.stdout or '').splitlines():
+            if line.lower().startswith('dn:'):
+                m = re.match(r'dn:\s*cn=([^,]+),', line, re.I)
+                cur = m.group(1).strip() if m else None
+                if cur is not None:
+                    out.setdefault(cur, [])
+                continue
+            m = re.match(r'memberof:\s*cn=tak_(.*?)(?:,|$)', line, re.I) if cur is not None else None
+            if m:
+                out[cur].append(m.group(1))
+    return out
+
+
+def _ldap_users_tak_group_counts(ldap_pass, cns):
+    """{cn (lower case): number of tak_ memberOf} for these users (see
+    `_ldap_users_tak_groups`). None when LDAP can't be read."""
+    groups = _ldap_users_tak_groups(ldap_pass, cns)
+    return None if groups is None else {cn.lower(): len(g) for cn, g in groups.items()}
+
+
+def _tak_file_users():
+    """Lower-case identifiers of TAK's file users (UserAuthenticationFile.xml: admin, service
+    certs). LDAP has nothing to say about them."""
+    try:
+        return {u.lower() for u in re.findall(r'identifier="([^"]+)"',
+                                              _read_priv('/opt/tak/UserAuthenticationFile.xml') or '')}
+    except Exception:
+        return set()
+
+
+def _subscription_num(uid):
+    try:
+        return int(str(uid).rsplit(':', 1)[-1])
+    except ValueError:
+        return -1
+
+
+def _tak_device_usernames():
+    """{device uid: last username TAK recorded for it} from TAK's client history (last 30
+    days). A connection TAK couldn't match to a user has no DN and no username at all
+    (test6: `dn: null, username: null`), but its device has connected before as someone."""
+    data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/clientEndPoints?secago=2592000', timeout=30)
+    items = data.get('data') if isinstance(data, dict) else None
+    return {e['uid']: e['username'] for e in (items or [])
+            if isinstance(e, dict) and e.get('uid') and e.get('username')}
+
+
+def _tak_client_sessions(devices=None, errs=None):
+    """TAK's live cert-authenticated streaming connections (tls/ssl: ATAK, WinTAK, CloudTAK
+    users, service certs) as {uid, cn, client, callsign, username, groups}; `groups` is
+    every group name in either direction minus __ANON__. `cn` is the cert DN's CN, else
+    TAK's username, else the device's last username from `devices` — so it is there even
+    when TAK couldn't match the cert to a user. `unnamed` = TAK put neither a DN nor a
+    username on it. None when the Marti API can't be read (why goes into `errs`)."""
+    data, err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
+    subs = data.get('data') if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        if errs is not None:
+            errs.append(err or 'no subscription list in the answer')
+        return None
+    out = []
+    for s in subs:
+        if not isinstance(s, dict):
+            continue
+        uid = str(s.get('subscriptionUid') or '')
+        if not uid.startswith(('tls:', 'ssl:')):
+            continue  # plain TCP/UDP inputs and static subscriptions have no LDAP user
+        m = re.search(r'(?:^|,)\s*CN=([^,]+)', s.get('dn') or '', re.I)
+        cn = (m.group(1) if m else (s.get('username') or (devices or {}).get(s.get('clientUid') or '') or '')).strip()
+        groups = {g.get('name') for g in (s.get('groups') or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
+        out.append({'uid': uid, 'cn': cn, 'client': s.get('clientUid') or '',
+                    'callsign': s.get('callsign') or uid, 'username': s.get('username') or None,
+                    'unnamed': not (m or s.get('username')), 'groups': groups})
+    return out
+
+
+# GH #207: one unanswered read of the client list went straight to a TAK restart. Field
+# (Amos, v10.2.23 → v10.2.24): LDAP had just settled after the update's Authentik restart
+# and the subscriptions call didn't answer in time; TAK was restarted although its API was
+# only briefly busy. The read is now retried, backing off, for this long before the heal
+# gives up on it.
+_TAK_MARTI_READ_WAIT_S = 300
+_TAK_MARTI_READ_RETRY_MAX_S = 60
+
+
+def _tak_client_sessions_wait(plog, tag):
+    """`_tak_client_sessions`, retried 10, 20, 40, then every 60 s for up to
+    `_TAK_MARTI_READ_WAIT_S`. Returns (sessions, None), or (None, the last error)."""
+    t0 = time.time()
+    delay, retried = 10, False
+    while True:
+        errs = []
+        sessions = _tak_client_sessions(errs=errs)
+        if sessions is not None:
+            if retried:
+                plog(f"  {tag}: TAK Server's Marti API answered after {int(time.time() - t0)}s")
+            return sessions, None
+        err = errs[-1] if errs else 'no answer'
+        left = _TAK_MARTI_READ_WAIT_S - (time.time() - t0)
+        if left <= 0:
+            return None, err
+        wait = int(min(delay, left))
+        plog(f"  {tag}: can't read TAK Server's client connections yet (Marti API: {err}) — "
+             f"trying again in {wait}s")
+        time.sleep(wait)
+        delay, retried = min(delay * 2, _TAK_MARTI_READ_RETRY_MAX_S), True
+
+
+def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
+    """Give TAK's live client connections their LDAP groups back after an LDAP outage,
+    without restarting TAK Server (ops #126). LDAP must already be verified healthy.
+
+    1. Re-authenticate every named LDAP user's connections in one call (POST
+       /Marti/api/groups/update — TAK repeats the LDAP lookup on the live connection, what
+       TAK Portal does after a group edit). This also cycles TAK's pooled LDAP connections:
+       a lookup on a dead one fails harmlessly (TAK keeps the groups it had) and the pool
+       drops it.
+    2. A connection that still has no groups while LDAP gives its cert's user tak_ groups
+       is dropped (DELETE /subscriptions/delete/<uid>, the Client Dashboard's delete), and
+       the client reconnects and is looked up again. A re-authenticate can't reach these:
+       TAK never put a username (or DN) on them, so the user is the device's last username
+       in TAK's client history. Users LDAP gives no groups and file users
+       (UserAuthenticationFile.xml) are never touched.
+       A connection with no groups AND no user at all is dropped too, even when client
+       history can't name it (test12, ops #131: the history left that device out). TAK names
+       every cert connection whose lookup completes — a user LDAP doesn't know still gets
+       its name and __ANON__ — so "no user, no groups" is a lookup that failed.
+    3. Wait for those clients to reconnect (same device uid); repeat once for any that came
+       back empty. One that comes back named, with no groups, as a user LDAP gives none is
+       fine: that is what it is.
+
+    Returns (verdict, summary): 'ok' (nothing needed), 'healed', 'broken' (a client came
+    back empty again, as a user LDAP has groups for or with no user at all, with LDAP
+    healthy: TAK's own LDAP path is bad, restart TAK) or
+    'unknown' (couldn't read TAK or LDAP)."""
+    sessions, err = _tak_client_sessions_wait(plog, tag)
+    if sessions is None:
+        return 'unknown', (f"can't read TAK Server's client connections (Marti API: {err}) "
+                           f"for {_TAK_MARTI_READ_WAIT_S // 60} min")
+    devices = {}
+    if any(not s['cn'] and s['client'] for s in sessions):
+        devices = _tak_device_usernames()
+        sessions = _tak_client_sessions(devices) or sessions
+    file_users = _tak_file_users()
+    ldap_cns = sorted({s['cn'] for s in sessions if s['cn'] and s['cn'].lower() not in file_users})
+    counts = _ldap_users_tak_group_counts(ldap_pass, ldap_cns)
+    if counts is None:
+        return 'unknown', "can't read the users' groups from LDAP"
+
+    def _owed(s):
+        if s['groups'] or s['cn'].lower() in file_users:
+            return False
+        # unnamed: TAK's lookup for it failed, whatever client history says (or doesn't)
+        return s['unnamed'] or counts.get(s['cn'].lower(), 0) > 0
+
+    def _label(s):
+        if not s['cn']:
+            return f"{s['callsign']} (no user)"
+        return s['callsign'] if s['callsign'] == s['cn'] else f"{s['callsign']} ({s['cn']})"
+
+    def _same_client(d, s):
+        """Is live connection `s` the client of dropped connection `d`, reconnected?"""
+        if _subscription_num(s['uid']) <= _subscription_num(d['uid']):
+            return False
+        if not d['cn']:   # nothing named it: only its device uid can tell
+            return bool(d['client']) and s['client'] == d['client']
+        return (s['cn'].lower() == d['cn'].lower()
+                and (not d['client'] or s['client'] in (d['client'], '')))
+
+    def _reauth(conns):
+        names = sorted({s['username'] for s in conns if s['username'] and s['cn'].lower() not in file_users})
+        if not names:
+            return False
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/groups/update', timeout=60,
+                                       method='POST', json_body=names)
+        plog(f"  {tag}: re-authenticated {len(names)} LDAP user(s) on their live connections"
+             + (f" — failed ({err})" if ok is None else ''))
+        return True
+
+    owed = [s for s in sessions if _owed(s)]
+    nameless = sum(1 for s in owed if not s['cn'])
+    plog(f"  {tag}: {len(sessions)} client connection(s), {len(owed)} with no groups that LDAP says should have them"
+         + (f" ({nameless} with no user at all: TAK's lookup for them failed)" if nameless else ''))
+    if not owed:
+        _reauth(sessions)  # still cycles any dead pooled LDAP connections before the next login
+        return 'ok', f"all {len(sessions)} streaming (8089) client connection(s) have their groups"
+
+    healed, gone, undroppable, no_ldap_groups, blind = [], [], [], [], []
+    for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
+        if _reauth(sessions if rnd == 1 else owed):
+            time.sleep(3)
+            now = _tak_client_sessions(devices) or []
+            fixed = {s['uid'] for s in now if s['groups']}
+            healed += [s for s in owed if s['uid'] in fixed]
+            owed = [s for s in owed if s['uid'] not in fixed]
+        dropped = []
+        for s in owed:
+            ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                           timeout=20, method='DELETE')
+            if ok is None:
+                plog(f"  {tag}: couldn't drop {_label(s)} ({s['uid']}): {err}")
+                undroppable.append(s)
+            else:
+                dropped.append(s)
+        if dropped:
+            plog(f"  {tag}: dropped {len(dropped)} connection(s) with no groups so they reconnect and get them: "
+                 + ', '.join(_label(s) for s in dropped[:15]) + (' …' if len(dropped) > 15 else ''))
+        # Wait for each dropped client's NEXT connection (same cert CN, same device uid when
+        # it had one; only the device uid when nothing named it) and judge that one.
+        # GH #207: one with neither (a Node-RED feed TAK's lookup failed for has no user and
+        # no device uid) can't be told apart from any other new connection, so it isn't
+        # waited for; it reconnects by itself and is looked up again like any other.
+        blind += [s for s in dropped if not (s['cn'] or s['client'])]
+        waiting = {s['uid']: s for s in dropped if s['cn'] or s['client']}
+        back = {}
+        t0 = time.time()
+        while waiting and time.time() - t0 < _TAK_LDAP_HEAL_WAIT_S:
+            time.sleep(5)
+            now = _tak_client_sessions(devices)
+            if now is None:
+                continue
+            for uid, d in list(waiting.items()):
+                nxt = [s for s in now if _same_client(d, s)]
+                if not nxt:
+                    continue
+                n = max(nxt, key=lambda s: _subscription_num(s['uid']))
+                if n['callsign'] == n['uid']:   # no callsign until its first position report
+                    n = dict(n, callsign=d['callsign'])
+                if not n['groups'] and not n['unnamed'] and n['cn'].lower() not in counts:
+                    counts.update(_ldap_users_tak_group_counts(ldap_pass, [n['cn']]) or {})
+                if n['groups']:
+                    healed.append(n)
+                    waiting.pop(uid)
+                elif not _owed(n):
+                    # looked up fine this time, as a user LDAP gives no groups: nothing owed
+                    no_ldap_groups.append(n)
+                    back.pop(uid, None)
+                    waiting.pop(uid)
+                else:
+                    back[uid] = n  # keep waiting: TAK may still be assigning
+        gone += [d for uid, d in waiting.items() if uid not in back]
+        owed = [back[uid] for uid in waiting if uid in back]
+        if not owed:
+            break
+        plog(f"  {tag}: round {rnd}: {len(owed)} client(s) reconnected still with no groups: "
+             + ', '.join(_label(s) for s in owed[:15]))
+    stuck = owed + undroppable
+    healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
+
+    parts = []
+    if healed:
+        parts.append(f"{len(healed)} client(s) got their groups back: "
+                     + ', '.join(_label(s) for s in healed[:15]) + (' …' if len(healed) > 15 else ''))
+    if gone:
+        parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
+                     "they get their groups when they do")
+    if blind:
+        parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
+                     "they reconnect by themselves and are looked up again")
+    if no_ldap_groups:
+        parts.append(f"{len(no_ldap_groups)} reconnected as user(s) LDAP gives no TAK groups, left as is: "
+                     + ', '.join(_label(s) for s in no_ldap_groups[:15]))
+    if stuck:
+        parts.append(f"{len(stuck)} still with no groups although LDAP is healthy: "
+                     + ', '.join(_label(s) for s in stuck[:15]))
+        return 'broken', '; '.join(parts)
+    return 'healed', '; '.join(parts) or 'nothing left to heal'
+
+
+# The HTTPS side (ops #139). TAK's API looks a cert user's groups up on its own, apart from
+# the 8089 connections the heal above reads. On test8 it stopped doing that after LDAP was
+# restarted under TAK: ATAK kept its streaming groups while every Data Sync / mission call
+# got 0 groups, an empty list and a 403 on create, and the heal said "all clients have
+# their groups" eight times. So the check also logs in over HTTPS as a real non-admin LDAP
+# user, with a throwaway cert, and does what ATAK's Data Sync does.
+_TAK_API_CHECK_EKU = 'clientAuth,1.2.840.113549.1.9.7'   # what TAK's enrollment puts on ATAK certs
+_TAK_API_CHECK_TOOL = 'infratak-check'   # not 'public': ATAK's Data Sync lists 'public' missions
+_TAK_API_CHECK_ATTEMPTS = 2   # a lookup through a dead pooled LDAP connection fails once
+_TAK_API_CHECK_RETRY_S = 15
+_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS = 6   # the API answers on 8443 a while before it serves
+
+
+def _tak_user_leaf_cert(cn, workdir):
+    """A throwaway client cert for LDAP user `cn` (CN=cn, the EKU TAK's enrollment gives
+    ATAK), valid one day, signed by the CA TAK's own enrollment signs with (CoreConfig
+    TAKServerCAConfig), so TAK trusts it and looks `cn` up in LDAP like any ATAK login.
+    Nothing is registered in TAK. The new key and the CA files are written only into
+    `workdir` (the caller's mkdtemp, 0700), which the caller removes; the CA password goes
+    to openssl through its environment, never argv. Returns (cert path, key path); raises
+    RuntimeError with the reason."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn or ''):
+        raise RuntimeError(f"user name {cn!r} can't be put in a cert subject")
+    cfg = re.search(r'<TAKServerCAConfig\b[^>]*>', _read_priv('/opt/tak/CoreConfig.xml') or '')
+    ca = re.search(r'keystoreFile="certs/files/([A-Za-z0-9._-]+)-signing\.jks"', cfg.group(0) if cfg else '')
+    if not ca:
+        raise RuntimeError("CoreConfig has no enrollment CA (TAKServerCAConfig)")
+    pw = re.search(r'keystorePass="([^"]*)"', cfg.group(0))
+    ca_pass = pw.group(1) if pw else _get_tak_cert_password(load_settings())
+    ca_pem, ca_key = os.path.join(workdir, 'ca.pem'), os.path.join(workdir, 'ca.key')
+    for ext, dst in (('pem', ca_pem), ('key', ca_key)):
+        src = f'/opt/tak/certs/files/{ca.group(1)}.{ext}'
+        try:
+            data = _read_priv_bytes(src)
+        except Exception as e:
+            raise RuntimeError(f"can't read {src}: {str(e)[:80]}")
+        if not data:
+            raise RuntimeError(f"{src} is empty")
+        with os.fdopen(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+            f.write(data)
+    key, csr, extfile, crt = (os.path.join(workdir, n) for n in ('user.key', 'user.csr', 'ext.cnf', 'user.pem'))
+    with os.fdopen(os.open(extfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as f:
+        f.write('basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n'
+                f'extendedKeyUsage={_TAK_API_CHECK_EKU}\n')
+    env = dict(os.environ, TAK_CA_PASS=ca_pass)
+    for cmd in (['openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
+                 '-subj', f'/CN={cn}/O=infra-TAK/OU=LDAP check', '-out', csr],
+                ['openssl', 'x509', '-req', '-in', csr, '-CA', ca_pem, '-CAkey', ca_key,
+                 '-passin', 'env:TAK_CA_PASS', '-set_serial', str(secrets.randbits(63)),
+                 '-days', '1', '-sha256', '-extfile', extfile, '-out', crt]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"openssl {cmd[1]}: {type(e).__name__}")
+        if r.returncode != 0:
+            raise RuntimeError(f"openssl {cmd[1]} failed: {(r.stderr or '').strip()[-160:]}")
+    return crt, key
+
+
+def _tak_user_marti_req(cert, key, url, method='GET', timeout=20):
+    """One Marti API call with a client cert from `_tak_user_leaf_cert`. Returns (HTTP
+    code, parsed JSON or None); code 0 = no HTTP answer (refused, TLS error, timeout)."""
+    try:
+        r = subprocess.run(['curl', '-sk', '--max-time', str(timeout - 2), '--cert', cert, '--key', key,
+                            '-X', method, '-w', '\n__HTTP_CODE:%{http_code}', url],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0, None
+    body, sep, code = (r.stdout or '').rpartition('\n__HTTP_CODE:')
+    try:
+        code = int(code.strip()) if sep and r.returncode == 0 else 0
+    except ValueError:
+        code = 0
+    try:
+        data = json.loads(body) if body.strip() else None
+    except ValueError:
+        data = None
+    return code, data
+
+
+def _tak_api_user_check_once(cn, ldap_groups):
+    """One HTTPS round as `cn` (see `_tak_api_user_check`). Returns (verdict, summary)."""
+    workdir = tempfile.mkdtemp(prefix='tak-api-check-')
+    try:
+        try:
+            cert, key = _tak_user_leaf_cert(cn, workdir)
+        except Exception as e:
+            return 'unknown', f"couldn't make a test cert for {cn}: {str(e)[:160]}"
+
+        def req(path, method='GET'):
+            return _tak_user_marti_req(cert, key, f'{_TAK_MARTI_API}/{path}', method)
+
+        code, data = req('groups/all')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s groups/all ({f'HTTP {code}' if code else 'no answer'})"
+        rows = data.get('data') if code == 200 and isinstance(data, dict) else None
+        got = {g.get('name') for g in (rows or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
+        have = sorted(got & set(ldap_groups))
+        if not have:
+            return 'broken', (f"TAK's API gave {cn} {'no groups' if code == 200 else f'HTTP {code}'} on "
+                              f"groups/all, while LDAP gives {len(ldap_groups)} ({', '.join(sorted(ldap_groups)[:5])})")
+        code, data = req('missions')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s mission list ({f'HTTP {code}' if code else 'no answer'})"
+        if code != 200:
+            return 'broken', f"{cn} can't list missions over HTTPS (HTTP {code})"
+        listed = len(data.get('data') or []) if isinstance(data, dict) else 0
+        # A group TAK already reports for the user, so a group added in TAK Portal a minute
+        # ago (TAK's group cache catches up on its own) can't look like a broken TAK.
+        group = have[0]
+        name = f'infratak-ldap-check-{int(time.time())}'
+        code, _ = req(f'missions/{name}?creatorUid=infratak-ldap-check&tool={_TAK_API_CHECK_TOOL}'
+                      f'&group={urllib.parse.quote(group, safe="")}', method='PUT')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s mission create ({f'HTTP {code}' if code else 'no answer'})"
+        if code not in (200, 201):
+            return 'broken', f"{cn} got HTTP {code} creating a mission in {group} over HTTPS"
+        dpath = f'missions/{name}?creatorUid=infratak-ldap-check'
+        dcode, _ = req(dpath, method='DELETE')
+        note = ''
+        if dcode != 200:
+            ok, _err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/{dpath}', timeout=20, method='DELETE')
+            if ok is None:
+                note = f" (couldn't delete test mission {name}: delete it in TAK's Mission Manager)"
+        return 'ok', (f"HTTPS as {cn}: {len(got)} group(s), {listed} mission(s) listed, "
+                      f"mission create + delete in {group} OK{note}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _tak_api_user_check(plog, tag, ldap_pass, attempts=_TAK_API_CHECK_ATTEMPTS):
+    """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
+
+    Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
+    one, else the first in LDAP; never a file user or a ROLE_ADMIN member) and, as a
+    throwaway cert for that user, reads its groups (groups/all), lists missions, creates a
+    mission in one of its groups (tool `infratak-check`, which ATAK's Data Sync doesn't
+    list) and deletes it again. Up to `attempts` rounds, a fresh cert each.
+    Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
+    refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
+    check with, or the cert or the API couldn't be used)."""
+    file_users = _tak_file_users()
+
+    def _pick(groups):
+        for cn in sorted(groups or {}, key=str.lower):
+            g = [x for x in groups[cn] if x not in ('__ANON__', '')]
+            if (g and 'ROLE_ADMIN' not in g and cn.lower() not in file_users
+                    and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
+                return cn, g
+        return None
+
+    live = {s['cn'] for s in (_tak_client_sessions() or []) if s['cn'] and not s['unnamed']}
+    groups = _ldap_users_tak_groups(ldap_pass, live) if live else {}
+    pick = _pick(groups)
+    if not pick:
+        groups = _ldap_users_tak_groups(ldap_pass)
+        if groups is None:
+            return 'unknown', "can't read the users' groups from LDAP"
+        pick = _pick(groups)
+    if not pick:
+        return 'unknown', "no non-admin LDAP user with TAK groups to check with"
+    cn, ldap_groups = pick
+    verdict, summary = 'unknown', 'not run'
+    for n in range(1, attempts + 1):
+        if n > 1:
+            plog(f"  {tag}: HTTPS check round {n - 1}: {summary} — trying again in {_TAK_API_CHECK_RETRY_S}s")
+            time.sleep(_TAK_API_CHECK_RETRY_S)
+        verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+        if verdict == 'ok':
+            break
+    return verdict, summary
+
+
+def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
+    """Ask for one TAK client heal (TAK restart only as the fallback) once LDAP is healthy
+    again; `restart` = TAK must restart regardless (CoreConfig's LDAP credential changed).
+    Persisted, so it is carried out at the end of this run, or by the next console start if
+    this run dies."""
+    try:
+        s = load_settings()
+        st = dict(s.get('tak_ldap_recycle') or {})
+        prev = [p for p in (st.get('pending') or []) if p != reason]
+        st['need_groups'] = bool(need_groups or (prev and st.get('need_groups')))
+        st['restart'] = bool(restart or (prev and st.get('restart')))
+        st['pending'] = (prev + [reason])[-5:]
+        st['requested_epoch'] = time.time()
+        s['tak_ldap_recycle'] = st
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _console_update_in_progress():
+    """True while this console's post-update run hasn't finished (it saves
+    last_console_version/sha only at its end) — the same test `_post_update_auto_deploy`
+    uses to decide whether to run it."""
+    try:
+        s = load_settings()
+        if s.get('last_console_version', '') != VERSION:
+            return True
+        sha = subprocess.run(['git', f'--git-dir={os.path.join(BASE_DIR, ".git")}', 'rev-parse', 'HEAD'],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(sha) and s.get('last_console_sha', '') != sha
+    except Exception:
+        return False
+
+
+def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=False):
+    """Once LDAP is healthy again after TAK Server ran through an LDAP outage (see above),
+    give its client connections their groups back without a restart
+    (`_tak_heal_ldap_sessions`); restart TAK ONCE only if that heal reports TAK's own LDAP
+    path broken or can't run. Reasons it acts on:
+      - a pending `_tak_ldap_recycle_request` made after TAK last started;
+      - (`check_outpost`) the local outpost having (re)started at least
+        `_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S` after TAK did — this is also the one-time
+        catch-up for boxes already on v10.2.23 whose outpost was recreated under TAK;
+      - (`check_outpost`) Guard Dog having restarted Authentik that long after TAK started
+        (GH #207; the console's 10-min monitor checks for both).
+    While a console update is still running, a non-`final` caller only records its reasons;
+    the update's own final call carries them out after every other Authentik step.
+    Verifies SA bind + memberOf first and never heals or restarts into a broken LDAP.
+    Returns True only when TAK was restarted."""
+    tag = 'TAK LDAP recycle'
+    with _tak_ldap_recycle_lock:
+        st = dict(load_settings().get('tak_ldap_recycle') or {})
+        pending = list(st.get('pending') or [])
+        req_at = float(st.get('requested_epoch') or 0)
+        need_groups = bool(st.get('need_groups', True)) if pending else True
+        must_restart = False
+
+        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None):
+            try:
+                s = load_settings()
+                cur = dict(s.get('tak_ldap_recycle') or {})
+                if keep:
+                    cur['pending'] = list(dict.fromkeys((cur.get('pending') or []) + keep))[-5:]
+                    cur['requested_epoch'] = max(float(cur.get('requested_epoch') or 0), time.time())
+                    cur.setdefault('need_groups', need_groups)
+                    cur['restart'] = bool(cur.get('restart') or must_restart)
+                elif float(cur.get('requested_epoch') or 0) <= req_at:
+                    # a request made while we worked stays pending for the next caller
+                    for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
+                        cur.pop(k, None)
+                if healed_ldap_start is not None:
+                    cur['healed_ldap_start'] = healed_ldap_start
+                if healed_gd_restart is not None:
+                    cur['healed_gd_restart'] = healed_gd_restart
+                cur.update({'last_outcome': outcome, 'last_trigger': trigger,
+                            'last_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')})
+                s['tak_ldap_recycle'] = cur
+                save_settings(s)
+            except Exception:
+                pass
+
+        if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+            if pending:
+                _finish('skipped: TAK Server not installed / not on LDAP')
+            return False
+        tak_start = _tak_started_epoch()
+        if tak_start is None:
+            if pending:
+                plog(f"  {tag}: TAK Server is not running — nothing to restart")
+                _finish('skipped: TAK Server not running')
+            return False
+        reasons = []
+        if pending:
+            if req_at > tak_start:
+                reasons.extend(pending)
+                must_restart = bool(st.get('restart'))
+            else:
+                plog(f"  {tag}: TAK Server already restarted after: {'; '.join(pending)} — reusing that restart")
+        ldap_start = gd_restart = None
+        if check_outpost:
+            ldap_start = _docker_started_epoch('authentik-ldap-1')
+            # Once healed for a given outpost start, that start is done with — every later
+            # update or boot would otherwise run the heal again for the same outage.
+            if (ldap_start is not None and ldap_start - tak_start >= _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                    and ldap_start > float(st.get('healed_ldap_start') or 0) + 1):
+                up = int(ldap_start - tak_start)
+                reasons.append(f"LDAP outpost restarted while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+            # Only with a local outpost: with remote Authentik a local Guard Dog restart
+            # history says nothing about the LDAP TAK uses.
+            gd_restart = _guarddog_authentik_restart_epoch() if ldap_start is not None else None
+            if (gd_restart is not None and gd_restart - tak_start >= _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                    and gd_restart > float(st.get('healed_gd_restart') or 0) + 1):
+                up = int(gd_restart - tak_start)
+                reasons.append(f"Guard Dog restarted Authentik while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+        reasons = list(dict.fromkeys(reasons))   # a kept reason is also found again above
+        if not reasons:
+            if pending:
+                _finish('not needed')
+            return False
+        if not final and _console_update_in_progress():
+            plog(f"  {tag} ({trigger}): {'; '.join(reasons)} — client check deferred to the end of "
+                 f"the console update, after its other Authentik steps")
+            _finish('deferred to the end of the update', keep=reasons)
+            return False
+
+        plog(f"  {tag} ({trigger}): TAK Server ran through an LDAP outage — {'; '.join(reasons)}. "
+             f"Clients that connected during it have NO groups until they are looked up again; checking LDAP first...")
+        s = load_settings()
+        ldap_pass = _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        if not ldap_pass or not _ensure_ldapsearch():
+            plog(f"  ✗ {tag}: can't check LDAP (no ldapsearch or no adm_ldapservice password) — TAK Server "
+                 f"NOT restarted. If clients show no groups, restart TAK Server once.")
+            # said once per outage: the 10-min monitor would otherwise repeat it every tick
+            _finish('skipped: LDAP not checkable', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+            return False
+        if not _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'before healing TAK clients', tag=tag):
+            plog(f"  ✗ {tag}: LDAP is not healthy — TAK clients NOT healed, TAK Server NOT restarted (it "
+                 f"would reload the same broken LDAP). Kept pending: the console retries within 10 min.")
+            _finish('deferred: LDAP not healthy', keep=reasons)
+            return False
+
+        # ops #126: heal the connections first; restart TAK only if that can't work, or if
+        # CoreConfig's LDAP credential changed (TAK reads it only at start).
+        if must_restart:
+            verdict, summary = 'restart', "CoreConfig's LDAP credential changed; TAK Server loads it only at start"
+        else:
+            try:
+                verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
+            except Exception as e:
+                verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
+        if verdict in ('ok', 'healed'):
+            # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
+            try:
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass)
+            except Exception as e:
+                api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
+            outcome = 'clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
+            if api_verdict == 'ok':
+                plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
+                _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                return False
+            if api_verdict == 'unknown':
+                plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
+                _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                return False
+            plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
+                 f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
+            summary = f"HTTPS/API side gives users no groups ({api_summary})"
+
+        native = not _tak_is_container()
+        plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
+             f"({'systemd' if native else 'container'})...")
+        cmd = ['systemctl', 'restart', 'takserver'] if native else ['docker', 'restart', TAK_CONTAINER]
+        try:
+            # Native `systemctl restart` blocks until ExecStart returns (100 s+ observed);
+            # same 240 s cap as _apply_ldap_to_coreconfig.
+            r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
+            if r.returncode != 0:
+                plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+                _finish('restart failed', keep=reasons)
+                return False
+        except subprocess.TimeoutExpired:
+            plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
+        ready = _tak_wait_ready(plog, tag)
+        if not ready:
+            _finish('restarted, ports not up in time')
+            return True
+        plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
+        try:
+            api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass,
+                                                           attempts=_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS)
+        except Exception as e:
+            api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
+        if api_verdict == 'ok':
+            plog(f"  ✓ {tag}: after the restart: {api_summary}")
+            _finish('restarted')
+        elif api_verdict == 'unknown':
+            plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
+            _finish('restarted (HTTPS not checked)')
+        else:
+            plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
+                 f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
+            _finish('restarted, HTTPS still broken')
+        return True
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
@@ -59599,7 +62712,10 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
       2. Application exists with:
          - correct slug + name
          - provider link to the above
-         - open_in_new_tab per the catalog entry
+         - open_in_new_tab per the catalog entry, ON CREATE ONLY. It is a launch
+           preference the operator owns (#151): the healer runs on every console
+           boot and the console restarts daily, so asserting it reverted an
+           operator's change within a day.
       3. Provider is in the embedded outpost's providers[] list
 
     Uses `_ak_api_call` (3 retries with 5s/10s/15s backoff, 30s timeout) instead
@@ -59908,7 +63024,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                         try:
                             _ak_api_call(
                                 f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                                data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                                data=json.dumps({'provider': provider_pk}).encode(),
                                 method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                             )
                             result['app'] = 'fixed'
@@ -59923,17 +63039,17 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     result['app'] = 'failed:create-timeout'
                     _log(f"  ✗ {app_name}: app create failed ({str(ae)[:120]})")
             else:
+                # open_in_new_tab is not asserted on an existing app — operator-owned (#151).
                 cur_prov = existing_app.get('provider')
-                cur_otb = bool(existing_app.get('open_in_new_tab'))
-                if cur_prov != provider_pk or cur_otb != bool(open_new_tab):
+                if cur_prov != provider_pk:
                     try:
                         _ak_api_call(
                             f'{ak_url}/api/v3/core/applications/{app_slug}/',
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             method='PATCH', headers=ak_headers, max_retries=3, timeout=30
                         )
                         result['app'] = 'fixed'
-                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk}, open_in_new_tab {cur_otb} → {bool(open_new_tab)})")
+                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk})")
                     except Exception as pe2:
                         result['app'] = 'failed:patch-timeout'
                         _log(f"  ✗ {app_name}: app PATCH failed ({str(pe2)[:120]})")
@@ -61661,25 +64777,41 @@ def _takportal_mapsync_watchdog_loop():
     This is what picks up channels created later in the portal with no operator action,
     and heals a UAF admin entry reset to __ANON__ by a TAK redeploy — within one tick.
     Idempotent (no UAF write / no portal restart when membership already matches; never
-    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true."""
+    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true.
+
+    ops #127: checks the channel list every minute (one /groups/all read) and runs the syncs as
+    soon as it changes — a channel created or renamed in TAK Portal reaches the map bridge and
+    the CloudTAK bootstrap cert within a minute, not up to 10. The full syncs still run every
+    10 min regardless."""
     import time as _wt
     _wt.sleep(150)  # let startup migrations + first cert sync settle
-    _ok_interval = 6  # ~1h between liveness lines
-    _ok_counter = 0
+    _full_every = 10  # ticks (1 min each) between unconditional syncs
+    _ok_interval = 60  # ~1h between liveness lines
+    _tick = 0
+    _last_channels = None
     while True:
         try:
             if not load_settings().get('takportal_mapsync_disabled'):
-                _takportal_sync_map_channels()
-                # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
-                # too — a channel created later reaches the cache as inactive
-                # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
-                _tak_sync_admin_group_cache()
-            _ok_counter += 1
-            if _ok_counter % _ok_interval == 0:
+                _items = _tak_channel_items()
+                _now = None if _items is None else frozenset(g['name'] for g in _items)
+                if _tick % _full_every == 0 or (_now is not None and _now != _last_channels):
+                    if _now is not None and _last_channels is not None and _now != _last_channels:
+                        print(f"[takportal-map-sync] channel list changed "
+                              f"(+{len(_now - _last_channels)} / -{len(_last_channels - _now)}) — syncing now", flush=True)
+                    if _now is not None:
+                        _last_channels = _now  # before the syncs: a failing sync retries on the 10-min tick, not every minute
+                    _takportal_sync_map_channels()
+                    # v10.1.5 (PLAN W1): keep the x509 group cache's active flags converged
+                    # too — a channel created later reaches the cache as inactive
+                    # (x509useGroupCacheDefaultUpdatesActive defaults false in TAK).
+                    _tak_sync_admin_group_cache()
+                    _tak_sync_bootstrap_group_cache()
+            _tick += 1
+            if _tick % _ok_interval == 0:
                 print("[takportal-map-sync] watchdog alive", flush=True)
         except Exception as _e:
             print(f"[takportal-map-sync] watchdog error (non-fatal): {_e}", flush=True)
-        _wt.sleep(600)
+        _wt.sleep(60)
 
 
 def _start_takportal_mapsync_watchdog():
@@ -62836,6 +65968,21 @@ def _authentik_fix_pg_idle_timeout(plog):
     return True
 
 
+def _spiral_monitor_tak_recycle(ldap_started_before, plog):
+    """ops #128: the monitor's routing passes recreate the LDAP outpost (a move, or a move
+    plus its rollback). TAK clients that connected meanwhile hold no groups, and nothing else
+    would heal them before the next console start — so heal them now, the same way the other
+    callers do (`_tak_recycle_after_ldap_outage` checks LDAP first, restarts TAK only as the
+    fallback, and leaves it to the end of a running console update)."""
+    after = _docker_started_epoch('authentik-ldap-1')
+    if after is None or after == ldap_started_before:
+        return
+    try:
+        _tak_recycle_after_ldap_outage(plog, 'spiral monitor LDAP routing', check_outpost=True)
+    except Exception as e:
+        plog(f"TAK LDAP recycle error (non-fatal): {e}")
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -62930,10 +66077,19 @@ def _authentik_spiral_monitor():
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
+            _mon_log = lambda m: print(f"[spiral monitor] {m}", flush=True)
             try:
-                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"[spiral monitor] {m}", flush=True))
+                _ensure_authentik_ldap_outpost_on_fqdn(_mon_log, quiet_repeats=True)
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
+            # GH #207: every tick, not only after this pass moved the outpost. Guard Dog's
+            # authentik-watch restarts Authentik on its own, and a request kept because LDAP
+            # wasn't healthy yet waited for the next console start. Silent and cheap when
+            # there is nothing to heal (two start times, one file).
+            try:
+                _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
+            except Exception as _tr_e:
+                print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
 
             s = load_settings()
 
@@ -62949,7 +66105,9 @@ def _authentik_spiral_monitor():
 
             print(f"[spiral monitor] spiral signature detected: {evidence['reason']}", flush=True)
             print(f"[spiral monitor] running idempotent routing repair...", flush=True)
-            _apply_authentik_ldap_routing_repair(ak_dir, lambda m: print(f"[spiral monitor] {m}", flush=True))
+            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
+            _apply_authentik_ldap_routing_repair(ak_dir, _mon_log)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)   # now, not at the next tick
         except Exception as e:
             try:
                 print(f"[spiral monitor] iteration error (will retry in 10 min): {e}", flush=True)
@@ -64059,7 +67217,6 @@ entries:
                                         plog(f"  ✓ LDAP application already exists")
                                     else:
                                         plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
-                                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
     
                                 # Get or create LDAP outpost (blueprint may have created it)
                                 outpost_token_id = None
@@ -64363,7 +67520,6 @@ entries:
                                 app_slug = 'tak-portal'
                             else:
                                 plog(f"  ⚠ Application error: {e.code}")
-                        _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=plog)
 
                     # 12e: Add to embedded outpost
                     if app_slug:
@@ -64779,6 +67935,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         'dnAttributeName': 'DN',
         'nameAttr': 'CN',
         'adminGroup': 'ROLE_ADMIN',
+        # ops #64: reuse bound LDAP connections — see _heal_coreconfig_ldap_connection_pool.
+        'enableConnectionPool': 'true',
     }
     _auth_attrs = {
         'default': 'ldap',
@@ -64969,7 +68127,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         f' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
         f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
         f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
-        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
+        f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN" enableConnectionPool="true"/>\n'
         '    </auth>'
     )
     try:
@@ -65040,6 +68198,62 @@ def _heal_coreconfig_updateinterval_ms(log=None):
         return True
     except Exception as e:
         _log(f"CoreConfig updateinterval migration error (non-fatal): {str(e)[:160]}")
+        return False
+
+
+def _heal_coreconfig_ldap_connection_pool(log=None):
+    """ops #64: add enableConnectionPool="true" to CoreConfig's <ldap> on boxes already wired to LDAP.
+
+    Without it TAK Server opens a new LDAP connection and binds as adm_ldapservice for every
+    API call (test12: ~200 binds/min under a Node-RED feed). The outpost answers those from its
+    cached session until the session expires (AK_LDAP_SESSION_DURATION); then every bind in
+    flight runs its own ldap-authentication-flow until the first one finishes. On test12,
+    2026-10-16 10:31 AM PT, the first took 73 s, ~200 flows piled up behind it and hung for
+    2-7 min — the herd Guard Dog then restarted Authentik for. With the pool on, the bound
+    connections are reused: binds fell from ~200/min to ~0 and searches carried on unchanged.
+    The outpost's cached search mode authorizes a search from the bind's cached flags, not
+    the session, so a pooled connection keeps working across the session expiry.
+
+    TAK's own attribute (CoreConfig.xsd: enableConnectionPool, default false; idle connections
+    close after connectionPoolTimeout, default 30000 ms). Same shape as the updateinterval heal:
+      * only when the attribute is ABSENT — no infra-TAK version ever wrote it, so an explicit
+        value is somebody's decision and is left alone; a fresh LDAP sync writes "true".
+      * a targeted text insert, not an ElementTree round-trip, so the rest of the file stays
+        byte-for-byte.
+      * it does NOT restart TAK Server (a restart drops every connected client); the running
+        JVM picks it up on the next restart. Say so in the log.
+
+    Idempotent, non-fatal, returns True only when it actually changed the file."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists(CORECONFIG_PATH):
+            return False
+        content = _read_coreconfig(CORECONFIG_PATH)
+    except Exception as _re_err:
+        _log(f"CoreConfig LDAP connection-pool migration: cannot read CoreConfig.xml "
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
+        return False
+    try:
+        _tag_re = re.compile(r'<((?:[A-Za-z][\w-]*:)?ldap\b[^>]*?)(\s*/?>)', re.IGNORECASE)
+        changed = []
+
+        def _add_attr(m):
+            if re.search(r'\benableConnectionPool\s*=', m.group(1), re.IGNORECASE):
+                return m.group(0)
+            changed.append(1)
+            return f'<{m.group(1)} enableConnectionPool="true"{m.group(2)}'
+
+        new_content = _tag_re.sub(_add_attr, content)
+        if not changed:
+            return False
+        _write_priv(CORECONFIG_PATH, new_content)
+        _log('CoreConfig <ldap enableConnectionPool="true"> added (TAK Server reuses bound LDAP '
+             'connections instead of binding for every API call, so an outpost session expiry '
+             'no longer sets off a login-flow herd). TAK Server picks this up on its NEXT '
+             'restart; nothing was restarted for you.')
+        return True
+    except Exception as e:
+        _log(f"CoreConfig LDAP connection-pool migration error (non-fatal): {str(e)[:160]}")
         return False
 
 
@@ -68763,8 +71977,9 @@ def takserver_connect_ldap():
     # operator's "Resync LDAP" click never actually moved the outpost off the spiral-prone path.
     # The migration is self-contained (recreates only the ldap container, validates the websocket
     # connection, auto-rolls-back if FQDN isn't viable), so it's safe to invoke here. Visible output.
+    # force: an operator click skips the failed-move back-off (ops #128), not the DNS/cert check.
     try:
-        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()))
+        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()), force=True)
     except Exception as _e:
         diag.append(f'Proactive routing: skipped ({str(_e)[:80]})')
     # Diagnostic: compare passwords and check outpost health
@@ -68863,6 +72078,19 @@ def takserver_connect_ldap():
     else:
         overall_ok = bool(ok and verify.get('ready', True))
         diag.append('Final: READY' if overall_ok else 'Final: NOT READY (verification failed)')
+    # ops #126: the webadmin/FQDN steps above can recreate the LDAP outpost under a TAK
+    # Server that _apply_ldap_to_coreconfig left running (CoreConfig already correct). If
+    # so, heal TAK's clients once LDAP settles (restart only as the fallback) — in the
+    # background, it takes minutes.
+    if not is_remote_ak:
+        threading.Thread(
+            target=lambda: _tak_recycle_after_ldap_outage(
+                lambda m: print(f"Resync LDAP to TAK Server:{m}", flush=True),
+                'Resync LDAP to TAK Server', check_outpost=True),
+            daemon=True, name='tak-ldap-recycle').start()
+        diag.append('TAK clients: if the outpost was restarted under TAK Server, clients left with no '
+                    'groups are re-checked in the background once LDAP settles (TAK restart only if that '
+                    'fails; console log: "TAK LDAP recycle")')
     return jsonify({'success': overall_ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
@@ -70381,6 +73609,295 @@ def takserver_ca_info():
 rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
+
+def _rotate_client_cert_names(cert_dir, skip=()):
+    """Client certs Rotate Intermediate CA re-issues: each NAME.p12 that is not CA material.
+
+    makeCert.sh `ca` leaves NAME.crl, truststore-NAME.jks and NAME-signing.p12 behind for
+    every intermediate ever made, so a box rotated N times holds INT-CA-01..0N and their
+    -signing keystores. Matching only the old/new CA names re-issued all of those as client
+    certs, which appends a non-CA private key to the live enrollment signing keystore that
+    CoreConfig's TAKServerCAConfig points at (ops #82, seen on test8 after nine rotations).
+    """
+    files = os.listdir(cert_dir)
+    cas = {'takserver', 'root-ca', 'ca'} | {s.lower() for s in skip if s}
+    for f in files:
+        if f.endswith('.crl'):
+            cas.add(f[:-4].lower())
+        elif f.startswith('truststore-') and f.endswith('.jks'):
+            cas.add(f[len('truststore-'):-4].lower())
+    names = []
+    for f in sorted(files):
+        if not f.endswith('.p12') or f.startswith('truststore-'):
+            continue
+        name = f[:-4]
+        low = name.lower()
+        if low in cas or (low.endswith('-signing') and low[:-len('-signing')] in cas):
+            continue
+        names.append(name)
+    return names
+
+
+def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
+    """`makeCert.sh <kind> NAME` that really replaces NAME.p12 and NAME.jks. Returns True on success.
+
+    makeCert.sh writes both keystores with `keytool -importkeystore -alias NAME`, which on an
+    existing store asks "Existing entry alias NAME exists, overwrite? [no]" on stdin. The one
+    `echo "y"` piped in is read by the first keytool (the .jks); the second (the .p12) reads EOF
+    and keeps the OLD cert. So every rotation left NAME.pem/.jks on the new CA and NAME.p12 on
+    the one it was first made with, and whatever loads the .p12 (TAK Portal's admin.p12,
+    CloudTAK's bootstrap cert, Guard Dog's Marti scrape) kept presenting it until a later
+    rotation dropped that CA from the truststore — then 8089 "peer not verified" (ops #96,
+    test8: admin.p12 still on INT-CA-08 three rotations later). Moving both keystores aside
+    first means makeCert creates them fresh, with no prompt; they are put back if it does not.
+    `run` is the rotation's own runner: run(cmd) -> bool, container-aware, logs failures."""
+    aside = []
+    for ext in ('.p12', '.jks'):
+        p = os.path.join(cert_dir, name + ext)
+        if _exists_priv(p) and run(f'mv -f {shlex.quote(p)} {shlex.quote(p + ".reissue")}'):
+            aside.append(p)
+    ok = run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh {kind} {shlex.quote(name)} 2>&1')
+    for p in aside:
+        if _exists_priv(p):
+            run(f'rm -f {shlex.quote(p + ".reissue")}')
+        else:
+            run(f'mv -f {shlex.quote(p + ".reissue")} {shlex.quote(p)}')
+            ok = False
+    return ok
+
+
+def _rotate_refresh_integrations(log):
+    """After a rotation's TAK Server restart: integrations that cache a client cert in memory.
+
+    Node-RED's TLS config reads /certs/admin.pem once, when the flows start, so it presents the
+    previous cert until it restarts — fine while that CA is still in the truststore, and an 8089
+    failure from the next rotation on (test8, 3:01 PM PT Oct 19, until a console update happened
+    to resync the flows). CloudTAK keeps its TAK cert in its own database; the existing W11d heal
+    swaps it only when the connection is dead because its CA is gone, which is exactly the state
+    the rotation that drops that CA leaves behind.
+
+    makeCert.sh writes the new admin.key 600 (tak-owned), and Node-RED reads it as uid 1000
+    through the bind mount, so the restart alone came back with EACCES on /certs/admin.key and
+    connected to 8089 with no client cert at all (test8, 7:59 PM PT Oct 19). The boot-time heal
+    puts the pair back to 644 first."""
+    try:
+        _heal_nodered_cert_read_access(lambda m: log(f"  {m}"))
+    except Exception as e:
+        log(f"  ⚠ Node-RED cert read heal skipped: {str(e)[:160]}")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--filter', 'name=nodered']),
+                           capture_output=True, text=True, timeout=15)
+        if (r.stdout or '').strip():
+            r = subprocess.run(_sudo_wrap(['docker', 'restart', 'nodered']),
+                               capture_output=True, text=True, timeout=120)
+            log(f"  {'✓ Node-RED restarted (reloads admin.pem)' if r.returncode == 0 else '⚠ Node-RED restart failed: ' + (r.stderr or r.stdout or '').strip()[:160]}")
+    except Exception as e:
+        log(f"  ⚠ Node-RED restart skipped: {str(e)[:160]}")
+    try:
+        _cloudtak_tak_cert_heal(log=log)
+    except Exception as e:
+        log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+
+
+def _rotate_sh(cmd, timeout=120):
+    """Container-aware shell runner that keeps the output: (ok, stdout+stderr)."""
+    try:
+        r = subprocess.run(_rotate_tak_cert_cmd(cmd), shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+    except Exception as e:
+        return False, str(e)
+
+
+def _rotate_coreconfig_truststore(cc_text):
+    """(absolute truststoreFile, truststorePass) from CoreConfig's <tls> element, or ('', '').
+    This is the truststore TAK Server is enforcing right now. Federation has a <tls> of its own
+    (fed-truststore.jks), so read the one under <security>."""
+    sec = re.search(r'<security\b.*?</security>', cc_text or '', re.S)
+    m = re.search(r'<tls\b[^>]*>', sec.group(0) if sec else (cc_text or ''))
+    if not m:
+        return '', ''
+    f = re.search(r'\btruststoreFile="([^"]*)"', m.group(0))
+    p = re.search(r'\btruststorePass="([^"]*)"', m.group(0))
+    path = (f.group(1) if f else '').strip()
+    if path and not path.startswith('/'):
+        path = os.path.join('/opt/tak', path)
+    return path, html.unescape(p.group(1)) if p else ''
+
+
+def _pem_key(pem):
+    """The base64 body of a PEM cert, whitespace-free: equal for the same cert in any store."""
+    m = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', pem or '', re.S)
+    return re.sub(r'\s+', '', m.group(1) if m else (pem or ''))
+
+
+def _rotate_truststore_entries(ts_path, storepass, sh):
+    """[(alias, pem)] for every trustedCertEntry in a truststore, via `keytool -list -rfc`.
+    None if keytool cannot read it. sh(cmd) -> (ok, output)."""
+    ok, out = sh(f'runuser -u tak -- keytool -list -rfc -keystore {shlex.quote(ts_path)} '
+                 f'-storepass {shlex.quote(storepass)} 2>&1')
+    if not ok or 'Alias name:' not in out:
+        return None
+    entries = []
+    for block in out.split('Alias name:')[1:]:
+        alias = block.split('\n', 1)[0].strip()
+        pem = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', block, re.S)
+        if alias and pem and 'trustedCertEntry' in block:
+            entries.append((alias, pem.group(0)))
+    return entries
+
+
+def _pem_cn_and_expiry(pem):
+    """(subject CN, notAfter datetime or None) of a PEM cert, via openssl."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-enddate'], input=pem,
+                           capture_output=True, text=True, timeout=10)
+        out = r.stdout or ''
+    except Exception:
+        return '', None
+    cn = re.search(r'^subject\s*=.*?CN\s*=\s*([^,/\n]+)', out, re.M)
+    end = re.search(r'^notAfter=(.+)$', out, re.M)
+    try:
+        not_after = datetime.strptime(end.group(1).strip(), '%b %d %H:%M:%S %Y %Z') if end else None
+    except ValueError:
+        not_after = None
+    return (cn.group(1).strip() if cn else ''), not_after
+
+
+def _tak_live_certs_by_issuer(query):
+    """{issuer CN lower: count} of the client certs in TAK Server's certificate table that are
+    still live (not revoked, not expired), or None if the table can't be read.
+    query(sql) -> (ok, text), e.g. _cotdb_psql bound to the box's deployment config."""
+    ok, out = query("SELECT replace(replace(certificate, chr(13), ''), chr(10), '') FROM certificate "
+                    "WHERE revocation_date IS NULL AND (expiration_date IS NULL OR expiration_date > now())")
+    if not ok:
+        return None
+    pems = []
+    for line in (out or '').splitlines():
+        body = re.sub(r'-----(BEGIN|END) CERTIFICATE-----|\s', '', line)
+        if body:
+            pems.append('-----BEGIN CERTIFICATE-----\n'
+                        + '\n'.join(body[i:i + 64] for i in range(0, len(body), 64))
+                        + '\n-----END CERTIFICATE-----\n')
+    counts = {}
+    if not pems:
+        return counts
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.pem') as f:
+            f.write(''.join(pems))
+            f.flush()
+            p7 = subprocess.run(['openssl', 'crl2pkcs7', '-nocrl', '-certfile', f.name],
+                                capture_output=True, text=True, timeout=60)
+            r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-noout'], input=p7.stdout,
+                               capture_output=True, text=True, timeout=60)
+        if p7.returncode != 0 or r.returncode != 0:
+            return None
+    except Exception:
+        return None
+    for m in re.finditer(r'^issuer\s*=.*?CN\s*=\s*([^,/\n]+)', r.stdout or '', re.M):
+        k = m.group(1).strip().lower()
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _rotate_tak_live_certs_by_issuer():
+    try:
+        tak_cfg = _get_tak_deployment_config(load_settings())
+        return _tak_live_certs_by_issuer(lambda sql: _cotdb_psql(tak_cfg, sql))
+    except Exception:
+        return None
+
+
+def _live_count_text(live, cn):
+    if live is None:
+        return 'live cert count unknown'
+    n = live.get((cn or '').lower(), 0)
+    return f"{n} live client cert{'' if n == 1 else 's'}"
+
+
+def _rotate_carry_forward_truststore(new_ts, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
+                                     live, run, sh, log, now=None):
+    """Rotate Intermediate CA Step 5: the new truststore keeps every CA the live one trusts.
+
+    It used to get only the root, the new CA and the CA being replaced, so the CA from two
+    rotations back left the truststore and every client cert it signed (ATAK enrollments,
+    bridges, TAKX) was refused without a word (infra-TAK #204: test8 lost INT-CA-08 with 82
+    live certs). Every trusted entry of the truststore CoreConfig points at now is copied over;
+    only an expired CA is dropped, and that is logged with the live certs that still name it.
+    A CA that is no longer in the truststore is not brought back (Revoke Old CA may have removed
+    it on purpose); if live certs still depend on it, that is logged as a warning.
+    Returns the CNs of every CA in the new truststore."""
+    now = now or datetime.utcnow()
+    have = _rotate_truststore_entries(new_ts, cert_pass, sh) or []
+    have_keys = {_pem_key(p) for _, p in have}
+    have_aliases = {a.lower() for a, _ in have}
+    trusted = {_pem_cn_and_expiry(p)[0].lower() for _, p in have}
+    prev = None
+    if prev_ts and os.path.realpath(prev_ts) != os.path.realpath(new_ts):
+        prev = _rotate_truststore_entries(prev_ts, prev_pass or cert_pass, sh)
+    if prev is None:
+        log(f"  ⚠ Could not read the current truststore ({os.path.basename(prev_ts or '') or 'none'}); "
+            f"only {old_ca_name} is carried forward")
+        prev = []
+    kept, dropped = [], []
+    for alias, pem in prev:
+        key = _pem_key(pem)
+        if key in have_keys:
+            continue
+        cn, not_after = _pem_cn_and_expiry(pem)
+        if not_after and not_after < now:
+            dropped.append(alias)
+            log(f"  ⚠ Dropped {alias}: expired {not_after:%Y-%m-%d} ({_live_count_text(live, cn or alias)} signed by it)")
+            continue
+        # makeCert.sh puts each new CA in its truststore as `mykey`, so the CA being replaced
+        # clashes with the new one on every rotation: carry it under its CN, which is also the
+        # alias Revoke Old CA lists it by.
+        dest = alias
+        if dest.lower() in have_aliases and cn:
+            dest = cn
+        while dest.lower() in have_aliases:
+            dest = f'{dest}-prev'
+        if run(f'runuser -u tak -- keytool -importkeystore -srckeystore {shlex.quote(prev_ts)} '
+               f'-srcstorepass {shlex.quote(prev_pass or cert_pass)} -srcalias {shlex.quote(alias)} '
+               f'-destkeystore {shlex.quote(new_ts)} -deststorepass {shlex.quote(cert_pass)} '
+               f'-destalias {shlex.quote(dest)} -noprompt 2>&1'):
+            have_keys.add(key)
+            have_aliases.add(dest.lower())
+            trusted.add((cn or alias).lower())
+            kept.append(dest)
+        else:
+            log(f"  ⚠ Could not carry {alias} forward; {_live_count_text(live, cn or alias)} depend on it")
+    # The CA being replaced signed every client cert issued up to now: it must stay trusted
+    # even when the old truststore could not be read or did not hold it.
+    if old_ca_name.lower() not in trusted and os.path.exists(old_pem):
+        if run(f'runuser -u tak -- keytool -import -trustcacerts -file {shlex.quote(old_pem)} '
+               f'-keystore {shlex.quote(new_ts)} -alias {shlex.quote(old_ca_name)} '
+               f'-deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'):
+            trusted.add(old_ca_name.lower())
+            kept.append(old_ca_name)
+    if old_ca_name.lower() not in trusted:
+        log(f"  ⚠ {old_ca_name} is NOT in the new truststore; {_live_count_text(live, old_ca_name)} depend on it")
+    log(f"  Carried forward: {', '.join(kept) if kept else 'none'}")
+    for cn, n in sorted((live or {}).items()):
+        if n and cn not in trusted:
+            log(f"  ⚠ {n} live client cert{'' if n == 1 else 's'} signed by {cn}, which is not in the truststore: "
+                f"those clients are refused. Not re-added (Revoke Old CA may have removed it); "
+                f"re-import its .pem if it was dropped by mistake")
+    return trusted
+
+
+def _rotate_log_dropped_cas(ts_path, storepass, live, sh, log):
+    """Rotate Root CA replaces the whole PKI, so every CA in the live truststore goes. Say which,
+    and how many live client certs each one signed, before the cert dir is wiped."""
+    entries = _rotate_truststore_entries(ts_path, storepass, sh) if ts_path else None
+    if entries is None:
+        log(f"  ⚠ Could not read the current truststore ({os.path.basename(ts_path or '') or 'none'})")
+        return
+    log("  CAs leaving the truststore (their clients must re-enroll):")
+    for alias, pem in entries:
+        cn = _pem_cn_and_expiry(pem)[0] or alias
+        log(f"    {alias}: {_live_count_text(live, cn)}")
+
+
 @app.route('/api/takserver/rotate-intca', methods=['POST'])
 @login_required
 def takserver_rotate_intca():
@@ -70391,9 +73908,10 @@ def takserver_rotate_intca():
     new_ca_name = (data.get('new_ca_name') or '').strip()
     if not new_ca_name:
         return jsonify({'error': 'New CA name is required'}), 400
-    import re
-    if not re.match(r'^[a-zA-Z0-9._-]+$', new_ca_name):
-        return jsonify({'error': 'CA name can only contain letters, numbers, dots, hyphens, underscores'}), 400
+    try:
+        _validate_ca_name(new_ca_name, 'New CA name')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     cert_dir = '/opt/tak/certs/files'
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
@@ -70502,25 +74020,24 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
             run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
-            skip = {'takserver', 'root-ca', 'ca', old_ca_name.lower(), new_ca_name.lower()}
             regen_count = 0
-            for f in sorted(os.listdir(cert_dir)):
-                if not f.endswith('.p12'):
-                    continue
-                name = f[:-4]
-                if name.lower() in skip or name.startswith('truststore-'):
-                    continue
+            regen_failed = []
+            for name in _rotate_client_cert_names(cert_dir, skip=(old_ca_name, new_ca_name)):
                 log(f"  Regenerating: {name}")
-                run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh client {name} 2>&1')
-                regen_count += 1
+                if _rotate_reissue_cert('client', name, run, cert_dir):
+                    regen_count += 1
+                else:
+                    regen_failed.append(name)
             log(f"✓ {regen_count} client certificate(s) regenerated (signed by new CA)")
+            if regen_failed:
+                log(f"  ⚠ {len(regen_failed)} not regenerated: {', '.join(regen_failed[:10])}{' …' if len(regen_failed) > 10 else ''}")
 
             log("")
             log("Step 5/7: Updating truststore...")
@@ -70531,13 +74048,17 @@ def takserver_rotate_intca():
                 f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
-            if os.path.exists(old_pem):
-                run(f'runuser -u tak -- keytool -import -trustcacerts -file {old_pem} '
-                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
-                    check=False)
-                log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
-            else:
-                log(f"  ⚠ {old_ca_name}.pem not found — old CA NOT added to truststore")
+            try:
+                prev_ts, prev_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
+            except Exception:
+                prev_ts, prev_pass = '', ''
+            if not prev_ts:
+                prev_ts = os.path.join(cert_dir, f'truststore-{old_ca_name}.jks')
+            live = _rotate_tak_live_certs_by_issuer()
+            if live is None:
+                log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
+            _rotate_carry_forward_truststore(ts_jks, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
+                                             live, run, _rotate_sh, log)
             log("✓ Truststore updated")
 
             log("")
@@ -70577,10 +74098,14 @@ def takserver_rotate_intca():
             log("✓ TAK Server restarted")
 
             log("")
+            log("Refreshing integrations that hold a client certificate...")
+            _rotate_refresh_integrations(log)
+
+            log("")
             log("━━━ ROTATION COMPLETE ━━━")
             log(f"  New CA: {new_ca_name}")
             log(f"  Server cert + all client certs signed by new CA")
-            log(f"  Old CA ({old_ca_name}) in truststore — server still accepts old client certs during transition")
+            log(f"  Old CA ({old_ca_name}) and earlier CAs kept in truststore — server still accepts their client certs")
             log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
             log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
@@ -70760,6 +74285,14 @@ def takserver_rotate_rootca():
             log(f"  Old Intermediate CA: {old_int_name}")
             log(f"  New Root CA: {new_root_name}")
             log(f"  New Intermediate CA: {new_int_name}")
+            try:
+                _ts, _ts_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
+            except Exception:
+                _ts, _ts_pass = '', ''
+            _live = _rotate_tak_live_certs_by_issuer()
+            if _live is None:
+                log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
+            _rotate_log_dropped_cas(_ts, _ts_pass or cert_pass, _live, _rotate_sh, log)
             log("")
 
             log("Step 1/8: Removing old certificate files...")
@@ -77256,6 +80789,8 @@ def deploy_takserver():
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
                            ('Organizational Unit', 'cert_ou')]:
             _sanitize_cert_field(data.get(key, ''), field)
+        _validate_ca_name(data.get('root_ca_name', 'ROOT-CA-01'), 'Root CA Name')
+        _validate_ca_name(data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'), 'Intermediate CA Name')
     except ValueError as e:
         return jsonify({'error': str(e)[:200]}), 400
     # v10.0.5: TAK's makeRootCa.sh REFUSES to run (cert-gen exit 255) unless these are set,
@@ -79713,7 +83248,9 @@ def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
         _body_file = None
-        cmd = ['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key,
+        # curl's own limit follows the caller's (ops #126: a bulk re-authenticate or the
+        # client history on a big server takes longer than the old fixed 8 s).
+        cmd = ['curl', '-sk', '--max-time', str(max(8, int(timeout) - 2)), '--cert', _pem, '--key', _key,
                '-w', '\n__HTTP_CODE:%{http_code}']
         if method != 'GET':
             cmd += ['-X', method]
@@ -79964,6 +83501,191 @@ def _tak_sync_admin_group_cache(plog=None):
     _log("cache still had inactive entries after 3 passes — will retry on next watchdog tick")
 
 
+# System groups never required of the bootstrap cert (ROLE_ADMIN is a role; __ANON__ is not a channel).
+_TAK_NON_CHANNEL_GROUPS = ('ROLE_ADMIN', '__ANON__')
+_bootstrap_groupcache_splitbox_logged = False
+
+
+def _tak_core_is_remote():
+    """True on a split deploy whose TAK core is another host (Marti is not on 127.0.0.1 here).
+    A split deploy with TAK on this box and only Postgres remote (test8's layout) is local."""
+    try:
+        return _cloudtak_bootstrap_cert_target(load_settings())[0] == 'remote'
+    except Exception:
+        return False
+
+
+def _tak_channel_items():
+    """The box's TAK channels as Marti Group records (name, bitpos, …) from
+    /Marti/api/groups/all, minus ROLE_ADMIN/__ANON__. None when TAK is not on this box or on any
+    fetch error — callers treat None as "unknown", never as "no channels"."""
+    if _tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return None
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
+    if data is None:
+        return None
+    items = data.get('data', data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    out = {}
+    for g in items:
+        n = ((g.get('name') if isinstance(g, dict) else '') or '').strip()
+        if n and n not in _TAK_NON_CHANNEL_GROUPS:
+            out[n] = g
+    return list(out.values())
+
+
+def _tak_bootstrap_cert_present():
+    """True when this TAK has the CloudTAK bootstrap cert (its p12 or its UAF entry)."""
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    if os.path.exists(f'/opt/tak/certs/files/{cn}.p12'):
+        return True
+    try:
+        return f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+    except Exception:
+        return False
+
+
+def _tak_bootstrap_channel_state(channels=None):
+    """ops #127 detector (read-only): which TAK channels the CloudTAK bootstrap cert's LIVE 8089
+    subscription cannot deliver Core Events to. CloudTAK reposts them over that connection with a
+    marti dest per channel; a channel the connection lacks IN is never delivered (test12
+    2026-10-20), with no error anywhere. A channel counts as missing unless it is there IN and OUT
+    — what _tak_sync_bootstrap_group_cache converges to.
+    Returns {'state', 'missing', 'channels', 'connected'}; state is one of
+      absent        TAK not on this box, or no bootstrap cert — nothing to check
+      unknown       TAK down or an API error — say nothing
+      disconnected  the cert has no live connection (CloudTAK stopped or on another cert)
+      ok | missing  compared its newest subscription's groups with /groups/all"""
+    res = {'state': 'absent', 'missing': [], 'channels': 0, 'connected': False}
+    if (_tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml')
+            or not _tak_bootstrap_cert_present()):
+        return res
+    if channels is None:
+        channels = _tak_channel_items()
+    data, _err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/subscriptions/all', timeout=20)
+    subs = data.get('data') if isinstance(data, dict) else None
+    if channels is None or not isinstance(subs, list):
+        res['state'] = 'unknown'
+        return res
+    res['channels'] = len(channels)
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mine = [s for s in subs if isinstance(s, dict) and (s.get('username') or '').lower() == cn]
+    if not mine:
+        res['state'] = 'disconnected'
+        return res
+
+    def _num(s):
+        try:
+            return int(str(s.get('subscriptionUid', '')).rsplit(':', 1)[-1])
+        except ValueError:
+            return -1
+    # After a reconnect the old subscription can linger with its old groups: judge the newest.
+    newest = max(mine, key=_num)
+    have = {(g.get('name'), g.get('direction')) for g in (newest.get('groups') or []) if isinstance(g, dict)}
+    res['connected'] = True
+    res['missing'] = sorted(g['name'] for g in channels
+                            if (g.get('name'), 'IN') not in have or (g.get('name'), 'OUT') not in have)
+    res['state'] = 'missing' if res['missing'] else 'ok'
+    return res
+
+
+def _tak_sync_bootstrap_group_cache(plog=None):
+    """ops #127: make sure the CloudTAK CoreEvents bootstrap cert (cloudtak-svc-bootstrap) can deliver
+    Core Events to every channel, including channels created after it connected. Core Events sent to a channel
+    it is not in are dropped by TAK with no error anywhere (nuc 2026-10-20: RAPID-SOS).
+
+    Two independent ways a new channel goes missing, so two steps:
+
+    1. The x509 group cache. Since v0.9.21 CoreConfig carries
+       x509useGroupCacheRequiresExtKeyUsage="false", so makeCert certs like this one ARE cached;
+       a channel created later reaches the cache inactive (IN and OUT), or not at all — the trap
+       _tak_sync_admin_group_cache() fixes for `admin`. Every channel's IN and OUT entries are
+       made active (inactive ones activated, missing ones added). IN is the one that decides
+       delivery — measured on test12 2026-10-20 by toggling one entry at a time: IN off / OUT on,
+       a Core Event on that channel never reaches a member; IN on / OUT off, it does. OUT is
+       kept active too, the same as the admin sync and as an uncached admin cert gets. Entries
+       for non-channels (ROLE_ADMIN, __ANON__) are passed back unchanged. One activeForce PUT
+       (TAK 5.5+) stores the list and re-authenticates the live connection.
+    2. The live connection. ROLE_ADMIN + x509assignAdminAllGroups grants "every group" only when
+       the connection AUTHENTICATES, so even an uncached cert misses later channels (test8
+       2026-10-20: live subscription missing TAKDEV-EMU, no cache entry at all). When the newest
+       subscription still lacks a channel, GET /Marti/api/groups/update/<cn> re-authenticates it
+       in place — measured on test8: same tls:5 session, 24 -> 25 channels, no reconnect.
+
+    Same rules as the admin sync: idempotent (no PUT / re-auth when converged), never-shrink (never
+    deactivates or drops an entry; a failed /groups/all read changes nothing), no-op when the cert
+    is absent or not connected, split box with a remote TAK core logs once and skips.
+    Returns {'changed', 'activated', 'added', 'reauth', 'missing'}."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[tak-groupcache-sync] {m}", flush=True)
+    res = {'changed': False, 'activated': 0, 'added': 0, 'reauth': False, 'missing': []}
+    if _tak_core_is_remote():
+        global _bootstrap_groupcache_splitbox_logged
+        if not _bootstrap_groupcache_splitbox_logged:
+            _bootstrap_groupcache_splitbox_logged = True
+            _log("split-box (TAK core on another host): bootstrap cert channel sync not supported yet — Marti is on the remote box; parked")
+        return res
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _tak_bootstrap_cert_present():
+        return res
+    channels = _tak_channel_items()
+    if not channels:
+        return res  # TAK down / fetch failed / no channels — never act on an empty list
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    base = 'https://127.0.0.1:8443/Marti/api/groups'
+    # Step 1 — the group cache.
+    enabled, _err = _tak_admin_marti_get(f'{base}/groupCacheEnabled')
+    for _pass in range(3 if (isinstance(enabled, dict) and enabled.get('data') is True) else 0):
+        data, err = _tak_admin_marti_get(f'{base}/user?username={cn}')
+        entries = data.get('data') if isinstance(data, dict) else None
+        if data is None or not entries:
+            break  # read failed, or not cached (never connected / makeCert EKU bypass): step 2 decides
+        entries = [e for e in entries if isinstance(e, dict)]
+        names = {g.get('name') for g in channels}
+        have = {(e.get('name'), e.get('direction')) for e in entries}
+        inactive = [e for e in entries if e.get('name') in names
+                    and e.get('direction') in ('IN', 'OUT') and not e.get('active')]
+        added = [dict(g, direction=d, active=True) for g in channels for d in ('IN', 'OUT')
+                 if (g.get('name'), d) not in have]
+        if not inactive and not added:
+            break
+        for e in inactive:
+            e['active'] = True
+        ok, perr = _tak_admin_marti_req(f'{base}/activeForce?username={cn}',
+                                        timeout=15, method='PUT', json_body=entries + added)
+        if ok is None:
+            _log(f"bootstrap cert activeForce PUT failed ({perr}) — cache left as-is")
+            break
+        res['changed'] = True
+        res['activated'] += len(inactive)
+        res['added'] += len(added)
+        _log(f"bootstrap cert: cache — activated {len(inactive)}, added {len(added)} channel entr(y/ies) (IN+OUT)"
+             + (f" ({', '.join(sorted({g['name'] for g in inactive + added})[:10])})" if inactive or added else '')
+             + f" (pass {_pass + 1})")
+        time.sleep(2)  # activeForce re-authenticates the live connection
+    # Step 2 — the live connection.
+    state = _tak_bootstrap_channel_state(channels)
+    if state['state'] == 'missing':
+        _ok, rerr = _tak_admin_marti_get(f'{base}/update/{cn}')
+        if _ok is None and rerr != 'empty_body':  # 200 with no body is this endpoint's success
+            _log(f"bootstrap cert re-authenticate failed ({rerr}) — still missing {len(state['missing'])} channel(s)")
+            res['missing'] = state['missing']
+            return res
+        res['changed'] = res['reauth'] = True
+        time.sleep(2)
+        after = _tak_bootstrap_channel_state(channels)
+        res['missing'] = after['missing'] if after['state'] == 'missing' else []
+        _log(f"bootstrap cert: re-authenticated its TAK connection — {len(state['missing'])} channel(s) were missing"
+             + f" ({', '.join(state['missing'][:10])})"
+             + (f"; still missing {len(res['missing'])} — retrying on the next sync" if res['missing'] else '; now in all'))
+    elif not res['changed'] and state['state'] == 'ok':
+        _log(f"bootstrap cert: live connection in all {len(channels)} channels — no change")
+    return res
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -80106,6 +83828,10 @@ def _takportal_sync_certs(plog=None, restart=False):
             _tak_sync_admin_group_cache(plog=plog)
         except Exception as _gce:
             _log(f"  ⚠ Group-cache sync (non-fatal): {_gce}")
+        try:
+            _tak_sync_bootstrap_group_cache(plog=plog)
+        except Exception as _bce:
+            _log(f"  ⚠ Bootstrap cert group-cache sync (non-fatal): {_bce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -84881,6 +88607,12 @@ def _startup_harden_cloudtak_ports():
             except Exception:
                 pass
         if _needs_recreate:
+            if _override_changed:
+                # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
+                # Download it before the recreate so `up -d` doesn't spend its 240 s budget
+                # on the pull — the stack keeps running meanwhile.
+                _docker_compose_pull(None, _ct_dir, lambda m: print(f"Startup migration: {m}", flush=True),
+                                     timeout=600, label='CloudTAK postgis', services=['postgis'])
             r = subprocess.run(
                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
             )
@@ -85240,8 +88972,16 @@ def _startup_resync_ldap_service_account():
         # Gate strictly on final_verdict='ok' so we never restart into a still-
         # broken state.
         if healing_performed and final_verdict == 'ok' and not coreconfig_changed:
-            print("Startup migration: LDAP healed on the Authentik side — TAK Server not "
-                  "restarted (its CoreConfig credential was already correct; nothing to reload)")
+            # ops #126 (GH #189): "TAK keeps no such state" is not true — clients that
+            # connected while the bind was failing hold empty groups. The shared helper
+            # acts only if the outpost was restarted under a TAK that had been up 5+ min
+            # (never at box boot, the GH #83 case), after LDAP has settled, and leaves it
+            # to the end of a running console update. It heals those clients without a
+            # TAK restart; restart is only its fallback.
+            print("Startup migration: LDAP healed on the Authentik side (CoreConfig credential "
+                  "already correct) — checking whether TAK Server ran through the outage")
+            _tak_recycle_after_ldap_outage(lambda m: print(f"Startup migration:{m}", flush=True),
+                                           'boot LDAP service-account heal', check_outpost=True)
         elif (coreconfig_changed
                 and final_verdict == 'ok'
                 and os.path.exists('/opt/tak/CoreConfig.xml')):
@@ -87605,12 +91345,22 @@ def _startup_migrations():
 
         # Harden existing WebODM installs: patch compose port bindings + UFW deny
         # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
-        _wo_compose = os.path.expanduser('~/webodm/docker-compose.yml')
-        if os.path.exists(_wo_compose):
+        # ops #92 / #101 W5: a box flipped from root keeps WebODM in /root/webodm, which the
+        # console can't read or stat — resolve it with _webodm_dir() and go through the broker
+        # there, or the flipped box is skipped and keeps EOL redis until someone presses Update.
+        _wo_dir = _webodm_dir()
+        # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
+        _wo_priv = (_wo_dir == '/root/webodm'
+                    and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
+        _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
+        if _wo_priv or os.path.exists(_wo_compose):
             try:
                 import re as _re_wo
-                with open(_wo_compose) as _f:
-                    _wo_txt = _f.read()
+                if _wo_priv:
+                    _wo_txt = _read_priv(_wo_compose)
+                else:
+                    with open(_wo_compose) as _f:
+                        _wo_txt = _f.read()
                 # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
                 _wo_patched = _re_wo.sub(
                     r'- "(\d+):8000"',
@@ -87644,33 +91394,53 @@ def _startup_migrations():
                 _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
                 if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
                     _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
-                    _wo_nodeodm_block = (
-                        '  wo_nodeodm:\n'
-                        '    image: webodm/nodeodx\n'
-                        '    container_name: wo_nodeodm\n'
-                        f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
-                        f'    cpus: {_wo_cpus}\n'
-                        f'    mem_limit: {_wo_mem}g\n'
-                        '    restart: unless-stopped\n'
-                        '    oom_score_adj: 250\n'
-                    )
+
+                    def _wo_nodeodm_block(_m):
+                        # Keep the image the box already runs: moving NodeODX to the pin is a
+                        # large pull, so it happens on Update/redeploy, not on a console restart.
+                        _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
+                        return (
+                            '  wo_nodeodm:\n'
+                            f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
+                            '    container_name: wo_nodeodm\n'
+                            f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                            f'    cpus: {_wo_cpus}\n'
+                            f'    mem_limit: {_wo_mem}g\n'
+                            '    restart: unless-stopped\n'
+                            '    oom_score_adj: 250\n'
+                        )
                     _wo_before_cap = _wo_patched
                     _wo_patched = _re_wo.sub(
                         r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
-                        lambda _m: _wo_nodeodm_block,
+                        _wo_nodeodm_block,
                         _wo_patched,
                         count=1,
                     )
                     _wo_cap_changed = (_wo_patched != _wo_before_cap)
+                # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
+                # restart — a small image, and only wo_broker is recreated. The WebODM images
+                # move to their pins on Update/redeploy (large pulls + DB migrations).
+                _wo_before_redis = _wo_patched
+                _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
+                _wo_redis_changed = (_wo_patched != _wo_before_redis)
                 if _wo_patched != _wo_txt:
-                    with open(_wo_compose, 'w') as _f:
-                        _f.write(_wo_patched)
-                    print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    if _wo_priv:
+                        _write_priv(_wo_compose, _wo_patched)
+                    else:
+                        with open(_wo_compose, 'w') as _f:
+                            _f.write(_wo_patched)
+                    print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
                     if _wo_cap_changed:
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
-                    import subprocess as _sp_wo
-                    _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
-                               capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
+                    if _wo_redis_changed:
+                        print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
+                    if _wo_priv:
+                        # root's dir: no cwd into /root, so compose runs via the broker
+                        _webodm_compose(_wo_dir, 'up -d', timeout=120)
+                    else:
+                        import subprocess as _sp_wo
+                        _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                                   capture_output=True, timeout=120, cwd=_wo_dir)
             except Exception as _wo_e:
                 print(f"Startup migration: webodm compose harden warning: {_wo_e}")
         # UFW deny belt-and-braces for WebODM ports
@@ -87913,9 +91683,10 @@ def _startup_migrations():
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
 
-        # v0.9.55: Fleet-uniform login/MFA copy — replace the stock "Welcome to authentik!" /
-        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Idempotent no-op
-        # once applied; gated on Authentik being present + reachable.
+        # v0.9.55: login/MFA copy — replace the stock "Welcome to authentik!" /
+        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Seeded once
+        # (#151: re-applying it every boot reverted operator edits daily); gated on
+        # Authentik being present + reachable.
         try:
             if os.path.exists(os.path.expanduser('~/authentik/.env')):
                 _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
@@ -88022,6 +91793,14 @@ def _startup_migrations():
             _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_wd_err:
             print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
+
+        # v10.2.21: the install step above only writes the PgBouncer image when it first
+        # adds the service, so existing boxes never left v1.25.1-p0. Converge them onto
+        # _AUTHENTIK_PGBOUNCER_IMAGE (PgBouncer security fixes); recreates pgbouncer only.
+        try:
+            _ensure_authentik_pgbouncer_image(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_img_err:
+            print(f"Startup migration: pgbouncer image error (non-fatal): {ak_pgb_img_err}")
 
         # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
         # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
@@ -88234,6 +92013,7 @@ def _startup_migrations():
         # rebuild that raced the non-root flip's Authentik re-home (test6/test8 hit this:
         # 'Missing AUTHENTIK_TOKEN in settings.json'). Re-pushes a valid token now that the
         # .env is readable. Idempotent: skips when the token is already present.
+        # v10.2.18 (ops #71): also heals TAK Portal template placeholders left by GH #158.
         try:
             _heal_takportal_authentik_token(
                 lambda m: print(f"Startup migration: {m}", flush=True)
@@ -88296,6 +92076,16 @@ def _startup_migrations():
             )
         except Exception as _ui_err:
             print(f"Startup migration: CoreConfig updateinterval error (non-fatal): {_ui_err}")
+
+        # ops #64 — same for <ldap enableConnectionPool>: without it TAK binds to LDAP for
+        # every API call, and an outpost session expiry turns a busy minute into a login-flow
+        # herd. Absent-only, idempotent, never restarts TAK Server.
+        try:
+            _heal_coreconfig_ldap_connection_pool(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _cp_err:
+            print(f"Startup migration: CoreConfig LDAP connection-pool error (non-fatal): {_cp_err}")
 
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
@@ -88453,6 +92243,11 @@ def _startup_migrations():
             _tak_sync_admin_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _gce:
             print(f"Startup migration: TAK group-cache sync error (non-fatal): {_gce}", flush=True)
+        # ops #127: and the CloudTAK bootstrap cert's, so Core Events reach every channel.
+        try:
+            _tak_sync_bootstrap_group_cache(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _bce:
+            print(f"Startup migration: bootstrap cert group-cache sync error (non-fatal): {_bce}", flush=True)
 
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
@@ -88486,7 +92281,7 @@ def _startup_migrations():
         # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
         try:
             _start_takportal_mapsync_watchdog()
-            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+            print("Startup: TAK Portal map-channel watchdog started (channel check 1 min, full sync 10 min)", flush=True)
         except Exception as _mwe:
             print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
@@ -88558,6 +92353,11 @@ def _startup_migrations():
             _startup_caddy_stream_close_delay_converge()
         except Exception as _scd_err:
             print(f"Startup migration: stream_close_delay converge error (non-fatal): {_scd_err}",
+                  flush=True)
+        try:
+            _startup_caddy_read_body_idle_converge()
+        except Exception as _rbi_err:
+            print(f"Startup migration: read_body_idle converge error (non-fatal): {_rbi_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
@@ -88856,6 +92656,18 @@ def _post_update_auto_deploy():
                         print(f"Post-update (same-version): webadmin role re-assert error (non-fatal): {_wre}", flush=True)
             except Exception as _shce:
                 print(f"Post-update (same-version): compose self-heal error (non-fatal): {_shce}", flush=True)
+
+            # ops #126: no update run follows, so carry out a pending TAK client heal request
+            # here (e.g. a PgBouncer swap the startup migrations retried, or one an earlier run
+            # couldn't finish). Pending only — a plain console restart never touches TAK on
+            # its own. Background: it waits for LDAP (and TAK's ports, if it falls back to a
+            # restart).
+            if (load_settings().get('tak_ldap_recycle') or {}).get('pending'):
+                threading.Thread(
+                    target=lambda: _tak_recycle_after_ldap_outage(
+                        lambda m: print(f"Post-update (same-version):{m}", flush=True),
+                        'console start', check_outpost=False, final=True),
+                    daemon=True, name='tak-ldap-recycle').start()
 
             # v0.9.24 Item 2 (lock itself now cleared at startup above): a lock
             # present on a same-version restart means the previous deploy was
@@ -89296,6 +93108,9 @@ def _post_update_auto_deploy():
                                 if ok:
                                     _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
                                     print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
+                                    # ops #110: the override may have moved postgis to POSTGIS_IMAGE.
+                                    _cloudtak_postgis_extensions_upgrade(
+                                        plog=lambda m: print(f"Post-update:{m}"), remote_cfg=remote_cfg)
                                 else:
                                     print("Post-update: could not SCP CloudTAK override to remote")
                             finally:
@@ -89346,9 +93161,16 @@ def _post_update_auto_deploy():
                         # Phase 2 hardening — pin image (drop :latest), add cap_drop / no-new-privileges /
                         # mem_limit / user / restart / env_file. Idempotent string-level patches that
                         # respect any operator overrides already in place.
-                        if 'image: nodered/node-red:latest' in content:
-                            content = content.replace('image: nodered/node-red:latest', 'image: nodered/node-red:4.0')
-                            print("Post-update: Node-RED image pinned to 4.0 (was :latest)")
+                        # Every box converges on NODERED_IMAGE (the same tag a Redeploy
+                        # writes) — :latest, the old 4.0 pin, or any other tag.
+                        _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
+                        _nr_img_changed = bool(_nr_img_m) and \
+                            _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
+                        if _nr_img_changed:
+                            content = _NODERED_IMAGE_LINE_RE.sub(
+                                lambda m: m.group(1) + NODERED_IMAGE, content, count=1)
+                            print(f"Post-update: Node-RED image → {NODERED_IMAGE} "
+                                  f"(was {_nr_img_m.group(0).strip()[len('image:'):].strip()})")
                         if 'restart:' not in content and 'container_name: nodered' in content:
                             content = content.replace(
                                 'container_name: nodered\n',
@@ -89395,6 +93217,14 @@ def _post_update_auto_deploy():
                                     print("Post-update: Node-RED .env file created (empty scaffold)")
                                 except Exception as ee:
                                     print(f"Post-update: Node-RED .env create warning: {ee}")
+                            if _nr_img_changed:
+                                # Pull on its own budget first: `up -d`'s 120 s cannot fit a
+                                # ~200 MB download on a slow link (see _docker_compose_pull).
+                                # On failure `up -d` below retries the pull and, if that fails
+                                # too, leaves the running container alone.
+                                if not _docker_compose_pull(None, nr_dir, lambda m: print(f"Post-update: {m}"),
+                                                            label='Node-RED image'):
+                                    print("Post-update: Node-RED image pull failed — Update Now again retries it")
                             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=nr_dir, capture_output=True, text=True, timeout=120)
                             print("Post-update: Node-RED recreated (compose patch)")
                         _nodered_malware_scan()
@@ -89592,7 +93422,21 @@ def _post_update_auto_deploy():
                                 for _orphan_pid in (_old_pg_pids & _surviving):
                                     subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
                                     print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
-                        if _ak != _ak_orig:
+                        # ops #123: recreate only when the compose MEANS something different.
+                        # A formatting-only diff (v10.2.22's width=200 dump re-wrapped long
+                        # lines) recreated worker/server/ldap on every updating box: each LDAP
+                        # outage was followed by seconds of memberOf=0, and TAK users who
+                        # reconnected then got no groups. The normalized text is still written.
+                        _ak_recreate = _ak != _ak_orig
+                        if _ak_recreate:
+                            try:
+                                import yaml as _yaml_cmp
+                                if _yaml_cmp.safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig):
+                                    _ak_recreate = False
+                                    print("Post-update: Authentik compose — formatting-only change, no container recreate")
+                            except Exception:
+                                pass
+                        if _ak_recreate:
                             print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
                             # ops #30: LDAP after the server is healthy, never in the same
                             # `up` (an outpost that starts against the old server panics
@@ -90007,9 +93851,39 @@ def _post_update_auto_deploy():
                 except Exception as _rake:
                     print(f"Post-update: remote Authentik hardening error (non-fatal): {_rake}")
 
+            def _auto_nodered_image_remote():
+                """Move a remote Node-RED onto NODERED_IMAGE, same as _auto_nodered does
+                locally. No-op unless Node-RED is deployed remote, and no recreate when
+                the remote compose is already on the pin."""
+                try:
+                    _nr_cfg = _get_module_deployment_config(load_settings(), 'nodered_deployment')
+                    if not _nr_cfg or _nr_cfg.get('target_mode') != 'remote':
+                        return
+                    if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
+                        return
+                    _cmd = (
+                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+                        'docker compose pull --quiet 2>&1 && '
+                        'docker compose up -d 2>&1'
+                    )
+                    print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
+                    _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
+                    for _line in (_out or '').strip().splitlines()[:10]:
+                        print(f"  remote-nr: {_line}")
+                    if not _ok:
+                        print("Post-update: remote Node-RED image move failed (non-fatal) — Update Now again retries it")
+                except Exception as _rnre:
+                    print(f"Post-update: remote Node-RED image error (non-fatal): {_rnre}")
+
             _auto_authentik_ports()
             _auto_authentik_ports_remote()
             _auto_nodered()
+            _auto_nodered_image_remote()
             _auto_harden_containers()
 
             # v0.9.25 hotfix: synchronous webadmin role re-assert after the YAML
@@ -90644,6 +94518,18 @@ def _post_update_auto_deploy():
             except Exception as _se:
                 print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
 
+            # ops #126 (GH #189): LAST, after every step above that can restart or recreate
+            # Authentik / the LDAP outpost: if TAK Server ran through an LDAP outage (a
+            # step requested it, or the outpost restarted under TAK — including before this
+            # update, the one-time catch-up for boxes already on v10.2.23), heal TAK's clients
+            # once LDAP is settled: clients that connected during the outage hold empty groups
+            # until they are looked up again. TAK restart only as the fallback.
+            try:
+                _tak_recycle_after_ldap_outage(lambda m: print(f"Post-update:{m}", flush=True),
+                                               'end of console update', check_outpost=True, final=True)
+            except Exception as _tre:
+                print(f"Post-update: TAK LDAP recycle error (non-fatal): {_tre}", flush=True)
+
             print("Post-update: auto-deploy complete")
 
         def _run_post_update_guarded():
@@ -91097,6 +94983,9 @@ try:
         try:
             if os.path.isfile(os.path.expanduser('~/CloudTAK/.env')):
                 _cloudtak_sync_postgis_password(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
+                # ops #110: the startup override refresh just moved postgis to POSTGIS_IMAGE
+                # (console Update) — update the PostGIS extensions to match. No-op after.
+                _cloudtak_postgis_extensions_upgrade(plog=lambda m: print(f"[startup-postgis]{m}", flush=True))
         except Exception:
             pass
     _threading_pgsync.Thread(target=_startup_postgis_sync, daemon=True, name='cloudtak-postgis-sync').start()
@@ -91276,10 +95165,9 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
-    # ATLAS MDM needs these two Authentik helpers, which this file
+    # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
-    '_authentik_application_open_in_new_tab': _authentik_application_open_in_new_tab,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at

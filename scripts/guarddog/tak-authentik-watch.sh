@@ -4,7 +4,8 @@
 # - HTTP failure × 3 → restart server+worker; a second escalation within 6h → full down + up -d
 # - HTTP failure while the host is CPU-starved → hold and alert, do not restart (GH #111)
 # - LDAP failure × 3 → targeted LDAP recreate (doesn't nuke the whole stack)
-# - LDAP flow herd that does not drain (8 of the last 10 min busy) → same restart as HTTP (ops #38)
+# - LDAP flow herd that does not drain (8 of the last 10 min busy) → same restart as HTTP (ops #38),
+#   held while it is clearly falling from its peak (ops #64)
 # - 10-min boot grace period; HTTP cooldown 15 min, doubling per restart in the last 6h (max 2h).
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -281,17 +282,42 @@ _ak_restart() {
 # 0.5 s → 28 s, 750 flows per 10 min, health check 7 s, and nothing here noticed —
 # HTTP answered inside 30 s and port 389 stayed open. A server+worker restart cleared
 # it. Healthy boxes show 1–2 busy minutes an hour; the stuck herd shows every minute.
+#
+# ops #64: a herd that is DRAINING must be left alone. test12, 2026-10-16: an expiry
+# that met a 2,200-request Node-RED poll ran 149/237/225/192 flows a minute, then fell
+# 96, 40, 58, 15, 14 on its own; 8 busy minutes tripped the restart at the tail, and the
+# restart itself cost a 90 s LDAP group outage and a second herd (178/215/130). So the
+# rule also looks at the trend: if the last HERD_TAIL_MIN complete minutes together ran
+# no more flows than the peak minute alone (their average is a third of the peak or
+# less), the backlog is clearing and we hold. The hold ends by itself: once the peak
+# slides out of the window, a herd still running at the lower rate is judged against
+# its own level and restarted, so a draining verdict buys at most HERD_WINDOW_MIN.
 HERD_WINDOW_MIN=10
 HERD_PER_MIN=10
 HERD_BUSY_MIN=8
+HERD_TAIL_MIN=3
 
-# Prints how many of the last HERD_WINDOW_MIN minutes ran >= HERD_PER_MIN LDAP flows.
-_ldap_flow_busy_minutes() {
+# Prints "BUSY PEAK TAIL": how many of the last HERD_WINDOW_MIN minutes ran >= HERD_PER_MIN
+# LDAP flows, the busiest minute's count, and the total over the last HERD_TAIL_MIN
+# complete minutes (the current, partial minute is left out; a minute with no flows
+# counts as 0). Minutes are placed by age from now (UTC, as Authentik logs), so a
+# window across midnight still lines up.
+_ldap_flow_herd_stats() {
+  local now_hm
+  now_hm=$(date -u +%H:%M)
   timeout 30 docker logs authentik-server-1 --since "${HERD_WINDOW_MIN}m" 2>&1 \
     | grep 'flows/executor/ldap-authentication-flow' \
     | grep -oE '"timestamp": ?"[0-9-]{10}T[0-9]{2}:[0-9]{2}' \
     | sed -E 's/.*T//' | sort | uniq -c \
-    | awk -v n="$HERD_PER_MIN" '$1 >= n { b++ } END { print b + 0 }'
+    | awk -v n="$HERD_PER_MIN" -v tail="$HERD_TAIL_MIN" -v now="$now_hm" '
+        BEGIN { split(now, t, ":"); now_m = t[1] * 60 + t[2] }
+        {
+          split($2, t, ":"); age = (now_m - (t[1] * 60 + t[2]) + 1440) % 1440
+          if ($1 >= n) b++
+          if ($1 > peak) peak = $1
+          if (age >= 1 && age <= tail) s += $1
+        }
+        END { print b + 0, peak + 0, s + 0 }'
 }
 
 # ── HTTP health check (Authentik server) ──
@@ -469,11 +495,15 @@ if [ "$HTTP_OK" -eq 1 ] && [ "${LDAP_OK:-0}" -eq 1 ]; then
   RECENT=$(_recent_restarts)
   HTTP_COOLDOWN=$(_backoff_secs "$RECENT")
   if _cooldown_ok "$COOLDOWN_HTTP" "$HTTP_COOLDOWN"; then
-    BUSY=$(_ldap_flow_busy_minutes)
-    if [ "${BUSY:-0}" -ge "$HERD_BUSY_MIN" ]; then
+    read -r BUSY PEAK TAIL <<EOF
+$(_ldap_flow_herd_stats)
+EOF
+    if [ "${BUSY:-0}" -ge "$HERD_BUSY_MIN" ] && [ "${TAIL:-0}" -le "${PEAK:-0}" ]; then
+      _log "hold | LDAP flow herd draining (${BUSY} of the last ${HERD_WINDOW_MIN} min ran >= ${HERD_PER_MIN} LDAP flows, but the last ${HERD_TAIL_MIN} min ran ${TAIL} vs a peak of ${PEAK}/min) — NOT restarting"
+    elif [ "${BUSY:-0}" -ge "$HERD_BUSY_MIN" ]; then
       _ak_pick_restart_mode
       NEXT_COOLDOWN=$(_backoff_secs $(( RECENT + 1 )))
-      _log "restart | LDAP flow herd not draining (${BUSY} of the last ${HERD_WINDOW_MIN} min ran >= ${HERD_PER_MIN} LDAP flows) — $MODE restart (restart $(( RECENT + 1 )) in 6h; next allowed after $(( NEXT_COOLDOWN / 60 )) min)"
+      _log "restart | LDAP flow herd not draining (${BUSY} of the last ${HERD_WINDOW_MIN} min ran >= ${HERD_PER_MIN} LDAP flows; the last ${HERD_TAIL_MIN} min ran ${TAIL} vs a peak of ${PEAK}/min) — $MODE restart (restart $(( RECENT + 1 )) in 6h; next allowed after $(( NEXT_COOLDOWN / 60 )) min)"
       _alert "Guard Dog: Authentik LDAP logins backed up, restarted on $SERVER_IDENTIFIER" \
 "Authentik's LDAP login flow has been running non-stop: ${BUSY} of the last ${HERD_WINDOW_MIN} minutes each ran ${HERD_PER_MIN} or more LDAP flows (a healthy box runs a short burst about once an hour).
 

@@ -158,7 +158,7 @@ If you have a **TAK Server VM runbook** (disk full, Docker container logs, Postg
 | **CoT DB size / retention** | Yes — **CoT database size** monitor (alert at 25 GB / 40 GB); VACUUM via TAK Server page | — |
 | **OOM in TAK logs** | Yes — **OOM** monitor (scans logs, restart + alert) | — |
 | **Authentik / Node-RED / MediaMTX / CloudTAK down** | Yes — **Authentik**: **`/-/health/live/`** or **`/`**, with a **3s** retry before a failed check counts; **Node-RED / MediaMTX / CloudTAK**: unchanged. All: alert + restart after **3** failures when installed | — |
-| **Journal / APT / Docker build cache** | No | One-time or periodic: journald limit, `apt-get clean`, `docker builder prune`; see runbook or DISK-AND-LOGS.md |
+| **Journal / Docker build cache / old images** | Yes — **Docker build-cache reclaim** (hourly): caps journald at 500 MB; at 70% root prunes build cache older than 7 days; at 80% prunes all unused build cache, images no container uses, and vacuums the journal. Never volumes or images in use | APT cache: `apt-get clean` / `dnf clean all` by hand |
 
 **Do Guard Dog monitors “just have to run”?** Yes. Once Guard Dog is **deployed**, systemd **timers** run the watch scripts on a schedule (every 1 min, 5 min, 1 hr, 6 hr, or daily). You don’t run them by hand; they run automatically. Use the Guard Dog page **Activity log** (or `/var/log/takguard/restarts.log`) to see restarts and alerts.
 

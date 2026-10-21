@@ -3191,21 +3191,42 @@ RECYCLE_AFTER_SECS = 23 * 3600
 RECYCLE_POLL_SECS = 5
 RECYCLE_NOTE_SECS = 3600        # how often a deferred recycle says so in the audit log
 RECYCLE_DRAIN_MAX_SECS = 6 * 3600
+# ops #113: "nothing in flight at this instant" is not idle. The console's privileged calls
+# arrive one after another, each a few ms, so a 5 s poll almost always sees zero in flight
+# — even mid-burst. test6, 2026-10-20 13:14:58Z: the recycle fired between two calls of the
+# post-update Guard Dog timer loop (calls every <1 s), and the console's next calls in the
+# 3.3 s gap failed. So the recycle also waits for RECYCLE_QUIET_SECS with no request at all.
+# 15 s, not more: test6's audit log has a background request every ~30 s all day (no 60 s
+# gap in 36 h), so a longer window would defer the recycle forever. RECYCLE_QUIET_MAX_SECS
+# bounds that anyway — the console waits out a restarting broker now, so a recycle that
+# never finds a quiet window still goes at the next idle moment instead of never.
+RECYCLE_QUIET_SECS = 15
+RECYCLE_QUIET_MAX_SECS = 3600
+# After unlinking the socket, how long the accept loop keeps running so a client that
+# connected just before the unlink is served instead of reset with its request unread.
+RECYCLE_UNLINK_GRACE_SECS = 1
 
 _INFLIGHT = 0
 _INFLIGHT_LOCK = threading.Lock()
+_LAST_ACTIVITY = None           # monotonic time a request last started or finished
 
 
 def _inflight_add(n):
-    global _INFLIGHT
+    global _INFLIGHT, _LAST_ACTIVITY
     with _INFLIGHT_LOCK:
         _INFLIGHT += n
+        _LAST_ACTIVITY = time.monotonic()
         return _INFLIGHT
 
 
 def _inflight():
     with _INFLIGHT_LOCK:
         return _INFLIGHT
+
+
+def _last_activity():
+    with _INFLIGHT_LOCK:
+        return _LAST_ACTIVITY
 
 
 def _recycle_after_secs():
@@ -3221,29 +3242,51 @@ def _recycle_after_secs():
         return RECYCLE_AFTER_SECS
 
 
-def _recycle_watch(srv, after, started, clock=time.monotonic, sleep=time.sleep,
-                   poll=RECYCLE_POLL_SECS, note_every=RECYCLE_NOTE_SECS, log=None):
-    """Stop `srv` once uptime >= `after` AND nothing is in flight. Returns 'idle'.
+def _unlink_socket():
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
 
-    `srv.shutdown()` only stops the accept loop; requests already accepted keep running,
-    and serve() waits for them before it exits — so the in-flight count can only fall
-    after this decides."""
+
+def _recycle_watch(srv, after, started, clock=time.monotonic, sleep=time.sleep,
+                   poll=RECYCLE_POLL_SECS, note_every=RECYCLE_NOTE_SECS, log=None,
+                   quiet=RECYCLE_QUIET_SECS, quiet_max=RECYCLE_QUIET_MAX_SECS,
+                   unlink=None, grace=RECYCLE_UNLINK_GRACE_SECS):
+    """Stop `srv` once uptime >= `after`, nothing is in flight AND no request started or
+    finished in the last `quiet` seconds (or, after `quiet_max` past `after` without such a
+    window, at the first moment nothing is in flight). Returns 'idle'.
+
+    The socket is unlinked first, so a new client waits for the restarted broker (ENOENT)
+    rather than queueing on a socket nobody will accept on; the accept loop keeps running
+    for `grace` to serve anything that connected just before. `srv.shutdown()` only stops
+    the accept loop; requests already accepted keep running, and serve() waits for them
+    before it exits — so the in-flight count can only fall after this decides."""
     log = log or (lambda summary: AUDIT and AUDIT.info(json.dumps(
         {'op': 'recycle', 'verdict': 'INFO', 'summary': summary})))
     last_note = None
     while True:
         sleep(poll)
-        up = clock() - started
+        now = clock()
+        up = now - started
         if up < after:
             continue
         n = _inflight()
-        if n == 0:
-            log('recycle: idle after %.1fh uptime — exiting for a clean restart' % (up / 3600.0))
+        last = _last_activity()
+        idle_for = None if last is None else now - last
+        if n == 0 and (idle_for is None or idle_for >= quiet or up - after >= quiet_max):
+            log('recycle: idle after %.1fh uptime (%s) — exiting for a clean restart'
+                % (up / 3600.0, 'no request yet' if idle_for is None
+                   else 'last request %.0fs ago' % idle_for))
+            if unlink:
+                unlink()
+            sleep(grace)
             srv.shutdown()
             return 'idle'
-        now = clock()
         if last_note is None or now - last_note >= note_every:
-            log('recycle deferred: %d request(s) in flight' % n)
+            log('recycle deferred: %d request(s) in flight' % n if n else
+                'recycle deferred: busy (last request %.0fs ago, waiting for %ds quiet)'
+                % (idle_for, quiet))
             last_note = now
 
 
@@ -3341,6 +3384,7 @@ def serve():
                                'summary': 'own unit converge failed: %s' % e}))
     _after = _recycle_after_secs()
     threading.Thread(target=_recycle_watch, args=(srv, _after, time.monotonic()),
+                     kwargs={'unlink': _unlink_socket},
                      daemon=True, name='recycle-watch').start()
     if _after != RECYCLE_AFTER_SECS:
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
@@ -3353,10 +3397,8 @@ def serve():
     finally:
         # Unlink first so a new client fails fast (ENOENT) instead of waiting in the
         # backlog of a socket nobody will accept on; then let accepted work finish.
-        try:
-            os.unlink(SOCKET_PATH)
-        except OSError:
-            pass
+        # (The idle recycle has already unlinked it; this covers every other exit.)
+        _unlink_socket()
         try:
             srv.server_close()
         except OSError:

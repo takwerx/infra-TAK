@@ -643,6 +643,29 @@ docker exec "$CONTAINER" node -e "
   });
   console.log('    Synced ' + nSync + ' function nodes in dynamic engine tabs');
 
+  // ops #64: the DELETE path's delay node. v10.1.25 R1 made it 'Rate limit 1/s', but delay
+  // nodes are not template-synced, so every tab created before that still has a fixed 1s
+  // delay that fires all of a poll's DELETEs at once (test12 2026-10-15: up to 3,100 TAK
+  // calls in a burst, each an LDAP lookup -> Authentik login herd). Find it by wiring —
+  // the delay node on the reconcile function's second output — and convert it in place.
+  // Only the pacing fields change; id, wires and position are kept.
+  var byId = {};
+  preserved.forEach(function(n) { byId[n.id] = n; });
+  var nRate = 0;
+  preserved.forEach(function(n) {
+    if (n.type !== 'function') return;
+    if (n._templateKey !== 'arcgis.reconcile' && n._templateKey !== 'tfr.reconcile') return;
+    ((n.wires || [])[1] || []).forEach(function(tid) {
+      var d = byId[tid];
+      if (!d || d.type !== 'delay' || d.pauseType === 'rate') return;
+      d.name = 'Rate limit 1/s'; d.pauseType = 'rate';
+      d.rate = '1'; d.nbRateUnits = '1'; d.rateUnits = 'second';
+      d.drop = false; d.allowrate = false; d.outputs = 1;
+      nRate++;
+    });
+  });
+  if (nRate) console.log('    Converted ' + nRate + ' engine DELETE delay nodes to Rate limit 1/s');
+
   // Load nodes embed the feed name so they can't template-sync — patch the legacy
   // hard-fail serverUrl guard to the host.docker.internal fallback (parity with TC/PP).
   var guardRe = /if \(!tak\.serverUrl\) \{ node\.warn\('[^']*'\); return null; \}/;

@@ -92,6 +92,26 @@ def test_error_line_falls_back_to_the_last_line(h):
 # the record
 # --------------------------------------------------------------------------- #
 
+def test_versions_filled_in_after_start_survive_the_finish(h):
+    # ops #129: the CloudTAK update learns from/to only after it starts — its card said "? -> ?".
+    h['_mod_result_start']('cloudtak', 'update')
+    h['_mod_result_versions']('cloudtak', frm='13.109.3', to='13.111.3')
+    h['_mod_result_finish']('cloudtak', False, '✗ CloudTAK update failed at docker compose up -d: boom')
+    last = json.loads((h['_tmp'] / 'module-results.json').read_text())['cloudtak']['last']
+    assert last['from'] == '13.109.3' and last['to'] == '13.111.3'
+    # only an in-flight record is touched; a finished one is history
+    h['_mod_result_versions']('cloudtak', frm='9.9.9')
+    last = json.loads((h['_tmp'] / 'module-results.json').read_text())['cloudtak']['last']
+    assert last['from'] == '13.109.3'
+
+
+def test_cloudtak_update_records_from_and_to():
+    body = APP[APP.index('def run_cloudtak_update('):]
+    body = body[:body.index('\ndef ', 1)]
+    assert "_mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))" in body
+    assert body.index('_mod_result_versions(') < body.index('Step 2/3')
+
+
 def test_start_step_finish_persist_with_mode_600(h):
     h['_mod_result_start']('authentik', 'update', '2026.5.6', '2026.5.7')
     h['_mod_result_step']('authentik', 'pull + recreate')
@@ -241,9 +261,10 @@ def test_results_api_is_login_required_and_name_checked():
 
 SYNC = {  # route -> module record
     "/api/authentik/control": 'authentik', "/api/netbird/control": 'netbird',
-    "/api/takportal/control": 'takportal', "/api/caddy/update": 'caddy',
-    "/api/guarddog/update": 'guarddog',
+    "/api/caddy/update": 'caddy', "/api/guarddog/update": 'guarddog',
 }
+# TAK Portal's Update became a background job in ops #72; its recorder sits on the job function
+# (tests/test_takportal_update_gateway_timeout.py::test_the_job_is_what_records_the_outcome).
 ASYNC = {  # module record -> the worker it tracks
     'cloudtak': 'run_cloudtak_update', 'fedhub': 'run_fedhub_remote_update',
     'webodm': '_run_webodm_update', 'remote-assist': '_run_remote_assist_update',

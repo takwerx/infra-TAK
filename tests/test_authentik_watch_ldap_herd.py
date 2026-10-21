@@ -58,9 +58,9 @@ def _health_line(ts):
                        'timestamp': ts.strftime('%Y-%m-%dT%H:%M:%S.%f')}, separators=(', ', ': '))
 
 
-def server_log(per_minute):
-    """per_minute: flow counts for the last N minutes, oldest first."""
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+def server_log(per_minute, now=None):
+    """per_minute: flow counts for the last N minutes, oldest first; the last is the current minute."""
+    now = (now or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
     lines = []
     for i, n in enumerate(per_minute):
         minute = now - timedelta(minutes=len(per_minute) - 1 - i)
@@ -100,6 +100,10 @@ def box(tmp_path):
     (stubs / 'sleep').write_text('#!/bin/sh\nexit 0\n')
     (stubs / 'timeout').write_text('#!/bin/sh\nshift\nexec "$@"\n')
     (stubs / 'nproc').write_text('#!/bin/sh\necho 8\n')
+    # Only the herd check's `date -u +%H:%M` is pinned (when a test sets a clock).
+    (stubs / 'date').write_text(
+        '#!/bin/sh\n[ "$*" = "-u +%%H:%%M" ] && [ -f %s ] && exec cat %s\nexec /bin/date "$@"\n'
+        % (tmp_path / 'clock', tmp_path / 'clock'))
     for f in stubs.iterdir():
         f.chmod(0o755)
     (tmp_path / 'running').write_text('postgresql\nredis\nserver\nworker\nldap\n')
@@ -114,8 +118,10 @@ def box(tmp_path):
     sp = tmp_path / 'watch.sh'
     sp.write_text(script)
 
-    def tick(per_minute):
-        (tmp_path / 'server.log').write_text(server_log(per_minute))
+    def tick(per_minute, now=None):
+        (tmp_path / 'server.log').write_text(server_log(per_minute, now))
+        if now:
+            (tmp_path / 'clock').write_text(now.strftime('%H:%M') + '\n')
         if calls.exists():
             calls.unlink()
         env = {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs}
@@ -175,6 +181,59 @@ def test_herd_shares_the_http_restart_backoff(box):
     calls = box(STUCK)
     assert 'docker compose down --timeout 30' in calls   # second in 6h escalates to full, like HTTP
     assert 'restart 2 in 6h; next allowed after 60 min' in box.log()
+
+
+# ops #64: test12 2026-10-16 10:30-10:39 AM PT (17:30-17:39 UTC), flows per minute. An outpost
+# expiry met a 2,200-request POWER-OUTAGES poll; it was falling on its own when the old
+# rule restarted server+worker at 10:39:33, which caused a 90 s LDAP group outage and a
+# second herd. The last minute is the partial 10:39 one.
+DRAINING = [2, 149, 237, 225, 192, 96, 40, 58, 15, 6]
+
+
+def test_draining_herd_at_the_outpost_expiry_is_left_alone(box):
+    calls = box(DRAINING)
+    assert _restarts(calls) == [] and 'alert' not in calls
+    assert 'hold | LDAP flow herd draining (8 of the last 10 min' in box.log()
+    assert 'the last 3 min ran 113 vs a peak of 237/min' in box.log()
+    assert 'restart |' not in box.log()
+
+
+def test_draining_herd_is_left_alone_on_every_tick(box):
+    # Each minute's tick from the expiry through the tail, the current minute half done.
+    minutes = DRAINING[:-1] + [14, 8, 3, 1]
+    for end in range(1, len(minutes) + 1):
+        seen = minutes[max(0, end - 10):end]
+        calls = box(seen[:-1] + [seen[-1] // 2])
+        assert _restarts(calls) == [] and 'alert' not in calls, seen
+    assert 'restart |' not in box.log()
+
+
+def test_sustained_herd_still_restarts(box):
+    calls = box([60] * 10)
+    assert _restarts(calls) == ['docker compose restart -t 30 server worker']
+    assert 'the last 3 min ran 180 vs a peak of 60/min' in box.log()
+
+
+def test_rising_herd_still_restarts(box):
+    calls = box([10, 20, 30, 40, 60, 80, 100, 120, 150, 90])
+    assert _restarts(calls) == ['docker compose restart -t 30 server worker']
+
+
+def test_tail_that_settles_into_its_own_herd_restarts_once_the_peak_slides_out(box):
+    # The draining hold ends by itself: the peak is gone from the window and the herd
+    # never stopped, so it is judged against its own level.
+    calls = box([40, 40, 40, 40, 40, 40, 40, 40, 40, 40])
+    assert _restarts(calls) == ['docker compose restart -t 30 server worker']
+
+
+def test_trend_is_read_by_minute_age_across_midnight(box):
+    now = datetime(2026, 10, 17, 0, 4, 30, tzinfo=timezone.utc)   # window 23:55..00:04
+    calls = box(DRAINING, now=now)
+    assert _restarts(calls) == []
+    assert 'the last 3 min ran 113 vs a peak of 237/min' in box.log()
+    calls = box(STUCK, now=now)
+    assert _restarts(calls) == ['docker compose restart -t 30 server worker']
+    assert 'the last 3 min ran 290 vs a peak of 190/min' in box.log()
 
 
 def test_no_herd_check_while_port_389_is_down(box):

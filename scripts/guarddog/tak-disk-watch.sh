@@ -14,6 +14,9 @@ LOGS_USAGE=$(df /opt/tak/logs 2>/dev/null | awk 'NR==2 {print $5}' | sed 's/%//'
 # recovers WITHIN THE HOUR instead of waiting for the daily 04:30 timer. Riding this
 # already-hourly monitor means the self-heal deploys on a plain pull+restart (no
 # "Update Guard Dog" needed). Re-read usage after so the alert reflects post-reclaim state.
+# GH #165: at ALERT_THRESHOLD the reclaim script also takes all unused build cache,
+# unused images and the journal (its FULL_RECLAIM_PCT must equal ALERT_THRESHOLD), so
+# the run that would raise the warning first frees everything it safely can.
 RECLAIM_TRIGGER_PCT=70
 if [ -n "$ROOT_USAGE" ] && [ "$ROOT_USAGE" -ge "$RECLAIM_TRIGGER_PCT" ] && [ -x /opt/tak-guarddog/tak-buildcache-reclaim.sh ]; then
   /opt/tak-guarddog/tak-buildcache-reclaim.sh >/dev/null 2>&1

@@ -447,7 +447,8 @@ async function rotateIntCA(){
   var nameInput=document.getElementById('rotate-ca-name');
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
-  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected via the old CA in the truststore.\n\nContinue?'))return;
+  if(!/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/.test(newName)){alert('CA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-02).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
+  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected: the old CA and every earlier CA in the truststore stay trusted.\n\nContinue?'))return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
   if(isNaN(validityDays)||validityDays<1)validityDays=730;
@@ -1707,6 +1708,8 @@ async function startDeploy(){
     const asn1ok=/^[A-Za-z0-9 '()+,\-./:=?]*$/;const certFields=[{id:'cert_country',l:'Country'},{id:'cert_state',l:'State'},{id:'cert_city',l:'City'},{id:'cert_org',l:'Organization'},{id:'cert_ou',l:'Org Unit'}];
     const badFields=certFields.filter(f=>{const v=document.getElementById(f.id).value.trim();return v&&!asn1ok.test(v)});
     if(badFields.length>0){alert('Invalid characters in: '+badFields.map(f=>f.l).join(', ')+'\n\nCertificate fields only allow: A-Z, 0-9, spaces, and \' ( ) + , - . / : = ?\n\nNo underscores, @, #, ! or special characters.');badFields.forEach(f=>{const el=document.getElementById(f.id);el.style.borderColor='var(--red)';el.addEventListener('input',()=>el.style.borderColor='',{once:true})});return}
+    const caNameOk=/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/;const badCa=[{id:'root_ca_name',l:'Root CA Name'},{id:'intermediate_ca_name',l:'Intermediate CA Name'}].filter(f=>!caNameOk.test(document.getElementById(f.id).value.trim()));
+    if(badCa.length>0){alert('Invalid '+badCa.map(f=>f.l).join(', ')+'\n\nCA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-01).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');badCa.forEach(f=>{const el=document.getElementById(f.id);el.style.borderColor='var(--red)';el.addEventListener('input',()=>el.style.borderColor='',{once:true})});return}
     const aui=document.getElementById('enable_admin_ui').checked;
     if(aui){const p=document.getElementById('webadmin_password').value;const pc=document.getElementById('webadmin_password_confirm').value;if(!p){alert('Please set a webadmin password.');return}if(p!==pc){alert('Passwords do not match.');return}if(!validatePassword()){alert('Password does not meet requirements.');return}}
     const btn=document.getElementById('deploy-btn');btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.6';btn.style.cursor='not-allowed';

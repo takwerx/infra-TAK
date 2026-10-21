@@ -68,7 +68,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="help-card" id="diag-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Diagnostics — send us a report</h2><span class="help-card-toggle" style="transform:rotate(180deg)">&#9662;</span></div>
 <div class="help-card-body" style="display:block">
-<p>Something not working? Run diagnostics and send the report to support. It looks at this server — versions, connectivity, containers, Authentik and LDAP, TAK Server clients, logs and database, recent package installs and OS updates, Email Relay — and <strong>changes nothing</strong>. Passwords, tokens and keys are removed from the report; it does contain hostnames, IP addresses, usernames and log lines.</p>
+<p>Something not working? Run diagnostics and send the report to support. It looks at this server — versions, connectivity, containers, Authentik and LDAP, TAK Server clients, logs and database, recent package installs and OS updates, Email Relay — and <strong>changes nothing</strong>. Passwords, tokens and keys are removed from the report; it does contain hostnames, IP addresses, usernames and log lines. <b>Email it to takwerx@gmail.com; don't attach it to a public GitHub issue.</b></p>
 <button type="button" class="btn btn-primary" id="diag-run">Run diagnostics</button>
 <span id="diag-status" style="margin-left:12px;font-size:12px;color:var(--text-dim)"></span>
 <pre id="diag-report" hidden style="margin-top:14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word"></pre>

@@ -35,6 +35,27 @@
 #   - The probe's and the restart's real output are logged. "ssh connect/auth failed"
 #     was also what a key restricted to a forced command produced — it connects fine,
 #     it just runs something else — so the log said nothing about why.
+#
+# v10.2.19 (ops #74 — a split box logged "mgmt channel degraded — pg_isready rc=1" every
+# 2 min for days, 3,900+ lines, while TAK Server had 107 clients on that very database and
+# the same probe's `sudo -u postgres psql` passed):
+#   - pg_isready ran with NO -h/-p, so it asked whatever the SSH user's defaults point at
+#     (default socket, PGHOST/PGPORT in its environment, pg_wrapper's per-user cluster
+#     choice) — not the database TAK uses. rc 1 means a server answered "cannot connect
+#     now" (starting up / in recovery): some other cluster. It now asks DB_HOST:DB_PORT,
+#     the endpoint TAK Server connects to, and falls back to the local socket on DB_PORT
+#     (for a DB_HOST that does not route back to itself). Its output is logged.
+#   - restarts.log gets a line when something changes or an alert goes out, not every run.
+#     The email was already capped hourly → daily; the log line was not.
+#
+# v10.2.25 (ops #132 — a split box's Server One logged `FATAL: no pg_hba.conf entry for
+# host "<its own IP>", user "root", database "root"` on every run):
+#   - pg_isready ran as the SSH user, so it connected as a ROLE of that name. There is no
+#     such role and no pg_hba line for it, and the server logs every refused connection.
+#     It now asks first as the postgres OS user over the local socket on DB_PORT (peer
+#     auth: it authenticates, so nothing is logged). Only when that is not "up" does it
+#     also ask DB_HOST:DB_PORT, and, if this SSH user cannot sudo to postgres, the local
+#     socket as itself, as before. Same livelier-answer rule.
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
@@ -51,6 +72,7 @@ STATE_FILE="/var/lib/takguard/remotedb_state"                     # last state (
 STATE_SINCE_FILE="/var/lib/takguard/remotedb_state_since"         # epoch current state began
 DB_RESTART_COUNT_FILE="/var/lib/takguard/remotedb_restart_count_24h"
 DB_RESTART_WINDOW_FILE="/var/lib/takguard/remotedb_restart_window"
+LOGGED_FILE="/var/lib/takguard/remotedb_last_logged"              # restarts.log dedupe
 MAX_DAILY_DB_RESTARTS=3
 mkdir -p /var/lib/takguard /var/log/takguard
 
@@ -76,10 +98,26 @@ fi
 SSH_MGMT_OK=true
 SSH_DETAIL=""
 PR=""   # pg_isready rc ON Server One: 0 up, 1 rejecting (starting), 2 no response, 3 no attempt
+PG_OUT=""
 if [ "$EXTERNAL_DB" != "true" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
+  # Ask the cluster on DB_PORT as postgres over the local socket (silent in the server log);
+  # if that is not up, ask the endpoint TAK uses (DB_HOST:DB_PORT), and without sudo to
+  # postgres also the local socket as this user. Keep the livelier answer
+  # (0 up > 1 rejecting > 2 no response). A sudo refusal is not a pg_isready answer.
   PROBE=$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
-    'PR=127; command -v pg_isready >/dev/null 2>&1 && { pg_isready -q; PR=$?; }; \
-     sudo -n -u postgres psql -lqt >/dev/null 2>&1; SU=$?; echo "SSHOK PR=$PR SU=$SU"' 2>&1)
+    "H=$(printf '%q' "$DB_HOST"); P=$(printf '%q' "$DB_PORT"); "'PR=127; PO=""; AS_PG=""; \
+     pick() { if [ "$PR" = 127 ] || [ "$2" = 0 ] || { [ "$2" = 1 ] && [ "$PR" != 1 ]; }; then PR=$2; PO=$1; \
+              else PO="$PO / $1"; fi; }; \
+     PGI=$(command -v pg_isready 2>/dev/null); \
+     if [ -n "$PGI" ]; then \
+       O=$(sudo -n -u postgres "$PGI" -p "$P" 2>&1); R=$?; \
+       case "$O" in *" - accepting"*|*" - rejecting"*|*" - no response"*|*" - no attempt"*) \
+         AS_PG=1; pick "$O" "$R" ;; esac; \
+       if [ "$PR" != 0 ]; then O=$("$PGI" -h "$H" -p "$P" 2>&1); pick "$O" "$?"; fi; \
+       if [ "$PR" != 0 ] && [ -z "$AS_PG" ]; then O=$("$PGI" -p "$P" 2>&1); pick "$O" "$?"; fi; \
+     fi; \
+     sudo -n -u postgres psql -lqt >/dev/null 2>&1; SU=$?; echo "SSHOK PR=$PR SU=$SU"; \
+     echo "PGOUT $PO" | tr "\n" " "' 2>&1)
   SSH_RC=$?
   if ! printf '%s' "$PROBE" | grep -q "SSHOK"; then
     SSH_MGMT_OK=false
@@ -92,10 +130,12 @@ if [ "$EXTERNAL_DB" != "true" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; then
       SSH_DETAIL="ssh connected but the probe did not run (rc $SSH_RC; is this key restricted to a forced command on Server One?): ${PROBE_OUT:-no output}"
     fi
   else
-    PR=$(printf '%s' "$PROBE" | sed -n 's/.*PR=\([0-9]*\).*/\1/p')
-    SU=$(printf '%s' "$PROBE" | sed -n 's/.*SU=\([0-9]*\).*/\1/p')
+    OKLINE=$(printf '%s\n' "$PROBE" | grep -m1 "SSHOK")
+    PR=$(printf '%s' "$OKLINE" | sed -n 's/.*PR=\([0-9]*\).*/\1/p')
+    SU=$(printf '%s' "$OKLINE" | sed -n 's/.*SU=\([0-9]*\).*/\1/p')
+    PG_OUT=$(printf '%s\n' "$PROBE" | sed -n 's/^PGOUT //p' | head -1 | sed 's/ *$//' | cut -c1-200)
     [ "$PR" = "127" ] && { SSH_MGMT_OK=false; SSH_DETAIL="pg_isready not found in PATH on Server One"; }
-    [ "$PR" != "0" ] && [ "$PR" != "127" ] && { SSH_MGMT_OK=false; SSH_DETAIL="pg_isready rc=$PR"; }
+    [ "$PR" != "0" ] && [ "$PR" != "127" ] && { SSH_MGMT_OK=false; SSH_DETAIL="pg_isready rc=$PR on $DB_HOST:$DB_PORT (${PG_OUT:-no output})"; }
     [ "$SU" != "0" ] && { SSH_MGMT_OK=false; SSH_DETAIL="${SSH_DETAIL:+$SSH_DETAIL; }sudo -n -u postgres psql rc=$SU (needs NOPASSWD sudo for the GD user)"; }
   fi
 fi
@@ -109,9 +149,12 @@ else
   STATE="mgmt_degraded"    # DB reachable, SSH management probe failing
 fi
 
-# Healthy → clear every state file and exit
+# Healthy → clear every state file and exit (one "healthy again" line if a problem was logged)
 if [ "$STATE" = "healthy" ]; then
-  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE" "$STATE_FILE" "$STATE_SINCE_FILE"
+  if [ -f "$LOGGED_FILE" ]; then
+    echo "$(date): remote DB ($DB_HOST) checks healthy again (was: $(cat "$LOGGED_FILE"))" >> /var/log/takguard/restarts.log
+  fi
+  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE" "$STATE_FILE" "$STATE_SINCE_FILE" "$LOGGED_FILE"
   exit 0
 fi
 
@@ -127,6 +170,18 @@ STATE_SINCE=$NOW; [ -f "$STATE_SINCE_FILE" ] && STATE_SINCE=$(cat "$STATE_SINCE_
 DEDUPE_MIN=60
 [ $((NOW - STATE_SINCE)) -ge 86400 ] && DEDUPE_MIN=1440
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# restarts.log line for a non-healthy run: written when the situation changes (new state,
+# new failing leg, new outcome), when $3=always (a restart was attempted), or once per
+# alert window (hourly, daily after 24 h). Not every 2-minute run: that was 3,900+ lines.
+log_event() {  # $1=line  $2=what (what changed is judged on this)  $3=always|""
+  if [ "$3" != "always" ] && [ -f "$LOGGED_FILE" ] && [ "$(cat "$LOGGED_FILE")" = "$2" ] \
+     && [ -z "$(find "$LOGGED_FILE" -mmin +"$DEDUPE_MIN" 2>/dev/null)" ]; then
+    return 0
+  fi
+  echo "$(date): $1" >> /var/log/takguard/restarts.log
+  printf '%s\n' "$2" > "$LOGGED_FILE"
+}
 
 send_alert() {  # $1=subject  $2=body  $3=dedupe_file
   if [ -f "$3" ] && [ -z "$(find "$3" -mmin +"$DEDUPE_MIN" 2>/dev/null)" ]; then return 0; fi
@@ -153,7 +208,7 @@ This is a MONITORING/ACCESS issue on Guard Dog's SSH health check — NOT a data
 outage. No restart was attempted and none is needed.
 
 Reproduce from this server:
-  ssh ${SSH_USER}@${DB_HOST} 'pg_isready; sudo -n -u postgres psql -lqt'
+  ssh ${SSH_USER}@${DB_HOST} 'sudo -n -u postgres pg_isready -p $DB_PORT; pg_isready -h $DB_HOST -p $DB_PORT; sudo -n -u postgres psql -lqt'
 
 Fix on Server One ($DB_HOST): ensure the Guard Dog SSH user ($SSH_USER) has
 pg_isready in PATH and passwordless sudo for the postgres user, e.g.:
@@ -162,7 +217,7 @@ pg_isready in PATH and passwordless sudo for the postgres user, e.g.:
 (This alert backs off to daily after 24h of the same state.)
 "
   send_alert "$SUBJ" "$BODY" "$DEGRADED_SENT_FILE"
-  echo "$(date): mgmt channel degraded (DB reachable) — $SSH_DETAIL — no restart" >> /var/log/takguard/restarts.log
+  log_event "mgmt channel degraded (DB reachable) — $SSH_DETAIL — no restart" "mgmt channel degraded: $SSH_DETAIL"
   exit 0
 fi
 
@@ -267,7 +322,7 @@ Check from this server:
   timeout 5 bash -c '</dev/tcp/$DB_HOST/$DB_PORT' && echo OPEN || echo CLOSED
 
 Check on Server One ($DB_HOST):
-  pg_isready
+  pg_isready -h $DB_HOST -p $DB_PORT
   sudo pg_ctlcluster 15 main status
   sudo -u postgres psql -lqt
 
@@ -278,13 +333,13 @@ fi
 send_alert "$SUBJ" "$BODY" "$ALERT_SENT_FILE"
 case "$OUTCOME" in
   external)
-    echo "$(date): Managed DB ($DB_HOST) unreachable (TCP closed) — no auto-restart (external provider)" ;;
+    log_event "Managed DB ($DB_HOST) unreachable (TCP closed) — no auto-restart (external provider)" "db down: external" ;;
   restarted)
-    echo "$(date): Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restarted successfully via SSH" ;;
+    log_event "Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restarted successfully via SSH" "db down: restarted" always ;;
   restart_failed)
-    echo "$(date): Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restart FAILED — ${RESTART_OUT:-no output}" ;;
+    log_event "Remote DB ($DB_HOST) TCP down, PostgreSQL confirmed down on Server One, restart FAILED — ${RESTART_OUT:-no output}" "db down: restart failed" always ;;
   capped)
-    echo "$(date): Remote DB ($DB_HOST) confirmed down but daily restart cap ($MAX_DAILY_DB_RESTARTS) reached — manual intervention required" ;;
+    log_event "Remote DB ($DB_HOST) confirmed down but daily restart cap ($MAX_DAILY_DB_RESTARTS) reached — manual intervention required" "db down: capped" ;;
   *)
-    echo "$(date): Remote DB ($DB_HOST) TCP down — NOT restarted, state not confirmed on Server One: $WHY" ;;
-esac >> /var/log/takguard/restarts.log
+    log_event "Remote DB ($DB_HOST) TCP down — NOT restarted, state not confirmed on Server One: $WHY" "db down: not restarted: $WHY" ;;
+esac

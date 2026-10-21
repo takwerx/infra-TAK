@@ -52,16 +52,17 @@ body:
         3.
     validations:
       required: false
-  - type: textarea
-    id: diagnostics
+  - type: markdown
     attributes:
-      label: Diagnostics report
-      description: |
-        In the console: **Help → Diagnostics → Run diagnostics → Download report**, then drag
-        the file into this box. It changes nothing on your server and removes passwords, tokens
-        and keys. It usually answers our first round of questions, so please attach it.
-    validations:
-      required: false
+      value: |
+        ### Diagnostics report: email it, don't attach it here
+        **This repository is public.** The diagnostics report has passwords, tokens and keys
+        removed, but it still contains your server's hostnames, IP addresses, usernames and log
+        lines. Please **do not attach it to this issue.**
+
+        Instead, in the console go to **Help → Diagnostics → Run diagnostics**, then either
+        **Email report** to **takwerx@gmail.com**, or **Download report** and email the file there.
+        Put this issue's number in the subject. It usually answers our first round of questions.
   - type: textarea
     id: logs
     attributes:

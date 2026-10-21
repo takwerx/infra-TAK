@@ -362,15 +362,23 @@ if [ "$GROUPLESS" -gt 0 ]; then
    above: $SERVICE)
   Connected and authenticated, but holding no channel, so TAK routes them
   nothing."
+  # GH #207: the LDAP-outage case comes first and names every trigger, not just a reboot.
+  # Field: after a console update and a Guard Dog Authentik restart, accounts that DID have
+  # channels were stuck on __ANON__; reconnecting the client (restarting Node-RED for its
+  # feeds) cleared them, and another TAK Server restart wasn't needed.
   ACTIONS="$ACTIONS
 - For the __ANON__ subscriptions: there are two different causes and they need
   different fixes.
-    * If they appeared after a reboot, they connected while LDAP was still
-      unavailable. Restarting TAK Server clears those.
-    * If they persist after a restart, or the same account keeps coming back
-      __ANON__, the ACCOUNT HAS NO CHANNEL ASSIGNED. Restarting will not fix it.
-      Assign the user a channel (TAK Portal -> the user -> channels), then have
-      them reconnect."
+    * Most often: they CONNECTED DURING AN LDAP OUTAGE (a reboot, a console
+      update, or an Authentik restart by Guard Dog) and the account is fine.
+      The console reconnects these by itself within about 10 minutes of LDAP
+      being healthy again. If they are still there: reconnect the client
+      (for Node-RED data feeds, restart Node-RED); restart TAK Server only if
+      that does not clear them.
+    * If the same account keeps coming back __ANON__ after reconnecting, the
+      ACCOUNT HAS NO CHANNEL ASSIGNED. Restarting will not fix it. Assign the
+      user a channel (TAK Portal -> the user -> channels), then have them
+      reconnect."
 fi
 
 if [ "$STORM_UID" -eq 1 ]; then

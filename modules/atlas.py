@@ -50,6 +50,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 # ⚠️ Module level. `ensure_authentik_app` sleeps between attempts while it
 # waits for Authentik's authorization flow; in app.py that name came from a
 # module-level import, and moving the function here left it unbound. It only
@@ -135,6 +136,31 @@ ATLAS_TAG = 'v1.54.1'
 #
 #     git ls-remote https://github.com/cfd2474/TAK-MDM.git refs/tags/v1.54.1
 ATLAS_SHA = 'e580fa6618fc9dbfe2b782f7ca9ff980fd813f2b'
+
+#: The keys an ATLAS release tag must be signed by, in ssh-keygen's
+#: ALLOWED SIGNERS format: ``(principal, public key)``.
+#:
+#: ⚠️ **Why this lives here and not on the mirror.** Anyone who can push to
+#: `cfd2474/TAK-MDM` (the account, or a token lifted from the workstation that
+#: publishes) can move a tag and its branch together, and every check that
+#: compares the two passes. A key that GitHub never sees is what closes that,
+#: and the list of trusted keys has to sit outside the repository it vouches
+#: for. This file is in a different repository, with a different owner.
+#:
+#: * ``atlas-release`` signs every release. It is held, passphrase-protected,
+#:   in the publishing workstation's ssh-agent.
+#: * ``atlas-recovery`` is kept offline and signs nothing day to day. It exists
+#:   so that a lost or stolen release key can be replaced by publishing with it,
+#:   rather than every box refusing every update until this file changes.
+#:
+#: Changing this list is a security change: add the new key before removing the
+#: old one, so that no release in between is unverifiable.
+ATLAS_ALLOWED_SIGNERS = (
+    ('atlas-release',
+     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICuwbHw1KwWuJJC51192Fp6599U0PtTAR/6uiv1kAV7K'),
+    ('atlas-recovery',
+     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILq692pIw13m8WaBZxOa7W4ExBXXB86qdUrstI14ctVv'),
+)
 
 # The device channel. One public port, justified: enrolled tablets cannot reach
 # the console's vhost (Authentik would bounce a device that cannot log in), and
@@ -1681,6 +1707,58 @@ def _push_email_relay(ctx, dirpath, plog):
     return True
 
 
+#: ATLAS's own setting for "Use InfraTAK's email configuration".
+RELAY_CHOICE_KEY = 'smtp.use_infratak_relay'
+
+#: Runs inside the api container, through ATLAS's own session and model.
+#: Prints one `relay-choice:` line saying what it found or did.
+_SEED_RELAY_CHOICE = '''
+from app.db.base import SessionLocal
+from app.db.models import AppSetting
+KEY = %r
+with SessionLocal() as s:
+    host = s.get(AppSetting, 'smtp.host')
+    if s.get(AppSetting, KEY) is not None:
+        print('relay-choice: kept')
+    elif host is not None and (host.value or '').strip():
+        print('relay-choice: own-smtp')
+    else:
+        s.add(AppSetting(key=KEY, value='true', updated_by='infra-TAK'))
+        s.commit()
+        print('relay-choice: ticked')
+''' % RELAY_CHOICE_KEY
+
+
+def _seed_relay_choice(ctx, plog, inst=None):
+    """Tick ATLAS's "Use InfraTAK's email configuration", once (#155).
+
+    ⚠️ **Seeded, never written.** The box is the operator's (CLAUDE.md,
+    "Third-party app config is operator-owned"). It is ticked only while no
+    row exists for it at all, and ATLAS writes that row, ticked or not, the
+    first time anyone saves its Email page. So a deliberate untick is a
+    stored `""`, and this leaves it alone on every update after.
+
+    ⚠️ An ATLAS that already holds its own SMTP host is left alone too. That
+    is an operator who saved the Email page on a release older than the box,
+    and switching them onto the relay would reroute mail they set up by hand.
+
+    Only while the relay is configured, and after `_push_email_relay` has
+    handed ATLAS the address: ticking it with nothing to inherit would make
+    ATLAS send through a relay that is not there.
+    """
+    relay = (ctx['load_settings']() or {}).get('email_relay') or {}
+    if not (relay.get('from_addr') or '').strip():
+        return
+    out = _compose_exec(ctx, ['python', '-c', _SEED_RELAY_CHOICE],
+                        timeout=60, inst=inst) or ''
+    if 'relay-choice: ticked' in out:
+        plog('✓ ATLAS set to use InfraTAK\'s Email Relay (Admin → Email)')
+    elif 'relay-choice:' not in out:
+        # Not fatal: the relay is still offered, it just starts unticked.
+        plog('⚠ Could not set ATLAS to use the Email Relay; tick "Use '
+             'InfraTAK\'s email configuration" in Admin → Email')
+
+
 def admin_groups_for(inst=None, global_group=None):
     """The groups that may administer one deployment, most specific first.
 
@@ -3017,11 +3095,17 @@ def deploy_validate(data):
     from the form alone.
     """
     data = data or {}
+    slug = data.get('slug') or None
     raw = data.get('store_gb')
     if raw in (None, ''):
         # Not supplied: an existing box keeps whatever it has, and a new one
         # gets no reservation at all rather than a size nobody chose.
-        return {}, None
+        #
+        # ⚠️ **The slug still travels (#88).** What this returns *replaces* the
+        # request, so dropping it here turned "redeploy corona" into a deploy of
+        # the plain deployment. `deploy()` already refuses a slug nobody
+        # registered, so carrying it is safe.
+        return ({'slug': slug} if slug else {}), None
 
     # ⚠️ The sizing mode and the agency travel with the deploy, because the
     # store is built during it and cannot be changed afterwards: `resize2fs`
@@ -3073,8 +3157,7 @@ def deploy_validate(data):
         if error:
             return {}, error
 
-    return {'store_bytes': size, 'mode': mode,
-            'slug': (data.get('slug') or None)}, None
+    return {'store_bytes': size, 'mode': mode, 'slug': slug}, None
 
 
 def _stale_deploy_key(dirpath):
@@ -3162,19 +3245,16 @@ def _resolve_install_target(ctx, plog):
     selected channel's `VERSION` — so install and update agree on what a
     channel means (GH #81).
 
-    ⚠️ **Checked, where the update path is not.** The channel's tag must
-    dereference to the *same commit* as the channel's branch tip. The mirror
-    guarantees that by construction (one orphan commit per release, and the
-    branch is moved onto it), so a disagreement means a tag moved away from its
-    channel, or a `VERSION` naming a tag the branch does not hold — refused
-    either way. `_verify_checkout` then requires the clone's HEAD to be that
-    commit.
+    ⚠️ **Checked, as the update path now is too (W415).** The channel's tag
+    must dereference to the *same commit* as the channel's branch tip
+    (`_channel_commit`), `deploy` then checks its signature
+    (`_verify_release`), and `_verify_checkout` requires the clone's HEAD to be
+    that commit.
 
-    ⚠️ **Weaker than an out-of-band pin, and said so.** A repository owner who
-    moves the tag and the branch together passes this check; only a hash
-    recorded in this file would catch that. It is the same trust the update
-    path already has (accepted 2026-09-19), which every deployment runs after
-    install — so the pin was protecting the first install and nothing after.
+    ⚠️ **The tip check alone is weak, and said so.** A repository owner, or a
+    stolen token, can move the tag and the branch together and pass it. The
+    signature is what catches that: the trusted keys are in this file
+    (`ATLAS_ALLOWED_SIGNERS`), not on the mirror.
 
     ⚠️ **GitHub unreachable falls back to the pin, not to a refusal.** The pin
     is a scanned `main` release, which is the right thing for a box that
@@ -3187,24 +3267,13 @@ def _resolve_install_target(ctx, plog):
              f'or rate-limited) — installing the pinned {ATLAS_TAG}')
         return ATLAS_TAG, ATLAS_SHA
     tag = 'v' + version
-    branch_ref, tag_ref = 'refs/heads/' + channel, 'refs/tags/' + tag
     try:
-        refs = _ls_remote([branch_ref, tag_ref, tag_ref + '^{}'])
+        refs = _ls_remote(_channel_refs(channel, tag))
     except Exception as e:
         plog(f'  ⚠ Could not list the mirror ({str(e)[:120]}) — installing '
              f'the pinned {ATLAS_TAG}')
         return ATLAS_TAG, ATLAS_SHA
-    tip = refs.get(branch_ref)
-    commit = refs.get(tag_ref + '^{}') or refs.get(tag_ref)
-    if not commit:
-        raise RuntimeError(
-            f'The {channel} channel names {tag}, but the mirror has no such '
-            'tag — refusing to install')
-    if commit != tip:
-        raise RuntimeError(
-            f'{tag} is {commit[:12]} but the {channel} branch is at '
-            f'{(tip or "nothing")[:12]} — refusing to install a tag that is '
-            f'not the {channel} release')
+    commit = _channel_commit(refs, channel, tag)
     plog(f'  {channel} channel offers {tag} = {commit[:12]} (tag and branch agree)')
     return tag, commit
 
@@ -3235,6 +3304,142 @@ def _verify_checkout(ctx, dirpath, plog, tag, expected):
         )
     plog(f'  ✓ Commit verified: {tag} = {head[:12]}')
     return head
+
+
+_SSH_SIGNATURE = b'-----BEGIN SSH SIGNATURE-----'
+
+
+def _check_release_signature(raw, tag, commit, signers=None):
+    """Refuse a tag object unless it is `tag`, on `commit`, signed by a trusted key.
+
+    `raw` is the tag object exactly as `git cat-file tag` prints it: headers,
+    a blank line, the message, then the SSH signature over everything before it.
+    Raises RuntimeError naming what is wrong; returns the principal that signed.
+
+    ⚠️ **The `tag` header is checked, not just the signature.** A signature
+    proves who made the object, not which release it is. Without the header
+    check, an old signed tag object pushed under a newer ref name (with the
+    channel branch moved onto its commit) verifies perfectly, and turns the
+    update button into a downgrade.
+
+    ⚠️ **Verified with `ssh-keygen -Y verify`, not `git verify-tag`.** The git
+    route needs `gpg.ssh.*` config, and a config key naming a program is
+    exactly what the broker's git gate refuses (`-c safe.directory` only)
+    because it executes. This needs neither git config nor the broker.
+    """
+    signers = ATLAS_ALLOWED_SIGNERS if signers is None else signers
+    cut = raw.find(_SSH_SIGNATURE)
+    if cut < 0:
+        raise RuntimeError(
+            f'{tag} is not signed. Every ATLAS release is; refusing to install '
+            'one that is not')
+    payload, signature = raw[:cut], raw[cut:]
+    header = payload.split(b'\n\n', 1)[0].decode('utf-8', 'replace').splitlines()
+    if f'tag {tag}' not in header or f'object {commit}' not in header:
+        raise RuntimeError(
+            f'the signed tag fetched as {tag} does not describe {tag} at '
+            f'{commit[:12]}: refusing what may be an older release replayed '
+            'under a newer name')
+    with tempfile.TemporaryDirectory() as tmp:
+        allowed = os.path.join(tmp, 'allowed_signers')
+        with open(allowed, 'w', encoding='utf-8') as handle:
+            for principal, key in signers:
+                handle.write(f'{principal} namespaces="git" {key}\n')
+        sig = os.path.join(tmp, 'tag.sig')
+        with open(sig, 'wb') as handle:
+            handle.write(signature)
+        for principal, _key in signers:
+            r = subprocess.run(
+                ['ssh-keygen', '-Y', 'verify', '-f', allowed, '-I', principal,
+                 '-n', 'git', '-s', sig],
+                input=payload, capture_output=True, timeout=30,
+            )
+            if r.returncode == 0:
+                return principal
+    raise RuntimeError(
+        f'{tag} is signed, but not by a trusted ATLAS release key: refusing '
+        'to install it')
+
+
+def _verify_release(dirpath, plog, tag, commit):
+    """Check the fetched tag in `dirpath` before its code is checked out.
+
+    The tag object is read with plain git as the console user, the same way
+    the fetch before it runs. See `_check_release_signature` for why not the
+    broker.
+    """
+    r = subprocess.run(
+        ['git', '-C', dirpath, '-c', 'safe.directory=' + dirpath,
+         'cat-file', 'tag', 'refs/tags/' + tag],
+        capture_output=True, timeout=30,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f'{tag} is not an annotated, signed tag on this checkout: '
+            + (r.stderr or b'').decode('utf-8', 'replace')[-200:])
+    signer = _check_release_signature(r.stdout, tag, commit)
+    plog(f'  ✓ Signature verified: {tag} signed by {signer}')
+
+
+def _fetch_tag_argv(dirpath, tag):
+    """The one fetch install and update use: this release's tag and nothing else.
+
+    ⚠️ **Not `--tags`.** That pulls every tag on the mirror, and without
+    `--force` git refuses to replace a tag the box already holds ("would
+    clobber existing tag") and exits 1. So one old tag changed upstream, for
+    example re-signed in place, made *every* later Update on a box holding it
+    fail with "git fetch failed", whatever version it was updating to.
+
+    The forced single-tag refspec fetches only what is about to be installed,
+    and lets it replace a stale local copy. That is safe, because a moved tag
+    is no longer trusted for being unchanged: `_verify_release` checks its
+    signature and names, and `_verify_checkout` checks its commit.
+    `--no-tags` stops git following other tags in along with it.
+    """
+    ref = 'refs/tags/' + tag
+    return ['git', '-C', dirpath, 'fetch', '--no-tags', '--depth=1', 'origin',
+            '+%s:%s' % (ref, ref)]
+
+
+def _is_pin_fallback(tag, expected):
+    """True for the offline fallback, the one install not checked by signature.
+
+    The pin predates signing, and the commit recorded in this file is the
+    stronger proof anyway: `_verify_checkout` holds the clone to it. Every
+    release resolved from a channel is checked.
+    """
+    return (tag, expected) == (ATLAS_TAG, ATLAS_SHA)
+
+
+def _channel_refs(channel, tag):
+    """The refs `_channel_commit` needs, for one `_ls_remote` call."""
+    tag_ref = 'refs/tags/' + tag
+    return ['refs/heads/' + channel, tag_ref, tag_ref + '^{}']
+
+
+def _channel_commit(refs, channel, tag):
+    """The commit `tag` is, provided it is the `channel` branch tip. Raises otherwise.
+
+    `refs` is `_ls_remote(_channel_refs(channel, tag))`. Install and update
+    share this, so they agree on what "the channel's release" means.
+
+    The mirror guarantees that by construction (one orphan commit per release,
+    and the branch is moved onto it), so a disagreement means a tag moved away
+    from its channel, or a `VERSION` naming a tag the branch does not hold.
+    """
+    branch_ref, tag_ref = 'refs/heads/' + channel, 'refs/tags/' + tag
+    tip = refs.get(branch_ref)
+    commit = refs.get(tag_ref + '^{}') or refs.get(tag_ref)
+    if not commit:
+        raise RuntimeError(
+            f'The {channel} channel names {tag}, but the mirror has no such '
+            'tag — refusing to install')
+    if commit != tip:
+        raise RuntimeError(
+            f'{tag} is {commit[:12]} but the {channel} branch is at '
+            f'{(tip or "nothing")[:12]} — refusing to install a tag that is '
+            f'not the {channel} release')
+    return commit
 
 
 def deploy(ctx, job, params):
@@ -3334,16 +3539,19 @@ def deploy(ctx, job, params):
         # resolved before anything is fetched, so a refusal leaves the box as
         # it was.
         tag, expected = _resolve_install_target(ctx, plog)
+        signed = not _is_pin_fallback(tag, expected)
 
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
             r = subprocess.run(
-                ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
+                _fetch_tag_argv(dirpath, tag),
                 capture_output=True, text=True, timeout=300, env=None,
             )
             if r.returncode != 0:
                 raise RuntimeError(f'git fetch failed: {r.stderr[-300:]}')
+            if signed:
+                _verify_release(dirpath, plog, tag, expected)
             ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
         else:
             os.makedirs(dirpath, exist_ok=True)
@@ -3357,6 +3565,20 @@ def deploy(ctx, job, params):
                 if 'Permission denied' in r.stderr or 'not read from remote' in r.stderr:
                     hint = ' — the repository is private; supply a read-only deploy key'
                 raise RuntimeError(f'git clone failed{hint}: {r.stderr[-300:]}')
+            if signed:
+                # After the clone (there is nothing to check before it), and
+                # before anything in it is built or run.
+                try:
+                    _verify_release(dirpath, plog, tag, expected)
+                except RuntimeError:
+                    # ⚠️ Nothing would run it, but an unverified tree should not
+                    # sit in the install directory. `git clone` only accepts an
+                    # empty directory, so everything in it is the clone.
+                    # Through `_rm_priv`, the module's one way to delete.
+                    err = _rm_priv(dirpath, os.path.dirname(dirpath.rstrip('/')))
+                    plog('  ⚠ ' + err if err else
+                         '  Removed the refused clone from ' + dirpath)
+                    raise
         commit = _verify_checkout(ctx, dirpath, plog, tag, expected)
         _write_build_file(dirpath, plog)
         plog('✓ Source in place')
@@ -3596,6 +3818,7 @@ def deploy(ctx, job, params):
         restart_api = _push_email_relay(ctx, dirpath, plog) or restart_api
         if restart_api:
             _compose(ctx, 'up -d api', timeout=300, inst=_inst)
+        _seed_relay_choice(ctx, plog, inst=_inst)
 
         # ── The certificate authority is split before anyone can use it ──────
         #
@@ -4166,7 +4389,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                     try:
                         req = _urlreq.Request(
                             '%s/api/v3/core/applications/%s/' % (_ak_url, _names['app_slug']),
-                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            data=json.dumps({'provider': provider_pk}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -4185,8 +4408,6 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                                            plog=log),
                 plog=log)
             ctx['_outpost_add_providers_safe'](_ak_url, _ak_headers, [provider_pk], plog=log)
-            ctx['_authentik_application_open_in_new_tab'](
-                _ak_url, _ak_headers, _names['app_slug'], plog=log)
             # ⚠️ The answer is recorded, not discarded (SEC_AUDIT.md H-1). ATLAS
             # runs with an empty admin group — it trusts Authentik to decide who is
             # an administrator — so this binding *is* the access control. It was
@@ -4718,17 +4939,27 @@ def _run_update(ctx, inst=None):
 
         tag = 'v' + target
         plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')
-        # The module rewrites .env and the compose override on every deploy, so
-        # the working tree is dirty on tracked files and a plain pull aborts with
-        # "local changes would be overwritten".
-        ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
+        # ⚠️ **Checked as an install is (W415, ATLAS audit H3).** This path
+        # used to fetch the tag and check it out with no check at all, so the
+        # stronger checks on a fresh install guarded the one deploy and not
+        # the many updates after it. Now: the tag must be the channel's tip,
+        # signed by a trusted key, and the checkout must be its commit. All of
+        # it before the working tree is touched, so a refusal leaves the
+        # running deployment exactly as it was.
+        commit = _channel_commit(_ls_remote(_channel_refs(channel, tag)), channel, tag)
         r = subprocess.run(
-            ['git', '-C', dirpath, 'fetch', '--tags', '--depth=1', 'origin', tag],
+            _fetch_tag_argv(dirpath, tag),
             capture_output=True, text=True, timeout=600,
         )
         if r.returncode != 0:
             raise RuntimeError('git fetch failed: ' + (r.stderr or '')[-300:])
+        _verify_release(dirpath, plog, tag, commit)
+        # The module rewrites .env and the compose override on every deploy, so
+        # the working tree is dirty on tracked files and a plain pull aborts with
+        # "local changes would be overwritten".
+        ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
         ctx['_module_git'](dirpath, 'checkout', '-f', tag, timeout=60)
+        _verify_checkout(ctx, dirpath, plog, tag, commit)
         _write_build_file(dirpath, plog)
         # ⚠️ **Before anything reads it (W243).** A deployment built
         # before W240 has a root-owned `.env`; the readers below now raise
@@ -4776,6 +5007,7 @@ def _run_update(ctx, inst=None):
             changed = _push_email_relay(ctx, dirpath, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            _seed_relay_choice(ctx, plog, inst=inst)
         except Exception as exc:
             # Not fatal. The containers are already rebuilt and serving; a stale
             # vhost is worse reported than turned into a failed update.

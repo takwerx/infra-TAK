@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.14-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.14-alpha)**
+**Current release: [v10.2.24-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -357,6 +357,19 @@ Each page has buttons that do specific things. Here's what they do and when to u
 | **Switch Provider** | Reconfigures Postfix with new SMTP credentials/host, restarts Postfix | Changing email provider or From address |
 | **Configure Authentik** | Pushes relay settings (localhost:25, From address) into Authentik so password recovery emails work | After deploying or switching Email Relay provider |
 
+### CloudTAK: keeping your own source patches (pre-build hooks)
+
+CloudTAK **Update** checks out a clean release, so any edit you made to `~/CloudTAK`'s source is wiped before the rebuild. To have it put back every time, put a script in `.config/cloudtak-hooks/pre-build.d/` inside the infra-TAK folder. Executable files there run in name order (`10-…`, `20-…`) right before every CloudTAK build: on Update, on a plugin install/update/remove, and on the tree a failed update rolls back to. They run as the console user, with `~/CloudTAK` as the working directory and `INFRATAK_HOOK_PHASE` (`update` / `plugin` / `revert`), `INFRATAK_CLOUDTAK_DIR`, `INFRATAK_CLOUDTAK_TAG` and `INFRATAK_CLOUDTAK_PREV_SHA` set. If a hook exits non-zero or runs over 5 minutes, the build does not start: the update rolls back and CloudTAK keeps running, and the log names the hook and shows its output. Hooks must be safe to run twice and should fail loudly when the code they patch has moved. The folders and scripts must be owned by the console user and not writable by anyone else, or nothing runs; `chmod -x` a script to turn it off. Hooks run only for a CloudTAK on the same server as the console, not for a remote CloudTAK host or a fresh Deploy.
+
+### Caddy: your own lines inside a generated site
+
+infra-TAK rewrites `/etc/caddy/Caddyfile` on every deploy, domain change and Update, so a line you add inside a generated site block is lost. New sites go below the `# --- User-added blocks (do not remove) ---` line at the bottom. For lines that must sit inside a generated site (an extra route on the CloudTAK map host, for example), use the include folders, which infra-TAK never writes:
+
+- `/etc/caddy/sites.d/<host>/*.caddy` is imported as the first line of that host's site block. `<host>` is the site address exactly as the Caddyfile shows it, e.g. `/etc/caddy/sites.d/map.example.com/10-print.caddy`.
+- `/etc/caddy/snippets.d/*.caddy` is imported at the top of the file, right after the global options, for named snippets you use from a site file.
+
+Only files ending in `.caddy` are read, so a `.bak` copy is ignored. Files must be readable by caddy (`0644`). Press **Reload** on the Caddy page to apply them; the page lists the files in use. If an include makes the Caddyfile invalid, infra-TAK writes it without any includes so every site keeps working, and the Caddy page names the files and Caddy's error. Fix the file and press **Reload** again.
+
 ### General Rules
 
 - **Deploy order matters:** Caddy → Authentik → Email Relay → TAK Server → TAK Portal → everything else
@@ -428,6 +441,129 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.24-alpha — 2026-10-21 — Security: TAK Portal and Remote Assist on the newest Node 22; TAK clients get their LDAP groups back without a restart; Remote Assist Update keeps its database password
+
+**Headline: Update now rebuilds TAK Portal and EUD Remote Assist on the newest Node 22 base image (the Oct 21 Node.js security release), and still builds from the copy on the box if Docker Hub is down. After an LDAP outage, TAK clients that connected during it get their groups back without restarting TAK Server. Remote Assist Update no longer changes its database password, and repairs installs an earlier Update broke. Plus: a DNS check before Let's Encrypt, a safer LDAP outpost move, CloudTAK Update rollbacks that work on Docker 29, and quieter PostgreSQL logs.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha))
+
+**Security: Node 22 base image.** `docker compose up -d --build` never checked for a newer `FROM` image, so TAK Portal and Remote Assist kept rebuilding on whatever `node:22-alpine` the box first pulled. Deploy and Update now `docker pull` each base image first, then build. If the pull fails (Docker Hub down, rate limit), the build uses the copy already on the box and the log says why.
+
+**TAK clients after an LDAP outage (GH #189).** A TAK client that connected while LDAP was down kept an empty group set (no CoT) until TAK Server was restarted. Once LDAP is healthy again, the console now re-authenticates LDAP users' live connections and drops any connection that has no user and no groups, so the client reconnects and is looked up again. TAK Server is restarted only as a fallback, once, and only into a healthy LDAP.
+
+**Remote Assist database password.** On an install where the console had no saved database password, Update wrote a new random one the database had never seen, and Remote Assist could not log in. Update and Deploy now reuse the existing password (`.env`, then the running container), and if `.env` and the database disagree, the database is set to match and Remote Assist restarts. This repairs installs an earlier Update broke.
+
+**Also in this release.**
+- **Caddy:** setup and domain changes check that each name's DNS A record points at this server before asking Let's Encrypt, and say which record is wrong. **Continue anyway** is there for NAT and proxies. The installed Caddy page has a **DNS Check** card.
+- **Authentik:** the LDAP outpost moves to the box's FQDN only after DNS and the certificate check out, and a failed move backs off (1 h up to 24 h) instead of retrying every 10 minutes.
+- **CloudTAK:** the bootstrap cert receives Core Events on channels created after it connected. A failed CloudTAK Update (local or remote) or plugin rebuild rolls back to the old images on Docker 29, and the map data is downloaded before the build with retries.
+- **Guard Dog:** two-server installs stop logging `role "root" does not exist` in PostgreSQL, and the retention guard stops logging `count_estimate` errors.
+- **ATLAS:** an API redeploy with only an agency slug redeploys that agency.
+
+### v10.2.23-alpha — 2026-10-20 — Hotfix: ATAK users keep their LDAP groups after updating; Caddy keeps your own lines inside generated sites; ATLAS installs only signed releases
+
+**Headline: after updating to v10.2.22, ATAK clients that reconnected could get no LDAP groups and see no one on the map. This hotfix puts the Authentik PgBouncer sidecar back on 1.25.1, stops the update from restarting Authentik over and over, and checks LDAP groups after the swap. Also: your own lines inside a generated Caddy site block now survive regeneration, ATLAS installs and updates only signed releases, and non-root boxes no longer fail privileged calls while the broker restarts.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.23-alpha))
+
+**LDAP groups after update (hotfix).** v10.2.22's PgBouncer move rewrote Authentik's `docker-compose.yml` in a way the post-update hardening step read as a change, so Authentik's server, worker and LDAP outpost were recreated several times. Right after each LDAP outpost restart, users briefly had no group memberships, and TAK clients that connected then got no groups. Now PgBouncer goes back to `v1.25.1-p0` (boxes on 1.26.1 move back at their next console start), the swap edits only the image line, hardening ignores formatting-only differences, and after a swap the console checks a live LDAP bind and users' `tak_` groups before resyncing TAK Server's LDAP credential. If LDAP doesn't come back healthy, it does one ordered restart and otherwise rolls back. The PgBouncer security bump returns as its own change.
+
+**Caddy.** A line you add inside a generated site block (for example `import cloudtak_print`) was lost on every deploy, domain change or Update. The generated Caddyfile now imports `/etc/caddy/snippets.d/*.caddy` and `/etc/caddy/sites.d/<host>/*.caddy`, which infra-TAK never writes. If your file breaks the config, the Caddyfile is written without the includes so every site stays up, and the Caddy page shows the error. See "Caddy: your own lines inside a generated site" above. (GH #176)
+
+**ATLAS.** Install and Update now check that the ATLAS release tag is signed by a trusted key, names the version being installed and points at the channel's commit, before any code is checked out. A refused update leaves the running deployment untouched.
+
+**Non-root boxes.** The privileged broker's daily recycle could land in the middle of the post-update work, and for those few seconds privileged calls failed (false "Node-RED container not running", a false Authentik port-conflict error). The broker now waits for a quiet window, and callers wait for a restarting broker instead of failing.
+
+### v10.2.22-alpha — 2026-10-20 — Security release: CloudTAK PostgreSQL 17.11 + PostGIS 3.6, Authentik PgBouncer 1.26.1; console survives early connection resets; Rotate Intermediate CA really renews .p12 client certs
+
+**Headline: CloudTAK's database moves from PostgreSQL 17.0 (October 2024, two years of security fixes behind) to 17.11 with PostGIS 3.6, data kept in place; the Authentik PgBouncer sidecar moves to 1.26.1 and existing boxes are moved on restart; a client that drops its connection before the TLS handshake no longer crashes the console; Rotate Intermediate CA now really rewrites client .p12 files and refreshes Node-RED and CloudTAK; the WebODM redis update now reaches boxes moved to the takwerx user.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.22-alpha))
+
+**CloudTAK database.** Upstream's `postgis/postgis:17-3.4-alpine` tag stopped being rebuilt in October 2024, so every CloudTAK box ran PostgreSQL 17.0 / PostGIS 3.4.3. infra-TAK now pins `17-3.6-alpine` (PostgreSQL 17.11, PostGIS 3.6) and upgrades the PostGIS extensions in place. Same major version, so the data volume is reused as-is. Existing boxes move at the console restart after Update Now. Don't roll an upgraded box back to an older infra-TAK: PostGIS 3.4 can't run against a 3.6 catalog.
+
+**Authentik PgBouncer.** `v1.25.1-p0` → `v1.26.1-p0` (PgBouncer 1.25.2–1.26.1 security fixes: pre-auth crashes and hangs, a KILL_CLIENT authorization flaw, a CPU spin). Earlier pin bumps never reached existing boxes; now a console restart pulls the new image, recreates only PgBouncer, and rolls back if it isn't healthy.
+
+**Console stability.** A client that connected and reset before the TLS handshake could crash the console worker (seen most on Rocky 9), taking the console down for about 50 seconds each time. Those connections are now dropped and logged, and the worker stays up.
+
+**Rotate Intermediate CA.** Rotate re-issued `.pem`/`.jks` but left each client `.p12` on the old CA, so TAK Portal, CloudTAK and Guard Dog kept presenting old certs and failed once that CA left the truststore. Rotate now rebuilds the `.p12` files, then restarts Node-RED (after fixing its read access to the new key) and refreshes CloudTAK's cert if its CA is gone.
+
+**WebODM.** The restart-time move of the WebODM broker to redis 8.10.2 now also reaches boxes moved from root to the takwerx user, where WebODM stays in `/root/webodm`.
+
+### v10.2.21-alpha — 2026-10-19 — Security release: CloudTAK video, TAK Video Restreamer, Caddy, WebODM and Node-RED updates; Rotate Intermediate CA leaves CA files alone
+
+**Headline: CloudTAK video moves to media-infra 9.12.1 (MediaMTX 1.21.2), fixing a critical MediaMTX hole; TAK Video Restreamer moves to MediaMTX 1.21.2 on a pinned source and publishing now needs a login; every box is lifted to Caddy 2.11.7 or newer; WebODM's broker moves off end-of-life redis 7.0.10 and the WebODM images are pinned; Node-RED moves to 4.1.16 on Node.js 22; Rotate Intermediate CA no longer re-issues CA signing keystores as client certs.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.21-alpha))
+
+**CloudTAK video.** The media container moves from `media-infra` v9.11.0 (MediaMTX 1.20.0) to v9.12.1 (MediaMTX 1.21.2). Existing boxes move on their own at the console restart after Update Now.
+
+**TAK Video Restreamer.** MediaMTX in the TVR image is now v1.21.2, checksum-verified, and the upstream source is pinned to a fixed commit. Publishing (RTSP, RTMP, SRT) now needs the `publish` login shown on the TVR page; viewing stays open. Existing installs get a "Security update available" banner: run **Update Now**, then add the publish login to each camera, drone or encoder.
+
+**Caddy.** New minimum Caddy 2.11.7. Console Update, Caddy → Update and deploy lift older boxes onto it from the package source, and Caddy is restarted only after the new binary accepts the config. Boxes with NetBird keep their gRPC streams open past Caddy 2.11.6's new 60-second idle cut.
+
+**WebODM.** The broker moves from redis 7.0.10 (end of life) to 8.10.2 at the next console restart. The WebODM images are pinned (WebODM 3.3.1, NodeODX 2.4.0); WebODM's Update now installs the pins instead of `:latest`.
+
+**Node-RED.** `nodered/node-red:4.0` (Node.js 20, end of life) → `4.1.16-22` (Node.js 22). Update Now moves existing boxes; configurator configs are kept.
+
+**Rotate Intermediate CA.** A box rotated several times had every old `INT-CA-NN-signing` keystore re-issued as a client cert, including the live enrollment signing keystore. Rotate now re-issues only real client certs.
+
+### v10.2.20-alpha — 2026-10-19 — Guard Dog frees disk at the 80% warning; CA names with an underscore are refused; TAK Portal flags login turned off
+
+**Headline: at the 80% disk warning Guard Dog now reclaims all unused Docker build cache and unused images and caps the system journal at 500 MB, so a box no longer sits in the warning while every run reclaims nothing; TAK Deploy and Rotate Intermediate CA refuse CA names with an underscore, which made TAK reject every enrolled device; the TAK Portal page flags login turned off (every signed-in user a Global admin) with a one-click fix.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.20-alpha))
+
+**Guard Dog disk reclaim ([#165](https://github.com/takwerx/infra-TAK/issues/165)).** Between 80% and 85% the hourly reclaim only pruned build cache older than 7 days, and above 85% it left non-dangling cache behind, while young cache, old image tags and an uncapped journal held tens of GB. At 80%+ it now prunes all unused build cache and images no container uses (running or stopped), and vacuums the journal to 500 MB. The image prune waits while Update Now or a compose / pull / build is running. journald gets a fleet-wide 500 MB cap on every run. 70–79% and the 20 GB cache cap are unchanged; volumes, containers and images in use are never touched.
+
+**CA names ([#128](https://github.com/takwerx/infra-TAK/issues/128)).** An underscore isn't a PrintableString character, so a CA named like `INTERMEDIATE_CA_03` was stored in a different string encoding than TAK's signer writes into enrolled client certs, and TAK rejected every enrolled device on 8089 with `peer not verified`. CA names now allow letters, digits, `-` and `.`, checked on TAK Deploy and Rotate Intermediate CA. Affected boxes: rotate the intermediate CA to a hyphenated name; the root can stay.
+
+**TAK Portal login off.** A TAK Portal settings reset to its template turns `PORTAL_AUTH_ENABLED` off, and TAK Portal then treats every signed-in user as a Global admin. The TAK Portal page now shows a red card when that happens on a box with a domain, with a **Turn Portal login back on** button. Nothing else in TAK Portal's settings changes.
+
+### v10.2.19-alpha — 2026-10-18 — Two-server Guard Dog stops false DB alerts and log spam; Online Compact works on container TAK; Diagnostics show TAK Portal's Authentik state
+
+**Headline: on a two-server install Guard Dog now checks the database TAK Server actually uses, so the false "mgmt channel degraded" every 2 minutes and the restarts.log flood stop, and the weekly database repack no longer leaves `takdbrepack.service` failed; Online Compact can install pg_repack on container-mode TAK; the Diagnostics report shows TAK Portal's Authentik URL, token state and pending Authentik writes.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.19-alpha))
+
+**Two-server Guard Dog.** The remote-DB watcher ran `pg_isready` on the database host without a host or port, so it could ask a different PostgreSQL cluster than TAK Server's and report "mgmt channel degraded" while TAK's database was fine. It now probes the database TAK uses (falling back to the local socket on that port), and a restart still needs both to give no response. restarts.log gets one line when the state changes, once per alert window, and one "healthy again" line, instead of a line every run. The weekly repack on a two-server box uses `sudo` for a non-root SSH user, reads the PostgreSQL version from the server rather than the newest client, and when pg_repack can't be installed the weekly run now skips cleanly instead of leaving the unit failed. Online Compact still fails loudly with the reason. The Diagnostics Guard Dog section shows the latest repack lines.
+
+**Online Compact on container-mode TAK.** The TAK database container runs as `postgres`, so the pg_repack install inside it was refused and logged as "not available on this platform". It now installs as root inside the container (psql and pg_repack still run as postgres), and an install refused for lack of root is reported as that.
+
+**Diagnostics: TAK Portal and Authentik.** When a TAK Portal group change fails with "Authentik operation failed and remains queued for retry", the TAK Portal section now shows the Authentik URL TAK Portal calls, whether its token is blank, still the template placeholder, or different from infra-TAK's (the token itself is never printed), the queued Authentik writes with their last error, and the directory sync error.
+
+### v10.2.18-alpha — 2026-10-17 — TAK Portal group changes work again on boxes left on template settings; TAK Portal Update no longer shows a false failure behind a gateway
+
+**Headline: a TAK Portal `settings.json` still holding its own template values (left over from [#158](https://github.com/takwerx/infra-TAK/issues/158) on boxes reset before v10.2.17) is now healed on console start, so group changes stop failing with "Authentik operation failed and remains queued for retry"; TAK Portal Update runs in the background, so a reverse proxy or gateway timeout no longer shows "Update failed" while the update actually succeeds.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.18-alpha))
+
+**TAK Portal template settings healed.** v10.2.17 stopped new resets but didn't repair a box that was already reset: the Authentik URL and token, the TAK URL and the API certificate paths stayed on TAK Portal's fill-in-the-blank placeholders, so every group change queued with a DNS error and the dashboard's TAK stats broke. On console start infra-TAK now replaces exactly those placeholders (and the template certificate paths, only while the TAK URL is still the placeholder) and pushes the settings. A real operator value is never touched; a healthy file is left byte-identical. Other template defaults a full reset put back (branding, hidden prefixes, agency types) can't be told apart from a choice and stay as they are.
+
+**TAK Portal Update behind a gateway.** Update was one long request covering the whole checkout and build. A gateway in front of the console (Azure Application Gateway defaults to 20 s) gave up first, and the page showed "Update failed" while the box finished the update. Update now starts a background job and the page follows its progress, shows the console's full error text on a real failure, and picks the result back up if the console restarted mid-update.
+
+### v10.2.17-alpha — 2026-10-17 — TAK Portal Update keeps your settings; ATLAS uses the Email Relay; no more LDAP login herds from feeds
+
+**Headline: a TAK Portal Update can no longer reset `settings.json` to template defaults ([#158](https://github.com/takwerx/infra-TAK/issues/158)); ATLAS starts on InfraTAK's Email Relay when nobody has chosen yet ([#155](https://github.com/takwerx/infra-TAK/issues/155)); Node-RED feeds stop bursting TAK Server's mission API, and TAK Server reuses its LDAP connections, which ends the Authentik LDAP login herd and the Guard Dog restarts it caused.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.17-alpha))
+
+**TAK Portal settings survive Update.** infra-TAK wrote `settings.json` in place while the portal was running, and a portal read in that moment rebuilt the file from `settings.example.json`. The file is now swapped in atomically, the previous copy is backed up first (newest 10 kept), and the Update checks the TAK connection keys after the build and puts them back if they changed.
+
+**ATLAS email.** On deploy and update, ATLAS's *Use InfraTAK's email configuration* is ticked once, only if the Email Relay is configured, nobody has saved ATLAS's Email page yet, and ATLAS has no SMTP host of its own. An operator's choice is never changed.
+
+**Node-RED feeds and LDAP.** A feed whose layer churns IDs could send over 1,000 mission-API DELETEs in a minute, and TAK Server binds to LDAP on every API call, so each hourly Authentik LDAP cache expiry turned into a login herd and a Guard Dog restart. DELETEs are now paced at 1/s and capped per poll (the rest go next poll, still with offline-device ForceDeletes), one PUT chain runs per layer, and existing engine tabs are converted on the next Node-RED sync. TAK Server's LDAP connection pool (`enableConnectionPool`) is turned on, and Guard Dog no longer restarts Authentik for a herd that is already draining. **Restart TAK Server once after updating** so it picks up the LDAP pool.
+
+### v10.2.16-alpha — 2026-10-16 — CloudTAK Update keeps your source patches; Authentik edits survive restarts and updates
+
+**Headline: CloudTAK Update can re-apply your own source patches through pre-build hooks, and a failing hook rolls the update back with CloudTAK left running ([#150](https://github.com/takwerx/infra-TAK/issues/150)); the Authentik brand title and each application's open-in-new-tab setting are now yours to change, and stay changed across the daily console restart and console updates ([#151](https://github.com/takwerx/infra-TAK/issues/151)).** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.16-alpha))
+
+**CloudTAK pre-build hooks.** CloudTAK Update checks out the new tag, which wiped any local edit to CloudTAK's source, so the build shipped stock source. Executable scripts in `.config/cloudtak-hooks/pre-build.d/` now run in name order right before every local CloudTAK build (Update, plugin install/update/remove, and the rollback after a failed update). A hook that fails or runs past 5 minutes stops the build, and the Update rolls back exactly like a failed build. Hooks must be owned by the console user and not group- or world-writable. No folder means no change.
+
+**Authentik edits stick.** The console restarts once a day, and on every start it set the Authentik brand title back to `infra-TAK` and each application's open-in-new-tab back to the catalog value; console updates flipped open-in-new-tab again. The login wording is now seeded once, and open-in-new-tab is only set when an application is created. Provider links are still repaired.
+
+**Upgrade note.** Update the console. Nothing to do. To carry a CloudTAK source patch, put an executable script in `.config/cloudtak-hooks/pre-build.d/`.
+
+### v10.2.15-alpha — 2026-10-15 — TAK Server stops restarting on every console start; console logins work on FIPS boxes; Docker TAK builds again
+
+**Headline: on native TAK with a non-root console, a console start no longer restarts TAK Server, and the 8446 enrollment port gets its Let's Encrypt certificate even when Let's Encrypt is slow; console logins and admin-password checks work on FIPS boxes ([#137](https://github.com/takwerx/infra-TAK/issues/137)); managed-database installs keep TAK able to read its own `CoreConfig.xml`; and Docker TAK builds again and recovers from stale database lock files.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.15-alpha))
+
+**TAK Server restarts.** The 8446 certificate check read TAK's keystore as the console user, couldn't open it, and so re-imported the same certificate and restarted TAK Server on every console start, including every boot and the daily restart. It now reads the keystore as `tak`, and TAK only restarts when the certificate really changed.
+
+**8446 certificate.** When Let's Encrypt was slow to issue the TAK Server certificate during deploy, 8446 kept TAK's own certificate for good and phones couldn't enroll by QR. The deploy now retries in the background for up to 30 minutes, and the daily repair picks up any box the deploy skipped.
+
+**Console logins on FIPS boxes.** On a box where OpenSSL doesn't offer scrypt (FIPS mode), login and every admin-password check crashed with a 500. Any error in a password check is now a refusal with a clear message. New password hashes use PBKDF2-SHA256, which works in FIPS mode, and an old hash is upgraded the next time you log in. ATLAS uninstall shows the real error instead of `JSON.parse: unexpected character`.
+
+**Managed-database installs.** On an External / Managed DB install with a non-root console, `CoreConfig.xml` was owned by root, so TAK Server couldn't read it and wouldn't start after its next restart. New installs set the right owner, and the console fixes existing boxes on start without restarting TAK.
+
+**Docker TAK.** The hardened TAK 5.8 image build no longer fails on a `microdnf` depsolve error. A database container left with stale PostgreSQL lock files after an unclean stop is healed automatically, and TAK Server reconnects. The TAK Portal deploy log names the extras that aren't available on Docker TAK yet instead of "SSH auto-setup failed".
+
+**Upgrade note.** Update the console. If your login page says the stored password hash can't be checked on this box, run `sudo ./reset-console-password.sh` once from the install folder.
 
 ### v10.2.14-alpha — 2026-10-14 — ATLAS deploys again; Caddyfile changes stick on non-root boxes
 

@@ -19,6 +19,22 @@
 # v10.0.1: single-server local mode dispatches through _gd-tak-lib.sh so a
 # containerized DB (takserver-db) is queried/repacked via docker exec. The
 # two-server SSH path and the native-local path are unchanged.
+#
+# v10.2.19 (ops #74 — a split box sat with takdbrepack.service `failed`):
+#   - Two-server: the pg_repack install ran apt-get/dnf over SSH as SSH_USER with no sudo,
+#     so it could only ever work when that user is root. Privileged remote commands now go
+#     through `sudo -n` for a non-root SSH user, and `sudo -n -u postgres` everywhere so a
+#     password prompt fails fast with a message instead of hanging or failing silently.
+#   - PG_VER comes from the SERVER (server_version_num), not pg_config/psql --version: on
+#     Debian those report the newest CLIENT installed, which need not be the server's major,
+#     so the wrong postgresql-<v>-repack was installed and CREATE EXTENSION then failed.
+#   - The weekly timer skips cleanly (exit 0) when pg_repack cannot be installed; only an
+#     operator-pressed Online Compact exits 1 for that. Before, one failed install left the
+#     unit `failed` until someone ran reset-failed. A repack that RUNS and fails still exits 1.
+#   - The install's own output is logged when it does not yield pg_repack.
+#   - Container TAK (ops #76): the install ran inside takserver-db as postgres (the image's
+#     USER), so dnf always refused it. gd_db_shell now execs as root; a refused-for-root
+#     install is logged as that, not as "not available on this platform".
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -67,6 +83,13 @@ fi
 
 SSH_TARGET="${REMOTE_DB_HOST:-$DB_HOST}"
 
+# Prefix for root-only commands on the DB host. Locally this script already runs as root
+# (systemd unit, and inside takserver-db via docker exec); over SSH only a root login is.
+RSUDO=""
+if [ "$TWO_SERVER_MODE" = "1" ] && [ "$SSH_USER" != "root" ]; then
+  RSUDO="sudo -n "
+fi
+
 mkdir -p /var/log/takguard
 LOG_FILE="/var/log/takguard/restarts.log"
 
@@ -81,7 +104,7 @@ psql_scalar() {
     [ -z "$SSH_TARGET" ] || [ ! -f "$SSH_KEY" ] && return 1
     out=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
       "${SSH_USER}@${SSH_TARGET}" \
-      "sudo -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null) || return 1
+      "sudo -n -u postgres psql -d cot -t -A -c $(printf '%q' "$sql")" 2>/dev/null) || return 1
   else
     out=$(gd_psql_scalar "$sql" cot) || return 1
   fi
@@ -160,10 +183,16 @@ fi
 #      and `sudo -u postgres pg_repack` would fail anyway because sudo discards
 #      an exported PATH via secure_path. The path must be ABSOLUTE.
 DB_ARCH=$(remote_cmd "uname -m 2>/dev/null" || echo "unknown")
-# pg_config on PATH (Debian) -> versioned dir (RHEL) -> psql as last resort.
-PG_VER=$(remote_cmd "{ pg_config --version 2>/dev/null \
-  || /usr/pgsql-*/bin/pg_config --version 2>/dev/null \
-  || psql --version 2>/dev/null; } | grep -oP '\\d+' | head -1" || echo "")
+# The server's own major version first: the extension has to match the SERVER, and on
+# Debian pg_config / psql --version report the newest client package instead.
+PG_VER=$(psql_scalar "SELECT current_setting('server_version_num')::int / 10000;")
+case "$PG_VER" in ''|*[!0-9]*) PG_VER="" ;; esac
+if [ -z "$PG_VER" ]; then
+  # pg_config on PATH (Debian) -> versioned dir (RHEL) -> psql as last resort.
+  PG_VER=$(remote_cmd "{ pg_config --version 2>/dev/null \
+    || /usr/pgsql-*/bin/pg_config --version 2>/dev/null \
+    || psql --version 2>/dev/null; } | grep -oP '\\d+' | head -1" || echo "")
+fi
 
 # Absolute path to the pg_repack CLI, or empty when it is not installed.
 pg_repack_path() {
@@ -184,13 +213,13 @@ if [ -z "$PG_REPACK_BIN" ]; then
     # The family is detected WHERE THE INSTALL RUNS — the remote box in
     # two-server mode, inside takserver-db in container mode — not from the
     # console's os_type, which describes a different machine in both of those.
-    remote_cmd "if command -v apt-get >/dev/null 2>&1; then \
-  apt-get update -qq && apt-get install -y -qq postgresql-${PG_VER}-repack 2>&1; \
+    INSTALL_OUT=$(remote_cmd "if command -v apt-get >/dev/null 2>&1; then \
+  ${RSUDO}apt-get update -qq && ${RSUDO}apt-get install -y -qq postgresql-${PG_VER}-repack 2>&1; \
 elif command -v dnf >/dev/null 2>&1; then \
-  dnf install -y -q pg_repack_${PG_VER} 2>&1; \
+  ${RSUDO}dnf install -y -q pg_repack_${PG_VER} 2>&1; \
 elif command -v yum >/dev/null 2>&1; then \
-  yum install -y -q pg_repack_${PG_VER} 2>&1; \
-else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" >/dev/null
+  ${RSUDO}yum install -y -q pg_repack_${PG_VER} 2>&1; \
+else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" 2>&1)
     PG_REPACK_BIN=$(pg_repack_path)
     if [ -z "$PG_REPACK_BIN" ] && [ -n "$(remote_cmd 'command -v dnf 2>/dev/null')" ]; then
       # Known PGDG signature: a tty-less dnf run can die on an untrusted per-repo
@@ -198,25 +227,38 @@ else echo 'DB-REPACK: no supported package manager (apt-get/dnf/yum)'; fi" >/dev
       # systemd oneshot is exactly that. Refresh metadata once and retry before
       # declaring the platform unsupported. GPG checking stays ON.
       log_line "DB-REPACK: dnf install did not yield pg_repack, refreshing repo metadata and retrying"
-      remote_cmd "dnf clean all -q >/dev/null 2>&1; dnf -y -q makecache >/dev/null 2>&1; \
-dnf install -y -q pg_repack_${PG_VER} 2>&1" >/dev/null
+      INSTALL_OUT=$(remote_cmd "${RSUDO}dnf clean all -q >/dev/null 2>&1; ${RSUDO}dnf -y -q makecache >/dev/null 2>&1; \
+${RSUDO}dnf install -y -q pg_repack_${PG_VER} 2>&1" 2>&1)
       PG_REPACK_BIN=$(pg_repack_path)
     fi
   fi
   if [ -z "$PG_REPACK_BIN" ]; then
-    # Deliberately a FAILURE, not a clean skip (unlike the not-ready cases above):
-    # the operator pressed Online Compact and must be told it cannot run here —
-    # pg_repack has no package on every arch/PG combination — so they reach for
-    # Purge Old CoT or Compact Database instead of waiting on a silent no-op.
-    log_line "DB-REPACK: pg_repack is not available on this platform (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}) — Online Compact cannot run here. Use Purge Old CoT to free space, or Compact Database during a maintenance window."
-    exit 1
+    INSTALL_MSG=$(printf '%s' "${INSTALL_OUT:-}" | tr '\n' ' ' | cut -c1-200)
+    # ops #76: an install refused for lack of root is OUR bug, not a platform without a
+    # package. Saying "not available on this platform" for it hid the container-mode bug.
+    case "$INSTALL_OUT" in
+      *"superuser privileges"*|*"Permission denied"*|*"are you root"*|*"password is required"*|*"not in the sudoers"*)
+        log_line "DB-REPACK: pg_repack install was refused for lack of root on the database host (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}, install said: $INSTALL_MSG) — repack not run."
+        [ "$FORCE_RUN" = "1" ] && exit 1
+        exit 0 ;;
+    esac
+    if [ "$FORCE_RUN" = "1" ]; then
+      # A FAILURE, not a clean skip: the operator pressed Online Compact and must be told
+      # it cannot run here — pg_repack has no package on every arch/PG combination — so
+      # they reach for Purge Old CoT or Compact Database instead of waiting on a no-op.
+      log_line "DB-REPACK: pg_repack is not available on this platform (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}${INSTALL_MSG:+, install said: $INSTALL_MSG}) — Online Compact cannot run here. Use Purge Old CoT to free space, or Compact Database during a maintenance window."
+      exit 1
+    fi
+    # The weekly timer: nobody asked, so nobody is waiting on it. Say why and skip.
+    log_line "DB-REPACK: weekly repack skipped (clean) — pg_repack is not installed on the database host and could not be installed (arch=${DB_ARCH:-unknown}, pg=${PG_VER:-unknown}${INSTALL_MSG:+, install said: $INSTALL_MSG})"
+    exit 0
   fi
   log_line "DB-REPACK: pg_repack installed successfully (${PG_REPACK_BIN})"
 fi
 
 # Ensure extension is created in the database
 if [ "$TWO_SERVER_MODE" = "1" ]; then
-  remote_cmd "sudo -u postgres psql -d cot -c 'CREATE EXTENSION IF NOT EXISTS pg_repack;'" >/dev/null 2>&1
+  remote_cmd "sudo -n -u postgres psql -d cot -c 'CREATE EXTENSION IF NOT EXISTS pg_repack;'" >/dev/null 2>&1
 else
   # native-local → sudo -u postgres psql; container → docker exec -u postgres
   gd_psql_raw "CREATE EXTENSION IF NOT EXISTS pg_repack;" cot >/dev/null 2>&1
@@ -229,7 +271,7 @@ SIZE_BEFORE=$COT_GB
 log_line "DB-REPACK: starting online repack of cot database (${SIZE_BEFORE}GB)"
 if [ "$TWO_SERVER_MODE" = "1" ]; then
   # Absolute path (see the PATH note above) — `sudo -u postgres` drops secure_path.
-  REPACK_OUTPUT=$(remote_cmd "sudo -u postgres ${PG_REPACK_BIN} -d cot --no-superuser-check --wait-timeout=30 2>&1")
+  REPACK_OUTPUT=$(remote_cmd "sudo -n -u postgres ${PG_REPACK_BIN} -d cot --no-superuser-check --wait-timeout=30 2>&1")
 else
   # native-local → sudo -u postgres <abs path>; container → docker exec -u postgres
   REPACK_OUTPUT=$(gd_db_pg "$PG_REPACK_BIN" -d cot --no-superuser-check --wait-timeout=30)

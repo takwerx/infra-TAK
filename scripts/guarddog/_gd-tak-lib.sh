@@ -366,10 +366,13 @@ gd_tak_started_monotonic() {
 # gd_db_shell "<cmd>"  -> run an arbitrary shell command in the DB host context
 # as root (used by tak-db-repack for pg_repack install / pg_config). native →
 # bash -c on the host; container → root shell inside the db container.
+# v10.2.19 (ops #76): `-u root` is explicit. The takserver-db image sets USER postgres, so a
+# bare `docker exec` was a postgres shell and the pg_repack dnf install always failed with
+# "has to be run with superuser privileges" (aws-arm, container TAK on RHEL 10 / PG 18).
 gd_db_shell() {
   local cmd="$1"
   if gd_is_container; then
-    docker exec "$GD_DB_CONTAINER" bash -c "$cmd" 2>&1
+    docker exec -u root "$GD_DB_CONTAINER" bash -c "$cmd" 2>&1
   else
     bash -c "$cmd" 2>&1
   fi

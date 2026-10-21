@@ -89,6 +89,12 @@
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 {% from '_module_result.html' import last_update_result %}{{ last_update_result('takportal') }}
 </div>
+<div id="portal-auth-card" style="display:none;background:var(--bg-card);border:1px solid var(--red);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div style="font-weight:600;color:var(--red);margin-bottom:8px">&#9888; TAK Portal login is turned off: every signed-in user is a Global admin</div>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">TAK Portal's "Portal authentication" setting is off. With it off, TAK Portal gives full Global admin access to anyone who signs in through Authentik. This usually happens when TAK Portal's settings were reset to its defaults. <b>Press the button</b> to turn it back on. TAK Portal restarts (about 30 seconds); nothing else in it changes.</div>
+<button class="control-btn" id="portal-enable-auth-btn" type="button" style="border-color:var(--red);color:var(--red);font-weight:600">&#128274; Turn Portal login back on</button>
+<span id="portal-enable-auth-msg" style="margin-left:10px;font-size:12px"></span>
+</div>
 <div id="portal-address-card" style="display:none;background:var(--bg-card);border:1px solid var(--yellow);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div style="font-weight:600;color:var(--yellow);margin-bottom:8px">&#9888; TAK Portal needs a fix: it is still using this server's IP address</div>
 <div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">TAK Portal was set up before this server had its domain name, so these settings still point at the IP:</div>
@@ -360,20 +366,78 @@ async function portalUpdate(){
         ?'Beta Mode is ON in TAK Portal, so this follows the development tip (main), not a published release. Rebuilding container...'
         :'Updating to the latest GitHub Release and rebuilding container...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
-    try{
-        var r=await fetch('/api/takportal/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
-        var d;
-        try{d=r.ok?await r.json():{};}catch(_){d={};}
-        if(!r.ok&&d&&typeof d.error==='string'){ status.style.color='var(--red)'; status.textContent='✗ '+(d.error.length>100?d.error.slice(0,100)+'…':d.error); }
-        else if(d.success){
+    function _portalUpdateDone(){
+        btn.disabled=false;btn.innerHTML='⬆ Update';
+        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity='1'});
+    }
+    function _portalUpdateShow(d){
+        if(d&&d.success){
             status.style.color=d.rolled_back?'var(--yellow)':'var(--green)';
             var head=d.rolled_back?'↺ Rolled back':'✓ Updated';
             status.textContent=head+(d.pull?' — '+d.pull:'')+(d.version?' ('+d.version+')':'');
             setTimeout(function(){window.location.href='/takportal'},d.rolled_back?4000:1500);
-        }else{ status.style.color='var(--red)'; var msg=(d&&d.error)?String(d.error).slice(0,120):'Update failed'; if(msg.length>=120)msg+='…'; status.textContent='✗ '+msg+'. Try Start below.'; }
-    }catch(e){ status.style.color='var(--red)'; status.textContent='✗ Update failed — try Start below.'; }
-    btn.disabled=false;btn.innerHTML='⬆ Update';
-    document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity='1'});
+            return;
+        }
+        // The console's own reason, whole. This page used to parse the body only when r.ok, so a
+        // real failure (a git error, a build error) only ever read "Update failed".
+        status.style.color='var(--red)';
+        status.textContent='✗ '+((d&&d.error)?String(d.error):'Update failed')+(d&&d.hint?' '+d.hint:'');
+        _portalUpdateDone();
+    }
+    // ops #72: the update runs on the box as a background job; the POST only starts it and this
+    // page polls for the outcome. It used to be ONE request lasting the whole checkout + build,
+    // and a gateway in front of the console (Azure Application Gateway: 20 s by default) gave up
+    // first — "✗ Update failed. Try Start below." over a portal already running the new release
+    // (CORAZ, 2026-10-17). The job id read first tells THIS update from the one before it, so a
+    // POST that never arrives cannot be mistaken for a finished update.
+    var prevJob=null;
+    try{ var pr=await fetch('/api/takportal/update/status',{credentials:'same-origin'}); prevJob=((await pr.json())||{}).job||''; }catch(_){}
+    var myJob=null, started=Date.now();
+    function again(){
+        if(Date.now()-started<1200000){setTimeout(poll,5000);}else{window.location.href='/takportal';}
+    }
+    function poll(){
+        fetch('/api/takportal/update/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+            j=j||{};
+            // Ours: the id the POST returned, or (POST lost) a job newer than the one before it.
+            // With no prior id to compare against, only a job still running can be ours.
+            if(j.job&&(j.job===myJob||(!myJob&&(prevJob!==null?j.job!==prevJob:!!j.running)))){
+                myJob=j.job;
+                if(j.running){ again(); return; }
+                if(j.result){ _portalUpdateShow(j.result); return; }
+            }
+            if(!j.job&&myJob){
+                // The console restarted mid-update: the job is gone, its record says what happened.
+                var last=j.last||{};
+                if(last.outcome==='ok'){ _portalUpdateShow({success:true,version:last.to}); return; }
+                if(last.outcome==='failed'||last.outcome==='interrupted'){
+                    _portalUpdateShow({error:'Update failed'+(last.step&&last.step!=='started'?' at “'+last.step+'”':'')+': '+(last.error||'unknown error')}); return;
+                }
+            }
+            if(!myJob&&Date.now()-started>60000){
+                status.style.color='var(--red)';
+                status.textContent='✗ The update request did not reach the console, so nothing was changed. Press Update again.';
+                _portalUpdateDone(); return;
+            }
+            again();
+        }).catch(again);
+    }
+    try{
+        var r=await fetch('/api/takportal/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
+        var d=null;
+        try{ d=await r.json(); }catch(_pe){}
+        if(d&&d.started&&d.job){ myJob=d.job; }
+        else if(r.status===409&&d&&d.running){
+            myJob=d.job||null;
+            status.textContent='An update is already running on this console — showing its result when it finishes.';
+        }
+        // A gateway's own answer (HTML 502/504) says nothing about whether the job started; ask the box.
+        else if(d&&!(r.status===502||r.status===504)){ _portalUpdateShow(d); return; }
+    }catch(e){
+        // The POST itself dropped — it may still have started the job. Ask the box.
+        try{console.error('portalUpdate transport error (checking the box for the job):',e);}catch(_le){}
+    }
+    poll();
 }
 
 async function deployPortal(){
@@ -544,6 +608,8 @@ async function portalAddressCheck(){
     try{
         var r=await fetch('/api/takportal/address-check');
         var d=await r.json();
+        var authCard=document.getElementById('portal-auth-card');
+        if(authCard) authCard.style.display=(d&&d.auth_off)?'block':'none';
         var fields=(d&&d.fields)||[];
         if(!fields.length){card.style.display='none';return;}
         var list=document.getElementById('portal-address-list');
@@ -583,8 +649,29 @@ async function portalUseDomain(){
     }catch(e){msg.style.color='var(--red)';msg.textContent='\u2717 '+e.message;}
     btn.disabled=false;btn.style.opacity='1';
 }
+// v10.2.20 — TAK Portal login off (settings reset to TAK Portal's defaults): every signed-in
+// user is a Global admin. Shown by portalAddressCheck(); written only on this click.
+async function portalEnableAuth(){
+    var btn=document.getElementById('portal-enable-auth-btn');
+    var msg=document.getElementById('portal-enable-auth-msg');
+    btn.disabled=true;btn.style.opacity='0.5';
+    msg.style.color='var(--text-secondary)';msg.textContent='Turning TAK Portal login on and restarting it...';
+    try{
+        var r=await fetch('/api/takportal/enable-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        var d=await r.json();
+        if(d.success){
+            msg.style.color='var(--green)';msg.textContent='✓ '+(d.message||'Done');
+            setTimeout(portalAddressCheck,3000);
+        }else{
+            msg.style.color='var(--red)';msg.textContent='✗ '+(d.error||'Failed');
+        }
+    }catch(e){msg.style.color='var(--red)';msg.textContent='✗ '+e.message;}
+    btn.disabled=false;btn.style.opacity='1';
+}
 (function(){
     var btn=document.getElementById('portal-use-domain-btn');
+    var authBtn=document.getElementById('portal-enable-auth-btn');
+    if(authBtn) authBtn.addEventListener('click',portalEnableAuth);
     if(btn){btn.addEventListener('click',portalUseDomain);portalAddressCheck();}
 })();
 
