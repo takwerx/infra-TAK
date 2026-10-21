@@ -84115,6 +84115,30 @@ _KERNEL_PATCH_UNIT = 'infratak-kernel-patch.service'
 _KERNEL_PATCH_LOGFILE = '/var/log/takguard/kernel-patch.log'
 
 
+def _systemctl_show_tuple(out):
+    """`systemctl show -p LoadState,ActiveState,SubState,Result,MainPID` text ->
+    (load, active, sub, result, pid) — the same tuple _kernel_patch_unit_state() returns."""
+    load = active = sub = result = ''
+    pid = 0
+    for line in (out or '').splitlines():
+        k, _, v = line.partition('=')
+        v = v.strip()
+        if k == 'LoadState':
+            load = v
+        elif k == 'ActiveState':
+            active = v
+        elif k == 'SubState':
+            sub = v
+        elif k == 'Result':
+            result = v
+        elif k == 'MainPID':
+            try:
+                pid = int(v)
+            except ValueError:
+                pid = 0
+    return (load, active, sub, result, pid)
+
+
 def _kernel_patch_unit_state(unit=_KERNEL_PATCH_UNIT):
     """Return (load_state, active_state, sub_state, result, main_pid) for a transient
     unit — the kernel-patch unit by default; v10.3.0 W4 passes the OS-upgrade unit.
@@ -84143,80 +84167,29 @@ def _kernel_patch_unit_state(unit=_KERNEL_PATCH_UNIT):
              unit],
             capture_output=True, text=True, timeout=5
         )
-        out = r.stdout or ''
-        load = active = sub = result = ''
-        pid = 0
-        for line in out.splitlines():
-            if line.startswith('LoadState='):
-                load = line.split('=', 1)[1].strip()
-            elif line.startswith('ActiveState='):
-                active = line.split('=', 1)[1].strip()
-            elif line.startswith('SubState='):
-                sub = line.split('=', 1)[1].strip()
-            elif line.startswith('Result='):
-                result = line.split('=', 1)[1].strip()
-            elif line.startswith('MainPID='):
-                try:
-                    pid = int(line.split('=', 1)[1].strip())
-                except ValueError:
-                    pid = 0
-        return (load, active, sub, result, pid)
+        return _systemctl_show_tuple(r.stdout or '')
     except Exception:
         return ('', '', '', '', 0)
 
 
-def _kernel_patch_start_job():
-    """Fire `apt-get update && apt-get full-upgrade` as a transient systemd
-    unit. Returns (ok, message, pid_or_None).
+_KERNEL_PATCH_TAK_PKGS = 'takserver takserver-fed-hub'
+_KERNEL_PATCH_PKGS_RE = re.compile(r'^[a-z0-9][a-z0-9.+-]*( [a-z0-9][a-z0-9.+-]*)*$')
 
-    Why systemd-run vs subprocess.Popen: needrestart inside the apt run will
-    almost certainly restart takwerx-console.service (any libpython/libssl/
-    libc upgrade triggers it with NEEDRESTART_MODE=a). A plain Popen child
-    shares the parent's cgroup and would get killed. systemd-run creates a
-    transient unit in a separate cgroup that survives takwerx-console's
-    restart, daemon-reexec, etc.
 
-    Idempotent: if the transient unit is already active, refuses to spawn
-    another and returns the existing pid. If the unit is failed or
-    inactive, accepts the new request (and resets failed-state first so
-    systemd allows the re-start).
+def _kernel_patch_apt_script(tak_pkgs=_KERNEL_PATCH_TAK_PKGS, status_file=''):
+    """The apt leg of Install updates, as text. Pure function of its inputs.
+
+    Called with no arguments by the console's own patch job and byte-identical to the
+    inline script it replaced (v10.3.0 W4.e extracted it so a split install's database
+    server runs the SAME script — lock wait, retries, third-party-repo tolerance, TAK
+    holds, honest fetch-vs-install messages — not a copy that drifts).
+      tak_pkgs:    space-separated package names held for the run (validated).
+      status_file: when set, the script writes running / done / done:reboot-required /
+                   failed:updates there on exit. A remote job has no console beside it,
+                   and its transient unit is garbage-collected once it succeeds.
     """
-    if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
-        return (False, "systemd-run not found — cannot detach safely", None)
-    load, active, sub, result, pid = _kernel_patch_unit_state()
-    if active in ('active', 'activating') and pid:
-        return (False, f"kernel patch already running (pid {pid})", pid)
-    # v10.1.32 — the patch script's first statement is
-    #   apt-get update || { FATAL; exit $rc; }
-    # so an apt source still pointing at a vanished USB/ISO install medium makes
-    # OS patching fail forever on that box, quietly. This is the worst place for
-    # that entry to survive: the operator sees a failed patch job, not a broken
-    # apt source. Clear it before firing rather than after diagnosing it. No-op on
-    # cloud images and on RHEL.
-    _apt_disable_dead_local_sources()
-    # v10.2.10 (Cloudsmith 402): same for Caddy's Cloudsmith repo while it answers 402 — the field failure
-    # that left two operators' boxes unpatchable. Re-enabled here too once it is back.
-    _caddy_apt_repo_heal()
-    # If unit is in a failed state from a previous run, reset so systemd
-    # accepts a fresh start request with the same unit name. Only meaningful
-    # if LoadState=loaded — a transient unit that doesn't exist post-reboot
-    # has LoadState=not-found and reset-failed would be a no-op anyway.
-    if load == 'loaded' and active == 'failed':
-        try:
-            subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT]),
-                           capture_output=True, timeout=5)
-        except Exception:
-            pass
-    try:
-        _makedirs_priv(os.path.dirname(_KERNEL_PATCH_LOGFILE))
-    except Exception:
-        pass
-    # v10.0.1: which OS-upgrade command this job runs is package-manager
-    # specific. The apt script below is byte-identical to pre-v10 (critical
-    # regression surface); the dnf override for EL9 is applied right after.
-    pkg_mgr = (load_settings().get('pkg_mgr', 'apt') or 'apt').lower()
-    # Bash script body. Written to a tmp file rather than inlined into the
-    # systemd-run argv to keep the unit definition compact.
+    if not _KERNEL_PATCH_PKGS_RE.fullmatch(tak_pkgs or ''):
+        raise ValueError(f'bad package list {tak_pkgs!r}')
     script = (
         '#!/bin/bash\n'
         'set -o pipefail\n'
@@ -84324,6 +84297,79 @@ def _kernel_patch_start_job():
         'rm -f "$UPGLOG"\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
+    if tak_pkgs != _KERNEL_PATCH_TAK_PKGS:
+        script = script.replace('TAK_PKGS="' + _KERNEL_PATCH_TAK_PKGS + '"\n', 'TAK_PKGS="' + tak_pkgs + '"\n', 1)
+    if status_file:
+        if not re.fullmatch(r'/var/lib/infratak-[a-z-]+/status', status_file):
+            raise ValueError(f'bad status file {status_file!r}')
+        q = shlex.quote
+        script = script.replace(
+            'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) ==="\n',
+            f'STATUS={q(status_file)}\n'
+            'mkdir -p "$(dirname "$STATUS")" && echo "running:updates" > "$STATUS"\n'
+            'echo "[$(TS)] === infra-TAK updates job starting (pid $$) ==="\n', 1)
+        script = script.replace(
+            'trap release_holds EXIT\n',
+            'finish() { rc=$?; release_holds; if [ "$rc" -ne 0 ]; then echo "failed:updates" > "$STATUS"; '
+            'elif [ -f /var/run/reboot-required ]; then echo "done:reboot-required" > "$STATUS"; '
+            'else echo "done" > "$STATUS"; fi; }\n'
+            'trap finish EXIT\n', 1)
+    return script
+
+
+def _kernel_patch_start_job():
+    """Fire `apt-get update && apt-get full-upgrade` as a transient systemd
+    unit. Returns (ok, message, pid_or_None).
+
+    Why systemd-run vs subprocess.Popen: needrestart inside the apt run will
+    almost certainly restart takwerx-console.service (any libpython/libssl/
+    libc upgrade triggers it with NEEDRESTART_MODE=a). A plain Popen child
+    shares the parent's cgroup and would get killed. systemd-run creates a
+    transient unit in a separate cgroup that survives takwerx-console's
+    restart, daemon-reexec, etc.
+
+    Idempotent: if the transient unit is already active, refuses to spawn
+    another and returns the existing pid. If the unit is failed or
+    inactive, accepts the new request (and resets failed-state first so
+    systemd allows the re-start).
+    """
+    if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
+        return (False, "systemd-run not found — cannot detach safely", None)
+    load, active, sub, result, pid = _kernel_patch_unit_state()
+    if active in ('active', 'activating') and pid:
+        return (False, f"kernel patch already running (pid {pid})", pid)
+    # v10.1.32 — the patch script's first statement is
+    #   apt-get update || { FATAL; exit $rc; }
+    # so an apt source still pointing at a vanished USB/ISO install medium makes
+    # OS patching fail forever on that box, quietly. This is the worst place for
+    # that entry to survive: the operator sees a failed patch job, not a broken
+    # apt source. Clear it before firing rather than after diagnosing it. No-op on
+    # cloud images and on RHEL.
+    _apt_disable_dead_local_sources()
+    # v10.2.10 (Cloudsmith 402): same for Caddy's Cloudsmith repo while it answers 402 — the field failure
+    # that left two operators' boxes unpatchable. Re-enabled here too once it is back.
+    _caddy_apt_repo_heal()
+    # If unit is in a failed state from a previous run, reset so systemd
+    # accepts a fresh start request with the same unit name. Only meaningful
+    # if LoadState=loaded — a transient unit that doesn't exist post-reboot
+    # has LoadState=not-found and reset-failed would be a no-op anyway.
+    if load == 'loaded' and active == 'failed':
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT]),
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+    try:
+        _makedirs_priv(os.path.dirname(_KERNEL_PATCH_LOGFILE))
+    except Exception:
+        pass
+    # v10.0.1: which OS-upgrade command this job runs is package-manager
+    # specific. The apt script below is byte-identical to pre-v10 (critical
+    # regression surface); the dnf override for EL9 is applied right after.
+    pkg_mgr = (load_settings().get('pkg_mgr', 'apt') or 'apt').lower()
+    # Bash script body. Written to a tmp file rather than inlined into the
+    # systemd-run argv to keep the unit definition compact.
+    script = _kernel_patch_apt_script()
     if pkg_mgr == 'dnf':
         # EL9 (RHEL/Rocky/Alma/CentOS) path. Full `dnf -y upgrade`, the OS-wide
         # equivalent of apt full-upgrade, with the TAK Server packages EXCLUDED —
@@ -84686,6 +84732,179 @@ _OS_UPGRADE_IRREVERSIBLE = (
     'A failure after the package phase starts leaves a half-upgraded box: the status names the step, and the fix is your snapshot, not a retry.',
 )
 
+# v10.3.0 W4.e — the job script is built from shared fragments so the core job and the
+# database-server job (_os_upgrade_dbserver_script) run the SAME landmine handlers (L2-L6)
+# and the same UNCHANGED / PARTLY UPGRADED failure reporting. Plain literals only: every
+# value a script needs arrives as a shell variable set by its own header.
+_OS_UPGRADE_SH_FUNCS = (
+    'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
+    'step() { echo "running:$1" > "$STATUS"; echo "[$(TS)] === step $1 ==="; }\n'
+    # A failure that left every package exactly as it was (compared against the version list
+    # taken first thing in pre-snapshot) undoes the job's own temporary settings and says the
+    # box is unchanged — fix the cause, run it again. Anything else that is still 22.04 is
+    # partly upgraded: say so plainly, keep the pins (they protect a manual recovery), and
+    # point at the snapshot. On 24.04 the failing step's own message already says what to do.
+    'fail() {\n'
+    '  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"\n'
+    '  if [ ! -s "$PRE/dpkg-versions.txt" ] || dpkg-query -W -f=\'${Package} ${Version}\\n\' 2>/dev/null | sort | cmp -s - "$PRE/dpkg-versions.txt"; then\n'
+    '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+    '    [ -f "$PRE/release-upgrades" ] && cp -a "$PRE/release-upgrades" /etc/update-manager/release-upgrades\n'
+    '    echo "[$(TS)] UNCHANGED: no package was touched — this box is exactly as it was and the upgrade\'s temporary settings were removed. Fix the cause above and run the upgrade again."\n'
+    '  else\n'
+    '    . /etc/os-release\n'
+    '    [ "$VERSION_ID" = "22.04" ] && echo "[$(TS)] PARTLY UPGRADED: packages changed before the failure. Restore your snapshot; do not run the upgrade again on this box."\n'
+    '  fi\n'
+    '  exit 1\n'
+    '}\n'
+)
+
+_OS_UPGRADE_SH_OS_CHECK = (
+    '. /etc/os-release\n'
+    '[ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "22.04" ] || fail pre-snapshot "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 22.04"\n'
+)
+
+_OS_UPGRADE_SH_HOLDS = (
+    'HELD=""\n'
+    'PREHELD="$(apt-mark showhold 2>/dev/null)"\n'
+    'for p in $TAK_PKGS; do\n'
+    '  if dpkg -s "$p" >/dev/null 2>&1; then\n'
+    '    case " $PREHELD " in *" $p "*) : ;; *) apt-mark hold "$p" >/dev/null 2>&1 && HELD="$HELD $p" ;; esac\n'
+    '  fi\n'
+    'done\n'
+    'release_holds() { for p in $HELD; do apt-mark unhold "$p" >/dev/null 2>&1; done; [ -n "$HELD" ] && echo "[$(TS)] released TAK holds:$HELD"; }\n'
+    'trap release_holds EXIT\n'
+    'wait_for_apt() {\n'
+    '  local waited=0\n'
+    '  while [ "$waited" -lt 1800 ]; do\n'
+    '    local busy=0\n'
+    '    pgrep -f apt.systemd.daily >/dev/null 2>&1 && busy=1\n'
+    '    pgrep -x apt-get >/dev/null 2>&1 && busy=1\n'
+    '    pgrep -x apt >/dev/null 2>&1 && busy=1\n'
+    '    pgrep -x dpkg >/dev/null 2>&1 && busy=1\n'
+    '    pgrep -af unattended-upgrade 2>/dev/null | grep -qv unattended-upgrade-shutdown && busy=1\n'
+    '    [ "$busy" -eq 0 ] && return 0\n'
+    '    [ $((waited % 60)) -eq 0 ] && echo "[$(TS)] waiting for another apt/dpkg process to finish (${waited}s)"\n'
+    '    sleep 5; waited=$((waited+5))\n'
+    '  done\n'
+    '  return 1\n'
+    '}\n'
+    '\n'
+)
+
+_OS_UPGRADE_SH_SNAPSHOT_HEAD = (
+    # ---- 1. pre-snapshot ------------------------------------------------------
+    'step pre-snapshot\n'
+    'mkdir -p "$PRE/sources.list.d" "$PRE/apt" || fail pre-snapshot "cannot create $PRE"\n'
+    'rm -f "$PRE/dpkg-versions.txt"\n'
+    'dpkg-query -W -f=\'${Package} ${Version}\\n\' | sort > "$PRE/dpkg-versions.txt" || fail pre-snapshot "could not record the installed package versions"\n'
+    'cp -a /etc/apt/sources.list.d/*.list "$PRE/sources.list.d/" 2>/dev/null || true\n'
+    'cp -a /etc/apt/sources.list "$PRE/apt/sources.list" 2>/dev/null || true\n'
+    'cp -a /etc/ssl/openssl.cnf "$PRE/openssl.cnf" 2>/dev/null || true\n'
+    'cp -a /etc/update-manager/release-upgrades "$PRE/release-upgrades" 2>/dev/null || true\n'
+    'cp -a "$STATE_DIR/baseline.json" "$PRE/baseline.json" 2>/dev/null || true\n'
+    'dpkg --get-selections > "$PRE/dpkg-selections.txt" 2>/dev/null || true\n'
+)
+
+_OS_UPGRADE_SH_SNAPSHOT_TAIL = (
+    'echo "[$(TS)] pre-flip snapshot written to $PRE"\n'
+    # Prompt=lts: do-release-upgrade reads it through MetaReleaseCore; `never` makes it
+    # exit 1 with "upgrading is not possible". Corrected here (by the job the operator
+    # started), never as a side effect of looking (preflight).
+    'if [ -f /etc/update-manager/release-upgrades ] && grep -q "^Prompt=" /etc/update-manager/release-upgrades; then\n'
+    '  sed -i "s/^Prompt=.*/Prompt=lts/" /etc/update-manager/release-upgrades\n'
+    'else\n'
+    '  mkdir -p /etc/update-manager; printf "[DEFAULT]\\nPrompt=lts\\n" > /etc/update-manager/release-upgrades\n'
+    'fi\n'
+    '\n'
+)
+
+_OS_UPGRADE_SH_FLIP = (
+    # ---- 2. pin-pg16 ----------------------------------------------------------
+    'step pin-pg16\n'
+    # L2: noble's own postgresql-16 would be pulled in by the `postgresql` metapackage
+    # and its fresh cluster takes :5432 at boot, shoving TAK's PG 18 to 5433.
+    'cat > /etc/apt/preferences.d/infratak-no-pg16 <<\'EOF\'\n'
+    'Package: postgresql-16*\n'
+    'Pin: release *\n'
+    'Pin-Priority: -1\n'
+    'EOF\n'
+    # L6: keep obsolete packages — DistUpgradeConfigParser reads *.cfg here after
+    # the bundled DistUpgrade.cfg; doPostUpgrade() then logs "Skipping obsolete Removal".
+    'mkdir -p /etc/update-manager/release-upgrades.d\n'
+    'cat > /etc/update-manager/release-upgrades.d/infratak.cfg <<\'EOF\'\n'
+    '[Distro]\n'
+    'RemoveObsoletes=no\n'
+    'EOF\n'
+    # L4: keep every conffile we patched (openssl.cnf string_mask, sshd/hardening).
+    'cat > /etc/apt/apt.conf.d/99infratak-os-upgrade <<\'EOF\'\n'
+    'Dpkg::Options { "--force-confdef"; "--force-confold"; };\n'
+    'Acquire::Retries "3";\n'
+    'EOF\n'
+    'echo "[$(TS)] postgresql-16 pinned out; obsolete-package removal disabled; conffiles kept"\n'
+    '\n'
+    # ---- 3. release-upgrade ---------------------------------------------------
+    'step release-upgrade\n'
+    'wait_for_apt || fail release-upgrade "apt/dpkg still busy after 30 min"\n'
+    'echo "[$(TS)] do-release-upgrade -f DistUpgradeViewNonInteractive (this takes 15-45 minutes)"\n'
+    'do-release-upgrade -f DistUpgradeViewNonInteractive\n'
+    'rc=$?\n'
+    '. /etc/os-release\n'
+    'if [ "$rc" -ne 0 ]; then\n'
+    '  fail release-upgrade "do-release-upgrade exited $rc (its reason is the line above); this box reports ${PRETTY_NAME:-unknown}"\n'
+    'fi\n'
+    '[ "$VERSION_ID" = "24.04" ] || fail release-upgrade "do-release-upgrade exited 0 but /etc/os-release still says ${PRETTY_NAME:-unknown}"\n'
+    'echo "[$(TS)] now running $PRETTY_NAME"\n'
+    '\n'
+    # ---- 4. repos-noble -------------------------------------------------------
+    'step repos-noble\n'
+    # L3: the upgrader comments third-party entries out ("disabled on upgrade to noble")
+    # and leaves them saying jammy. Rewrite from the PRE-flip copy, not the mangled one.
+    'for f in "$PRE/sources.list.d/"*.list; do\n'
+    '  [ -e "$f" ] || continue\n'
+    '  b="$(basename "$f")"\n'
+    '  sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"\n'
+    '  echo "[$(TS)] re-enabled $b (jammy -> noble)"\n'
+    'done\n'
+    'rm -f /etc/apt/sources.list.d/*.distUpgrade 2>/dev/null\n'
+    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
+    'UPDLOG="$(mktemp)"\n'
+    'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
+    'rc=${PIPESTATUS[0]}\n'
+    'if [ "$rc" -ne 0 ]; then\n'
+    '  ERRS="$(grep -E "^E: " "$UPDLOG" | grep -v "Some index files failed to download")"\n'
+    '  OTHER="$(grep -vE "$THIRD_PARTY" <<< "$ERRS" | grep -v "^$")"\n'
+    '  if [ -n "$ERRS" ] && [ -z "$OTHER" ]; then\n'
+    '    echo "[$(TS)] WARN: a third-party repository could not be refreshed (see the E: lines above); the Ubuntu sources are clean, continuing"\n'
+    '  else\n'
+    '    rm -f "$UPDLOG"; fail repos-noble "apt-get update failed (exit $rc) after re-pointing the repositories at noble"\n'
+    '  fi\n'
+    'fi\n'
+    'rm -f "$UPDLOG"\n'
+    '\n'
+)
+
+_OS_UPGRADE_SH_PG_CHECK = (
+    'if [ -n "$PG_EXPECT" ]; then\n'
+    '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot"; fi\n'
+    '  CL="$(pg_lsclusters --no-header 2>/dev/null)"\n'
+    '  echo "[$(TS)] pg_lsclusters: ${CL:-none}"\n'
+    '  N="$(printf "%s\\n" "$CL" | grep -c .)"\n'
+    '  [ "$N" -eq 1 ] || fail reassert "expected exactly one PostgreSQL cluster, found $N: $CL"\n'
+    '  printf "%s\\n" "$CL" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online" || fail reassert "expected PostgreSQL ${PG_EXPECT} on 5432 online, found: $CL"\n'
+    'fi\n'
+)
+
+_OS_UPGRADE_SH_REBOOT = (
+    # ---- 8. reboot ------------------------------------------------------------
+    'step reboot\n'
+    'release_holds; HELD=""\n'
+    'echo "rebooting" > "$STATUS"\n'
+    'echo "[$(TS)] === DONE (pre-reboot) — rebooting into Ubuntu 24.04; the console verifies after boot ==="\n'
+    'sync\n'
+    'systemctl reboot\n'
+)
+
+
 
 def _os_upgrade_unit_state():
     return _kernel_patch_unit_state(_OS_UPGRADE_UNIT)
@@ -84762,6 +84981,12 @@ def _os_upgrade_running_jobs():
         with open(_NONROOT_MIGRATE_STATUS) as f:
             if f.read().strip() == 'running':
                 busy.append('nonroot-migrate')
+    except Exception:
+        pass
+    try:
+        _db_rec = _dbserver_record_read()
+        if _dbserver_in_flight(_db_rec):
+            busy.append('database-server ' + (_db_rec.get('job') or 'job'))
     except Exception:
         pass
     return busy
@@ -85087,211 +85312,87 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
     Each step writes `running:<step>` to the status file BEFORE doing anything, so a
     failure (`failed:<step>`) names the step that hit it."""
     q = shlex.quote
-    return (
-        '#!/bin/bash\n'
-        '# infra-TAK OS upgrade job (Ubuntu 22.04 -> 24.04). Written by the console, run as root\n'
-        '# in the transient unit infratak-os-upgrade. Do not run by hand.\n'
-        'set -o pipefail\n'
-        'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a RELEASE_UPGRADER_NO_SCREEN=1\n'
-        f'STATE_DIR={q(_OS_UPGRADE_DIR)}\n'
-        f'STATUS={q(_OS_UPGRADE_STATUS)}\n'
-        'PRE="$STATE_DIR/pre"\n'
-        f'INSTALL_DIR={q(install_dir)}\n'
-        f'CONSOLE_USER={q(console_user)}\n'
-        f'CONSOLE_PORT={q(str(console_port))}\n'
-        f'PG_EXPECT={q(pg_expect)}\n'
-        'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
-        'step() { echo "running:$1" > "$STATUS"; echo "[$(TS)] === step $1 ==="; }\n'
-        # A failure that left every package exactly as it was (compared against the version list
-        # taken first thing in pre-snapshot) undoes the job's own temporary settings and says the
-        # box is unchanged — fix the cause, run it again. Anything else that is still 22.04 is
-        # partly upgraded: say so plainly, keep the pins (they protect a manual recovery), and
-        # point at the snapshot. On 24.04 the failing step's own message already says what to do.
-        'fail() {\n'
-        '  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"\n'
-        '  if [ ! -s "$PRE/dpkg-versions.txt" ] || dpkg-query -W -f=\'${Package} ${Version}\\n\' 2>/dev/null | sort | cmp -s - "$PRE/dpkg-versions.txt"; then\n'
-        '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
-        '    [ -f "$PRE/release-upgrades" ] && cp -a "$PRE/release-upgrades" /etc/update-manager/release-upgrades\n'
-        '    echo "[$(TS)] UNCHANGED: no package was touched — this box is exactly as it was and the upgrade\'s temporary settings were removed. Fix the cause above and run the upgrade again."\n'
-        '  else\n'
-        '    . /etc/os-release\n'
-        '    [ "$VERSION_ID" = "22.04" ] && echo "[$(TS)] PARTLY UPGRADED: packages changed before the failure. Restore your snapshot; do not run the upgrade again on this box."\n'
-        '  fi\n'
-        '  exit 1\n'
-        '}\n'
-        'echo "[$(TS)] === infra-TAK OS upgrade 22.04 -> 24.04 starting (pid $$) ==="\n'
-        '. /etc/os-release\n'
-        '[ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "22.04" ] || fail pre-snapshot "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 22.04"\n'
-        '[ -d "$INSTALL_DIR/.venv" ] || fail pre-snapshot "console venv $INSTALL_DIR/.venv not found"\n'
-        # Same TAK hold the kernel-patch job takes: an OS flip must never resume a
-        # half-configured TAK package (v0.9.44). Released on exit, reboot included.
-        'TAK_PKGS="takserver takserver-fed-hub"\n'
-        'HELD=""\n'
-        'PREHELD="$(apt-mark showhold 2>/dev/null)"\n'
-        'for p in $TAK_PKGS; do\n'
-        '  if dpkg -s "$p" >/dev/null 2>&1; then\n'
-        '    case " $PREHELD " in *" $p "*) : ;; *) apt-mark hold "$p" >/dev/null 2>&1 && HELD="$HELD $p" ;; esac\n'
-        '  fi\n'
-        'done\n'
-        'release_holds() { for p in $HELD; do apt-mark unhold "$p" >/dev/null 2>&1; done; [ -n "$HELD" ] && echo "[$(TS)] released TAK holds:$HELD"; }\n'
-        'trap release_holds EXIT\n'
-        'wait_for_apt() {\n'
-        '  local waited=0\n'
-        '  while [ "$waited" -lt 1800 ]; do\n'
-        '    local busy=0\n'
-        '    pgrep -f apt.systemd.daily >/dev/null 2>&1 && busy=1\n'
-        '    pgrep -x apt-get >/dev/null 2>&1 && busy=1\n'
-        '    pgrep -x apt >/dev/null 2>&1 && busy=1\n'
-        '    pgrep -x dpkg >/dev/null 2>&1 && busy=1\n'
-        '    pgrep -af unattended-upgrade 2>/dev/null | grep -qv unattended-upgrade-shutdown && busy=1\n'
-        '    [ "$busy" -eq 0 ] && return 0\n'
-        '    [ $((waited % 60)) -eq 0 ] && echo "[$(TS)] waiting for another apt/dpkg process to finish (${waited}s)"\n'
-        '    sleep 5; waited=$((waited+5))\n'
-        '  done\n'
-        '  return 1\n'
-        '}\n'
-        '\n'
-        # ---- 1. pre-snapshot ------------------------------------------------------
-        'step pre-snapshot\n'
-        'mkdir -p "$PRE/sources.list.d" "$PRE/apt" || fail pre-snapshot "cannot create $PRE"\n'
-        'rm -f "$PRE/dpkg-versions.txt"\n'
-        'dpkg-query -W -f=\'${Package} ${Version}\\n\' | sort > "$PRE/dpkg-versions.txt" || fail pre-snapshot "could not record the installed package versions"\n'
-        'cp -a /etc/apt/sources.list.d/*.list "$PRE/sources.list.d/" 2>/dev/null || true\n'
-        'cp -a /etc/apt/sources.list "$PRE/apt/sources.list" 2>/dev/null || true\n'
-        'cp -a /etc/ssl/openssl.cnf "$PRE/openssl.cnf" 2>/dev/null || true\n'
-        'cp -a /etc/update-manager/release-upgrades "$PRE/release-upgrades" 2>/dev/null || true\n'
-        'cp -a "$STATE_DIR/baseline.json" "$PRE/baseline.json" 2>/dev/null || true\n'
-        'dpkg --get-selections > "$PRE/dpkg-selections.txt" 2>/dev/null || true\n'
-        'rm -rf "$PRE/venv"\n'
-        'cp -a "$INSTALL_DIR/.venv" "$PRE/venv" || fail pre-snapshot "could not copy the console venv to $PRE/venv"\n'
-        'echo "[$(TS)] pre-flip snapshot written to $PRE"\n'
-        # Prompt=lts: do-release-upgrade reads it through MetaReleaseCore; `never` makes it
-        # exit 1 with "upgrading is not possible". Corrected here (by the job the operator
-        # started), never as a side effect of looking (preflight).
-        'if [ -f /etc/update-manager/release-upgrades ] && grep -q "^Prompt=" /etc/update-manager/release-upgrades; then\n'
-        '  sed -i "s/^Prompt=.*/Prompt=lts/" /etc/update-manager/release-upgrades\n'
-        'else\n'
-        '  mkdir -p /etc/update-manager; printf "[DEFAULT]\\nPrompt=lts\\n" > /etc/update-manager/release-upgrades\n'
-        'fi\n'
-        '\n'
-        # ---- 2. pin-pg16 ----------------------------------------------------------
-        'step pin-pg16\n'
-        # L2: noble's own postgresql-16 would be pulled in by the `postgresql` metapackage
-        # and its fresh cluster takes :5432 at boot, shoving TAK's PG 18 to 5433.
-        'cat > /etc/apt/preferences.d/infratak-no-pg16 <<\'EOF\'\n'
-        'Package: postgresql-16*\n'
-        'Pin: release *\n'
-        'Pin-Priority: -1\n'
-        'EOF\n'
-        # L6: keep obsolete packages — DistUpgradeConfigParser reads *.cfg here after
-        # the bundled DistUpgrade.cfg; doPostUpgrade() then logs "Skipping obsolete Removal".
-        'mkdir -p /etc/update-manager/release-upgrades.d\n'
-        'cat > /etc/update-manager/release-upgrades.d/infratak.cfg <<\'EOF\'\n'
-        '[Distro]\n'
-        'RemoveObsoletes=no\n'
-        'EOF\n'
-        # L4: keep every conffile we patched (openssl.cnf string_mask, sshd/hardening).
-        'cat > /etc/apt/apt.conf.d/99infratak-os-upgrade <<\'EOF\'\n'
-        'Dpkg::Options { "--force-confdef"; "--force-confold"; };\n'
-        'Acquire::Retries "3";\n'
-        'EOF\n'
-        'echo "[$(TS)] postgresql-16 pinned out; obsolete-package removal disabled; conffiles kept"\n'
-        '\n'
-        # ---- 3. release-upgrade ---------------------------------------------------
-        'step release-upgrade\n'
-        'wait_for_apt || fail release-upgrade "apt/dpkg still busy after 30 min"\n'
-        'echo "[$(TS)] do-release-upgrade -f DistUpgradeViewNonInteractive (this takes 15-45 minutes)"\n'
-        'do-release-upgrade -f DistUpgradeViewNonInteractive\n'
-        'rc=$?\n'
-        '. /etc/os-release\n'
-        'if [ "$rc" -ne 0 ]; then\n'
-        '  fail release-upgrade "do-release-upgrade exited $rc (its reason is the line above); this box reports ${PRETTY_NAME:-unknown}"\n'
-        'fi\n'
-        '[ "$VERSION_ID" = "24.04" ] || fail release-upgrade "do-release-upgrade exited 0 but /etc/os-release still says ${PRETTY_NAME:-unknown}"\n'
-        'echo "[$(TS)] now running $PRETTY_NAME"\n'
-        '\n'
-        # ---- 4. repos-noble -------------------------------------------------------
-        'step repos-noble\n'
-        # L3: the upgrader comments third-party entries out ("disabled on upgrade to noble")
-        # and leaves them saying jammy. Rewrite from the PRE-flip copy, not the mangled one.
-        'for f in "$PRE/sources.list.d/"*.list; do\n'
-        '  [ -e "$f" ] || continue\n'
-        '  b="$(basename "$f")"\n'
-        '  sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"\n'
-        '  echo "[$(TS)] re-enabled $b (jammy -> noble)"\n'
-        'done\n'
-        'rm -f /etc/apt/sources.list.d/*.distUpgrade 2>/dev/null\n'
-        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
-        'UPDLOG="$(mktemp)"\n'
-        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
-        'rc=${PIPESTATUS[0]}\n'
-        'if [ "$rc" -ne 0 ]; then\n'
-        '  ERRS="$(grep -E "^E: " "$UPDLOG" | grep -v "Some index files failed to download")"\n'
-        '  OTHER="$(grep -vE "$THIRD_PARTY" <<< "$ERRS" | grep -v "^$")"\n'
-        '  if [ -n "$ERRS" ] && [ -z "$OTHER" ]; then\n'
-        '    echo "[$(TS)] WARN: a third-party repository could not be refreshed (see the E: lines above); the Ubuntu sources are clean, continuing"\n'
-        '  else\n'
-        '    rm -f "$UPDLOG"; fail repos-noble "apt-get update failed (exit $rc) after re-pointing the repositories at noble"\n'
-        '  fi\n'
-        'fi\n'
-        'rm -f "$UPDLOG"\n'
-        '\n'
-        # ---- 5. venv-rebuild ------------------------------------------------------
-        'step venv-rebuild\n'
-        # L1: the venv was built for python3.10; noble is 3.12 and the console will not
-        # start on it. Rebuild as the console user BEFORE the console is restarted.
-        'wait_for_apt || fail venv-rebuild "apt/dpkg still busy after 30 min"\n'
-        'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-venv python3-pip || fail venv-rebuild "could not install python3-venv on the new release"\n'
-        'echo "[$(TS)] rebuilding $INSTALL_DIR/.venv with $(python3 --version 2>&1)"\n'
-        'rm -rf "$INSTALL_DIR/.venv"\n'
-        'if runuser -u "$CONSOLE_USER" -- bash -c "cd \\"$INSTALL_DIR\\" && python3 -m venv .venv && .venv/bin/pip install --upgrade pip wheel && .venv/bin/pip install -r requirements.txt"; then\n'
-        '  echo "[$(TS)] venv rebuilt: $("$INSTALL_DIR/.venv/bin/python3" --version 2>&1)"\n'
-        'else\n'
-        '  rm -rf "$INSTALL_DIR/.venv"; cp -a "$PRE/venv" "$INSTALL_DIR/.venv"\n'
-        '  fail venv-rebuild "pip install failed on the new python. The pre-upgrade venv was put back but it is built for python 3.10, so the console cannot start until it is rebuilt: run \'cd $INSTALL_DIR && sudo ./start.sh\'"\n'
-        'fi\n'
-        '\n'
-        # ---- 6. reassert ----------------------------------------------------------
-        'step reassert\n'
-        # L4 belt-and-braces: the conffile should have been kept; assert the one line we care about.
-        'if [ -f /etc/ssl/openssl.cnf ] && grep -q "^string_mask = utf8only" /etc/ssl/openssl.cnf; then\n'
-        '  sed -i "s/^string_mask = utf8only/string_mask = nombstr/" /etc/ssl/openssl.cnf && echo "[$(TS)] re-applied string_mask = nombstr"\n'
-        'fi\n'
-        'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-pip python3-venv openssl sshpass git wget curl ca-certificates || fail reassert "base dependencies could not be installed"\n'
-        'if [ -n "$PG_EXPECT" ]; then\n'
-        '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot"; fi\n'
-        '  CL="$(pg_lsclusters --no-header 2>/dev/null)"\n'
-        '  echo "[$(TS)] pg_lsclusters: ${CL:-none}"\n'
-        '  N="$(printf "%s\\n" "$CL" | grep -c .)"\n'
-        '  [ "$N" -eq 1 ] || fail reassert "expected exactly one PostgreSQL cluster, found $N: $CL"\n'
-        '  printf "%s\\n" "$CL" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online" || fail reassert "expected PostgreSQL ${PG_EXPECT} on 5432 online, found: $CL"\n'
-        'fi\n'
-        'if systemctl list-unit-files docker.service >/dev/null 2>&1 && systemctl list-unit-files docker.service | grep -q docker.service; then systemctl enable docker >/dev/null 2>&1 || true; fi\n'
-        'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
-        'echo "[$(TS)] reassert complete"\n'
-        '\n'
-        # ---- 7. restart-console ---------------------------------------------------
-        'step restart-console\n'
-        'systemctl daemon-reload\n'
-        'if systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker; then systemctl restart takwerx-broker || echo "[$(TS)] WARN: takwerx-broker restart returned $?"; fi\n'
-        'systemctl restart takwerx-console || fail restart-console "takwerx-console did not restart (journalctl -u takwerx-console)"\n'
-        'UP=0\n'
-        'for i in $(seq 1 60); do\n'
-        '  code="$(curl -ksS -o /dev/null -w "%{http_code}" "https://127.0.0.1:${CONSOLE_PORT}/login" 2>/dev/null)"\n'
-        '  case "$code" in 2*|3*|4*) UP=1; break ;; esac\n'
-        '  sleep 2\n'
-        'done\n'
-        '[ "$UP" -eq 1 ] || fail restart-console "the console did not answer on :${CONSOLE_PORT} within 120 s after the restart (journalctl -u takwerx-console)"\n'
-        'echo "[$(TS)] console answering on :${CONSOLE_PORT} with the rebuilt venv"\n'
-        '\n'
-        # ---- 8. reboot ------------------------------------------------------------
-        'step reboot\n'
-        'release_holds; HELD=""\n'
-        'echo "rebooting" > "$STATUS"\n'
-        'echo "[$(TS)] === DONE (pre-reboot) — rebooting into Ubuntu 24.04; the console verifies after boot ==="\n'
-        'sync\n'
-        'systemctl reboot\n'
-    )
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK OS upgrade job (Ubuntu 22.04 -> 24.04). Written by the console, run as root\n'
+            '# in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a RELEASE_UPGRADER_NO_SCREEN=1\n'
+            f'STATE_DIR={q(_OS_UPGRADE_DIR)}\n'
+            f'STATUS={q(_OS_UPGRADE_STATUS)}\n'
+            'PRE="$STATE_DIR/pre"\n'
+            f'INSTALL_DIR={q(install_dir)}\n'
+            f'CONSOLE_USER={q(console_user)}\n'
+            f'CONSOLE_PORT={q(str(console_port))}\n'
+            f'PG_EXPECT={q(pg_expect)}\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        (
+            'echo "[$(TS)] === infra-TAK OS upgrade 22.04 -> 24.04 starting (pid $$) ==="\n'
+        ),
+        _OS_UPGRADE_SH_OS_CHECK,
+        (
+            '[ -d "$INSTALL_DIR/.venv" ] || fail pre-snapshot "console venv $INSTALL_DIR/.venv not found"\n'
+            # Same TAK hold the kernel-patch job takes: an OS flip must never resume a
+            # half-configured TAK package (v0.9.44). Released on exit, reboot included.
+            'TAK_PKGS="takserver takserver-fed-hub"\n'
+        ),
+        _OS_UPGRADE_SH_HOLDS,
+        _OS_UPGRADE_SH_SNAPSHOT_HEAD,
+        (
+            'rm -rf "$PRE/venv"\n'
+            'cp -a "$INSTALL_DIR/.venv" "$PRE/venv" || fail pre-snapshot "could not copy the console venv to $PRE/venv"\n'
+        ),
+        _OS_UPGRADE_SH_SNAPSHOT_TAIL,
+        _OS_UPGRADE_SH_FLIP,
+        (
+            # ---- 5. venv-rebuild ------------------------------------------------------
+            'step venv-rebuild\n'
+            # L1: the venv was built for python3.10; noble is 3.12 and the console will not
+            # start on it. Rebuild as the console user BEFORE the console is restarted.
+            'wait_for_apt || fail venv-rebuild "apt/dpkg still busy after 30 min"\n'
+            'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-venv python3-pip || fail venv-rebuild "could not install python3-venv on the new release"\n'
+            'echo "[$(TS)] rebuilding $INSTALL_DIR/.venv with $(python3 --version 2>&1)"\n'
+            'rm -rf "$INSTALL_DIR/.venv"\n'
+            'if runuser -u "$CONSOLE_USER" -- bash -c "cd \\"$INSTALL_DIR\\" && python3 -m venv .venv && .venv/bin/pip install --upgrade pip wheel && .venv/bin/pip install -r requirements.txt"; then\n'
+            '  echo "[$(TS)] venv rebuilt: $("$INSTALL_DIR/.venv/bin/python3" --version 2>&1)"\n'
+            'else\n'
+            '  rm -rf "$INSTALL_DIR/.venv"; cp -a "$PRE/venv" "$INSTALL_DIR/.venv"\n'
+            '  fail venv-rebuild "pip install failed on the new python. The pre-upgrade venv was put back but it is built for python 3.10, so the console cannot start until it is rebuilt: run \'cd $INSTALL_DIR && sudo ./start.sh\'"\n'
+            'fi\n'
+            '\n'
+            # ---- 6. reassert ----------------------------------------------------------
+            'step reassert\n'
+            # L4 belt-and-braces: the conffile should have been kept; assert the one line we care about.
+            'if [ -f /etc/ssl/openssl.cnf ] && grep -q "^string_mask = utf8only" /etc/ssl/openssl.cnf; then\n'
+            '  sed -i "s/^string_mask = utf8only/string_mask = nombstr/" /etc/ssl/openssl.cnf && echo "[$(TS)] re-applied string_mask = nombstr"\n'
+            'fi\n'
+            'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-pip python3-venv openssl sshpass git wget curl ca-certificates || fail reassert "base dependencies could not be installed"\n'
+        ),
+        _OS_UPGRADE_SH_PG_CHECK,
+        (
+            'if systemctl list-unit-files docker.service >/dev/null 2>&1 && systemctl list-unit-files docker.service | grep -q docker.service; then systemctl enable docker >/dev/null 2>&1 || true; fi\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'echo "[$(TS)] reassert complete"\n'
+            '\n'
+            # ---- 7. restart-console ---------------------------------------------------
+            'step restart-console\n'
+            'systemctl daemon-reload\n'
+            'if systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker; then systemctl restart takwerx-broker || echo "[$(TS)] WARN: takwerx-broker restart returned $?"; fi\n'
+            'systemctl restart takwerx-console || fail restart-console "takwerx-console did not restart (journalctl -u takwerx-console)"\n'
+            'UP=0\n'
+            'for i in $(seq 1 60); do\n'
+            '  code="$(curl -ksS -o /dev/null -w "%{http_code}" "https://127.0.0.1:${CONSOLE_PORT}/login" 2>/dev/null)"\n'
+            '  case "$code" in 2*|3*|4*) UP=1; break ;; esac\n'
+            '  sleep 2\n'
+            'done\n'
+            '[ "$UP" -eq 1 ] || fail restart-console "the console did not answer on :${CONSOLE_PORT} within 120 s after the restart (journalctl -u takwerx-console)"\n'
+            'echo "[$(TS)] console answering on :${CONSOLE_PORT} with the rebuilt venv"\n'
+            '\n'
+        ),
+        _OS_UPGRADE_SH_REBOOT,
+    ))
 
 
 def _os_upgrade_start_job(data):
@@ -85553,6 +85654,968 @@ def console_os_upgrade_log_api():
         return jsonify({'ok': False, 'error': 'not available on this operating system'}), 404
     present, tail = _os_upgrade_log_tail()
     return jsonify({'ok': True, 'present': present, 'log': tail})
+
+
+# =============================================================================
+# v10.3.0 W4.e — a split install's DATABASE server (Server One), from the core console.
+# PLAN-v10.3.0-W4e-dbserver-upgrade.md.
+#
+# The core's own upgrade (above) leaves a two_server database server alone and says so
+# (preflight `tak_db_local`). This is the other half: Install updates, Reboot, and the
+# 22.04 -> 24.04 upgrade for THAT box, driven over the SSH config the console already holds
+# for it (_ssh_probe / _scp_to_host: the console user, the stored key, `sudo -n` on the far
+# side — the trust boundary every Server One deploy step already crosses; no broker change,
+# no new port). Everything that matters runs ON the database server as a transient systemd
+# unit, so it survives the SSH session, a console restart and a core reboot. The core only
+# installs the script (sha256-checked), launches it, and watches.
+#
+# Every long remote job before this one (the 5.8 migration's pg_dump / upgrade-db.sh, the DB
+# host move) is ONE blocking SSH call that a console restart kills. A release upgrade takes
+# 15-45 min and reboots the box at the end; it cannot be done that way.
+#
+# Proof is read on the database server as `postgres` (peer auth, no password): TAK's martiuser
+# sessions in pg_stat_activity, encrypted per pg_stat_ssl. The martiuser password never leaves
+# the core — _verify_server_one_db_password() puts it on Server One's command line, so it is
+# deliberately not used here.
+_DBSERVER_ACK = 'I have a snapshot of the database server'
+_DBSERVER_RECORD = os.path.join(CONFIG_DIR, 'dbserver-job.json')
+_DBSERVER_JOBS = {
+    'os-upgrade': {'unit': 'infratak-os-upgrade', 'script': '/var/lib/infratak-os-upgrade.sh',
+                   'dir': '/var/lib/infratak-os-upgrade', 'log': '/var/log/infratak-os-upgrade.log',
+                   'title': 'database server OS upgrade Ubuntu 22.04 -> 24.04'},
+    'updates': {'unit': 'infratak-updates', 'script': '/var/lib/infratak-updates.sh',
+                'dir': '/var/lib/infratak-updates', 'log': '/var/log/infratak-updates.log',
+                'title': 'database server Install updates'},
+}
+_DBSERVER_OS_STEPS = ('pre-snapshot', 'db-dump', 'pin-pg16', 'release-upgrade', 'repos-noble',
+                      'reassert', 'reboot')
+_DBSERVER_MIN_ROOT_GB = 5        # no venv, no image re-pulls here — the core's floor is 10
+_DBSERVER_DUMP_FACTOR = 1.2      # room for the verified pg_dump the job takes first
+_DBSERVER_SERVICES = ('postgresql@18-main', 'tak-db-health', 'fail2ban', 'ssh', 'ufw',
+                      'unattended-upgrades')
+_DBSERVER_POLL_S = 30
+_DBSERVER_REBOOT_WAIT_S = 1800   # no SSH this long after the reboot -> failed:verify:unreachable
+_DBSERVER_PG_WAIT_S = 300        # PostgreSQL gets this long to answer once SSH is back
+_DBSERVER_RECONNECT_S = 600      # then TAK Server gets this long to reconnect by itself
+_DBSERVER_STANDDOWN = '/var/lib/takguard/dbserver-maintenance'
+_DBSERVER_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800}
+_DBSERVER_IRREVERSIBLE = (
+    'The database server goes from Ubuntu 22.04 to Ubuntu 24.04. do-release-upgrade has no rollback; the only way back is the snapshot of the database server you take BEFORE pressing Start.',
+    'Every package on the database server is replaced and it reboots at the end. PostgreSQL 18 and the TAK database are kept as they are; the job takes a verified database dump on the database server first.',
+    'TAK Server stays up and devices stay connected, but nothing is saved to or read from the database while it is down (CoT history, DataSync missions). Expect 15-45 minutes.',
+    'Guard Dog\'s database checks pause while the job runs, so it does not restart PostgreSQL in the middle of the upgrade. They resume when the job ends, or after 3 hours at the latest.',
+    'A failure after the package phase starts leaves a half-upgraded database server: the status names the step, and the fix is your snapshot, not a retry.',
+)
+_dbserver_lock = threading.Lock()
+_dbserver_start_lock = threading.Lock()
+_dbserver_watch_active = False
+_dbserver_log_cache = {}
+
+# The read-only probe, run on the database server as root by `python3 -I -c`. Built only from
+# the constants substituted below (_dbserver_probe_text) — no settings value is ever in it.
+# Prints ONE line: INFRATAK-PROBE <json>.
+_DBSERVER_PROBE_PY = r'''
+import json, os, subprocess, urllib.request
+MODE = '@@MODE@@'
+PENDING_PY = @@PENDING_PY@@
+SERVICES = @@SERVICES@@
+JOBS = @@JOBS@@
+out = {'mode': MODE}
+def run(argv, t=30):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=t)
+        return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+    except Exception as e:
+        return 127, '', str(e)[:200]
+def psql(sql):
+    rc, o, e = run(['runuser', '-u', 'postgres', '--', 'psql', '-X', '-q', '-tA', '-F', '|', '-c', sql])
+    return o if rc == 0 else None
+def readf(path, limit=4096):
+    try:
+        with open(path, 'rb') as f:
+            return f.read(limit).decode('utf-8', 'replace')
+    except Exception:
+        return None
+osr = {}
+for line in (readf('/etc/os-release') or '').splitlines():
+    if '=' in line:
+        k, v = line.split('=', 1)
+        osr[k] = v.strip().strip('"')
+out['os_id'] = osr.get('ID', '')
+out['os_version'] = osr.get('VERSION_ID', '')
+out['os_pretty'] = osr.get('PRETTY_NAME', '')
+out['arch'] = os.uname().machine
+out['boot_id'] = (readf('/proc/sys/kernel/random/boot_id') or '').strip()
+out['jobs'] = {}
+for name, j in JOBS.items():
+    rc, o, e = run(['systemctl', 'show', '-p', 'LoadState,ActiveState,SubState,Result,MainPID', j['unit'] + '.service'], 10)
+    out['jobs'][name] = {'status': (readf(j['dir'] + '/status') or '').strip(), 'show': o}
+rc, o, e = run(['pg_lsclusters', '--no-header'], 15)
+out['clusters'] = [l.split()[:4] for l in o.splitlines() if l.strip()] if rc == 0 else []
+out['pg_ready'] = run(['pg_isready', '-q'], 10)[0] == 0
+m = psql("SELECT count(*), count(*) FILTER (WHERE s.ssl) FROM pg_stat_activity a LEFT JOIN pg_stat_ssl s ON s.pid = a.pid WHERE a.usename = 'martiuser' AND a.backend_type = 'client backend'")
+try:
+    a, b = (m or '').split('|')
+    out['tak_sessions'], out['tak_sessions_ssl'] = int(a), int(b)
+except Exception:
+    out['tak_sessions'] = out['tak_sessions_ssl'] = None
+if MODE == 'full':
+    out['ssl'] = psql('SHOW ssl')
+    out['cot'] = psql("SELECT 1 FROM pg_database WHERE datname = 'cot'") == '1'
+    sz = psql("SELECT pg_database_size('cot')") if out['cot'] else None
+    out['cot_bytes'] = int(sz) if sz and sz.isdigit() else 0
+    mt = psql("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() AND state = 'active' AND query ~* '^[[:space:]]*(vacuum|cluster|reindex)'")
+    out['db_maint'] = int(mt) if mt and mt.isdigit() else 0
+    cf, hf = psql('SHOW config_file'), psql('SHOW hba_file')
+    conf = readf(cf, 1 << 20) if cf else None
+    hba = readf(hf, 1 << 20) if hf else None
+    out['dbtls'] = None if conf is None else sum(1 for l in conf.splitlines() if 'infra-TAK-dbtls' in l)
+    out['hostssl'] = None if hba is None else [' '.join(l.split()) for l in hba.splitlines() if l.strip().startswith('hostssl')]
+    coll = psql("SELECT datname, coalesce(datcollversion, ''), coalesce(pg_database_collation_actual_version(oid), '') FROM pg_database WHERE datallowconn")
+    out['collation'] = [l.split('|') for l in (coll or '').splitlines() if l]
+    def free(path):
+        try:
+            st = os.statvfs(path)
+            return st.f_bavail * st.f_frsize
+        except Exception:
+            return None
+    out['root_free'] = free('/')
+    out['boot_free'] = free('/boot') if os.path.isdir('/boot') else out['root_free']
+    # Busy = another package or database job. This probe's own ancestors (sudo, the SSH
+    # session's shell) are skipped; names are matched on comm, never on the command line,
+    # because the probe's own command line contains every one of these words.
+    anc, p = set(), os.getpid()
+    while p > 1 and p not in anc:
+        anc.add(p)
+        try:
+            p = int((readf('/proc/%d/stat' % p) or '').rsplit(')', 1)[1].split()[1])
+        except Exception:
+            break
+    busy = set()
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit() or int(pid) in anc:
+            continue
+        comm = (readf('/proc/%s/comm' % pid) or '').strip()
+        cmd = (readf('/proc/%s/cmdline' % pid) or '').replace('\x00', ' ')
+        if (comm in ('apt', 'apt-get', 'dpkg', 'pg_dump', 'pg_restore', 'pg_repack', 'vacuumdb', 'do-release-upgr')
+                or comm.startswith('apt.systemd.dai')
+                or (comm.startswith('unattended-upgr') and 'unattended-upgrade-shutdown' not in cmd)):
+            busy.add(comm)
+    out['busy'] = sorted(busy)
+    rc, o, e = run(['dpkg-query', '-W', '-f=${Version}', 'ubuntu-release-upgrader-core'], 15)
+    out['upgrader'] = o if rc == 0 else ''
+    out['do_release_upgrade'] = os.path.exists('/usr/bin/do-release-upgrade')
+    prompt = ''
+    for line in (readf('/etc/update-manager/release-upgrades') or '').splitlines():
+        if line.strip().lower().startswith('prompt='):
+            prompt = line.strip().split('=', 1)[1].strip().lower()
+    out['prompt'] = prompt
+    rc, o, e = run(['/usr/bin/python3', '-I', '-c', PENDING_PY], 180)
+    try:
+        out['pending'] = [str(n) for n in json.loads(o.splitlines()[-1])] if rc == 0 else None
+    except Exception:
+        out['pending'] = None
+    out['pending_err'] = '' if out['pending'] is not None else (((e or o).splitlines() or ['exit %d' % rc])[-1])[:200]
+    rb = (readf('/var/run/reboot-required.pkgs', 1 << 16) or '').splitlines()
+    out['reboot_pkgs'] = sorted({l for l in rb if l in ('libc6', 'linux-base') or l.startswith('linux-image-')})
+    out['reboot_required'] = os.path.exists('/var/run/reboot-required')
+    out['services'] = {s: (run(['systemctl', 'is-active', s], 10)[1] or 'unknown') for s in SERVICES}
+    rc, o, e = run(['ufw', 'status'], 15)
+    if rc != 0:
+        out['ufw'] = None
+    else:
+        lines = o.splitlines()
+        rules = []
+        if any(l.startswith('--') for l in lines):
+            rules = [' '.join(l.split()) for l in lines[[i for i, l in enumerate(lines) if l.startswith('--')][0] + 1:] if l.strip()]
+        out['ufw'] = {'status': (lines[0] if lines else ''), 'rules': rules}
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4) as r:
+            out['agent'] = r.status
+    except Exception:
+        out['agent'] = 0
+print('INFRATAK-PROBE ' + json.dumps(out))
+'''
+
+
+def _dbserver_probe_text(mode):
+    if mode not in ('full', 'status'):
+        raise ValueError(f'bad probe mode {mode!r}')
+    jobs = {k: {'unit': v['unit'], 'dir': v['dir']} for k, v in _DBSERVER_JOBS.items()}
+    return (_DBSERVER_PROBE_PY.replace("'@@MODE@@'", repr(mode))
+            .replace('@@PENDING_PY@@', repr(_OS_UPGRADE_PENDING_PY))
+            .replace('@@SERVICES@@', repr(list(_DBSERVER_SERVICES)))
+            .replace('@@JOBS@@', repr(jobs)))
+
+
+def _dbserver_routes_available(settings=None):
+    """The routes exist on a split install only. Anything else — single server, a managed
+    database (external_db), no TAK — gets a 404, as if the feature were not there."""
+    try:
+        settings = settings if settings is not None else load_settings()
+        return _get_tak_deployment_config(settings).get('mode') == 'two_server'
+    except Exception:
+        return False
+
+
+def _dbserver_target(settings=None):
+    """(server_one_cfg, '') or (None, why this split install's database server cannot be
+    managed from here)."""
+    settings = settings if settings is not None else load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if cfg.get('mode') != 'two_server':
+        return None, 'this is not a split install'
+    s1 = dict(cfg.get('server_one') or {})
+    host = (s1.get('host') or '').strip()
+    if not host:
+        return None, 'no database server is configured — set it up under TAK Server → Two-server first'
+    if s1.get('use_localhost') or host in ('127.0.0.1', 'localhost', '::1'):
+        return None, 'the database server is this box — the upgrade above covers it'
+    user = (s1.get('ssh_user') or 'root').strip() or 'root'
+    ok, err = _validate_ssh_target(host, user, s1.get('ssh_port') or 22)
+    if not ok:
+        return None, f'the database server\'s SSH settings are not usable: {err}'
+    s1['host'], s1['ssh_user'] = host, user
+    return s1, ''
+
+
+def _dbserver_priv(s1):
+    """Prefix that runs a command as root on the database server. `sudo -n` never prompts:
+    a password-protected sudo is a clear refusal, not a hung SSH session."""
+    return '' if (s1.get('ssh_user') or 'root').strip() == 'root' else 'sudo -n '
+
+
+def _dbserver_probe(s1, mode='full', timeout=None):
+    """(data, kind, error). kind: '' on success, else 'ssh' | 'sudo' | 'probe'."""
+    cmd = _dbserver_priv(s1) + '/usr/bin/python3 -I -c ' + shlex.quote(_dbserver_probe_text(mode))
+    ok, out = _ssh_probe(s1, cmd, timeout=timeout or (240 if mode == 'full' else 40))
+    text = out or ''
+    for line in reversed(text.splitlines()):
+        if line.startswith('INFRATAK-PROBE '):
+            try:
+                return json.loads(line[len('INFRATAK-PROBE '):]), '', ''
+            except Exception as e:
+                return None, 'probe', f'the database server sent an unreadable answer: {str(e)[:100]}'
+    low = text.lower()
+    if 'a password is required' in low or 'not in the sudoers' in low or 'sudo: ' in low:
+        return None, 'sudo', text.strip().splitlines()[-1][:200] if text.strip() else 'sudo refused'
+    if not ok:
+        return None, 'ssh', (text.strip()[-300:] or 'SSH failed')
+    return None, 'probe', 'the database server answered without a probe result: ' + text.strip()[-200:]
+
+
+def _dbserver_same_host(a, b):
+    """True when CoreConfig's database host and the console's Server One are the same box —
+    same string, or names that resolve to a shared address."""
+    a, b = (a or '').strip().lower(), (b or '').strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        ra = {i[4][0] for i in socket.getaddrinfo(a, None)}
+        rb = {i[4][0] for i in socket.getaddrinfo(b, None)}
+        return bool(ra & rb)
+    except Exception:
+        return False
+
+
+def _dbserver_remote_busy(d):
+    """Names of jobs in flight ON the database server (from a full probe)."""
+    busy = list(d.get('busy') or [])
+    for name, j in (d.get('jobs') or {}).items():
+        _l, a, _s, _r, _p = _systemctl_show_tuple(j.get('show'))
+        if a in ('active', 'activating'):
+            busy.append('infratak-' + name)
+    if d.get('db_maint'):
+        busy.append(f"{d['db_maint']} VACUUM/CLUSTER/REINDEX")
+    return busy
+
+
+def _os_upgrade_dbserver_script(pg_expect='18'):
+    """The database server's job (W4.e), built from the SAME fragments as the core job
+    (_os_upgrade_script): identical landmine handlers L2-L6 and UNCHANGED / PARTLY UPGRADED
+    reporting. Runs ON Server One as root in the transient unit infratak-os-upgrade; the core
+    installed it (sha256-checked) and watches over SSH. Pure function of constants — no
+    settings value is in the text."""
+    if pg_expect != '18':
+        raise ValueError(f'unsupported PostgreSQL major {pg_expect!r}')
+    q = shlex.quote
+    j = _DBSERVER_JOBS['os-upgrade']
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK database server OS upgrade (Ubuntu 22.04 -> 24.04). Written by the core\'s\n'
+            '# console, run as root in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a RELEASE_UPGRADER_NO_SCREEN=1\n'
+            f'STATE_DIR={q(j["dir"])}\n'
+            'STATUS="$STATE_DIR/status"\n'
+            'PRE="$STATE_DIR/pre"\n'
+            f'PG_EXPECT={q(pg_expect)}\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        (
+            'echo "[$(TS)] === infra-TAK database server OS upgrade 22.04 -> 24.04 starting (pid $$) ==="\n'
+        ),
+        _OS_UPGRADE_SH_OS_CHECK,
+        (
+            'PSQL() { runuser -u postgres -- psql -X -q -tA -c "$1" 2>/dev/null; }\n'
+            # TAK's database package, held like the core holds takserver: an OS flip must never
+            # resume a half-configured TAK package (v0.9.44).
+            'TAK_PKGS="takserver-database"\n'
+        ),
+        _OS_UPGRADE_SH_HOLDS,
+        _OS_UPGRADE_SH_SNAPSHOT_HEAD,
+        (
+            # What the reassert step and a manual recovery need: the configuration TAK's TLS
+            # connection depends on (# infra-TAK-dbtls block, hostssl rules, the server cert/key)
+            # and the firewall rules. Mode 0700 — the key is in here.
+            'CONF="$(PSQL "SHOW config_file")"\n'
+            'HBA="$(PSQL "SHOW hba_file")"\n'
+            'DATA="$(PSQL "SHOW data_directory")"\n'
+            '[ -n "$CONF" ] && [ -n "$HBA" ] && [ -n "$DATA" ] || fail pre-snapshot "PostgreSQL did not answer SHOW config_file / hba_file / data_directory — is it running?"\n'
+            'install -d -m 0700 "$PRE/pg" || fail pre-snapshot "cannot create $PRE/pg"\n'
+            'cp -a "$CONF" "$PRE/pg/postgresql.conf" && cp -a "$HBA" "$PRE/pg/pg_hba.conf" || fail pre-snapshot "could not copy postgresql.conf / pg_hba.conf"\n'
+            'for f in "$DATA/infratak-db.crt" "$DATA/infratak-db.key"; do [ -f "$f" ] && cp -a "$f" "$PRE/pg/"; done\n'
+            'PSQL "SHOW ssl" > "$PRE/pg/ssl"\n'
+            'grep -c "infra-TAK-dbtls" "$CONF" > "$PRE/pg/dbtls-count"\n'
+            'grep -E "^[[:space:]]*hostssl" "$HBA" > "$PRE/pg/hostssl"\n'
+            'ufw status > "$PRE/ufw-status.txt" 2>&1 || true\n'
+            'echo "[$(TS)] PostgreSQL configuration, TLS files and firewall rules saved to $PRE/pg"\n'
+        ),
+        _OS_UPGRADE_SH_SNAPSHOT_TAIL,
+        (
+            # ---- 2. db-dump -----------------------------------------------------------
+            # The snapshot the operator acknowledged is the rollback; this is the one thing on
+            # this box that matters, kept on the box. Same verified shape as the 5.8 migration
+            # (_tak58_s1_backup): pg_dump -Fc, then pg_restore --list must read it back.
+            'step db-dump\n'
+            'chmod 0711 "$PRE" || fail db-dump "cannot open $PRE to the postgres user"\n'
+            'install -d -o postgres -g postgres -m 0700 "$PRE/db" || fail db-dump "cannot create $PRE/db"\n'
+            'rm -f "$PRE/db/cot.dump"\n'
+            'echo "[$(TS)] pg_dump -Fc cot — TAK Server keeps running; a few minutes on a busy database"\n'
+            'runuser -u postgres -- pg_dump -Fc -d cot -f "$PRE/db/cot.dump" || fail db-dump "pg_dump failed (exit $?) — nothing on this box has been changed"\n'
+            'runuser -u postgres -- pg_restore --list "$PRE/db/cot.dump" > /dev/null || fail db-dump "the dump could not be read back (pg_restore --list) — nothing on this box has been changed"\n'
+            'echo "[$(TS)] database dump verified: $PRE/db/cot.dump ($(du -h "$PRE/db/cot.dump" | cut -f1))"\n'
+            '\n'
+        ),
+        _OS_UPGRADE_SH_FLIP,
+        (
+            # ---- 6. reassert ----------------------------------------------------------
+            'step reassert\n'
+        ),
+        _OS_UPGRADE_SH_PG_CHECK,
+        (
+            # The cluster is the same one, so the TLS block should have survived — prove it
+            # before the reboot rather than learn it from 37 TAK pool errors after (the 5.8
+            # cluster move dropped it: ROADMAP, _tak58_s1_carry_db_tls). Static comparisons
+            # against the pre-snapshot; the live TLS sessions are checked by the core after boot.
+            'SSL_NOW="$(PSQL "SHOW ssl")"; SSL_WAS="$(cat "$PRE/pg/ssl" 2>/dev/null)"\n'
+            '[ "$SSL_NOW" = "$SSL_WAS" ] || fail reassert "PostgreSQL ssl is now \'$SSL_NOW\', it was \'$SSL_WAS\' before the upgrade — the pre-upgrade postgresql.conf is in $PRE/pg"\n'
+            '[ "$(grep -c "infra-TAK-dbtls" "$CONF")" = "$(cat "$PRE/pg/dbtls-count" 2>/dev/null)" ] || fail reassert "the infra-TAK TLS lines in postgresql.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
+            'grep -E "^[[:space:]]*hostssl" "$HBA" | cmp -s - "$PRE/pg/hostssl" || fail reassert "the hostssl rules in pg_hba.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'echo "[$(TS)] reassert complete: one PostgreSQL ${PG_EXPECT} cluster on 5432; TLS settings and hostssl rules as before"\n'
+            '\n'
+        ),
+        _OS_UPGRADE_SH_REBOOT,
+    ))
+
+
+def _dbserver_record_read():
+    try:
+        with open(_DBSERVER_RECORD) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
+
+
+def _dbserver_record_write(rec):
+    tmp = _DBSERVER_RECORD + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, _DBSERVER_RECORD)
+
+
+def _dbserver_in_flight(rec):
+    return (rec or {}).get('phase') in ('running', 'rebooting', 'verifying')
+
+
+def _dbserver_standdown_begin(job):
+    """Guard Dog stands down on the database server for the job (W4.e.3): the shell guards
+    read the expiry in _DBSERVER_STANDDOWN (gd_dbserver_standdown in _gd-tak-lib.sh), the
+    console's own picture uses the existing maintenance window. Both expire on their own, so
+    a console that dies mid-job silences Guard Dog for at most this long."""
+    secs = _DBSERVER_STANDDOWN_S[job]
+    try:
+        _makedirs_priv('/var/lib/takguard', mode=0o755)
+    except Exception:
+        pass
+    _write_priv(_DBSERVER_STANDDOWN, f'{int(time.time()) + secs}\n', perm=0o644)
+    _gd_maintenance_begin('remotedb', secs)
+
+
+def _dbserver_standdown_end(grace=120):
+    try:
+        _write_priv(_DBSERVER_STANDDOWN, '0\n', perm=0o644)   # expired == run normally
+    except Exception as e:
+        print(f'[dbserver] could not clear the Guard Dog stand-down marker: {e}', flush=True)
+    _gd_maintenance_begin('remotedb', grace)
+
+
+def _dbserver_launch(s1, job, script_text):
+    """Copy the job script to the database server, install it root-owned 0700, prove the
+    installed bytes are the ones rendered here (sha256), then start the transient unit.
+    (ok, error). Nothing is launched unless every step succeeded."""
+    j = _DBSERVER_JOBS[job]
+    sha = hashlib.sha256(script_text.encode('utf-8')).hexdigest()
+    remote_tmp = f'/tmp/infratak-dbjob.{secrets.token_hex(8)}.sh'
+    fd, local = tempfile.mkstemp(prefix='dbjob-', suffix='.sh', dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(script_text)
+        ok, out = _scp_to_host(s1, local, remote_tmp, timeout=60)
+    finally:
+        try:
+            os.unlink(local)
+        except Exception:
+            pass
+    if not ok:
+        return False, f'could not copy the job script to the database server: {(out or "")[:200]}'
+    launch = (
+        'set -e; '
+        f'install -o root -g root -m 0700 {remote_tmp} {j["script"]}; rm -f {remote_tmp}; '
+        f'[ "$(sha256sum {j["script"]} | cut -d" " -f1)" = {sha} ] || {{ echo HASH_MISMATCH; rm -f {j["script"]}; exit 3; }}; '
+        f'systemctl reset-failed {j["unit"]}.service 2>/dev/null || true; '
+        f'mkdir -p -m 0755 {j["dir"]}; echo running:start > {j["dir"]}/status; '
+        f'systemd-run --unit={j["unit"]} --description="infra-TAK {j["title"]} (detached)" '
+        f'--property=StandardOutput=append:{j["log"]} --property=StandardError=append:{j["log"]} '
+        '--setenv=DEBIAN_FRONTEND=noninteractive --setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin '
+        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1 --no-block '
+        f'/bin/bash {j["script"]}; echo LAUNCHED'
+    )
+    ok, out = _ssh_probe(s1, _dbserver_priv(s1) + 'bash -c ' + shlex.quote(launch), timeout=60)
+    if 'HASH_MISMATCH' in (out or ''):
+        return False, 'the script installed on the database server is not the one the console wrote — nothing was started'
+    if not ok or 'LAUNCHED' not in (out or ''):
+        return False, f'could not start the job on the database server: {(out or "")[-240:]}'
+    return True, ''
+
+
+def _dbserver_baseline(d):
+    return {
+        'boot_id': d.get('boot_id') or '',
+        'os_version': d.get('os_version') or '',
+        'ssl': d.get('ssl'),
+        'dbtls': d.get('dbtls'),
+        'hostssl': d.get('hostssl'),
+        'ufw': d.get('ufw'),
+        'services': sorted(s for s, v in (d.get('services') or {}).items() if v == 'active'),
+        'agent': d.get('agent') or 0,
+        'tak_sessions': d.get('tak_sessions') or 0,
+        'tak_sessions_ssl': d.get('tak_sessions_ssl') or 0,
+        'collation': d.get('collation') or [],
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+
+
+def _dbserver_preflight(for_start=False, data=None, settings=None, probe=None):
+    """Every W4.e check (PLAN-v10.3.0-W4e §4.3). Read-only. Returns {ok, checks, irreversible,
+    baseline, host, os_version, pending_count, reboot_required}. `probe` is injectable."""
+    checks = []
+
+    def add(name, ok, detail, notice=False):
+        checks.append({'name': name, 'pass': bool(ok), 'detail': detail, 'notice': bool(notice)})
+
+    settings = settings if settings is not None else load_settings()
+    res = {'ok': False, 'checks': checks, 'irreversible': list(_DBSERVER_IRREVERSIBLE), 'baseline': {},
+           'host': ((_get_tak_deployment_config(settings).get('server_one') or {}).get('host') or '').strip(),
+           'os_version': '', 'os_name': '', 'pending_count': None, 'reboot_required': False,
+           'from': _OS_UPGRADE_FROM, 'to': _OS_UPGRADE_TO}
+
+    # 1. TAK uses the box the console would upgrade.
+    s1, why = _dbserver_target(settings)
+    if s1 is None:
+        add('split_config', False, why)
+        return res
+    try:
+        db_host = _tak_db_host_from_coreconfig() or ''
+    except Exception:
+        db_host = ''
+    if not db_host:
+        add('split_config', False, 'could not read the database host from TAK Server\'s CoreConfig.xml — refusing to guess which box TAK Server uses')
+    elif not _dbserver_same_host(db_host, s1['host']):
+        add('split_config', False, f'TAK Server\'s CoreConfig.xml points at {db_host}, but the console\'s database server is {s1["host"]} — refusing to touch a box TAK Server is not using. Fix the database server under TAK Server → Two-server first')
+    else:
+        add('split_config', True, f'TAK Server uses {db_host}, the database server the console manages')
+
+    # 2. SSH + root on the far side (one probe answers everything below).
+    d, kind, err = probe if probe is not None else _dbserver_probe(s1, 'full')
+    if d is None:
+        add('ssh_sudo', False, {
+            'sudo': f'SSH as {s1["ssh_user"]} works, but sudo on the database server asks for a password — the console needs passwordless sudo there (or root login): {err}',
+            'ssh': f'cannot reach the database server over SSH: {err}',
+        }.get(kind, err))
+        return res
+    add('ssh_sudo', True, f'SSH as {s1["ssh_user"]}' + (' (root login)' if s1['ssh_user'] == 'root' else ' with passwordless sudo'))
+    res['os_version'], res['os_name'] = d.get('os_version') or '', d.get('os_pretty') or ''
+
+    # 3. Ubuntu 22.04.
+    if d.get('os_id') == 'ubuntu' and d.get('os_version') == '22.04':
+        add('os_type', True, d.get('os_pretty') or 'Ubuntu 22.04')
+    elif d.get('os_id') == 'ubuntu' and d.get('os_version') == '24.04':
+        add('os_type', False, f"{d.get('os_pretty') or 'Ubuntu 24.04'} — already upgraded, nothing to do")
+    else:
+        add('os_type', False, f"{d.get('os_pretty') or d.get('os_id') or 'unknown OS'} — this upgrade is for Ubuntu 22.04 database servers only")
+
+    # 4. This is TAK's database: one PG 18 cluster on 5432, a cot database, TAK connected now.
+    cl = d.get('clusters') or []
+    tak_n, tak_ssl = d.get('tak_sessions'), d.get('tak_sessions_ssl')
+    cl_text = ', '.join('/'.join(c) for c in cl) or 'none'
+    if len(cl) != 1 or cl[0][:1] != ['18'] or cl[0][2:4] != ['5432', 'online']:
+        hint = ' — run the TAK Server 5.8 update first (it moves the database to PostgreSQL 18)' if any(c[:1] == ['15'] for c in cl) else ''
+        add('is_tak_db', False, f'expected exactly one PostgreSQL 18 cluster on 5432, online; found {cl_text}{hint}')
+    elif not d.get('cot'):
+        add('is_tak_db', False, 'PostgreSQL 18 is running but there is no cot database — this is not TAK Server\'s database')
+    elif not tak_n:
+        add('is_tak_db', False, 'TAK Server holds no connection to this database right now — start TAK Server first (the after-upgrade check has to see it reconnect)')
+    else:
+        add('is_tak_db', True, f'PostgreSQL 18 on 5432 ({cl_text}); TAK Server connected: {tak_n} session(s), {tak_ssl} encrypted')
+
+    # 5. Disk: 5 GB plus room for the dump.
+    rf, bf, cot = d.get('root_free'), d.get('boot_free'), d.get('cot_bytes') or 0
+    if rf is None or bf is None:
+        add('disk', False, 'could not read free space on the database server')
+    else:
+        need = _DBSERVER_MIN_ROOT_GB * 1024 ** 3 + _DBSERVER_DUMP_FACTOR * cot
+        add('disk', rf >= need and bf >= _OS_UPGRADE_MIN_BOOT_MB * 1024 ** 2,
+            f'/ {rf / 1024 ** 3:.1f} GB free (need {need / 1024 ** 3:.1f}: {_DBSERVER_MIN_ROOT_GB} GB + room for a '
+            f'{cot / 1024 ** 3:.1f} GB database dump), /boot {bf / 1024 ** 2:.0f} MB free (need {_OS_UPGRADE_MIN_BOOT_MB})')
+
+    # 6. Nothing else in flight, there or here.
+    busy = ['database server: ' + b for b in _dbserver_remote_busy(d)]
+    try:
+        busy += ['core: ' + b for b in _os_upgrade_running_jobs()]
+    except Exception:
+        pass
+    add('no_job_running', not busy, 'no package, database or console job is running' if not busy
+        else 'wait for these to finish: ' + ', '.join(busy))
+
+    # 7. Ubuntu's release upgrader.
+    if not d.get('upgrader') or not d.get('do_release_upgrade'):
+        add('release_upgrader', False, 'ubuntu-release-upgrader-core is not installed on the database server — every Ubuntu server image ships it; this box\'s package set was trimmed')
+    elif d.get('prompt') == 'never':
+        add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt=never — the job sets Prompt=lts first", notice=True)
+    else:
+        add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt={d.get('prompt') or 'lts (default)'}")
+
+    # 8-9. Ubuntu's own two gates, asked the way do-release-upgrade asks them.
+    pend = d.get('pending')
+    res['pending_count'] = None if pend is None else len(pend)
+    if pend is None:
+        add('os_up_to_date', False, f"could not ask apt on the database server which updates are pending: {d.get('pending_err') or 'no answer'}")
+    elif pend:
+        add('os_up_to_date', False, f'{len(pend)} update(s) pending on the database server ({", ".join(pend[:6])}'
+            f'{", …" if len(pend) > 6 else ""}) — Ubuntu\'s upgrader refuses until every update is installed. '
+            'Press Install updates below, then Re-check')
+    else:
+        add('os_up_to_date', True, 'every available update is installed')
+    rb = d.get('reboot_pkgs') or []
+    res['reboot_required'] = bool(d.get('reboot_required'))
+    add('no_reboot_pending', not rb, 'no reboot pending' if not rb else
+        'a reboot is pending on the database server after updating ' + ', '.join(rb[:4]) +
+        ' — press Reboot below, then Re-check')
+
+    # 10. Baseline for the after-reboot check (always passes; says what it will compare).
+    bl = _dbserver_baseline(d)
+    res['baseline'] = bl
+    ufw = bl['ufw'] or {}
+    add('baseline', True, f"ssl={bl['ssl'] or '?'}, {bl['dbtls'] or 0} infra-TAK TLS line(s), "
+        f"{len(bl['hostssl'] or [])} hostssl rule(s), ufw {('%s, %d rule(s)' % (ufw.get('status') or '?', len(ufw.get('rules') or []))) if bl['ufw'] else 'not installed'}, "
+        f"services: {', '.join(bl['services']) or 'none'}")
+
+    # 11. Typed acknowledgment — start only.
+    if for_start:
+        ack = ((data or {}).get('acknowledge') or '').strip()
+        add('acknowledge', ack == _DBSERVER_ACK, 'snapshot acknowledged' if ack == _DBSERVER_ACK
+            else f'type exactly "{_DBSERVER_ACK}" to confirm a snapshot of the database server exists')
+    res['ok'] = all(c['pass'] for c in checks)
+    return res
+
+
+def _dbserver_compare(baseline, d, full):
+    """(problems, notices) — the after-job state against the baseline. `full` adds the OS
+    flip's own checks; Install updates / Reboot use the rest."""
+    if d is None:
+        return ['unreachable'], []
+    problems, notices = [], []
+    if full and not (d.get('os_id') == 'ubuntu' and d.get('os_version') == '24.04'):
+        problems.append(f"os-release={d.get('os_pretty') or d.get('os_version') or 'unknown'}")
+    cl = d.get('clusters') or []
+    if len(cl) != 1 or cl[0][:1] != ['18'] or cl[0][2:4] != ['5432', 'online']:
+        problems.append('postgresql=' + (';'.join('/'.join(c) for c in cl) or 'none'))
+    for key, label in (('ssl', 'ssl'), ('dbtls', 'tls-lines'), ('hostssl', 'hostssl'), ('ufw', 'ufw')):
+        if key in baseline and key in d and d.get(key) != baseline.get(key):
+            problems.append(f'{label}-changed')
+    svc = d.get('services') or {}
+    down = [s for s in baseline.get('services') or [] if s in svc and svc[s] != 'active']
+    if down:
+        problems.append('services=' + ','.join(down))
+    if baseline.get('agent') == 200 and 'agent' in d and d.get('agent') != 200:
+        problems.append('guarddog-agent')
+    if (baseline.get('tak_sessions') or 0) > 0:
+        if not d.get('tak_sessions'):
+            problems.append('tak-not-reconnected')
+        elif (baseline.get('tak_sessions_ssl') or 0) == baseline.get('tak_sessions') and d.get('tak_sessions_ssl') != d.get('tak_sessions'):
+            problems.append('tak-sessions-not-encrypted')
+    for row in d.get('collation') or []:
+        if len(row) == 3 and row[1] and row[2] and row[1] != row[2]:
+            notices.append(f'collation version of database {row[0]} changed {row[1]} -> {row[2]}')
+    return problems, notices
+
+
+def _dbserver_verify(s1, rec, probe_fn=None, sleep=time.sleep, now=time.time):
+    """Poll until the database server is back as it was, or the deadlines pass. PostgreSQL
+    gets _DBSERVER_PG_WAIT_S once SSH answers; TAK then gets _DBSERVER_RECONNECT_S to reconnect
+    by itself. The job never restarts TAK — not reconnecting is a finding, not something to
+    paper over. Returns (problems, notices)."""
+    probe_fn = probe_fn or _dbserver_probe
+    full = rec.get('job') == 'os-upgrade'
+    baseline = rec.get('baseline') or {}
+    pg_deadline = now() + _DBSERVER_PG_WAIT_S
+    tak_deadline = None
+    while True:
+        d, _k, _e = probe_fn(s1, 'full')
+        problems, notices = _dbserver_compare(baseline, d, full)
+        pg_ok = d is not None and not any(p.startswith('postgresql=') for p in problems)
+        if pg_ok and tak_deadline is None:
+            tak_deadline = now() + _DBSERVER_RECONNECT_S
+        if not problems or now() >= (tak_deadline or pg_deadline):
+            return problems, notices
+        sleep(20)
+
+
+def _dbserver_finish(rec, phase, step='', detail='', s1=None, notices=None):
+    rec.update({'phase': phase, 'step': step, 'detail': detail, 'finished': time.time()})
+    if notices is not None:
+        rec['notices'] = notices
+    _dbserver_record_write(rec)
+    _dbserver_standdown_end()
+    job = rec.get('job') or 'job'
+    if s1 is not None and job == 'os-upgrade':
+        mark = 'done' if phase == 'done' else ('failed:verify:' + (detail or '?') if step == 'verify' else '')
+        if mark:
+            j = _DBSERVER_JOBS['os-upgrade']
+            _ssh_probe(s1, _dbserver_priv(s1) + 'bash -c ' + shlex.quote(f'echo {shlex.quote(mark)} > {j["dir"]}/status'), timeout=20)
+    msg = f"[dbserver] {job} on {rec.get('host')}: {phase}" + (f' at {step}' if step else '') + (f' — {detail}' if detail else '')
+    print(('✓ ' if phase == 'done' else '✗ ') + msg, flush=True)
+    try:
+        audit(f'dbserver-{job}:{phase}', f"host={rec.get('host')} step={step} {detail}".strip())
+    except Exception:
+        pass
+    return rec
+
+
+def _dbserver_tick(rec, s1, probe_fn=None, sleep=time.sleep, now=time.time):
+    """One watcher pass: read the job's state on the database server and move the record on.
+    Pure over its injectables (tests drive it with scripted probe answers)."""
+    probe_fn = probe_fn or _dbserver_probe
+    job, t = rec.get('job'), now()
+    d, _kind, err = probe_fn(s1, 'status')
+    if d is None:
+        rec['unreachable_since'] = rec.get('unreachable_since') or t
+        rec['last_error'] = (err or '')[:200]
+        since = rec.get('reboot_at') or rec['unreachable_since']
+        if job == 'reboot' or rec.get('phase') == 'rebooting':
+            if t - since > _DBSERVER_REBOOT_WAIT_S:
+                return _dbserver_finish(rec, 'failed', 'verify', f'unreachable: no SSH for {_DBSERVER_REBOOT_WAIT_S // 60} min after the reboot', s1)
+        elif t - rec['unreachable_since'] > _DBSERVER_STANDDOWN_S.get(job, 3600):
+            return _dbserver_finish(rec, 'failed', rec.get('step') or 'start', f'unreachable over SSH for {int((t - rec["unreachable_since"]) // 60)} min while the job ran — read its log on the database server', s1)
+        _dbserver_record_write(rec)
+        return rec
+    rec['unreachable_since'] = 0
+    rec['last_seen'] = t
+    rebooted = bool(d.get('boot_id')) and d.get('boot_id') != rec.get('boot_id')
+    if job in ('os-upgrade', 'reboot') and rebooted:
+        rec.update({'phase': 'verifying', 'step': 'verify'})
+        _dbserver_record_write(rec)
+        problems, notices = _dbserver_verify(s1, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+        if problems:
+            return _dbserver_finish(rec, 'failed', 'verify', ' '.join(problems), s1, notices)
+        return _dbserver_finish(rec, 'done', '', '', s1, notices)
+    if job == 'reboot':
+        if t - (rec.get('started') or t) > _DBSERVER_REBOOT_WAIT_S:
+            return _dbserver_finish(rec, 'failed', 'reboot', 'the database server did not reboot (same boot id)', s1)
+        rec['phase'] = 'rebooting'
+        _dbserver_record_write(rec)
+        return rec
+    jd = (d.get('jobs') or {}).get(job) or {}
+    raw = (jd.get('status') or '').strip()
+    unit = _systemctl_show_tuple(jd.get('show'))
+    if job == 'updates':
+        if raw.startswith('done'):
+            rec['reboot_required'] = raw == 'done:reboot-required'
+            rec.update({'phase': 'verifying', 'step': 'verify'})
+            _dbserver_record_write(rec)
+            problems, notices = _dbserver_verify(s1, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+            if problems:
+                return _dbserver_finish(rec, 'failed', 'verify', ' '.join(problems), s1, notices)
+            return _dbserver_finish(rec, 'done', '', 'a reboot is required' if rec['reboot_required'] else '', s1, notices)
+        if raw.startswith('failed'):
+            return _dbserver_finish(rec, 'failed', 'updates', 'apt reported a failure — the log says why', s1)
+        if raw.startswith('running') and unit[1] not in ('active', 'activating'):
+            return _dbserver_finish(rec, 'failed', 'updates', f"the updates job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", s1)
+        rec.update({'phase': 'running', 'step': 'updates'})
+        _dbserver_record_write(rec)
+        return rec
+    st = _os_upgrade_job_state(raw=raw, unit=unit)
+    if st['state'] == 'failed':
+        return _dbserver_finish(rec, 'failed', st['step'] or 'start', st['detail'], s1)
+    if st['state'] == 'rebooting':
+        rec['reboot_at'] = rec.get('reboot_at') or t
+        rec.update({'phase': 'rebooting', 'step': 'reboot'})
+    else:
+        rec.update({'phase': 'running', 'step': st['step'] or 'start'})
+    _dbserver_record_write(rec)
+    return rec
+
+
+def _dbserver_watch():
+    global _dbserver_watch_active
+    try:
+        while True:
+            rec = _dbserver_record_read()
+            if not _dbserver_in_flight(rec):
+                return
+            s1, why = _dbserver_target()
+            if s1 is None:
+                _dbserver_finish(rec, 'failed', rec.get('step') or 'start', f'the database server is no longer configured: {why}')
+                return
+            try:
+                rec = _dbserver_tick(rec, s1)
+            except Exception as e:
+                print(f'[dbserver] watcher pass error (retrying): {e}', flush=True)
+            if not _dbserver_in_flight(rec):
+                return
+            time.sleep(_DBSERVER_POLL_S)
+    finally:
+        with _dbserver_lock:
+            _dbserver_watch_active = False
+
+
+def _dbserver_watch_start():
+    global _dbserver_watch_active
+    with _dbserver_lock:
+        if _dbserver_watch_active:
+            return False
+        _dbserver_watch_active = True
+    threading.Thread(target=_dbserver_watch, daemon=True, name='dbserver-watch').start()
+    return True
+
+
+def _startup_dbserver_watch():
+    """A console that restarts (or a core that reboots) mid-job picks the watch back up and
+    re-opens the console-side Guard Dog window for whatever is left of the job."""
+    rec = _dbserver_record_read()
+    if not _dbserver_in_flight(rec):
+        return False
+    left = int((rec.get('started') or 0) + _DBSERVER_STANDDOWN_S.get(rec.get('job'), 3600) - time.time())
+    if left > 0:
+        _gd_maintenance_begin('remotedb', left)
+    return _dbserver_watch_start()
+
+
+def _dbserver_begin(job, s1, baseline, launch):
+    """Shared start path: stand Guard Dog down, write the record, launch, start watching.
+    `launch` is a no-arg callable returning (ok, error). The record is written BEFORE the
+    launch, so a console that dies in between still knows a job may be running."""
+    rec = {'job': job, 'host': s1['host'], 'started': time.time(), 'boot_id': baseline.get('boot_id') or '',
+           'phase': 'rebooting' if job == 'reboot' else 'running', 'step': 'start', 'detail': '',
+           'baseline': baseline, 'notices': [], 'finished': 0, 'reboot_required': False}
+    try:
+        _dbserver_standdown_begin(job)
+    except Exception as e:
+        return 500, {'ok': False, 'error': f'could not pause Guard Dog\'s database checks: {str(e)[:160]} — nothing was started'}
+    _dbserver_record_write(rec)
+    ok, err = launch()
+    if not ok:
+        _dbserver_finish(rec, 'failed', 'start', err)
+        return 500, {'ok': False, 'error': err}
+    try:
+        remote = request.remote_addr
+    except Exception:
+        remote = '?'
+    print(f"[dbserver] {job} STARTED on {s1['host']} by console remote={remote}", flush=True)
+    try:
+        audit(f'dbserver-{job}:start', f"host={s1['host']}")
+    except Exception:
+        pass
+    _dbserver_watch_start()
+    return 200, {'ok': True, 'message': f"{job} started on {s1['host']}"}
+
+
+def _dbserver_start(job, data=None):
+    """(http_status, payload) for os-upgrade / updates / reboot. One start at a time: the
+    preflight can take a minute, and two clicks must not both pass the in-flight check."""
+    if not _dbserver_start_lock.acquire(blocking=False):
+        return 409, {'ok': False, 'error': 'a database server job is already being started'}
+    try:
+        if _dbserver_in_flight(_dbserver_record_read()):
+            return 409, {'ok': False, 'error': 'a database server job is already running'}
+        return _dbserver_start_locked(job, data)
+    finally:
+        _dbserver_start_lock.release()
+
+
+def _dbserver_start_locked(job, data):
+    s1, why = _dbserver_target()
+    if s1 is None:
+        return 409, {'ok': False, 'error': why}
+    if job == 'os-upgrade':
+        pf = _dbserver_preflight(for_start=True, data=data)
+        if not pf['ok']:
+            failed = [c['name'] for c in pf['checks'] if not c['pass']]
+            return 409, {'ok': False, 'error': 'preflight failed: ' + ', '.join(failed), 'preflight': pf}
+        script = _os_upgrade_dbserver_script('18')
+        return _dbserver_begin(job, s1, pf['baseline'], lambda: _dbserver_launch(s1, job, script))
+    d, kind, err = _dbserver_probe(s1, 'full')
+    if d is None:
+        return 409, {'ok': False, 'error': f'cannot reach the database server ({kind}): {err}'}
+    busy = _dbserver_remote_busy(d)
+    if busy:
+        return 409, {'ok': False, 'error': 'wait for these to finish on the database server: ' + ', '.join(busy)}
+    baseline = _dbserver_baseline(d)
+    if job == 'updates':
+        script = _kernel_patch_apt_script('takserver-database', _DBSERVER_JOBS['updates']['dir'] + '/status')
+        return _dbserver_begin(job, s1, baseline, lambda: _dbserver_launch(s1, job, script))
+    if job == 'reboot':
+        def _reboot():
+            # The connection usually drops as sshd stops; that is the reboot working. Only an
+            # explicit refusal counts as failure — the watcher fails the job if the boot id
+            # never changes.
+            ok, out = _ssh_probe(s1, _dbserver_priv(s1) + 'systemctl reboot', timeout=20)
+            low = (out or '').lower()
+            if not ok and ('password' in low or 'not allowed' in low or 'permission denied' in low):
+                return False, f'the database server refused the reboot: {(out or "")[-200:]}'
+            return True, ''
+        return _dbserver_begin(job, s1, baseline, _reboot)
+    return 400, {'ok': False, 'error': f'unknown job {job!r}'}
+
+
+def _dbserver_status_payload():
+    rec = _dbserver_record_read()
+    job = rec.get('job') or ''
+    phase = rec.get('phase') or 'idle'
+    return {'ok': True, 'job': job, 'state': phase, 'step': rec.get('step') or '',
+            'detail': rec.get('detail') or '', 'notices': rec.get('notices') or [],
+            'host': rec.get('host') or '', 'started': rec.get('started') or 0,
+            'finished': rec.get('finished') or 0, 'reboot_required': bool(rec.get('reboot_required')),
+            'running': _dbserver_in_flight(rec),
+            'steps': list(_DBSERVER_OS_STEPS) if job == 'os-upgrade' else [],
+            'raw': f"{job}:{phase}:{int(rec.get('started') or 0)}" if job else ''}
+
+
+def _dbserver_log_tail(job, limit=12000):
+    """(present, text) — tail of the job's log on the database server, cached 5 s so several
+    open tabs do not each open an SSH session."""
+    j = _DBSERVER_JOBS.get(job)
+    if j is None:
+        return False, ''
+    hit = _dbserver_log_cache.get(job)
+    if hit and time.time() - hit[0] < 5:
+        return hit[1], hit[2]
+    s1, _why = _dbserver_target()
+    if s1 is None:
+        return False, ''
+    ok, out = _ssh_probe(s1, _dbserver_priv(s1) + f'tail -c {int(limit)} {j["log"]}', timeout=20)
+    val = (time.time(), bool(ok), (out or '') if ok else '')
+    _dbserver_log_cache[job] = val
+    return val[1], val[2]
+
+
+@app.route('/api/console/dbserver/preflight')
+@login_required
+def console_dbserver_preflight_api():
+    """Every W4.e check, read-only. 404 unless this is a split install."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    try:
+        return jsonify(_dbserver_preflight())
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'preflight error: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/console/dbserver/os-upgrade/start', methods=['POST'])
+@login_required
+def console_dbserver_os_upgrade_start_api():
+    """One-way and destructive: console password (same bar as the core's upgrade) AND the
+    typed snapshot acknowledgment AND an all-green preflight re-run right now."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    try:
+        code, payload = _dbserver_start('os-upgrade', data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/dbserver/updates', methods=['POST'])
+@login_required
+def console_dbserver_updates_api():
+    """Install updates on the database server — same gate as the core's Install updates."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    try:
+        code, payload = _dbserver_start('updates')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/dbserver/reboot', methods=['POST'])
+@login_required
+def console_dbserver_reboot_api():
+    """Reboot the database server — console password, same bar as the console's own Reboot."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    try:
+        code, payload = _dbserver_start('reboot')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'reboot error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/dbserver/status')
+@login_required
+def console_dbserver_status_api():
+    """The core's record of the last database server job — no SSH, safe to poll."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    return jsonify(_dbserver_status_payload())
+
+
+@app.route('/api/console/dbserver/log')
+@login_required
+def console_dbserver_log_api():
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    job = (request.args.get('job') or _dbserver_record_read().get('job') or '').strip()
+    if job not in _DBSERVER_JOBS:
+        return jsonify({'ok': True, 'present': False, 'log': ''})
+    present, tail = _dbserver_log_tail(job)
+    return jsonify({'ok': True, 'present': present, 'log': tail})
+
 
 @app.route('/api/metrics')
 @login_required
@@ -92421,6 +93484,15 @@ def _startup_migrations():
                 print("Startup migration: OS upgrade post-reboot verify started", flush=True)
         except Exception as _ou_err:
             print(f"Startup migration: OS upgrade verify start error (non-fatal): {_ou_err}")
+
+        # v10.3.0 W4.e: a database server job (upgrade / updates / reboot) that was in
+        # flight when this console stopped is watched again — it kept running on the
+        # database server either way. No-op unless dbserver-job.json says one is in flight.
+        try:
+            if _startup_dbserver_watch():
+                print("Startup migration: database server job watch resumed", flush=True)
+        except Exception as _dw_err:
+            print(f"Startup migration: database server watch start error (non-fatal): {_dw_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()

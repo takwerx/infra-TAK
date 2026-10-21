@@ -36,6 +36,8 @@
 #     USER), so dnf always refused it. gd_db_shell now execs as root; a refused-for-root
 #     install is logged as that, not as "not available on this platform".
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+# v10.3.0 W4.e: the console is upgrading / updating / rebooting the database server — stand down.
+type gd_dbserver_standdown >/dev/null 2>&1 && gd_dbserver_standdown tak-db-repack && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 GUARDDOG_CONF="/opt/tak-guarddog/guarddog.conf"
