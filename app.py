@@ -28547,12 +28547,19 @@ def _caddy_resync_public_urls(settings):
     Authentik at the new URLs: brand, embedded outpost, every proxy provider's
     external_host and redirect URIs, the console app and TAK Portal's provider."""
     fqdn = (settings.get('fqdn') or '').strip()
-    _authentik_sync_all_domain_refs(fqdn, settings)
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    ak_url = _get_authentik_api_url(settings)
+    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    # Pass 1 rewrites AUTHENTIK_HOST in .env and restarts Authentik, so its API calls
+    # (brand, embedded outpost, providers) can land while Authentik is going down and get
+    # a 503 — seen on test12. Pass 2, once the API answers again, finds the env already
+    # right (no second restart) and patches whatever pass 1 missed.
+    _authentik_sync_all_domain_refs(fqdn, settings)
+    if ak_token:
+        _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36)
+    _authentik_sync_all_domain_refs(fqdn, settings)
     if ak_token:
         _ensure_authentik_console_app(fqdn, ak_token)
-        ak_url = _get_authentik_api_url(settings)
-        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
     if _is_module_deployed(settings, 'takportal'):
         _sync_authentik_takportal_provider_url(settings)
