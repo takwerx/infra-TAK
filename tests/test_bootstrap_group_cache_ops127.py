@@ -143,40 +143,58 @@ def _sync(ns):
 
 
 def _old_cache():
-    """The nuc cache: older channels, OUT active, IN deactivated (by CloudTAK or the operator)."""
-    return [_grp('MPD Main', 'OUT', 4), _grp('MPD Main', 'IN', 4, active=False),
+    """A cache made at first connect: the channels of the day active both ways, system groups as TAK left them."""
+    return [_grp('MPD Main', 'OUT', 4), _grp('MPD Main', 'IN', 4),
             _grp('ROLE_ADMIN', 'OUT', 2), _grp('ROLE_ADMIN', 'IN', 2, active=False),
             _grp('__ANON__', 'OUT', 3), _grp('__ANON__', 'IN', 3, active=False)]
 
 
-def _sendable(tak):
-    return {n for n, d in tak.live if d == 'OUT'}
+def _both(*names):
+    return [(n, d) for n in names for d in ('IN', 'OUT')]
+
+
+def _deliverable(tak):
+    """Channels a Core Event reaches: the live connection has them IN and OUT (IN is the one that
+    decides it — test12 2026-10-20; OUT is kept for uniformity with the admin sync)."""
+    return {n for n, d in tak.live if d == 'IN'} & {n for n, d in tak.live if d == 'OUT'}
 
 
 # ---------------------------------------------------------------- step 1: the group cache
 
-def test_new_channel_missing_from_the_cache_is_added_for_sending():
+def test_new_channel_missing_from_the_cache_is_added_both_ways():
     tak = FakeTak(_old_cache())
     res, log = _sync(_ns(tak))
     assert len(tak.puts) == 1, 'one activeForce PUT, then the second pass sees it converged'
     rapid = [e for e in tak.puts[0] if e['name'] == 'RAPID-SOS']
-    assert rapid == [_grp('RAPID-SOS', 'OUT', 22)], 'added as OUT active, with the bitpos TAK gave it'
-    assert res['added'] == 1 and res['activated'] == 0 and res['changed'] is True
-    assert 'RAPID-SOS' in _sendable(tak), 'activeForce re-authenticated the live connection'
+    assert rapid == [_grp('RAPID-SOS', 'IN', 22), _grp('RAPID-SOS', 'OUT', 22)], \
+        'added IN and OUT active, with the bitpos TAK gave it'
+    assert res['added'] == 2 and res['activated'] == 0 and res['changed'] is True
+    assert 'RAPID-SOS' in _deliverable(tak), 'activeForce re-authenticated the live connection'
     assert tak.reauths == 0 and res['reauth'] is False, 'no second re-auth needed'
     assert any('RAPID-SOS' in m for m in log)
 
 
-def test_inactive_out_entry_is_activated_and_in_is_left_alone():
+def test_inactive_entries_are_activated_in_both_directions():
+    """The nuc / test12 trap: a channel created after first connect lands in the cache inactive
+    both ways. IN is what decides delivery, so leaving it off (the first cut of this fix) did not
+    deliver a single Event on test12."""
     cache = _old_cache() + [_grp('RAPID-SOS', 'OUT', 22, active=False), _grp('RAPID-SOS', 'IN', 22, active=False)]
     tak = FakeTak(cache)
-    res, _ = _sync(_ns(tak))
-    assert res['activated'] == 1 and res['added'] == 0
+    res, log = _sync(_ns(tak))
+    assert res['activated'] == 2 and res['added'] == 0
     body = {(e['name'], e['direction']): e['active'] for e in tak.puts[0]}
-    assert body[('RAPID-SOS', 'OUT')] is True
-    assert not any(v for (n, d), v in body.items() if d == 'IN'), \
-        'IN decides what CloudTAK receives; the sync must not widen it'
-    assert 'RAPID-SOS' in _sendable(tak)
+    assert body[('RAPID-SOS', 'IN')] is True and body[('RAPID-SOS', 'OUT')] is True
+    assert 'RAPID-SOS' in _deliverable(tak)
+    assert any('RAPID-SOS' in m and 'activated 2' in m for m in log)
+
+
+def test_only_the_in_entry_inactive_is_still_fixed():
+    """OUT active alone is not enough: test12, IN off / OUT on, the Event never arrived."""
+    cache = _old_cache() + [_grp('RAPID-SOS', 'OUT', 22), _grp('RAPID-SOS', 'IN', 22, active=False)]
+    tak = FakeTak(cache)
+    res, _ = _sync(_ns(tak))
+    assert res['activated'] == 1 and len(tak.puts) == 1
+    assert {(e['name'], e['direction']): e['active'] for e in tak.puts[0]}[('RAPID-SOS', 'IN')] is True
 
 
 def test_never_shrinks_the_cache():
@@ -189,7 +207,7 @@ def test_never_shrinks_the_cache():
 
 
 def test_already_converged_is_a_no_op_no_put_no_reauth_no_restart():
-    cache = _old_cache() + [_grp('RAPID-SOS', 'OUT', 22), _grp('RAPID-SOS', 'IN', 22, active=False)]
+    cache = _old_cache() + [_grp('RAPID-SOS', 'OUT', 22), _grp('RAPID-SOS', 'IN', 22)]
     tak = FakeTak(cache)
     res, log = _sync(_ns(tak))
     assert tak.puts == [] and tak.reauths == 0 and res['changed'] is False
@@ -197,39 +215,41 @@ def test_already_converged_is_a_no_op_no_put_no_reauth_no_restart():
     assert 'docker' not in _func('_tak_sync_bootstrap_group_cache'), 'the sync never restarts CloudTAK'
 
 
-def test_system_groups_are_never_added():
-    tak = FakeTak([_grp('MPD Main', 'OUT', 4)])
+def test_system_groups_are_never_added_or_activated():
+    tak = FakeTak([_grp('MPD Main', 'OUT', 4), _grp('MPD Main', 'IN', 4), _grp('__ANON__', 'IN', 3, active=False)])
     _sync(_ns(tak))
-    assert {e['name'] for e in tak.puts[0]} - {'MPD Main'} == {'RAPID-SOS'}, 'ROLE_ADMIN / __ANON__ are not channels'
+    assert {e['name'] for e in tak.puts[0]} - {'MPD Main', '__ANON__'} == {'RAPID-SOS'}, \
+        'ROLE_ADMIN / __ANON__ are not channels'
+    assert [e['active'] for e in tak.puts[0] if e['name'] == '__ANON__'] == [False], 'passed back unchanged'
 
 
 def test_cache_disabled_still_fixes_the_live_connection():
     tak = FakeTak([], live=[('MPD Main', 'OUT')], enabled=False)
     res, _ = _sync(_ns(tak))
-    assert tak.puts == [] and tak.reauths == 1 and 'RAPID-SOS' in _sendable(tak)
+    assert tak.puts == [] and tak.reauths == 1 and 'RAPID-SOS' in _deliverable(tak)
 
 
 # ---------------------------------------------------------------- step 2: the live connection
 
 def test_uncached_cert_missing_a_later_channel_is_reauthenticated_in_place():
     """test8: no cache entry, live subscription lacks the newest channel."""
-    tak = FakeTak([], live=[('MPD Main', 'OUT'), ('MPD Main', 'IN')])
+    tak = FakeTak([], live=_both('MPD Main'))
     res, log = _sync(_ns(tak))
     assert tak.puts == [], 'nothing cached, nothing to force'
     assert tak.reauths == 1 and res['reauth'] is True and res['missing'] == []
-    assert 'RAPID-SOS' in _sendable(tak)
+    assert 'RAPID-SOS' in _deliverable(tak)
     assert any('re-authenticated' in m and 'now in all' in m for m in log)
 
 
 def test_reauth_that_does_not_help_says_so():
-    tak = FakeTak([], live=[('MPD Main', 'OUT')], stuck=True)
+    tak = FakeTak([], live=_both('MPD Main'), stuck=True)
     res, log = _sync(_ns(tak))
     assert tak.reauths == 1 and res['missing'] == ['RAPID-SOS']
     assert any('still missing' in m and 'next sync' in m for m in log)
 
 
 def test_uncached_and_already_in_every_channel_does_nothing():
-    tak = FakeTak([], live=[('MPD Main', 'OUT'), ('RAPID-SOS', 'OUT')])
+    tak = FakeTak([], live=_both('MPD Main', 'RAPID-SOS'))
     res, _ = _sync(_ns(tak))
     assert tak.puts == [] and tak.reauths == 0 and res['changed'] is False
 
@@ -295,26 +315,28 @@ def _state(tak, **kw):
 
 
 def test_detector_names_the_channel_the_live_subscription_lacks():
-    tak = FakeTak([], live=[('MPD Main', 'OUT'), ('MPD Main', 'IN')])
-    tak.extra_subs = [_sub('tls:30', [('RAPID-SOS', 'OUT')], user='someone-else')]
+    tak = FakeTak([], live=_both('MPD Main'))
+    tak.extra_subs = [_sub('tls:30', _both('RAPID-SOS'), user='someone-else')]
     s = _state(tak)
     assert s['state'] == 'missing' and s['missing'] == ['RAPID-SOS'] and s['connected'] is True
     assert s['channels'] == 2
 
 
-def test_detector_ok_when_every_channel_is_sendable():
-    assert _state(FakeTak([], live=[('MPD Main', 'OUT'), ('RAPID-SOS', 'OUT')]))['state'] == 'ok'
+def test_detector_ok_when_every_channel_is_there_both_ways():
+    assert _state(FakeTak([], live=_both('MPD Main', 'RAPID-SOS')))['state'] == 'ok'
 
 
-def test_detector_counts_out_only():
-    """IN membership does not let the cert send."""
-    assert _state(FakeTak([], live=[('MPD Main', 'OUT'), ('RAPID-SOS', 'IN')]))['missing'] == ['RAPID-SOS']
+def test_detector_flags_a_channel_present_out_only():
+    """test12 2026-10-20: the first cut of this fix left the connection OUT-only on the new channel;
+    the detector said ok and not one Event was delivered. IN is the one that decides it."""
+    assert _state(FakeTak([], live=_both('MPD Main') + [('RAPID-SOS', 'OUT')]))['missing'] == ['RAPID-SOS']
+    assert _state(FakeTak([], live=_both('MPD Main') + [('RAPID-SOS', 'IN')]))['missing'] == ['RAPID-SOS']
 
 
 def test_detector_judges_the_newest_subscription():
-    tak = FakeTak([], live=[('MPD Main', 'OUT')])
+    tak = FakeTak([], live=_both('MPD Main'))
     tak.uid = 12
-    tak.extra_subs = [_sub('tls:9', [('MPD Main', 'OUT'), ('RAPID-SOS', 'OUT')])]
+    tak.extra_subs = [_sub('tls:9', _both('MPD Main', 'RAPID-SOS'))]
     assert _state(tak)['missing'] == ['RAPID-SOS']
 
 
@@ -331,6 +353,15 @@ def test_fix_then_detector_agree_on_the_nuc_case():
     assert ns['_tak_bootstrap_channel_state']()['missing'] == ['RAPID-SOS']
     ns['_tak_sync_bootstrap_group_cache'](plog=lambda m: None)
     assert ns['_tak_bootstrap_channel_state']()['state'] == 'ok'
+
+
+def test_fix_then_detector_agree_on_the_test12_case():
+    """New channel cached inactive both ways: flagged before, delivered (IN and OUT live) after."""
+    tak = FakeTak(_old_cache() + [_grp('RAPID-SOS', 'OUT', 22, active=False), _grp('RAPID-SOS', 'IN', 22, active=False)])
+    ns = _ns(tak)
+    assert ns['_tak_bootstrap_channel_state']()['missing'] == ['RAPID-SOS']
+    ns['_tak_sync_bootstrap_group_cache'](plog=lambda m: None)
+    assert ns['_tak_bootstrap_channel_state']()['state'] == 'ok' and 'RAPID-SOS' in _deliverable(tak)
 
 
 # ---------------------------------------------------------------- wiring

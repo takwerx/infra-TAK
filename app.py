@@ -52416,7 +52416,7 @@ window.ctLoadBootstrapChannels = function() {
         '<div style="font-weight:600;font-size:13px;margin-bottom:4px;color:var(--yellow)">Core Events will not reach ' + d.missing.length + ' channel' + (d.missing.length === 1 ? '' : 's') + '</div>' +
         '<div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">' +
         'CloudTAK’s TAK Server connection is not in: <strong style="color:var(--text-primary)">' + names + '</strong>. ' +
-        'TAK Server drops Events sent there without an error. infra-TAK fixes this by itself within a minute of a channel change; Fix now does it immediately.' +
+        'Events on those channels are never delivered, with no error. infra-TAK fixes this by itself within a minute of a channel change; Fix now does it immediately.' +
         '</div>' +
         '<div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button class="control-btn" id="ct-bootstrap-channels-fix">Fix now</button>' +
         '<span id="ct-bootstrap-channels-msg" style="font-size:12px;color:var(--text-dim)"></span></div></div>';
@@ -81874,13 +81874,15 @@ def _tak_bootstrap_cert_present():
 
 def _tak_bootstrap_channel_state(channels=None):
     """ops #127 detector (read-only): which TAK channels the CloudTAK bootstrap cert's LIVE 8089
-    subscription cannot send to. CloudTAK reposts Core Events over that connection with a marti
-    dest per channel, and TAK drops a dest group the sender is not in — no error anywhere.
+    subscription cannot deliver Core Events to. CloudTAK reposts them over that connection with a
+    marti dest per channel; a channel the connection lacks IN is never delivered (test12
+    2026-10-20), with no error anywhere. A channel counts as missing unless it is there IN and OUT
+    — what _tak_sync_bootstrap_group_cache converges to.
     Returns {'state', 'missing', 'channels', 'connected'}; state is one of
       absent        TAK not on this box, or no bootstrap cert — nothing to check
       unknown       TAK down or an API error — say nothing
       disconnected  the cert has no live connection (CloudTAK stopped or on another cert)
-      ok | missing  compared its newest subscription's OUT groups with /groups/all"""
+      ok | missing  compared its newest subscription's groups with /groups/all"""
     res = {'state': 'absent', 'missing': [], 'channels': 0, 'connected': False}
     if (_tak_core_is_remote() or not os.path.exists('/opt/tak/CoreConfig.xml')
             or not _tak_bootstrap_cert_present()):
@@ -81906,29 +81908,31 @@ def _tak_bootstrap_channel_state(channels=None):
             return -1
     # After a reconnect the old subscription can linger with its old groups: judge the newest.
     newest = max(mine, key=_num)
-    out = {g.get('name') for g in (newest.get('groups') or [])
-           if isinstance(g, dict) and g.get('direction') == 'OUT'}
+    have = {(g.get('name'), g.get('direction')) for g in (newest.get('groups') or []) if isinstance(g, dict)}
     res['connected'] = True
-    res['missing'] = sorted(g['name'] for g in channels if g.get('name') not in out)
+    res['missing'] = sorted(g['name'] for g in channels
+                            if (g.get('name'), 'IN') not in have or (g.get('name'), 'OUT') not in have)
     res['state'] = 'missing' if res['missing'] else 'ok'
     return res
 
 
 def _tak_sync_bootstrap_group_cache(plog=None):
-    """ops #127: make sure the CloudTAK CoreEvents bootstrap cert (cloudtak-svc-bootstrap) can SEND
-    to every channel, including channels created after it connected. Core Events sent to a channel
+    """ops #127: make sure the CloudTAK CoreEvents bootstrap cert (cloudtak-svc-bootstrap) can deliver
+    Core Events to every channel, including channels created after it connected. Core Events sent to a channel
     it is not in are dropped by TAK with no error anywhere (nuc 2026-10-20: RAPID-SOS).
 
     Two independent ways a new channel goes missing, so two steps:
 
     1. The x509 group cache. Since v0.9.21 CoreConfig carries
        x509useGroupCacheRequiresExtKeyUsage="false", so makeCert certs like this one ARE cached;
-       a channel created later reaches the cache inactive, or not at all — the trap
-       _tak_sync_admin_group_cache() fixes for `admin`. Only OUT matters for sending, so only OUT
-       is touched: inactive OUT entries are activated and channels with no OUT entry are added
-       active. IN entries are passed back unchanged — they decide what CloudTAK's server
-       connection RECEIVES, and CloudTAK or the operator may have narrowed that on purpose. One
-       activeForce PUT (TAK 5.5+) stores the list and re-authenticates the live connection.
+       a channel created later reaches the cache inactive (IN and OUT), or not at all — the trap
+       _tak_sync_admin_group_cache() fixes for `admin`. Every channel's IN and OUT entries are
+       made active (inactive ones activated, missing ones added). IN is the one that decides
+       delivery — measured on test12 2026-10-20 by toggling one entry at a time: IN off / OUT on,
+       a Core Event on that channel never reaches a member; IN on / OUT off, it does. OUT is
+       kept active too, the same as the admin sync and as an uncached admin cert gets. Entries
+       for non-channels (ROLE_ADMIN, __ANON__) are passed back unchanged. One activeForce PUT
+       (TAK 5.5+) stores the list and re-authenticates the live connection.
     2. The live connection. ROLE_ADMIN + x509assignAdminAllGroups grants "every group" only when
        the connection AUTHENTICATES, so even an uncached cert misses later channels (test8
        2026-10-20: live subscription missing TAKDEV-EMU, no cache entry at all). When the newest
@@ -81966,9 +81970,12 @@ def _tak_sync_bootstrap_group_cache(plog=None):
         if data is None or not entries:
             break  # read failed, or not cached (never connected / makeCert EKU bypass): step 2 decides
         entries = [e for e in entries if isinstance(e, dict)]
-        have_out = {e.get('name') for e in entries if e.get('direction') == 'OUT'}
-        inactive = [e for e in entries if e.get('direction') == 'OUT' and not e.get('active')]
-        added = [dict(g, direction='OUT', active=True) for g in channels if g.get('name') not in have_out]
+        names = {g.get('name') for g in channels}
+        have = {(e.get('name'), e.get('direction')) for e in entries}
+        inactive = [e for e in entries if e.get('name') in names
+                    and e.get('direction') in ('IN', 'OUT') and not e.get('active')]
+        added = [dict(g, direction=d, active=True) for g in channels for d in ('IN', 'OUT')
+                 if (g.get('name'), d) not in have]
         if not inactive and not added:
             break
         for e in inactive:
@@ -81981,8 +81988,8 @@ def _tak_sync_bootstrap_group_cache(plog=None):
         res['changed'] = True
         res['activated'] += len(inactive)
         res['added'] += len(added)
-        _log(f"bootstrap cert: cache — activated {len(inactive)}, added {len(added)} channel(s) for sending"
-             + (f" ({', '.join(sorted(g['name'] for g in added)[:10])})" if added else '')
+        _log(f"bootstrap cert: cache — activated {len(inactive)}, added {len(added)} channel entr(y/ies) (IN+OUT)"
+             + (f" ({', '.join(sorted({g['name'] for g in inactive + added})[:10])})" if inactive or added else '')
              + f" (pass {_pass + 1})")
         time.sleep(2)  # activeForce re-authenticates the live connection
     # Step 2 — the live connection.
