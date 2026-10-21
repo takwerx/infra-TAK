@@ -9,6 +9,8 @@
 # v10.0.1: single-server local DB access goes through _gd-tak-lib.sh so a
 # containerized DB (takserver-db) is queried via docker exec; native unchanged.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+# v10.3.0 W4.e: the console is upgrading / updating / rebooting the database server — stand down.
+type gd_dbserver_standdown >/dev/null 2>&1 && gd_dbserver_standdown tak-cotdb-watch && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cotdb_alert_sent"

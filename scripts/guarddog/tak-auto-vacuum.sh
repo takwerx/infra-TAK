@@ -19,6 +19,8 @@
 # containerized DB (takserver-db) is reached via docker exec; the two-server
 # SSH path and native local path are unchanged.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+# v10.3.0 W4.e: the console is upgrading / updating / rebooting the database server — stand down.
+type gd_dbserver_standdown >/dev/null 2>&1 && gd_dbserver_standdown tak-auto-vacuum && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 GUARDDOG_CONF="/opt/tak-guarddog/guarddog.conf"

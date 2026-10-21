@@ -436,3 +436,25 @@ gd_find_stack_dir() {
   done
   return 1
 }
+
+# v10.3.0 W4.e — the console is working on a split install's database server (OS upgrade,
+# Install updates, reboot). While /var/lib/takguard/dbserver-maintenance holds an epoch in
+# the future, a stopped PostgreSQL is that job working, not an outage: the DB watchers stand
+# down (return 0) instead of restarting PostgreSQL in the middle of dpkg. Absent, unreadable,
+# expired or garbage -> return 1 and the caller runs normally, so a console that died
+# mid-job silences Guard Dog for at most the expiry it wrote (3 h for the upgrade).
+# Logs once per script per window, not once per run.
+gd_dbserver_standdown() {
+  local f=/var/lib/takguard/dbserver-maintenance name="${1:-guarddog}" until now seen
+  [ -f "$f" ] || return 1
+  until="$(head -c 32 "$f" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$until" ] || return 1
+  now="$(date +%s)"
+  [ "$now" -lt "$until" ] 2>/dev/null || return 1
+  seen="/var/lib/takguard/dbserver-maintenance.${name//[^a-z-]/}.logged"
+  if [ "$(cat "$seen" 2>/dev/null)" != "$until" ]; then
+    echo "$(date): ${name}: stand-down — the console is working on the database server (until $(date -d "@$until" 2>/dev/null || echo "$until"))" >> /var/log/takguard/restarts.log
+    echo "$until" > "$seen" 2>/dev/null
+  fi
+  return 0
+}
