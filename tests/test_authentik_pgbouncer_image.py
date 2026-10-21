@@ -71,7 +71,8 @@ def healthy(live):
     return 0, 3
 
 
-def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pass=SA_PASS, raw=None):
+def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pass=SA_PASS, raw=None,
+         cred_changed=False):
     """`ldap(live) -> (rc, tak_groups)` scripts the outpost; `live` carries the running
     pgbouncer image, how many server/worker/ldap restarts happened, and the fake clock."""
     ak = tmp_path / 'authentik'
@@ -125,8 +126,10 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
         '_wait_for_authentik_stack_healthy': lambda plog, timeout=0: calls.append(['wait-healthy']) or True,
         're': re,
         'threading': threading,      # the ops #126 block after the settle helper makes a Lock
-        '_resync_ldap_credential_to_coreconfig': lambda: (calls.append(['tak-resync']) or (False, 'in_sync')),
-        '_tak_ldap_recycle_request': lambda reason, need_groups=True: calls.append(['tak-recycle-request', reason, need_groups]),
+        '_resync_ldap_credential_to_coreconfig': lambda: (calls.append(['tak-resync']) or
+                                                          ((True, 'credential') if cred_changed else (False, 'in_sync'))),
+        '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False: calls.append(
+            ['tak-recycle-request', reason, need_groups, restart]),
     }
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
@@ -380,20 +383,30 @@ def test_harden_step_does_not_recreate_on_a_formatting_only_diff():
     assert block.rstrip().endswith('if _ak_recreate:')
 
 
-# ── ops #126 (GH #189): TAK Server is restarted once LDAP is back ──────────────────
+# ── ops #126 (GH #189): TAK's clients are healed once LDAP is back ─────────────────
 
 def _recycle_requests(calls):
     return [c for c in calls if c[0] == 'tak-recycle-request']
 
 
-def test_good_swap_requests_a_tak_restart_even_with_the_credential_in_sync(tmp_path):
+def test_good_swap_requests_a_tak_client_heal_even_with_the_credential_in_sync(tmp_path):
     out, _, calls, _, log, _ = _run(tmp_path, OTHER)
     assert out is True
     assert calls.count(['tak-resync']) == 1                         # resync said 'in_sync'
     reqs = _recycle_requests(calls)
     assert len(reqs) == 1 and PIN in reqs[0][1] and reqs[0][2] is True
+    assert reqs[0][3] is False                                      # heal first, no forced restart
     assert calls.index(['tak-resync']) < calls.index(reqs[0])      # after the settle passed
     assert not any('restart needed to load it' in l for l in log)  # no more "someone should restart"
+    assert any('TAK client check requested' in l for l in log)
+
+
+def test_changed_credential_requests_a_real_tak_restart(tmp_path):
+    # Java reads CoreConfig at start: a new credential only takes effect after a restart.
+    out, _, calls, _, log, _ = _run(tmp_path, OTHER, cred_changed=True)
+    assert out is True
+    reqs = _recycle_requests(calls)
+    assert len(reqs) == 1 and reqs[0][3] is True
     assert any('TAK Server restart requested' in l for l in log)
 
 
@@ -422,7 +435,7 @@ def test_rollback_without_an_ldap_outage_requests_nothing(tmp_path):
     assert _recycle_requests(calls) == []
 
 
-def test_rollback_after_an_ldap_outage_requests_a_restart(tmp_path):
+def test_rollback_after_an_ldap_outage_requests_a_heal(tmp_path):
     out, _, calls, settings, _, _ = _run(tmp_path, OTHER, ldap=lambda live: (49, 0) if live['image'] == PIN else (0, 3))
     assert out is None and settings['authentik_pgbouncer']['image_last_outcome'] == 'rolled-back-ldap'
     reqs = _recycle_requests(calls)
@@ -430,7 +443,7 @@ def test_rollback_after_an_ldap_outage_requests_a_restart(tmp_path):
 
 
 def test_rollback_that_never_recovers_requests_nothing(tmp_path):
-    # Restarting TAK into a broken LDAP fixes nothing.
+    # Healing (or restarting) TAK into a broken LDAP fixes nothing.
     _, _, calls, _, _, _ = _run(tmp_path, OTHER, ldap=lambda live: (0, 0) if live['t'] > 0 else (0, 3))
     assert _recycle_requests(calls) == []
 
