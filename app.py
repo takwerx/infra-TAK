@@ -2075,6 +2075,23 @@ def _mod_result_step(module, step):
         pass
 
 
+def _mod_result_versions(module, frm=None, to=None):
+    """Fill in from/to on an in-flight record once the job itself knows them (ops #129: the
+    CloudTAK update only learns both after it starts, so its card said "? -> ?")."""
+    try:
+        with _MODULE_RESULTS_LOCK:
+            d = _mod_results_load()
+            last = (d.get(module) or {}).get('last')
+            if last and last.get('outcome') == 'running':
+                if frm:
+                    last['from'] = str(frm)[:60]
+                if to:
+                    last['to'] = str(to)[:60]
+                _mod_results_save(d)
+    except Exception:
+        pass
+
+
 def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None):
     """Record the outcome. `error` may be a message or a whole log; the real line is extracted."""
     try:
@@ -45473,6 +45490,182 @@ def _cloudtak_update_failed_note(plog):
     plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
+def _cloudtak_running_version(cloudtak_dir):
+    """The CloudTAK version the api container is RUNNING, else the tree's api/package.json.
+
+    ops #129: the container first, because a failed update can leave the tree at a newer tag
+    than the images that are serving. Never raises; '' when neither answers."""
+    try:
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-q', 'api'], timeout=30)
+        cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
+        if re.fullmatch(r'[0-9a-f]{12,64}', cid):
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'node', '-e',
+                                           "process.stdout.write(require('/home/etl/api/package.json').version)"]),
+                               capture_output=True, text=True, timeout=15)
+            v = (r.stdout or '').strip()
+            if r.returncode == 0 and re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v):
+                return v
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
+            v = str((json.load(f) or {}).get('version') or '').strip()
+        return v if re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v) else ''
+    except Exception:
+        return ''
+
+
+def _cloudtak_snapshot_images(cloudtak_dir):
+    """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now.
+
+    ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
+    old containers keep serving by image ID, but the moment anything recreates them (a failed
+    or partial `up -d`, the next boot heal) they come back on the NEW image with the OLD
+    compose. Taking these refs back is what makes a rollback a rollback. Registry images
+    (postgis, media, garage — refs with a '/') are pinned by tag and left alone."""
+    snap = []
+    try:
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-a', '-q'], timeout=60)
+        ids = [l.strip() for l in out.splitlines() if re.fullmatch(r'[0-9a-f]{12,64}', l.strip())] if rc == 0 else []
+        if not ids:
+            return snap
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}'] + ids),
+                           capture_output=True, text=True, timeout=60)
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.split()
+            if len(parts) != 2:
+                continue
+            ref, iid = parts
+            if ('/' not in ref and _CT_IMAGE_REF_RE.match(ref)
+                    and re.fullmatch(r'sha256:[0-9a-f]{64}', iid) and (ref, iid) not in snap):
+                snap.append((ref, iid))
+    except Exception:
+        pass
+    return snap
+
+
+def _cloudtak_restore_images(snap, plog):
+    """Point each snapshotted ref back at the image it named before the build. Never raises."""
+    n = 0
+    for ref, iid in snap or []:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'tag', iid, ref]), capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                n += 1
+            else:
+                plog(f"  ⚠ Could not point {ref} back at the previous image: {(r.stderr or '').strip()[:160]}")
+        except Exception as e:
+            plog(f"  ⚠ Could not point {ref} back at the previous image: {str(e)[:160]}")
+    if n:
+        plog(f"↩ Image tags put back on the previous build ({n} image(s))")
+    return n
+
+
+def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog):
+    """ops #129: the build succeeded, then `docker compose up -d` failed. Put the WHOLE stack
+    back on the previous version — tree, image tags, and any container the failed `up -d`
+    already replaced — instead of leaving the new tree over the old containers.
+
+    Order: revert the tree, re-tag the old images, then `up -d --no-build` from the reverted
+    compose. Containers `up -d` never reached match that compose + image exactly and are left
+    running untouched; any it stopped or replaced are recreated from the old image.
+    Returns True when the api container is running afterwards. Never raises."""
+    try:
+        if not snap:
+            plog("  ⚠ No record of the previous images — cannot roll the containers back")
+            return False
+        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        _cloudtak_restore_images(snap, plog)
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d', '--no-build'], timeout=900)
+        if rc != 0:
+            plog(f"  ⚠ Restarting the previous CloudTAK failed too: {_update_error_line(out) or out.strip()[-300:]}")
+            return False
+        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-q', 'api'], timeout=60)
+        cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
+        if re.fullmatch(r'[0-9a-f]{12,64}', cid):
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', cid]),
+                               capture_output=True, text=True, timeout=30)
+            if (r.stdout or '').strip() == 'true':
+                plog("↩ CloudTAK is running on the previous version again")
+                return True
+        plog("  ⚠ The previous CloudTAK did not come back up — check the CloudTAK page")
+        return False
+    except Exception as e:
+        plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+        return False
+
+
+_CT_DATA_ARG_RE = re.compile(r'^\s*ARG\s+DATA_SOURCE_URL\s*=\s*"?(https://[^\s"]+)"?\s*$', re.M)
+_CT_LOCAL_ZIP_ARG_RE = re.compile(r'^\s*ARG\s+USE_LOCAL_ZIP\b', re.M)
+_CT_DATA_TRIES = (0, 10, 30)   # seconds to wait before each attempt
+
+
+def _cloudtak_prefetch_build_data(cloudtak_dir, plog):
+    """Download CloudTAK's map data (CloudTAK-Data zip) on the host, BEFORE the build.
+
+    ops #129: the api Dockerfile's first stage wgets this zip from GitHub (codeload) inside the
+    build. One dropped download there fails the whole 90-minute build (ops1, twice in an hour),
+    and buildkit only says "process ... did not complete successfully". Upstream's Dockerfile
+    takes a local copy instead (`COPY api/data.zip*` + USE_LOCAL_ZIP=true), so fetch it here
+    with retries and a zip check, at the URL the checked-out Dockerfile pins.
+
+    Returns (ok, use_local, error). use_local=False with ok=True means this tree's Dockerfile
+    has no such step (nothing to do). ok=False: the data could not be fetched — the caller
+    stops before anything is built or restarted. Never raises."""
+    import zipfile
+    import urllib.request
+    try:
+        with open(os.path.join(cloudtak_dir, 'Dockerfile')) as f:
+            df = f.read()
+    except OSError:
+        return True, False, ''
+    m = _CT_DATA_ARG_RE.search(df)
+    if not m or not _CT_LOCAL_ZIP_ARG_RE.search(df):
+        return True, False, ''
+    url = m.group(1)
+    dest = os.path.join(cloudtak_dir, 'api', 'data.zip')
+    tmp = dest + '.part'
+    last = ''
+    plog(f"  Downloading CloudTAK map data before the build: {url}")
+    for i, wait in enumerate(_CT_DATA_TRIES, 1):
+        if wait:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': f'infra-TAK/{VERSION}'})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, 'wb') as out:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            with zipfile.ZipFile(tmp) as z:
+                names = z.namelist()
+                bad = z.testzip()
+            if bad is not None:
+                raise ValueError(f'the download is damaged ({bad})')
+            if not any(n.startswith('CloudTAK-Data-') for n in names):
+                raise ValueError('the download is not the CloudTAK-Data archive')
+            os.replace(tmp, dest)
+            plog(f"  ✓ Map data downloaded ({os.path.getsize(dest) // 1024} KB) — the build uses this copy")
+            return True, True, ''
+        except Exception as e:
+            last = str(e)[:200]
+            plog(f"  ⚠ Map data download attempt {i}/{len(_CT_DATA_TRIES)} failed: {last}")
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return False, False, f'could not download CloudTAK map data from {url} ({last})'
+
+
+def _cloudtak_drop_build_data(cloudtak_dir):
+    try:
+        os.remove(os.path.join(cloudtak_dir, 'api', 'data.zip'))
+    except OSError:
+        pass
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -45510,6 +45703,21 @@ def run_cloudtak_update():
         # enforced separately at plugin-install time.
         release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
+        # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
+        from_ver = ''
+        if is_remote:
+            _okv, _outv = _ssh_probe(remote_cfg, "cat ~/CloudTAK/api/package.json", timeout=30) if remote_host else (False, '')
+            try:
+                from_ver = str((json.loads(_outv or '{}') or {}).get('version') or '').strip() if _okv else ''
+            except ValueError:
+                from_ver = ''
+        else:
+            from_ver = _cloudtak_running_version(os.path.expanduser('~/CloudTAK'))
+        if not re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', from_ver or ''):
+            from_ver = ''
+        if from_ver:
+            plog(f"  Running now: {from_ver}")
+        _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -45750,6 +45958,22 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #129: what is serving NOW, so any failure from here on can put it back.
+            _ct_snap = _cloudtak_snapshot_images(cloudtak_dir)
+            # ops #129: fetch the map-data zip on the host with retries; a dropped download
+            # inside the build used to fail it after the long npm steps. Nothing is built or
+            # stopped yet, so a failure here leaves CloudTAK exactly as it was.
+            _dok, _use_local_zip, _derr = _cloudtak_prefetch_build_data(cloudtak_dir, plog)
+            if not _dok:
+                plog(f"✗ Update stopped before the build: {_derr}")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous version — nothing was built or restarted.")
+                plog("  This server could not download from GitHub (codeload.github.com). Check its internet/DNS")
+                plog("  access to github.com and codeload.github.com, or wait if GitHub is having an outage,")
+                plog("  then press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
@@ -45763,7 +45987,7 @@ def run_cloudtak_update():
             # test6, 2026-10-08) must leave the box exactly as it was, and it does only if
             # nothing has been stopped or migrated yet.
             proc = subprocess.Popen(
-                f'{dcc} build --no-cache',
+                f'{dcc} build --no-cache' + (' --build-arg USE_LOCAL_ZIP=true' if _use_local_zip else ''),
                 shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=cloudtak_dir, bufsize=1,
                 env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '5400'}
@@ -45782,21 +46006,27 @@ def run_cloudtak_update():
             try:
                 proc.wait(timeout=5400)  # 90 min (same as deploy)
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 if proc.returncode != 0:
                     plog(f"✗ Build failed with exit code {proc.returncode}")
                     for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
                         plog(_hint)
                     _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                    # ops #129: services that DID build were re-tagged; take the tags back so the
+                    # next recreate (boot heal, Update config) cannot start a new image on the old tree.
+                    _cloudtak_restore_images(_ct_snap, plog)
                     _cloudtak_update_failed_note(plog)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
                 proc.kill()
                 reader.join(timeout=5)
+                _cloudtak_drop_build_data(cloudtak_dir)
                 plog("✗ Build timed out after 90 minutes")
                 _undo_plugin_moves()
                 _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_restore_images(_ct_snap, plog)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
@@ -45805,6 +46035,7 @@ def run_cloudtak_update():
             # containers kept serving through the build, and if the move fails they are started
             # again as they were (_cloudtak_garage_rollback). A MinIO-era tree skips this; an
             # already-migrated one only re-checks .env.
+            _had_minio_store = os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
             if _cloudtak_compose_is_garage(cloudtak_dir):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -45813,14 +46044,34 @@ def run_cloudtak_update():
                     plog(f"✗ Garage store setup failed: {_gerr}")
                     _undo_plugin_moves()
                     _cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            # A MinIO -> Garage move THIS run archived .docker-store: the previous (MinIO) tree
+            # can no longer read the files, so a failed start below must not roll back to it.
+            _migrated_now = _had_minio_store and not os.path.isdir(os.path.join(cloudtak_dir, '.docker-store'))
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             _urc, _uout = _cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)
             for _l in _uout.strip().splitlines()[-12:]:
                 plog(f"  {_l}")
             if _urc != 0:
-                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}")
+                # ops #129 (ops1): this used to stop here — new tree, new image tags, old containers,
+                # and nothing put back. Name the cause, then roll the whole stack back.
+                _why = _update_error_line(_uout) or f'exit code {_urc}'
+                plog(f"✗ Restart (docker compose up -d) failed with exit code {_urc}: {_why}")
+                if _migrated_now:
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    _undo_plugin_moves()
+                    if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
