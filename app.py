@@ -16105,9 +16105,124 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     os.chmod(env_path, 0o600)
 
 
+# ops #138: Postgres reads POSTGRES_PASSWORD once, when the data volume is first created; the
+# password then lives in the volume and the env var is ignored. Deploy and Update used to take
+# the saved password or make a random one (since v0.9.59), so a box with none saved got a .env
+# its own database had never seen, and Remote Assist could no longer log in. A new password is
+# now made only when there is no database yet; otherwise the one in use is adopted and saved.
+# https://hub.docker.com/_/postgres (POSTGRES_PASSWORD: "only used if you start the container
+# with an empty data directory")
+def _remote_assist_env_value(ra_dir, key):
+    """`key` from Remote Assist's .env, or ''."""
+    try:
+        with open(os.path.join(ra_dir, '.env')) as f:
+            for line in f:
+                k, sep, v = line.strip().partition('=')
+                if sep and k.strip() == key:
+                    return v.strip().strip('"\'')
+    except OSError:
+        pass
+    return ''
+
+
+def _remote_assist_db_state(ra_dir):
+    """(exists, password) for the database of the compose project in `ra_dir`: whether its
+    postgres container or data volume exists, and the POSTGRES_PASSWORD its container was
+    created with ('' if unknown). Plain docker, not compose: compose refuses to parse the
+    file at all when .env is missing (POSTGRES_PASSWORD is `:?` required)."""
+    project = re.sub(r'[^a-z0-9_-]', '', os.path.basename(os.path.normpath(ra_dir)).lower())
+    try:
+        r = subprocess.run(['docker', 'ps', '-a', '-q',
+                            '--filter', f'label=com.docker.compose.project.working_dir={ra_dir}',
+                            '--filter', 'label=com.docker.compose.service=postgres'],
+                           capture_output=True, text=True, timeout=30)
+        cids = (r.stdout or '').split() if r.returncode == 0 else []
+        if cids:
+            r = subprocess.run(['docker', 'inspect', '--format',
+                                '{{range .Config.Env}}{{println .}}{{end}}', cids[0]],
+                               capture_output=True, text=True, timeout=30)
+            for line in (r.stdout or '').splitlines():
+                k, sep, v = line.partition('=')
+                if sep and k == 'POSTGRES_PASSWORD':
+                    return True, v.strip()
+            return True, ''
+        r = subprocess.run(['docker', 'volume', 'ls', '-q',
+                            '--filter', f'label=com.docker.compose.project={project}',
+                            '--filter', 'label=com.docker.compose.volume=postgres_data'],
+                           capture_output=True, text=True, timeout=30)
+        return bool(r.returncode == 0 and (r.stdout or '').strip()), ''
+    except Exception:
+        return False, ''
+
+
+def _remote_assist_pg_password(ra_dir, settings, plog):
+    """The DB password to write to .env. Saved setting first, then the existing .env, then the
+    running postgres container. A new one only when there is no database: with a database and
+    no password anywhere, the new one is applied to the database by _remote_assist_sync_db_password."""
+    saved = settings.get('remote_assist_pg_password')
+    if saved:
+        return saved
+    from_env = _remote_assist_env_value(ra_dir, 'POSTGRES_PASSWORD')
+    if from_env:
+        plog('  No DB password saved in the console; using the one in .env')
+        return from_env
+    exists, from_container = _remote_assist_db_state(ra_dir)
+    if from_container:
+        plog('  No DB password saved in the console; using the one the database container runs with')
+        return from_container
+    if exists:
+        plog('  ⚠ Existing database but no password found anywhere; setting a new one on the database')
+    return secrets.token_hex(24)
+
+
+def _remote_assist_pw_matches(verifier, password, user):
+    """True if `password` matches a pg_authid.rolpassword verifier (SCRAM-SHA-256 or md5)."""
+    verifier = (verifier or '').strip()
+    if verifier.startswith('SCRAM-SHA-256$'):
+        try:
+            iters_salt, keys = verifier[len('SCRAM-SHA-256$'):].split('$', 1)
+            iters, salt = iters_salt.split(':', 1)
+            stored_key = keys.split(':', 1)[0]
+            salted = hashlib.pbkdf2_hmac('sha256', password.encode(), _b64.b64decode(salt), int(iters))
+            client_key = hmac.new(salted, b'Client Key', hashlib.sha256).digest()
+            return hmac.compare_digest(hashlib.sha256(client_key).digest(), _b64.b64decode(stored_key))
+        except Exception:
+            return False
+    if verifier.startswith('md5'):
+        return hmac.compare_digest(verifier, 'md5' + hashlib.md5((password + user).encode()).hexdigest())
+    return False
+
+
+def _remote_assist_sync_db_password(ra_dir, pg_password, plog):
+    """Make the database role's password match .env, over the container's local socket (trust
+    in the official image, so the old password is not needed). A no-op when they already match.
+    Also repairs installs an earlier Update already broke. Returns True if it changed anything."""
+    user = _remote_assist_env_value(ra_dir, 'POSTGRES_USER') or 'cfd'
+    psql = _remote_assist_compose_cmd(ra_dir, 'exec', '-T', 'postgres',
+                                      'psql', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', 'postgres', '-tA')
+    r = subprocess.run(psql + ['-c', 'SELECT rolpassword FROM pg_authid WHERE rolname = current_user'],
+                       capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        plog(f'  ⚠ Could not check the database password: {(r.stderr or r.stdout).strip()[-200:]}')
+        return False
+    if _remote_assist_pw_matches(r.stdout, pg_password, user):
+        plog('  ✓ Database password matches .env')
+        return False
+    # The password goes in on stdin, not argv, so it never shows in a process list.
+    sql = "ALTER ROLE CURRENT_USER PASSWORD '%s';\n" % pg_password.replace("'", "''")
+    r = subprocess.run(psql, input=sql, capture_output=True, text=True, timeout=60, cwd=ra_dir)
+    if r.returncode != 0:
+        # Not psql's output: an error echoes the statement, password included.
+        plog(f'  ⚠ Could not set the database password (psql exit {r.returncode})')
+        return False
+    subprocess.run(_remote_assist_compose_cmd(ra_dir, 'restart', 'server'),
+                   capture_output=True, text=True, timeout=120, cwd=ra_dir)
+    plog('  ✓ Database password did not match .env; set it and restarted the server')
+    return True
+
+
 def _run_remote_assist_deploy(settings):
     import subprocess as _sp
-    import secrets as _sec
     plog = _remote_assist_deploy_log
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     try:
@@ -16159,7 +16274,7 @@ def _run_remote_assist_deploy(settings):
 
         plog('')
         plog('━━━ Step 4/6: Writing Configuration ━━━')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (NGINX_BIND_ADDR=127.0.0.1 HTTP_PORT={REMOTE_ASSIST_PORT})')
@@ -16175,6 +16290,7 @@ def _run_remote_assist_deploy(settings):
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up --build failed:\n{(r.stderr or r.stdout)[-600:]}')
         plog('✓ Containers built and started')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
@@ -16380,7 +16496,6 @@ _remote_assist_update_status = {'running': False, 'complete': False, 'error': Fa
 
 def _run_remote_assist_update():
     import subprocess as _sp
-    import secrets as _sec
     global _remote_assist_update_status
     log = []
     def plog(msg):
@@ -16415,7 +16530,7 @@ def _run_remote_assist_update():
             client_id, _ = _ensure_authentik_remote_assist_app(settings, plog=plog)
         if not client_id:
             raise RuntimeError('Authentik OIDC client_id missing')
-        pg_password = settings.get('remote_assist_pg_password') or _sec.token_hex(24)
+        pg_password = _remote_assist_pg_password(ra_dir, settings, plog)
         _remote_assist_write_env(ra_dir, settings, client_id, pg_password)
         ra_version = _remote_assist_read_version_file(ra_dir)
         plog(f'✓ .env written (loopback nginx → 127.0.0.1:{REMOTE_ASSIST_PORT})')
@@ -16430,6 +16545,7 @@ def _run_remote_assist_update():
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose build failed: {r.stderr[:300]}')
+        _remote_assist_sync_db_password(ra_dir, pg_password, plog)
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
