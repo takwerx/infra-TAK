@@ -86,6 +86,12 @@
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">Create DNS A records for *.{{ settings.get('fqdn', '') }} or individual subdomains pointing to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span><br>Subdomains in use on this box: {{ service_subdomains|join(' · ') }}<br>A wildcard record covers all of them; with individual A records you need one per subdomain listed.</div>
 </div>
+<div class="section-title">DNS Check</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">Each name's A record, as this server resolves it, compared with this server's address. Let's Encrypt can only issue a certificate for a name that points here.</div>
+<div id="dns-check-box">Checking…</div>
+<div style="margin-top:14px"><button id="dns-recheck-btn" class="control-btn">↻ Recheck</button></div>
+</div>
 <details id="service-domains-section" style="margin-bottom:24px">
 <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--text-secondary);padding:12px 0;user-select:none">Service Domains <span style="font-size:11px;color:var(--text-dim);font-weight:400">— customize per-service domains</span></summary>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-top:8px">
@@ -231,6 +237,15 @@
 <div style="text-align:center;margin-top:20px">
 <button onclick="deployCaddy()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;cursor:pointer">🚀 Deploy Caddy</button>
 </div>
+<div id="dns-check-panel" style="display:none;margin-top:20px;padding:16px;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.3);border-radius:8px">
+<div style="font-weight:600;color:var(--red);font-size:14px;margin-bottom:8px">Stopped before requesting certificates: DNS does not point to this server</div>
+<div id="dns-check-box-setup"></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px">
+<button id="dns-retry-btn" class="control-btn btn-start">↻ Retry</button>
+<button id="dns-skip-btn" class="control-btn">Continue anyway</button>
+<span style="font-size:11px;color:var(--text-dim);line-height:1.5">Continue anyway only if this server is behind NAT or a proxy, so its public address differs from the one shown above.</span>
+</div>
+</div>
 </div>
 </div>
 <div class="section-title">What You Get With a Domain</div>
@@ -252,12 +267,15 @@ function toggleSetupSslMode(){
     var panel=document.getElementById('setup-custom-cert');
     if(panel)panel.style.display=(sel&&sel.value==='custom')?'block':'none';
 }
-async function deployCaddy(){
+async function deployCaddy(opts){
+    opts=opts||{};
     var domain=document.getElementById('domain-input').value.trim();
     if(!domain){alert('Please enter a domain name');return}
     var modeEl=document.querySelector('input[name="setup-ssl-mode"]:checked');
     var mode=modeEl?modeEl.value:'fqdn';
     var req;
+    var dnsPanel=document.getElementById('dns-check-panel');
+    if(dnsPanel)dnsPanel.style.display='none';
     if(mode==='custom'){
         var cf=document.getElementById('setup-cert-file'),kf=document.getElementById('setup-key-file');
         if(!cf.files.length||!kf.files.length){alert('Custom Certificate selected — choose both a certificate and a private key file.');return}
@@ -265,8 +283,8 @@ async function deployCaddy(){
         var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
         req={method:'POST',body:fd};
     }else{
-        if(!confirm('Deploy Caddy with domain: '+domain+'?\n\nMake sure DNS is pointing to this server.')){return}
-        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn'})};
+        if(!opts.retry&&!confirm('Deploy Caddy with domain: '+domain+'?\n\nMake sure DNS is pointing to this server.')){return}
+        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn',skip_dns_check:!!opts.skipDns})};
     }
     var btn=document.getElementById('deploy-btn');
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
@@ -274,9 +292,77 @@ async function deployCaddy(){
         var r=await fetch('/api/caddy/deploy',req);
         var d=await r.json();
         if(d.success){pollCaddyLog()}
+        else if(d.dns_check){showSetupDnsBlock(d.dns_check);btn.disabled=false;btn.textContent='🚀 Deploy Caddy';btn.style.opacity='1'}
         else{var el=document.getElementById('deploy-log');var card=el?(el.closest('.card')||el.parentElement):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';if(window.MOD_INSTALLED){b.innerHTML='<strong>✗ Failed.</strong> See the log above for the cause. Nothing was removed — the existing install and its data were left in place.';}else{b.innerHTML='<strong>✗ Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){caddyUninstall()};b.appendChild(_ub);}card.insertBefore(b,el||card.firstChild);}if(el)el.textContent='Error: '+d.error;btn.disabled=false;btn.textContent='✗ Deployment failed — Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Caddy';btn.style.background='';deployCaddy();};}
     }catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='🚀 Deploy Caddy';btn.style.opacity='1'}
 }
+// ops #125 — DNS pre-check: does each name point here before Caddy asks Let's Encrypt?
+// Built with textContent (the IPs come from DNS) and listeners, no inline handlers.
+var _DNS_STATUS={
+    ok:['✓ points here','var(--green)'],
+    mismatch:['✗ points elsewhere','var(--red)'],
+    missing:['✗ no A record','var(--red)'],
+    error:['? lookup failed on this server','var(--yellow)'],
+    unknown:['? this server’s IP is unknown','var(--yellow)']
+};
+function _dnsCell(text,color){
+    var c=document.createElement('div');c.textContent=text;
+    if(color)c.style.color=color;
+    return c;
+}
+function renderDnsCheck(box,res){
+    box.innerHTML='';
+    var top=document.createElement('div');
+    top.style.cssText='font-size:13px;line-height:1.6;margin-bottom:12px;white-space:pre-wrap';
+    if(res.message){top.style.color='var(--red)';top.textContent=res.message}
+    else{top.style.color='var(--green)';top.textContent='✓ Every name Caddy serves points to this server ('+(res.server_ip||'IP unknown')+').'}
+    box.appendChild(top);
+    var grid=document.createElement('div');
+    grid.style.cssText='display:grid;grid-template-columns:minmax(180px,1.4fr) minmax(120px,1fr) minmax(160px,1fr);gap:6px 16px;font-family:\'JetBrains Mono\',monospace;font-size:12px';
+    ['Name','Resolves to','Status'].forEach(function(h){var c=_dnsCell(h,'var(--text-dim)');c.style.cssText+=';font-size:10px;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--border);padding-bottom:4px';grid.appendChild(c)});
+    (res.hosts||[]).forEach(function(h){
+        var st=_DNS_STATUS[h.status]||[h.status,''];
+        var label=st[0],color=st[1];
+        if(!h.needed&&h.status!=='ok'){
+            color=h.status==='mismatch'?'var(--yellow)':'var(--text-dim)';
+            label=(h.status==='missing'?'— no record':st[0])+' (not used yet)';
+        }
+        grid.appendChild(_dnsCell(h.host,h.needed?'var(--text-primary)':'var(--text-dim)'));
+        grid.appendChild(_dnsCell((h.ips||[]).join(', ')||'—',''));
+        var s=_dnsCell(label,color);if(h.error)s.title=h.error;grid.appendChild(s);
+    });
+    box.appendChild(grid);
+    var foot=_dnsCell('This server: '+(res.server_ip||'unknown')+'. Names marked "not used yet" only need a record once you install that service.','var(--text-dim)');
+    foot.style.cssText+=';font-size:11px;margin-top:10px';
+    box.appendChild(foot);
+}
+function showSetupDnsBlock(res){
+    var panel=document.getElementById('dns-check-panel');
+    if(!panel){alert(res.message);return}
+    renderDnsCheck(document.getElementById('dns-check-box-setup'),res);
+    panel.style.display='block';
+    panel.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+async function loadDnsCheck(){
+    var box=document.getElementById('dns-check-box');
+    if(!box)return;
+    var btn=document.getElementById('dns-recheck-btn');
+    if(btn){btn.disabled=true;btn.textContent='Checking…'}
+    try{
+        var d=await (await fetch('/api/caddy/dns-check')).json();
+        if(d.success)renderDnsCheck(box,d);else box.textContent=d.error||'DNS check failed';
+    }catch(e){box.textContent='DNS check failed: '+e.message}
+    if(btn){btn.disabled=false;btn.textContent='↻ Recheck'}
+}
+// A blocked save: offer the NAT/proxy override, then resend with skip_dns_check.
+function confirmDnsOverride(d){
+    return confirm(d.error+'\n\nOK = save anyway (only if this server is behind NAT or a proxy).\nCancel = fix DNS first.');
+}
+document.addEventListener('DOMContentLoaded',function(){
+    var rb=document.getElementById('dns-recheck-btn');if(rb){rb.addEventListener('click',loadDnsCheck);loadDnsCheck()}
+    var rt=document.getElementById('dns-retry-btn');if(rt)rt.addEventListener('click',function(){deployCaddy({retry:true})});
+    var sk=document.getElementById('dns-skip-btn');if(sk)sk.addEventListener('click',function(){deployCaddy({retry:true,skipDns:true})});
+});
 function pollCaddyLog(){
     var el=document.getElementById('deploy-log');
     if(!el){location.reload();return}
@@ -354,7 +440,13 @@ async function updateDomain(){
         if (!ok) return;
     }
     try{var r=await fetch('/api/caddy/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain})});
-    var d=await r.json();if(d.success){alert('Domain updated and Caddy reload scheduled.\n\nAuthentik domain sync is running in the background — check the Authentik page → Domain Migration Audit in ~60s to verify.');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
+    var d=await r.json();
+    if(d.dns_check){
+        if(!confirmDnsOverride(d))return;
+        r=await fetch('/api/caddy/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,skip_dns_check:true})});
+        d=await r.json();
+    }
+    if(d.success){alert('Domain updated and Caddy reload scheduled.\n\nAuthentik domain sync is running in the background — check the Authentik page → Domain Migration Audit in ~60s to verify.');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
 }
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
@@ -568,6 +660,10 @@ async function saveDomains(){
     try{
         var r=await fetch('/api/caddy/domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domains:domains,aliases:aliases})});
         var d=await r.json();
+        if(d.dns_check&&confirmDnsOverride(d)){
+            r=await fetch('/api/caddy/domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domains:domains,aliases:aliases,skip_dns_check:true})});
+            d=await r.json();
+        }
         if(d.success){
             status.style.color='var(--green)';status.textContent='Saved — Caddy reloading…';
             setTimeout(function(){location.reload()},3000);
