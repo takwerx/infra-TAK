@@ -41752,7 +41752,12 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     leaves the tag pointing at the new image even though the source gets rolled
     back — the next unrelated `compose up -d` then silently ships the
     rolled-back plugin. The running container still references the pre-build
-    image, so capture both here and retag on rollback."""
+    image, so capture both here and retag on rollback.
+
+    ops #133: and PIN it. On Docker 29 (containerd image store) the build moving the tag
+    makes the old image ID unusable for `docker tag` at once, running container or not
+    (test8, Docker 29.9.1), so the retag above failed and the new image stayed. The pin
+    (`cloudtak-api:infratak-rollback`, same helper as the CloudTAK Update) keeps it."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
     routes = _cloudtak_server_routes_dir(ct_dir)
@@ -41761,19 +41766,8 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    api_image_tag = api_image_id = ''
-    try:
-        cid = subprocess.run(['docker', 'compose', 'ps', '-q', 'api'], cwd=ct_dir,
-                             capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
-        if cid:
-            insp = subprocess.run(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}', cid[0]],
-                                  capture_output=True, text=True, timeout=30).stdout.split()
-            if len(insp) == 2:
-                api_image_tag, api_image_id = insp[0], insp[1]
-    except Exception:
-        pass
     return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes,
-            'api_image_tag': api_image_tag, 'api_image_id': api_image_id}
+            'api_images': _cloudtak_snapshot_images(ct_dir, services=['api'])}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -41798,26 +41792,31 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
         plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
     # v10.1.8: if the failed rebuild already advanced the image tag, point it back
     # at the pre-build image so the next `compose up -d` can't ship the rolled-back
-    # plugin. The old image is still referenced by the running container (and by
-    # this retag), so it can't have been pruned out from under us.
-    tag, old_id = snap_info.get('api_image_tag'), snap_info.get('api_image_id')
-    if tag and old_id:
+    # plugin. ops #133: from the pin taken before the build (see the snapshot), and
+    # only claimed when the retag actually worked.
+    images = snap_info.get('api_images') or []
+    moved = []
+    for ref, old_id in images:
         try:
-            cur = subprocess.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', tag],
-                                 capture_output=True, text=True, timeout=30).stdout.strip()
-            if cur and cur != old_id:
-                subprocess.run(['docker', 'tag', old_id, tag],
-                               capture_output=True, text=True, timeout=30)
-                if plog:
-                    plog(f'  ↩ Re-pointed image tag {tag} back at the pre-build image.')
+            _rc, cur, _err = _cloudtak_docker(['docker', 'image', 'inspect', '-f', '{{.Id}}', ref], timeout=30)
+            if cur.strip() != old_id:
+                moved.append((ref, old_id))
         except Exception:
-            pass
+            moved.append((ref, old_id))
+    if moved:
+        # Drops the pin only when the tag is back; a failed restore keeps it, so the
+        # previous image is still on the box (it is named in the warning above).
+        _cloudtak_restore_images(moved, plog or (lambda m: None))
+    _cloudtak_drop_rollback_pins([i for i in images if i not in moved])
+    snap_info['api_images'] = []
 
 
 def _cleanup_snapshot(snap_info):
     import shutil
     if snap_info and snap_info.get('snap'):
         shutil.rmtree(snap_info['snap'], ignore_errors=True)
+    if snap_info and snap_info.get('api_images'):
+        _cloudtak_drop_rollback_pins(snap_info['api_images'])   # ops #133: never leave a pin behind
 
 
 def _detect_cloudtak_plugins():
@@ -45579,10 +45578,11 @@ def _cloudtak_rollback_ref(ref):
     return ref.rsplit(':', 1)[0] + ':' + _CT_ROLLBACK_TAG
 
 
-def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None):
+def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None, services=()):
     """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now,
     each pinned under a `:infratak-rollback` tag so it still exists when it is needed.
     remote_cfg: the same on the remote CloudTAK host, which builds its own images (ops #133).
+    services: only these compose services (the plugin rebuild touches `api` alone).
 
     ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
     old containers keep serving by image ID, but the moment anything recreates them (a failed
@@ -45591,10 +45591,16 @@ def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None):
     with Docker's containerd image store (default since Docker 29) an image that has lost its
     tag is deleted as soon as its last container is replaced — measured on the box test, every
     old image was gone the moment `up -d` recreated its container. Registry images (postgis,
-    media, garage — refs with a '/') are pinned by tag already and left alone."""
+    media, garage — refs with a '/') are pinned by tag already and left alone.
+
+    ops #133 box test (test8, Docker 29.9.1): it is earlier than that. The moment a build moves
+    the tag, the old image ID is gone for `docker tag` / `image inspect` — while its container
+    is still running on it. So the pin has to be taken BEFORE the build; afterwards there is
+    nothing left to point the tag back at."""
     snap = []
     try:
-        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-a', '-q'], remote_cfg=remote_cfg, timeout=60)
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-a', '-q'] + list(services),
+                                       remote_cfg=remote_cfg, timeout=60)
         ids = [l.strip() for l in out.splitlines() if re.fullmatch(r'[0-9a-f]{12,64}', l.strip())] if rc == 0 else []
         if not ids:
             return snap

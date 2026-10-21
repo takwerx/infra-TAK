@@ -44,6 +44,7 @@ _FUNCS = {
     '_cloudtak_rollback_after_failed_up', '_cloudtak_prefetch_build_data',
     '_cloudtak_drop_build_data', '_cloudtak_rollback_ref', '_cloudtak_drop_rollback_pins',
     '_cloudtak_docker', '_cloudtak_compose_at',
+    '_snapshot_cloudtak_plugin_state', '_rollback_cloudtak_plugin_state', '_cleanup_snapshot',
 }
 DOCKERFILE = '''FROM alpine:3.24 AS data
 
@@ -167,6 +168,7 @@ def _ns(compose=None, run=None, ssh=None):
     assert _FUNCS <= names, 'a function under test was renamed or removed'
     ns = {'os': os, 're': re, 'json': json, 'shlex': shlex, 'VERSION': '10.2.24-alpha',
           '_ssh_probe': ssh or Ssh(), '_compose_cmd': lambda remote_cfg=None: 'docker compose',
+          '_cloudtak_server_routes_dir': lambda d: os.path.join(d, 'api', 'routes'),
           'time': type('T', (), {'sleep': staticmethod(lambda s: None)}),
           'subprocess': type('S', (), {'run': staticmethod(run or Run())}),
           '_sudo_wrap': lambda a: a, '_update_error_line': lambda t: (t or '').strip().splitlines()[-1] if t else '',
@@ -518,6 +520,80 @@ def test_remote_up_failure_rolls_back_unless_the_files_just_moved_to_garage():
     # the MinIO check brackets the Garage step
     assert r.index('_had_minio_store = ') < r.index('_cloudtak_remote_compose_is_garage(remote_cfg)') \
         < r.index('_migrated_now = ')
+
+
+class PluginRun(Run):
+    """Run, plus what `docker image inspect cloudtak-api` says the tag points at now."""
+    def __init__(self, tag_now=API_ID, **kw):
+        super().__init__(inspect_out=f'cloudtak-api {API_ID}\n', **kw)
+        self.tag_now = tag_now
+
+    def __call__(self, argv, **kw):
+        if argv[:3] == ['docker', 'image', 'inspect']:
+            self.calls.append(list(argv))
+            return type('R', (), {'returncode': 0, 'stdout': self.tag_now + '\n', 'stderr': ''})()
+        return super().__call__(argv, **kw)
+
+
+def _plugin_snap(ct, run, compose=None):
+    (ct / 'api' / 'routes').mkdir(parents=True)
+    web = ct / 'web-plugin'
+    web.mkdir()
+    ns = _ns(run=run, compose=compose or Compose())
+    return ns, str(web), ns['_snapshot_cloudtak_plugin_state'](str(ct), str(web))
+
+
+def test_plugin_snapshot_pins_the_api_image_before_the_build(ct):
+    compose, run = Compose(), PluginRun()
+    ns, web, snap = _plugin_snap(ct, run, compose)
+    assert ['ps', '-a', '-q', 'api'] in compose.calls          # api only: the plugin rebuild builds api alone
+    assert snap['api_images'] == [('cloudtak-api', API_ID)]
+    assert ['docker', 'tag', API_ID, 'cloudtak-api:infratak-rollback'] in run.calls
+
+
+def test_plugin_rollback_after_the_tag_moved_puts_it_back_from_the_pin(ct):
+    # test8, Docker 29.9.1: once the build moves the tag the old ID is gone for `docker tag`,
+    # running container or not — the retag only works because of the pin.
+    run, log = PluginRun(tag_now=EV_ID), []
+    ns, web, snap = _plugin_snap(ct, run)
+    run.calls.clear()
+    ns['_rollback_cloudtak_plugin_state'](str(ct), web, snap, log.append)
+    i_tag = run.calls.index(['docker', 'tag', API_ID, 'cloudtak-api'])
+    i_rm = run.calls.index(['docker', 'image', 'rm', 'cloudtak-api:infratak-rollback'])
+    assert i_tag < i_rm
+    assert any('Image tags put back' in l for l in log)
+    run.calls.clear()
+    ns['_cleanup_snapshot'](snap)                              # the finally: nothing left to do
+    assert run.calls == []
+
+
+def test_plugin_rollback_with_the_tag_unmoved_only_drops_the_pin(ct):
+    run = PluginRun(tag_now=API_ID)
+    ns, web, snap = _plugin_snap(ct, run)
+    run.calls.clear()
+    ns['_rollback_cloudtak_plugin_state'](str(ct), web, snap, lambda m: None)
+    assert not [c for c in run.calls if c[:2] == ['docker', 'tag']]
+    assert ['docker', 'image', 'rm', 'cloudtak-api:infratak-rollback'] in run.calls
+
+
+def test_plugin_rollback_that_cannot_retag_keeps_the_pin_and_says_so(ct):
+    run, log = PluginRun(tag_now=EV_ID), []
+    ns, web, snap = _plugin_snap(ct, run)
+    run.tag_rc = 1
+    run.calls.clear()
+    ns['_rollback_cloudtak_plugin_state'](str(ct), web, snap, log.append)
+    ns['_cleanup_snapshot'](snap)
+    assert not [c for c in run.calls if c[:3] == ['docker', 'image', 'rm']]
+    assert any('Could not point cloudtak-api back' in l for l in log)
+    assert not any('Re-pointed' in l for l in log)
+
+
+def test_a_finished_plugin_action_drops_the_pin(ct):
+    run = PluginRun()
+    ns, web, snap = _plugin_snap(ct, run)
+    run.calls.clear()
+    ns['_cleanup_snapshot'](snap)
+    assert run.calls == [['docker', 'image', 'rm', 'cloudtak-api:infratak-rollback']]
 
 
 def test_remote_from_version_is_what_the_remote_container_runs():
