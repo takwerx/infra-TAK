@@ -38,7 +38,9 @@ import base64
 import json
 import os
 import socket
+import subprocess
 import sys
+import time
 
 # Duplicated from takwerx_broker.py on purpose (importing it is the cost this
 # file exists to avoid). tests/test_brokerctl.py asserts they stay equal.
@@ -47,12 +49,58 @@ MAX_MSG = 32 * 1024 * 1024
 DEFAULT_TIMEOUT = 600
 MAX_TIMEOUT = 7200
 
+# ops #113: the broker restarts itself once a day (idle recycle) and on every source
+# change; for ~2-3 s its socket is gone (or still there but refusing). A call landing in
+# that gap used to fail with exit 125. Nothing was sent yet, so retrying the CONNECT cannot
+# run a command twice — wait for the broker, bounded, while systemd says it is up or on its
+# way back up (a stopped or failed broker fails fast, as before).
+UNIT_SOCKET = '/run/takwerx-broker.sock'
+RESTART_WAIT_SECS = 30
+LIVE_STATES = ('active', 'activating', 'deactivating', 'reloading')
+
+
+def broker_restarting():
+    """True while systemd has takwerx-broker up or coming back. False when it cannot
+    tell, and for a socket that is not the unit's (tests, TAKWERX_BROKER_SOCKET)."""
+    if SOCKET_PATH != UNIT_SOCKET:
+        return False
+    for sc in ('/usr/bin/systemctl', '/bin/systemctl'):
+        if os.path.exists(sc):
+            break
+    else:
+        return False
+    try:
+        r = subprocess.run([sc, 'is-active', 'takwerx-broker'], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (r.stdout or '').strip() in LIVE_STATES
+
+
+def connect(timeout, wait=RESTART_WAIT_SECS, clock=time.monotonic, sleep=time.sleep):
+    """A socket connected to the broker; waits out a broker restart (see above)."""
+    deadline = None
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(SOCKET_PATH)
+            return s
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            if deadline is None:
+                deadline = clock() + wait
+            if clock() >= deadline or not broker_restarting():
+                raise
+            sleep(0.25)
+        except BaseException:
+            s.close()
+            raise
+
 
 def client_send(req, timeout=DEFAULT_TIMEOUT):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s = connect(timeout)
     try:
-        s.settimeout(timeout)
-        s.connect(SOCKET_PATH)
         s.sendall(json.dumps(req).encode())
         s.shutdown(socket.SHUT_WR)
         buf = bytearray()

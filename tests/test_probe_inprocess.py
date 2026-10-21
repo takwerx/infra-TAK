@@ -50,7 +50,8 @@ def _cut(name, kind='def'):
 
 
 SRC = '\n'.join([
-    _cut('BrokerError', 'class'), _cut('_broker_request'), _cut('_probe_run'),
+    _cut('BrokerError', 'class'), _cut('_broker_connect'), _cut('_broker_request'),
+    _cut('_probe_run'),
     _cut('_PROBE_SHIMMED', 'assign'), _cut('_probe_shim_equivalent'),
     _cut('_BROKER_INPROCESS_KW', 'assign'), _cut('_broker_client_prefix'),
     _cut('_broker_inprocess_eligible'), _cut('_broker_exec_inprocess'),
@@ -67,6 +68,7 @@ class Console:
             'BROKER_SOCKET': sock,
             '_broker_shim_env': lambda env: env,
             '_broker_should_route': lambda: True, '_broker_available': lambda: True,
+            '_broker_wait': lambda ready, *a, **k: False,       # no broker restart here
             '_BROKER_SHIM_DIR': str(REPO / 'tests'),            # replaced per test when needed
         }
         self.ns['_sudo_wrap'] = lambda cmd: [sys.executable, '-I', '-S', CLIENT, 'exec', '--'] + list(cmd)

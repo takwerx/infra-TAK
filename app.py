@@ -216,22 +216,109 @@ def _broker_should_route():
     return os.getuid() != 0
 
 
-def _broker_available():
+def _broker_socket_present():
     try:
         return _stat.S_ISSOCK(os.stat(BROKER_SOCKET).st_mode)
     except OSError:
         return False
 
 
+# ops #113: the broker restarts itself once a day (its idle recycle) and whenever its source
+# changes, and for ~2-3 s its socket is gone. Every caller below that found it gone fell back
+# to `sudo -n` or the bare binary — which, on a non-root box, simply fails. test6 2026-10-20
+# 13:14:58Z: 46 `sudo -n` failures in the 3.3 s gap, mid post-update → "Node-RED container
+# not running" (flow sync skipped) and a false Authentik `FATAL: port conflict`. On a box that
+# routes through the broker, a broker systemd still has up or on its way back up is a broker
+# to wait for, not to route around. Bounded; a stopped or failed broker fails fast as before.
+# Same rule as takwerx_brokerctl.connect() and the PATH shims.
+BROKER_RESTART_WAIT_SECS = 30
+_BROKER_UNIT_SOCKET = '/run/takwerx-broker.sock'
+_BROKER_LIVE_STATES = ('active', 'activating', 'deactivating', 'reloading')
+_broker_wait_note_at = 0.0
+
+
+def _broker_restarting():
+    """True while systemd has takwerx-broker up or coming back. Real systemctl, not the
+    PATH shim (which would itself wait on the broker); False when it cannot tell."""
+    if BROKER_SOCKET != _BROKER_UNIT_SOCKET:
+        return False
+    sc = shutil.which('systemctl', path='/usr/bin:/bin')
+    if not sc:
+        return False
+    try:
+        r = subprocess.run([sc, 'is-active', 'takwerx-broker'], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (r.stdout or '').strip() in _BROKER_LIVE_STATES
+
+
+def _broker_wait(ready, max_secs=BROKER_RESTART_WAIT_SECS):
+    """Poll `ready()` while the broker is restarting, for at most `max_secs`. True once
+    `ready()` is; False at once when not routing or systemd says the broker is down."""
+    global _broker_wait_note_at
+    if not _broker_should_route():
+        return False
+    t0 = time.monotonic()
+    next_state_check = t0
+    while True:
+        now = time.monotonic()
+        if now >= next_state_check:
+            if not _broker_restarting():
+                return False
+            next_state_check = now + 1
+        if now - t0 >= max_secs:
+            print(f'Privileged broker still unreachable after {max_secs}s of waiting for its '
+                  'restart — this call falls back', flush=True)
+            return False
+        time.sleep(0.1)
+        if ready():
+            if now - _broker_wait_note_at >= 10:     # one line per restart, not per call
+                _broker_wait_note_at = now
+                print(f'Privileged broker was restarting — waited '
+                      f'{time.monotonic() - t0:.1f}s for it instead of falling back', flush=True)
+            return True
+
+
+def _broker_available():
+    return _broker_socket_present() or _broker_wait(_broker_socket_present)
+
+
+def _broker_connect(timeout):
+    """A socket connected to the broker. A missing/refusing socket while the broker restarts
+    is retried (_broker_wait) — nothing was sent yet, so a retry cannot run a command twice."""
+    def _try():
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(BROKER_SOCKET)
+            return s
+        except BaseException:
+            s.close()
+            raise
+    try:
+        return _try()
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        first = e
+    except OSError as e:
+        raise BrokerError(f'broker unreachable: {e}')
+    got = []
+
+    def _ready():
+        try:
+            got.append(_try())
+            return True
+        except OSError:
+            return False
+    if _broker_wait(_ready):
+        return got[0]
+    raise BrokerError(f'broker unreachable: {first}')
+
+
 def _broker_request(req, timeout=600):
     """Send one JSON request to the broker, return the parsed response dict.
     Raises BrokerError if the socket is unreachable."""
-    try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(BROKER_SOCKET)
-    except OSError as e:
-        raise BrokerError(f'broker unreachable: {e}')
+    s = _broker_connect(timeout)
     try:
         s.sendall(json.dumps(req).encode())
         s.shutdown(_socket.SHUT_WR)
@@ -1081,7 +1168,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.22-alpha"
+VERSION = "10.2.23-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1159,6 +1246,11 @@ CADDY_CERT_STORE = "/var/lib/caddy/.local/share/caddy/certificates"
 CADDY_LE_ISSUER_DIR = "acme-v02.api.letsencrypt.org-directory"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
+# GH #176: operator-owned Caddy includes, outside the generated file so no regeneration
+# can touch them. snippets.d/*.caddy is imported at the top level right after the global
+# options; sites.d/<host>/*.caddy is imported as the first line of that host's site block.
+CADDY_SNIPPETS_INCLUDE_DIR = "/etc/caddy/snippets.d"
+CADDY_SITES_INCLUDE_DIR = "/etc/caddy/sites.d"
 # CloudTAK official icon (SVG data URL)
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
@@ -26917,6 +27009,26 @@ def _caddy_configured_urls(settings, modules):
         urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
+def _caddy_includes_summary(caddyfile_text):
+    """What the Caddy page shows about the GH #176 include hooks: the folders, the per-site
+    folders the live Caddyfile actually imports, the files in use, and the last rejection."""
+    pat = re.compile(r'^\s*import ' + re.escape(CADDY_SITES_INCLUDE_DIR) + r'/([^/\s]+)/\*\.caddy\s*$')
+    hosts = []
+    for ln in (caddyfile_text or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0].splitlines():
+        m = pat.match(ln)
+        if m and m.group(1) not in hosts:
+            hosts.append(m.group(1))
+    rej = _caddy_include_rejected
+    return {
+        'sites_dir': CADDY_SITES_INCLUDE_DIR,
+        'snippets_dir': CADDY_SNIPPETS_INCLUDE_DIR,
+        'hosts': hosts,
+        'files': _caddy_operator_include_files(),
+        'rejected_err': rej.get('err') or '',
+        'rejected_files': list(rej.get('files') or []),
+    }
+
+
 @app.route('/caddy')
 @login_required
 def caddy_page():
@@ -26949,6 +27061,7 @@ def caddy_page():
         caddy_update_available=caddy_update_available,
         caddy_version=caddy_version,
         caddy_last_action=_caddy_last_action_summary(),
+        caddy_includes=_caddy_includes_summary(caddyfile_content),
         service_subdomains=_service_subdomain_labels(settings),
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
@@ -32347,6 +32460,147 @@ def _inject_custom_cert_tls(lines, cert_path, key_path):
     return out
 
 
+# GH #176: a plain host address only. `http://…`, `host:port` and anything with a wildcard
+# or a second address are skipped: Caddy allows one wildcard per import pattern, and the
+# extra listeners (ATLAS :8449, Remote Assist device port) must not pick up the 443 site's
+# directives.
+_CADDY_INCLUDE_HOST_RE = re.compile(r'^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$')
+
+
+def _inject_operator_includes(lines, sites_dir=CADDY_SITES_INCLUDE_DIR,
+                              snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """Add the operator's include hooks to a rendered Caddyfile (GH #176).
+
+    Every regeneration rewrites the generated part of the file, so a line an operator added
+    inside a generated site block (the reporter's `import cloudtak_print` in the CloudTAK
+    map site) is gone after the next deploy or Update Now. The user-blocks marker at the
+    bottom cannot hold it: a second block for the same host is "ambiguous site definition".
+    So the generated file points at files it never writes:
+
+      * `import <snippets_dir>/*.caddy` right after the global options block, for snippet
+        definitions (a snippet must be defined above the line that imports it);
+      * `import <sites_dir>/<host>/*.caddy` as the FIRST line of each plain-host site block.
+
+    A glob that matches nothing is only a warning in Caddy ("No files matching import glob
+    pattern"), so a box without operator files serves exactly what it served before. A
+    per-host folder with `*.caddy` (not `<host>.caddy*`) so an editor backup or a
+    `cp x.caddy x.caddy.bak` is never imported twice. Pure function on the line list."""
+    flat = '\n'.join(lines).split('\n')
+    out = []
+    in_global = None   # None = not seen yet, True = inside it, False = done
+    for ln in flat:
+        out.append(ln)
+        s = ln.rstrip()
+        if in_global is None and s == '{':
+            in_global = True
+            continue
+        if in_global is True:
+            if s == '}':
+                in_global = False
+                out.append(f"import {snippets_dir}/*.caddy")
+            continue
+        if not s.endswith(' {') or s[0].isspace() or s.startswith(('#', '(')):
+            continue
+        addr = s[:-2].strip().lower()
+        if not _CADDY_INCLUDE_HOST_RE.match(addr):
+            continue
+        out.append(f"    import {sites_dir}/{addr}/*.caddy")
+    return out
+
+
+def _caddy_operator_include_files(sites_dir=CADDY_SITES_INCLUDE_DIR,
+                                  snippets_dir=CADDY_SNIPPETS_INCLUDE_DIR):
+    """The operator include files the generated Caddyfile would import, sorted. Both folders
+    are root-owned 755 (see _caddy_ensure_include_dirs), so the console can list them."""
+    found = []
+    try:
+        found += [os.path.join(snippets_dir, n) for n in os.listdir(snippets_dir)
+                  if n.endswith('.caddy')]
+    except OSError:
+        pass
+    try:
+        hosts = os.listdir(sites_dir)
+    except OSError:
+        hosts = []
+    for h in hosts:
+        d = os.path.join(sites_dir, h)
+        if not os.path.isdir(d):
+            continue
+        try:
+            found += [os.path.join(d, n) for n in os.listdir(d) if n.endswith('.caddy')]
+        except OSError:
+            pass
+    return sorted(found)
+
+
+_CADDY_INCLUDE_README = {
+    CADDY_SNIPPETS_INCLUDE_DIR: (
+        "# Caddy snippets that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in this folder is imported at the top of /etc/caddy/Caddyfile,\n"
+        "# right after the global options. Define named snippets here, e.g.\n"
+        "#   (cloudtak_print) {\n"
+        "#       @cloudtak_print path /print-api /print-api/*\n"
+        "#       handle @cloudtak_print {\n"
+        "#           reverse_proxy 127.0.0.1:5010\n"
+        "#       }\n"
+        "#   }\n"
+        "# and use them from a per-site file in /etc/caddy/sites.d/<host>/.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"),
+    CADDY_SITES_INCLUDE_DIR: (
+        "# Per-site Caddy directives that survive every infra-TAK Caddyfile regeneration (GH #176).\n"
+        "# Every *.caddy file in /etc/caddy/sites.d/<host>/ is imported as the FIRST line of that\n"
+        "# host's site block, e.g. /etc/caddy/sites.d/map.example.com/10-print.caddy:\n"
+        "#   @cloudtak_print path /print-api /print-api/*\n"
+        "#   handle @cloudtak_print {\n"
+        "#       reverse_proxy 127.0.0.1:5010\n"
+        "#   }\n"
+        "# <host> is the site address exactly as it appears in /etc/caddy/Caddyfile.\n"
+        "# Files must be readable by caddy (0644). Apply with Reload on the infra-TAK Caddy page.\n"
+        "# If a file here makes the Caddyfile invalid, infra-TAK's next regeneration leaves\n"
+        "# ALL includes out (so every site keeps working) and says why on the Caddy page.\n"),
+}
+
+
+def _caddy_ensure_include_dirs():
+    """Create the two include folders (root-owned 0755) with a README, once. Non-fatal."""
+    for d, text in _CADDY_INCLUDE_README.items():
+        try:
+            if not os.path.isdir(d):
+                _makedirs_priv(d, mode=0o755)
+            readme = os.path.join(d, 'README')
+            if not os.path.exists(readme):
+                _write_priv(readme, text, perm=0o644)
+        except Exception as e:
+            print(f'Caddy: could not prepare {d} (non-fatal): {str(e)[:160]}', flush=True)
+
+
+# Set when the last regeneration had to leave the operator includes out (GH #176).
+_caddy_include_rejected = {'err': '', 'ts': 0.0, 'files': []}
+
+
+def _caddy_validate_operator_includes(with_includes, plain):
+    """The Caddyfile with operator imports is on disk; check it. Returns (text_on_disk, done).
+
+    If Caddy rejects it and the same file WITHOUT the imports is fine, the operator's files
+    are the cause: keep the plain file so a typo in one include cannot take every proxied
+    service down, and record why for the Caddy page. `done` False means the plain file is
+    on disk and still needs the normal GH #59 validate-or-restore."""
+    verdict, out = _caddy_validate_config()
+    if verdict != 'bad':
+        _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        return with_includes, True
+    _write_priv(CADDYFILE_PATH, plain)
+    verdict2, _ = _caddy_validate_config()
+    if verdict2 == 'bad':
+        return plain, False
+    files = _caddy_operator_include_files()
+    err = (out or 'caddy validate failed with no output')[-400:]
+    _caddy_include_rejected.update({'err': err, 'ts': time.time(), 'files': files})
+    print('Caddy: operator include files REJECTED by `caddy validate` — Caddyfile written '
+          'WITHOUT them (%s): %s' % (', '.join(files) or 'none found', err), flush=True)
+    return plain, True
+
+
 # GH #137 follow-up: registry-resident modules (ATLAS MDM, TVR, Email Relay, Client Feed,
 # Simulator) only read as installed once mod_registry.load_all() has run at the bottom of
 # app.py, ~90 s into a console start. Every regen before that — the Hardened-posture
@@ -33192,7 +33446,10 @@ def generate_caddyfile(settings=None):
         if cert_path and key_path:
             lines = _inject_custom_cert_tls(lines, cert_path, key_path)
 
-    caddyfile = '\n'.join(lines)
+    # GH #176: operator include hooks. The file WITHOUT them is kept as the fallback for an
+    # include that does not parse (_caddy_validate_operator_includes).
+    caddyfile_plain = '\n'.join(lines)
+    caddyfile = '\n'.join(_inject_operator_includes(lines))
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     # v10.1.0: the marker is now ALWAYS emitted at the end of the generated file. It used to
     # exist only if an operator already knew the magic string and typed it in by hand — so in
@@ -33215,12 +33472,17 @@ def generate_caddyfile(settings=None):
                 user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
-    caddyfile = (caddyfile.rstrip() + '\n\n'
-                 + CADDYFILE_USER_BLOCKS_MARKER + '\n'
-                 + '# Anything below this line survives every infra-TAK regeneration.\n'
-                 + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
+    # GH #176: this hint sits ABOVE the marker, in the generated part, so no version's
+    # user-block capture can ever keep it as operator content.
+    tail = ('\n\n# Directives INSIDE a generated site: ' + CADDY_SITES_INCLUDE_DIR
+            + '/<host>/*.caddy (see README there).\n'
+            + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+            + '# Anything below this line survives every infra-TAK regeneration.\n'
+            + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
     if user_blocks:
-        caddyfile += '\n' + user_blocks + '\n'
+        tail += '\n' + user_blocks + '\n'
+    caddyfile = caddyfile.rstrip() + tail
+    caddyfile_plain = caddyfile_plain.rstrip() + tail
     # GH #137 follow-up: before the module registry loads, registry modules read as not
     # installed — writing now would drop their sites. Return what was built; the
     # post-registry catch-up writes the real file.
@@ -33231,6 +33493,7 @@ def generate_caddyfile(settings=None):
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
     _makedirs_priv(os.path.dirname(CADDYFILE_PATH))
+    _caddy_ensure_include_dirs()
     # v10.1.39 (GH #59): keep the outgoing file so a config that does not parse can be put
     # back. Must be read BEFORE the write — after it there is nothing left to restore.
     _caddy_prev = None
@@ -33245,7 +33508,13 @@ def generate_caddyfile(settings=None):
     # than left on disk to strand the box at its next restart (GH #59). Same single choke
     # point as _selinux_sync_caddy_ports() below.
     try:
-        _caddy_validate_or_restore(_caddy_prev)
+        _inc_done = False
+        if caddyfile != caddyfile_plain and _caddy_operator_include_files():
+            caddyfile, _inc_done = _caddy_validate_operator_includes(caddyfile, caddyfile_plain)
+        else:
+            _caddy_include_rejected.update({'err': '', 'ts': 0.0, 'files': []})
+        if not _inc_done:
+            _caddy_validate_or_restore(_caddy_prev)
     except Exception as _cv_err:
         print(f'Caddy: validate/restore step errored (non-fatal): {_cv_err}', flush=True)
     # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
@@ -58052,8 +58321,13 @@ def _authentik_apply_official_tunings(plog):
 # for the PgBouncer security releases 1.25.2 / 1.26.0 / 1.26.1 — pre-auth
 # crashes and hangs in SCRAM/packet parsing, KILL_CLIENT authz, and a SCRAM
 # login-as-another-user flaw. https://www.pgbouncer.org/changelog.html
+# v10.2.23: back to v1.25.1-p0 (ops #123). After the v10.2.22 swap a field box's
+# LDAP SA bind never came back and TAK users reconnected with no groups; test12
+# showed every user at memberOf=0 for ~10 s after the swap. The security bump
+# returns as its own change once the swap is verified end to end.
 # Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
-# (the install path only writes it when it first adds the service).
+# (the install path only writes it when it first adds the service), in either
+# direction, so boxes already on v1.26.1-p0 move back on their next console start.
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -58061,7 +58335,7 @@ def _authentik_apply_official_tunings(plog):
 # for that pgbouncer version. Tags MUST be the exact DockerHub tag —
 # `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.26.1-p0'
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
 
 
 def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
@@ -59726,10 +60000,19 @@ def _ensure_authentik_pgbouncer_image(plog):
     deliberate swap with different env semantics and is left alone.
 
     Pulls first (nothing is mutated if the pull fails), then rewrites compose and
-    recreates pgbouncer only — never server, worker or the LDAP outpost. The server's
-    client connections drop for the few seconds the container takes to come back,
-    the same blip as a pool-size reconcile. Verifies the RUNTIME (the container's
-    image and health), and rolls compose back to the old image if it doesn't come up.
+    recreates pgbouncer only. The server's client connections drop for the few seconds
+    the container takes to come back, the same blip as a pool-size reconcile. Verifies
+    the RUNTIME (the container's image and health), and rolls compose back to the old
+    image if it doesn't come up.
+
+    v10.2.23 (ops #123): a healthy container is not proof TAK can read groups. After the
+    v10.2.22 swap, test12's outpost served memberOf=0 for every user for ~10 s, starting
+    ~25 s after pg_isready said healthy, and a field box's SA bind never came back. So
+    the swap must also pass what TAK Server depends on: a live adm_ldapservice bind plus
+    users' memberOf through the outpost, held for `_PGB_SWAP_LDAP_STABLE_S`. If it
+    doesn't, server+worker+ldap are restarted (fresh DB pools, fresh outpost cache) and
+    it is checked again; still failing → roll back. A box whose LDAP was already failing
+    BEFORE the swap is not rolled back for it (the swap didn't break it).
 
     Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
     """
@@ -59783,7 +60066,32 @@ def _ensure_authentik_pgbouncer_image(plog):
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
             cwd=ak_dir, capture_output=True, text=True, timeout=180)
 
-    def _rollback(why):
+    restarted = []
+
+    def _restart_ak(why):
+        # The restart is itself an LDAP outage, so at most ONE per run, and the outpost
+        # only after the server is healthy (ops #30: an outpost that starts against a
+        # server that goes away mid start-up panics).
+        if restarted:
+            plog(f"  pgbouncer image: {why} — Authentik already restarted once this run, not again")
+            return
+        restarted.append(why)
+        plog(f"  pgbouncer image: {why} — restarting Authentik server+worker, then ldap "
+             f"(fresh DB pools, fresh outpost cache)...")
+        with _authentik_compose_lock('pgbouncer-image-restart', plog=plog) as _locked:
+            if not _locked:
+                plog("  ✗ pgbouncer image: compose lock busy — restart NOT done")
+                return
+            rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=300)
+            _wait_for_authentik_stack_healthy(plog, timeout=180)
+            rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=120)
+        for res in (rr, rl):
+            if res.returncode != 0:
+                plog(f"  ✗ pgbouncer image: restart failed: {((res.stderr or '') + (res.stdout or ''))[-300:]}")
+
+    def _rollback(why, check_ldap=False):
         plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
         with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
             if _locked:
@@ -59793,8 +60101,25 @@ def _ensure_authentik_pgbouncer_image(plog):
             else:
                 plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
                      f"restore {compose_bak} by hand")
+                return
+        if check_ldap and not _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback'):
+            _restart_ak(f"LDAP failing after rolling back to {cur}")
+            _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback + restart')
 
-    plog(f"  pgbouncer image: {cur} → {target} (PgBouncer security fixes) — pulling first...")
+    # Baseline the LDAP path TAK Server uses BEFORE touching anything, so the post-swap
+    # check knows what "working" looks like on this box (and whether it already wasn't).
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    can_probe = bool(ldap_pass) and _ensure_ldapsearch()
+    base_ok, base_groups = False, 0
+    if can_probe:
+        base_ok, base_groups, base_detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        plog(f"  pgbouncer image: LDAP before the swap: "
+             f"{'SA bind ok' if base_ok else 'SA bind FAILING'}, {base_detail}")
+    else:
+        plog("  pgbouncer image: no ldapsearch or no adm_ldapservice password — "
+             "can only check container health after the swap")
+
+    plog(f"  pgbouncer image: {cur} → {target} — pulling first...")
     p = subprocess.run(_sudo_wrap(['docker', 'pull', target]), capture_output=True, text=True, timeout=300)
     if p.returncode != 0:
         plog(f"  ✗ pgbouncer image: pull failed, nothing changed (next boot retries): "
@@ -59802,7 +60127,21 @@ def _ensure_authentik_pgbouncer_image(plog):
         _record('pull-failed')
         return None
 
+    # ops #123: change the image LINE only. v10.2.22 re-dumped the whole file
+    # (safe_dump width=200), which re-wrapped long lines; the post-update harden step
+    # saw a text diff and force-recreated server/worker/ldap — three LDAP outages on
+    # test6 in 2.5 min, each followed by memberOf=0.
+    new_compose = _compose_set_service_image(raw_compose, 'pgbouncer', target)
     pgb['image'] = target
+    try:
+        same_otherwise = new_compose is not None and _yaml.safe_load(new_compose) == data
+    except Exception:
+        same_otherwise = False
+    if not same_otherwise:
+        plog("  ✗ pgbouncer image: couldn't change just the image line in compose — "
+             "nothing changed (the whole file is never re-dumped)")
+        _record('write-failed')
+        return None
     with _authentik_compose_lock('pgbouncer-image', plog=plog) as _locked:
         if not _locked:
             plog("  pgbouncer image: compose lock busy — skipped, next console boot retries")
@@ -59811,7 +60150,7 @@ def _ensure_authentik_pgbouncer_image(plog):
             with open(compose_bak, 'w') as f:
                 f.write(raw_compose)
             with open(compose_path, 'w') as f:
-                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+                f.write(new_compose)
         except Exception as e:
             plog(f"  ✗ pgbouncer image: compose write failed ({e}) — restoring")
             try:
@@ -59839,12 +60178,154 @@ def _ensure_authentik_pgbouncer_image(plog):
         if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
             break
     if status != f"{target} running healthy":
-        _rollback(f"container is {status or 'state unknown'}")
+        _rollback(f"container is {status or 'state unknown'}", check_ldap=can_probe and base_ok)
         _record('rolled-back')
         return None
-    plog(f"  ✓ pgbouncer image: running {target} (healthy); server+worker untouched")
-    _record('applied')
-    return True
+    plog(f"  pgbouncer image: container running {target} (healthy) — now checking LDAP as TAK Server does...")
+    if not can_probe:
+        plog(f"  ✓ pgbouncer image: running {target} (healthy); LDAP not checked (see above)")
+        _record('applied')
+        return True
+
+    def _resync_tak():
+        # TAK Server binds per request with CoreConfig's SA credential; make sure it
+        # still matches .env now that LDAP is verified (same step as 'Resync LDAP to TAK
+        # Server'). Java reads CoreConfig at start, so a change needs a TAK restart.
+        try:
+            changed, msg = _resync_ldap_credential_to_coreconfig()
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync: "
+                 f"{'UPDATED — TAK Server restart needed to load it' if changed else 'already in sync'} ({msg})")
+        except Exception as e:
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync error: {str(e)[:120]}")
+
+    need_groups = base_groups > 0
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap'):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified")
+        _resync_tak()
+        _record('applied')
+        return True
+    _restart_ak('LDAP check failed after the swap')
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart'):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified after restart")
+        _resync_tak()
+        _record('applied')
+        return True
+    if not base_ok:
+        # LDAP was failing before we touched anything, so the old image is no better —
+        # keep the pin and say so plainly rather than roll back into the same failure.
+        plog(f"  ✗ pgbouncer image: kept {target}, but LDAP is STILL failing (it was failing "
+             f"before the swap too). TAK users get no groups until adm_ldapservice binds: "
+             f"check docker logs authentik-ldap-1, then 'Resync LDAP to TAK Server'.")
+        _record('applied-ldap-failing')
+        return True
+    _rollback('LDAP SA bind / memberOf still failing after restart', check_ldap=True)
+    _record('rolled-back-ldap')
+    return None
+
+
+def _compose_set_service_image(raw, service, image):
+    """Return compose text `raw` with `services.<service>.image` set to `image`, every other
+    byte untouched (quotes on the value are kept). None if the line can't be found
+    unambiguously — callers must then change nothing rather than re-dump the file."""
+    lines = raw.splitlines(keepends=True)
+    svc_indent = key_indent = None     # indent of the services, and of one service's keys
+    in_services = in_svc = False
+    hits = []
+    for i, l in enumerate(lines):
+        body = l.rstrip('\r\n')
+        stripped = body.lstrip(' ')
+        if not stripped or stripped.startswith('#'):
+            continue
+        ind = len(body) - len(stripped)
+        if ind == 0:
+            in_services = stripped.split('#', 1)[0].strip() == 'services:'
+            in_svc = False
+            continue
+        if not in_services:
+            continue
+        if svc_indent is None:
+            svc_indent = ind
+        if ind == svc_indent:
+            in_svc = stripped.split('#', 1)[0].strip() == f'{service}:'
+            key_indent = None
+            continue
+        if in_svc and ind > svc_indent:
+            if key_indent is None:
+                key_indent = ind       # the service's own keys; deeper lines are values
+            if ind == key_indent and re.match(r'image:\s', stripped):
+                hits.append(i)
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    m = re.match(r'^(\s*image:\s*)([\'"]?)([^\'"\s#]+)\2(.*?)(\r?\n?)$', lines[i])
+    if not m:
+        return None
+    lines[i] = f"{m.group(1)}{m.group(2)}{image}{m.group(2)}{m.group(4)}{m.group(5)}"
+    return ''.join(lines)
+
+
+# ops #123: how long the post-swap LDAP check must hold, and how long it may take.
+# test12's memberOf=0 window opened ~25 s after the swap looked healthy and lasted ~10 s,
+# so a single passing probe proves nothing; it has to stay green for a while.
+_PGB_SWAP_LDAP_WINDOW_S = 120
+_PGB_SWAP_LDAP_STABLE_S = 45
+_PGB_SWAP_LDAP_EVERY_S = 5
+
+
+def _authentik_ldap_sa_group_probe(ldap_pass):
+    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
+    adm_ldapservice and read every user's memberOf. Password is never logged.
+
+    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
+    size limit hit, which still means both worked); `tak_groups` counts memberOf values
+    naming a tak_ group.
+    """
+    try:
+        r = subprocess.run(
+            ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+             '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
+             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', '500', '(objectClass=*)', 'memberOf'],
+            capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, 0, f"ldapsearch {type(e).__name__}"
+    lines = (r.stdout or '').splitlines()
+    users = sum(1 for l in lines if l.startswith('dn: '))
+    groups = sum(1 for l in lines if l.lower().startswith('memberof: cn=tak_'))
+    bound = r.returncode in (0, 4)
+    detail = f"ldapsearch rc={r.returncode}, {users} users, {groups} tak_ memberOf"
+    if not bound:
+        err = (r.stderr or '').strip().splitlines()
+        if err:
+            detail += f" ({err[-1][:80]})"
+    return bound, groups, detail
+
+
+def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label):
+    """Poll `_authentik_ldap_sa_group_probe` until it has passed continuously for
+    `_PGB_SWAP_LDAP_STABLE_S`, giving up after `_PGB_SWAP_LDAP_WINDOW_S` plus the hold.
+    Passing = SA bind works and, if the box had tak_ memberships before (`need_groups`),
+    at least one comes back. Every failed probe is logged. Returns True when stable."""
+    start = time.time()
+    good_since = None
+    fails = 0
+    while True:
+        ok, groups, detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        now = time.time()
+        if ok and (groups > 0 or not need_groups):
+            if good_since is None:
+                good_since = now
+            if now - good_since >= _PGB_SWAP_LDAP_STABLE_S:
+                note = f" ({fails} failed probe(s) before it settled)" if fails else ''
+                plog(f"  ✓ pgbouncer image: LDAP {label}: {detail}, held {_PGB_SWAP_LDAP_STABLE_S}s{note}")
+                return True
+        else:
+            fails += 1
+            good_since = None
+            plog(f"  pgbouncer image: LDAP {label}: {'SA bind ok but NO tak_ groups' if ok else 'SA bind FAILED'} — {detail}")
+            if now - start >= _PGB_SWAP_LDAP_WINDOW_S:
+                plog(f"  ✗ pgbouncer image: LDAP {label}: not passing after {_PGB_SWAP_LDAP_WINDOW_S}s")
+                return False
+        time.sleep(_PGB_SWAP_LDAP_EVERY_S)
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
@@ -89542,7 +90023,21 @@ def _post_update_auto_deploy():
                                 for _orphan_pid in (_old_pg_pids & _surviving):
                                     subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
                                     print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
-                        if _ak != _ak_orig:
+                        # ops #123: recreate only when the compose MEANS something different.
+                        # A formatting-only diff (v10.2.22's width=200 dump re-wrapped long
+                        # lines) recreated worker/server/ldap on every updating box: each LDAP
+                        # outage was followed by seconds of memberOf=0, and TAK users who
+                        # reconnected then got no groups. The normalized text is still written.
+                        _ak_recreate = _ak != _ak_orig
+                        if _ak_recreate:
+                            try:
+                                import yaml as _yaml_cmp
+                                if _yaml_cmp.safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig):
+                                    _ak_recreate = False
+                                    print("Post-update: Authentik compose — formatting-only change, no container recreate")
+                            except Exception:
+                                pass
+                        if _ak_recreate:
                             print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
                             # ops #30: LDAP after the server is healthy, never in the same
                             # `up` (an outpost that starts against the old server panics

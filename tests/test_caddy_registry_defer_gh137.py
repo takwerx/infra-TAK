@@ -203,10 +203,11 @@ def test_generate_returns_before_any_write():
     body = _segment('generate_caddyfile')
     gate = body.index("if _caddy_defer_until_registry('generate_caddyfile'):")
     # the content is complete (user blocks kept) before the gate...
-    assert body.index('caddyfile += \'\\n\' + user_blocks') < gate
+    assert body.index('tail += \'\\n\' + user_blocks') < gate
+    assert body.index('caddyfile = caddyfile.rstrip() + tail') < gate
     # ...and nothing touches the box before it
-    for write in ('_makedirs_priv(', '_write_priv(CADDYFILE_PATH', '_caddy_validate_or_restore(',
-                  '_selinux_sync_caddy_ports()'):
+    for write in ('_makedirs_priv(', '_caddy_ensure_include_dirs()', '_write_priv(CADDYFILE_PATH',
+                  '_caddy_validate_or_restore(', '_selinux_sync_caddy_ports()'):
         assert gate < body.index(write), write
     assert 'return caddyfile' in body[gate:body.index('_makedirs_priv(')]
 

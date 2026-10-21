@@ -184,7 +184,17 @@
 <div class="section-title">Caddyfile</div>
 <div style="margin-bottom:10px;padding:12px 16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.5">
 <span style="font-weight:600;color:var(--text-secondary)">Custom vhosts / rules</span> — add them <em>below</em> the line <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px"># --- User-added blocks (do not remove) ---</code> at the bottom of this file. Everything below that line is preserved automatically on every domain change, deploy, and "Update Now". Do not remove the marker itself. See <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/COMMANDS.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">COMMANDS.md</a> for an example.
+<br><br><span style="font-weight:600;color:var(--text-secondary)">Your own lines inside a generated site</span> — put them in <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{{ caddy_includes.sites_dir }}/&lt;host&gt;/*.caddy</code>; they are imported as the first line of that site. Snippet definitions go in <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{{ caddy_includes.snippets_dir }}/*.caddy</code>. infra-TAK never writes these files, so they survive every regeneration. Files must be readable by caddy (0644); apply with <strong>Reload</strong> on this page, which checks them first.
+{% if caddy_includes.hosts %}<br><span style="color:var(--text-secondary)">Sites with a hook:</span> <span style="font-family:'JetBrains Mono',monospace">{{ caddy_includes.hosts|join(', ') }}</span>{% endif %}
+<br><span style="color:var(--text-secondary)">Include files in use:</span> {% if caddy_includes.files %}<span style="font-family:'JetBrains Mono',monospace">{{ caddy_includes.files|join(', ') }}</span>{% else %}none{% endif %}
 </div>
+{% if caddy_includes.rejected_err %}
+<div style="margin-bottom:10px;padding:12px 16px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.5">
+<span style="font-weight:600;color:var(--red, #ef4444)">Your include files were left out of the last Caddyfile.</span> Caddy rejected the file with them, so it was written without any of them and every site kept working. Fix the file, then press <strong>Reload</strong> on this page to put them back.
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:6px;white-space:pre-wrap">{{ caddy_includes.rejected_files|join(', ') }}
+{{ caddy_includes.rejected_err }}</div>
+</div>
+{% endif %}
 <div style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap">{{ caddyfile }}</div>
 {% elif not caddy.installed %}
 <div class="section-title">Set Up Your Domain</div>

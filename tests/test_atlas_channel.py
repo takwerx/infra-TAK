@@ -372,7 +372,7 @@ def test_the_fetch_is_still_by_tag_not_by_branch():
     runner = MODULE[MODULE.index('def _run_update(') :
                     MODULE.index('def _run_update_all(')]
 
-    assert "'fetch', '--tags', '--depth=1', 'origin', tag" in runner
+    assert '_fetch_tag_argv(dirpath, tag)' in runner
     assert "tag = 'v' + target" in runner
     assert 'origin', 'the fetch must still name a tag'
     for branchy in ("origin', channel", 'origin/dev', 'origin/main'):
@@ -1021,6 +1021,6 @@ def test_deploy_fetches_what_was_resolved():
 
     resolve_at = source.index('_resolve_install_target(ctx, plog)')
     assert resolve_at < source.index("'git', 'clone'")
-    assert resolve_at < source.index("'fetch', '--tags'")
+    assert resolve_at < source.index('_fetch_tag_argv(dirpath, tag)')
     assert 'ATLAS_TAG' not in source
     assert '_verify_checkout(ctx, dirpath, plog, tag, expected)' in source
