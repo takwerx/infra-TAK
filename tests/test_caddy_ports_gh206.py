@@ -153,6 +153,8 @@ def test_firewall_and_generated_links_use_the_setting():
     assert "_pub_hostport('{host}', settings)" in gen          # ATLAS plain-HTTP redirect
     assert 'X-Forwarded-Port 443"' not in gen                  # Federation Hub
     assert 'settings=settings)' in gen                         # global block sees the ports
+    # Caddy's own redirect omits a moved https_port; ours names it.
+    assert 'redir https://{{host}}:{_hp}{{uri}} permanent' in gen
 
 
 def test_authentik_canonical_external_hosts_carry_the_port():

@@ -33278,6 +33278,15 @@ def generate_caddyfile(settings=None):
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
     lines += _caddy_global_options_lines(
         grpc_streams=bool(modules.get('netbird', {}).get('installed')), settings=settings)
+    # GH #206: Caddy's automatic HTTP->HTTPS redirect deliberately leaves a moved
+    # https_port out of the Location (it assumes a router maps public 443 onto it), so
+    # http://name:<http_port> would land on whatever else owns 443 — the very thing the
+    # operator moved away from. Redirect explicitly. ACME HTTP-01 is answered before routes,
+    # and a site with its own http:// block (ATLAS's agent package) still matches first.
+    _hp = _caddy_https_port(settings)
+    if _hp != CADDY_HTTPS_PORT_DEFAULT:
+        lines += ["# HTTP -> HTTPS on the moved port", "http:// {",
+                  f"    redir https://{{host}}:{_hp}{{uri}} permanent", "}", ""]
     sd = _get_all_service_domains(settings)
 
     def _emit_alias_redirect(alias, canonical):
