@@ -241,7 +241,7 @@ def test_update_builds_first_then_moves_the_store_then_starts():
     body = re.sub(r'#.*', '', _body('run_cloudtak_update'))
     i_capture = body.index('legacy_minio_img = _cloudtak_legacy_minio_image(cloudtak_dir)')
     i_checkout = body.index('checkout -f {release_tag}')
-    i_build = body.index("f'{dcc} build --no-cache',")
+    i_build = body.index("f'{dcc} build --no-cache'")
     i_store = body.index('_cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=legacy_minio_img, start=False)')
     i_up = body.index("_cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)")
     assert i_capture < i_checkout < i_build < i_store < i_up
