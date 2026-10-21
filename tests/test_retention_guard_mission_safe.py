@@ -50,7 +50,13 @@ with open(os.environ['FAKE_SQL_LOG'], 'a') as f:
     f.write(sql + '\n---\n')
 if sql == 'SELECT 1;':
     print('1'); sys.exit(0)
+if 'pg_proc' in sql:
+    if os.environ.get('FAKE_HAS_COUNT_ESTIMATE'):
+        print('1')
+    sys.exit(0)
 if 'count_estimate' in sql:
+    if os.environ.get('FAKE_HAS_COUNT_ESTIMATE'):
+        print(os.environ.get('FAKE_EXPIRED', '5000')); sys.exit(0)
     sys.stderr.write('ERROR:  function count_estimate(unknown) does not exist\n'); sys.exit(1)
 if 'pg_stat_activity' in sql:
     if 'COUNT(*)' in sql:
@@ -139,12 +145,32 @@ def test_delete_keeps_mission_rows_and_geochat_like_tak(box):
 
 
 def test_count_estimate_inner_query_is_quoted_for_sql(box):
-    res = box()
-    est = [s for s in res['sql'] if 'count_estimate' in s]
+    res = box(env={'FAKE_HAS_COUNT_ESTIMATE': '1'})
+    est = [s for s in res['sql'] if 'count_estimate(' in s]
     assert est
     # The inner query is a SQL string literal: every quote inside must be doubled.
     assert "interval ''48 hours''" in est[0] and "<> ''b-t-f''" in est[0]
     assert '\\' not in est[0]
+
+
+def test_missing_count_estimate_is_never_called(box):
+    # ops #129: TAK's schema has no count_estimate(). Calling it anyway put
+    # "function count_estimate(unknown) does not exist" in the PostgreSQL log every
+    # 15 minutes. pg_proc is asked first; the plain COUNT is the only estimate sent.
+    res = box()
+    assert res['rc'] == 0, res
+    assert any('pg_proc' in s and "proname = 'count_estimate'" in s for s in res['sql'])
+    assert not [s for s in res['sql'] if 'count_estimate(' in s]
+    assert [s for s in res['sql'] if s.startswith('SELECT COUNT(*) FROM (SELECT 1 FROM cot_router')]
+    assert 'removed 5000 rows' in res['log']
+
+
+def test_present_count_estimate_is_used_without_the_fallback(box):
+    res = box(env={'FAKE_HAS_COUNT_ESTIMATE': '1'})
+    assert res['rc'] == 0, res
+    assert [s for s in res['sql'] if s.startswith('SELECT count_estimate(')]
+    assert not [s for s in res['sql'] if s.startswith('SELECT COUNT(*) FROM (SELECT 1 FROM cot_router')]
+    assert 'removed 5000 rows' in res['log']
 
 
 def test_unreachable_local_db_fails_loudly_not_zero_rows(box):
