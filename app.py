@@ -56310,6 +56310,15 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             return
         plog(f"  routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN")
 
+        ok, problem, _cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            # ops #128: the move would fail TLS and roll back — two outpost restarts for nothing.
+            # Recorded as an attempt so the monitor's 6 h rate limit applies.
+            plog(f"  ⚠ routing repair: {problem} — not moving the outpost (it would fail TLS and roll back); "
+                 f"fix DNS/certificate for {fqdn}")
+            _record_spiral_repair_attempt('precheck_failed', evidence)
+            return
+
         try:
             _probe = subprocess.run(
                 _sudo_wrap(['docker', 'exec', 'authentik-ldap-1', 'wget', '--spider',
@@ -56408,7 +56417,69 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
-def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
+# ops #128 — the FQDN move recreates the LDAP outpost, and a move that fails validation
+# recreates it again to roll back. On a box whose DNS or certificate for that name is broken
+# the move can only fail (Caddy has no certificate to offer: `tls: internal error`), yet it was
+# retried on every deploy, update and 10-minute spiral-monitor tick — two outpost restarts each
+# time, and TAK clients that connect during one get no groups (ops #126). So the name is
+# checked first, and a move that failed anyway backs off before the next automatic try.
+_LDAP_FQDN_MOVE_BACKOFF_S = 3600        # after the first failed move; doubles per failure
+_LDAP_FQDN_MOVE_BACKOFF_MAX_S = 86400
+
+
+def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
+    """Can the outpost reach Authentik on https://<fqdn> through this box's Caddy?
+    Returns (ok, problem, cert_sha256). Needs a DNS A record for the name (Caddy can't get or
+    renew its Let's Encrypt certificate without one; a lookup that fails on this box's own
+    resolver doesn't count against it) and Caddy on this host's 443 — where the outpost lands
+    through `extra_hosts: <fqdn>:host-gateway` — completing TLS for the name with a valid
+    certificate. Touches no container."""
+    _ips, problem = _dns_resolve_ipv4(fqdn)
+    if problem == 'missing':
+        return False, f"{fqdn} has no DNS A record", ''
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection(('127.0.0.1', 443), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
+                der = tls.getpeercert(binary_form=True) or b''
+    except ssl.SSLCertVerificationError as e:
+        return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+    except (ssl.SSLError, OSError) as e:
+        return False, f"Caddy has no working certificate for {fqdn} ({e})", ''
+    return True, '', hashlib.sha256(der).hexdigest()
+
+
+def _ldap_fqdn_move_backoff(fqdn, cert_sha256, now=None):
+    """(seconds until the next automatic move may be tried — 0 = go, recorded state). A
+    different FQDN or certificate starts over: that is what fixing the box changes."""
+    st = load_settings().get('authentik_proactive_routing_migration') or {}
+    if (st.get('outcome') == 'success' or not st.get('fails')
+            or st.get('fqdn') != fqdn or st.get('cert') != cert_sha256):
+        return 0, st
+    return max(0, int(float(st.get('retry_after') or 0) - (now or time.time()))), st
+
+
+def _ldap_fqdn_move_failed(fqdn, cert_sha256, outcome, now=None):
+    """Record a failed move; returns the back-off (seconds) before the next automatic try."""
+    now = now or time.time()
+    try:
+        s = load_settings()
+        prev = s.get('authentik_proactive_routing_migration') or {}
+        same = (prev.get('outcome') != 'success' and prev.get('fqdn') == fqdn
+                and prev.get('cert') == cert_sha256)
+        fails = (int(prev.get('fails') or 0) if same else 0) + 1
+        wait = min(_LDAP_FQDN_MOVE_BACKOFF_S * 2 ** min(fails - 1, 10), _LDAP_FQDN_MOVE_BACKOFF_MAX_S)
+        s['authentik_proactive_routing_migration'] = {
+            'ts': int(now), 'outcome': outcome, 'fqdn': fqdn, 'cert': cert_sha256,
+            'fails': fails, 'retry_after': int(now + wait),
+        }
+        save_settings(s)
+        return wait
+    except Exception:
+        return 0
+
+
+def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True, force=False, quiet_repeats=False):
     """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
     (reactive) by migrating any box where the LDAP outpost is on internal direct routing
     (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
@@ -56429,23 +56500,36 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
          Waived with require_tak=False — used by the Authentik deploy's final SA-bind verify,
          which runs BEFORE TAK exists and deadlocks on internal routing (2026.x flow recursion
          kills every bind regardless of password; field-confirmed 2026-07-08 on a fresh deploy).
+      6. (ops #128) the FQDN has a DNS A record and Caddy serves a valid certificate for it
+         (`_ldap_outpost_fqdn_precheck`) — otherwise the move can only fail and roll back.
+      7. (ops #128) no back-off from a failed move with this FQDN + certificate
+         (`_ldap_fqdn_move_backoff`). force=True — the operator's "Resync LDAP to TAK Server"
+         button — skips this one only.
 
     Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
+    quiet_repeats (the 10-min spiral monitor): a skip reason is logged once, not every tick.
 
     Cardinal rule: NEVER restart the LDAP outpost unless something is wrong. "Wrong routing
     + heavy load + healthy FQDN target available" qualifies — the alternative is waiting for
     the user to hit the spiral and lose webadmin access.
     """
+    def _skip(msg):
+        if quiet_repeats:
+            if getattr(_ensure_authentik_ldap_outpost_on_fqdn, '_last_skip', None) == msg:
+                return
+            _ensure_authentik_ldap_outpost_on_fqdn._last_skip = msg
+        plog(msg)
+
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(compose_path) or not os.path.exists(env_path):
-        plog("  proactive routing: ~/authentik not installed — skipping")
+        _skip("  proactive routing: ~/authentik not installed — skipping")
         return
 
     try:
         if require_tak and not os.path.exists('/opt/tak'):
-            plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
+            _skip("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
             return
 
         fqdn = ''
@@ -56456,14 +56540,29 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
                     fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
                     break
         if not fqdn:
-            plog("  proactive routing: no FQDN in .env — skipping (no migration target)")
+            _skip("  proactive routing: no FQDN in .env — skipping (no migration target)")
             return
 
         with open(compose_path) as _f:
             compose_text = _f.read()
         if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
-            plog("  proactive routing: outpost already on FQDN — skipping (already correct)")
+            _skip("  proactive routing: outpost already on FQDN — skipping (already correct)")
             return
+
+        ok, problem, cert_sha = _ldap_outpost_fqdn_precheck(fqdn)
+        if not ok:
+            _skip(f"  proactive routing: {problem} — leaving the outpost on internal routing, not "
+                  f"recreating it (the move would fail TLS and roll back); retried once DNS/certificate are fixed")
+            return
+        if not force:
+            left, st = _ldap_fqdn_move_backoff(fqdn, cert_sha)
+            if left:
+                _skip(f"  proactive routing: moving the outpost to https://{fqdn} failed {st.get('fails')}x with "
+                      f"this certificate — backing off until "
+                      f"{time.strftime('%a %H:%M %Z', time.localtime(float(st.get('retry_after') or 0)))} "
+                      f"('Resync LDAP to TAK Server' tries now)")
+                return
+        _ensure_authentik_ldap_outpost_on_fqdn._last_skip = None  # an attempt: log the next skip again
 
         try:
             _probe = subprocess.run(
@@ -56492,7 +56591,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             # automatic rollback (below) be the real safety net for boxes where FQDN truly won't work.
             _caddy_up = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True, timeout=10)
             if (_caddy_up.stdout or '').strip() != 'active':
-                plog(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
+                _skip(f"  proactive routing: FQDN unreachable from container AND host Caddy not active — skipping (retry later)")
                 return
             plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
                  f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
@@ -56523,6 +56622,8 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
+            _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'recreate_failed')
+            plog(f"  proactive routing: next automatic try in {_wait // 3600}h")
             return
 
         # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
@@ -56559,7 +56660,9 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
-        plog("  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; will retry later)")
+        _wait = _ldap_fqdn_move_failed(fqdn, cert_sha, 'validation_failed')
+        plog(f"  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; "
+             f"next automatic try in {_wait // 3600}h)")
     except Exception as e:
         plog(f"  ⚠ proactive routing error (no changes applied): {e}")
 
@@ -64760,6 +64863,21 @@ def _authentik_fix_pg_idle_timeout(plog):
     return True
 
 
+def _spiral_monitor_tak_recycle(ldap_started_before, plog):
+    """ops #128: the monitor's routing passes recreate the LDAP outpost (a move, or a move
+    plus its rollback). TAK clients that connected meanwhile hold no groups, and nothing else
+    would heal them before the next console start — so heal them now, the same way the other
+    callers do (`_tak_recycle_after_ldap_outage` checks LDAP first, restarts TAK only as the
+    fallback, and leaves it to the end of a running console update)."""
+    after = _docker_started_epoch('authentik-ldap-1')
+    if after is None or after == ldap_started_before:
+        return
+    try:
+        _tak_recycle_after_ldap_outage(plog, 'spiral monitor LDAP routing', check_outpost=True)
+    except Exception as e:
+        plog(f"TAK LDAP recycle error (non-fatal): {e}")
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -64854,10 +64972,13 @@ def _authentik_spiral_monitor():
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
+            _mon_log = lambda m: print(f"[spiral monitor] {m}", flush=True)
+            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
             try:
-                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"[spiral monitor] {m}", flush=True))
+                _ensure_authentik_ldap_outpost_on_fqdn(_mon_log, quiet_repeats=True)
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
 
             s = load_settings()
 
@@ -64873,7 +64994,9 @@ def _authentik_spiral_monitor():
 
             print(f"[spiral monitor] spiral signature detected: {evidence['reason']}", flush=True)
             print(f"[spiral monitor] running idempotent routing repair...", flush=True)
-            _apply_authentik_ldap_routing_repair(ak_dir, lambda m: print(f"[spiral monitor] {m}", flush=True))
+            _ldap_t0 = _docker_started_epoch('authentik-ldap-1')
+            _apply_authentik_ldap_routing_repair(ak_dir, _mon_log)
+            _spiral_monitor_tak_recycle(_ldap_t0, _mon_log)
         except Exception as e:
             try:
                 print(f"[spiral monitor] iteration error (will retry in 10 min): {e}", flush=True)
@@ -70743,8 +70866,9 @@ def takserver_connect_ldap():
     # operator's "Resync LDAP" click never actually moved the outpost off the spiral-prone path.
     # The migration is self-contained (recreates only the ldap container, validates the websocket
     # connection, auto-rolls-back if FQDN isn't viable), so it's safe to invoke here. Visible output.
+    # force: an operator click skips the failed-move back-off (ops #128), not the DNS/cert check.
     try:
-        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()))
+        _ensure_authentik_ldap_outpost_on_fqdn(lambda m: diag.append(m.strip()), force=True)
     except Exception as _e:
         diag.append(f'Proactive routing: skipped ({str(_e)[:80]})')
     # Diagnostic: compare passwords and check outpost health
