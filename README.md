@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.23-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.23-alpha)**
+**Current release: [v10.2.24-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,23 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.24-alpha — 2026-10-21 — Security: TAK Portal and Remote Assist on the newest Node 22; TAK clients get their LDAP groups back without a restart; Remote Assist Update keeps its database password
+
+**Headline: Update now rebuilds TAK Portal and EUD Remote Assist on the newest Node 22 base image (the Oct 21 Node.js security release), and still builds from the copy on the box if Docker Hub is down. After an LDAP outage, TAK clients that connected during it get their groups back without restarting TAK Server. Remote Assist Update no longer changes its database password, and repairs installs an earlier Update broke. Plus: a DNS check before Let's Encrypt, a safer LDAP outpost move, CloudTAK Update rollbacks that work on Docker 29, and quieter PostgreSQL logs.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha))
+
+**Security: Node 22 base image.** `docker compose up -d --build` never checked for a newer `FROM` image, so TAK Portal and Remote Assist kept rebuilding on whatever `node:22-alpine` the box first pulled. Deploy and Update now `docker pull` each base image first, then build. If the pull fails (Docker Hub down, rate limit), the build uses the copy already on the box and the log says why.
+
+**TAK clients after an LDAP outage (GH #189).** A TAK client that connected while LDAP was down kept an empty group set (no CoT) until TAK Server was restarted. Once LDAP is healthy again, the console now re-authenticates LDAP users' live connections and drops any connection that has no user and no groups, so the client reconnects and is looked up again. TAK Server is restarted only as a fallback, once, and only into a healthy LDAP.
+
+**Remote Assist database password.** On an install where the console had no saved database password, Update wrote a new random one the database had never seen, and Remote Assist could not log in. Update and Deploy now reuse the existing password (`.env`, then the running container), and if `.env` and the database disagree, the database is set to match and Remote Assist restarts. This repairs installs an earlier Update broke.
+
+**Also in this release.**
+- **Caddy:** setup and domain changes check that each name's DNS A record points at this server before asking Let's Encrypt, and say which record is wrong. **Continue anyway** is there for NAT and proxies. The installed Caddy page has a **DNS Check** card.
+- **Authentik:** the LDAP outpost moves to the box's FQDN only after DNS and the certificate check out, and a failed move backs off (1 h up to 24 h) instead of retrying every 10 minutes.
+- **CloudTAK:** the bootstrap cert receives Core Events on channels created after it connected. A failed CloudTAK Update (local or remote) or plugin rebuild rolls back to the old images on Docker 29, and the map data is downloaded before the build with retries.
+- **Guard Dog:** two-server installs stop logging `role "root" does not exist` in PostgreSQL, and the retention guard stops logging `count_estimate` errors.
+- **ATLAS:** an API redeploy with only an agency slug redeploys that agency.
 
 ### v10.2.23-alpha — 2026-10-20 — Hotfix: ATAK users keep their LDAP groups after updating; Caddy keeps your own lines inside generated sites; ATLAS installs only signed releases
 
