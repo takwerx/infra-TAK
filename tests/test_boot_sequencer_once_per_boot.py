@@ -119,8 +119,13 @@ def test_startup_migration_restarts_tak_only_for_a_changed_coreconfig_credential
     guard = code.rfind('if ', 0, restart_at)
     branch = code[code.rfind('\n', 0, code.rfind('elif', 0, restart_at)):restart_at]
     assert 'coreconfig_changed' in branch and "final_verdict == 'ok'" in branch, branch
-    # the Authentik-side-only heal is its own branch and does not restart
+    # the Authentik-side-only heal is its own branch and does not restart TAK itself.
+    # ops #126: it hands off to the shared helper, which restarts only when the outpost
+    # restarted under a TAK that had been up 5+ min (never at box boot — the GH #83 case;
+    # covered in test_tak_ldap_recycle.py::test_box_boot_order_never_restarts_tak).
     noop = code[code.index("if healing_performed and final_verdict == 'ok' and not coreconfig_changed:"):]
     noop = noop[:noop.index('elif')]
-    assert '_tak_systemctl' not in noop and 'TAK Server not' in noop
+    assert '_tak_systemctl' not in noop and 'systemctl' not in noop
+    assert "_tak_recycle_after_ldap_outage(" in noop and 'check_outpost=True' in noop
+    assert 'final=True' not in noop          # defers to the end of a running console update
     assert guard >= 0

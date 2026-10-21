@@ -32,6 +32,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 import types
 
 import yaml
@@ -123,7 +124,9 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
         '_ensure_ldapsearch': lambda: True,
         '_wait_for_authentik_stack_healthy': lambda plog, timeout=0: calls.append(['wait-healthy']) or True,
         're': re,
+        'threading': threading,      # the ops #126 block after the settle helper makes a Lock
         '_resync_ldap_credential_to_coreconfig': lambda: (calls.append(['tak-resync']) or (False, 'in_sync')),
+        '_tak_ldap_recycle_request': lambda reason, need_groups=True: calls.append(['tak-recycle-request', reason, need_groups]),
     }
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
@@ -375,6 +378,61 @@ def test_harden_step_does_not_recreate_on_a_formatting_only_diff():
     assert '_ak_recreate = _ak != _ak_orig' in block
     assert 'safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig)' in block
     assert block.rstrip().endswith('if _ak_recreate:')
+
+
+# ── ops #126 (GH #189): TAK Server is restarted once LDAP is back ──────────────────
+
+def _recycle_requests(calls):
+    return [c for c in calls if c[0] == 'tak-recycle-request']
+
+
+def test_good_swap_requests_a_tak_restart_even_with_the_credential_in_sync(tmp_path):
+    out, _, calls, _, log, _ = _run(tmp_path, OTHER)
+    assert out is True
+    assert calls.count(['tak-resync']) == 1                         # resync said 'in_sync'
+    reqs = _recycle_requests(calls)
+    assert len(reqs) == 1 and PIN in reqs[0][1] and reqs[0][2] is True
+    assert calls.index(['tak-resync']) < calls.index(reqs[0])      # after the settle passed
+    assert not any('restart needed to load it' in l for l in log)  # no more "someone should restart"
+    assert any('TAK Server restart requested' in l for l in log)
+
+
+def test_swap_that_needed_the_authentik_restart_requests_it_too(tmp_path):
+    def broken_until_restart(live):
+        return (0, 0) if live['image'] == PIN and live['restarts'] == 0 else (0, 3)
+    out, _, calls, _, _, _ = _run(tmp_path, OTHER, ldap=broken_until_restart)
+    assert out is True
+    reqs = _recycle_requests(calls)
+    assert len(reqs) == 1
+    assert calls.index(reqs[0]) > calls.index(RESTART_SEQ[-1])     # after the 'after restart' settle
+
+
+def test_no_request_when_nothing_was_swapped(tmp_path):
+    for i, kw in enumerate(({'image': PIN}, {'image': OTHER, 'pull_rc': 1}, {'image': OTHER, 'up_rc': 1})):
+        sub = tmp_path / str(i)
+        sub.mkdir()
+        _, _, calls, _, _, _ = _run(sub, **kw)
+        assert _recycle_requests(calls) == [], kw
+
+
+def test_rollback_without_an_ldap_outage_requests_nothing(tmp_path):
+    # Container unhealthy → rolled back; LDAP held throughout, so TAK never lost it.
+    _, _, calls, _, _, _ = _run(tmp_path, OTHER, inspect=f'{PIN} running unhealthy\n')
+    assert _restarts(calls) == []
+    assert _recycle_requests(calls) == []
+
+
+def test_rollback_after_an_ldap_outage_requests_a_restart(tmp_path):
+    out, _, calls, settings, _, _ = _run(tmp_path, OTHER, ldap=lambda live: (49, 0) if live['image'] == PIN else (0, 3))
+    assert out is None and settings['authentik_pgbouncer']['image_last_outcome'] == 'rolled-back-ldap'
+    reqs = _recycle_requests(calls)
+    assert len(reqs) == 1 and 'rolled back' in reqs[0][1]
+
+
+def test_rollback_that_never_recovers_requests_nothing(tmp_path):
+    # Restarting TAK into a broken LDAP fixes nothing.
+    _, _, calls, _, _, _ = _run(tmp_path, OTHER, ldap=lambda live: (0, 0) if live['t'] > 0 else (0, 3))
+    assert _recycle_requests(calls) == []
 
 
 def test_startup_migration_calls_it():
