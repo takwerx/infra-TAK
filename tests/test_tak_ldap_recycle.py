@@ -72,11 +72,12 @@ def _ldif(groups):
     return '\n'.join(out) + '\nresult: 0 Success\n'
 
 
-def sess(n, cn, groups=('OPS',), username='same', client=None, dn=None):
-    """One live 8089 connection the way /subscriptions/all shows it."""
-    return {'subscriptionUid': f'tls:{n}', 'dn': dn or f'OU=TAK, O=PUBLIC SAFETY, CN={cn}',
-            'username': cn if username == 'same' else username, 'callsign': cn.upper(),
-            'clientUid': client if client is not None else f'ANDROID-{cn}',
+def sess(n, cn, groups=('OPS',), username='same', client=None, unmapped=False):
+    """One live 8089 connection the way /subscriptions/all shows it. `unmapped` = TAK could
+    not match the cert to a user (its lookup failed): no DN and no username at all (test6)."""
+    return {'subscriptionUid': f'tls:{n}', 'dn': None if unmapped else f'OU=TAK, O=PUBLIC SAFETY, CN={cn}',
+            'username': None if unmapped else (cn if username == 'same' else username), 'callsign': cn.upper(),
+            'clientUid': client if client is not None else f'ANDROID-{cn}', '_cn': cn,
             'groups': [{'name': g, 'direction': d} for g in groups for d in ('IN', 'OUT')]}
 
 
@@ -88,7 +89,8 @@ class Box:
 
     def __init__(self, tak_start, ldap_start=None, container=False, ldap=lambda box: (0, 3),
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
-                 subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True):
+                 subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
+                 history=None):
         self.t = T0
         self.tak_start = tak_start
         self.ldap_start = ldap_start
@@ -106,6 +108,9 @@ class Box:
         self.dead_pool = dead_pool
         self.online = online
         self.api_ok = api_ok
+        # TAK's client history: device uid → last username (every device seen with a user)
+        self.history = history if history is not None else {'ANDROID-takdev-emu': 'takdev-emu',
+                                                             'ANDROID-aj5cacor': 'aj5cacor'}
         self.reconnects = []           # (at, session) still to come
         self.next_uid = 100            # TAK numbers new connections upward
         self.calls, self.api, self.log = [], [], []
@@ -132,6 +137,9 @@ class Box:
         if method == 'GET' and url == f'{API}/subscriptions/all':
             self._materialize()
             return {'data': [dict(s) for s in self.subs]}, None
+        if method == 'GET' and url.startswith(f'{API}/clientEndPoints?'):
+            return {'data': [{'uid': u, 'username': n, 'callsign': u, 'lastStatus': 'Disconnected'}
+                             for u, n in self.history.items()]}, None
         if method == 'POST' and url == f'{API}/groups/update':
             for s in self.subs:
                 if s['username'] in json_body:
@@ -147,10 +155,10 @@ class Box:
             self.subs.remove(gone[0])
             if self.online:
                 old = gone[0]
-                cn = re.search(r'CN=([^,]+)', old['dn']).group(1)
+                cn = old['_cn']
                 g = self._tak_lookup(cn)
-                new = dict(old, subscriptionUid=f'tls:{self.next_uid}',
-                           username=cn if g else None, groups=sess(0, 'x', g or ())['groups'])
+                new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'], unmapped=not g),
+                           callsign=old['callsign'])
                 self.next_uid += 1
                 self.reconnects.append((self.t + 15, new))
             return {'data': f'Successfully deleted subscription with uid: {uid}'}, None
@@ -208,7 +216,7 @@ class Box:
 
     def live(self, cn):
         self._materialize()
-        return [s for s in self.subs if cn in s['dn']]
+        return [s for s in self.subs if s['_cn'] == cn]
 
     def ns(self):
         box = self
@@ -246,7 +254,7 @@ class Box:
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
                      '_authentik_ldap_sa_group_probe', '_authentik_ldap_sa_groups_settle',
                      '_ldap_filter_escape', '_ldap_users_tak_group_counts', '_subscription_num',
-                     '_tak_client_sessions', '_tak_heal_ldap_sessions'):
+                     '_tak_device_usernames', '_tak_client_sessions', '_tak_heal_ldap_sessions'):
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
         return ns
 
@@ -268,9 +276,9 @@ def healthy_box(**kw):
 
 
 def outage_box(**kw):
-    """test6 2026-10-20: takdev-emu reconnected while the outpost was down → user None, 0 groups."""
+    """test6 2026-10-20: takdev-emu reconnected while the outpost was down → dn/user None, 0 groups."""
     box = healthy_box(**kw)
-    box.subs.append(sess(16, 'takdev-emu', (), username=None))
+    box.subs.append(sess(16, 'takdev-emu', (), unmapped=True))
     return box
 
 
@@ -322,9 +330,25 @@ def test_everyone_named_is_reauthenticated_but_file_users_never():
 
 def test_users_ldap_gives_no_groups_and_file_users_are_never_dropped():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
-    box.subs += [sess(30, 'nogroups', ()), sess(31, 'admin', ()), sess(32, 'stranger', (), username=None)]
+    box.subs += [sess(30, 'nogroups', ()), sess(31, 'admin', ()),
+                 sess(32, 'stranger', (), unmapped=True)]     # no DN, device never seen as anyone
     assert box.recycle() is False
     assert box.drops() == [] and box.restarts() == []
+
+
+def test_unmapped_connection_is_identified_by_its_device_history():
+    # test6: the empty connection has dn=None and username=None; TAK's client history says
+    # that device (ANDROID-…) last connected as takdev-emu, who is in tak_TAKDEV-EMU.
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.drops() == ['tls:16']
+    assert any(u.startswith(f'{API}/clientEndPoints?') for _, u, _ in box.api)
+
+
+def test_client_history_is_read_only_when_a_connection_has_no_user():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    box.recycle()
+    assert not any('clientEndPoints' in u for _, u, _ in box.api)
 
 
 def test_in_only_feeder_counts_as_having_groups():
@@ -337,7 +361,7 @@ def test_dead_pooled_connection_heals_in_the_second_round():
     # No named LDAP users to cycle the pool first: the reconnect's lookup hits the dead
     # pooled connection, the pool drops it, round 2 gets a good one.
     box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, dead_pool=1,
-              subs=[sess(16, 'takdev-emu', (), username=None)], ldap_users={'takdev-emu': 1})
+              subs=[sess(16, 'takdev-emu', (), unmapped=True)], ldap_users={'takdev-emu': 1})
     assert box.recycle() is False
     assert box.restarts() == []
     assert len(box.drops()) == 2

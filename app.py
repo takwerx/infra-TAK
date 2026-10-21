@@ -60643,12 +60643,22 @@ def _subscription_num(uid):
         return -1
 
 
-def _tak_client_sessions():
+def _tak_device_usernames():
+    """{device uid: last username TAK recorded for it} from TAK's client history (last 30
+    days). A connection TAK couldn't match to a user has no DN and no username at all
+    (test6: `dn: null, username: null`), but its device has connected before as someone."""
+    data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/clientEndPoints?secago=2592000', timeout=30)
+    items = data.get('data') if isinstance(data, dict) else None
+    return {e['uid']: e['username'] for e in (items or [])
+            if isinstance(e, dict) and e.get('uid') and e.get('username')}
+
+
+def _tak_client_sessions(devices=None):
     """TAK's live cert-authenticated streaming connections (tls/ssl: ATAK, WinTAK, CloudTAK
     users, service certs) as {uid, cn, client, callsign, username, groups}; `groups` is
-    every group name in either direction minus __ANON__. `cn` comes from the cert DN, so it
-    is there even when TAK couldn't match the cert to a user (username None). None when the
-    Marti API can't be read."""
+    every group name in either direction minus __ANON__. `cn` is the cert DN's CN, else
+    TAK's username, else the device's last username from `devices` — so it is there even
+    when TAK couldn't match the cert to a user. None when the Marti API can't be read."""
     data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
     subs = data.get('data') if isinstance(data, dict) else None
     if not isinstance(subs, list):
@@ -60661,7 +60671,7 @@ def _tak_client_sessions():
         if not uid.startswith(('tls:', 'ssl:')):
             continue  # plain TCP/UDP inputs and static subscriptions have no LDAP user
         m = re.search(r'(?:^|,)\s*CN=([^,]+)', s.get('dn') or '', re.I)
-        cn = (m.group(1) if m else (s.get('username') or '')).strip()
+        cn = (m.group(1) if m else (s.get('username') or (devices or {}).get(s.get('clientUid') or '') or '')).strip()
         groups = {g.get('name') for g in (s.get('groups') or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
         out.append({'uid': uid, 'cn': cn, 'client': s.get('clientUid') or '',
                     'callsign': s.get('callsign') or uid, 'username': s.get('username') or None,
@@ -60681,8 +60691,9 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     2. A connection that still has no groups while LDAP gives its cert's user tak_ groups
        is dropped (DELETE /subscriptions/delete/<uid>, the Client Dashboard's delete), and
        the client reconnects and is looked up again. A re-authenticate can't reach these:
-       TAK never put a username on them. Users LDAP gives no groups, and file users
-       (UserAuthenticationFile.xml), are never touched.
+       TAK never put a username (or DN) on them, so the user is the device's last username
+       in TAK's client history. Users LDAP gives no groups, connections whose user can't be
+       told, and file users (UserAuthenticationFile.xml) are never touched.
     3. Wait for those clients to reconnect; repeat once for any that came back empty.
 
     Returns (verdict, summary): 'ok' (nothing needed), 'healed', 'broken' (a client came
@@ -60691,6 +60702,10 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     sessions = _tak_client_sessions()
     if sessions is None:
         return 'unknown', "can't read TAK Server's client connections (Marti API)"
+    devices = {}
+    if any(not s['cn'] and s['client'] for s in sessions):
+        devices = _tak_device_usernames()
+        sessions = _tak_client_sessions(devices) or sessions
     try:
         file_users = {u.lower() for u in re.findall(r'identifier="([^"]+)"',
                                                     _read_priv('/opt/tak/UserAuthenticationFile.xml') or '')}
@@ -60728,7 +60743,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
         if _reauth(sessions if rnd == 1 else owed):
             time.sleep(3)
-            now = _tak_client_sessions() or []
+            now = _tak_client_sessions(devices) or []
             fixed = {s['uid'] for s in now if s['groups']}
             healed += [s for s in owed if s['uid'] in fixed]
             owed = [s for s in owed if s['uid'] not in fixed]
@@ -60751,7 +60766,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         t0 = time.time()
         while waiting and time.time() - t0 < _TAK_LDAP_HEAL_WAIT_S:
             time.sleep(5)
-            now = _tak_client_sessions()
+            now = _tak_client_sessions(devices)
             if now is None:
                 continue
             for uid, d in list(waiting.items()):
@@ -81727,7 +81742,9 @@ def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
         _body_file = None
-        cmd = ['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key,
+        # curl's own limit follows the caller's (ops #126: a bulk re-authenticate or the
+        # client history on a big server takes longer than the old fixed 8 s).
+        cmd = ['curl', '-sk', '--max-time', str(max(8, int(timeout) - 2)), '--cert', _pem, '--key', _key,
                '-w', '\n__HTTP_CODE:%{http_code}']
         if method != 'GET':
             cmd += ['-X', method]
