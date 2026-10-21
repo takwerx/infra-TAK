@@ -45515,29 +45515,57 @@ def _cloudtak_update_failed_note(plog):
     plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
-def _cloudtak_running_version(cloudtak_dir, container_only=False):
+def _cloudtak_docker(argv, remote_cfg=None, timeout=60):
+    """(returncode, stdout, error text) for one docker argv: on this box through the broker, or
+    on the remote CloudTAK host over SSH (ops #133 — the rollback helpers below serve both).
+    The remote side gets the argv shell-quoted, the same user as every other remote CloudTAK
+    docker command."""
+    if remote_cfg is not None:
+        ok, out = _ssh_probe(remote_cfg, ' '.join(shlex.quote(a) for a in argv), timeout=timeout)
+        return (0, out or '', '') if ok else (1, '', out or '')
+    r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout or '', r.stderr or ''
+
+
+def _cloudtak_compose_at(cloudtak_dir, args, remote_cfg=None, timeout=600):
+    """`_cloudtak_compose_run()` here, or the same compose args in ~/CloudTAK on the remote host.
+    Returns (rc, output)."""
+    if remote_cfg is None:
+        return _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+    dcc = _compose_cmd(remote_cfg=remote_cfg) or 'docker compose'
+    ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} " + ' '.join(shlex.quote(a) for a in args),
+                         timeout=timeout)
+    return (0 if ok else 1), out or ''
+
+
+def _cloudtak_running_version(cloudtak_dir, container_only=False, remote_cfg=None):
     """The CloudTAK version the api container is RUNNING, else the tree's api/package.json.
 
     ops #129: the container first, because a failed update can leave the tree at a newer tag
     than the images that are serving. container_only: never fall back to the tree (a rollback
-    check — the tree is reverted, so it would always "match"). Never raises; '' = no answer."""
+    check — the tree is reverted, so it would always "match"). remote_cfg: ask the remote
+    CloudTAK host (ops #133). Never raises; '' = no answer."""
     try:
-        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-q', 'api'], timeout=30)
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-q', 'api'], remote_cfg=remote_cfg, timeout=30)
         cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
         if re.fullmatch(r'[0-9a-f]{12,64}', cid):
-            r = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'node', '-e',
-                                           "process.stdout.write(require('/home/etl/api/package.json').version)"]),
-                               capture_output=True, text=True, timeout=15)
-            v = (r.stdout or '').strip()
-            if r.returncode == 0 and re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v):
+            rc, out, _err = _cloudtak_docker(['docker', 'exec', cid, 'node', '-e',
+                                              "process.stdout.write(require('/home/etl/api/package.json').version)"],
+                                             remote_cfg=remote_cfg, timeout=15)
+            v = out.strip()
+            if rc == 0 and re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v):
                 return v
     except Exception:
         pass
     if container_only:
         return ''
     try:
-        with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
-            v = str((json.load(f) or {}).get('version') or '').strip()
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, "cat ~/CloudTAK/api/package.json", timeout=30)
+            v = str((json.loads(out or '{}') or {}).get('version') or '').strip() if ok else ''
+        else:
+            with open(os.path.join(cloudtak_dir, 'api', 'package.json')) as f:
+                v = str((json.load(f) or {}).get('version') or '').strip()
         return v if re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', v) else ''
     except Exception:
         return ''
@@ -45551,9 +45579,10 @@ def _cloudtak_rollback_ref(ref):
     return ref.rsplit(':', 1)[0] + ':' + _CT_ROLLBACK_TAG
 
 
-def _cloudtak_snapshot_images(cloudtak_dir):
+def _cloudtak_snapshot_images(cloudtak_dir, remote_cfg=None):
     """[(image_ref, image_id)] for the LOCALLY BUILT images the CloudTAK containers run now,
     each pinned under a `:infratak-rollback` tag so it still exists when it is needed.
+    remote_cfg: the same on the remote CloudTAK host, which builds its own images (ops #133).
 
     ops #129: `build` re-tags cloudtak-api & co. to the new images before `up -d` runs. The
     old containers keep serving by image ID, but the moment anything recreates them (a failed
@@ -45565,62 +45594,62 @@ def _cloudtak_snapshot_images(cloudtak_dir):
     media, garage — refs with a '/') are pinned by tag already and left alone."""
     snap = []
     try:
-        rc, out = _cloudtak_compose_run(cloudtak_dir, ['ps', '-a', '-q'], timeout=60)
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-a', '-q'], remote_cfg=remote_cfg, timeout=60)
         ids = [l.strip() for l in out.splitlines() if re.fullmatch(r'[0-9a-f]{12,64}', l.strip())] if rc == 0 else []
         if not ids:
             return snap
-        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}'] + ids),
-                           capture_output=True, text=True, timeout=60)
-        for ln in (r.stdout or '').splitlines():
+        _rc, insp, _err = _cloudtak_docker(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}'] + ids,
+                                           remote_cfg=remote_cfg, timeout=60)
+        for ln in insp.splitlines():
             parts = ln.split()
             if len(parts) != 2:
                 continue
             ref, iid = parts
             if ('/' not in ref and _CT_IMAGE_REF_RE.match(ref)
                     and re.fullmatch(r'sha256:[0-9a-f]{64}', iid) and (ref, iid) not in snap):
-                p = subprocess.run(_sudo_wrap(['docker', 'tag', iid, _cloudtak_rollback_ref(ref)]),
-                                   capture_output=True, text=True, timeout=60)
-                if p.returncode == 0:
+                prc, _o, _e = _cloudtak_docker(['docker', 'tag', iid, _cloudtak_rollback_ref(ref)],
+                                               remote_cfg=remote_cfg, timeout=60)
+                if prc == 0:
                     snap.append((ref, iid))
     except Exception:
         pass
     return snap
 
 
-def _cloudtak_drop_rollback_pins(snap):
+def _cloudtak_drop_rollback_pins(snap, remote_cfg=None):
     """Remove the `:infratak-rollback` tags (only the tag — an image still tagged or in use
     stays). Never raises."""
     for ref, _iid in snap or []:
         try:
-            subprocess.run(_sudo_wrap(['docker', 'image', 'rm', _cloudtak_rollback_ref(ref)]),
-                           capture_output=True, text=True, timeout=120)
+            _cloudtak_docker(['docker', 'image', 'rm', _cloudtak_rollback_ref(ref)],
+                             remote_cfg=remote_cfg, timeout=120)
         except Exception:
             pass
 
 
-def _cloudtak_restore_images(snap, plog):
+def _cloudtak_restore_images(snap, plog, remote_cfg=None):
     """Point each snapshotted ref back at the image it named before the build, then drop the
     rollback pins. Returns True only if EVERY ref was put back. Never raises."""
     n, ok = 0, True
     for ref, iid in snap or []:
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'tag', iid, ref]), capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
+            rc, _out, err = _cloudtak_docker(['docker', 'tag', iid, ref], remote_cfg=remote_cfg, timeout=60)
+            if rc == 0:
                 n += 1
             else:
                 ok = False
-                plog(f"  ⚠ Could not point {ref} back at the previous image: {(r.stderr or '').strip()[:160]}")
+                plog(f"  ⚠ Could not point {ref} back at the previous image: {err.strip()[:160]}")
         except Exception as e:
             ok = False
             plog(f"  ⚠ Could not point {ref} back at the previous image: {str(e)[:160]}")
     if n:
         plog(f"↩ Image tags put back on the previous build ({n} image(s))")
     if ok:
-        _cloudtak_drop_rollback_pins(snap)
+        _cloudtak_drop_rollback_pins(snap, remote_cfg=remote_cfg)
     return ok
 
 
-def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expect_version=''):
+def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expect_version='', remote_cfg=None):
     """ops #129: the build succeeded, then `docker compose up -d` failed. Put the WHOLE stack
     back on the previous version — tree, image tags, and any container the failed `up -d`
     already replaced — instead of leaving the new tree over the old containers.
@@ -45630,22 +45659,25 @@ def _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, snap, plog, expec
     running untouched; any it stopped or replaced are recreated from the old image. If any old
     image cannot be put back, `up -d` is NOT run (it would start new images on the old tree).
     Returns True only when the api container is running `expect_version` (when known).
-    Never raises."""
+    remote_cfg: the same on the remote CloudTAK host (ops #133). Never raises."""
     try:
         if not snap:
             plog("  ⚠ No record of the previous images — cannot roll the containers back")
             return False
-        _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
-        if not _cloudtak_restore_images(snap, plog):
+        if remote_cfg is not None:
+            _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+        else:
+            _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+        if not _cloudtak_restore_images(snap, plog, remote_cfg=remote_cfg):
             plog("  ⚠ Not every previous image could be put back — containers left as they are")
             return False
-        rc, out = _cloudtak_compose_run(cloudtak_dir, ['up', '-d', '--no-build'], timeout=900)
+        rc, out = _cloudtak_compose_at(cloudtak_dir, ['up', '-d', '--no-build'], remote_cfg=remote_cfg, timeout=900)
         if rc != 0:
             plog(f"  ⚠ Restarting the previous CloudTAK failed too: {_update_error_line(out) or out.strip()[-300:]}")
             return False
         running = ''
         for _i in range(6):                  # the api container needs a moment to answer exec
-            running = _cloudtak_running_version(cloudtak_dir, container_only=True)
+            running = _cloudtak_running_version(cloudtak_dir, container_only=True, remote_cfg=remote_cfg)
             if running:
                 break
             time.sleep(5)
@@ -45773,11 +45805,8 @@ def run_cloudtak_update():
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
         if is_remote:
-            _okv, _outv = _ssh_probe(remote_cfg, "cat ~/CloudTAK/api/package.json", timeout=30) if remote_host else (False, '')
-            try:
-                from_ver = str((json.loads(_outv or '{}') or {}).get('version') or '').strip() if _okv else ''
-            except ValueError:
-                from_ver = ''
+            # ops #133: the running container first, as locally — it is what a rollback checks.
+            from_ver = _cloudtak_running_version(None, remote_cfg=remote_cfg) if remote_host else ''
         else:
             from_ver = _cloudtak_running_version(os.path.expanduser('~/CloudTAK'))
         if not re.fullmatch(r'\d+\.\d+\.\d+[\w.-]*', from_ver or ''):
@@ -45988,6 +46017,10 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #133: the remote host builds its own images, so it has the same Docker 29 trap
+            # the local branch closed in ops #129 — pin what is serving now, so every failure
+            # below can put the image tags (and, after a failed `up -d`, the containers) back.
+            _ct_snap = _cloudtak_snapshot_images(None, remote_cfg=remote_cfg)
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
@@ -45995,9 +46028,12 @@ def run_cloudtak_update():
             if not ok:
                 plog(f"✗ Build failed on remote: {(out or '')[:600]}")
                 _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _r_store_sh = "test -d ~/CloudTAK/.docker-store && echo yes"
+            _had_minio_store = _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
@@ -46007,14 +46043,33 @@ def run_cloudtak_update():
                 if not _gok:
                     plog("✗ Garage store setup failed on the remote host (output above)")
                     _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
+                    _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+            _migrated_now = _had_minio_store and not _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
+            plog("")
+            plog("━━━ Restarting on the new build ━━━")
             ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {dcc} up -d", timeout=1800)
             if not ok:
-                plog(f"✗ Restart failed on remote: {(out or '')[:600]}")
+                # ops #133: same rollback as the local branch (ops #129), over SSH.
+                _why = _update_error_line(out) or 'docker compose up -d failed'
+                plog(f"✗ Restart failed on remote: {_why}")
+                if _migrated_now:
+                    _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
+                    plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                    plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                else:
+                    if _cloudtak_rollback_after_failed_up(None, prev_sha, _ct_snap, plog,
+                                                          expect_version=from_ver, remote_cfg=remote_cfg):
+                        plog("  CloudTAK is running the previous version — the update was undone, nothing was lost.")
+                    else:
+                        plog("  ⚠ CloudTAK could not be restarted on the previous version — open the CloudTAK page.")
+                    plog("  Fix the cause above, then press Update again.")
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
             dcc = _compose_cmd()
