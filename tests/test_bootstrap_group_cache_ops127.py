@@ -225,7 +225,7 @@ def test_reauth_that_does_not_help_says_so():
     tak = FakeTak([], live=[('MPD Main', 'OUT')], stuck=True)
     res, log = _sync(_ns(tak))
     assert tak.reauths == 1 and res['missing'] == ['RAPID-SOS']
-    assert any('still missing' in m and 'Restart CloudTAK' in m for m in log)
+    assert any('still missing' in m and 'next sync' in m for m in log)
 
 
 def test_uncached_and_already_in_every_channel_does_nothing():

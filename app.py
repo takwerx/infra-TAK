@@ -52300,7 +52300,7 @@ window.ctFixBootstrapChannels = function() {
       var after = d && d.after;
       if (d && d.success && after && after.state === 'ok') { window.ctLoadBootstrapChannels(); return; }
       if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
-      if (msg) msg.textContent = (d && d.error) ? d.error : ('Still missing ' + ((after && after.missing) ? after.missing.length : '?') + ' — see the console log; Restart CloudTAK reconnects it.');
+      if (msg) msg.textContent = (d && d.error) ? d.error : ('Still missing ' + ((after && after.missing) ? after.missing.length : '?') + ' — see the console log; it retries on the next sync.');
     })
     .catch(function(e) {
       if (btn) { btn.disabled = false; btn.textContent = 'Fix now'; }
@@ -81598,7 +81598,7 @@ def _tak_sync_bootstrap_group_cache(plog=None):
         res['missing'] = after['missing'] if after['state'] == 'missing' else []
         _log(f"bootstrap cert: re-authenticated its TAK connection — {len(state['missing'])} channel(s) were missing"
              + f" ({', '.join(state['missing'][:10])})"
-             + (f"; still missing {len(res['missing'])} — Restart CloudTAK to reconnect it" if res['missing'] else '; now in all'))
+             + (f"; still missing {len(res['missing'])} — retrying on the next sync" if res['missing'] else '; now in all'))
     elif not res['changed'] and state['state'] == 'ok':
         _log(f"bootstrap cert: live connection in all {len(channels)} channels — no change")
     return res
