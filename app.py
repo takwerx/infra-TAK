@@ -50108,12 +50108,34 @@ def _ensure_netbird_store_key_setting(settings=None):
     generating a new key'), so any restart orphans every previously-encrypted row —
     SSO then 401s 'token invalid' via 'decrypt email: cipher: message authentication
     failed' (test12 2026-07-17, WS2 validation). Key format matches netbird's own
-    generator: 32 bytes base64."""
+    generator: 32 bytes base64.
+
+    A key already in config.yaml but missing from settings is ADOPTED, never replaced:
+    minting a new one here would make the next deploy rewrite config.yaml and orphan
+    every row the running server wrote (test6 carried exactly that split, ops #150)."""
     s = settings if settings is not None else load_settings()
     k = (s.get('netbird_store_encryption_key') or '').strip()
     if not k:
+        for d in (os.path.expanduser('~/netbird'), '/root/netbird'):
+            cfg_path = os.path.join(d, 'config.yaml')
+            if not os.path.isfile(cfg_path):
+                continue
+            try:
+                try:
+                    with open(cfg_path) as f:
+                        txt = f.read()
+                except Exception:
+                    txt = _read_priv(cfg_path)
+                m = re.search(r'^\s*encryptionKey:\s*"?([A-Za-z0-9+/=]{40,})"?\s*$', txt or '', re.M)
+            except Exception:
+                m = None
+            if m:
+                k = m.group(1)
+                break
+    if not k:
         import base64 as _b64
         k = _b64.b64encode(os.urandom(32)).decode()
+    if (s.get('netbird_store_encryption_key') or '').strip() != k:
         s['netbird_store_encryption_key'] = k
         save_settings(s)
     return k
@@ -50233,8 +50255,12 @@ def _heal_netbird_orphaned_store(plog=None):
                 return False
             if _users == 0 and _inst.get('setup_required') is False and settings.get('netbird_enabled'):
                 _torn = True
-            else:
+            elif not (_users > 0 and _inst.get('setup_required') is False and settings.get('netbird_enabled')):
                 return False  # no PAT but nothing provably wrong — don't guess
+            # else: populated store and no PAT to probe with (a lost PAT is a normal,
+            # working state). Only the decrypt signature below can condemn it: test6
+            # and test8 (ops #150) sat here with every user row orphaned and no PAT,
+            # so the heal never ran and SSO login spun on 401 'token invalid'.
         elif _netbird_pat_is_valid(pat):
             return False  # healthy
         # PAT failed — the probe above just forced the server to log WHY. Only the
@@ -50247,7 +50273,7 @@ def _heal_netbird_orphaned_store(plog=None):
                            capture_output=True, text=True, timeout=20)
         _recent = (r.stdout or '') + (r.stderr or '')
         if not _torn and 'message authentication failed' not in _recent:
-            if not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
+            if pat and not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
                 _heal_netbird_orphaned_store._ambig_logged = True
                 _log('  netbird: stored PAT invalid but no orphaned-store signature yet — watching. '
                      'If SSO login fails with 401, the failed attempt itself will confirm the '
