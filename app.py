@@ -61188,7 +61188,8 @@ def _tak_client_sessions(devices=None):
     users, service certs) as {uid, cn, client, callsign, username, groups}; `groups` is
     every group name in either direction minus __ANON__. `cn` is the cert DN's CN, else
     TAK's username, else the device's last username from `devices` — so it is there even
-    when TAK couldn't match the cert to a user. None when the Marti API can't be read."""
+    when TAK couldn't match the cert to a user. `unnamed` = TAK put neither a DN nor a
+    username on it. None when the Marti API can't be read."""
     data, _err = _tak_admin_marti_get(f'{_TAK_MARTI_API}/subscriptions/all', timeout=20)
     subs = data.get('data') if isinstance(data, dict) else None
     if not isinstance(subs, list):
@@ -61205,7 +61206,7 @@ def _tak_client_sessions(devices=None):
         groups = {g.get('name') for g in (s.get('groups') or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
         out.append({'uid': uid, 'cn': cn, 'client': s.get('clientUid') or '',
                     'callsign': s.get('callsign') or uid, 'username': s.get('username') or None,
-                    'groups': groups})
+                    'unnamed': not (m or s.get('username')), 'groups': groups})
     return out
 
 
@@ -61222,12 +61223,19 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
        is dropped (DELETE /subscriptions/delete/<uid>, the Client Dashboard's delete), and
        the client reconnects and is looked up again. A re-authenticate can't reach these:
        TAK never put a username (or DN) on them, so the user is the device's last username
-       in TAK's client history. Users LDAP gives no groups, connections whose user can't be
-       told, and file users (UserAuthenticationFile.xml) are never touched.
-    3. Wait for those clients to reconnect; repeat once for any that came back empty.
+       in TAK's client history. Users LDAP gives no groups and file users
+       (UserAuthenticationFile.xml) are never touched.
+       A connection with no groups AND no user at all is dropped too, even when client
+       history can't name it (test12, ops #131: the history left that device out). TAK names
+       every cert connection whose lookup completes — a user LDAP doesn't know still gets
+       its name and __ANON__ — so "no user, no groups" is a lookup that failed.
+    3. Wait for those clients to reconnect (same device uid); repeat once for any that came
+       back empty. One that comes back named, with no groups, as a user LDAP gives none is
+       fine: that is what it is.
 
     Returns (verdict, summary): 'ok' (nothing needed), 'healed', 'broken' (a client came
-    back empty again with LDAP healthy: TAK's own LDAP path is bad, restart TAK) or
+    back empty again, as a user LDAP has groups for or with no user at all, with LDAP
+    healthy: TAK's own LDAP path is bad, restart TAK) or
     'unknown' (couldn't read TAK or LDAP)."""
     sessions = _tak_client_sessions()
     if sessions is None:
@@ -61247,11 +61255,24 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         return 'unknown', "can't read the users' groups from LDAP"
 
     def _owed(s):
-        return (not s['groups'] and s['cn'].lower() not in file_users
-                and counts.get(s['cn'].lower(), 0) > 0)
+        if s['groups'] or s['cn'].lower() in file_users:
+            return False
+        # unnamed: TAK's lookup for it failed, whatever client history says (or doesn't)
+        return s['unnamed'] or counts.get(s['cn'].lower(), 0) > 0
 
     def _label(s):
+        if not s['cn']:
+            return f"{s['callsign']} (no user)"
         return s['callsign'] if s['callsign'] == s['cn'] else f"{s['callsign']} ({s['cn']})"
+
+    def _same_client(d, s):
+        """Is live connection `s` the client of dropped connection `d`, reconnected?"""
+        if _subscription_num(s['uid']) <= _subscription_num(d['uid']):
+            return False
+        if not d['cn']:   # nothing named it: only its device uid can tell
+            return bool(d['client']) and s['client'] == d['client']
+        return (s['cn'].lower() == d['cn'].lower()
+                and (not d['client'] or s['client'] in (d['client'], '')))
 
     def _reauth(conns):
         names = sorted({s['username'] for s in conns if s['username'] and s['cn'].lower() not in file_users})
@@ -61264,12 +61285,14 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         return True
 
     owed = [s for s in sessions if _owed(s)]
-    plog(f"  {tag}: {len(sessions)} client connection(s), {len(owed)} with no groups that LDAP says should have them")
+    nameless = sum(1 for s in owed if not s['cn'])
+    plog(f"  {tag}: {len(sessions)} client connection(s), {len(owed)} with no groups that LDAP says should have them"
+         + (f" ({nameless} with no user at all: TAK's lookup for them failed)" if nameless else ''))
     if not owed:
         _reauth(sessions)  # still cycles any dead pooled LDAP connections before the next login
         return 'ok', f"all {len(sessions)} client connection(s) have their groups"
 
-    healed, gone, undroppable = [], [], []
+    healed, gone, undroppable, no_ldap_groups = [], [], [], []
     for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
         if _reauth(sessions if rnd == 1 else owed):
             time.sleep(3)
@@ -61290,7 +61313,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
             plog(f"  {tag}: dropped {len(dropped)} connection(s) with no groups so they reconnect and get them: "
                  + ', '.join(_label(s) for s in dropped[:15]) + (' …' if len(dropped) > 15 else ''))
         # Wait for each dropped client's NEXT connection (same cert CN, same device uid when
-        # it had one) and judge that one.
+        # it had one; only the device uid when nothing named it) and judge that one.
         waiting = {s['uid']: s for s in dropped}
         back = {}
         t0 = time.time()
@@ -61300,16 +61323,21 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
             if now is None:
                 continue
             for uid, d in list(waiting.items()):
-                nxt = [s for s in now if s['cn'].lower() == d['cn'].lower()
-                       and _subscription_num(s['uid']) > _subscription_num(uid)
-                       and (not d['client'] or s['client'] in (d['client'], ''))]
+                nxt = [s for s in now if _same_client(d, s)]
                 if not nxt:
                     continue
                 n = max(nxt, key=lambda s: _subscription_num(s['uid']))
                 if n['callsign'] == n['uid']:   # no callsign until its first position report
                     n = dict(n, callsign=d['callsign'])
+                if not n['groups'] and not n['unnamed'] and n['cn'].lower() not in counts:
+                    counts.update(_ldap_users_tak_group_counts(ldap_pass, [n['cn']]) or {})
                 if n['groups']:
                     healed.append(n)
+                    waiting.pop(uid)
+                elif not _owed(n):
+                    # looked up fine this time, as a user LDAP gives no groups: nothing owed
+                    no_ldap_groups.append(n)
+                    back.pop(uid, None)
                     waiting.pop(uid)
                 else:
                     back[uid] = n  # keep waiting: TAK may still be assigning
@@ -61329,8 +61357,11 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     if gone:
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
+    if no_ldap_groups:
+        parts.append(f"{len(no_ldap_groups)} reconnected as user(s) LDAP gives no TAK groups, left as is: "
+                     + ', '.join(_label(s) for s in no_ldap_groups[:15]))
     if stuck:
-        parts.append(f"{len(stuck)} still with no groups although LDAP has them: "
+        parts.append(f"{len(stuck)} still with no groups although LDAP is healthy: "
                      + ', '.join(_label(s) for s in stuck[:15]))
         return 'broken', '; '.join(parts)
     return 'healed', '; '.join(parts) or 'nothing left to heal'
