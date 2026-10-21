@@ -60187,14 +60187,27 @@ def _ensure_authentik_pgbouncer_image(plog):
         _record('applied')
         return True
 
+    def _resync_tak():
+        # TAK Server binds per request with CoreConfig's SA credential; make sure it
+        # still matches .env now that LDAP is verified (same step as 'Resync LDAP to TAK
+        # Server'). Java reads CoreConfig at start, so a change needs a TAK restart.
+        try:
+            changed, msg = _resync_ldap_credential_to_coreconfig()
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync: "
+                 f"{'UPDATED — TAK Server restart needed to load it' if changed else 'already in sync'} ({msg})")
+        except Exception as e:
+            plog(f"  pgbouncer image: LDAP → TAK Server credential resync error: {str(e)[:120]}")
+
     need_groups = base_groups > 0
     if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap'):
         plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified")
+        _resync_tak()
         _record('applied')
         return True
     _restart_ak('LDAP check failed after the swap')
     if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart'):
         plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified after restart")
+        _resync_tak()
         _record('applied')
         return True
     if not base_ok:

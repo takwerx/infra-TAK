@@ -123,6 +123,7 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
         '_ensure_ldapsearch': lambda: True,
         '_wait_for_authentik_stack_healthy': lambda plog, timeout=0: calls.append(['wait-healthy']) or True,
         're': re,
+        '_resync_ldap_credential_to_coreconfig': lambda: (calls.append(['tak-resync']) or (False, 'in_sync')),
     }
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
@@ -159,6 +160,7 @@ def test_box_on_1_26_1_is_moved_back_to_the_pin(tmp_path):
     assert settings['authentik_pgbouncer']['image_last_outcome'] == 'applied'
     assert compose['services']['server']['environment']['AUTHENTIK_POSTGRESQL__HOST'] == 'pgbouncer'
     assert _restarts(calls) == []                     # LDAP held — nothing else restarted
+    assert calls.count(['tak-resync']) == 1           # LDAP → TAK credential resync, logged
 
 
 def test_already_on_pin_is_a_noop(tmp_path):
