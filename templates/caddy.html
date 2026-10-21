@@ -310,11 +310,11 @@ function _dnsCell(text,color){
     if(color)c.style.color=color;
     return c;
 }
-function renderDnsCheck(box,res){
+function renderDnsCheck(box,res,button){
     box.innerHTML='';
     var top=document.createElement('div');
     top.style.cssText='font-size:13px;line-height:1.6;margin-bottom:12px;white-space:pre-wrap';
-    if(res.message){top.style.color='var(--red)';top.textContent=res.message}
+    if(res.message){top.style.color='var(--red)';top.textContent=button?res.message.replace(/press Retry\.$/,'press '+button+'.'):res.message}
     else{top.style.color='var(--green)';top.textContent='✓ Every name Caddy serves points to this server ('+(res.server_ip||'IP unknown')+').'}
     box.appendChild(top);
     var grid=document.createElement('div');
@@ -350,7 +350,7 @@ async function loadDnsCheck(){
     if(btn){btn.disabled=true;btn.textContent='Checking…'}
     try{
         var d=await (await fetch('/api/caddy/dns-check')).json();
-        if(d.success)renderDnsCheck(box,d);else box.textContent=d.error||'DNS check failed';
+        if(d.success)renderDnsCheck(box,d,'Recheck');else box.textContent=d.error||'DNS check failed';
     }catch(e){box.textContent='DNS check failed: '+e.message}
     if(btn){btn.disabled=false;btn.textContent='↻ Recheck'}
 }
