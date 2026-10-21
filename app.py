@@ -58321,8 +58321,13 @@ def _authentik_apply_official_tunings(plog):
 # for the PgBouncer security releases 1.25.2 / 1.26.0 / 1.26.1 — pre-auth
 # crashes and hangs in SCRAM/packet parsing, KILL_CLIENT authz, and a SCRAM
 # login-as-another-user flaw. https://www.pgbouncer.org/changelog.html
+# v10.2.23: back to v1.25.1-p0 (ops #123). After the v10.2.22 swap a field box's
+# LDAP SA bind never came back and TAK users reconnected with no groups; test12
+# showed every user at memberOf=0 for ~10 s after the swap. The security bump
+# returns as its own change once the swap is verified end to end.
 # Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
-# (the install path only writes it when it first adds the service).
+# (the install path only writes it when it first adds the service), in either
+# direction, so boxes already on v1.26.1-p0 move back on their next console start.
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -58330,7 +58335,7 @@ def _authentik_apply_official_tunings(plog):
 # for that pgbouncer version. Tags MUST be the exact DockerHub tag —
 # `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.26.1-p0'
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
 
 
 def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
@@ -59995,10 +60000,19 @@ def _ensure_authentik_pgbouncer_image(plog):
     deliberate swap with different env semantics and is left alone.
 
     Pulls first (nothing is mutated if the pull fails), then rewrites compose and
-    recreates pgbouncer only — never server, worker or the LDAP outpost. The server's
-    client connections drop for the few seconds the container takes to come back,
-    the same blip as a pool-size reconcile. Verifies the RUNTIME (the container's
-    image and health), and rolls compose back to the old image if it doesn't come up.
+    recreates pgbouncer only. The server's client connections drop for the few seconds
+    the container takes to come back, the same blip as a pool-size reconcile. Verifies
+    the RUNTIME (the container's image and health), and rolls compose back to the old
+    image if it doesn't come up.
+
+    v10.2.23 (ops #123): a healthy container is not proof TAK can read groups. After the
+    v10.2.22 swap, test12's outpost served memberOf=0 for every user for ~10 s, starting
+    ~25 s after pg_isready said healthy, and a field box's SA bind never came back. So
+    the swap must also pass what TAK Server depends on: a live adm_ldapservice bind plus
+    users' memberOf through the outpost, held for `_PGB_SWAP_LDAP_STABLE_S`. If it
+    doesn't, server+worker+ldap are restarted (fresh DB pools, fresh outpost cache) and
+    it is checked again; still failing → roll back. A box whose LDAP was already failing
+    BEFORE the swap is not rolled back for it (the swap didn't break it).
 
     Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
     """
@@ -60052,7 +60066,19 @@ def _ensure_authentik_pgbouncer_image(plog):
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
             cwd=ak_dir, capture_output=True, text=True, timeout=180)
 
-    def _rollback(why):
+    def _restart_ak(why):
+        plog(f"  pgbouncer image: {why} — restarting Authentik server, worker and ldap "
+             f"(fresh DB pools, fresh outpost cache)...")
+        with _authentik_compose_lock('pgbouncer-image-restart', plog=plog) as _locked:
+            if not _locked:
+                plog("  ✗ pgbouncer image: compose lock busy — restart NOT done")
+                return
+            rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker', 'ldap']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=300)
+        if rr.returncode != 0:
+            plog(f"  ✗ pgbouncer image: restart failed: {((rr.stderr or '') + (rr.stdout or ''))[-300:]}")
+
+    def _rollback(why, restart=False):
         plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
         with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
             if _locked:
@@ -60062,8 +60088,25 @@ def _ensure_authentik_pgbouncer_image(plog):
             else:
                 plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
                      f"restore {compose_bak} by hand")
+                return
+        if restart:
+            _restart_ak(f"rolled back to {cur}")
+            _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback')
 
-    plog(f"  pgbouncer image: {cur} → {target} (PgBouncer security fixes) — pulling first...")
+    # Baseline the LDAP path TAK Server uses BEFORE touching anything, so the post-swap
+    # check knows what "working" looks like on this box (and whether it already wasn't).
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    can_probe = bool(ldap_pass) and _ensure_ldapsearch()
+    base_ok, base_groups = False, 0
+    if can_probe:
+        base_ok, base_groups, base_detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        plog(f"  pgbouncer image: LDAP before the swap: "
+             f"{'SA bind ok' if base_ok else 'SA bind FAILING'}, {base_detail}")
+    else:
+        plog("  pgbouncer image: no ldapsearch or no adm_ldapservice password — "
+             "can only check container health after the swap")
+
+    plog(f"  pgbouncer image: {cur} → {target} — pulling first...")
     p = subprocess.run(_sudo_wrap(['docker', 'pull', target]), capture_output=True, text=True, timeout=300)
     if p.returncode != 0:
         plog(f"  ✗ pgbouncer image: pull failed, nothing changed (next boot retries): "
@@ -60108,12 +60151,100 @@ def _ensure_authentik_pgbouncer_image(plog):
         if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
             break
     if status != f"{target} running healthy":
-        _rollback(f"container is {status or 'state unknown'}")
+        _rollback(f"container is {status or 'state unknown'}", restart=can_probe and base_ok)
         _record('rolled-back')
         return None
-    plog(f"  ✓ pgbouncer image: running {target} (healthy); server+worker untouched")
-    _record('applied')
-    return True
+    plog(f"  pgbouncer image: container running {target} (healthy) — now checking LDAP as TAK Server does...")
+    if not can_probe:
+        plog(f"  ✓ pgbouncer image: running {target} (healthy); LDAP not checked (see above)")
+        _record('applied')
+        return True
+
+    need_groups = base_groups > 0
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after swap'):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified")
+        _record('applied')
+        return True
+    _restart_ak('LDAP check failed after the swap')
+    if _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, 'after restart'):
+        plog(f"  ✓ pgbouncer image: running {target}; SA bind + memberOf verified after restart")
+        _record('applied')
+        return True
+    if not base_ok:
+        # LDAP was failing before we touched anything, so the old image is no better —
+        # keep the pin and say so plainly rather than roll back into the same failure.
+        plog(f"  ✗ pgbouncer image: kept {target}, but LDAP is STILL failing (it was failing "
+             f"before the swap too). TAK users get no groups until adm_ldapservice binds: "
+             f"check docker logs authentik-ldap-1, then 'Resync LDAP to TAK Server'.")
+        _record('applied-ldap-failing')
+        return True
+    _rollback('LDAP SA bind / memberOf still failing after restart', restart=True)
+    _record('rolled-back-ldap')
+    return None
+
+
+# ops #123: how long the post-swap LDAP check must hold, and how long it may take.
+# test12's memberOf=0 window opened ~25 s after the swap looked healthy and lasted ~10 s,
+# so a single passing probe proves nothing; it has to stay green for a while.
+_PGB_SWAP_LDAP_WINDOW_S = 120
+_PGB_SWAP_LDAP_STABLE_S = 45
+_PGB_SWAP_LDAP_EVERY_S = 5
+
+
+def _authentik_ldap_sa_group_probe(ldap_pass):
+    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
+    adm_ldapservice and read every user's memberOf. Password is never logged.
+
+    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
+    size limit hit, which still means both worked); `tak_groups` counts memberOf values
+    naming a tak_ group.
+    """
+    try:
+        r = subprocess.run(
+            ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+             '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
+             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', '500', '(objectClass=*)', 'memberOf'],
+            capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
+        return False, 0, f"ldapsearch {type(e).__name__}"
+    lines = (r.stdout or '').splitlines()
+    users = sum(1 for l in lines if l.startswith('dn: '))
+    groups = sum(1 for l in lines if l.lower().startswith('memberof: cn=tak_'))
+    bound = r.returncode in (0, 4)
+    detail = f"ldapsearch rc={r.returncode}, {users} users, {groups} tak_ memberOf"
+    if not bound:
+        err = (r.stderr or '').strip().splitlines()
+        if err:
+            detail += f" ({err[-1][:80]})"
+    return bound, groups, detail
+
+
+def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label):
+    """Poll `_authentik_ldap_sa_group_probe` until it has passed continuously for
+    `_PGB_SWAP_LDAP_STABLE_S`, giving up after `_PGB_SWAP_LDAP_WINDOW_S` plus the hold.
+    Passing = SA bind works and, if the box had tak_ memberships before (`need_groups`),
+    at least one comes back. Every failed probe is logged. Returns True when stable."""
+    start = time.time()
+    good_since = None
+    fails = 0
+    while True:
+        ok, groups, detail = _authentik_ldap_sa_group_probe(ldap_pass)
+        now = time.time()
+        if ok and (groups > 0 or not need_groups):
+            if good_since is None:
+                good_since = now
+            if now - good_since >= _PGB_SWAP_LDAP_STABLE_S:
+                note = f" ({fails} failed probe(s) before it settled)" if fails else ''
+                plog(f"  ✓ pgbouncer image: LDAP {label}: {detail}, held {_PGB_SWAP_LDAP_STABLE_S}s{note}")
+                return True
+        else:
+            fails += 1
+            good_since = None
+            plog(f"  pgbouncer image: LDAP {label}: {'SA bind ok but NO tak_ groups' if ok else 'SA bind FAILED'} — {detail}")
+            if now - start >= _PGB_SWAP_LDAP_WINDOW_S:
+                plog(f"  ✗ pgbouncer image: LDAP {label}: not passing after {_PGB_SWAP_LDAP_WINDOW_S}s")
+                return False
+        time.sleep(_PGB_SWAP_LDAP_EVERY_S)
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
