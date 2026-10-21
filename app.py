@@ -4983,23 +4983,87 @@ def _parse_dnf_check_update(out):
     return pend
 
 
-def _pending_os_updates():
+# `dnf check-update` exit codes: 100 = updates pending, 0 = none, anything else
+# (1 in practice) = dnf could not answer. Ops #152: rc=1 was read as "none".
+_DNF_CHECK_OK_RC = (0, 100)
+
+# -C            cacheonly: no network, so a dead mirror cannot hang a UI request.
+# --assumeno    a repo_gpgcheck key-import prompt is answered NO, never yes.
+# skip_if_unavailable  one repo with no usable cache is skipped (and reported
+#               via `Ignoring repositories:`) instead of failing the whole check.
+_DNF_CHECK_UPDATE_ARGS = ['-C', '-q', '--assumeno', '--setopt=skip_if_unavailable=True',
+                          'check-update']
+
+
+def _dnf_error_tail(stderr):
+    """The line of dnf's stderr worth showing an operator (its `Error:` line)."""
+    lines = [ln.strip() for ln in (stderr or '').splitlines() if ln.strip()]
+    errs = [ln for ln in lines if ln.lower().startswith('error')]
+    return ((errs or lines or ['no output'])[-1])[:120]
+
+
+def _dnf_ignored_repos(stderr):
+    """Repo ids dnf skipped under skip_if_unavailable (`Ignoring repositories: a, b`)."""
+    out = []
+    for m in re.finditer(r'Ignoring repositories:\s*(.+)', stderr or ''):
+        out.extend(x.strip() for x in m.group(1).split(',') if x.strip())
+    return out
+
+
+def _dnf_check_update_run():
+    """Run the read-only dnf check-update; return the CompletedProcess or raise.
+
+    Ops #152 (Rocky 9): run as the console user, `dnf -C check-update`
+    failed with rc=1 — the PGDG repo has repo_gpgcheck, and verifying its cached
+    metadata needs a key in root's keyring that the console user cannot import
+    without answering a prompt. Root's own cache (kept fresh by
+    dnf-makecache.timer) reads fine. So ask as root first, through the broker
+    (`check-update` is allowlisted; it is a query and -C keeps it off the
+    network), and fall back to the console user only if that path is not
+    available. If neither answers, raise: "could not check" must never become
+    "nothing pending".
+    """
+    attempts = [_sudo_wrap(['dnf'] + _DNF_CHECK_UPDATE_ARGS)]
+    if os.getuid() != 0:
+        attempts.append([_real_bin('dnf')] + _DNF_CHECK_UPDATE_ARGS)
+    first_err = ''
+    for argv in attempts:
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                               stdin=subprocess.DEVNULL)
+        except Exception as e:
+            first_err = first_err or str(e)[:120]
+            continue
+        if r.returncode in _DNF_CHECK_OK_RC:
+            return r
+        first_err = first_err or ('dnf check-update failed (rc=%s): %s'
+                                  % (r.returncode, _dnf_error_tail(r.stderr)))
+    raise RuntimeError(first_err or 'dnf check-update did not run')
+
+
+def _pending_os_updates(notes=None):
     """Return [{name, old, new}] of packages a full upgrade would install.
 
-    Read-only SIMULATION on both families, run UNPRIVILEGED (neither command
-    needs root) and against the package lists already on disk — no network, no
-    `apt-get update`. So the answer is exactly what the operator would see, and
-    is only as fresh as the last list refresh (the UI says so).
+    Read-only SIMULATION on both families, against the package lists already
+    on disk — no network, no `apt-get update`. So the answer is exactly what the
+    operator would see, and is only as fresh as the last list refresh (the UI
+    says so). apt runs as the console user; dnf asks as root first (see
+    _dnf_check_update_run). Raises when the package manager could not answer.
+
+    `notes`, if a dict, receives `skipped_repos`: dnf repos that could not be
+    read, so the panel can say its list is partial.
     """
-    ok = True
     try:
         if _pkg_mgr() == 'dnf':
-            # -C = cacheonly. Without it dnf may hit the network for metadata and
-            # hang a UI request; check-update exits 100 when updates exist, 0 when
-            # none, so a non-zero rc is NOT an error here.
-            r = subprocess.run([_real_bin('dnf'), '-C', '-q', 'check-update'],
-                               capture_output=True, text=True, timeout=60)
+            r = _dnf_check_update_run()
             pend = _parse_dnf_check_update(r.stdout)
+            skipped = _dnf_ignored_repos(r.stderr)
+            if skipped and not pend:
+                # Every repo that answered says "current", but some did not
+                # answer at all. That is not "nothing pending".
+                raise RuntimeError('could not read package source(s): ' + ', '.join(skipped)[:100])
+            if notes is not None:
+                notes['skipped_repos'] = skipped
             # check-update reports only the CANDIDATE version. Without the
             # installed side, the panel rendered every row as "(new)" — a
             # visible lie for packages that are plainly installed (field:
@@ -5021,6 +5085,13 @@ def _pending_os_updates():
             return pend
         r = subprocess.run([_real_bin('apt-get'), '-s', 'full-upgrade'],
                            capture_output=True, text=True, timeout=60)
+        # apt-get exits 0 on a good simulation; anything else (broken deps,
+        # unreadable lists) prints `E:` and an empty plan. Ops #152: same
+        # rc-means-current trap as dnf.
+        if r.returncode != 0:
+            errs = [ln.strip() for ln in (r.stderr or '').splitlines() if ln.strip()]
+            raise RuntimeError('apt-get simulation failed (rc=%s): %s'
+                               % (r.returncode, (errs[-1] if errs else 'no output')[:120]))
         return _parse_apt_simulation(r.stdout)
     except Exception as _e:
         # v10.1.37: this used to `return []`, which made "I could not check"
@@ -5029,7 +5100,8 @@ def _pending_os_updates():
         # that told operators they were current for five releases
         # ([[apppy-ur-per-function-import-silent-nameerror]]). Raise so the
         # caller can SAY it failed; the failure direction must be toward noise.
-        raise RuntimeError('could not read pending updates: ' + str(_e)[:120])
+        # (The panel already prefixes "Could not read pending updates:".)
+        raise RuntimeError(str(_e)[:160])
 
 
 def _is_major_jump(old, new):
@@ -5154,8 +5226,9 @@ def _os_updates_summary(force=False):
     if not force and _OS_UPDATES_CACHE['data'] is not None and (now - _OS_UPDATES_CACHE['ts']) < _OS_UPDATES_TTL:
         return _OS_UPDATES_CACHE['data']
     err = ''
+    notes = {}
     try:
-        pending = _pending_os_updates()
+        pending = _pending_os_updates(notes)
     except Exception as _pe:
         pending, err = [], str(_pe)[:160]
     managed, routine = _classify_os_updates(pending)
@@ -5185,6 +5258,7 @@ def _os_updates_summary(force=False):
         'checked_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'pkg_mgr': _pkg_mgr(),
         'error': err,
+        'skipped_repos': notes.get('skipped_repos') or [],
     }
     _OS_UPDATES_CACHE['ts'], _OS_UPDATES_CACHE['data'] = now, data
     return data
@@ -27301,6 +27375,7 @@ def caddy_page():
     cert_days_fmt, _ = _fmt_caddy_cert_days(cert_days)  # same format as dashboard card
     caddy_ver_info = _get_caddy_version_info() if caddy.get('installed') else {}
     caddy_update_available = caddy_ver_info.get('update_available', False)
+    caddy_update_check_failed = caddy_ver_info.get('update_check_failed', False)
     caddy_version = caddy_ver_info.get('version', '')
     return render_template('caddy.html',
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
@@ -27308,6 +27383,7 @@ def caddy_page():
         cert_days_left=cert_days, cert_days_color=cert_days_color,
         cert_days_fmt=cert_days_fmt,
         caddy_update_available=caddy_update_available,
+        caddy_update_check_failed=caddy_update_check_failed,
         caddy_version=caddy_version,
         caddy_last_action=_caddy_last_action_summary(),
         caddy_includes=_caddy_includes_summary(caddyfile_content),
@@ -35256,8 +35332,8 @@ def _get_fedhub_version_info():
 
 
 def _get_caddy_version_info():
-    """Return {version: str, update_available: bool} for Caddy."""
-    out = {'version': '', 'update_available': False}
+    """Return {version: str, update_available: bool, update_check_failed: bool} for Caddy."""
+    out = {'version': '', 'update_available': False, 'update_check_failed': False}
     try:
         r = subprocess.run('caddy version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout:
@@ -35268,14 +35344,27 @@ def _get_caddy_version_info():
         if out['version']:
             # Family-branched: bare `apt` on RHEL raised FileNotFoundError every
             # poll (benign but noisy in the broker audit log — seen on aws-rocky).
+            # Ops #152: the rc is checked before the output. It used to be piped
+            # through grep, so a failed check (dnf rc=1, empty stdout) read as
+            # "current".
             if _distro_family() == 'rhel':
-                chk = _priv_pipe(['dnf', '-q', 'check-update', 'caddy'], ['grep', '-i', 'caddy'], timeout=15)
+                chk = subprocess.run(_sudo_wrap(['dnf', '-q', '--assumeno', 'check-update', 'caddy']),
+                                     capture_output=True, text=True, timeout=15,
+                                     stdin=subprocess.DEVNULL)
+                # 100 = update pending, 0 = current, anything else = error.
+                if chk.returncode not in _DNF_CHECK_OK_RC:
+                    out['update_check_failed'] = True
+                out['update_available'] = (chk.returncode == 100)
             else:
-                chk = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
-            if chk.returncode == 0 and (chk.stdout or '').strip():
-                out['update_available'] = True
+                chk = subprocess.run(_sudo_wrap(['apt', 'list', '--upgradable']),
+                                     capture_output=True, text=True, timeout=10)
+                if chk.returncode != 0:
+                    out['update_check_failed'] = True
+                elif 'caddy' in (chk.stdout or '').lower():
+                    out['update_available'] = True
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        if out['version']:
+            out['update_check_failed'] = True
     return out
 
 
@@ -83876,29 +83965,39 @@ def kernel_patch_status_api():
     # surface). The dnf path (EL9: RHEL/Rocky/Alma/CentOS) uses `dnf
     # check-update`, whose exit code 100 means "updates available" — scoped to
     # the kernel packages so the banner means the same thing on every distro.
+    # Ops #152: an rc that is neither "updates" nor "none" used to read as
+    # "patched". It is now an error, and `patched` is only true when the
+    # package manager actually answered.
+    check_err = ''
+    upgradable_count = 0
     if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'dnf':
         try:
             r = subprocess.run(
-                _sudo_wrap(['dnf', '-q', 'check-update', 'kernel', 'kernel-core']), capture_output=True, text=True, timeout=30
+                _sudo_wrap(['dnf', '-q', '--assumeno', 'check-update', 'kernel', 'kernel-core']),
+                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL
             )
             # dnf check-update: 100 = updates available, 0 = up to date, 1 = error.
-            # Treat error/timeout as "no banner" (same fail-safe as the apt branch).
-            upgradable_count = 1 if r.returncode == 100 else 0
-        except Exception:
-            upgradable_count = 0
+            if r.returncode == 100:
+                upgradable_count = 1
+            elif r.returncode != 0:
+                check_err = 'dnf check-update failed (rc=%s): %s' % (r.returncode, _dnf_error_tail(r.stderr))
+        except Exception as e:
+            check_err = 'dnf check-update did not run: ' + str(e)[:120]
     else:
         try:
-            upgradable_out = subprocess.run(
-                'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
-                shell=True, capture_output=True, text=True, timeout=20
-            ).stdout.strip()
-            upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
-        except Exception:
-            upgradable_count = 0
+            r = subprocess.run(_sudo_wrap(['apt', 'list', '--upgradable']),
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                check_err = 'apt list failed (rc=%s)' % r.returncode
+            else:
+                upgradable_count = sum(1 for ln in (r.stdout or '').splitlines() if 'linux-image' in ln)
+        except Exception as e:
+            check_err = 'apt list did not run: ' + str(e)[:120]
     data = {
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
-        'patched': upgradable_count == 0,
+        'patched': upgradable_count == 0 and not check_err,
+        'error': check_err,
         # Named only while the running kernel predates the fix (GH #53) — the
         # banner text for a routine point-release must not claim CVE exposure.
         'cve_banner': _kernel_cve_banner(running_kernel) if upgradable_count > 0 else None,
