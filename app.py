@@ -61372,19 +61372,25 @@ def _ldap_filter_escape(v):
     return ''.join('\\%02x' % ord(c) if c in '\\*()\x00' else c for c in v)
 
 
-def _ldap_users_tak_group_counts(ldap_pass, cns):
-    """{cn (lower case): number of tak_ memberOf} for these users, read through the local
-    outpost as adm_ldapservice, the way TAK looks them up. A user LDAP doesn't have is left
-    out. None when LDAP can't be read. Password is never logged."""
+def _ldap_users_tak_groups(ldap_pass, cns=None):
+    """{cn as LDAP has it: [its TAK group names]} for these users (or the first 500 users
+    when `cns` is None), read through the local outpost as adm_ldapservice, the way TAK
+    looks them up; a group name is what CoreConfig's groupNameExtractorRegex takes from a
+    tak_ memberOf. A user LDAP doesn't have is left out. None when LDAP can't be read.
+    Password is never logged."""
     out = {}
-    cns = sorted({c for c in cns if c})
-    for i in range(0, len(cns), 50):
-        flt = '(|' + ''.join(f'(cn={_ldap_filter_escape(c)})' for c in cns[i:i + 50]) + ')'
+    if cns is None:
+        searches = [['-z', '500', '(objectClass=*)']]
+    else:
+        cns = sorted({c for c in cns if c})
+        searches = [['(|' + ''.join(f'(cn={_ldap_filter_escape(c)})' for c in cns[i:i + 50]) + ')']
+                    for i in range(0, len(cns), 50)]
+    for search in searches:
         try:
             r = subprocess.run(
                 ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
                  '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-                 '-b', 'ou=users,dc=takldap', '-s', 'one', flt, 'memberOf'],
+                 '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
                 capture_output=True, text=True, timeout=20)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             return None
@@ -61392,15 +61398,33 @@ def _ldap_users_tak_group_counts(ldap_pass, cns):
             return None
         cur = None
         for line in (r.stdout or '').splitlines():
-            low = line.lower()
-            if low.startswith('dn:'):
+            if line.lower().startswith('dn:'):
                 m = re.match(r'dn:\s*cn=([^,]+),', line, re.I)
-                cur = m.group(1).strip().lower() if m else None
+                cur = m.group(1).strip() if m else None
                 if cur is not None:
-                    out.setdefault(cur, 0)
-            elif cur is not None and low.startswith('memberof: cn=tak_'):
-                out[cur] += 1
+                    out.setdefault(cur, [])
+                continue
+            m = re.match(r'memberof:\s*cn=tak_(.*?)(?:,|$)', line, re.I) if cur is not None else None
+            if m:
+                out[cur].append(m.group(1))
     return out
+
+
+def _ldap_users_tak_group_counts(ldap_pass, cns):
+    """{cn (lower case): number of tak_ memberOf} for these users (see
+    `_ldap_users_tak_groups`). None when LDAP can't be read."""
+    groups = _ldap_users_tak_groups(ldap_pass, cns)
+    return None if groups is None else {cn.lower(): len(g) for cn, g in groups.items()}
+
+
+def _tak_file_users():
+    """Lower-case identifiers of TAK's file users (UserAuthenticationFile.xml: admin, service
+    certs). LDAP has nothing to say about them."""
+    try:
+        return {u.lower() for u in re.findall(r'identifier="([^"]+)"',
+                                              _read_priv('/opt/tak/UserAuthenticationFile.xml') or '')}
+    except Exception:
+        return set()
 
 
 def _subscription_num(uid):
@@ -61481,11 +61505,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     if any(not s['cn'] and s['client'] for s in sessions):
         devices = _tak_device_usernames()
         sessions = _tak_client_sessions(devices) or sessions
-    try:
-        file_users = {u.lower() for u in re.findall(r'identifier="([^"]+)"',
-                                                    _read_priv('/opt/tak/UserAuthenticationFile.xml') or '')}
-    except Exception:
-        file_users = set()
+    file_users = _tak_file_users()
     ldap_cns = sorted({s['cn'] for s in sessions if s['cn'] and s['cn'].lower() not in file_users})
     counts = _ldap_users_tak_group_counts(ldap_pass, ldap_cns)
     if counts is None:
@@ -61527,7 +61547,7 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
          + (f" ({nameless} with no user at all: TAK's lookup for them failed)" if nameless else ''))
     if not owed:
         _reauth(sessions)  # still cycles any dead pooled LDAP connections before the next login
-        return 'ok', f"all {len(sessions)} client connection(s) have their groups"
+        return 'ok', f"all {len(sessions)} streaming (8089) client connection(s) have their groups"
 
     healed, gone, undroppable, no_ldap_groups = [], [], [], []
     for rnd in range(1, _TAK_LDAP_HEAL_ROUNDS + 1):
@@ -61602,6 +61622,179 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
                      + ', '.join(_label(s) for s in stuck[:15]))
         return 'broken', '; '.join(parts)
     return 'healed', '; '.join(parts) or 'nothing left to heal'
+
+
+# The HTTPS side (ops #139). TAK's API looks a cert user's groups up on its own, apart from
+# the 8089 connections the heal above reads. On test8 it stopped doing that after LDAP was
+# restarted under TAK: ATAK kept its streaming groups while every Data Sync / mission call
+# got 0 groups, an empty list and a 403 on create, and the heal said "all clients have
+# their groups" eight times. So the check also logs in over HTTPS as a real non-admin LDAP
+# user, with a throwaway cert, and does what ATAK's Data Sync does.
+_TAK_API_CHECK_EKU = 'clientAuth,1.2.840.113549.1.9.7'   # what TAK's enrollment puts on ATAK certs
+_TAK_API_CHECK_TOOL = 'infratak-check'   # not 'public': ATAK's Data Sync lists 'public' missions
+_TAK_API_CHECK_ATTEMPTS = 2   # a lookup through a dead pooled LDAP connection fails once
+_TAK_API_CHECK_RETRY_S = 15
+_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS = 6   # the API answers on 8443 a while before it serves
+
+
+def _tak_user_leaf_cert(cn, workdir):
+    """A throwaway client cert for LDAP user `cn` (CN=cn, the EKU TAK's enrollment gives
+    ATAK), valid one day, signed by the CA TAK's own enrollment signs with (CoreConfig
+    TAKServerCAConfig), so TAK trusts it and looks `cn` up in LDAP like any ATAK login.
+    Nothing is registered in TAK. The new key and the CA files are written only into
+    `workdir` (the caller's mkdtemp, 0700), which the caller removes; the CA password goes
+    to openssl through its environment, never argv. Returns (cert path, key path); raises
+    RuntimeError with the reason."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn or ''):
+        raise RuntimeError(f"user name {cn!r} can't be put in a cert subject")
+    cfg = re.search(r'<TAKServerCAConfig\b[^>]*>', _read_priv('/opt/tak/CoreConfig.xml') or '')
+    ca = re.search(r'keystoreFile="certs/files/([A-Za-z0-9._-]+)-signing\.jks"', cfg.group(0) if cfg else '')
+    if not ca:
+        raise RuntimeError("CoreConfig has no enrollment CA (TAKServerCAConfig)")
+    pw = re.search(r'keystorePass="([^"]*)"', cfg.group(0))
+    ca_pass = pw.group(1) if pw else _get_tak_cert_password(load_settings())
+    ca_pem, ca_key = os.path.join(workdir, 'ca.pem'), os.path.join(workdir, 'ca.key')
+    for ext, dst in (('pem', ca_pem), ('key', ca_key)):
+        src = f'/opt/tak/certs/files/{ca.group(1)}.{ext}'
+        try:
+            data = _read_priv_bytes(src)
+        except Exception as e:
+            raise RuntimeError(f"can't read {src}: {str(e)[:80]}")
+        if not data:
+            raise RuntimeError(f"{src} is empty")
+        with os.fdopen(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+            f.write(data)
+    key, csr, extfile, crt = (os.path.join(workdir, n) for n in ('user.key', 'user.csr', 'ext.cnf', 'user.pem'))
+    with os.fdopen(os.open(extfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as f:
+        f.write('basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n'
+                f'extendedKeyUsage={_TAK_API_CHECK_EKU}\n')
+    env = dict(os.environ, TAK_CA_PASS=ca_pass)
+    for cmd in (['openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
+                 '-subj', f'/CN={cn}/O=infra-TAK/OU=LDAP check', '-out', csr],
+                ['openssl', 'x509', '-req', '-in', csr, '-CA', ca_pem, '-CAkey', ca_key,
+                 '-passin', 'env:TAK_CA_PASS', '-set_serial', str(secrets.randbits(63)),
+                 '-days', '1', '-sha256', '-extfile', extfile, '-out', crt]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"openssl {cmd[1]}: {type(e).__name__}")
+        if r.returncode != 0:
+            raise RuntimeError(f"openssl {cmd[1]} failed: {(r.stderr or '').strip()[-160:]}")
+    return crt, key
+
+
+def _tak_user_marti_req(cert, key, url, method='GET', timeout=20):
+    """One Marti API call with a client cert from `_tak_user_leaf_cert`. Returns (HTTP
+    code, parsed JSON or None); code 0 = no HTTP answer (refused, TLS error, timeout)."""
+    try:
+        r = subprocess.run(['curl', '-sk', '--max-time', str(timeout - 2), '--cert', cert, '--key', key,
+                            '-X', method, '-w', '\n__HTTP_CODE:%{http_code}', url],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0, None
+    body, sep, code = (r.stdout or '').rpartition('\n__HTTP_CODE:')
+    try:
+        code = int(code.strip()) if sep and r.returncode == 0 else 0
+    except ValueError:
+        code = 0
+    try:
+        data = json.loads(body) if body.strip() else None
+    except ValueError:
+        data = None
+    return code, data
+
+
+def _tak_api_user_check_once(cn, ldap_groups):
+    """One HTTPS round as `cn` (see `_tak_api_user_check`). Returns (verdict, summary)."""
+    workdir = tempfile.mkdtemp(prefix='tak-api-check-')
+    try:
+        try:
+            cert, key = _tak_user_leaf_cert(cn, workdir)
+        except Exception as e:
+            return 'unknown', f"couldn't make a test cert for {cn}: {str(e)[:160]}"
+
+        def req(path, method='GET'):
+            return _tak_user_marti_req(cert, key, f'{_TAK_MARTI_API}/{path}', method)
+
+        code, data = req('groups/all')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s groups/all ({f'HTTP {code}' if code else 'no answer'})"
+        rows = data.get('data') if code == 200 and isinstance(data, dict) else None
+        got = {g.get('name') for g in (rows or []) if isinstance(g, dict)} - {'__ANON__', None, ''}
+        have = sorted(got & set(ldap_groups))
+        if not have:
+            return 'broken', (f"TAK's API gave {cn} {'no groups' if code == 200 else f'HTTP {code}'} on "
+                              f"groups/all, while LDAP gives {len(ldap_groups)} ({', '.join(sorted(ldap_groups)[:5])})")
+        code, data = req('missions')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s mission list ({f'HTTP {code}' if code else 'no answer'})"
+        if code != 200:
+            return 'broken', f"{cn} can't list missions over HTTPS (HTTP {code})"
+        listed = len(data.get('data') or []) if isinstance(data, dict) else 0
+        # A group TAK already reports for the user, so a group added in TAK Portal a minute
+        # ago (TAK's group cache catches up on its own) can't look like a broken TAK.
+        group = have[0]
+        name = f'infratak-ldap-check-{int(time.time())}'
+        code, _ = req(f'missions/{name}?creatorUid=infratak-ldap-check&tool={_TAK_API_CHECK_TOOL}'
+                      f'&group={urllib.parse.quote(group, safe="")}', method='PUT')
+        if code == 0 or code >= 500:
+            return 'unknown', f"TAK's API didn't answer {cn}'s mission create ({f'HTTP {code}' if code else 'no answer'})"
+        if code not in (200, 201):
+            return 'broken', f"{cn} got HTTP {code} creating a mission in {group} over HTTPS"
+        dpath = f'missions/{name}?creatorUid=infratak-ldap-check'
+        dcode, _ = req(dpath, method='DELETE')
+        note = ''
+        if dcode != 200:
+            ok, _err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/{dpath}', timeout=20, method='DELETE')
+            if ok is None:
+                note = f" (couldn't delete test mission {name}: delete it in TAK's Mission Manager)"
+        return 'ok', (f"HTTPS as {cn}: {len(got)} group(s), {listed} mission(s) listed, "
+                      f"mission create + delete in {group} OK{note}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _tak_api_user_check(plog, tag, ldap_pass, attempts=_TAK_API_CHECK_ATTEMPTS):
+    """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
+
+    Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
+    one, else the first in LDAP; never a file user or a ROLE_ADMIN member) and, as a
+    throwaway cert for that user, reads its groups (groups/all), lists missions, creates a
+    mission in one of its groups (tool `infratak-check`, which ATAK's Data Sync doesn't
+    list) and deletes it again. Up to `attempts` rounds, a fresh cert each.
+    Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
+    refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
+    check with, or the cert or the API couldn't be used)."""
+    file_users = _tak_file_users()
+
+    def _pick(groups):
+        for cn in sorted(groups or {}, key=str.lower):
+            g = [x for x in groups[cn] if x not in ('__ANON__', '')]
+            if (g and 'ROLE_ADMIN' not in g and cn.lower() not in file_users
+                    and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
+                return cn, g
+        return None
+
+    live = {s['cn'] for s in (_tak_client_sessions() or []) if s['cn'] and not s['unnamed']}
+    groups = _ldap_users_tak_groups(ldap_pass, live) if live else {}
+    pick = _pick(groups)
+    if not pick:
+        groups = _ldap_users_tak_groups(ldap_pass)
+        if groups is None:
+            return 'unknown', "can't read the users' groups from LDAP"
+        pick = _pick(groups)
+    if not pick:
+        return 'unknown', "no non-admin LDAP user with TAK groups to check with"
+    cn, ldap_groups = pick
+    verdict, summary = 'unknown', 'not run'
+    for n in range(1, attempts + 1):
+        if n > 1:
+            plog(f"  {tag}: HTTPS check round {n - 1}: {summary} — trying again in {_TAK_API_CHECK_RETRY_S}s")
+            time.sleep(_TAK_API_CHECK_RETRY_S)
+        verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+        if verdict == 'ok':
+            break
+    return verdict, summary
 
 
 def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
@@ -61742,10 +61935,23 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             except Exception as e:
                 verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
         if verdict in ('ok', 'healed'):
-            plog(f"  ✓ {tag}: {summary} — no TAK Server restart needed")
-            _finish('clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart',
-                    healed_ldap_start=ldap_start)
-            return False
+            # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
+            try:
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass)
+            except Exception as e:
+                api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
+            outcome = 'clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
+            if api_verdict == 'ok':
+                plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
+                _finish(outcome, healed_ldap_start=ldap_start)
+                return False
+            if api_verdict == 'unknown':
+                plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
+                _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start)
+                return False
+            plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
+                 f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
+            summary = f"HTTPS/API side gives users no groups ({api_summary})"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
@@ -61762,9 +61968,25 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         except subprocess.TimeoutExpired:
             plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
         ready = _tak_wait_ready(plog, tag)
-        if ready:
-            plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
-        _finish('restarted' if ready else 'restarted, ports not up in time')
+        if not ready:
+            _finish('restarted, ports not up in time')
+            return True
+        plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
+        try:
+            api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass,
+                                                           attempts=_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS)
+        except Exception as e:
+            api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
+        if api_verdict == 'ok':
+            plog(f"  ✓ {tag}: after the restart: {api_summary}")
+            _finish('restarted')
+        elif api_verdict == 'unknown':
+            plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
+            _finish('restarted (HTTPS not checked)')
+        else:
+            plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
+                 f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
+            _finish('restarted, HTTPS still broken')
         return True
 
 
