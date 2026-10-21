@@ -60066,19 +60066,32 @@ def _ensure_authentik_pgbouncer_image(plog):
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'pgbouncer']),
             cwd=ak_dir, capture_output=True, text=True, timeout=180)
 
+    restarted = []
+
     def _restart_ak(why):
-        plog(f"  pgbouncer image: {why} — restarting Authentik server, worker and ldap "
+        # The restart is itself an LDAP outage, so at most ONE per run, and the outpost
+        # only after the server is healthy (ops #30: an outpost that starts against a
+        # server that goes away mid start-up panics).
+        if restarted:
+            plog(f"  pgbouncer image: {why} — Authentik already restarted once this run, not again")
+            return
+        restarted.append(why)
+        plog(f"  pgbouncer image: {why} — restarting Authentik server+worker, then ldap "
              f"(fresh DB pools, fresh outpost cache)...")
         with _authentik_compose_lock('pgbouncer-image-restart', plog=plog) as _locked:
             if not _locked:
                 plog("  ✗ pgbouncer image: compose lock busy — restart NOT done")
                 return
-            rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker', 'ldap']),
+            rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']),
                                 cwd=ak_dir, capture_output=True, text=True, timeout=300)
-        if rr.returncode != 0:
-            plog(f"  ✗ pgbouncer image: restart failed: {((rr.stderr or '') + (rr.stdout or ''))[-300:]}")
+            _wait_for_authentik_stack_healthy(plog, timeout=180)
+            rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
+                                cwd=ak_dir, capture_output=True, text=True, timeout=120)
+        for res in (rr, rl):
+            if res.returncode != 0:
+                plog(f"  ✗ pgbouncer image: restart failed: {((res.stderr or '') + (res.stdout or ''))[-300:]}")
 
-    def _rollback(why, restart=False):
+    def _rollback(why, check_ldap=False):
         plog(f"  ✗ pgbouncer image: {why} — rolling back to {cur}")
         with _authentik_compose_lock('pgbouncer-image-rollback', plog=plog) as _locked:
             if _locked:
@@ -60089,9 +60102,9 @@ def _ensure_authentik_pgbouncer_image(plog):
                 plog(f"  ✗ pgbouncer image: compose lock busy — rollback NOT applied; "
                      f"restore {compose_bak} by hand")
                 return
-        if restart:
-            _restart_ak(f"rolled back to {cur}")
-            _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback')
+        if check_ldap and not _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback'):
+            _restart_ak(f"LDAP failing after rolling back to {cur}")
+            _authentik_ldap_sa_groups_settle(ldap_pass, base_groups > 0, plog, 'after rollback + restart')
 
     # Baseline the LDAP path TAK Server uses BEFORE touching anything, so the post-swap
     # check knows what "working" looks like on this box (and whether it already wasn't).
@@ -60114,7 +60127,21 @@ def _ensure_authentik_pgbouncer_image(plog):
         _record('pull-failed')
         return None
 
+    # ops #123: change the image LINE only. v10.2.22 re-dumped the whole file
+    # (safe_dump width=200), which re-wrapped long lines; the post-update harden step
+    # saw a text diff and force-recreated server/worker/ldap — three LDAP outages on
+    # test6 in 2.5 min, each followed by memberOf=0.
+    new_compose = _compose_set_service_image(raw_compose, 'pgbouncer', target)
     pgb['image'] = target
+    try:
+        same_otherwise = new_compose is not None and _yaml.safe_load(new_compose) == data
+    except Exception:
+        same_otherwise = False
+    if not same_otherwise:
+        plog("  ✗ pgbouncer image: couldn't change just the image line in compose — "
+             "nothing changed (the whole file is never re-dumped)")
+        _record('write-failed')
+        return None
     with _authentik_compose_lock('pgbouncer-image', plog=plog) as _locked:
         if not _locked:
             plog("  pgbouncer image: compose lock busy — skipped, next console boot retries")
@@ -60123,7 +60150,7 @@ def _ensure_authentik_pgbouncer_image(plog):
             with open(compose_bak, 'w') as f:
                 f.write(raw_compose)
             with open(compose_path, 'w') as f:
-                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+                f.write(new_compose)
         except Exception as e:
             plog(f"  ✗ pgbouncer image: compose write failed ({e}) — restoring")
             try:
@@ -60151,7 +60178,7 @@ def _ensure_authentik_pgbouncer_image(plog):
         if parts[2:3] in (['healthy'], ['unhealthy']) or parts[1:2] in (['exited'], ['dead'], ['restarting']):
             break
     if status != f"{target} running healthy":
-        _rollback(f"container is {status or 'state unknown'}", restart=can_probe and base_ok)
+        _rollback(f"container is {status or 'state unknown'}", check_ldap=can_probe and base_ok)
         _record('rolled-back')
         return None
     plog(f"  pgbouncer image: container running {target} (healthy) — now checking LDAP as TAK Server does...")
@@ -60178,9 +60205,50 @@ def _ensure_authentik_pgbouncer_image(plog):
              f"check docker logs authentik-ldap-1, then 'Resync LDAP to TAK Server'.")
         _record('applied-ldap-failing')
         return True
-    _rollback('LDAP SA bind / memberOf still failing after restart', restart=True)
+    _rollback('LDAP SA bind / memberOf still failing after restart', check_ldap=True)
     _record('rolled-back-ldap')
     return None
+
+
+def _compose_set_service_image(raw, service, image):
+    """Return compose text `raw` with `services.<service>.image` set to `image`, every other
+    byte untouched (quotes on the value are kept). None if the line can't be found
+    unambiguously — callers must then change nothing rather than re-dump the file."""
+    lines = raw.splitlines(keepends=True)
+    svc_indent = key_indent = None     # indent of the services, and of one service's keys
+    in_services = in_svc = False
+    hits = []
+    for i, l in enumerate(lines):
+        body = l.rstrip('\r\n')
+        stripped = body.lstrip(' ')
+        if not stripped or stripped.startswith('#'):
+            continue
+        ind = len(body) - len(stripped)
+        if ind == 0:
+            in_services = stripped.split('#', 1)[0].strip() == 'services:'
+            in_svc = False
+            continue
+        if not in_services:
+            continue
+        if svc_indent is None:
+            svc_indent = ind
+        if ind == svc_indent:
+            in_svc = stripped.split('#', 1)[0].strip() == f'{service}:'
+            key_indent = None
+            continue
+        if in_svc and ind > svc_indent:
+            if key_indent is None:
+                key_indent = ind       # the service's own keys; deeper lines are values
+            if ind == key_indent and re.match(r'image:\s', stripped):
+                hits.append(i)
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    m = re.match(r'^(\s*image:\s*)([\'"]?)([^\'"\s#]+)\2(.*?)(\r?\n?)$', lines[i])
+    if not m:
+        return None
+    lines[i] = f"{m.group(1)}{m.group(2)}{image}{m.group(2)}{m.group(4)}{m.group(5)}"
+    return ''.join(lines)
 
 
 # ops #123: how long the post-swap LDAP check must hold, and how long it may take.
@@ -89942,7 +90010,21 @@ def _post_update_auto_deploy():
                                 for _orphan_pid in (_old_pg_pids & _surviving):
                                     subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
                                     print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
-                        if _ak != _ak_orig:
+                        # ops #123: recreate only when the compose MEANS something different.
+                        # A formatting-only diff (v10.2.22's width=200 dump re-wrapped long
+                        # lines) recreated worker/server/ldap on every updating box: each LDAP
+                        # outage was followed by seconds of memberOf=0, and TAK users who
+                        # reconnected then got no groups. The normalized text is still written.
+                        _ak_recreate = _ak != _ak_orig
+                        if _ak_recreate:
+                            try:
+                                import yaml as _yaml_cmp
+                                if _yaml_cmp.safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig):
+                                    _ak_recreate = False
+                                    print("Post-update: Authentik compose — formatting-only change, no container recreate")
+                            except Exception:
+                                pass
+                        if _ak_recreate:
                             print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
                             # ops #30: LDAP after the server is healthy, never in the same
                             # `up` (an outpost that starts against the old server panics

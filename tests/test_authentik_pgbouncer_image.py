@@ -70,12 +70,12 @@ def healthy(live):
     return 0, 3
 
 
-def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pass=SA_PASS):
+def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pass=SA_PASS, raw=None):
     """`ldap(live) -> (rc, tak_groups)` scripts the outpost; `live` carries the running
     pgbouncer image, how many server/worker/ldap restarts happened, and the fake clock."""
     ak = tmp_path / 'authentik'
     ak.mkdir()
-    (ak / 'docker-compose.yml').write_text(yaml.safe_dump(_compose(image), sort_keys=False))
+    (ak / 'docker-compose.yml').write_text(raw or yaml.safe_dump(_compose(image), sort_keys=False))
     calls, settings, log = [], {}, []
     live = {'image': image, 'restarts': 0, 't': 0.0, 'probes': 0}
 
@@ -87,7 +87,8 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
             live['image'] = yaml.safe_load((ak / 'docker-compose.yml').read_text())['services']['pgbouncer']['image']
             return subprocess.CompletedProcess(cmd, up_rc, stdout='', stderr='up boom' if up_rc else '')
         if cmd[:3] == ['docker', 'compose', 'restart']:
-            live['restarts'] += 1
+            if 'ldap' in cmd:
+                live['restarts'] += 1
             return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
         if cmd[:2] == ['docker', 'inspect']:
             return subprocess.CompletedProcess(cmd, 0, stdout=inspect or f"{live['image']} running healthy\n")
@@ -120,9 +121,11 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
         'save_settings': lambda s: settings.update(s),
         '_get_authentik_env_value': lambda s, k: sa_pass if k == 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD' else None,
         '_ensure_ldapsearch': lambda: True,
+        '_wait_for_authentik_stack_healthy': lambda plog, timeout=0: calls.append(['wait-healthy']) or True,
+        're': re,
     }
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
-                 '_authentik_ldap_sa_groups_settle'):
+                 '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
     out = ns['_ensure_authentik_pgbouncer_image'](log.append)
     on_disk = yaml.safe_load((ak / 'docker-compose.yml').read_text())
@@ -130,7 +133,12 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
 
 
 def _restarts(calls):
-    return [c for c in calls if c[:3] == ['docker', 'compose', 'restart']]
+    """One entry per Authentik restart (server+worker, healthy wait, then ldap)."""
+    return [c for c in calls if c[:3] == ['docker', 'compose', 'restart'] and 'server' in c]
+
+
+RESTART_SEQ = [['docker', 'compose', 'restart', 'server', 'worker'], ['wait-healthy'],
+               ['docker', 'compose', 'restart', 'ldap']]
 
 
 def test_pin_is_back_on_1_25_1_after_ops_123():
@@ -183,7 +191,8 @@ def test_unhealthy_container_rolls_back(tmp_path):
     assert out is None
     assert compose['services']['pgbouncer']['image'] == OTHER
     assert len([c for c in calls if c[:3] == ['docker', 'compose', 'up']]) == 2   # new, then back
-    assert len(_restarts(calls)) == 1                 # LDAP was fine before → fresh pools after rollback
+    assert _restarts(calls) == []                     # LDAP held after the rollback → no restart
+    assert any('LDAP after rollback' in l and 'held' in l for l in log)
     assert settings['authentik_pgbouncer']['image_last_outcome'] == 'rolled-back'
     assert 'image' not in settings['authentik_pgbouncer']
 
@@ -228,7 +237,9 @@ def test_persistent_failure_restarts_server_worker_ldap_then_passes(tmp_path):
     out, compose, calls, settings, log, _ = _run(tmp_path, OTHER, ldap=broken_until_restart)
     assert out is True
     assert compose['services']['pgbouncer']['image'] == PIN
-    assert _restarts(calls) == [['docker', 'compose', 'restart', 'server', 'worker', 'ldap']]
+    i = calls.index(RESTART_SEQ[0])
+    assert calls[i:i + 3] == RESTART_SEQ             # ldap only after the server is healthy (ops #30)
+    assert len(_restarts(calls)) == 1
     assert settings['authentik_pgbouncer']['image_last_outcome'] == 'applied'
     assert any('verified after restart' in l for l in log)
 
@@ -240,7 +251,7 @@ def test_still_failing_after_restart_rolls_back_and_restarts_again(tmp_path):
     assert out is None
     assert compose['services']['pgbouncer']['image'] == OTHER
     assert live['image'] == OTHER
-    assert len(_restarts(calls)) == 2                 # after the swap, then after the rollback
+    assert len(_restarts(calls)) == 1                 # never more than one LDAP outage per run
     assert settings['authentik_pgbouncer']['image_last_outcome'] == 'rolled-back-ldap'
     assert any('SA bind FAILED' in l for l in log)
     assert any('LDAP after rollback' in l and 'held' in l for l in log)
@@ -288,6 +299,80 @@ def test_probe_reads_memberof_the_way_tak_server_does():
     assert "'cn=adm_ldapservice,ou=users,dc=takldap'" in src
     assert "'ldap://127.0.0.1:389'" in src
     assert "'memberOf'" in src
+
+
+def test_rollback_that_still_fails_does_not_restart_twice(tmp_path):
+    out, _, calls, settings, log, _ = _run(tmp_path, OTHER, ldap=lambda live: (0, 0) if live['t'] > 0 else (0, 3))
+    assert out is None
+    assert len(_restarts(calls)) == 1
+    assert any('already restarted once this run' in l for l in log)
+
+
+# ── ops #123: only the image line changes; nothing is re-dumped ─────────────────────
+
+LONG = 'x' * 150
+RAW = f"""---
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB", "-c", "{LONG}"]
+    restart: unless-stopped
+  pgbouncer:
+    # pinned by infra-TAK
+    image: "{OTHER}"
+    environment:
+      DB_HOST: postgresql
+      AUTH_TYPE: scram-sha-256
+    restart: unless-stopped
+  server:
+    image: ghcr.io/goauthentik/server:2026.8.3
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: pgbouncer
+"""
+
+
+def test_only_the_image_line_changes(tmp_path):
+    out, compose, _, _, _, _ = _run(tmp_path, OTHER, raw=RAW)
+    assert out is True
+    text = (tmp_path / 'authentik' / 'docker-compose.yml').read_text()
+    assert text == RAW.replace(f'image: "{OTHER}"', f'image: "{PIN}"')    # byte-identical otherwise
+    assert compose['services']['pgbouncer']['image'] == PIN
+
+
+def test_set_service_image_ignores_other_pgbouncer_keys():
+    ns = {'re': re}
+    exec(compile(_src('_compose_set_service_image'), 'x', 'exec'), ns)
+    f = ns['_compose_set_service_image']
+    out = f(RAW, 'pgbouncer', PIN)
+    assert out.count(PIN) == 1 and OTHER not in out
+    assert 'ghcr.io/goauthentik/server:2026.8.3' in out
+    assert f(RAW, 'missing', PIN) is None
+    two = RAW.replace('    environment:\n      DB_HOST', '    image: other:1\n    environment:\n      DB_HOST', 1)
+    assert f(two, 'pgbouncer', PIN) is None                                # ambiguous → no edit
+
+
+def test_line_edit_failure_changes_nothing_and_never_redumps(tmp_path):
+    raw = RAW.replace(f'    image: "{OTHER}"\n', f'    image:\n      "{OTHER}"\n')
+    out, _, calls, settings, _, _ = _run(tmp_path, OTHER, raw=raw)
+    assert out is None
+    assert (tmp_path / 'authentik' / 'docker-compose.yml').read_text() == raw
+    assert not [c for c in calls if c[:2] == ['docker', 'compose']]
+    assert settings['authentik_pgbouncer']['image_last_outcome'] == 'write-failed'
+    src = _src('_ensure_authentik_pgbouncer_image')
+    assert '.safe_dump(' not in src
+
+
+def test_harden_step_does_not_recreate_on_a_formatting_only_diff():
+    # The post-update harden step re-dumps compose at the default width; v10.2.22's
+    # width=200 file differed only in line wrapping and still recreated server/ldap.
+    i = APP.index('print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")')
+    block = APP[i - 1500:i]
+    assert '_ak_recreate = _ak != _ak_orig' in block
+    assert 'safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig)' in block
+    assert block.rstrip().endswith('if _ak_recreate:')
 
 
 def test_startup_migration_calls_it():
