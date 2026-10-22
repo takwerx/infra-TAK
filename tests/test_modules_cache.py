@@ -131,6 +131,17 @@ def test_stale_serves_old_data_once_and_refreshes_in_background_single_flight(h)
     assert h.calls == 2
 
 
+def test_data_older_than_max_stale_is_never_served(h):
+    """GH #214: the first page after a quiet spell showed a boot-time "Stopped" 34 min later."""
+    h.detect_modules()
+    h.result = {'takportal': {'installed': True, 'running': True}}
+    h.clock[0] += h._MODULES_CACHE_MAX_STALE_S
+    assert h.detect_modules()['takportal']['running'] is True     # computed now, not served stale
+    assert h.calls == 2
+    assert h._MODULES_CACHE['refreshing'] == 0.0                   # no background refresh needed
+    assert h._MODULES_CACHE_MAX_STALE_S > h._MODULES_CACHE_REFRESH_STUCK_S + h._MODULES_CACHE_FRESH_S
+
+
 def test_invalidate_forces_a_synchronous_compute(h):
     h.detect_modules()
     h.result = {'caddy': {'installed': False, 'running': False}}
