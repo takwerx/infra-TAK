@@ -5290,7 +5290,15 @@ def _os_updates_summary(force=False):
 @login_required
 def os_updates_api():
     """Pending OS updates, classified by what installing them would restart."""
-    return jsonify(_os_updates_summary(force=(request.args.get('refresh') == '1')))
+    data = dict(_os_updates_summary(force=(request.args.get('refresh') == '1')))
+    # ops #154: read fresh on every call, outside the 5-min cache. It is a stat and
+    # a glob, and it is the half of the answer that stays true after the pending
+    # list empties: an installed-but-not-running kernel still needs a restart.
+    rb = _kernel_reboot_state()
+    rb['cve_banner'] = _kernel_cve_banner(rb['running']) if rb['kernel'] else None
+    data['reboot'] = rb
+    data['reboot_required'] = bool(data.get('reboot_required') or rb['pending'])
+    return jsonify(data)
 
 
 def _get_unattended_upgrades_status():
@@ -5317,10 +5325,15 @@ def _get_unattended_upgrades_status_remote(remote_cfg):
     """Return {enabled, running} for unattended-upgrades on a remote host via SSH, or {error: str}."""
     if not remote_cfg or not (remote_cfg.get('host') or '').strip():
         return {'error': 'no host'}
+    # ops #154: the same "installed but not running" check as _kernel_reboot_state(),
+    # riding the probe the card already makes. Read-only; the rescue image is skipped.
     cmd = (
         'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); '
         'r=1; systemctl is-active apt-daily-upgrade.service 2>/dev/null | grep -qx active && r=0; '
-        'echo "ENABLED=$e"; echo "RUNNING=$r"'
+        'echo "ENABLED=$e"; echo "RUNNING=$r"; '
+        'echo "KRUN=$(uname -r)"; '
+        "echo \"KNEW=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v rescue | sort -V | tail -1)\"; "
+        'f=0; [ -e /var/run/reboot-required ] && f=1; echo "RFLAG=$f"'
     )
     try:
         ok, out = _ssh_probe(remote_cfg, cmd, timeout=10)
@@ -5328,7 +5341,12 @@ def _get_unattended_upgrades_status_remote(remote_cfg):
             return {'error': (out or 'ssh failed')[:80]}
         enabled = 'enabled' in (out or '')
         running = 'RUNNING=0' in (out or '')  # remote script: RUNNING=0 when process is running
-        return {'enabled': enabled, 'running': running}
+        kv = dict(l.split('=', 1) for l in (out or '').splitlines() if '=' in l)
+        krun, knew = kv.get('KRUN', '').strip(), kv.get('KNEW', '').strip()
+        kernel = bool(krun and knew and _kernel_version_key(knew) > _kernel_version_key(krun))
+        return {'enabled': enabled, 'running': running,
+                'reboot_required': kernel or kv.get('RFLAG', '').strip() == '1',
+                'staged_kernel': knew if kernel else ''}
     except Exception as e:
         return {'error': str(e)[:80]}
 
@@ -5341,6 +5359,7 @@ def _build_uu_hosts(metrics, settings):
     # does not exist there. Carry the real mechanism (and whether it is even
     # installed) so the template can say what is actually true on this family.
     _lp = _auto_update_posture()
+    _rb = _kernel_reboot_state()
     hosts = [{
         'id': 'this_host',
         'label': 'This host',
@@ -5348,6 +5367,8 @@ def _build_uu_hosts(metrics, settings):
         'running': metrics.get('unattended_upgrades', {}).get('running', False),
         'mechanism': _lp.get('mechanism') or 'unattended-upgrades',
         'installed': _lp.get('installed', True),
+        'reboot_required': _rb['pending'],
+        'staged_kernel': _rb['staged'] if _rb['kernel'] else '',
     }]
     cfg = _get_tak_deployment_config(settings)
     if cfg.get('mode') == 'two_server':
@@ -5361,6 +5382,8 @@ def _build_uu_hosts(metrics, settings):
                 'enabled': remote.get('enabled', False) if 'error' not in remote else False,
                 'running': remote.get('running', False) if 'error' not in remote else False,
                 'error': remote.get('error'),
+                'reboot_required': bool(remote.get('reboot_required')),
+                'staged_kernel': remote.get('staged_kernel', ''),
             })
     # Federation Hub remote host
     fh_cfg = _get_fedhub_deployment_config(settings)
@@ -5374,6 +5397,8 @@ def _build_uu_hosts(metrics, settings):
                 'enabled': fh_remote.get('enabled', False) if 'error' not in fh_remote else False,
                 'running': fh_remote.get('running', False) if 'error' not in fh_remote else False,
                 'error': fh_remote.get('error'),
+                'reboot_required': bool(fh_remote.get('reboot_required')),
+                'staged_kernel': fh_remote.get('staged_kernel', ''),
             })
     return hosts
 
@@ -84518,6 +84543,9 @@ _KERNEL_CVE_FIXES = {
         # distro codename (VERSION_CODENAME in /etc/os-release) -> first fixed kernel
         'jammy': (5, 15, 0, 179),
     },
+    'CVE-2026-53266': {
+        'jammy': (5, 15, 0, 198),
+    },
 }
 
 
@@ -84597,14 +84625,18 @@ def kernel_patch_status_api():
                 upgradable_count = sum(1 for ln in (r.stdout or '').splitlines() if 'linux-image' in ln)
         except Exception as e:
             check_err = 'apt list did not run: ' + str(e)[:120]
+    # ops #154: a fixed kernel that is installed but not booted is not "patched".
+    # Counting only what is left to download called test12 patched for 54 days.
+    reboot_pending = _kernel_reboot_pending()
     data = {
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
-        'patched': upgradable_count == 0 and not check_err,
+        'reboot_pending': reboot_pending,
+        'patched': upgradable_count == 0 and not check_err and not reboot_pending,
         'error': check_err,
         # Named only while the running kernel predates the fix (GH #53) — the
         # banner text for a routine point-release must not claim CVE exposure.
-        'cve_banner': _kernel_cve_banner(running_kernel) if upgradable_count > 0 else None,
+        'cve_banner': _kernel_cve_banner(running_kernel) if (upgradable_count > 0 or reboot_pending) else None,
     }
     _kernel_patch_cache.update({'ts': now, 'data': data})
     return jsonify(data)
@@ -84967,19 +84999,63 @@ def _kernel_patch_start_job():
     return (True, f"started (unit {_KERNEL_PATCH_UNIT}, pid {new_pid or 'pending'})", new_pid or None)
 
 
+# --- ops #154: installed-but-not-running kernel -------------------------------
+def _kernel_version_key(v):
+    """`sort -V` order for kernel release strings: digit runs compare as numbers."""
+    return [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', v or '')]
+
+
+def _kernel_reboot_state():
+    """What the console needs to say "restart needed", on every family.
+
+    ops #154: unattended-upgrades (or dnf, or a past patch run) installs the fixed
+    kernel, nothing is pending any more, and the panel went quiet while the box kept
+    running the old kernel for weeks (test12: 54 days up on 190 with 198 staged).
+    The signal has to come from what is INSTALLED vs what is RUNNING, not from the
+    pending list.
+
+    `staged` is the newest kernel in /boot (the RHEL rescue image is skipped); it is
+    also what a dismissal is keyed to, so staging a newer kernel re-shows the prompt.
+    `flag` is Ubuntu's /var/run/reboot-required (set for libc/systemd too, and absent
+    on RHEL). Never raises: an unreadable /boot reads as "nothing staged"."""
+    st = {'pending': False, 'kernel': False, 'flag': False,
+          'running': '', 'staged': '', 'sig': ''}
+    try:
+        st['running'] = os.uname().release
+    except Exception:
+        pass
+    try:
+        import glob as _glob
+        names = [os.path.basename(p)[len('vmlinuz-'):] for p in _glob.glob('/boot/vmlinuz-*')]
+        names = [n for n in names if n and 'rescue' not in n]
+        if names:
+            st['staged'] = max(names, key=_kernel_version_key)
+    except Exception:
+        pass
+    # Newer, not just different: a container or a hand-booted older kernel with no
+    # matching /boot image must not claim a restart would change anything.
+    st['kernel'] = bool(st['running'] and st['staged'] and
+                        _kernel_version_key(st['staged']) > _kernel_version_key(st['running']))
+    flag_path = '/var/run/reboot-required'
+    st['flag'] = os.path.exists(flag_path)
+    st['pending'] = st['kernel'] or st['flag']
+    if st['kernel']:
+        st['sig'] = 'reboot@' + st['staged']
+    elif st['flag']:
+        try:
+            st['sig'] = 'reboot@flag-%d' % int(os.path.getmtime(flag_path))
+        except Exception:
+            st['sig'] = 'reboot@flag'
+    return st
+# --- end ops #154 ---------------------------------------------------------------
+
+
 def _kernel_reboot_pending():
     """v0.9.44: True when the running kernel isn't the newest installed one — a more
     reliable "reboot needed" signal than /var/run/reboot-required, which can be cleared
     (e.g. a reboot that didn't land the new kernel, or a notify hook that never fired)
     while a reboot is still required to activate a freshly-installed kernel."""
-    try:
-        running = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
-        newest = subprocess.run(
-            "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1",
-            shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
-        return bool(running and newest and running != newest)
-    except Exception:
-        return False
+    return _kernel_reboot_state()['kernel']
 
 
 def _kernel_patch_job_state():
@@ -85042,7 +85118,11 @@ def _kernel_patch_job_state():
     # should reboot" signal — and the kernel auto-clears /var/run/reboot-required
     # after the reboot, so it also ends the post-reboot banner loop the old
     # LoadState gate was guarding against (more directly than the apt-list probe).
-    reboot_required = os.path.exists('/var/run/reboot-required') or _kernel_reboot_pending()
+    _rb = _kernel_reboot_state()
+    reboot_required = _rb['pending']
+    # ops #154: the same key the standalone "restart needed" panel uses, so closing
+    # the done panel with "I'll reboot later" does not bring that one straight back.
+    reboot_sig = _rb['sig']
 
     # Transient unit gone. systemd garbage-collects a *successful* transient unit
     # within seconds of completion — even while the box is still up — so the old
@@ -85087,6 +85167,7 @@ def _kernel_patch_job_state():
             'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
             'reboot_required': reboot_required,
+            'reboot_sig': reboot_sig,
             'log_tail': log_tail,
             'log_present': log_present,
             'unit_state': f"not-loaded/{load or 'unknown'}",
@@ -85116,6 +85197,7 @@ def _kernel_patch_job_state():
         'done_at': done_at,
         'error': err,
         'reboot_required': reboot_required,
+        'reboot_sig': reboot_sig,
         'log_tail': log_tail,
         'log_present': log_present,
         'unit_state': f"{active or 'unknown'}/{sub or 'unknown'}" + (f" ({result})" if result else ''),

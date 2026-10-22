@@ -193,7 +193,7 @@ def test_summary_carries_the_error_not_an_empty_list():
 
 # ── kernel-only check ──────────────────────────────────────────────────────────
 
-def _kernel(answers, pkg_mgr='dnf'):
+def _kernel(answers, pkg_mgr='dnf', reboot_pending=False):
     calls = []
 
     def fake_run(argv, *a, **k):
@@ -211,6 +211,7 @@ def _kernel(answers, pkg_mgr='dnf'):
         '_sudo_wrap': lambda argv: list(argv),
         '_kernel_patch_cache': {'ts': 0, 'data': None},
         '_kernel_cve_banner': lambda k: None,
+        '_kernel_reboot_pending': lambda: reboot_pending,
     }
     exec(compile(_cut('_dnf_error_tail') + '\n' + _cut('kernel_patch_status_api'), 'app.py', 'exec'), n)
     return n['kernel_patch_status_api'](), calls
@@ -239,6 +240,12 @@ def test_kernel_check_apt():
     assert d['patched'] is True
     d, _ = _kernel((100, '', 'E: boom'), pkg_mgr='apt')
     assert d['patched'] is False and d['error']
+
+
+def test_kernel_check_installed_but_not_running_is_not_patched():
+    # ops #154: nothing left to download, but the new kernel is not booted yet.
+    d, _ = _kernel((0, '', ''), reboot_pending=True)
+    assert d['patched'] is False and d['reboot_pending'] is True and not d['error']
 
 
 # ── Caddy check ────────────────────────────────────────────────────────────────
