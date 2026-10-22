@@ -86509,7 +86509,14 @@ def _dbserver_status_payload():
     rec = _dbserver_record_read()
     job = rec.get('job') or ''
     phase = rec.get('phase') or 'idle'
+    # Which box a new job would go to — config only, no SSH, so the card can name it on load.
+    try:
+        s1, why = _dbserver_target()
+    except Exception as e:
+        s1, why = None, f'could not read the database server settings: {str(e)[:160]}'
     return {'ok': True, 'job': job, 'state': phase, 'step': rec.get('step') or '',
+            'target_host': (s1 or {}).get('host') or '', 'target_error': '' if s1 else why,
+            'target_is_local': (not s1) and why.startswith('the database server is this box'),
             'detail': rec.get('detail') or '', 'notices': rec.get('notices') or [],
             'host': rec.get('host') or '', 'started': rec.get('started') or 0,
             'finished': rec.get('finished') or 0, 'reboot_required': bool(rec.get('reboot_required')),

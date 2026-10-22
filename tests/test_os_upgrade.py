@@ -550,7 +550,9 @@ def test_console_card_only_offers_the_button_on_2204():
     html = (REPO / 'templates' / 'console.html').read_text(encoding='utf-8')
     assert "{% if settings.get('os_type') in ('ubuntu-22.04', 'ubuntu-24.04') %}" in html
     assert 'id="os-upgrade-card"' in html and 'id="osup-modal"' in html
-    assert "ack.trim()!=='I have a snapshot'" in html
+    # W4.e parameterized the modal by target; the core's phrase is unchanged
+    assert "var _OSUP_ACK={core:'I have a snapshot'," in html
+    assert "ack.trim()!==_OSUP_ACK[_osupTarget]" in html
     assert "admin_password:pw,acknowledge:ack.trim()" in html
     # the button is rendered only when the server says the box can start (22.04, idle)
     assert "_osupShow(d.can_start?'osup-idle':null)" in html

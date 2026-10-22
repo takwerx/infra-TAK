@@ -189,6 +189,41 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 {% endif %}
+<!-- v10.3.0 W4.e — the split install's database server (Server One), driven from this core.
+     Not inside the os_type gate above: a RHEL core with an Ubuntu database server uses it too.
+     Hidden until /api/console/dbserver/status answers (404 = not a split install). Install
+     updates / Reboot / Upgrade all open the shared preflight modal with target 'dbserver'. -->
+<div id="dbserver-card" style="display:none;background:linear-gradient(135deg,rgba(59,130,246,0.08),rgba(14,116,144,0.06));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div id="dbs-idle" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px">
+<div id="dbs-idle-head" style="font-size:13px;font-weight:600;color:var(--cyan)">&#128451; Database server</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">TAK Server's database runs on a separate box. The console can install its updates, reboot it, and upgrade it from Ubuntu 22.04 to 24.04 over the SSH connection it already uses &mdash; no SSH session from you. TAK Server stays up throughout, but nothing is saved to or read from the database while it restarts. Snapshot the database server before upgrading: there is no rollback.</div>
+<div id="dbs-idle-err" style="display:none;font-size:11px;color:var(--yellow);margin-top:6px;line-height:1.5"></div>
+</div>
+<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="dbs-check-btn" onclick="osupOpenPreflight('dbserver')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
+</div></div>
+</div>
+<div id="dbs-progress" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div id="dbs-progress-head" style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Working on the database server</div>
+<div id="dbs-progress-sub" style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs on the database server itself &mdash; safe to close this tab.</div></div>
+<div id="dbs-steps" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+</div>
+<pre id="dbs-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:220px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="dbs-result" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px"><div id="dbs-result-head" style="font-size:13px;font-weight:600;color:var(--green)"></div>
+<div id="dbs-result-body" style="font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" onclick="dbsToggleResultLog()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show log</button>
+<button type="button" onclick="dbsDismiss()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Close</button>
+</div></div>
+<pre id="dbs-log-result" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:220px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+</div>
 <!-- v10.1.9 W8 — disk-reclaim card. Hidden unless /api/guarddog/disk-layout reports
      mode != 'ok'. Backend (WI-1/2/3) already exists and is NOT touched by this card. -->
 <div id="disk-reclaim-card" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
@@ -320,13 +355,26 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="osup-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:24px;width:580px;max-width:92vw;max-height:92vh;overflow-y:auto;box-sizing:border-box;font-family:'JetBrains Mono',monospace">
-    <div style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:6px">&#11014; Upgrade this box to Ubuntu 24.04 LTS</div>
+    <div id="osup-modal-title" style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:6px">&#11014; Upgrade this box to Ubuntu 24.04 LTS</div>
     <div id="osup-modal-intro" style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">Checking the box&hellip;</div>
     <div id="osup-checks" style="font-size:11px;line-height:1.6;margin-bottom:12px"></div>
+    <!-- W4.e: Ubuntu's upgrader refuses while updates are pending or a reboot is outstanding;
+         on the database server these two buttons are the only console path to clear that. -->
+    <div id="dbs-actions" style="display:none;margin-bottom:12px;padding:10px 12px;border:1px solid rgba(234,179,8,0.3);border-radius:8px;background:rgba(234,179,8,0.05)">
+      <div id="dbs-actions-msg" style="font-size:11px;color:var(--text-secondary);line-height:1.5;margin-bottom:8px"></div>
+      <div id="dbs-reboot-pw-block" style="display:none;margin-bottom:8px">
+        <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password (to reboot the database server)</label>
+        <input id="dbs-reboot-pw" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')dbsReboot()">
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" id="dbs-updates-btn" onclick="dbsInstallUpdates()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer">Install updates</button>
+        <button type="button" id="dbs-reboot-btn" onclick="dbsReboot()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer">Reboot database server</button>
+      </div>
+    </div>
     <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:4px">What cannot be undone</div>
     <ul id="osup-irreversible" style="font-size:11px;color:var(--text-dim);line-height:1.5;margin:0 0 12px 18px;padding:0"></ul>
     <div id="osup-ack-block" style="display:none">
-      <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type <span style="color:var(--yellow)">I have a snapshot</span> to confirm a VPS snapshot or off-box backup exists</label>
+      <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type <span id="osup-ack-phrase" style="color:var(--yellow)">I have a snapshot</span> to confirm a VPS snapshot or off-box backup exists</label>
       <input id="osup-ack-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;margin-bottom:10px" placeholder="I have a snapshot">
       <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
       <input id="osup-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')osupStart()">
@@ -1163,16 +1211,19 @@ checkKernelPatch();
 // gone — reload to the login page; the card re-renders from the status file.
 var _osupOsType='{{ settings.get("os_type","") }}';
 var _osupPollTimer=null,_osupGap=0,_osupLastState='',_osupSawGap=false,_osupStartBusy=false;
-var _OSUP_LABELS={os_type:'Operating system',takserver_58:'TAK Server 5.8 or newer (or not installed)',tak_db_local:'TAK database location',disk:'Free disk space',no_job_running:'No other job running',systemd_run:'Detached job runner (systemd-run / broker)',release_upgrader:'Ubuntu release upgrader',os_up_to_date:'All Ubuntu updates installed',no_reboot_pending:'No reboot pending',containers:'Containers (baseline for the after-reboot check)',acknowledge:'Snapshot acknowledgment'};
-var _OSUP_STEP_LABELS={'pre-snapshot':'snapshot','pin-pg16':'pin PG','release-upgrade':'release upgrade','repos-noble':'repos','venv-rebuild':'console venv','reassert':'re-assert','restart-console':'console restart','reboot':'reboot'};
+var _OSUP_LABELS={os_type:'Operating system',takserver_58:'TAK Server 5.8 or newer (or not installed)',tak_db_local:'TAK database location',disk:'Free disk space',no_job_running:'No other job running',systemd_run:'Detached job runner (systemd-run / broker)',release_upgrader:'Ubuntu release upgrader',os_up_to_date:'All Ubuntu updates installed',no_reboot_pending:'No reboot pending',containers:'Containers (baseline for the after-reboot check)',acknowledge:'Snapshot acknowledgment',split_config:'TAK Server uses this database server',ssh_sudo:'SSH + passwordless sudo on the database server',is_tak_db:'TAK Server\'s PostgreSQL 18 database',baseline:'Baseline (for the after-reboot check)'};
+var _OSUP_STEP_LABELS={'pre-snapshot':'snapshot','pin-pg16':'pin PG','release-upgrade':'release upgrade','repos-noble':'repos','venv-rebuild':'console venv','reassert':'re-assert','restart-console':'console restart','reboot':'reboot','db-dump':'database dump'};
+// Which box the shared preflight modal is driving: 'core' (this box) or 'dbserver' (W4.e).
+var _osupTarget='core';
+var _OSUP_ACK={core:'I have a snapshot',dbserver:'I have a snapshot of the database server'};
+function _osupApi(p){ return (_osupTarget==='dbserver'?'/api/console/dbserver/':'/api/console/os-upgrade/')+p; }
 function _osupShow(which){
     var card=document.getElementById('os-upgrade-card'); if(!card)return;
     ['osup-idle','osup-progress','osup-result'].forEach(function(id){var el=document.getElementById(id);if(el)el.style.display=(id===which)?'block':'none';});
     card.style.display=which?'block':'none';
 }
 function _osupEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function _osupRenderSteps(d){
-    var box=document.getElementById('osup-steps'); if(!box)return;
+function _osupStepsHtml(d){
     var steps=d.steps||[]; var cur=steps.indexOf(d.step);
     if(d.state==='rebooting')cur=steps.length-1;
     var html='';
@@ -1184,7 +1235,11 @@ function _osupRenderSteps(d){
         html+='<span style="font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid '+bd+';color:'+col+'">'+(done?'&#10003; ':(active?'&#9881; ':''))+(i+1)+' '+_osupEsc(_OSUP_STEP_LABELS[s]||s)+'</span>';
     });
     if(d.state==='verifying')html+='<span style="font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid rgba(59,130,246,.45);color:var(--cyan)">&#9881; verifying after reboot</span>';
-    box.innerHTML=html;
+    return html;
+}
+function _osupRenderSteps(d){
+    var box=document.getElementById('osup-steps'); if(!box)return;
+    box.innerHTML=_osupStepsHtml(d);
     var head=document.getElementById('osup-progress-head');
     if(head)head.innerHTML=(d.state==='rebooting')?'&#9881; Rebooting into Ubuntu 24.04 LTS':(d.state==='verifying'?'&#9881; Back up on Ubuntu 24.04 &mdash; checking services':'&#9881; Upgrading to Ubuntu 24.04 LTS &mdash; step '+_osupEsc(d.step||'start'));
     var sub=document.getElementById('osup-progress-sub');
@@ -1278,11 +1333,16 @@ async function osupDismiss(){
     try{localStorage.setItem('os-upgrade-dismissed',raw);}catch(e){}
     _osupShow(_osupOsType==='ubuntu-22.04'?'osup-idle':null);
 }
-function osupOpenPreflight(){
+function osupOpenPreflight(target){
     var m=document.getElementById('osup-modal'); if(!m)return;
+    _osupTarget=(target==='dbserver')?'dbserver':'core';
     var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
     var ack=document.getElementById('osup-ack-input'),pw=document.getElementById('osup-pw-input');
-    if(ack)ack.value=''; if(pw)pw.value='';
+    if(ack){ack.value=''; ack.placeholder=_OSUP_ACK[_osupTarget];} if(pw)pw.value='';
+    var ph=document.getElementById('osup-ack-phrase'); if(ph)ph.textContent=_OSUP_ACK[_osupTarget];
+    var t=document.getElementById('osup-modal-title');
+    if(t)t.innerHTML=(_osupTarget==='dbserver')?'&#11014; Upgrade the database server'+(_dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':'')+' to Ubuntu 24.04 LTS':'&#11014; Upgrade this box to Ubuntu 24.04 LTS';
+    _dbsRenderActions(null);
     m.style.display='flex';
     osupLoadPreflight();
 }
@@ -1303,15 +1363,17 @@ function _osupRenderPreflight(d){
     });
     box.innerHTML=html;
     if(irr){ irr.innerHTML=''; (d.irreversible||[]).forEach(function(t){var li=document.createElement('li');li.textContent=t;irr.appendChild(li);}); }
-    if(intro)intro.textContent=d.ok?'Every check passed. Read the list below, take your snapshot, then type the acknowledgment and your console password.':'This box is not ready — fix the red items and press Re-check. Nothing has been changed.';
+    var what=(_osupTarget==='dbserver')?'This database server':'This box';
+    if(intro)intro.textContent=d.ok?'Every check passed. Read the list below, take your snapshot, then type the acknowledgment and your console password.':what+' is not ready — fix the red items and press Re-check. Nothing has been changed.';
     _osupSetStartEnabled(!!d.ok);
+    if(_osupTarget==='dbserver')_dbsRenderActions(d);
 }
 async function osupLoadPreflight(){
     var intro=document.getElementById('osup-modal-intro'),err=document.getElementById('osup-modal-err');
-    if(intro)intro.textContent='Checking the box…';
+    if(intro)intro.textContent=(_osupTarget==='dbserver')?'Checking the database server over SSH (up to a minute)…':'Checking the box…';
     _osupSetStartEnabled(false);
     try{
-        var r=await fetch('/api/console/os-upgrade/preflight',{credentials:'same-origin',cache:'no-store'});
+        var r=await fetch(_osupApi('preflight'),{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
         if(!r.ok&&!d.checks){ if(err)err.textContent=d.error||('preflight failed ('+r.status+')'); return; }
         _osupRenderPreflight(d);
@@ -1320,17 +1382,18 @@ async function osupLoadPreflight(){
 async function osupStart(){
     if(_osupStartBusy)return;
     var ack=(document.getElementById('osup-ack-input')||{}).value||'',pw=(document.getElementById('osup-pw-input')||{}).value||'',err=document.getElementById('osup-modal-err');
-    if(ack.trim()!=='I have a snapshot'){ if(err)err.textContent='Type exactly: I have a snapshot'; return; }
+    if(ack.trim()!==_OSUP_ACK[_osupTarget]){ if(err)err.textContent='Type exactly: '+_OSUP_ACK[_osupTarget]; return; }
     if(!pw){ if(err)err.textContent='Console password required'; return; }
     if(err)err.textContent='';
     _osupStartBusy=true; _osupSetStartEnabled(false);
     try{
-        var r=await fetch('/api/console/os-upgrade/start',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({admin_password:pw,acknowledge:ack.trim()})});
+        var r=await fetch(_osupTarget==='dbserver'?'/api/console/dbserver/os-upgrade/start':'/api/console/os-upgrade/start',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({admin_password:pw,acknowledge:ack.trim()})});
         var d=await r.json();
         if(r.status===403){ if(err)err.textContent=d.error||'Incorrect console password'; _osupSetStartEnabled(true); return; }
         if(r.status===409&&d.preflight){ _osupRenderPreflight(d.preflight); if(err)err.textContent=d.error||'preflight failed'; return; }
         if(!r.ok||!d.ok){ if(err)err.textContent=d.error||('start failed ('+r.status+')'); _osupSetStartEnabled(true); return; }
         osupCloseModal();
+        if(_osupTarget==='dbserver'){ _dbsJobStarted('os-upgrade',d.message); return; }
         _osupSawGap=false; _osupGap=0; _osupLastState='running';
         _osupShow('osup-progress');
         _osupRenderSteps({state:'running',step:'start',steps:['pre-snapshot','pin-pg16','release-upgrade','repos-noble','venv-rebuild','reassert','restart-console','reboot']});
@@ -1340,6 +1403,150 @@ async function osupStart(){
     finally{ _osupStartBusy=false; }
 }
 osupInit();
+// ── v10.3.0 W4.e — the split install's database server, driven from this core ──
+// Status is the core's own record (no SSH), so polling is cheap; the log is one cached
+// SSH read. The core never restarts or reboots during these jobs, so there is no gap to
+// ride through — while the database server reboots its log is simply unreadable.
+var _dbsTargetHost='',_dbsPollTimer=null,_dbsBusy=false;
+var _DBS_TITLE={'os-upgrade':'database server upgrade to Ubuntu 24.04 LTS','updates':'database server updates','reboot':'database server reboot'};
+function _dbsShow(which){
+    var card=document.getElementById('dbserver-card'); if(!card)return;
+    ['dbs-idle','dbs-progress','dbs-result'].forEach(function(id){var el=document.getElementById(id);if(el)el.style.display=(id===which)?'block':'none';});
+    card.style.display=which?'block':'none';
+}
+function _dbsHostLabel(){ return _dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':''; }
+function _dbsRenderProgress(d){
+    var steps=document.getElementById('dbs-steps'),head=document.getElementById('dbs-progress-head'),sub=document.getElementById('dbs-progress-sub');
+    if(steps)steps.innerHTML=(d.job==='os-upgrade')?_osupStepsHtml(d):'';
+    var h,t;
+    if(d.state==='rebooting'){ h='Rebooting the database server'+_dbsHostLabel(); t='Waiting for it to come back over SSH and for PostgreSQL to answer. TAK Server stays up; nothing is saved to the database until then.'; }
+    else if(d.state==='verifying'){ h='Database server back up — checking it'; t='Waiting for PostgreSQL with its TLS settings, and for TAK Server to reconnect by itself (up to 15 min).'; }
+    else if(d.job==='updates'){ h='Installing updates on the database server'+_dbsHostLabel(); t='apt runs on the database server itself — safe to close this tab. TAK\'s database package is held. Typical time: 2-10 min.'; }
+    else { h='Upgrading the database server'+_dbsHostLabel()+' to Ubuntu 24.04 LTS — step '+_osupEsc(_OSUP_STEP_LABELS[d.step]||d.step||'start'); t='Runs on the database server itself — safe to close this tab. TAK Server stays up, but nothing is saved to or read from the database while it is down. Typical time: 15-45 min.'; }
+    if(head)head.innerHTML='&#9881; '+_osupEsc(h); if(sub)sub.textContent=t;
+}
+function _dbsRenderResult(d){
+    var head=document.getElementById('dbs-result-head'),body=document.getElementById('dbs-result-body');
+    if(!head||!body)return;
+    var notes=(d.notices||[]).length?' Notes: '+(d.notices||[]).join(' · '):'';
+    if(d.state==='done'){
+        head.style.color='var(--green)';
+        if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
+        else if(d.job==='updates'){ head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Check & upgrade, then Reboot database server.':'No reboot needed.')+notes; }
+        else { head.innerHTML='&#10003; Database server rebooted'; body.textContent='PostgreSQL is back and TAK Server reconnected by itself.'+notes; }
+        return;
+    }
+    head.style.color='var(--red)';
+    head.innerHTML='&#10007; '+_osupEsc(_DBS_TITLE[d.job]||'database server job')+' FAILED at step '+_osupEsc(d.step||'?');
+    var hint='';
+    if(d.step==='start')hint='Nothing was started on the database server.';
+    else if(d.job!=='os-upgrade')hint='Read the log, fix the cause and try again.';
+    else if(d.step==='pre-snapshot'||d.step==='db-dump'||d.step==='pin-pg16')hint='Nothing was upgraded — the database server is unchanged. Read the log, fix the cause and press Check & upgrade again.';
+    else if(d.step==='release-upgrade')hint='Ubuntu\'s upgrader did not complete. The last lines of the log say which: UNCHANGED means nothing was touched, so fix the cause and run it again; PARTLY UPGRADED means restore the database server\'s snapshot.';
+    else if(d.step==='reassert')hint='The packages moved to 24.04 but PostgreSQL does not match its pre-upgrade settings, so the database server was NOT rebooted. The log names the saved pre-upgrade copies.';
+    else if(d.step==='verify')hint='The database server rebooted but the after-reboot check found a problem. TAK Server was not restarted.';
+    else hint='The database server may be partly upgraded: read the log before doing anything else.';
+    body.textContent=(d.detail?d.detail+' — ':'')+hint+notes;
+}
+async function _dbsFetchLog(target,job){
+    try{
+        var r=await fetch('/api/console/dbserver/log'+(job?'?job='+encodeURIComponent(job):''),{credentials:'same-origin',cache:'no-store'});
+        if(!r.ok)return;
+        var d=await r.json();
+        if(d&&d.present)setLogPane(target,d.log||'');
+    }catch(e){}
+}
+function _dbsStopPolling(){ if(_dbsPollTimer){clearInterval(_dbsPollTimer);_dbsPollTimer=null;} }
+function _dbsStartPolling(){ if(_dbsPollTimer)return; _dbsPollTimer=setInterval(_dbsPollOnce,5000); _dbsPollOnce(); }
+async function _dbsPollOnce(){
+    try{
+        var r=await fetch('/api/console/dbserver/status',{credentials:'same-origin',cache:'no-store',redirect:'manual'});
+        if(r.status===401||r.type==='opaqueredirect'||r.redirected){ _dbsStopPolling(); location.reload(); return; }
+        if(r.status===404){ _dbsStopPolling(); _dbsShow(null); return; }
+        var d=await r.json(); if(!d||!d.ok)return;
+        if(d.running){ _dbsRenderProgress(d); if(d.state!=='rebooting'&&d.job!=='reboot')await _dbsFetchLog('dbs-log',d.job); return; }
+        _dbsStopPolling(); _dbsApply(d);
+    }catch(e){}
+}
+function _dbsApply(d){
+    if(!d||!d.ok)return;
+    _dbsTargetHost=d.target_host||d.host||'';
+    var head=document.getElementById('dbs-idle-head'); if(head)head.innerHTML='&#128451; Database server'+_dbsHostLabel();
+    var errEl=document.getElementById('dbs-idle-err'),btn=document.getElementById('dbs-check-btn');
+    if(errEl){ errEl.textContent=d.target_error||''; errEl.style.display=d.target_error?'block':'none'; }
+    if(btn)btn.style.display=d.target_error?'none':'inline-block';
+    if(d.running){ _dbsShow('dbs-progress'); _dbsRenderProgress(d); _dbsStartPolling(); return; }
+    var dismissed=null; try{dismissed=localStorage.getItem('dbserver-dismissed');}catch(e){}
+    if((d.state==='done'||d.state==='failed')&&dismissed!==d.raw){
+        _dbsRenderResult(d); _dbsShow('dbs-result'); if(d.job!=='reboot')_dbsFetchLog('dbs-log-result',d.job); return;
+    }
+    // A split install whose database is this box has nothing for this card to do.
+    _dbsShow(d.target_is_local?null:'dbs-idle');
+}
+async function dbsInit(){
+    if(!document.getElementById('dbserver-card'))return;
+    try{
+        var r=await fetch('/api/console/dbserver/status',{credentials:'same-origin',cache:'no-store'});
+        if(r.status===404)return;
+        _dbsApply(await r.json());
+    }catch(e){}
+}
+function dbsToggleResultLog(){ var p=document.getElementById('dbs-log-result'); if(p)p.style.display=(p.style.display==='none'?'block':'none'); }
+async function dbsDismiss(){
+    try{ var r=await fetch('/api/console/dbserver/status',{credentials:'same-origin',cache:'no-store'}); var d=await r.json(); try{localStorage.setItem('dbserver-dismissed',d.raw||'');}catch(e){} _dbsApply(d); }catch(e){ _dbsShow('dbs-idle'); }
+}
+// In the shared preflight modal: offer Install updates / Reboot when they are what blocks the upgrade.
+function _dbsRenderActions(pf){
+    var box=document.getElementById('dbs-actions'); if(!box)return;
+    var ub=document.getElementById('dbs-updates-btn'),rb=document.getElementById('dbs-reboot-btn'),pwb=document.getElementById('dbs-reboot-pw-block'),msg=document.getElementById('dbs-actions-msg');
+    if(pwb)pwb.style.display='none';
+    var pw=document.getElementById('dbs-reboot-pw'); if(pw)pw.value='';
+    if(!pf||_osupTarget!=='dbserver'){ box.style.display='none'; return; }
+    var by={}; (pf.checks||[]).forEach(function(c){by[c.name]=c;});
+    var sshOk=by.ssh_sudo&&by.ssh_sudo.pass, busy=by.no_job_running&&!by.no_job_running.pass;
+    var needUpd=!!(by.os_up_to_date&&!by.os_up_to_date.pass&&pf.pending_count);
+    var needRb=!!((by.no_reboot_pending&&!by.no_reboot_pending.pass)||pf.reboot_required);
+    if(!sshOk||busy||(!needUpd&&!needRb)){ box.style.display='none'; return; }
+    if(ub)ub.style.display=needUpd?'inline-block':'none';
+    if(rb)rb.style.display=(needRb&&!needUpd)?'inline-block':'none';   // updates first; they may add a reboot
+    if(msg)msg.textContent=needUpd
+        ?pf.pending_count+' update(s) are pending on the database server. Install updates runs apt full-upgrade there (TAK\'s database package is held). TAK Server stays up; PostgreSQL may restart briefly. Then Re-check.'
+        :'The database server needs a reboot before Ubuntu\'s upgrader will run. TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.';
+    box.style.display='block';
+}
+function _dbsJobStarted(job,message){
+    _dbsShow('dbs-progress');
+    _dbsRenderProgress({job:job,state:job==='reboot'?'rebooting':'running',step:'start',steps:job==='os-upgrade'?['pre-snapshot','db-dump','pin-pg16','release-upgrade','repos-noble','reassert','reboot']:[]});
+    var lg=document.getElementById('dbs-log'); if(lg)lg.textContent='Started on the database server ('+(message||job)+')…';
+    _dbsStartPolling();
+}
+async function _dbsPost(path,body){
+    var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
+    var r=await fetch('/api/console/dbserver/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+    var d={}; try{d=await r.json();}catch(e){}
+    if(!r.ok||!d.ok){ if(err)err.textContent=d.error||(path+' failed ('+r.status+')'); return null; }
+    return d;
+}
+async function dbsInstallUpdates(){
+    if(_dbsBusy)return;
+    if(!confirm('Install every pending update on the database server'+(_dbsTargetHost?' ('+_dbsTargetHost+')':'')+'?\n\nTAK Server stays up, but it cannot save or read data if PostgreSQL restarts during the run. TAK\'s database package is held and is not upgraded.'))return;
+    _dbsBusy=true;
+    try{ var d=await _dbsPost('updates'); if(d){ osupCloseModal(); _dbsJobStarted('updates',d.message); } }
+    catch(e){ var err=document.getElementById('osup-modal-err'); if(err)err.textContent='updates failed: '+e.message; }
+    finally{ _dbsBusy=false; }
+}
+async function dbsReboot(){
+    if(_dbsBusy)return;
+    var pwb=document.getElementById('dbs-reboot-pw-block'),pw=document.getElementById('dbs-reboot-pw');
+    if(pwb&&pwb.style.display==='none'){ pwb.style.display='block'; if(pw)pw.focus(); return; }   // first click asks for the password
+    var err=document.getElementById('osup-modal-err');
+    if(!pw||!pw.value){ if(err)err.textContent='Console password required'; return; }
+    _dbsBusy=true;
+    try{ var d=await _dbsPost('reboot',{admin_password:pw.value}); if(d){ osupCloseModal(); _dbsJobStarted('reboot',d.message); } }
+    catch(e){ if(err)err.textContent='reboot failed: '+e.message; }
+    finally{ _dbsBusy=false; }
+}
+dbsInit();
 var updateBody='';
 function setLogPane(id,text){
     /* v10.1.40: a log pane must open at the END. `textContent=` resets scrollTop to 0,
