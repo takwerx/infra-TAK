@@ -1072,6 +1072,132 @@ def test_no_local_outpost_container_does_nothing():
     assert box.restarts() == [] and box.api == []
 
 
+# ── ops #184: Authentik Reconfigure, and a heal cut short by a console restart ──────
+
+def reconfigure_heal(box, ns=None):
+    """What the end of an Authentik Reconfigure runs."""
+    ns = ns or box.ns()
+    exec(compile(_src('_authentik_reconfigure_heal_tak_clients'), 'app.py', 'exec'), ns)
+    ns['_authentik_reconfigure_heal_tak_clients'](box.log.append)
+
+
+def test_ops184_reconfigure_soon_after_tak_started_heals_the_client_it_left_empty():
+    # test12 (ops #180): TAK started 17:44:18Z; the post-update Reconfigure's flow fix
+    # recreated the outpost at 17:48:21Z and the emulator reconnected 11 s later: no user,
+    # no groups. Outpost started under 5 min after TAK, so the start-time check (the boot
+    # guard) never counts it and nothing would ever heal that client.
+    gap = _const('_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S') - 60
+    box = outage_box(tak_start=T0 - gap - 30, ldap_start=T0 - 30)
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.api == []                                 # the gap: nothing heals it
+    reconfigure_heal(box)
+    assert box.restarts() == []
+    assert box.drops() == ['tls:16']
+    [now] = box.live('takdev-emu')
+    assert now['username'] == 'takdev-emu' and now['groups']
+    assert any('(end of Authentik Reconfigure): TAK Server ran through an LDAP outage — '
+               'Authentik Reconfigure recreated the LDAP outpost' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert 'pending' not in st and st['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops184_reconfigure_inside_a_console_update_leaves_it_to_the_update_end():
+    box = outage_box(tak_start=T0 - 200, ldap_start=T0 - 30, update_in_progress=True)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert box.settings['tak_ldap_recycle']['pending'] == ['Authentik Reconfigure recreated the LDAP outpost']
+    assert any('client check deferred to the end of the console update' in l for l in box.log)
+    box.t += 300
+    box.update_in_progress = False
+    assert box.recycle(final=True) is False           # the update's last step
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    assert box.live('takdev-emu')[0]['groups']
+
+
+def test_ops184_tak_started_after_the_reconfigure_request_is_left_alone():
+    # TAK (re)started after the request (e.g. it was still coming up): it looked every
+    # client up against the healed LDAP already.
+    box = outage_box(tak_start=T0 + 5, ldap_start=T0 - 30)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert any('reusing that restart' in l for l in box.log)
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+def test_ops184_reconfigure_with_tak_not_on_ldap_does_nothing():
+    box = outage_box(tak_start=T0 - 200, ldap_start=T0 - 30, coreconfig=False)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+class ConsoleRestarted(BaseException):
+    """systemctl restart takwerx-console: the heal's thread just stops."""
+
+
+def test_ops184_heal_killed_by_a_console_restart_is_finished_by_the_next_console_start():
+    # test12 (ops #180): the update's final heal started at 17:53:35Z for an outpost
+    # restarted under TAK; the console was restarted at 17:53:38Z. That reason was never
+    # saved, and the restarted console carries out only pending requests.
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - 120)
+    marti = box.marti
+
+    def killed(url, timeout=12, method='GET', json_body=None):
+        raise ConsoleRestarted()
+    box.marti = killed
+    with pytest.raises(ConsoleRestarted):
+        box.recycle()
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'in progress'
+    assert st['pending'] == ['LDAP outpost restarted while TAK Server was running (TAK up 95h58m at the time)']
+    box.marti = marti
+    box.t += 60
+    assert box.recycle(trigger='console start', check_outpost=False, final=True) is False
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    assert box.live('takdev-emu')[0]['groups']
+    st = box.settings['tak_ldap_recycle']
+    assert 'pending' not in st and st['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops184_saving_the_reason_first_does_not_swallow_a_newer_request():
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - 120)
+    box.request('PgBouncer image swap')
+    req = box.settings['tak_ldap_recycle']['requested_epoch']
+    real_load = box.ns
+
+    def ns_with_a_late_request():
+        ns = real_load()
+        load = ns['load_settings']
+        state = {'n': 0}
+
+        def load_settings():
+            state['n'] += 1
+            if state['n'] == 2:                        # between the first read and the save
+                box.t += 1
+                box.request('late step')
+            return load()
+        ns['load_settings'] = load_settings
+        return ns
+    box.ns = ns_with_a_late_request
+    box.recycle()
+    st = box.settings['tak_ldap_recycle']
+    assert st['requested_epoch'] > req and st['pending'] == ['PgBouncer image swap', 'late step']
+
+
+def test_ops184_both_reconfigure_paths_heal_last():
+    local = APP[APP.index('def run_authentik_deploy('):]
+    local = local[:local.index('_authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)')]
+    tail = local[local.rindex('_sync_webadmin_after_authentik_reconfigure(plog)'):].split('\n')
+    assert [l.strip() for l in tail if l.strip() and not l.strip().startswith('#')] == [
+        '_sync_webadmin_after_authentik_reconfigure(plog)', '_authentik_reconfigure_heal_tak_clients(plog)', 'plog("")']
+    remote = _src('_run_authentik_reconfigure_remote')
+    tail = remote[remote.index('_sync_webadmin_after_authentik_reconfigure(plog)'):]
+    assert tail.index('_authentik_reconfigure_heal_tak_clients(plog)') < tail.index('_authentik_reconfigure_finish(')
+    src = _src('_authentik_reconfigure_heal_tak_clients')
+    assert src.index('_tak_ldap_recycle_request(') < src.index('_tak_recycle_after_ldap_outage(')
+    assert 'final=True' not in src                     # inside an update it must defer
+
+
 # ── GH #207: Guard Dog restarting Authentik under a running TAK ─────────────────────
 
 def nodered_feed(n, cn):

@@ -144,17 +144,35 @@ except Exception: print("")' "$GD_CONF" 2>/dev/null)
 
 _admin_cert || { _log "SKIP | no usable admin cert — cannot query subscriptions"; exit 0; }
 
-SUBS_JSON=$(curl -sk --max-time 15 --cert "$PEM" --key "$KEY" "$API_URL" 2>/dev/null)
+_subs_get() {   # sets SUBS_JSON (body) and SUBS_CODE (HTTP status, 000 = no answer)
+  local _r
+  _r=$(curl -sk --max-time 15 --cert "$PEM" --key "$KEY" -w '\n__HTTP:%{http_code}' "$1" 2>/dev/null)
+  SUBS_CODE=${_r##*__HTTP:}
+  SUBS_JSON=${_r%__HTTP:*}
+}
+_subs_get "$API_URL"
 # NOTE: this API is PAGINATED and `page` is 1-INDEXED — page=0 returns zero rows.
 # If the paginated form yields nothing, retry unparameterized before concluding
 # anything: an empty result must never be read as "every client vanished".
 if [ -z "$SUBS_JSON" ] || ! echo "$SUBS_JSON" | grep -q '"data"'; then
-  SUBS_JSON=$(curl -sk --max-time 15 --cert "$PEM" --key "$KEY" \
-    "https://127.0.0.1:8443/Marti/api/subscriptions/all" 2>/dev/null)
+  _subs_get "https://127.0.0.1:8443/Marti/api/subscriptions/all"
 fi
+# ops #184: TAK ANSWERING with a server error is not "no data". test12 2026-10-22: a client
+# that reconnected while the LDAP outpost was being recreated left a ghost subscription
+# (added and removed in the same 200 ms, still listed, refuses deletion) and from then on
+# every read of this list was HTTP 500 (StringIndexOutOfBounds in
+# RemoteUtil.getGroupsForBitVectorString). This check logged SKIP every 5 min, so nothing
+# was ever said, while the Client Dashboard and the console's own client heal were just as
+# blind. A 5xx counts as a failing check (3 in a row before anyone is emailed, like the
+# rest). A timeout or no answer (000) is still a SKIP: a busy TAK is not a broken list.
+API_BROKEN=0
 if [ -z "$SUBS_JSON" ] || ! echo "$SUBS_JSON" | grep -q '"data"'; then
-  _log "SKIP | subscriptions API returned no usable data — not evaluating"
-  exit 0
+  case "$SUBS_CODE" in
+    5[0-9][0-9]) API_BROKEN=1 ;;
+    *) _log "SKIP | subscriptions API returned no usable data (HTTP $SUBS_CODE) — not evaluating"
+       exit 0 ;;
+  esac
+  SUBS_JSON='{"data": []}'   # nothing to count; the parse below then reports zeros
 fi
 
 # Parse the subscription payload: channel health (W2 of 10.1.46) plus the
@@ -286,6 +304,7 @@ fi
 
 INVISIBLE=$(( EXTERNAL - SUBS ))
 [ "$INVISIBLE" -lt 0 ] && INVISIBLE=0
+[ "$API_BROKEN" -eq 1 ] && INVISIBLE=0   # no list to compare the sockets with
 
 # ── W2 (v10.1.47): connection storms ──
 # Two independent predicates. The uid one is the primary signal — it is device
@@ -300,11 +319,15 @@ if [ "${TOPIPSOCK:-0}" -ge "$STORM_IP_SOCKETS" ]; then
   [ $(( TOPIPSOCK / _d )) -ge "$STORM_IP_RATIO" ] && STORM_IP=1
 fi
 
-_log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS service=$SERVICE unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
+if [ "$API_BROKEN" -eq 1 ]; then
+  _log "CHECK | subscriptions API BROKEN (HTTP $SUBS_CODE on every read) external_sockets=$EXTERNAL"
+else
+  _log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS service=$SERVICE unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
+fi
 
 # ── 3. Verdict ──
 if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ] \
-   && [ "$STORM_UID" -eq 0 ] && [ "$STORM_IP" -eq 0 ]; then
+   && [ "$STORM_UID" -eq 0 ] && [ "$STORM_IP" -eq 0 ] && [ "$API_BROKEN" -eq 0 ]; then
   _quiet_exit
 fi
 
@@ -338,8 +361,26 @@ if [ "$STORM_UID" -eq 1 ] || [ "$STORM_IP" -eq 1 ]; then
   fi
 fi
 
+[ "$API_BROKEN" -eq 1 ] && SUBJ="TAK client list unreadable on $SERVER_IDENTIFIER"
+
 FINDINGS=""
 ACTIONS=""
+
+if [ "$API_BROKEN" -eq 1 ]; then
+  FINDINGS="$FINDINGS
+- TAK Server's client list FAILS: every read of /Marti/api/subscriptions/all
+  answers HTTP $SUBS_CODE. The Client Dashboard can't show who is connected,
+  and nobody can check whether clients have their channels (__ANON__), the
+  console's automatic reconnect of such clients included.
+  Seen when a client reconnected during an LDAP outage (a console update, an
+  Authentik reconfigure or restart) and TAK kept a broken leftover of that
+  connection.
+  (external clients connected on $PORT: $EXTERNAL)"
+  ACTIONS="$ACTIONS
+- For the unreadable client list: restart TAK Server from the console
+  (TAK Server -> Restart). Clients reconnect on their own and are looked up
+  again. Nothing else clears the broken entry."
+fi
 
 if [ "$INVISIBLE" -gt 0 ]; then
   FINDINGS="$FINDINGS
@@ -432,7 +473,7 @@ if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   rm -f "$TMPF"
 fi
 
-_log "ALERT | external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS service=$SERVICE storm_uid=$STORM_UID($TOPUID/$TOPUIDN) storm_ip=$STORM_IP($TOPIP/$TOPIPSOCK) fails=$FAILS"
-logger -t takguard "client visibility: $INVISIBLE invisible, $GROUPLESS groupless, storm_uid=$STORM_UID storm_ip=$STORM_IP"
+_log "ALERT | api_broken=$API_BROKEN external=$EXTERNAL subs=$SUBS invisible=$INVISIBLE groupless=$GROUPLESS service=$SERVICE storm_uid=$STORM_UID($TOPUID/$TOPUIDN) storm_ip=$STORM_IP($TOPIP/$TOPIPSOCK) fails=$FAILS"
+logger -t takguard "client visibility: api_broken=$API_BROKEN, $INVISIBLE invisible, $GROUPLESS groupless, storm_uid=$STORM_UID storm_ip=$STORM_IP"
 echo 0 > "$FAIL_FILE"
 exit 0

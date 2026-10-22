@@ -57467,6 +57467,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, n
     plog("  Enabling show password on login...")
     _authentik_enable_show_password(ak_url, ak_headers, plog)
     _sync_webadmin_after_authentik_reconfigure(plog)
+    _authentik_reconfigure_heal_tak_clients(plog)   # ops #184: the flow fix recreated the outpost
     plog("")
     _authentik_reconfigure_finish(plog, issues, "Reconfigure (remote)", notes)
 
@@ -63479,6 +63480,25 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             _finish('deferred to the end of the update', keep=reasons)
             return False
 
+        # ops #184: written down before the work starts. test12: a console restart 3 s into
+        # this heal (end of a console update) killed it, and its reason (the outpost start)
+        # had never been saved, so the restarted console, which carries out only PENDING
+        # requests, left the client that connected during the update's Reconfigure on
+        # __ANON__. Pending now: the next console start finishes it. Skipped if a newer
+        # request came in since we read (that one is pending anyway, and stays so).
+        try:
+            s = load_settings()
+            cur = dict(s.get('tak_ldap_recycle') or {})
+            if float(cur.get('requested_epoch') or 0) <= req_at:
+                mark = time.time()
+                cur.update({'pending': reasons[-5:], 'requested_epoch': mark, 'need_groups': need_groups,
+                            'restart': must_restart, 'last_outcome': 'in progress', 'last_trigger': trigger})
+                s['tak_ldap_recycle'] = cur
+                save_settings(s)
+                req_at = mark
+        except Exception:
+            pass
+
         plog(f"  {tag} ({trigger}): TAK Server ran through an LDAP outage — {'; '.join(reasons)}. "
              f"Clients that connected during it have NO groups until they are looked up again; checking LDAP first...")
         s = load_settings()
@@ -63557,6 +63577,25 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                  f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
             _finish('restarted, HTTPS still broken')
         return True
+
+
+def _authentik_reconfigure_heal_tak_clients(plog):
+    """End of an Authentik Reconfigure (ops #184): heal TAK's clients that connected while it
+    had LDAP down. Every Reconfigure takes the LDAP path down under TAK: the LDAP flow fix
+    recreates the outpost, and with an FQDN the domain sync restarts server/worker and then
+    recreates the outpost again. test12 (ops #180): the emulator reconnected 11 s into the
+    flow fix and TAK gave it no user and no groups. Until now only the outpost's start time
+    could bring the heal here, and it counts only 5+ min after TAK started (the box-boot
+    guard), so a Reconfigure soon after TAK started (the post-update one right after a
+    reboot) left such a client on __ANON__ for good. An explicit request has no such gate:
+    TAK just has to have been running before it. Inside a console update this only records
+    it, and the update's final step carries it out after its other Authentik steps; a
+    Reconfigure from the Authentik page heals right here, in its own log."""
+    _tak_ldap_recycle_request('Authentik Reconfigure recreated the LDAP outpost')
+    try:
+        _tak_recycle_after_ldap_outage(plog, 'end of Authentik Reconfigure', check_outpost=True)
+    except Exception as e:
+        plog(f"  TAK LDAP recycle error (non-fatal): {str(e)[:120]}")
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
@@ -67838,6 +67877,8 @@ def run_authentik_deploy(reconfigure=False):
             plog("  Ensuring password-recovery flow...")
             _ensure_recovery_flow_standalone(env_path, plog)
             _sync_webadmin_after_authentik_reconfigure(plog)
+            # ops #184: last, after every step above that takes LDAP down under TAK
+            _authentik_reconfigure_heal_tak_clients(plog)
             plog("")
             _authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)
             return
