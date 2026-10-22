@@ -114,9 +114,14 @@ def _ensure(family, have):
         calls.append(list(pkgs))
         installed.add('ufw')
         return True, ''
+    def fw_backend():
+        have_ufw, have_fwd = 'ufw' in installed, 'firewall-cmd' in installed
+        if family == 'rhel':
+            return 'firewalld' if have_fwd else ('ufw' if have_ufw else None)
+        return 'ufw' if have_ufw else ('firewalld' if have_fwd else None)
     ns = _ns('_fw_ensure_installed', _host_has_bin=lambda b: b in installed,
              _distro_family=lambda: family, _pkg_install=pkg_install,
-             _pkg_lock_wait=lambda **k: True, _fw_backend=lambda: 'ufw' if 'ufw' in installed else None,
+             _pkg_lock_wait=lambda **k: True, _fw_backend=fw_backend,
              _sudo_wrap=lambda c: (_ for _ in ()).throw(AssertionError(f'unexpected priv op {c}')))
     logs = []
     be = ns['_fw_ensure_installed'](log=logs.append)

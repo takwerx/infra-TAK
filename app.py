@@ -3034,14 +3034,14 @@ def _fw_ensure_installed(log=None):
         # ufw after allowing SSH, exactly as on a stock Ubuntu box. Skipped when firewalld is
         # the host firewall. --no-remove: ufw conflicts with iptables-persistent, and we never
         # trade an operator's own firewall for ours — apt aborts instead.
-        if not _host_has_bin('ufw') and not _host_has_bin('firewall-cmd'):
+        if _fw_backend() is None:
             _log("  firewall: installing ufw (this image does not ship it)…")
             _pkg_lock_wait(log_fn=log)
             ok, _out = _pkg_install(['--no-remove', 'ufw'], log_fn=log, timeout=600)
             _log("  ✓ ufw installed (not enabled)" if ok and _host_has_bin('ufw')
                  else "  ⚠ ufw install failed — the Firewall page stays unavailable until ufw is installed")
         return _fw_backend()
-    have_fwd = _host_has_bin('firewall-cmd')
+    have_fwd = _fw_backend() == 'firewalld'
     if not have_fwd:
         _log("  firewall: installing firewalld (RHEL always-on host firewall)…")
         try:
