@@ -84,7 +84,8 @@ def _ns(answers, pkg_mgr='dnf', uid=1001):
         '_sudo_wrap': lambda argv: ['BROKER'] + list(argv),
     }
     exec(compile(_src('_parse_dnf_check_update', '_parse_apt_simulation', '_dnf_error_tail',
-                      '_dnf_ignored_repos', '_dnf_check_update_run', '_pending_os_updates'),
+                      '_dnf_ignored_repos', '_dnf_check_update_run', '_dnf_readonly_run',
+                      '_pending_os_updates'),
                  'app.py', 'exec'), n)
     return n, calls
 
