@@ -284,7 +284,7 @@ async function createClientCert(){
     var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
-    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    if(msg){msg.textContent=d.group_warning||'';msg.style.color=d.group_warning?'var(--yellow)':'var(--text-dim)';}
     if(result){
       result.style.display='block';
       document.getElementById('cc-result-name').textContent=d.name+'.p12';
@@ -343,7 +343,7 @@ function _takCertStyle(el,tone){
          bad:['rgba(239,68,68,0.08)','rgba(239,68,68,0.35)'],busy:['rgba(59,130,246,0.08)','rgba(59,130,246,0.3)']}[tone];
   el.style.background=t[0];el.style.border='1px solid '+t[1];el.style.display='block';
 }
-var _takCertSawRun=false;
+var _takCertSawRun=false,_takCertTries=0;
 // The console-wide "certificate doesn't include …" bar is drawn at page load; once the row
 // confirms the live cert is fixed, take it down here instead of waiting for a reload, and
 // re-stack whatever notice bars are left (same layout the bars' own dismiss uses).
@@ -362,7 +362,7 @@ var _takCertFixBtn='<button type="button" id="tak-cert-fix-btn" onclick="fixTakC
 async function loadTakCertRow(){
   var el=document.getElementById('tak-cert-row');if(!el)return;
   var d;
-  try{var r=await fetch('/api/takserver/server-cert');d=await r.json();}catch(e){return;}
+  try{var r=await fetch('/api/takserver/server-cert');d=await r.json();}catch(e){d={job:{},status:null};}
   var job=d.job||{},st=d.status;
   if(job.running){
     _takCertSawRun=true;
@@ -380,7 +380,21 @@ async function loadTakCertRow(){
     var lg=el.lastChild;if(lg)lg.scrollTop=lg.scrollHeight;
     setTimeout(loadTakCertRow,2000);return;
   }
-  if(!st||st.state==='unknown'){el.style.display='none';return;}
+  // Never vanish: a busy box can miss one read (test12 under load, 2026-10-22). Say we're
+  // checking, retry a few times, then say plainly that it couldn't be read, with a retry.
+  if(!st||st.state==='unknown'){
+    _takCertStyle(el,'busy');el.style.padding='8px 16px';
+    if(_takCertTries<3){
+      _takCertTries++;
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Checking TAK Server\'s certificate…</div>';
+      setTimeout(loadTakCertRow,5000);
+    }else{
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Couldn\'t read TAK Server\'s certificate right now (TAK Server isn\'t answering on 8443). '
+        +'<a href="#" onclick="_takCertTries=0;loadTakCertRow();return false;" style="color:var(--cyan)">Check again</a></div>';
+    }
+    return;
+  }
+  _takCertTries=0;
   var dom=st.domain||'',names=(st.live||[]).map(escapeHtml).join(', ');
   if(st.state==='ok'){
     _takCertDropBar();
