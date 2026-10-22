@@ -160,6 +160,19 @@ _tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 _AK_LOCK="/tmp/takwerx-authentik-compose.lock"
 _AK_LOCK_WAIT=180
 
+# Open the lock on fd 9 READ-ONLY. flock needs only a descriptor, and `9<` is the one open
+# that never carries O_CREAT. With fs.protected_regular set (Ubuntu ships 2), the kernel
+# refuses an O_CREAT open — which every `>`/`>>` redirect is — of a file in sticky /tmp
+# that someone else owns, root included. The console (takwerx) creates this file first on
+# most boxes, so the old `exec 9>>` failed there and every restart below ran UNLOCKED
+# (test12 restarts.log, 2026-10-22 06:10 and 10:34 UTC). Create it only when it is
+# missing, 0666 so the console can open it too. No chmod of an existing file: that would
+# follow a symlink someone planted at this path.
+_ak_lock_open() {
+  [ -e "$_AK_LOCK" ] || [ -L "$_AK_LOCK" ] || ( umask 000; : >> "$_AK_LOCK" ) 2>/dev/null
+  exec 9<"$_AK_LOCK"
+}
+
 # Run a compose operation under the shared lock. Usage: _ak_compose_locked <tag> <args...>
 # Returns non-zero WITHOUT running anything if the lock cannot be taken in time.
 _ak_compose_locked() {
@@ -171,9 +184,7 @@ _ak_compose_locked() {
     docker compose "$@" 2>&1
     return $?
   fi
-  ( umask 000; : >> "$_AK_LOCK" ) 2>/dev/null || true
-  chmod 666 "$_AK_LOCK" 2>/dev/null || true
-  exec 9>>"$_AK_LOCK" || { _log "compose-lock | cannot open $_AK_LOCK — running $_tag UNLOCKED"; docker compose "$@" 2>&1; return $?; }
+  _ak_lock_open 2>/dev/null || { _log "compose-lock | cannot open $_AK_LOCK — running $_tag UNLOCKED"; docker compose "$@" 2>&1; return $?; }
   if ! flock -w "$_AK_LOCK_WAIT" 9; then
     _log "compose-lock | NOT acquired after ${_AK_LOCK_WAIT}s — skipping $_tag (console is mid-compose; next tick retries)"
     exec 9>&-
@@ -223,9 +234,7 @@ _ak_compose_restart_locked() {
     docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1
     return $?
   fi
-  ( umask 000; : >> "$_AK_LOCK" ) 2>/dev/null || true
-  chmod 666 "$_AK_LOCK" 2>/dev/null || true
-  exec 9>>"$_AK_LOCK" || { _log "compose-lock | cannot open $_AK_LOCK — full restart UNLOCKED"; docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1; return $?; }
+  _ak_lock_open 2>/dev/null || { _log "compose-lock | cannot open $_AK_LOCK — full restart UNLOCKED";docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1; return $?; }
   if ! flock -w "$_AK_LOCK_WAIT" 9; then
     _log "compose-lock | NOT acquired after ${_AK_LOCK_WAIT}s — skipping full restart (console is mid-compose; next tick retries)"
     exec 9>&-
