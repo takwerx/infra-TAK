@@ -57,7 +57,7 @@ def _pkg(version, beta):
 
 @pytest.fixture
 def upstream(tmp_path):
-    """A repo shaped like AdventureSeeker423/TAK-Portal around 2.0.14 / 2.0.15."""
+    """A repo shaped like ValleyTacticalSolutions/TAK-Portal around 2.0.14 / 2.0.15."""
     up = tmp_path / 'upstream'
     up.mkdir()
     _git(up, 'init', '-q', '-b', 'main')

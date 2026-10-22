@@ -1270,7 +1270,7 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 # TAK Video Restreamer constants live in modules/tvr.py (registry-resident since v10.1.24)
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
 # EUD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
-TAKPORTAL_REPO = "https://github.com/AdventureSeeker423/TAK-Portal.git"
+TAKPORTAL_REPO = "https://github.com/ValleyTacticalSolutions/TAK-Portal.git"
 # v10.1.49 W2. The clone used to be a `shell=True` f-string against the repo's
 # DEFAULT BRANCH — whatever was on upstream HEAD at deploy time ran on the box,
 # against CLAUDE.md's CJIS bar ("external repos pinned to a tag + commit SHA").
@@ -16280,7 +16280,7 @@ def _takportal_latest_tag(plog=None):
     import urllib.request as _ur
     tag = None
     try:
-        req = _ur.Request('https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+        req = _ur.Request('https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
                           headers={'Accept': 'application/vnd.github+json',
                                    'User-Agent': 'infra-TAK'})
         with _ur.urlopen(req, timeout=15) as r:
@@ -32004,7 +32004,7 @@ def _write_takportal_override():
     every update.
 
     v0.9.12 — port hardening (Tier 3, Caddy-loopback):
-      Upstream `AdventureSeeker423/TAK-Portal`'s docker-compose.yml binds
+      Upstream `ValleyTacticalSolutions/TAK-Portal`'s docker-compose.yml binds
       `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` which defaults to
       `0.0.0.0:3000:3000`. Authentication is delegated to Authentik via
       Caddy forward_auth, so anyone hitting port 3000 directly bypasses
@@ -32086,7 +32086,7 @@ def _patch_takportal_compose_network():
 def _patch_takportal_compose_ports(portal_dir=None):
     """Patch ~/TAK-Portal/docker-compose.yml to bind WEB_UI_PORT to loopback only.
 
-    Upstream AdventureSeeker423/TAK-Portal binds
+    Upstream ValleyTacticalSolutions/TAK-Portal binds
     `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` (0.0.0.0). We rewrite it to
     `127.0.0.1:${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}`.
 
@@ -35709,7 +35709,7 @@ def _fetch_takportal_latest(*, fresh=False):
     c['ts'] = now
     try:
         req = _ur.Request(
-            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
             headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
         # Short timeout: this runs inline in the /takportal page render.
         with _ur.urlopen(req, timeout=6) as resp:
@@ -37222,7 +37222,7 @@ def _takportal_release_tag_strict(portal_dir, plog=None):
     tag = ''
     try:
         req = _ur.Request(
-            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
             headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
         with _ur.urlopen(req, timeout=15) as r:
             tag = str((json.loads(r.read().decode()) or {}).get('tag_name') or '').strip()
@@ -37363,6 +37363,15 @@ def _takportal_update_git(portal_dir, plog=None):
     _healed, _heal_err = _module_checkout_ownership_selfheal(portal_dir, plog=_log)
     if _heal_err:
         _log(f'  ownership self-heal did not complete: {_heal_err}')
+    # 2026-10-22: upstream moved AdventureSeeker423 -> ValleyTacticalSolutions. Old clones
+    # still fetch through GitHub's rename redirect, which dies the day a repo of that name
+    # exists under the old account again. Repoint only the stock URL — a fork stays put.
+    _o = subprocess.run(_git + ['remote', 'get-url', 'origin'], capture_output=True, text=True, timeout=10)
+    if 'adventureseeker423/tak-portal' in (_o.stdout or '').lower():
+        _s = subprocess.run(_git + ['remote', 'set-url', 'origin', TAKPORTAL_REPO],
+                            capture_output=True, text=True, timeout=10)
+        _log(f'  origin repointed to {TAKPORTAL_REPO}' if _s.returncode == 0 else
+             f'  could not repoint origin: {(_s.stderr or "").strip()[:120]}')
     # Snapshot .env FIRST — before the discard below and before any ref moves. Upstream
     # tracked it through 1.4.6, so both steps can destroy it (v10.1.57 W9).
     _saved_env = _takportal_preserve_env(portal_dir, plog=_log)
@@ -38047,7 +38056,7 @@ TAKPORTAL_CONTAINER_TAK_NOTE = (
     "TAK Server runs in Docker, so TAK Portal can't issue integration-user certs, "
     "restart TAK Server or sync plugins to the Update Server yet. Users and QR "
     "enrollment work. Requested upstream: "
-    "https://github.com/AdventureSeeker423/TAK-Portal/issues/61")
+    "https://github.com/ValleyTacticalSolutions/TAK-Portal/issues/61")
 
 
 def _takportal_setup_ssh(log_fn=None):
@@ -94803,7 +94812,7 @@ def _post_update_auto_deploy():
             def _auto_harden_takportal():
                 """v0.9.12 — TAK Portal port hardening.
 
-                Mirrors _auto_harden_cloudtak() for upstream AdventureSeeker423/TAK-Portal:
+                Mirrors _auto_harden_cloudtak() for upstream ValleyTacticalSolutions/TAK-Portal:
                 upstream binds WEB_UI_PORT to 0.0.0.0; we override to 127.0.0.1 and add
                 UFW deny on 3000/tcp belt-and-braces. Browsers reach the portal via
                 Caddy on 443 → forward_auth → loopback 3000.
