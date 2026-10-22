@@ -37649,7 +37649,35 @@ def _takportal_merged_settings_json(settings, adopt=()):
             merged[k] = v  # the operator pressed "Use the domain" for this key
             continue
         # operator-owned — hands off, whatever the current value is
+    for k, required in TAKPORTAL_REQUIRED_PREFIXES.items():
+        merged[k] = _takportal_with_required_prefixes(merged.get(k), required)
     return json.dumps(merged, indent=2)
+
+
+# Our own admin accounts and groups, which TAK Portal must hide (and keep Disable/Delete off).
+# ADDED to whatever list the portal has, never replacing it (operator decision 2026-10-21):
+# seed-only could not work here, because TAK Portal 2.x ships its own values for these keys, so
+# a fresh install never received ours and showed akadmin, webadmin and ROLE_ADMIN. An operator's
+# own entries always survive; only a missing one of ours is appended.
+TAKPORTAL_REQUIRED_PREFIXES = {
+    'USERS_HIDDEN_PREFIXES': ('akadmin', 'webadmin'),
+    'USERS_ACTIONS_HIDDEN_PREFIXES': ('akadmin', 'webadmin'),
+    'GROUPS_HIDDEN_PREFIXES': ('tak_ROLE_', 'vid_'),
+}
+
+
+def _takportal_with_required_prefixes(value, required):
+    """`value` (TAK Portal's comma list) with every prefix in `required` present. Portal matches
+    case-insensitively by prefix, so an existing entry that is a prefix of ours already covers it.
+    Unchanged when nothing is missing; otherwise ours are appended in the list's own separator."""
+    value = str(value or '')
+    have = [p.strip().lower() for p in value.split(',') if p.strip()]
+    missing = [r for r in required if not any(r.lower().startswith(h) for h in have)]
+    if not missing:
+        return value
+    sep = ', ' if ', ' in value else ','
+    base = value.strip().rstrip(',').rstrip()
+    return sep.join(([base] if base else []) + missing)
 
 
 TAKPORTAL_SETTINGS_BACKUP_KEEP = 10
@@ -65067,9 +65095,10 @@ def _takportal_admin_guardrail(plog_fn=None):
     recovery for USERS_HIDDEN_PREFIXES / USERS_ACTIONS_HIDDEN_PREFIXES drift
     between Update Now clicks.
 
-    Idempotent — no-op when both 'akadmin' and 'webadmin' are already present
-    in both fields. See v0.9.15 release notes for the original "accidental
-    Disable on akadmin" incident motivation.
+    Idempotent — no-op when every TAKPORTAL_REQUIRED_PREFIXES entry is already
+    covered. See v0.9.15 release notes for the original "accidental Disable on
+    akadmin" incident motivation. Runs on every console start, so an infra-TAK
+    update is what fixes a box that is missing them.
     """
     _log = plog_fn or (lambda m: print(m, flush=True))
     try:
@@ -65079,20 +65108,25 @@ def _takportal_admin_guardrail(plog_fn=None):
         if not _takportal_web_running():
             return
 
-        _existing = _takportal_get_existing_settings()
-        _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-        _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-        _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
-        _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
-        _need_keys = {'akadmin', 'webadmin'}
-        if _need_keys.issubset(_hidden_parts) and _need_keys.issubset(_locked_parts):
+        def _missing(cur):
+            cur = cur if isinstance(cur, dict) else {}
+            return {k: cur.get(k) or '' for k, req in TAKPORTAL_REQUIRED_PREFIXES.items()
+                    if _takportal_with_required_prefixes(cur.get(k), req) != str(cur.get(k) or '')}
+
+        _before = _missing(_takportal_get_existing_settings())
+        if not _before:
             return  # Idempotent — no log spam on healthy boot
 
-        _log(f"takportal admin guardrail: current hidden={_hidden!r} actions_hidden={_locked!r} — re-asserting")
+        _log(f"takportal admin guardrail: missing our entries in {_before!r} — adding them")
         if not _takportal_push_settings(plog=_log):
             _log("takportal admin guardrail: settings push failed — will retry next boot")
             return
-        _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
+        # Read it back: the old guardrail logged success after a push that changed nothing.
+        _after = _missing(_takportal_get_existing_settings())
+        if _after:
+            _log(f"takportal admin guardrail: still missing after the push: {_after!r} — will retry next boot")
+            return
+        _log("takportal admin guardrail: akadmin/webadmin hidden + action-locked, tak_ROLE_/vid_ groups hidden")
     except Exception as _e:
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
