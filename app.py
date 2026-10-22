@@ -89051,15 +89051,15 @@ _startup_harden_tak_portal_ports()
 # So the recreate is a journaled step: the marker is written before any file can change and
 # removed only once the recreate AND the media heal have both succeeded. A console that finds
 # it waits for any compose run still in flight, then redoes the recreate + heal.
-_CT_RECREATE_PENDING = os.path.join(CONFIG_DIR, 'cloudtak-recreate-pending.json')
-_CT_RECREATE_MAX_TRIES = 3      # then stop force-recreating a stack that never comes up
-_CT_COMPOSE_UP_RE = re.compile(r'\bcompose\b.*\sup(?:\s|$)')
+_CLOUDTAK_RECREATE_PENDING = os.path.join(CONFIG_DIR, 'cloudtak-recreate-pending.json')
+_CLOUDTAK_RECREATE_MAX_TRIES = 3      # then stop force-recreating a stack that never comes up
+_CLOUDTAK_COMPOSE_UP_RE = re.compile(r'\bcompose\b.*\sup(?:\s|$)')
 
 
 def _ct_recreate_pending():
     """The pending-recreate marker as a dict, or None if there is none."""
     try:
-        with open(_CT_RECREATE_PENDING) as _f:
+        with open(_CLOUDTAK_RECREATE_PENDING) as _f:
             _d = json.load(_f)
         return _d if isinstance(_d, dict) else {'tries': 0}
     except FileNotFoundError:
@@ -89076,17 +89076,17 @@ def _ct_recreate_arm(tries=None):
         _d.setdefault('since', int(time.time()))
         _d['tries'] = int(_d.get('tries') or 0) if tries is None else int(tries)
         _d['pid'] = os.getpid()
-        _tmp = _CT_RECREATE_PENDING + '.tmp'
+        _tmp = _CLOUDTAK_RECREATE_PENDING + '.tmp'
         with open(_tmp, 'w') as _f:
             json.dump(_d, _f)
-        os.replace(_tmp, _CT_RECREATE_PENDING)
+        os.replace(_tmp, _CLOUDTAK_RECREATE_PENDING)
     except Exception as _e:
         print(f"CloudTAK recreate marker write failed (non-fatal): {_e}")
 
 
 def _ct_recreate_clear():
     try:
-        os.remove(_CT_RECREATE_PENDING)
+        os.remove(_CLOUDTAK_RECREATE_PENDING)
     except FileNotFoundError:
         pass
     except Exception as _e:
@@ -89102,7 +89102,7 @@ def _ct_wait_compose_idle(timeout=300, log=None):
     while True:
         try:
             _ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
-            _busy = [l.strip() for l in (_ps.stdout or '').splitlines() if _CT_COMPOSE_UP_RE.search(l)]
+            _busy = [l.strip() for l in (_ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_UP_RE.search(l)]
         except Exception:
             return True             # cannot tell: don't hold up startup
         if not _busy:
@@ -89157,8 +89157,8 @@ def _startup_harden_cloudtak_ports():
                 print("Startup migration: CloudTAK compromise banner present — not recreating")
             _ct_recreate_clear()
             _needs_recreate = False
-        elif _pending is not None and int(_pending.get('tries') or 0) >= _CT_RECREATE_MAX_TRIES:
-            print(f"Startup migration: ⚠ CloudTAK recreate did not complete after {_CT_RECREATE_MAX_TRIES} "
+        elif _pending is not None and int(_pending.get('tries') or 0) >= _CLOUDTAK_RECREATE_MAX_TRIES:
+            print(f"Startup migration: ⚠ CloudTAK recreate did not complete after {_CLOUDTAK_RECREATE_MAX_TRIES} "
                   "tries — giving up; check `docker compose ps` in ~/CloudTAK")
             _ct_recreate_clear()
             _pending = None

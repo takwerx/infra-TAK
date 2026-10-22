@@ -104,7 +104,7 @@ class Box:
             '_cloudtak_open_stream_ports': lambda *a, **k: None,
             'CONFIG_DIR': str(self.home / '.config'),
         }
-        for c in ('_CT_RECREATE_PENDING', '_CT_RECREATE_MAX_TRIES', '_CT_COMPOSE_UP_RE'):
+        for c in ('_CLOUDTAK_RECREATE_PENDING', '_CLOUDTAK_RECREATE_MAX_TRIES', '_CLOUDTAK_COMPOSE_UP_RE'):
             exec(_const(c), ns)
         for f in ('_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
                   '_ct_wait_compose_idle', '_startup_harden_cloudtak_ports'):
@@ -222,7 +222,7 @@ def test_compromised_stack_is_never_brought_back(home):
 
 
 def test_compose_up_matcher():
-    rx = re.compile(eval(re.search(r"re\.compile\((r'.*?')\)", _const('_CT_COMPOSE_UP_RE')).group(1)))
+    rx = re.compile(eval(re.search(r"re\.compile\((r'.*?')\)", _const('_CLOUDTAK_COMPOSE_UP_RE')).group(1)))
     for hit in (COMPOSE_UP, 'docker compose up -d --force-recreate',
                 'docker-compose up -d', 'docker compose -f a.yml up'):
         assert rx.search(hit), hit
