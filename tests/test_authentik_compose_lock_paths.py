@@ -190,7 +190,7 @@ def test_full_restart_path_uses_the_same_read_only_open():
 
 def test_no_write_open_or_chmod_of_the_lock_left():
     code = '\n'.join(l for l in WATCH.splitlines() if not l.lstrip().startswith('#'))
-    assert 'exec 9>' not in code
+    assert 'exec 9>>' not in code and 'exec 9>"' not in code     # `exec 9>&-` (close) is fine
     assert 'chmod 666 "$_AK_LOCK"' not in code
     opener = code[code.index('_ak_lock_open() {'):]
     opener = opener[:opener.index('\n}\n')]
