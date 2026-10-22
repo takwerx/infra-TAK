@@ -90,7 +90,8 @@ class Box:
     def __init__(self, tak_start, ldap_start=None, container=False, ldap=lambda box: (0, 3),
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
-                 history=None):
+                 history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
+                 gd_restart=None):
         self.t = T0
         self.tak_start = tak_start
         self.ldap_start = ldap_start
@@ -108,12 +109,52 @@ class Box:
         self.dead_pool = dead_pool
         self.online = online
         self.api_ok = api_ok
+        self.api_busy = api_busy       # that many client-list reads time out first (GH #207)
+        self.gd_restart = gd_restart   # Guard Dog's last Authentik restart (epoch), or None
         # TAK's client history: device uid → last username (every device seen with a user)
         self.history = history if history is not None else {'ANDROID-takdev-emu': 'takdev-emu',
                                                              'ANDROID-aj5cacor': 'aj5cacor'}
         self.reconnects = []           # (at, session) still to come
         self.next_uid = 100            # TAK numbers new connections upward
         self.calls, self.api, self.log = [], [], []
+        # TAK's HTTPS/API side (ops #139), apart from the 8089 connections above: 'ok', 'no_groups'
+        # (test8: groups/all empty, so missions empty and create 403), 'create_403', 'down' (no
+        # answer). `https_flaky` = that many rounds give no groups first (a dead pooled connection).
+        self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
+        self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
+
+    # ── TAK's HTTPS side, as a throwaway leaf cert for a user ──
+    def leaf_cert(self, cn, workdir):
+        self.leaf_certs.append(cn)
+        self.leaf_cn = cn
+        return f'{workdir}/user.pem', f'{workdir}/user.key'
+
+    def user_req(self, cert, key, url, method='GET', timeout=20):
+        self.user_api.append((self.leaf_cn, method, url))
+        assert url.startswith(f'{API}/') and cert.endswith('user.pem')
+        path = url[len(API) + 1:]
+        state = self.https
+        if self.https_flaky:
+            if path == 'groups/all':
+                self.https_flaky -= 1
+            state = 'no_groups'
+        if state == 'down':
+            return 0, None
+        groups = [] if state == 'no_groups' else ['OPS']
+        if method == 'GET' and path == 'groups/all':
+            return 200, {'data': [{'name': g, 'direction': d} for g in groups for d in ('IN', 'OUT')]}
+        if method == 'GET' and path == 'missions':
+            return 200, {'data': [{'name': 'ops-feed'}] if groups else []}
+        name = urllib.parse.urlsplit(path).path.split('/', 1)[1]
+        if method == 'PUT':
+            if not groups or state == 'create_403':
+                return 403, {'message': 'Illegal attempt to set groupVector for Mission!'}
+            self.missions.add(name)
+            return 201, {'data': [{'name': name}]}
+        if method == 'DELETE':
+            self.missions.discard(name)
+            return 200, {'data': []}
+        raise AssertionError((method, url))
 
     # ── TAK's own LDAP lookup for a cert user (X509Authenticator) ──
     def _tak_lookup(self, cn):
@@ -137,6 +178,10 @@ class Box:
         if not self.api_ok:
             return None, 'curl_exit_7'
         if method == 'GET' and url == f'{API}/subscriptions/all':
+            if self.api_busy:
+                self.api_busy -= 1
+                self.t += 20
+                return None, 'curl_exit_28'
             self._materialize()
             return {'data': [dict(s) for s in self.subs]}, None
         if method == 'GET' and url.startswith(f'{API}/clientEndPoints?'):
@@ -189,6 +234,7 @@ class Box:
             if self.restart_rc == 0:
                 self.tak_start = self.t
                 self.ports_up_at = self.t + 120
+                self.https = self.https_after_restart
             return subprocess.CompletedProcess(cmd, self.restart_rc, stdout='', stderr='boom' if self.restart_rc else '')
         if cmd[0] == 'ldapsearch':
             flt = [a for a in cmd if a.startswith('(')][0]
@@ -248,17 +294,29 @@ class Box:
             '_tak_admin_marti_get': lambda url, timeout=12: box.marti(url, timeout),
             '_read_priv': lambda p: UAF if p == '/opt/tak/UserAuthenticationFile.xml' else None,
             '_TAK_MARTI_API': API,
+            '_guarddog_authentik_restart_epoch': lambda: box.gd_restart,
+            '_tak_user_leaf_cert': box.leaf_cert,
+            '_tak_user_marti_req': box.user_req,
+            'tempfile': types.SimpleNamespace(
+                mkdtemp=lambda prefix='': box.workdirs.append(f'/tmp/{prefix}{len(box.workdirs)}') or box.workdirs[-1]),
+            'shutil': types.SimpleNamespace(rmtree=lambda p, ignore_errors=False: box.workdirs.remove(p)),
+            '_TAK_API_CHECK_TOOL': 'infratak-check',
         }
         for c in ('_PGB_SWAP_LDAP_WINDOW_S', '_PGB_SWAP_LDAP_STABLE_S', '_PGB_SWAP_LDAP_EVERY_S',
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
-                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS'):
+                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_ATTEMPTS',
+                  '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS',
+                  '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S'):
             ns[c] = _const(c)
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
                      '_authentik_ldap_sa_group_probe', '_authentik_ldap_sa_groups_settle',
-                     '_ldap_filter_escape', '_ldap_users_tak_group_counts', '_subscription_num',
-                     '_tak_device_usernames', '_tak_client_sessions', '_tak_heal_ldap_sessions'):
+                     '_ldap_filter_escape', '_ldap_users_tak_groups', '_ldap_users_tak_group_counts',
+                     '_tak_file_users', '_subscription_num',
+                     '_tak_device_usernames', '_tak_client_sessions', '_tak_client_sessions_wait',
+                     '_tak_heal_ldap_sessions',
+                     '_tak_api_user_check_once', '_tak_api_user_check'):
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
         return ns
 
@@ -441,6 +499,227 @@ def test_client_that_stays_offline_is_not_a_failure():
     assert any("didn't reconnect within" in l for l in box.log)
 
 
+# ── ops #139: TAK's HTTPS/API side, which the 8089 connections say nothing about ─────
+
+def test_healthy_box_checks_https_as_a_live_non_admin_user_and_cleans_up():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    # a connected LDAP user with groups; never admin / cloudtak-svc-bootstrap (file users)
+    assert box.leaf_certs == ['ADSB_PS']
+    calls = [(m, u.split('?')[0].rsplit('/Marti/api/', 1)[1]) for _, m, u in box.user_api]
+    name = calls[2][1].split('/', 1)[1]
+    assert calls == [('GET', 'groups/all'), ('GET', 'missions'), ('PUT', f'missions/{name}'),
+                     ('DELETE', f'missions/{name}')]
+    put = box.user_api[2][2]
+    assert 'group=OPS' in put and 'tool=infratak-check' in put and name.startswith('infratak-ldap-check-')
+    assert box.missions == set() and box.workdirs == []         # mission deleted, temp dir removed
+    line = [l for l in box.log if 'no TAK Server restart needed' in l][0]
+    assert 'have their groups' in line and 'HTTPS as ADSB_PS: 1 group(s), 1 mission(s) listed' in line
+    assert 'mission create + delete in OPS OK' in line
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients fine, no restart'
+
+
+def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
+    # test8 2026-10-21: every ATAK had its 8089 groups, but over HTTPS TAK gave cert users 0
+    # groups (empty mission list, 403 on create). The old check said "all clients have their
+    # groups" eight times. Now: one TAK restart, and the check repeated after it.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert box.drops() == []                       # the 8089 clients were fine, none dropped
+    assert not any('no TAK Server restart needed' in l for l in box.log)
+    assert any(l.startswith('  ✗ TAK LDAP recycle:') and "HTTPS/API side is broken" in l
+               and "gave ADSB_PS no groups on groups/all, while LDAP gives 1 (OPS)" in l for l in box.log)
+    assert any('falling back to restarting TAK Server' in l for l in box.log)
+    assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
+    assert len([c for c in box.leaf_certs]) == _const('_TAK_API_CHECK_ATTEMPTS') + 1
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'restarted' and 'healed_ldap_start' not in st
+    assert box.workdirs == []
+
+
+def test_https_403_on_create_restarts_tak():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='create_403')
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any('got HTTP 403 creating a mission in OPS over HTTPS' in l for l in box.log)
+    assert box.missions == set()
+
+
+def test_https_still_broken_after_the_restart_is_logged_and_not_restarted_again():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
+                      https_after_restart='no_groups')
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any('✗ TAK LDAP recycle: STILL BROKEN after the TAK Server restart' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'restarted, HTTPS still broken'
+    # ...and the next caller doesn't restart again for the same outpost start
+    assert box.recycle(trigger='console start') is False
+    assert len(box.restarts()) == 1
+
+
+def test_one_bad_https_round_is_retried_before_any_restart():
+    # The API's first lookup can hit a dead pooled LDAP connection, like the streaming side.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=1)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert len(box.leaf_certs) == 2                # a fresh cert for the second round
+    assert any('HTTPS check round 1' in l and 'trying again' in l for l in box.log)
+    assert any('no TAK Server restart needed' in l for l in box.log)
+
+
+def test_streaming_restart_fallback_also_checks_https_after():
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, tak_ldap_ok=False)
+    box.request('PgBouncer image swap')
+    assert box.recycle() is True
+    assert box.leaf_certs                          # only after the restart: the heal failed first
+    assert any('✓ TAK LDAP recycle: after the restart: HTTPS as' in l for l in box.log)
+
+
+def test_https_check_retries_while_the_api_warms_up_after_a_restart():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
+                      https_after_restart='down')
+    orig = box.user_req
+
+    def warming(cert, key, url, method='GET', timeout=20):
+        if box.https == 'down' and len([u for u in box.user_api if u[1] == 'GET']) >= 6:
+            box.https = 'ok'                       # the API serves a few rounds after 8443 opens
+        return orig(cert, key, url, method, timeout)
+    box.user_req = warming
+    assert box.recycle() is True
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'restarted'
+    assert any("didn't answer" in l and 'trying again' in l for l in box.log)
+
+
+def test_no_live_user_falls_back_to_a_user_from_ldap():
+    box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR,
+              subs=[sess(1, 'admin', ('A',))], ldap_users={})
+    assert box.recycle() is False
+    assert box.leaf_certs == ['user0']             # the first LDAP user with a tak_ group
+    assert any('HTTPS as user0' in l for l in box.log)
+
+
+def test_admins_file_users_and_odd_names_are_never_used_for_the_check():
+    box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR,
+              subs=[sess(1, 'admin', ('A',)), sess(2, 'boss'), sess(3, 'we/ird'), sess(4, 'zed')],
+              ldap_users={'admin': 1, 'boss': 1, 'we/ird': 1, 'zed': 1})
+    real = box.run
+
+    def run(cmd, **kw):                            # boss is in tak_ROLE_ADMIN as well
+        r = real(cmd, **kw)
+        if cmd[0] == 'ldapsearch' and r.stdout:
+            r.stdout = r.stdout.replace('dn: cn=boss,ou=users,dc=takldap\n',
+                                        'dn: cn=boss,ou=users,dc=takldap\n'
+                                        'memberOf: cn=tak_ROLE_ADMIN,ou=groups,dc=takldap\n')
+        return r
+    box.run = run
+    assert box.recycle() is False
+    assert box.leaf_certs == ['zed']
+
+
+def test_no_user_to_check_with_is_said_and_does_not_restart():
+    box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, subs=[sess(1, 'admin', ('A',))],
+              ldap=lambda b: (0, 0))
+    box.request('PgBouncer image swap', need_groups=False)
+    assert box.recycle() is False
+    assert box.restarts() == [] and box.leaf_certs == []
+    assert any('HTTPS/API side NOT checked: no non-admin LDAP user with TAK groups' in l for l in box.log)
+    assert not any('no TAK Server restart needed' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients fine, no restart (HTTPS not checked)'
+
+
+def test_https_no_answer_is_unknown_not_a_restart():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='down')
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any("HTTPS/API side NOT checked: TAK's API didn't answer" in l for l in box.log)
+
+
+def test_cert_that_cant_be_made_is_unknown_not_a_restart():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+
+    def no_ca(cn, workdir):
+        raise RuntimeError('CoreConfig has no enrollment CA (TAKServerCAConfig)')
+    box.leaf_cert = no_ca
+    assert box.recycle() is False
+    assert box.restarts() == [] and box.workdirs == []
+    assert any("couldn't make a test cert for ADSB_PS: CoreConfig has no enrollment CA" in l for l in box.log)
+
+
+def test_group_tak_already_reports_is_used_so_a_fresh_portal_add_cannot_restart_tak():
+    # Matt 2026-10-21: a group added in TAK Portal reaches TAK's group cache later. Creating
+    # in a group TAK already gives the user keeps that lag from looking like a broken TAK.
+    box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, subs=[sess(1, 'matt')], ldap_users={'matt': 1})
+    real = box.run
+
+    def run(cmd, **kw):                            # LDAP: matt is in AAA-NEW (just added) and OPS
+        r = real(cmd, **kw)
+        if cmd[0] == 'ldapsearch' and 'dn: cn=matt,' in (r.stdout or ''):
+            r.stdout = r.stdout.replace('memberOf: cn=tak_OPS', 'memberOf: cn=tak_AAA-NEW,ou=groups,dc=takldap\n'
+                                        'memberOf: cn=tak_OPS')
+        return r
+    box.run = run
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert 'group=OPS' in [u for _, m, u in box.user_api if m == 'PUT'][0]
+
+
+def test_test_mission_left_by_a_failed_user_delete_is_deleted_as_admin():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    orig = box.user_req
+    box.user_req = lambda c, k, u, m='GET', t=20: (403, None) if m == 'DELETE' else orig(c, k, u, m, t)
+    real_marti = box.marti
+    admin_deletes = []
+
+    def marti(url, timeout=12, method='GET', json_body=None):
+        if method == 'DELETE' and '/missions/' in url:
+            admin_deletes.append(url)
+            return True, None
+        return real_marti(url, timeout, method, json_body)
+    box.marti = marti
+    assert box.recycle() is False
+    assert len(admin_deletes) == 1 and 'infratak-ldap-check-' in admin_deletes[0]
+    assert not any("couldn't delete test mission" in l for l in box.log)
+
+
+def test_leaf_cert_is_signed_by_the_enrollment_ca_with_no_password_in_argv(tmp_path):
+    cc = ('<Configuration><certificateSigning CA="TAKServer"/><TAKServerCAConfig keystore="JKS" '
+          'keystoreFile="certs/files/INT-CA-14-signing.jks" keystorePass="ca-secret" validityDays="30"/>'
+          '</Configuration>')
+    reads, runs = [], []
+
+    def run(cmd, **kw):
+        runs.append((list(cmd), kw.get('env', {}).get('TAK_CA_PASS')))
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+    ns = {'re': re, 'os': os, 'subprocess': types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
+          'secrets': types.SimpleNamespace(randbits=lambda n: 12345),
+          '_read_priv': lambda p: cc if p == '/opt/tak/CoreConfig.xml' else None,
+          '_read_priv_bytes': lambda p: reads.append(p) or b'PEM',
+          '_get_tak_cert_password': lambda s: 'wrong', 'load_settings': dict,
+          '_TAK_API_CHECK_EKU': 'clientAuth,1.2.840.113549.1.9.7'}
+    exec(compile(_src('_tak_user_leaf_cert'), 'app.py:_tak_user_leaf_cert', 'exec'), ns)
+    crt, key = ns['_tak_user_leaf_cert']('aj5cacor', str(tmp_path))
+    assert reads == ['/opt/tak/certs/files/INT-CA-14.pem', '/opt/tak/certs/files/INT-CA-14.key']
+    assert crt.startswith(str(tmp_path)) and key.startswith(str(tmp_path))
+    for f in ('ca.pem', 'ca.key', 'ext.cnf'):
+        assert (tmp_path / f).stat().st_mode & 0o777 == 0o600
+    assert 'extendedKeyUsage=clientAuth,1.2.840.113549.1.9.7' in (tmp_path / 'ext.cnf').read_text()
+    (req, _), (sign, pw) = runs
+    assert req[:2] == ['openssl', 'req'] and '/CN=aj5cacor/O=infra-TAK/OU=LDAP check' in req
+    assert sign[:3] == ['openssl', 'x509', '-req'] and sign[sign.index('-passin') + 1] == 'env:TAK_CA_PASS'
+    assert pw == 'ca-secret' and not any('ca-secret' in a for c, _ in runs for a in c)
+    assert sign[sign.index('-days') + 1] == '1'
+    for bad in ('x/CN=admin', 'a b', '', '-rf', 'é'):
+        with pytest.raises(RuntimeError):
+            ns['_tak_user_leaf_cert'](bad, str(tmp_path))
+
+
+def test_https_check_code_is_argv_not_shell():
+    for name in ('_tak_user_leaf_cert', '_tak_user_marti_req', '_tak_api_user_check_once', '_tak_api_user_check'):
+        assert 'shell=True' not in _src(name), name
+
+
 # ── fallback: TAK restart ───────────────────────────────────────────────────────────
 
 def test_client_back_empty_twice_falls_back_to_one_restart_and_waits_for_the_ports():
@@ -461,16 +740,57 @@ def test_client_back_empty_twice_falls_back_to_one_restart_and_waits_for_the_por
 def test_tak_api_unreadable_falls_back_to_restart():
     box = outage_box(tak_start=T0 - 3 * 24 * HOUR, api_ok=False)
     box.request('PgBouncer image swap')
+    t_heal = []
+    real = box.marti
+
+    def marti(url, timeout=12, method='GET', json_body=None):
+        if url.endswith('/subscriptions/all') and not box.restarts():
+            t_heal.append(box.t)
+        return real(url, timeout, method, json_body)
+    box.marti = marti
     assert box.recycle() is True
-    assert any("can't read TAK Server's client connections" in l for l in box.log)
+    # GH #207: only after the client list stayed unreadable for the whole wait, and the
+    # reason says why it couldn't be read
+    assert t_heal[-1] - t_heal[0] >= _const('_TAK_MARTI_READ_WAIT_S')
+    assert any("can't read TAK Server's client connections (Marti API: curl_exit_7) for 5 min" in l
+               and 'falling back to restarting' in l for l in box.log)
+
+
+def test_gh207_briefly_busy_marti_api_is_retried_not_a_restart():
+    # Amos, v10.2.23 → v10.2.24: LDAP had settled, the client-list read didn't answer in
+    # time once, and TAK Server was restarted for it. Now it is read again, backing off.
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, api_busy=2)
+    box.request('PgBouncer image swap')
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:16']
+    tries = [l for l in box.log if "can't read TAK Server's client connections yet (Marti API: curl_exit_28)" in l]
+    assert len(tries) == 2 and 'trying again in 10s' in tries[0] and 'trying again in 20s' in tries[1]
+    assert any("Marti API answered after" in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
+
+
+def test_marti_read_backoff_is_capped_and_the_wait_bounded():
+    box = Box(tak_start=T0)
+    ns = box.ns()
+    box.api_ok = False
+    t0 = box.t
+    sessions, err = ns['_tak_client_sessions_wait'](box.log.append, 'tag')
+    assert sessions is None and err == 'curl_exit_7'
+    waits = [int(re.search(r'trying again in (\d+)s', l).group(1)) for l in box.log]
+    assert waits[:4] == [10, 20, 40, 60] and max(waits) == _const('_TAK_MARTI_READ_RETRY_MAX_S')
+    assert sum(waits) == _const('_TAK_MARTI_READ_WAIT_S') and box.t - t0 == sum(waits)
 
 
 def test_changed_credential_restarts_tak_without_trying_a_heal():
     box = outage_box(tak_start=T0 - 3 * 24 * HOUR)
     box.request('PgBouncer image swap', restart=True)
     assert box.recycle() is True
-    assert box.api == [] and len(box.restarts()) == 1
+    # no heal: nothing re-authenticated or dropped, only the HTTPS check after the restart reads TAK
+    assert [m for m, _, _ in box.api] == ['GET'] and len(box.restarts()) == 1
+    assert box.drops() == [] and box.reauths() == []
     assert any("LDAP credential changed" in l for l in box.log)
+    assert any('✓ TAK LDAP recycle: after the restart: HTTPS as' in l for l in box.log)
     assert 'restart' not in box.settings['tak_ldap_recycle']
 
 
@@ -601,6 +921,96 @@ def test_no_local_outpost_container_does_nothing():
     box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=None)
     assert box.recycle() is False
     assert box.restarts() == [] and box.api == []
+
+
+# ── GH #207: Guard Dog restarting Authentik under a running TAK ─────────────────────
+
+def nodered_feed(n, cn):
+    """A Node-RED feed that connected while LDAP was down: no DN, no user, no device uid."""
+    return sess(n, cn, (), unmapped=True, client='')
+
+
+def test_gh207_guard_dog_authentik_restart_is_healed_by_the_periodic_check():
+    # Amos: TAK restarted 18:16 by the update; Guard Dog's authentik-watch restarted
+    # Authentik at 18:51 (server+worker first, so the outpost start may not move); Node-RED
+    # feeds and devices that connected meanwhile stayed on __ANON__ until Node-RED was
+    # restarted by hand. The console's 10-min check now heals them without a TAK restart.
+    box = outage_box(tak_start=T0 - 40 * 60, ldap_start=T0 - 5 * HOUR, gd_restart=T0 - 5 * 60)
+    box.subs.append(nodered_feed(17, 'nodered-global-earthquake'))
+    box.ldap_users['nodered-global-earthquake'] = 1
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.restarts() == []
+    assert sorted(box.drops()) == ['tls:16', 'tls:17']
+    assert any('Guard Dog restarted Authentik while TAK Server was running (TAK up 0h35m' in l for l in box.log)
+    assert box.live('takdev-emu')[0]['groups'] and box.live('nodered-global-earthquake')[0]['groups']
+    # the feed can't be matched to its next connection: said as such, not as "offline?"
+    assert any('1 dropped with no user and no device id (feeds such as Node-RED' in l for l in box.log)
+    assert not any("didn't reconnect" in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['healed_gd_restart'] == T0 - 5 * 60 and st['last_trigger'] == 'periodic LDAP outage check'
+    # the next tick finds that restart already healed: silent, no Marti calls
+    n, logs = len(box.api), len(box.log)
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert len(box.api) == n and len(box.log) == logs
+    # ...a NEW Guard Dog restart is healed again
+    box.gd_restart = box.t - 60
+    box.recycle(trigger='periodic LDAP outage check', final=False)
+    assert len(box.api) > n
+
+
+def test_guard_dog_restart_before_tak_started_or_at_its_start_is_ignored():
+    for gap in (-HOUR, 0, _const('_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S') - 1):
+        box = outage_box(tak_start=T0 - 2 * HOUR, ldap_start=T0 - 3 * HOUR, gd_restart=T0 - 2 * HOUR + gap)
+        assert box.recycle(trigger='periodic LDAP outage check', final=False) is False, gap
+        assert box.api == [] and box.restarts() == []
+
+
+def test_guard_dog_history_is_ignored_with_remote_authentik():
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=None, gd_restart=T0 - HOUR)
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.api == [] and box.restarts() == []
+
+
+def test_guard_dog_restart_during_a_console_update_waits_for_its_end():
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - 5 * 24 * HOUR, gd_restart=T0 - 60,
+                     update_in_progress=True)
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.api == [] and box.settings['tak_ldap_recycle']['pending']
+    box.t += 300
+    assert box.recycle(final=True) is False
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    # the kept reason and the same Guard Dog restart, found again, are one reason
+    line = [l for l in box.log if 'TAK Server ran through an LDAP outage' in l][-1]
+    assert line.count('Guard Dog restarted Authentik') == 1
+
+
+def test_ldap_not_checkable_is_said_once_per_outage():
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - HOUR, gd_restart=T0 - HOUR)
+    ns = box.ns()
+    ns['_ensure_ldapsearch'] = lambda: False
+    ns['_tak_recycle_after_ldap_outage'](box.log.append, 'periodic LDAP outage check', check_outpost=True)
+    said = [l for l in box.log if "can't check LDAP" in l]
+    ns['_tak_recycle_after_ldap_outage'](box.log.append, 'periodic LDAP outage check', check_outpost=True)
+    assert len(said) == 1 and len([l for l in box.log if "can't check LDAP" in l]) == 1
+    assert box.restarts() == []
+
+
+def test_guard_dog_restart_history_is_read_from_its_file(tmp_path):
+    ns = {'_GD_AUTHENTIK_RESTART_HIST': str(tmp_path / 'authentik_restart_history')}
+    exec(compile(_src('_guarddog_authentik_restart_epoch'), 'app.py', 'exec'), ns)
+    f = ns['_guarddog_authentik_restart_epoch']
+    assert f() is None                                   # no Guard Dog / never restarted
+    (tmp_path / 'authentik_restart_history').write_text('1792546000\n1792549600\n\ngarbage\n1792548000\n')
+    assert f() == 1792549600.0
+    (tmp_path / 'authentik_restart_history').write_text('')
+    assert f() is None
+    # the path Guard Dog writes (tak-authentik-watch.sh RESTART_HIST under STATE_DIR)
+    assert re.search(r"^_GD_AUTHENTIK_RESTART_HIST = '/var/lib/takguard/authentik_restart_history'$", APP, re.M)
+    with open(os.path.join(REPO, 'scripts', 'guarddog', 'tak-authentik-watch.sh')) as g:
+        watch = g.read()
+    assert 'STATE_DIR="/var/lib/takguard"' in watch and 'RESTART_HIST="$STATE_DIR/authentik_restart_history"' in watch
+    assert '{ awk -v c="$cutoff"' in watch and 'echo "$now"; } > "$RESTART_HIST.tmp"' in watch
 
 
 # ── nothing to do / can't do ────────────────────────────────────────────────────────
