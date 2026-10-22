@@ -74386,7 +74386,7 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': []}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
 
 
 def _tak_server_cert_names(settings):
@@ -75366,6 +75366,7 @@ def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
     job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
         return jsonify({'job': job, 'status': None})
@@ -75395,7 +75396,7 @@ def takserver_server_cert_fix():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[])
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
 
     def do_fix():
         log = tak_server_cert_job['log'].append
