@@ -75503,7 +75503,12 @@ def takserver_create_client_cert():
         return jsonify({'error': 'Name too long (max 64 chars)'}), 400
 
     cert_dir = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(cert_dir, f'{cert_name}.p12')):
+    # ops #169: makeCert.sh client NAME writes NAME.key/.pem/.p12 over whatever is there, so a
+    # name that is a CA's (ca, INT-CA-09, …-signing, …-do-not-share) would overwrite CA files.
+    if (cert_name in _NOT_CLIENT_CERT_NAMES or _is_ca_private_material(f'{cert_name}.p12')
+            or cert_name.lower().startswith('truststore-')):
+        return jsonify({'error': f'"{cert_name}" is reserved for TAK Server and CA files'}), 400
+    if any(os.path.exists(os.path.join(cert_dir, f'{cert_name}{ext}')) for ext in ('.p12', '.pem', '.key')):
         return jsonify({'error': f'Certificate "{cert_name}" already exists'}), 400
 
     def _normalize_groups(values):
@@ -75620,11 +75625,59 @@ def _is_client_cert_pem(pem):
 def _client_cert_pem_or_none(name):
     if name in _NOT_CLIENT_CERT_NAMES or not _CLIENT_CERT_NAME_RE.match(name or ''):
         return None
+    # ops #169: a CA:FALSE leaf left as INT-CA-NN-signing.pem/.key by the old Rotate CA bug
+    # passed the leaf test, and the package then zipped INT-CA-NN-signing.p12 — the CA's own
+    # signing keystore. Any name whose .p12 is CA material is never a client cert here.
+    if _is_ca_private_material(f'{name}.p12'):
+        return None
     try:
         pem = _cert_file_bytes(os.path.join(_CERT_FILES_DIR, f'{name}.pem')).decode(errors='replace')
     except Exception:
         return None
     return pem if _is_client_cert_pem(pem) else None
+
+
+def _cert_pubkey(pem):
+    """The public key of a PEM certificate, or b'' when it can't be read."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-pubkey'], input=pem.encode(),
+                           capture_output=True, timeout=10)
+    except Exception:
+        return b''
+    return r.stdout.strip() if r.returncode == 0 else b''
+
+
+def _private_key_pubkey(data, password, p12=False):
+    """The public half of the private key in a PEM .key, or in a .p12 holding exactly one key.
+    b'' when it can't be read — the caller treats that as "does not match". The password
+    travels in the environment, never argv."""
+    import tempfile as _tf
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-keychk-') as td:
+            os.chmod(td, 0o700)
+            path = os.path.join(td, 'in')
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(data)
+            if not p12:
+                r = subprocess.run(['openssl', 'pkey', '-in', path, '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                                   capture_output=True, env=env, timeout=10)
+                return r.stdout.strip() if r.returncode == 0 else b''
+            # makeCert.sh writes RC2-40 .p12, which OpenSSL 3 opens only with -legacy.
+            for extra in ([], ['-legacy']):
+                r = subprocess.run(['openssl', 'pkcs12', '-in', path, '-nocerts', '-nodes',
+                                    '-passin', 'env:ITK_P12_PASS'] + extra,
+                                   capture_output=True, env=env, timeout=10)
+                if r.returncode == 0 and b'PRIVATE KEY-----' in r.stdout:
+                    break
+            else:
+                return b''
+            if r.stdout.count(b'-----BEGIN ') != 1:
+                return b''
+            r = subprocess.run(['openssl', 'pkey', '-pubout'], input=r.stdout, capture_output=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else b''
+    except Exception:
+        return b''
 
 
 def _modern_p12(pem_path, key_path, chain_pem, name, password):
@@ -75690,9 +75743,21 @@ def takserver_client_cert_package(name):
     except Exception:
         root = ''
     chain = ca.strip() + '\n' + (root.strip() + '\n' if root.strip() and root.strip() != ca.strip() else '')
+    settings = load_settings()
+    password = _get_tak_cert_password(settings)
+    # ops #169: only private keys that belong to THIS cert go in the zip. A .key or .p12 sitting
+    # next to the .pem under the same name is not proof — check the key against the cert.
+    pub = _cert_pubkey(pem)
+    if not pub or _private_key_pubkey(key, password) != pub:
+        audit('integration_package_refused', f'cert={name} reason=key-mismatch')
+        return jsonify({'error': f'The private key for "{name}" does not match its certificate; '
+                                 'no package was built'}), 409
     try:
         legacy_p12 = _cert_file_bytes(os.path.join(d, f'{name}.p12'))
     except Exception:
+        legacy_p12 = b''
+    if legacy_p12 and _private_key_pubkey(legacy_p12, password, p12=True) != pub:
+        audit('integration_package_p12_skipped', f'cert={name} reason=key-mismatch')
         legacy_p12 = b''
     trust = next((f for f in sorted(os.listdir(d))
                   if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
@@ -75700,9 +75765,8 @@ def takserver_client_cert_package(name):
         trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
     except Exception:
         trust_p12 = b''
-    settings = load_settings()
     modern_p12 = _modern_p12(os.path.join(d, f'{name}.pem'), os.path.join(d, f'{name}.key'),
-                             chain, name, _get_tak_cert_password(settings))
+                             chain, name, password)
     host = _get_takserver_host(settings) or (settings.get('server_ip') or '').strip() or '<this server>'
 
     files = []  # (zip name, bytes, README line)
