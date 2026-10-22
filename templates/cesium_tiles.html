@@ -92,7 +92,7 @@ Enable Cesium 3D Tiles
 <div>
 <span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--text-primary)">{% if ct.get('running') %}Active{% else %}Not running{% endif %}</span>
 {% if settings.get('fqdn') %}
-<span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ ct_domain }}</code></span>
+<span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ pub_host(ct_domain) }}</code></span>
 {% endif %}
 </div>
 <div style="display:flex;gap:8px;margin-left:auto">
@@ -227,7 +227,7 @@ This cannot be undone. Back up any datasets you want to keep before continuing.
 <div class="step-item"><div class="step-num">1</div><div class="step-text">Open ATAK and launch the <strong>Map Manager</strong></div></div>
 <div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>MOBILE</strong> tab</div></div>
 <div class="step-item"><div class="step-num">3</div><div class="step-text">Select the <strong>Down Arrow</strong>, then the <strong>Add (+)</strong> button</div></div>
-<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <span class="step-code">tileset.json</span> — e.g. <span class="step-code">https://{{ ct_domain }}/my-dataset/tileset.json</span><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <span class="step-code">tileset.json</span> — e.g. <span class="step-code">https://{{ pub_host(ct_domain) }}/my-dataset/tileset.json</span><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
 <div class="step-item"><div class="step-num">5</div><div class="step-text">If the connection succeeds, a window shows available services. <strong>Click the checkbox</strong> next to the tileset to import it.</div></div>
 <div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <span class="step-code">atak/3dtilescache/</span>.</div></div>
 </div>
@@ -239,7 +239,7 @@ This cannot be undone. Back up any datasets you want to keep before continuing.
 <div id="toast" class="toast"></div>
 <script>
 var _pendingFiles=null,_pendingZip=null,_uploadMode=null;
-var _ctBaseUrl='{% if settings.get("fqdn") %}https://{{ ct_domain }}{% else %}{% endif %}';
+var _ctBaseUrl='{% if settings.get("fqdn") %}https://{{ pub_host(ct_domain) }}{% else %}{% endif %}';
 function enableModule(){
     document.getElementById('enable-btn').disabled=true;
     document.getElementById('enable-status').textContent='Enabling…';

@@ -146,7 +146,7 @@
   <div class="url-row"><span class="url-label">RTSPS</span><span class="url-val">rtsps://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8555/&lt;stream&gt;</span></div>
   <div class="url-row"><span class="url-label">SRT</span><span class="url-val">srt://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:8890?streamid={% if pub_pass %}read{% else %}publish{% endif %}:&lt;stream&gt;</span></div>
   <div class="url-row"><span class="url-label">RTMP</span><span class="url-val">rtmp://{{ tvr_host or fqdn or server_ip or '&lt;host&gt;' }}:1935/&lt;stream&gt;</span></div>
-  {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ tvr_host }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
+  {% if fqdn %}<div class="url-row"><span class="url-label">HLS ABR</span><span class="url-val">https://{{ pub_host(tvr_host) }}/hls/&lt;stream&gt;/master.m3u8</span></div>{% endif %}
 </div>
 
 <div class="card">

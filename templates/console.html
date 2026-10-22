@@ -831,6 +831,10 @@ function renderOsUpdates(d){
     }
     if(d.reboot_required)parts.push('A reboot is needed afterwards to finish.');
     parts.push('Clients reconnect on their own, but pick a quiet moment if you are mid-operation.');
+    // A package source that could not be read means this list may be short.
+    var sk=d.skipped_repos||[];
+    if(sk.length)parts.push('<span style="color:var(--yellow)">Could not read '+escapeHtml(sk.join(', '))+
+        ' &mdash; updates from '+(sk.length===1?'that source':'those sources')+' are not listed.</span>');
     var pl=document.getElementById('osupd-plain');
     if(pl)pl.innerHTML=parts.join(' ');
     // Per-service impact lines — the "what does this actually cost me" answer.
