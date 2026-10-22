@@ -39,6 +39,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -199,8 +200,10 @@ def test_no_write_open_or_chmod_of_the_lock_left():
 
 # ── the console's lock helper ────────────────────────────────────────────────
 
-_LOCK_FUNCS = ('_ak_compose_lock_path', '_authentik_compose_lock', '_ak_compose_run_locked')
-_LOCK_CONSTS = ('_AK_COMPOSE_LOCK_PATH', '_AK_COMPOSE_LOCK_WAIT_S', '_AK_COMPOSE_LOCK_WAIT_LONG_S')
+_LOCK_FUNCS = ('_ak_compose_lock_path', '_authentik_compose_lock', '_ak_compose_run_locked',
+               '_ak_compose_lock_busy_msg', '_ak_compose_subprocess', '_ak_module_compose')
+_LOCK_CONSTS = ('_AK_COMPOSE_LOCK_PATH', '_AK_COMPOSE_LOCK_WAIT_S', '_AK_COMPOSE_LOCK_WAIT_LONG_S',
+                '_AK_COMPOSE_LOCK_HELD', '_AK_COMPOSE_LOCK_BUSY_RC')
 
 
 @pytest.fixture
@@ -234,13 +237,29 @@ def console(tmp_path):
             raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
         return types.SimpleNamespace(returncode=0, stdout='', stderr='')
 
-    ns = {'os': os, 'contextlib': contextlib, 'time': time, '_sudo_wrap': lambda c: list(c),
+    def module_run(cfg, cmd, **kw):
+        ran.append((cmd, cfg.get('target_mode'), _held()))
+        return True, ''
+
+    def _held():
+        with open(lock) as other:
+            try:
+                fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(other.fileno(), fcntl.LOCK_UN)
+                return False
+            except OSError:
+                return True
+
+    ns = {'os': os, 'contextlib': contextlib, 'time': time, 'threading': threading,
+          '_sudo_wrap': lambda c: list(c), '_module_run': module_run,
           'subprocess': types.SimpleNamespace(run=run, PIPE=-1, STDOUT=-2,
-                                              TimeoutExpired=subprocess.TimeoutExpired)}
+                                              TimeoutExpired=subprocess.TimeoutExpired,
+                                              CompletedProcess=subprocess.CompletedProcess,
+                                              CalledProcessError=subprocess.CalledProcessError)}
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     ns['_AK_COMPOSE_LOCK_PATH'] = str(lock)
     console = types.SimpleNamespace(ns=ns, lock=lock, ran=ran, logged=logged, raise_in_run=False,
-                                    plog=logged.append)
+                                    plog=logged.append, held=_held)
     return console
 
 
@@ -295,14 +314,24 @@ def test_long_wait_outlasts_the_updates_own_hold():
 _MUTATING = {'up', 'down', 'restart', 'stop', 'start', 'rm'}
 
 
+# ops #178: drop-in wrappers that run their command under the lock.
+_LOCKED_RUNNERS = {'_ak_compose_subprocess', '_ak_compose_run_locked', '_ak_module_compose'}
+
+
 def _lock_withs(fn):
     return [w for w in ast.walk(fn) if isinstance(w, ast.With) and any(
         isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, 'id', '') == '_authentik_compose_lock'
         for i in w.items)]
 
 
+def _locked_spans(fn):
+    return [(w.lineno, w.end_lineno) for w in _lock_withs(fn)] + [
+        (c.lineno, c.end_lineno) for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and getattr(c.func, 'id', '') in _LOCKED_RUNNERS]
+
+
 def _unlocked_compose(fn, within=None):
-    spans = [(w.lineno, w.end_lineno) for w in _lock_withs(fn)]
+    spans = _locked_spans(fn)
     out = []
     for node in ast.walk(within or fn):
         if (isinstance(node, ast.List) and len(node.elts) >= 3

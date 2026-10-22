@@ -131,6 +131,9 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
         '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False: calls.append(
             ['tak-recycle-request', reason, need_groups, restart]),
     }
+    # ops #178: the compose calls go through the locked runner; the lock is stubbed above.
+    ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
+    ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
