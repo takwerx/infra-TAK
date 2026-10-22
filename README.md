@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.24-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.24-alpha)**
+**Current release: [v10.2.25-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.25-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.25-alpha — 2026-10-21 — Hotfix: Node-RED feeds and TAK clients get their groups back after an update or Authentik restart; Node-RED on the newest Node 22; Rotate Intermediate CA keeps older CAs trusted
+
+**Headline: after the v10.2.24 update, some Node-RED feeds and TAK clients stayed on `__ANON__` (no groups) until Node-RED or TAK Server was restarted by hand. The console now retries a busy TAK API instead of restarting TAK Server, and heals those connections within about 10 minutes, including after Guard Dog restarts Authentik. Also: Node-RED moves to Node.js 22.23.4 (the Oct 21 security release), the LDAP check also covers TAK's HTTPS/API side (missions and Data Sync), and Rotate Intermediate CA no longer drops older CAs from the truststore.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.25-alpha))
+
+**Node-RED feeds and TAK clients on `__ANON__` (hotfix, GH #207).** The post-update LDAP check read TAK Server's client list once, and if TAK's API was still busy it restarted TAK Server. Nothing healed clients that reconnected while Guard Dog restarted Authentik, so feeds stayed on `__ANON__`. Now the read is retried for up to 5 minutes before any restart, and the console's 10-minute monitor heals empty connections after any LDAP outpost or Guard Dog Authentik restart, without restarting TAK Server. The `__ANON__` email now names the likely cause and says the console reconnects these by itself.
+
+**Security: Node-RED on Node 22.23.4.** Node-RED is pinned to `nodered/node-red:4.1.17-22`, built on Node.js 22.23.4. Update moves existing installs onto it; Configurator configs are kept.
+
+**Also in this release.**
+- **TAK LDAP check covers HTTPS/API:** after an LDAP outage the console also checks, as a normal LDAP user with a short-lived cert, that TAK's API returns their groups and can create and delete a mission. If streaming clients are fine but the API side lost its groups (empty mission lists, `403` on create), TAK Server is restarted once.
+- **Rotate Intermediate CA (GH #204):** the new truststore keeps every CA the live truststore trusts, dropping only expired ones, so clients holding certs from older intermediates keep working after repeated rotations. The rotation log warns about live certs whose CA is no longer trusted.
 
 ### v10.2.24-alpha — 2026-10-21 — Security: TAK Portal and Remote Assist on the newest Node 22; TAK clients get their LDAP groups back without a restart; Remote Assist Update keeps its database password
 
