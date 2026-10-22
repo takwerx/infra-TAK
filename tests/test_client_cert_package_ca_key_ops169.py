@@ -25,6 +25,7 @@ the live intermediate.
 
 import ast
 import datetime
+import html
 import io
 import os
 import pathlib
@@ -42,7 +43,8 @@ TREE = ast.parse(APP)
 PASSWORD = 'atakatak'
 
 FUNCS = ('_is_ca_private_material', '_cert_file_bytes', '_is_client_cert_pem', '_client_cert_pem_or_none',
-         '_cert_pubkey', '_private_key_pubkey', '_modern_p12', 'takserver_client_certs',
+         '_cert_pubkey', '_private_key_pubkey', '_modern_p12', '_rotate_coreconfig_truststore',
+         '_pem_cn_and_expiry', '_is_int_truststore_p12', '_live_truststore_p12', 'takserver_client_certs',
          'takserver_client_cert_package', 'takserver_create_client_cert')
 
 
@@ -127,11 +129,12 @@ def certs(tmp_path):
 @pytest.fixture
 def client(certs):
     audits = []
-    ns = {'os': os, 're': re, 'subprocess': subprocess, 'datetime': datetime.datetime,
+    ns = {'os': os, 're': re, 'html': html, 'subprocess': subprocess, 'datetime': datetime.datetime,
           'jsonify': flask.jsonify, 'request': flask.request, 'VERSION': 'test',
           '_CERT_FILES_DIR': str(certs), '_CLIENT_CERT_NAME_RE': re.compile(r'^[A-Za-z0-9._-]{1,64}$'),
           '_NOT_CLIENT_CERT_NAMES': {'takserver', 'ca', 'root-ca'},
           '_read_priv_bytes': lambda p: open(p, 'rb').read(),
+          '_read_priv': lambda p: '',
           'load_settings': lambda: {'server_ip': '203.0.113.5'},
           '_get_tak_cert_password': lambda s: PASSWORD,
           '_get_takserver_host': lambda s: 'tak.example.com',
