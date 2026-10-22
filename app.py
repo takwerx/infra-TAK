@@ -75953,6 +75953,42 @@ def _cert_file_bytes(path):
         return _read_priv_bytes(path)
 
 
+def _is_int_truststore_p12(f):
+    return f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f
+
+
+def _live_truststore_p12(cert_dir=None):
+    """The truststore-<CA>.p12 of the intermediate TAK Server uses now, or ''.
+    ops #170: Rotate CA leaves every earlier truststore-INT-CA-NN.p12 behind, and taking the
+    first one alphabetically handed out INT-CA-01 on a box running INT-CA-14. CoreConfig's
+    <tls> truststoreFile names the live CA, ca.pem's CN is the fallback, and a lone candidate
+    is unambiguous. Between several, never guess."""
+    d = cert_dir or _CERT_FILES_DIR
+    try:
+        have = set(os.listdir(d))
+    except OSError:
+        return ''
+    wanted = []
+    try:
+        ts, _pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
+        base = os.path.basename(ts)
+        if base.endswith('.jks'):
+            wanted.append(base[:-4] + '.p12')
+    except Exception:
+        pass
+    try:
+        cn, _end = _pem_cn_and_expiry(_cert_file_bytes(os.path.join(d, 'ca.pem')).decode(errors='replace'))
+        if cn:
+            wanted.append(f'truststore-{cn}.p12')
+    except Exception:
+        pass
+    for f in wanted:
+        if f in have and _is_int_truststore_p12(f):
+            return f
+    cands = [f for f in have if _is_int_truststore_p12(f)]
+    return cands[0] if len(cands) == 1 else ''
+
+
 def _is_client_cert_pem(pem):
     """True only for a leaf client cert: CA:FALSE and clientAuth WITHOUT serverAuth. The server
     cert (both EKUs), the CAs and anything unreadable are refused."""
@@ -76103,8 +76139,7 @@ def takserver_client_cert_package(name):
     if legacy_p12 and _private_key_pubkey(legacy_p12, password, p12=True) != pub:
         audit('integration_package_p12_skipped', f'cert={name} reason=key-mismatch')
         legacy_p12 = b''
-    trust = next((f for f in sorted(os.listdir(d))
-                  if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
+    trust = _live_truststore_p12(d)
     try:
         trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
     except Exception:
@@ -84702,11 +84737,10 @@ def download_user_cert():
 @login_required
 def download_truststore():
     p = '/opt/tak/certs/files'
-    if os.path.exists(p):
-        for f in os.listdir(p):
-            if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f:
-                # truststore-*.p12 is 0600 tak:tak too (GH #52) — same privileged read.
-                return _send_cert_file_priv(p, f)
+    f = _live_truststore_p12(p)  # ops #170: the live CA's, not whichever listdir returns first
+    if f:
+        # truststore-*.p12 is 0600 tak:tak too (GH #52) — same privileged read.
+        return _send_cert_file_priv(p, f)
     return jsonify({'error': 'truststore not found'}), 404
 
 
