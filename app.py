@@ -74386,7 +74386,7 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': []}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
 
 
 def _tak_server_cert_names(settings):
@@ -75366,6 +75366,7 @@ def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
     job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
         return jsonify({'job': job, 'status': None})
@@ -75395,7 +75396,7 @@ def takserver_server_cert_fix():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[])
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
 
     def do_fix():
         log = tak_server_cert_job['log'].append
@@ -75404,12 +75405,22 @@ def takserver_server_cert_fix():
         files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
         backed = []
 
+        # The same shell-string runner the CA rotations use: _rotate_reissue_cert() hands it
+        # `cd … && echo "y" | runuser -u tak -- makeCert.sh …` and mv/rm/cp strings. NOT
+        # _rotate_sh(): ops #163 made that one argv-only (`runuser -u tak -- <argv>`), so a
+        # string reached runuser one character at a time — "runuser: failed to execute c"
+        # on test12, 2026-10-22 (the backup step refused, nothing changed).
         def run(cmd, check=True):
-            ok, out = _rotate_sh(cmd, timeout=180)  # container-aware, same runner as the CA rotations
-            if check and not ok:
-                log(f"  ✗ {(out or '').strip()[:200]}")
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
                 return False
-            return True
 
         def restore():
             ok = all(run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed)
