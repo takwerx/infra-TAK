@@ -90818,9 +90818,28 @@ _CONSOLE_RESTART_SCRIPT = r'''#!/bin/bash
 # bouncing it. If it answers "not safe" we defer to the next cycle. If it does
 # NOT answer within the timeout it is almost certainly wedged -- which is
 # EXACTLY when a restart is wanted -- so we proceed.
+#
+# Fresh-console skip (ops #171): a console that started minutes ago is still
+# importing app.py and running its startup migrations, so it does not answer
+# :5001 either -- and the gate above read that as "wedged" and killed it
+# mid-migration (aws-arm, 2026-10-22: a catch-up run 2 s into boot cut off the
+# CloudTAK container recreate). A console that young has fresh workers and
+# runs the code on disk, which is all this restart is for, so skip it.
 set -u
 TAG=tak-console-restart
 log() { logger -t "$TAG" -- "$*" 2>/dev/null; echo "$(date -u +%FT%TZ) [$TAG] $*"; }
+
+# Covers the synchronous startup migrations plus the post-import threads that
+# wait up to 20 min (_STARTUP_IMPORT_DONE) before touching compose.
+MIN_UPTIME_S=1800
+MAIN_PID="$(systemctl show -p MainPID --value takwerx-console.service 2>/dev/null)"
+if [ -n "${MAIN_PID:-}" ] && [ "$MAIN_PID" != "0" ]; then
+    UP_S="$(ps -o etimes= -p "$MAIN_PID" 2>/dev/null | tr -d ' ')"
+    if [ -n "${UP_S:-}" ] && [ "$UP_S" -lt "$MIN_UPTIME_S" ] 2>/dev/null; then
+        log "skipped -- console started ${UP_S}s ago (startup may still be running; a fresh console needs no restart); next cycle will retry"
+        exit 0
+    fi
+fi
 
 # Port = whatever the console unit actually binds, so this works regardless of
 # install dir (/root/infra-TAK, the OG /home/takwerx/infra-TAK, ...). Fall back to 5001.
@@ -90875,15 +90894,16 @@ def _ensure_console_restart_timer():
             f'ExecStart={script_path}\n'
         )
         # RandomizedDelaySec spreads the fleet's 04:00 restarts so customers
-        # don't all bounce in lockstep; Persistent catches a missed window
-        # (box powered off at 04:00) on next boot.
+        # don't all bounce in lockstep. No Persistent=true (ops #171): a box
+        # that was off at 04:00 boots a fresh console anyway, so the catch-up
+        # run had nothing to do except fire seconds into that console's
+        # startup and kill it mid-migration.
         tmr_content = (
             '[Unit]\n'
             'Description=Restart infra-TAK console daily at 04:00 (recover wedged worker, load pulled code)\n\n'
             '[Timer]\n'
             'OnCalendar=*-*-* 04:00:00\n'
             'RandomizedDelaySec=1800\n'
-            'Persistent=true\n'
             'Unit=takconsolerestart.service\n\n'
             '[Install]\n'
             'WantedBy=timers.target\n'
