@@ -62490,9 +62490,17 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
 # user, with a throwaway cert, and does what ATAK's Data Sync does.
 _TAK_API_CHECK_EKU = 'clientAuth,1.2.840.113549.1.9.7'   # what TAK's enrollment puts on ATAK certs
 _TAK_API_CHECK_TOOL = 'infratak-check'   # not 'public': ATAK's Data Sync lists 'public' missions
-_TAK_API_CHECK_ATTEMPTS = 2   # a lookup through a dead pooled LDAP connection fails once
+# ops #158: TAK's API process has its own pooled LDAP connections, apart from the 8089 side's,
+# and nothing but HTTPS logins uses them. A login through a dead one silently gives the user
+# no groups, and the pool then drops it. test8's API held 4 after an outpost restart, so two
+# rounds 15 s apart (one login each) both failed and the update restarted TAK. Each round
+# now logs in up to this many times in a row, a fresh cert (= a fresh lookup) each, ...
+_TAK_API_CHECK_TRIES = 8
+# ... and failed rounds are retried 15, 30, 60, 60 … s apart for this long before TAK is
+# restarted (the same bound as the Marti read, GH #207).
+_TAK_API_CHECK_WAIT_S = 300
 _TAK_API_CHECK_RETRY_S = 15
-_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS = 6   # the API answers on 8443 a while before it serves
+_TAK_API_CHECK_RETRY_MAX_S = 60
 
 
 def _tak_user_leaf_cert(cn, workdir):
@@ -62563,13 +62571,14 @@ def _tak_user_marti_req(cert, key, url, method='GET', timeout=20):
 
 
 def _tak_api_user_check_once(cn, ldap_groups):
-    """One HTTPS round as `cn` (see `_tak_api_user_check`). Returns (verdict, summary)."""
+    """One HTTPS login as `cn` (see `_tak_api_user_check`). Returns (verdict, summary);
+    verdict 'nocert' = no test cert could be made (trying again won't change that)."""
     workdir = tempfile.mkdtemp(prefix='tak-api-check-')
     try:
         try:
             cert, key = _tak_user_leaf_cert(cn, workdir)
         except Exception as e:
-            return 'unknown', f"couldn't make a test cert for {cn}: {str(e)[:160]}"
+            return 'nocert', f"couldn't make a test cert for {cn}: {str(e)[:160]}"
 
         def req(path, method='GET'):
             return _tak_user_marti_req(cert, key, f'{_TAK_MARTI_API}/{path}', method)
@@ -62612,14 +62621,17 @@ def _tak_api_user_check_once(cn, ldap_groups):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _tak_api_user_check(plog, tag, ldap_pass, attempts=_TAK_API_CHECK_ATTEMPTS):
+def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
     Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
     one, else the first in LDAP; never a file user or a ROLE_ADMIN member) and, as a
     throwaway cert for that user, reads its groups (groups/all), lists missions, creates a
     mission in one of its groups (tool `infratak-check`, which ATAK's Data Sync doesn't
-    list) and deletes it again. Up to `attempts` rounds, a fresh cert each.
+    list) and deletes it again. A fresh cert for every login. A round is up to
+    `_TAK_API_CHECK_TRIES` logins in a row while TAK's API says no groups (each one gets
+    past one dead pooled LDAP connection, ops #158); failed rounds are retried, backing
+    off, for up to `wait_s`.
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
     refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
     check with, or the cert or the API couldn't be used)."""
@@ -62644,15 +62656,27 @@ def _tak_api_user_check(plog, tag, ldap_pass, attempts=_TAK_API_CHECK_ATTEMPTS):
     if not pick:
         return 'unknown', "no non-admin LDAP user with TAK groups to check with"
     cn, ldap_groups = pick
-    verdict, summary = 'unknown', 'not run'
-    for n in range(1, attempts + 1):
-        if n > 1:
-            plog(f"  {tag}: HTTPS check round {n - 1}: {summary} — trying again in {_TAK_API_CHECK_RETRY_S}s")
-            time.sleep(_TAK_API_CHECK_RETRY_S)
-        verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+    t0 = time.time()
+    delay, rnd = _TAK_API_CHECK_RETRY_S, 0
+    while True:
+        rnd += 1
+        for n in range(1, _TAK_API_CHECK_TRIES + 1):
+            verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+            if verdict != 'broken':
+                break   # ok, or the API / cert can't be used: logging in again right away won't help
         if verdict == 'ok':
-            break
-    return verdict, summary
+            if rnd > 1 or n > 1:
+                plog(f"  {tag}: HTTPS check passed on login {n} of round {rnd} ({int(time.time() - t0)}s)")
+            return verdict, summary
+        if verdict == 'nocert':
+            return 'unknown', summary
+        left = wait_s - (time.time() - t0)
+        if left <= 0:
+            return verdict, summary
+        wait = int(min(delay, left))
+        plog(f"  {tag}: HTTPS check round {rnd} ({n} login(s)): {summary} — trying again in {wait}s")
+        time.sleep(wait)
+        delay = min(delay * 2, _TAK_API_CHECK_RETRY_MAX_S)
 
 
 def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
@@ -62844,8 +62868,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             return True
         plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
         try:
-            api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass,
-                                                           attempts=_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS)
+            api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass)   # the API warms up a while
         except Exception as e:
             api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
         if api_verdict == 'ok':

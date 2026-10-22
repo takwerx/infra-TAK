@@ -119,7 +119,8 @@ class Box:
         self.calls, self.api, self.log = [], [], []
         # TAK's HTTPS/API side (ops #139), apart from the 8089 connections above: 'ok', 'no_groups'
         # (test8: groups/all empty, so missions empty and create 403), 'create_403', 'down' (no
-        # answer). `https_flaky` = that many rounds give no groups first (a dead pooled connection).
+        # answer). `https_flaky` = that many logins give no groups first (dead pooled connections
+        # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
 
@@ -304,8 +305,8 @@ class Box:
         }
         for c in ('_PGB_SWAP_LDAP_WINDOW_S', '_PGB_SWAP_LDAP_STABLE_S', '_PGB_SWAP_LDAP_EVERY_S',
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
-                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_ATTEMPTS',
-                  '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS',
+                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_TRIES',
+                  '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S'):
             ns[c] = _const(c)
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
@@ -523,8 +524,10 @@ def test_healthy_box_checks_https_as_a_live_non_admin_user_and_cleans_up():
 def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
     # test8 2026-10-21: every ATAK had its 8089 groups, but over HTTPS TAK gave cert users 0
     # groups (empty mission list, 403 on create). The old check said "all clients have their
-    # groups" eight times. Now: one TAK restart, and the check repeated after it.
+    # groups" eight times. Now: one TAK restart, only after the HTTPS check has kept failing
+    # for _TAK_API_CHECK_WAIT_S, and the check repeated after it.
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    t0 = box.t
     assert box.recycle() is True
     assert box.restarts() == [['systemctl', 'restart', 'takserver']]
     assert box.drops() == []                       # the 8089 clients were fine, none dropped
@@ -533,10 +536,55 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
                and "gave ADSB_PS no groups on groups/all, while LDAP gives 1 (OPS)" in l for l in box.log)
     assert any('falling back to restarting TAK Server' in l for l in box.log)
     assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
-    assert len([c for c in box.leaf_certs]) == _const('_TAK_API_CHECK_ATTEMPTS') + 1
+    rounds = [l for l in box.log if 'HTTPS check round' in l]
+    tries = _const('_TAK_API_CHECK_TRIES')
+    assert rounds and all(f'({tries} login(s))' in l for l in rounds)
+    assert len(box.leaf_certs) == (len(rounds) + 1) * tries + 1     # + the one after the restart
+    restart_at = next(i for i, c in enumerate(box.calls) if c[1:2] == ['restart'])
+    assert box.t - t0 >= _const('_TAK_API_CHECK_WAIT_S') and restart_at
     st = box.settings['tak_ldap_recycle']
     assert st['last_outcome'] == 'restarted' and 'healed_ldap_start' not in st
     assert box.workdirs == []
+
+
+def test_ops158_dead_pooled_connections_on_the_api_side_heal_without_a_restart():
+    # test8 2026-10-21 (v10.2.25 T&E): the update restarted the outpost under TAK; TAK's API
+    # held 4 pooled LDAP connections, all dead. Two logins 15 s apart both hit one and TAK
+    # was restarted. Logging in again with a fresh cert gets past them.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=4)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert len(box.leaf_certs) == 5 and box.workdirs == []      # a fresh cert each, all removed
+    assert not any('trying again in' in l for l in box.log)               # no wait: the same round
+    assert any('HTTPS check passed on login 5 of round 1' in l for l in box.log)
+    assert any('no TAK Server restart needed' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients fine, no restart'
+
+
+def test_more_dead_connections_than_one_round_heal_in_a_later_round():
+    tries = _const('_TAK_API_CHECK_TRIES')
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=tries + 2)
+    t0 = box.t
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any(f'HTTPS check round 1 ({tries} login(s))' in l and 'trying again in 15s' in l for l in box.log)
+    assert any('HTTPS check passed on login 3 of round 2' in l for l in box.log)
+    assert box.t - t0 < _const('_TAK_API_CHECK_WAIT_S')
+
+
+def test_https_check_backs_off_and_is_bounded():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    waits = []
+    real_sleep = box.sleep
+
+    def sleep(s):
+        if any('HTTPS check round' in l for l in box.log[-1:]):
+            waits.append(s)
+        real_sleep(s)
+    box.sleep = sleep
+    box.recycle()
+    assert waits[:4] == [15, 30, 60, 60] and max(waits) == _const('_TAK_API_CHECK_RETRY_MAX_S')
+    assert sum(waits) == _const('_TAK_API_CHECK_WAIT_S')
 
 
 def test_https_403_on_create_restarts_tak():
@@ -559,14 +607,22 @@ def test_https_still_broken_after_the_restart_is_logged_and_not_restarted_again(
     assert len(box.restarts()) == 1
 
 
-def test_one_bad_https_round_is_retried_before_any_restart():
+def test_one_bad_https_login_is_retried_before_any_restart():
     # The API's first lookup can hit a dead pooled LDAP connection, like the streaming side.
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=1)
     assert box.recycle() is False
     assert box.restarts() == []
-    assert len(box.leaf_certs) == 2                # a fresh cert for the second round
-    assert any('HTTPS check round 1' in l and 'trying again' in l for l in box.log)
+    assert len(box.leaf_certs) == 2                # a fresh cert for the second login
+    assert any('HTTPS check passed on login 2 of round 1' in l for l in box.log)
     assert any('no TAK Server restart needed' in l for l in box.log)
+
+
+def test_api_that_does_not_answer_is_not_logged_into_again_within_a_round():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='down')
+    assert box.recycle() is False
+    rounds = [l for l in box.log if 'HTTPS check round' in l]
+    assert rounds and all('(1 login(s))' in l for l in rounds)
+    assert len(box.leaf_certs) == len(rounds) + 1
 
 
 def test_streaming_restart_fallback_also_checks_https_after():
@@ -581,10 +637,13 @@ def test_https_check_retries_while_the_api_warms_up_after_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
                       https_after_restart='down')
     orig = box.user_req
+    down = []
 
     def warming(cert, key, url, method='GET', timeout=20):
-        if box.https == 'down' and len([u for u in box.user_api if u[1] == 'GET']) >= 6:
-            box.https = 'ok'                       # the API serves a few rounds after 8443 opens
+        if box.https == 'down':
+            down.append(url)
+            if len(down) > 4:
+                box.https = 'ok'                   # the API serves a few rounds after 8443 opens
         return orig(cert, key, url, method, timeout)
     box.user_req = warming
     assert box.recycle() is True
@@ -639,12 +698,18 @@ def test_https_no_answer_is_unknown_not_a_restart():
 def test_cert_that_cant_be_made_is_unknown_not_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
 
+    failed_at = []
+
     def no_ca(cn, workdir):
+        failed_at.append(box.t)
         raise RuntimeError('CoreConfig has no enrollment CA (TAKServerCAConfig)')
     box.leaf_cert = no_ca
     assert box.recycle() is False
+    t0 = failed_at[0]                              # not before: the recycle holds LDAP 45 s first
     assert box.restarts() == [] and box.workdirs == []
     assert any("couldn't make a test cert for ADSB_PS: CoreConfig has no enrollment CA" in l for l in box.log)
+    assert not any('HTTPS check round' in l for l in box.log)   # no cert won't change by waiting
+    assert box.t - t0 < _const('_TAK_API_CHECK_RETRY_S')
 
 
 def test_group_tak_already_reports_is_used_so_a_fresh_portal_add_cannot_restart_tak():
