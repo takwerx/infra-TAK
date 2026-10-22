@@ -4582,6 +4582,37 @@ def _no_retention_bar(settings):
             'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
 
 
+def _tak_cert_names_bar(settings):
+    """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
+
+    v10.2.26. Every box deployed before 10.2.26 has a server cert that names only
+    `takserver`, so integrations that check the hostname (cUAS feeds, TAK Portal with
+    the system CA) refuse the server while ATAK keeps working and nobody notices — on
+    TryTAK it surfaced as NineHills failing every 5 minutes. The fix is one button on
+    the TAK Server page; this bar is how an operator finds out it is needed.
+
+    Reads the CACHED live-cert result (no handshake on the render path). It clears the
+    moment TAK is presenting every name, because the Fix job stores its own verified
+    result; it stays silent while TAK is down or before the first check lands."""
+    try:
+        if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+            return None
+        st = _tak_server_cert_status_cached(settings)
+    except Exception:
+        return None
+    if not st or st.get('state') != 'missing':
+        return None
+    miss = st.get('missing') or []
+    dom = st.get('domain') or ''
+    name = dom if dom in miss else miss[0]
+    body = (f"⚠ TAK Server's certificate doesn't include {html.escape(name)} — integrations "
+            'that check the hostname will reject it. '
+            '<a href="/takserver" style="color:inherit;text-decoration:underline">Fix it →</a>')
+    # Keyed to the missing names, so dismissing it today can't hide a new domain tomorrow.
+    return {'cls': 'takcert-banner', 'key': 'takcertnames:' + ','.join(miss),
+            'fg': '#eab308', 'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def render_notice_bars(settings):
     """Render every fixed notice bar in ONE place.
 
@@ -4611,7 +4642,8 @@ def render_notice_bars(settings):
 
 
 def _render_notice_bars_inner(settings):
-    specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings)) if b]
+    specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
+                         _tak_cert_names_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -39395,7 +39427,7 @@ def certs_page():
     if os.path.isdir(cert_dir):
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp):
+            if os.path.isfile(fp) and not _is_ca_private_material(fn):  # v10.2.26 W6
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -74335,6 +74367,201 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     return names
 
 
+# v10.2.26 — the names on TAK Server's own certificate (8089/8443). TAK's makeCert.sh gives a
+# server cert exactly one SAN (`[alt_names] DNS.1 = <name>`), so every box we deployed carried
+# only DNS:takserver. ATAK/iTAK/WinTAK/CloudTAK never check the hostname on 8089, so nothing
+# noticed; anything that does — NineHills cUAS dialing takserver.trytak.org (2026-10-22, 50/50
+# handshakes refused with BAD_CERTIFICATE), TAK Portal with --use-system-ca (nuc, 2026-08-06,
+# ERR_TLS_CERT_ALTNAME_INVALID) — rejects the server outright.
+#
+# makeCert builds the server cert's extfile as a copy of certs/config.cfg with
+# `subjectAltName = @alt_names` + `[alt_names] DNS.1 = <name>` appended, and OpenSSL merges a
+# repeated section. So a managed [alt_names] block placed ABOVE `[ server ]` in config.cfg adds
+# this box's names to the cert makeCert issues — verified on OpenSSL 3.0.2 (Ubuntu 22.04) and
+# 3.6. The stock script, its key/keystore handling and the broker's makeCert-only carve-out
+# stay exactly as they were; client and CA certs never reference @alt_names. CN stays
+# `takserver` (it is what federation partners see) and so do the file names.
+_TAK_CERTS_CONFIG = '/opt/tak/certs/config.cfg'
+_TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits are replaced) >>>'
+_TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
+_TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+                              r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _tak_server_cert_names(settings):
+    """Every name TAK Server's certificate should carry, as 'DNS:x' / 'IP:y'.
+
+    makeCert's own DNS:takserver first (anything that dials the old name keeps working), then
+    the TAK domain, the bare domain, the server IP and loopback. Every value is validated here
+    because it ends up in a file makeCert hands to openssl."""
+    names = ['DNS:takserver']
+
+    def add(entry):
+        if entry not in names:
+            names.append(entry)
+    for host in (_get_service_domain(settings, 'takserver'), settings.get('fqdn')):
+        h = str(host or '').strip().lower().rstrip('.')
+        if h and _TAK_SAN_HOST_RE.match(h):
+            add(f'DNS:{h}')
+    sip = settings.get('server_ip')
+    if isinstance(sip, str):  # a list here is the server-ip tuple corruption; skip it, don't guess
+        try:
+            add(f'IP:{ipaddress.ip_address(sip.strip())}')
+        except ValueError:
+            pass
+    add('DNS:localhost')
+    add('IP:127.0.0.1')
+    return names
+
+
+def _tak_config_cfg_with_names(text, names):
+    """config.cfg with the managed [alt_names] block (re)placed directly above `[ server ]`.
+
+    Returns None when there is no `[ server ]` section, or a managed block with no end marker:
+    a config this code does not recognize is left alone rather than guessed at."""
+    kept, inside, after_block = [], False, False
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if s == _TAK_SAN_BEGIN:
+            inside = True
+        elif inside:
+            inside = s != _TAK_SAN_END
+            after_block = not inside
+        elif after_block and not s:
+            after_block = False          # the blank line we put after our own block
+        else:
+            after_block = False
+            kept.append(line)
+    if inside:
+        return None
+    at = next((i for i, line in enumerate(kept) if re.match(r'^\s*\[\s*server\s*\]\s*$', line)), None)
+    if at is None:
+        return None
+    # makeCert writes DNS.1 itself, so ours start at .2 (IP too, in case a name is ever an IP).
+    counter = {'DNS': 1, 'IP': 1}
+    block = [_TAK_SAN_BEGIN + '\n', '[ alt_names ]\n']
+    for entry in names:
+        if entry == 'DNS:takserver':
+            continue
+        kind, value = entry.split(':', 1)
+        counter[kind] += 1
+        block.append(f'{kind}.{counter[kind]} = {value}\n')
+    block += [_TAK_SAN_END + '\n', '\n']
+    if at and not kept[at - 1].endswith('\n'):
+        kept[at - 1] += '\n'
+    return ''.join(kept[:at] + block + kept[at:])
+
+
+def _tak_server_cert_prepare(settings, log=None):
+    """Write this box's names into certs/config.cfg so the next `makeCert.sh server` carries them.
+
+    Call it before every makeCert server run. Never raises and never blocks the caller: a box
+    whose config.cfg cannot be read or extended still gets the stock DNS:takserver cert, exactly
+    as before, and the TAK Server page's certificate row shows it. Returns True when in place."""
+    say = log or (lambda _m: None)
+    try:
+        cur = _read_priv(_TAK_CERTS_CONFIG)
+    except Exception as e:
+        say(f"  ⚠ Could not read {_TAK_CERTS_CONFIG} ({str(e)[:120]}) — server certificate keeps only DNS:takserver")
+        return False
+    names = _tak_server_cert_names(settings)
+    new = _tak_config_cfg_with_names(cur or '', names)
+    if new is None:
+        say(f"  ⚠ {_TAK_CERTS_CONFIG} has no [ server ] section — server certificate keeps only DNS:takserver")
+        return False
+    if new != cur:
+        try:
+            _write_priv(_TAK_CERTS_CONFIG, new)
+        except Exception as e:
+            say(f"  ⚠ Could not update {_TAK_CERTS_CONFIG} ({str(e)[:120]}) — server certificate keeps only DNS:takserver")
+            return False
+    say("  Server certificate names: " + ', '.join(n.split(':', 1)[1] for n in names))
+    return True
+
+
+def _cert_san_entries(pem):
+    """SANs of a PEM certificate as 'DNS:x' / 'IP:y' (IPs normalized), or None if unreadable."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'subjectAltName'],
+                           input=pem, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for part in r.stdout.split('\n', 1)[-1].split(','):
+        p = part.strip()
+        if p.startswith('DNS:'):
+            out.append('DNS:' + p[4:].lower())
+        elif p.startswith('IP Address:'):
+            try:
+                out.append(f"IP:{ipaddress.ip_address(p.split(':', 1)[1].strip())}")
+            except ValueError:
+                pass
+    return out
+
+
+def _tak_server_cert_live_names():
+    """SANs on the certificate TAK Server is presenting RIGHT NOW, or None if it isn't answering.
+
+    Reads 8443, not 8089: both are served from the same <tls> keystore, and a client-certless
+    handshake on 8089 writes an ERROR line into takserver-messaging.log on every probe, while
+    8443 stays quiet. s_client gets the server's cert before TAK asks for ours; nothing is sent."""
+    try:
+        r = subprocess.run(['openssl', 's_client', '-connect', '127.0.0.1:8443'],
+                           input='', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', r.stdout, re.S)
+    return _cert_san_entries(m.group(0)) if m else None
+
+
+def _tak_server_cert_status(settings):
+    """What the TAK Server page's certificate row shows. Judged from the LIVE cert, so the row
+    only turns green once TAK is actually presenting the names, not when a file was written."""
+    want = _tak_server_cert_names(settings)
+    tak_domain = (_get_service_domain(settings, 'takserver') or '').lower()
+    live = _tak_server_cert_live_names()
+    st = {'expected': [n.split(':', 1)[1] for n in want], 'domain': tak_domain}
+    if live is None:
+        return {**st, 'state': 'unknown', 'live': [], 'missing': []}
+    missing = [n.split(':', 1)[1] for n in want if n not in live]
+    return {**st, 'state': 'missing' if missing else 'ok',
+            'live': [n.split(':', 1)[1] for n in live], 'missing': missing}
+
+
+_tak_cert_status_cache = {'at': 0.0, 'status': None, 'refreshing': False}
+_TAK_CERT_STATUS_TTL = 600
+
+
+def _tak_server_cert_status_remember(status):
+    _tak_cert_status_cache.update(at=time.time(), status=status)
+    return status
+
+
+def _tak_server_cert_status_cached(settings):
+    """The last live result, for callers on every page render (the notice bar) that must not
+    run a TLS handshake inline. When stale, a background thread refreshes it and this call
+    returns the previous result (None before the first one lands). The TAK Server page and
+    the Fix job store fresh results directly, so the bar follows them without waiting."""
+    c = _tak_cert_status_cache
+    if (time.time() - c['at'] > _TAK_CERT_STATUS_TTL and not c['refreshing']
+            and not tak_server_cert_job['running']):
+        c['refreshing'] = True
+        snap = dict(settings or {})
+
+        def _refresh():
+            try:
+                _tak_server_cert_status_remember(_tak_server_cert_status(snap))
+            except Exception:
+                pass
+            finally:
+                c['refreshing'] = False
+        threading.Thread(target=_refresh, daemon=True).start()
+    return c['status']
+
+
 def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
     """`makeCert.sh <kind> NAME` that really replaces NAME.p12 and NAME.jks. Returns True on success.
 
@@ -74718,6 +74945,7 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
+            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
             if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
@@ -74845,6 +75073,7 @@ def takserver_revoke_old_ca():
         # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
+            _tak_server_cert_prepare(load_settings())  # v10.2.26: real names, not just `takserver`
             r = subprocess.run(
                 _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
                 shell=True, capture_output=True, text=True, timeout=120)
@@ -75029,6 +75258,7 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 4/8: Creating new server certificate...")
+            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
             if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
                 raise Exception('Failed to create server certificate')
             log("✓ Server certificate created")
@@ -75130,6 +75360,123 @@ def takserver_rotate_rootca_status():
     return jsonify({'log': rotate_rootca_log, **rotate_rootca_status})
 
 
+@app.route('/api/takserver/server-cert')
+@login_required
+def takserver_server_cert_status():
+    """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
+    plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
+    job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job['log'] = list(tak_server_cert_job['log'])
+    if tak_server_cert_job['running']:
+        return jsonify({'job': job, 'status': None})
+    return jsonify({'job': job,
+                    'status': _tak_server_cert_status_remember(_tak_server_cert_status(load_settings()))})
+
+
+@app.route('/api/takserver/server-cert/fix', methods=['POST'])
+@login_required
+def takserver_server_cert_fix():
+    """v10.2.26 — reissue TAK Server's certificate with this box's names, same CA.
+
+    Backs up takserver.{pem,key,p12,jks,csr}, writes the names into certs/config.cfg, reissues
+    through the stock makeCert.sh, checks the new file carries every name, restarts TAK and
+    waits until the LIVE cert does. Any failure before the restart puts the old files back
+    untouched; a TAK that doesn't come back presenting the new cert gets the old one restored
+    and restarted. Enrolled devices trust the CA, not this cert, so nobody re-enrolls."""
+    if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+            or rotate_intca_status.get('running')):
+        return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
+    settings = load_settings()
+    want = _tak_server_cert_names(settings)
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[])
+
+    def do_fix():
+        log = tak_server_cert_job['log'].append
+        cert_dir = '/opt/tak/certs/files'
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
+        backed = []
+
+        def run(cmd, check=True):
+            ok, out = _rotate_sh(cmd, timeout=180)  # container-aware, same runner as the CA rotations
+            if check and not ok:
+                log(f"  ✗ {(out or '').strip()[:200]}")
+                return False
+            return True
+
+        def restore():
+            ok = all(run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed)
+            log("  ✓ Previous certificate restored" if ok else "  ✗ Restore incomplete — backups are "
+                f"{cert_dir}/takserver.*.{stamp}")
+            return ok
+
+        def wait_live(seconds):
+            end = time.time() + seconds
+            live = None
+            while time.time() < end:
+                time.sleep(5)
+                live = _tak_server_cert_live_names()
+                if live is not None and all(n in live for n in want):
+                    return live
+            return live
+
+        try:
+            log("━━━ Fixing TAK Server's certificate names ━━━")
+            log("Step 1/4: Backing up the current server certificate...")
+            for p in files:
+                if _exists_priv(p):
+                    if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + "." + stamp)}'):
+                        raise Exception('Backup failed — nothing was changed')
+                    backed.append(p)
+            log(f"  ✓ Saved as {cert_dir}/takserver.*.{stamp}")
+
+            log("Step 2/4: Writing this server's names into the certificate config...")
+            if not _tak_server_cert_prepare(settings, log):
+                raise Exception('Could not write the names — nothing was changed')
+
+            log("Step 3/4: Reissuing the server certificate (same CA)...")
+            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+                restore()
+                raise Exception('makeCert.sh failed')
+            got = _cert_san_entries(_read_priv(f'{cert_dir}/takserver.pem')) or []
+            short = [n.split(':', 1)[1] for n in want if n not in got]
+            if short:
+                restore()
+                raise Exception('The new certificate is missing ' + ', '.join(short))
+            log("  ✓ New certificate carries: " + ', '.join(n.split(':', 1)[1] for n in got))
+
+            log("Step 4/4: Restarting TAK Server (devices reconnect on their own)...")
+            if not run('systemctl restart takserver 2>&1'):
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server restart failed')
+            live = wait_live(300)
+            if live is None or not all(n in live for n in want):
+                log("  ✗ TAK Server didn't come back presenting the new certificate within 5 minutes")
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server did not pick up the new certificate')
+            log("  ✓ TAK Server is presenting the new certificate")
+            _tak_server_cert_status_remember(_tak_server_cert_status(settings))
+            log("")
+            log("━━━ DONE ━━━")
+            tak_server_cert_job.update(running=False, complete=True, error=False)
+        except Exception as e:
+            log("")
+            log(f"✗ FAILED: {e}")
+            tak_server_cert_job.update(running=False, complete=True, error=True)
+
+    threading.Thread(target=do_fix, daemon=True).start()
+    return jsonify({'success': True, 'started': True})
+
+
 @app.route('/api/takserver/create-client-cert', methods=['POST'])
 @login_required
 def takserver_create_client_cert():
@@ -75206,10 +75553,164 @@ def takserver_create_client_cert():
             'download_url': f'/api/certs/download/{cert_name}.p12',
             'groups_both': groups_both,
             'groups_in': groups_in,
-            'groups_out': groups_out
+            'groups_out': groups_out,
+            'package_url': f'/api/takserver/client-cert/{cert_name}/package',
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
+
+
+# v10.2.26 W5 — integration package. A third-party system (cUAS cloud, CAD, SIEM) needs PEM
+# files and a "trust this server" CA file, not the one TAK-format .p12 the console used to hand
+# out. Cert-only by design: the groups are the ones put on the cert at creation, as Create
+# Client Certificate always did — no Authentik user, no data feed.
+_CERT_FILES_DIR = '/opt/tak/certs/files'
+_CLIENT_CERT_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+_NOT_CLIENT_CERT_NAMES = {'takserver', 'ca', 'root-ca'}
+
+
+def _cert_file_bytes(path):
+    """A file from the TAK cert dir. Client .p12/.key are 0600 tak:tak, so a non-root console
+    takes the privileged read when the plain one is refused (same as the .p12 download)."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError:
+        return _read_priv_bytes(path)
+
+
+def _is_client_cert_pem(pem):
+    """True only for a leaf client cert: CA:FALSE and clientAuth WITHOUT serverAuth. The server
+    cert (both EKUs), the CAs and anything unreadable are refused."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'basicConstraints,extendedKeyUsage'],
+                           input=pem, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    out = r.stdout
+    return (r.returncode == 0 and 'CA:FALSE' in out and 'TLS Web Client Authentication' in out
+            and 'TLS Web Server Authentication' not in out)
+
+
+def _client_cert_pem_or_none(name):
+    if name in _NOT_CLIENT_CERT_NAMES or not _CLIENT_CERT_NAME_RE.match(name or ''):
+        return None
+    try:
+        pem = _cert_file_bytes(os.path.join(_CERT_FILES_DIR, f'{name}.pem')).decode(errors='replace')
+    except Exception:
+        return None
+    return pem if _is_client_cert_pem(pem) else None
+
+
+def _modern_p12(pem_path, key_path, chain_pem, name, password):
+    """Re-wrap the client cert + key as a PKCS#12 OpenSSL 3, Node and Python can open.
+
+    makeCert.sh writes .p12 as pbeWithSHA1And40BitRC2-CBC (ATAK needs it), which modern stacks
+    refuse ("RC2-40-CBC unsupported"). OpenSSL 3's export defaults are AES-256-CBC + PBKDF2 +
+    SHA-256 MAC. The password travels in the environment, never argv. Returns bytes or None."""
+    import tempfile as _tf
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-p12-') as td:
+            os.chmod(td, 0o700)
+            key_tmp, pem_tmp, chain_tmp = (os.path.join(td, n) for n in ('k', 'c', 'ca'))
+            for p, data in ((key_tmp, _cert_file_bytes(key_path)), (pem_tmp, _cert_file_bytes(pem_path)),
+                            (chain_tmp, chain_pem.encode())):
+                with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                    f.write(data)
+            env = dict(os.environ, ITK_P12_PASS=password)
+            r = subprocess.run(['openssl', 'pkcs12', '-export', '-in', pem_tmp, '-inkey', key_tmp,
+                                '-certfile', chain_tmp, '-name', name,
+                                '-passin', 'env:ITK_P12_PASS', '-passout', 'env:ITK_P12_PASS'],
+                               capture_output=True, env=env, timeout=20)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+    except Exception:
+        return None
+
+
+@app.route('/api/takserver/client-certs')
+@login_required
+def takserver_client_certs():
+    """v10.2.26 W5 — client certs an integration package can be built for."""
+    try:
+        files = sorted(os.listdir(_CERT_FILES_DIR))
+    except OSError:
+        return jsonify({'certs': []})
+    have = set(files)
+    names = [f[:-4] for f in files
+             if f.endswith('.pem') and not f.endswith('-trusted.pem')
+             and f'{f[:-4]}.key' in have and _client_cert_pem_or_none(f[:-4])]
+    return jsonify({'certs': names})
+
+
+@app.route('/api/takserver/client-cert/<name>/package')
+@login_required
+def takserver_client_cert_package(name):
+    """v10.2.26 W5 — <name>-integration.zip: the client cert in every form a third-party system
+    asks for, this server's CA as plain PEM, and a README. The cert password is deliberately NOT
+    in the zip — it is shown beside the button for the operator to send separately."""
+    from flask import send_file
+    import io
+    import zipfile
+    pem = _client_cert_pem_or_none(name)
+    if not pem:
+        return jsonify({'error': f'"{name}" is not a client certificate on this server'}), 404
+    d = _CERT_FILES_DIR
+    try:
+        key = _cert_file_bytes(os.path.join(d, f'{name}.key'))
+        ca = _cert_file_bytes(os.path.join(d, 'ca.pem')).decode(errors='replace')
+    except Exception as e:
+        return jsonify({'error': f'Could not read the certificate files: {str(e)[:160]}'}), 500
+    try:
+        root = _cert_file_bytes(os.path.join(d, 'root-ca.pem')).decode(errors='replace')
+    except Exception:
+        root = ''
+    chain = ca.strip() + '\n' + (root.strip() + '\n' if root.strip() and root.strip() != ca.strip() else '')
+    try:
+        legacy_p12 = _cert_file_bytes(os.path.join(d, f'{name}.p12'))
+    except Exception:
+        legacy_p12 = b''
+    trust = next((f for f in sorted(os.listdir(d))
+                  if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
+    try:
+        trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
+    except Exception:
+        trust_p12 = b''
+    settings = load_settings()
+    modern_p12 = _modern_p12(os.path.join(d, f'{name}.pem'), os.path.join(d, f'{name}.key'),
+                             chain, name, _get_tak_cert_password(settings))
+    host = _get_takserver_host(settings) or (settings.get('server_ip') or '').strip() or '<this server>'
+
+    files = []  # (zip name, bytes, README line)
+    if modern_p12:
+        files.append((f'{name}.p12', modern_p12, 'Client certificate + private key (PKCS#12 / .pfx, AES-256).'
+                                                 ' Use this if your system takes a .p12 or .pfx.'))
+    if legacy_p12:
+        files.append((f'{name}-legacy.p12' if modern_p12 else f'{name}.p12', legacy_p12,
+                      'The same, in the older RC2 format TAK clients (ATAK) and older systems expect.'))
+    files += [(f'{name}.pem', pem.encode(), 'Client certificate (PEM).          } use these two if your system wants'),
+              (f'{name}.key', key, 'Client private key (PEM, encrypted). } separate certificate and key files'),
+              ('ca-chain.pem', chain.encode(), "This server's certificate authority (PEM). Add it as the trusted /"
+                                               ' server CA so your system trusts TAK Server.')]
+    if trust_p12:
+        files.append(('truststore.p12', trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
+    w = max(len(f[0]) for f in files)
+    readme = '\n'.join(
+        [f'TAK Server integration package: {name}',
+         f'Created {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC by infra-TAK v{VERSION}', '',
+         f'Server:  {host}',
+         'Port:    8089 (TLS, client certificate required)', '', 'Files:']
+        + [f'  {fn.ljust(w)}  {line}' for fn, _b, line in files]
+        + ['', 'Password: the .p12 files and the .key are protected with the TAK certificate password.',
+           'It is not included in this package; get it from your TAK Server administrator.', ''])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for fn, data, _line in files:
+            z.writestr(fn, data)
+        z.writestr('README.txt', readme)
+    audit('integration_package', f'cert={name} files={",".join(f[0] for f in files)}')
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f'{name}-integration.zip',
+                     mimetype='application/zip')
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
@@ -82425,6 +82926,7 @@ def _deploy_takserver_container(config):
         if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
             return
         log_step("Creating server certificate...")
+        _tak_server_cert_prepare(load_settings(), log_step)  # v10.2.26: real names, not just `takserver`
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
             return
         log_step("Creating admin certificate...")
@@ -83213,6 +83715,8 @@ def run_takserver_deploy(config):
         # still reported all certificates created AND the truststore imported. A
         # TAK Server with no certificates cannot serve a single client, so this is
         # not a warning — it ends the deploy.
+        # v10.2.26: the server cert carries this box's real names, not just `takserver`.
+        _tak_server_cert_prepare(load_settings(), log_step)
         _cert_steps = [
             ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
             ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
@@ -84505,7 +85009,7 @@ def list_cert_files():
     files = []
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp):
+        if os.path.isfile(fp) and not _is_ca_private_material(f):
             files.append({'name': f, 'size': os.path.getsize(fp),
                 'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
@@ -84516,7 +85020,19 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
+    if _is_ca_private_material(filename):
+        audit('cert_download_refused', f'file={filename}')
+        return jsonify({'error': 'CA private keys are never downloaded from the console'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
+
+
+def _is_ca_private_material(filename):
+    """v10.2.26 W6 — the CA's private key in any form: `*-do-not-share.key` (makeRootCa /
+    makeCert ca) and `<CA>-signing.{jks,p12}` (the keystore TAK signs enrollments with). Browse
+    Certificates used to serve these to any logged-in session; nothing on the console needs to
+    hand them to a browser, and whoever holds them can mint certs this server trusts."""
+    f = (filename or '').lower()
+    return 'do-not-share' in f or re.search(r'-signing\.(jks|p12|pem|key)$', f) is not None
 
 @app.route('/api/deploy/log')
 @login_required
