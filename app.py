@@ -54287,6 +54287,9 @@ def authentik_control():
         # started it, or, with the registry still unreachable, failed to start Authentik at all
         # (T&E test12, 2026-10-08). Remember what was there and put it back on failure.
         _pin_orig = {'compose': None, 'compose_changed': False, 'env_prev': ''}
+        # ops #167: Guard Dog's watcher skips while this is set. Success hands it to a thread
+        # that clears it after the migrations; every other exit clears it in the finally.
+        _gd_marker = {'set': False, 'handed_off': False}
 
         def _restore_pin():
             restored = []
@@ -54357,6 +54360,7 @@ def authentik_control():
                                          f'(the console process environment, a services.*.environment '
                                          f'override, or a second env file).'}), 500
             # (d) Pull + recreate, and BELIEVE the return code (it used to be discarded).
+            _gd_marker['set'] = _guarddog_authentik_update_begin(f'authentik-update {_inst or "?"} -> {latest}')
             _mod_result_step('authentik', 'pull + recreate')
             _last = _run_priv_chain([['docker', 'compose', 'pull'],
                                      ['docker', 'compose', 'down', '--timeout', '30'],
@@ -54407,11 +54411,20 @@ def authentik_control():
             # this image still carries the typo). Background: it waits for the server.
             threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
                              name='authentik-idle-load-converge-post-update').start()
+            if _gd_marker['set']:
+                threading.Thread(target=_guarddog_authentik_update_end_when_healthy, daemon=True,
+                                 name='guarddog-authentik-update-marker').start()
+                _gd_marker['handed_off'] = True
             return jsonify({'success': True, 'running': True, 'action': action,
                             'version': _run_tag})
         except Exception as _e:
             _authentik_release_cache['tag'] = None
             return jsonify({'error': f'Authentik update failed: {str(_e)[:400]} ({_restore_pin()})'}), 500
+        finally:
+            # A failed update hands Authentik straight back to Guard Dog: whatever state it
+            # was left in is the watcher's to judge (its migration check still applies).
+            if _gd_marker['set'] and not _gd_marker['handed_off']:
+                _guarddog_authentik_update_end()
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(5)
@@ -59784,6 +59797,65 @@ def _authentik_compose_lock(holder, plog=None, timeout=_AK_COMPOSE_LOCK_WAIT_S):
                 fh.close()
             except Exception:
                 pass
+
+
+# --- "Authentik update in progress" marker for Guard Dog (ops #167) ----------
+# The compose mutex above covers the down+up only. An Authentik Update's request returns
+# as soon as the new image is running, and THEN the server runs its migrations, serving
+# 503 meanwhile. test6, 2026-10-22 (2026.5.7 -> 2026.8.4): 58 migrations ran 06:50:08-
+# 06:51:59 UTC, tak-authentik-watch.sh counted three 503s and restarted server+worker at
+# 06:52:02, before the server had released its migration lock. On a bigger database that
+# restart lands in the middle of the migrations, and the next boot starts them again.
+#
+# So the Update writes this marker before it pulls and removes it once Authentik answers
+# its health check again; while it exists the watcher skips its tick and sends nothing.
+# The file holds the start epoch, and the watcher ignores (and removes) a marker older
+# than its own timeout, so a console that dies mid-update cannot silence Guard Dog for
+# good. Root-owned in Guard Dog's own state dir, not /tmp: anyone who can write it can
+# pause the Authentik watchdog. Keep the path and the timeout in step with the script.
+_GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
+_GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
+_AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+
+
+def _guarddog_authentik_update_begin(what):
+    """Tell Guard Dog's Authentik watcher a console update is under way. Best effort:
+    without Guard Dog (no state dir) there is no watcher to tell."""
+    if not os.path.isdir(os.path.dirname(_GD_AUTHENTIK_UPDATE_MARKER)):
+        return False
+    try:
+        _write_priv(_GD_AUTHENTIK_UPDATE_MARKER, f'{int(time.time())} {what}\n', perm=0o644)
+        return True
+    except Exception as e:
+        print(f'guarddog authentik update marker: could not write ({str(e)[:120]})', flush=True)
+        return False
+
+
+def _guarddog_authentik_update_end():
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-f', _GD_AUTHENTIK_UPDATE_MARKER]),
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _local_authentik_http_ok():
+    try:
+        with urllib.request.urlopen(_AK_LOCAL_HEALTH_URL, timeout=10) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
+
+
+def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S, every_s=5):
+    """Remove the marker once Authentik answers again, i.e. after its migrations. Gives up
+    at the marker's own timeout (the watcher ignores it from then on anyway)."""
+    deadline = time.time() + max_s
+    while time.time() < deadline:
+        if _local_authentik_http_ok():
+            break
+        time.sleep(every_s)
+    _guarddog_authentik_update_end()
 
 
 def _recreate_authentik_server_worker(plog, reason):
