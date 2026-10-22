@@ -117,6 +117,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Install updates</button>
+<button id="osupd-reboot-btn" onclick="rebootForKernelPatch()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
 <button onclick="toggleOsUpdDetails()" id="osupd-details-btn" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show details</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div></div>
@@ -141,6 +142,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div></div>
 <pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
+<div id="kpatch-reboot" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px"><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; <span id="kpatch-reboot-head">A security update is installed but needs a restart to take effect</span><span id="kpatch-reboot-cve"></span></div>
+<div id="kpatch-reboot-body" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6"></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I'll reboot later</button>
+</div></div></div>
 <div id="kpatch-error" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Update install FAILED &mdash; see log below</div>
@@ -201,6 +210,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% if host.get('error') %}<div class="metric-detail" style="color:var(--red);font-size:10px;margin-top:2px">{{ host.error }}</div>{% endif %}
 <div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">{{ host.get('mechanism','unattended-upgrades') }}{% if host.get('installed', True) == False %} — not installed{% endif %}</div>
+{# ops #154: per-host "installed but not running" — same signal as the banner. #}
+<div class="metric-detail" id="uu-reboot-{{ host.id }}" style="margin-top:2px;font-size:10px;color:var(--yellow);display:{% if host.get('reboot_required') %}block{% else %}none{% endif %}">&#9888; Restart needed{% if host.get('staged_kernel') %} &mdash; kernel {{ host.staged_kernel }} installed, not running{% endif %}</div>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 {# v10.1.37: no toggle when the mechanism is not installed. On Rocky the switch
@@ -316,7 +327,14 @@ function updateUUHost(hostId,uu){
 }
 function updateUUHosts(hosts){
     if(!hosts||!hosts.length)return;
-    hosts.forEach(function(h){updateUUHost(h.id,{enabled:h.enabled,running:h.running});});
+    hosts.forEach(function(h){
+        updateUUHost(h.id,{enabled:h.enabled,running:h.running});
+        var rb=document.getElementById('uu-reboot-'+h.id);
+        if(rb){
+            rb.style.display=h.reboot_required?'block':'none';
+            rb.textContent='⚠ Restart needed'+(h.staged_kernel?' — kernel '+h.staged_kernel+' installed, not running':'');
+        }
+    });
 }
 async function toggleUU(cb){
     var target=cb.getAttribute('data-target')||'this_host';
@@ -694,7 +712,7 @@ if(document.getElementById('fedhub-card-cert-expiry')){
 loadCaddyCertDays();
 var _kpatchPollTimer=null;
 function _kpatchShowState(state){
-    ['kpatch-idle','kpatch-running','kpatch-done','kpatch-error'].forEach(function(id){
+    ['kpatch-idle','kpatch-running','kpatch-done','kpatch-error','kpatch-reboot'].forEach(function(id){
         var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
     });
 }
@@ -717,7 +735,12 @@ function _kpatchShowState(state){
 // is deliberate: this bug class has bitten five times because a fix landed at one
 // call site and missed the others. A caller cannot write to, or clear, the wrong
 // namespace — there is no argument for it to get wrong.
-function _kpatchNs(sig){ return (String(sig||'').indexOf('done@')===0)?'done':'pending'; }
+// ops #154: a third namespace for "installed, needs a restart", keyed to the staged
+// kernel, so a newer staged kernel re-shows it.
+function _kpatchNs(sig){
+    var s=String(sig||'');
+    return s.indexOf('done@')===0?'done':(s.indexOf('reboot@')===0?'reboot':'pending');
+}
 function _kpatchKey(ns){ return 'kernel-patch-dismissed-'+ns; }
 
 // One-time carry-over of the pre-v10.1.38 single key, so an operator who dismissed
@@ -773,6 +796,7 @@ function _kpatchRenderDone(d){
     // function left half the behaviour broken.
     var _b=document.getElementById('kernel-patch-banner');
     if(_b)_b.setAttribute('data-osupd-sig','done@'+((d&&d.done_at)||''));
+    _kpatchSetRebootSig(d&&d.reboot_required?d.reboot_sig:'');
     // "Finished" and "needs a reboot" are different facts. A docker-only update
     // completes with nothing to reboot for, and telling the operator to reboot
     // anyway (or hiding the finish behind a reboot they don't need) is wrong.
@@ -793,6 +817,32 @@ function _kpatchRenderDone(d){
     // The pending list is stale the moment the job lands.
     fetch('/api/os-updates?refresh=1',{credentials:'same-origin',cache:'no-store'}).catch(function(){});
 }
+// ops #154: the restart key rides along with whichever panel is showing, so "I'll
+// reboot later" on the done or pending panel also quiets the restart panel for
+// that same staged kernel instead of swapping one prompt for another.
+function _kpatchSetRebootSig(sig){
+    var b=document.getElementById('kernel-patch-banner');if(!b)return;
+    if(sig)b.setAttribute('data-reboot-sig',sig);else b.removeAttribute('data-reboot-sig');
+}
+// ops #154: unattended-upgrades installs the fixed kernel, nothing is pending any
+// more, and the panel used to hide while the box kept running the old kernel for
+// weeks. This is the panel for that case: installed, not running, restart needed.
+function _kpatchRenderReboot(rb){
+    var b=document.getElementById('kernel-patch-banner');if(!b||!rb)return;
+    b.setAttribute('data-osupd-sig',rb.sig||'');
+    _kpatchSetRebootSig(rb.sig||'');
+    _kpatchBannerTone('warn');
+    var head=document.getElementById('kpatch-reboot-head'),
+        cve=document.getElementById('kpatch-reboot-cve'),
+        body=document.getElementById('kpatch-reboot-body');
+    if(head)head.textContent=rb.kernel?'A security update is installed but needs a restart to take effect'
+                                      :'An installed update needs a restart to take effect';
+    if(cve)cve.textContent=rb.cve_banner?(' — fixes '+rb.cve_banner):'';
+    var txt=rb.kernel
+        ?'The new kernel ('+rb.staged+') is installed, but this server is still running the old one ('+rb.running+'). The fix only takes effect after a restart.'
+        :'The system reports that a restart is needed to finish installing updates.';
+    if(body)body.textContent=txt+' TAK services are down for 1-3 minutes while the server restarts; clients reconnect on their own.';
+}
 function toggleOsUpdDetails(){
     var d=document.getElementById('osupd-details'),b=document.getElementById('osupd-details-btn');
     if(!d)return;
@@ -808,7 +858,7 @@ function renderOsUpdates(d){
     if(!d)return;
     _osUpdLast=d;
     var restarts=d.restarts||[],alerts=d.alerts||[],managed=d.managed||[];
-    var severe=(restarts.length>0||alerts.length>0);
+    var severe=(restarts.length>0||alerts.length>0||!!(d.reboot&&d.reboot.pending));
     _kpatchBannerTone(severe?'warn':'info');
     var hl=document.getElementById('osupd-headline');
     if(hl){
@@ -829,7 +879,17 @@ function renderOsUpdates(d){
         parts.push((d.total===1?'It does not restart any TAK service':'None of them restart TAK services')+
                    ' &mdash; '+(d.total===1?'this is a routine operating system patch.':'these are routine operating system patches.'));
     }
-    if(d.reboot_required)parts.push('A reboot is needed afterwards to finish.');
+    // ops #154: a kernel that is ALREADY installed needs the restart now, not
+    // "afterwards" — say so, and offer the restart here too.
+    var rbNow=!!(d.reboot&&d.reboot.pending);
+    if(rbNow)parts.push('<b style="color:var(--yellow)">'+(d.reboot.kernel
+        ?'A security update is already installed and needs a restart to take effect.'
+        :'An installed update already needs a restart to take effect.')+
+        '</b> Install these first and one restart covers both, or restart now.');
+    else if(d.reboot_required)parts.push('A reboot is needed afterwards to finish.');
+    var rbb=document.getElementById('osupd-reboot-btn');
+    if(rbb)rbb.style.display=rbNow?'':'none';
+    _kpatchSetRebootSig(rbNow?d.reboot.sig:'');
     parts.push('Clients reconnect on their own, but pick a quiet moment if you are mid-operation.');
     var pl=document.getElementById('osupd-plain');
     if(pl)pl.innerHTML=parts.join(' ');
@@ -948,7 +1008,20 @@ async function checkKernelPatch(){
         // Nothing pending: clear only the PENDING record. Clearing the done record
         // here is what made the finished-run panel come back — it is the common case
         // (a box with a finished patch run and nothing new to install).
-        if(!ud||!ud.total){banner.style.display='none';_kpatchClearDismiss('pending');return;}
+        if(!ud||!ud.total){
+            _kpatchClearDismiss('pending');
+            // ops #154: nothing left to download is NOT "nothing to do" — a fixed
+            // kernel installed by unattended-upgrades still needs the restart.
+            var rb=ud&&ud.reboot;
+            if(rb&&rb.pending&&rb.sig){
+                if(_kpatchDismissMatches(rb.sig)){banner.style.display='none';return;}
+                if(_kpatchReadDismiss('reboot'))_kpatchClearDismiss('reboot');
+                _kpatchRenderReboot(rb);
+                banner.style.display='block';_kpatchShowState('reboot');return;
+            }
+            _kpatchClearDismiss('reboot');
+            banner.style.display='none';return;
+        }
         renderOsUpdates(ud);
         try{
             var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
@@ -989,6 +1062,10 @@ function dismissKernelBanner(){
     // dismissal and vice versa. An empty signature records nothing (and destroys
     // nothing) — better to re-show than to wipe a valid record.
     _kpatchStoreDismiss(_sig);
+    // ops #154: closing any panel that also carried a pending restart quiets the
+    // restart prompt for that staged kernel too (same 24 h expiry).
+    var _rsig=(b&&b.getAttribute('data-reboot-sig'))||'';
+    if(_rsig&&_rsig!==_sig)_kpatchStoreDismiss(_rsig);
     // Don't kill the polling timer if a job is running in the background —
     // we just hide the UI. The job continues to run regardless.
 }
@@ -1091,10 +1168,21 @@ async function rebootForKernelPatch(){
     try{
         await fetch('/api/system/kernel-patch/reboot',{method:'POST',credentials:'same-origin'});
     }catch(e){}
-    // Either way the box is going down; show a friendly message
+    // Either way the box is going down; show a friendly message. ops #154: the
+    // button also lives on the restart and pending panels, so write into this one.
+    _kpatchShowState('done');
     var bn=document.getElementById('kpatch-done');
     if(bn)bn.innerHTML='<div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Reboot in progress &mdash; the console will reload automatically when the box is back up...</div>';
-    setTimeout(function(){location.reload();},45000);
+    // ops #154: reload once the console has gone away AND answered again, not on a
+    // fixed 45 s timer that lands on a browser error page while TAK is still stopping.
+    // Give up waiting after 10 min and reload anyway.
+    var wentDown=false,t0=Date.now();
+    var iv=setInterval(async function(){
+        try{
+            await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
+            if(wentDown||Date.now()-t0>600000){clearInterval(iv);location.reload();}
+        }catch(e){wentDown=true;}
+    },5000);
 }
 checkKernelPatch();
 var updateBody='';
