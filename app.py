@@ -37345,7 +37345,12 @@ def _takportal_repoint_origin(portal_dir, plog=None):
     try:
         _o = subprocess.run(_git + ['remote', 'get-url', 'origin'],
                             capture_output=True, text=True, timeout=10)
-        if 'adventureseeker423/tak-portal' not in (_o.stdout or '').lower():
+        # Exact stock URL only (any case, optional .git or trailing slash). A substring test
+        # would also catch a mirror or another repo that merely contains the old path.
+        _url = (_o.stdout or '').strip().lower().rstrip('/')
+        if _url.endswith('.git'):
+            _url = _url[:-4]
+        if _url != 'https://github.com/adventureseeker423/tak-portal':
             return False
         _s = subprocess.run(_git + ['remote', 'set-url', 'origin', TAKPORTAL_REPO],
                             capture_output=True, text=True, timeout=10)

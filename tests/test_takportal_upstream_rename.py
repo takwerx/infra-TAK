@@ -63,14 +63,15 @@ def test_constant_is_the_new_upstream():
 
 
 def test_no_old_upstream_url_left():
-    # The helper's lowercase match and its docstring are the only mentions left.
-    assert 'github.com/adventureseeker423' not in APP.lower()
+    # The helper's stock-URL match is the only mention left.
+    assert 'github.com/adventureseeker423' not in APP.replace(HELPER, '').lower()
 
 
 @pytest.mark.parametrize('old', [
     'https://github.com/AdventureSeeker423/TAK-Portal.git',
     'https://github.com/AdventureSeeker423/TAK-Portal',
     'https://github.com/adventureseeker423/tak-portal.git',
+    'https://github.com/AdventureSeeker423/TAK-Portal/',
 ])
 def test_stock_old_origin_is_repointed(tmp_path, old):
     d = _clone(tmp_path, old)
@@ -84,6 +85,9 @@ def test_stock_old_origin_is_repointed(tmp_path, old):
     NEW,
     'https://github.com/someagency/TAK-Portal.git',
     'git@github.com:someagency/TAK-Portal.git',
+    # Contain the old owner/repo path but are not the stock URL: a mirror, another repo.
+    'https://git.agency.local/mirrors/AdventureSeeker423/TAK-Portal.git',
+    'https://github.com/AdventureSeeker423/TAK-Portal-fork.git',
 ])
 def test_new_or_fork_origin_is_left_alone(tmp_path, origin):
     d = _clone(tmp_path, origin)
