@@ -25019,6 +25019,32 @@ def _gh_advisories_fixed_by(repo, installed, target):
     return out
 
 
+# ops #182: security releases a component never published a GitHub advisory for. The
+# update notice merges these with the GHSA results, so a box below `fixed_in` gets the
+# same security flag a GHSA would give it. Add an entry when a lead/security review
+# confirms a release is a security fix; `reason` is shown to the customer as-is.
+KNOWN_SECURITY_RELEASES = (
+    {'component': 'cloudtak', 'fixed_in': '13.112.2',
+     'reason': 'Node.js security fixes CVE-2026-111497 and CVE-2026-106069 '
+               '(API image rebuilt on Node 26)'},
+)
+
+
+def _known_security_fixed_by(component, installed, target):
+    """KNOWN_SECURITY_RELEASES entries for `component` that `installed` is below and
+    `target` reaches: ['<reason> (fixed in v<fixed_in>)', …]. A version that does not
+    parse claims nothing."""
+    inst, tgt = _semver_tuple(installed), _semver_tuple(target)
+    if inst is None or tgt is None:
+        return []
+    out = []
+    for e in KNOWN_SECURITY_RELEASES:
+        fixed = _semver_tuple(e['fixed_in'])
+        if e['component'] == component and fixed is not None and inst < fixed <= tgt:
+            out.append(f"{e['reason']} (fixed in v{e['fixed_in']})")
+    return out
+
+
 def _apply_security_identity(item):
     """ops #168: a pending version that turns out to be a security release mails once
     more (identity + '+security'); a sweep that could not tell accepts whichever
@@ -25127,11 +25153,16 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
                       'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
                       'identity': str(info['latest']), 'how': 'CloudTAK page → Update.'}
                 # ops #168: CloudTAK publishes GitHub advisories with version ranges.
+                # ops #182: plus the releases it shipped as security fixes without one.
+                known = ['Fixes ' + k for k in _known_security_fixed_by(
+                    'cloudtak', info['version'], info['latest'])]
                 try:
                     ct['security'] = ['Fixes ' + a for a in _gh_advisories_fixed_by(
-                        'dfpc-coe/CloudTAK', info['version'], info['latest'])]
+                        'dfpc-coe/CloudTAK', info['version'], info['latest'])] + known
                 except Exception as e:
                     ct['security_unknown'] = True
+                    if known:
+                        ct['security'] = known
                     print(f"[update-notify] CloudTAK advisories unreadable: {e}", flush=True)
                 pending.append(_apply_security_identity(ct))
     except Exception as e:
