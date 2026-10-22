@@ -89962,8 +89962,12 @@ def _startup_migrations():
             _cf = _read_priv(CADDYFILE_PATH) or ''
             if (s.get('fqdn') or '').strip() and 'reverse_proxy h2c://127.0.0.1:10000' in _cf:
                 generate_caddyfile(s)
-                if 'reverse_proxy h2c://127.0.0.1:10000' not in (_read_priv(CADDYFILE_PATH) or ''):
-                    _caddy_reload()
+                if not _CADDY_REGISTRY_READY.is_set():
+                    # Write deferred to the post-registry regen + reload (seen on test6).
+                    print("Startup migration: NetBird vhost signal/relay fix queued — written with "
+                          "the post-registry Caddyfile regen", flush=True)
+                elif 'reverse_proxy h2c://127.0.0.1:10000' not in (_read_priv(CADDYFILE_PATH) or ''):
+                    _caddy_reload_if_changed(timeout=60)
                     print("Startup migration: NetBird vhost — signal + relay routed to the combined "
                           "server (peers can connect)", flush=True)
                 else:

@@ -71,6 +71,8 @@ def test_startup_migration_rewrites_old_vhosts_and_checks_the_live_file():
     mig = body[body.index('# ops #150: the NetBird vhost'):]
     mig = mig[:mig.index('NetBird vhost regenerate error')]
     assert "'reverse_proxy h2c://127.0.0.1:10000' in _cf" in mig
-    assert 'generate_caddyfile(s)' in mig and '_caddy_reload()' in mig
+    assert 'generate_caddyfile(s)' in mig and '_caddy_reload_if_changed(' in mig
+    # before the module registry loads the write is deferred to the catch-up regen
+    assert mig.index('_CADDY_REGISTRY_READY.is_set()') < mig.index('_caddy_reload_if_changed(')
     # verified against the LIVE file: a rejected Caddyfile is restored to the old one
     assert "not in (_read_priv(CADDYFILE_PATH) or '')" in mig
