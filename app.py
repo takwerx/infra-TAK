@@ -4206,6 +4206,13 @@ import copy as _copy
 
 _MODULES_CACHE_FRESH_S = 15
 _MODULES_CACHE_REFRESH_STUCK_S = 120   # a refresh this old is presumed hung; allow another
+# GH #214: "served once while it refreshes" had no age limit, so the first page after a quiet
+# spell showed whatever was cached last, however old. ops1 rebooted, the console cached TAK
+# Portal in the boot window while the boot sequence had it stopped, and 34 minutes later the
+# page said "Stopped — Docker container not running" over a portal that had been up since a
+# minute after boot (Guard Dog checked it every minute). Older than this, compute now. Above the stuck
+# window on purpose, so a hung refresh is still retried in the background first.
+_MODULES_CACHE_MAX_STALE_S = 300
 _MODULES_CACHE = {'data': None, 'at': 0.0, 'jobs': None, 'gen': 0, 'refreshing': 0.0,
                   'computing': None}   # (gen, Event, thread ident) of the in-flight synchronous compute
 _MODULES_CACHE_WAIT_S = 60
@@ -4298,6 +4305,8 @@ def detect_modules(fresh=False):
         data = _MODULES_CACHE['data']
         usable = (not fresh and data is not None and jobs is not None
                   and _MODULES_CACHE['jobs'] == jobs)
+        if usable and time.monotonic() - _MODULES_CACHE['at'] >= _MODULES_CACHE_MAX_STALE_S:
+            usable = False                     # too old to show even once (GH #214)
         if usable:
             now = time.monotonic()
             busy = _MODULES_CACHE['refreshing']
@@ -35551,6 +35560,43 @@ def _takportal_version_tuple(ver):
     return tuple(parts)
 
 
+def _takportal_head_release_tag(portal_dir):
+    """The release tag the ~/TAK-Portal checkout sits on ('2.0.15'), or '' when HEAD is on no
+    release tag (beta/main, a pre-tag clone, no git). Local git only — no network, no docker.
+
+    GH #214: upstream published release 2.0.15 with package.json still saying
+    `"version": "2.0.14"` (only `beta-version` was bumped). The update checked out 2.0.15 and
+    rebuilt it correctly, then read package.json and reported "2.0.14 -> 2.0.14" with
+    "v2.0.15 available" still on the card. The tag is what upstream released; package.json is
+    a field upstream can forget to bump. When the checkout is on a release tag, that tag is
+    the installed release."""
+    try:
+        r = subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                            'tag', '--points-at', 'HEAD'],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ''
+    if r.returncode != 0:
+        return ''
+    tags = [t.strip() for t in (r.stdout or '').splitlines() if re.match(r'^v?\d+\.\d+\.\d+$', t.strip())]
+    if not tags:
+        return ''
+    return max(tags, key=_takportal_version_tuple).lstrip('vV')
+
+
+def _takportal_installed_version(portal_dir):
+    """Installed TAK Portal release from the checkout alone: the release tag HEAD is on, else
+    package.json `version`. '' when neither is readable. See _takportal_head_release_tag."""
+    tag = _takportal_head_release_tag(portal_dir) if os.path.isdir(os.path.join(portal_dir, '.git')) else ''
+    if tag:
+        return tag
+    try:
+        with open(os.path.join(portal_dir, 'package.json')) as _pj:
+            return str((json.load(_pj) or {}).get('version') or '').strip()
+    except Exception:
+        return ''
+
+
 def _fetch_takportal_latest(*, fresh=False):
     """Newest upstream TAK Portal release tag, cached. None if GitHub has never answered.
 
@@ -35654,6 +35700,11 @@ def _get_takportal_version_info(fresh=False):
     # there — never invent a number, and never override a release-channel box.
     if out['channel'] == 'beta' and out['beta_version']:
         out['version'] = out['beta_version']
+    elif os.path.isdir(os.path.join(portal_dir, '.git')):
+        # GH #214: a checkout on a release tag IS that release, whatever package.json says.
+        _tag = _takportal_head_release_tag(portal_dir)
+        if _tag:
+            out['version'] = _tag
     if not out['version'] and os.path.isdir(os.path.join(portal_dir, '.git')):
         rv = subprocess.run(f'cd {portal_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
@@ -37211,12 +37262,8 @@ def _takportal_update_git(portal_dir, plog=None):
     # `docker logs --tail 2000` and hits the GitHub releases API to decide the BADGE.
     # None of that belongs on the button press, and on a chatty box the log read is
     # seconds of pure waste inside an operation that already has a build to do.
-    from_version = ''
-    try:
-        with open(os.path.join(portal_dir, 'package.json')) as _pj:
-            from_version = str((json.load(_pj) or {}).get('version') or '').strip()
-    except Exception:
-        pass
+    # GH #214: the release tag the checkout is on wins over package.json `version`.
+    from_version = _takportal_installed_version(portal_dir)
     out = {'ok': False, 'channel': 'beta' if beta else 'stable', 'ref': '',
            'from_version': from_version, 'to_version': '', 'rolled_back': False,
            'message': '', 'error': ''}
@@ -37279,12 +37326,40 @@ def _takportal_update_git(portal_dir, plog=None):
     if ft.returncode != 0:
         ft = subprocess.run(_git + ['fetch', 'origin', 'tag', tag, '--force'],
                             capture_output=True, text=True, timeout=180)
+    if ft.returncode != 0:
+        # GH #214: this used to fall through to the checkout, which then used whatever local
+        # tag of that name existed (or failed with a misleading "pathspec" error). Only a
+        # successful forced fetch proves the local tag is the one upstream published.
+        err = (ft.stderr or ft.stdout or '').strip()[:300]
+        out['error'] = (f'Could not fetch release {tag} from GitHub: {err}.{_takportal_git_hint(err)} '
+                        'Nothing was changed.')
+        return out
+    _prev_head = subprocess.run(_git + ['rev-parse', 'HEAD'], capture_output=True, text=True,
+                                timeout=15).stdout.strip()
     c = subprocess.run(_git + ['checkout', '--force', tag], capture_output=True, text=True, timeout=60)
     if c.returncode != 0:
         err = ((c.stderr or c.stdout) or (ft.stderr or '')).strip()[:300]
         out['error'] = f'Could not check out release {tag}: {err}.{_takportal_git_hint(err)}'
         return out
     _takportal_restore_env(portal_dir, _saved_env, plog=_log)
+    # GH #214: prove the tree is on the release before anything is built from it. A checkout
+    # that exits 0 somewhere else (a stale local tag of the same name, a ref the fetch never
+    # updated) must fail HERE, while the running portal is still untouched, not turn into a
+    # green "Updated" over the old code. On a miss, put the tree back where the running portal
+    # was built from so the checkout and the containers agree again.
+    _head = subprocess.run(_git + ['rev-parse', 'HEAD'], capture_output=True, text=True,
+                           timeout=15).stdout.strip()
+    _want = subprocess.run(_git + ['rev-parse', f'refs/tags/{tag}^{{commit}}'], capture_output=True,
+                           text=True, timeout=15).stdout.strip()
+    if not _head or _head != _want:
+        if _prev_head and _prev_head != _head:
+            subprocess.run(_git + ['checkout', '--force', _prev_head], capture_output=True, text=True, timeout=60)
+            _takportal_restore_env(portal_dir, _saved_env, plog=_log)
+        out['error'] = (f'The checkout did not land on release {tag} (HEAD {_head[:12] or "unknown"}, '
+                        f'tag {_want[:12] or "not found locally"}). '
+                        'Nothing was rebuilt; TAK Portal is still running the previous version.')
+        _log(f"  {out['error']}")
+        return out
     out['ok'] = True
     # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
     # Beta Mode on and then turned it off converges DOWN to the newest release.
@@ -38285,6 +38360,9 @@ def _takportal_run_update(portal_dir):
     # hard 500 with the git error in it.
     gitr = _takportal_update_git(portal_dir)
     if not gitr['ok']:
+        # The git step discards local edits first, which reverts the loopback port patch. Put it
+        # back so the next `compose up` (boot stagger, Guard Dog, Start) cannot publish 0.0.0.0.
+        _patch_takportal_compose_ports(portal_dir)
         return {'success': False, 'error': gitr['error'],
                 'channel': gitr['channel']}, 500
     pull_msg = gitr['message']
@@ -38410,6 +38488,15 @@ def _takportal_run_update(portal_dir):
     if not running:
         # The controls sit ABOVE the status line this lands in (ops #72: the old text said "below").
         return {'success': False, 'error': 'Container not running after update — press Start in Controls above.'}, 500
+    # GH #214: never a green "Updated" that did not reach the release it went for. ops1 got
+    # "Updated from 2.0.14 to GitHub Release 2.0.15. (2.0.14)" recorded as OK 2.0.14 -> 2.0.14.
+    _target = gitr.get('to_version') or ''
+    if _target and _takportal_version_tuple(new_version) != _takportal_version_tuple(_target):
+        _miss = (f'Update did not reach {_target}: TAK Portal reports {new_version or "no version"} '
+                 'after the rebuild.')
+        print(f'[takportal] update: {_miss}', flush=True)
+        return {'success': False, 'error': _miss, 'version': new_version,
+                'channel': gitr['channel'], 'ref': gitr['ref']}, 500
     return {'success': True, 'running': running, 'action': 'update', 'pull': pull_msg,
             'version': new_version, 'settings_synced': settings_synced,
             'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
