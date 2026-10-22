@@ -75540,22 +75540,35 @@ def takserver_create_client_cert():
         if not os.path.exists(p12_path):
             return jsonify({'error': 'Certificate file was not created'}), 500
 
+        group_warning = ''
         if groups_in or groups_out or groups_both:
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
-            cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
+            argv = ['java', '-jar', '/opt/tak/utils/UserManager.jar', 'certmod']
             for g in groups_both:
-                cmd += f' -g {shlex.quote(g)}'
+                argv += ['-g', g]
             for g in groups_in:
-                cmd += f' -ig {shlex.quote(g)}'
+                argv += ['-ig', g]
             for g in groups_out:
-                cmd += f' -og {shlex.quote(g)}'
-            cmd += f' {shlex.quote(pem_path)}'
+                argv += ['-og', g]
+            argv.append(pem_path)
             # v10.0.1 container: java + UserManager.jar live ONLY inside the takserver container
-            # (no host JDK), so run the group-assignment in-container; native path unchanged.
-            full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
-            gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=15)
-            if gr.returncode != 0:
-                pass  # cert still created, group assignment is best-effort
+            # (no host JDK), so run the group-assignment in-container (the same `docker exec ...
+            # bash -c` form _tak_exec() builds). v10.2.26: an argv list with no host shell, so a
+            # group name is always one word and never re-parsed.
+            full = (['docker', 'exec', TAK_CONTAINER, 'bash', '-c', shlex.join(argv)]
+                    if _tak_is_container() else argv)
+            # v10.2.26: 15 s was a JVM start on an idle box. test12 under load took 16.1 s, the
+            # TimeoutExpired fell to the outer except and the page said the create FAILED while
+            # the cert existed with no groups. Give it room, and when the groups don't land, say
+            # exactly that next to a cert that was created.
+            try:
+                gr = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                if gr.returncode != 0:
+                    group_warning = ('Certificate created, but TAK Server did not accept the group '
+                                     f'assignment: {(gr.stdout or "").strip()[-200:]}')
+            except subprocess.TimeoutExpired:
+                group_warning = ('Certificate created, but assigning its groups took over 2 minutes '
+                                 'and was stopped. Assign the groups in TAK Server before using it.')
 
         return jsonify({
             'success': True,
@@ -75566,6 +75579,7 @@ def takserver_create_client_cert():
             'groups_in': groups_in,
             'groups_out': groups_out,
             'package_url': f'/api/takserver/client-cert/{cert_name}/package',
+            'group_warning': group_warning,
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -75703,7 +75717,7 @@ def takserver_client_cert_package(name):
               ('ca-chain.pem', chain.encode(), "This server's certificate authority (PEM). Add it as the trusted /"
                                                ' server CA so your system trusts TAK Server.')]
     if trust_p12:
-        files.append(('truststore.p12', trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
+        files.append((trust, trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
     w = max(len(f[0]) for f in files)
     readme = '\n'.join(
         [f'TAK Server integration package: {name}',
