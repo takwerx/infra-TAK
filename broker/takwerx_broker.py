@@ -899,10 +899,16 @@ def _check_pkgmgr(argv):
     # controlling dependency cleanup on `dnf remove takserver`; cannot run code).
     # Every other -o/--setopt — especially the Pre-Invoke/hook vectors — is denied.
     SAFE_SETOPT = 'clean_requirements_on_remove'
+    # Ops #152: the read-only OS-updates check (`dnf -C check-update`) skips a
+    # repo it cannot read instead of failing whole. Allowed ONLY as this exact
+    # literal — a boolean that cannot name a file, URL or command.
+    SAFE_SETOPT_EXACT = {'skip_if_unavailable=True'}
     sub = None
     for a in argv[1:]:
         # -o KEY=VAL / --option / --setopt run arbitrary config incl. exec hooks
         if a.startswith('--setopt='):
+            if a.split('=', 1)[1] in SAFE_SETOPT_EXACT:
+                continue
             key = a.split('=', 1)[1].split('=', 1)[0].strip()
             if key != SAFE_SETOPT:
                 raise Denied(f'{argv[0]}: --setopt {key} not allowed')

@@ -51,7 +51,7 @@ def _load():
         elif isinstance(node, ast.Assign) and any(getattr(t, 'id', None) in _WANT for t in node.targets):
             parts.append(ast.get_source_segment(APP, node))
     assert len(parts) == 2, 'MEDIAMTX_OPEN_PATHS / _emit_mediamtx_site not found at module level in app.py'
-    ns = {}
+    ns = {'_pub_url': lambda h, s=None: f'https://{h}' if h else ''}
     exec(compile('\n\n'.join(parts), 'app.py:_emit_mediamtx_site', 'exec'), ns)
     return ns['_emit_mediamtx_site']
 

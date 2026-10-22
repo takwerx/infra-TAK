@@ -57,13 +57,27 @@ CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
 # script and the remote/split-box cases; duplicating that sed here would be a second
 # writer of the same file.
 if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
-  _hls_ok=1
-  for _k in "^hlsVariant: mpegts" "^hlsSegmentCount: 3" "^hlsSegmentDuration: 500ms" "^hlsPartDuration: 200ms"; do
-    docker exec cloudtak-media-1 grep -q "$_k" /mediamtx.yml 2>/dev/null || _hls_ok=0
-  done
+  # ops #161: read the file ONCE, then grep it here. This used to run
+  # `docker exec ... grep -q` per key, so a failed exec looked exactly like a missing
+  # key. Seen on ops1 2026-10-21: the patch job's apt run restarted Docker, exec
+  # failed for ~45s, and two checks in a row reported MISSING on a profile that was
+  # never gone (a plain restart keeps it). A read we could not make is UNKNOWN: log
+  # it and leave the drift state alone, so it neither starts nor clears an episode.
+  _hls_cfg="$(docker exec cloudtak-media-1 cat /mediamtx.yml 2>/dev/null)"
+  _hls_rc=$?
+  if [ "$_hls_rc" -ne 0 ] || [ -z "$_hls_cfg" ]; then
+    _hls_ok=unknown
+  else
+    _hls_ok=1
+    for _k in "^hlsVariant: mpegts" "^hlsSegmentCount: 3" "^hlsSegmentDuration: 500ms" "^hlsPartDuration: 200ms"; do
+      printf '%s\n' "$_hls_cfg" | grep -q "$_k" || _hls_ok=0
+    done
+  fi
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
   _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
-  if [ "$_hls_ok" -eq 0 ]; then
+  if [ "$_hls_ok" = unknown ]; then
+    _log "drift | cloudtak-media HLS profile UNKNOWN — could not read /mediamtx.yml (docker exec rc=$_hls_rc); not counted as missing"
+  elif [ "$_hls_ok" -eq 0 ]; then
     _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
     # v10.1.57 W12: TWO-STRIKE. Do not alert on first sight.
     #

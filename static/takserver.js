@@ -189,6 +189,7 @@ if(document.getElementById('tak-cert-password-inline')||document.getElementById(
 if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
+if(document.getElementById('tak-cert-row')){loadTakCertRow();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
 function refreshTakServerCAState(){
   if(document.getElementById('cert-expiry-info'))loadCertExpiry();
@@ -234,6 +235,27 @@ function ccGroupChanged(cb,type){
     b.checked=(r.checked&&w.checked);
   }
 }
+// v10.2.26 W5 — integration package for an existing client cert. The list is loaded the first
+// time the picker is opened (the server checks each cert with openssl), not on every page load.
+var _pkgCertsLoaded=false;
+async function loadPackageCerts(){
+  if(_pkgCertsLoaded)return;_pkgCertsLoaded=true;
+  var sel=document.getElementById('cc-pkg-select'),msg=document.getElementById('cc-pkg-msg');if(!sel)return;
+  try{
+    var r=await fetch('/api/takserver/client-certs');var d=await r.json();var certs=d.certs||[];
+    var cur=sel.value;
+    sel.innerHTML='<option value="">'+(certs.length?'Choose a client certificate…':'No client certificates found')+'</option>'
+      +certs.map(function(n){return '<option value="'+escapeHtml(n)+'">'+escapeHtml(n)+'</option>';}).join('');
+    if(cur)sel.value=cur;
+  }catch(e){_pkgCertsLoaded=false;if(msg){msg.textContent='Could not load certificates';msg.style.color='var(--red)';}}
+}
+function downloadIntegrationPackage(){
+  var sel=document.getElementById('cc-pkg-select'),msg=document.getElementById('cc-pkg-msg');
+  var n=sel?sel.value:'';
+  if(!n){if(msg){msg.textContent='Choose a certificate first.';msg.style.color='var(--red)';}return;}
+  if(msg)msg.textContent='';
+  window.location.href='/api/takserver/client-cert/'+encodeURIComponent(n)+'/package';
+}
 async function createClientCert(){
   var nameEl=document.getElementById('cc-name');
   var btn=document.getElementById('cc-create-btn');
@@ -262,12 +284,14 @@ async function createClientCert(){
     var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
-    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    if(msg){msg.textContent=d.group_warning||'';msg.style.color=d.group_warning?'var(--yellow)':'var(--text-dim)';}
     if(result){
       result.style.display='block';
       document.getElementById('cc-result-name').textContent=d.name+'.p12';
       document.getElementById('cc-download-link').href=d.download_url;
+      var pk=document.getElementById('cc-package-link');if(pk&&d.package_url)pk.href=d.package_url;
     }
+    _pkgCertsLoaded=false;
     if(btn)btn.disabled=false;
     if(nameEl)nameEl.value='';
   }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
@@ -309,6 +333,100 @@ async function loadCertExpiry(){
       banner.innerHTML=bh;
     }
   }catch(e){el.textContent='Failed to load certificate info';}
+}
+
+// v10.2.26 — TAK Server certificate names row. Always shown once TAK answers: yellow with
+// [Fix it] when the live cert is missing one of this box's names, a live log while fixing,
+// green once TAK is PRESENTING every name (the server re-reads the live cert), red on failure.
+function _takCertStyle(el,tone){
+  var t={warn:['rgba(234,179,8,0.08)','rgba(234,179,8,0.35)'],ok:['rgba(34,197,94,0.07)','rgba(34,197,94,0.3)'],
+         bad:['rgba(239,68,68,0.08)','rgba(239,68,68,0.35)'],busy:['rgba(59,130,246,0.08)','rgba(59,130,246,0.3)']}[tone];
+  el.style.background=t[0];el.style.border='1px solid '+t[1];el.style.display='block';
+}
+var _takCertSawRun=false,_takCertTries=0;
+// The console-wide "certificate doesn't include …" bar is drawn at page load; once the row
+// confirms the live cert is fixed, take it down here instead of waiting for a reload, and
+// re-stack whatever notice bars are left (same layout the bars' own dismiss uses).
+function _takCertDropBar(){
+  var b=document.querySelector('.takcert-banner');if(!b||!b.parentNode)return;
+  b.parentNode.removeChild(b);
+  var bars=[].slice.call(document.querySelectorAll('.itk-notice'));
+  var base=parseInt(b.getAttribute('data-base'),10)||0,h=parseInt(b.getAttribute('data-h'),10)||34;
+  bars.forEach(function(x,i){x.style.top=(base+i*h)+'px';});
+  document.body.style.setProperty('padding-top',(base+bars.length*h)+'px','important');
+}
+function _takCertLog(job){
+  return '<div style="margin-top:12px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap">'+escapeHtml((job.log||[]).join('\n'))+'</div>';
+}
+var _takCertFixBtn='<button type="button" id="tak-cert-fix-btn" onclick="fixTakCert()" style="margin-top:12px;padding:8px 18px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;font-weight:600;cursor:pointer">Fix it</button>';
+async function loadTakCertRow(){
+  var el=document.getElementById('tak-cert-row');if(!el)return;
+  var d;
+  try{var r=await fetch('/api/takserver/server-cert');d=await r.json();}catch(e){d={job:{},status:null};}
+  var job=d.job||{},st=d.status;
+  if(job.running){
+    _takCertSawRun=true;
+    _takCertStyle(el,'busy');
+    var steps=(job.log||[]).filter(function(l){return /^Step \d\/4/.test(l);});
+    var step=steps.length?steps[steps.length-1]:'Starting…';
+    var secs=job.elapsed||0,el_t=(secs>=60?Math.floor(secs/60)+'m ':'')+(secs%60)+'s';
+    var restarting=/^Step 4\/4/.test(step);
+    el.innerHTML='<div style="display:flex;align-items:center;gap:12px">'
+      +'<span style="width:18px;height:18px;flex:none;border:2px solid rgba(59,130,246,0.25);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite"></span>'
+      +'<div><div style="font-weight:600;color:var(--accent)">Fixing TAK Server\'s certificate… <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
+      +'<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">'+escapeHtml(step)
+      +(restarting?' TAK Server usually takes 1–3 minutes to come back; devices reconnect on their own.':'')+'</div></div></div>'
+      +_takCertLog(job);
+    var lg=el.lastChild;if(lg)lg.scrollTop=lg.scrollHeight;
+    setTimeout(loadTakCertRow,2000);return;
+  }
+  // Never vanish: a busy box can miss one read (test12 under load, 2026-10-22). Say we're
+  // checking, retry a few times, then say plainly that it couldn't be read, with a retry.
+  if(!st||st.state==='unknown'){
+    _takCertStyle(el,'busy');el.style.padding='8px 16px';
+    if(_takCertTries<3){
+      _takCertTries++;
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Checking TAK Server\'s certificate…</div>';
+      setTimeout(loadTakCertRow,5000);
+    }else{
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Couldn\'t read TAK Server\'s certificate right now (TAK Server isn\'t answering on 8443). '
+        +'<a href="#" onclick="_takCertTries=0;loadTakCertRow();return false;" style="color:var(--cyan)">Check again</a></div>';
+    }
+    return;
+  }
+  _takCertTries=0;
+  var dom=st.domain||'',names=(st.live||[]).map(escapeHtml).join(', ');
+  if(st.state==='ok'){
+    _takCertDropBar();
+    // Steady state is one quiet line; the names are in the tooltip. The "Fixed" sentence only
+    // shows on the page that watched the fix run — not on every reload after it.
+    var justFixed=_takCertSawRun&&job.complete&&!job.error;
+    _takCertStyle(el,'ok');
+    el.style.padding=justFixed?'14px 20px':'8px 16px';
+    el.innerHTML='<div title="Names on the certificate: '+escapeHtml((st.live||[]).join(', '))+'" style="font-weight:600;color:var(--green);font-size:12px">✓ TAK Server certificate covers '+escapeHtml(dom||st.expected[0]||'this server')+'</div>'
+      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Fixed. TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
+    return;
+  }
+  var miss=st.missing||[],head=(dom&&miss.indexOf(dom)>=0)?dom:miss[0];
+  var failed=job.complete&&job.error;
+  _takCertStyle(el,failed?'bad':'warn');
+  el.innerHTML=(failed?'<div style="font-weight:600;color:var(--red)">✗ The last fix did not complete. The previous certificate was put back; details below.</div>':'')
+    +'<div style="font-weight:600;color:var(--yellow);'+(failed?'margin-top:8px':'')+'">⚠ Your TAK Server certificate doesn\'t include '+escapeHtml(head)+'</div>'
+    +'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">ATAK, iTAK, WinTAK and CloudTAK don\'t check this, but integrations that verify the hostname (cUAS feeds, TAK Portal with the system CA, any standard TLS client) will reject the server. '
+    +'Fixing keeps your CA, so enrolled devices don\'t re-enroll. TAK Server restarts and devices reconnect in about 1–2 minutes.</div>'
+    +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Missing: '+miss.map(escapeHtml).join(', ')+(names?' · on the certificate now: '+names:'')+'</div>'
+    +_takCertFixBtn+(failed?_takCertLog(job):'');
+}
+async function fixTakCert(){
+  if(!confirm('Reissue TAK Server\'s certificate with this server\'s names?\n\n• Your CA stays the same, so enrolled devices keep working\n• TAK Server restarts; devices reconnect in about 1–2 minutes\n• The current certificate is backed up first and restored if anything fails'))return;
+  var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
+  var btn=document.getElementById('tak-cert-fix-btn');if(btn){btn.disabled=true;btn.textContent='Starting…';}
+  try{
+    var r=await fetch('/api/takserver/server-cert/fix',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    var d=await r.json();
+    if(!d.success){alert(d.error||'Could not start the fix');if(btn){btn.disabled=false;btn.textContent='Fix it';}return;}
+  }catch(e){alert('Error: '+e.message);if(btn){btn.disabled=false;btn.textContent='Fix it';}return;}
+  loadTakCertRow();
 }
 
 async function loadCAInfo(){

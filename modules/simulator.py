@@ -549,10 +549,13 @@ def _cloudtak_state(ctx, settings):
         host = custom if '.' in custom or not fqdn else f'{custom}.{fqdn}'
     else:
         host = f'map.{fqdn}' if fqdn else ''
+    # GH #206: with Caddy's port when the operator moved it off 443.
+    _ph = ctx.get('_pub_hostport')
+    _pub = _ph(host, settings) if (_ph and host) else host
     return {
         'installed': installed,
-        'map_url': f'https://{host}' if host and installed else '',
-        'panel_url': f'https://{host}/menu/taksim' if host and installed else '',
+        'map_url': f'https://{_pub}' if host and installed else '',
+        'panel_url': f'https://{_pub}/menu/taksim' if host and installed else '',
         'plugin_installed': os.path.isdir(SIM_CLOUDTAK_PLUGIN_DIR),
         'plugin_key': 'taksim',
     }

@@ -989,6 +989,9 @@ def capacity_facts(ctx, size_gb=None):
         'plain_host': plain_host,
         'host_template': atlas_instances.agency_host(plain_host, '{slug}')
         if plain_host else '',
+        # GH #206: ':PORT' when the operator moved Caddy off 443, else ''. Links
+        # only; `hostFor` stays the bare host Caddy's site address uses.
+        'https_suffix': _pub_host(ctx, '_', None)[1:],
         'may_deploy_plain': atlas_instances.may_deploy_plain(instances),
         # ⚠️ So the page can refuse a duplicate slug before anything is
         # recorded. The server refuses it too — this is the courtesy, not
@@ -3033,6 +3036,13 @@ def detect(ctx):
 # --------------------------------------------------------------------------- #
 
 
+def _pub_host(ctx, host, settings, http=False):
+    """GH #206: `host` as a browser must type it, with Caddy's port when the operator
+    moved it off 443/80. The bare host when the console has no such seam."""
+    fn = (ctx or {}).get('_pub_http_hostport' if http else '_pub_hostport')
+    return fn(host, settings) if (fn and host) else host
+
+
 def deployment_identity(ctx, inst, settings):
     """Every name and number a deploy configures itself with.
 
@@ -3078,9 +3088,9 @@ def deployment_identity(ctx, inst, settings):
         # Empty rather than a half-formed URL: a box with no domain resolved
         # cannot enrol devices, and `https://:8449` in a QR would fail on the
         # tablet with nothing to point at.
-        'console_url': f'https://{host}' if host else '',
+        'console_url': f'https://{_pub_host(ctx, host, settings)}' if host else '',
         'device_url': f'https://{host}:{DEVICE_PORT}' if host else '',
-        'apk_url': (f'http://{host}/api/v1/provisioning/agent.apk'
+        'apk_url': (f'http://{_pub_host(ctx, host, settings, http=True)}/api/v1/provisioning/agent.apk'
                     if host else ''),
         'authentik': atlas_instances.authentik_names(inst),
     }
@@ -3900,7 +3910,7 @@ def deploy(ctx, job, params):
         plog('')
         plog('✓ ATLAS deployed.')
         if fqdn:
-            plog(f'  Console:  https://{fqdn}/')
+            plog(f'  Console:  https://{_pub_host(ctx, fqdn, None)}/')
             plog(f'  Devices:  https://{fqdn}:{DEVICE_PORT}/  (mutual TLS)')
         plog('')
         # The agent and the launcher ship with the source and load into the
@@ -4336,7 +4346,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
         # served at and the sign-in loop never terminated.
         _host_name = atlas_instances.agency_host(
             _host_name, (inst or {}).get('slug'))
-        _atlas_host = 'https://' + _host_name
+        _atlas_host = 'https://' + _pub_host(ctx, _host_name, settings)
         _names = atlas_instances.authentik_names(inst)
         _cookie = f'.{fqdn.split(":")[0]}'
         try:

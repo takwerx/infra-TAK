@@ -129,7 +129,9 @@ class Keytool:
 
     def _argv(self, cmd):
         assert cmd.startswith('runuser -u tak -- keytool '), cmd
-        argv = shlex.split(cmd[len('runuser -u tak -- '):].replace('2>&1', ''))
+        return self._opts(shlex.split(cmd[len('runuser -u tak -- '):].replace('2>&1', '')))
+
+    def _opts(self, argv):
         opts, i = {}, 2
         while i < len(argv):
             if argv[i] in ('-noprompt', '-trustcacerts', '-rfc'):
@@ -144,9 +146,11 @@ class Keytool:
             return None
         return self.stores[path][1]
 
-    def sh(self, cmd):
-        self.cmds.append(cmd)
-        op, o = self._argv(cmd)
+    def sh(self, argv):
+        # _rotate_sh takes an argv list (ops #163), never a shell string
+        assert isinstance(argv, list) and argv[0] == 'keytool', argv
+        self.cmds.append(argv)
+        op, o = self._opts(argv)
         assert op == '-list'
         st = self._open(o['-keystore'], o['-storepass'])
         if st is None:
@@ -397,3 +401,67 @@ def test_rotate_intca_step5_uses_the_carry_forward():
 def test_rotate_rootca_logs_what_it_drops_before_wiping():
     body = _func('takserver_rotate_rootca')
     assert body.index('_rotate_log_dropped_cas(') < body.index('Step 1/8')
+
+
+# ── _rotate_sh runs an argv list, not a host shell (ops #163) ──────────────
+
+HOSTILE = "x'; touch /tmp/pwned; echo '$(id)`id`"
+
+
+def _cert_ns(container):
+    ns = {'os': os, 'shlex': shlex, 'TAK_CONTAINER': 'takserver',
+          '_tak_is_container': lambda: container}
+    for name in ('_rotate_tak_cert_cmd', '_rotate_tak_cert_argv'):
+        exec(compile(_func(name), 'app.py', 'exec'), ns)
+    return ns
+
+
+@pytest.mark.parametrize('container', [False, True])
+def test_the_argv_is_the_command_the_shell_string_ran(container):
+    """Same command as the old `runuser -u tak -- keytool ... 2>&1` string, on both paths."""
+    cns = _cert_ns(container)
+    argv = ['keytool', '-list', '-rfc', '-keystore', '/opt/tak/certs/files/truststore-INT CA.jks',
+            '-storepass', HOSTILE]
+    old = cns['_rotate_tak_cert_cmd']('runuser -u tak -- ' + shlex.join(argv) + ' 2>&1')
+    old_argv = shlex.split(old)
+    assert old_argv[-1] == '2>&1'          # the outer redirect, now stderr=STDOUT
+    assert cns['_rotate_tak_cert_argv'](argv) == old_argv[:-1]
+
+
+def test_the_container_argv_quotes_every_value_as_one_word():
+    got = _cert_ns(True)['_rotate_tak_cert_argv'](['keytool', '-storepass', HOSTILE])
+    assert got[:7] == ['docker', 'run', '--rm', '-v', f'{os.path.realpath("/opt/tak")}:/opt/tak:z',
+                       '--entrypoint', 'bash']
+    inner = got[got.index('-c') + 1]
+    assert shlex.split(inner) == ['keytool', '-storepass', HOSTILE, '2>&1']
+
+
+def test_rotate_sh_never_uses_a_shell():
+    calls = []
+
+    class R:
+        returncode, stdout = 0, 'Alias name: x\n'
+
+    class Sub:
+        PIPE, STDOUT = subprocess.PIPE, subprocess.STDOUT
+
+        @staticmethod
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            return R()
+
+    sns = {'subprocess': Sub, '_rotate_tak_cert_argv': lambda a: ['runuser', '-u', 'tak', '--'] + a}
+    exec(compile(_func('_rotate_sh'), 'app.py', 'exec'), sns)
+    assert sns['_rotate_sh'](['keytool', '-list', '-storepass', HOSTILE]) == (True, 'Alias name: x\n')
+    argv, kw = calls[0]
+    assert argv == ['runuser', '-u', 'tak', '--', 'keytool', '-list', '-storepass', HOSTILE]
+    assert not kw.get('shell')
+    assert kw['stderr'] == subprocess.STDOUT
+
+
+def test_a_hostile_truststore_password_reaches_keytool_as_one_word(ns):
+    seen = []
+    ns['_rotate_truststore_entries']('/opt/tak/certs/files/truststore-INT-CA-10.jks', HOSTILE,
+                                     lambda argv: (seen.append(argv), (False, ''))[1])
+    assert seen == [['keytool', '-list', '-rfc', '-keystore', '/opt/tak/certs/files/truststore-INT-CA-10.jks',
+                     '-storepass', HOSTILE]]

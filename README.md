@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.25-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.25-alpha)**
+**Current release: [v10.2.26-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.26-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,31 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.26-alpha — 2026-10-22 — Security: a TAK client with a bad certificate no longer locks the admin out; NetBird 0.80.0; Authentik 2026.8.4; restart prompt after a kernel security update; TAK Server certificate names; choose Caddy's ports
+
+**Headline: fail2ban no longer bans a whole address on every port because one TAK device keeps retrying with an old certificate, so the admin can't be locked out of the console that way. NetBird moves to 0.80.0 (GHSA-v5w2-pqxj-6r94), Authentik to 2026.8.4, and the console prompts for a restart when a kernel security fix is installed but not running. The OS-updates panel is accurate on RHEL/Rocky. TAK Server's own certificate now names the server, with a Fix it button for existing boxes and a client-certificate integration package that never contains a CA key. Plus: TAK Portal Update installs and reports the right version, and Caddy can move off ports 443/80.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.26-alpha))
+
+**Security: a TAK client with a bad certificate no longer blocks the console.** The `takserver` fail2ban jail banned on all ports, so one ATAK/iTAK device retrying with an old certificate could lock its address out of the console, Authentik, TAK Portal and SSH, and `recidive` stretched that to 7 days. The jail now bans only TAK's ports (8089, 8443, 8446, 9000, 9001), and TAK bans no longer escalate through `recidive`. Existing boxes switch over when the console starts, keeping current bans and the operator's thresholds and whitelist. The Fail2ban page and the Guard Dog ban e-mail explain each TAK ban in plain words, for example a device with an old certificate that needs re-enrolling.
+
+**Security: NetBird 0.80.0.** NetBird server and dashboard move from 0.74.4 / v2.90.4 to 0.80.0 / v2.94.0, which fixes a pre-auth relay issue (GHSA-v5w2-pqxj-6r94). Also: SSO login no longer spins on a box whose NetBird store lost its key, and peers enrolled through Caddy now connect (signal and relay are routed).
+
+**Security: OS updates and kernel restarts.** On RHEL/Rocky a failed `dnf` check no longer reads as "nothing pending"; the panel says when the check failed and which repos it skipped. When a new kernel is installed but the server still runs the old one, the console now says a restart is needed and offers **Reboot now**, on Ubuntu and RHEL alike.
+
+**Security: TAK Server certificate names, Fix it, and the integration package.** TAK Server's own certificate (8089/8443) was issued with only the name `takserver`, so integrations that check the hostname rejected it. New installs, CA rotations and Revoke Old CA now issue it with the box's names and IP. On existing boxes, the TAK Server page shows a yellow certificate row with a **Fix it** button: it backs up the certificate, reissues it from the same CA, restarts TAK Server, and restores the old one if anything fails. The CA, the name and the file names stay the same, so enrolled devices are unaffected. The client-certificate integration package (.zip) and the certificate list never include a CA's private key, including on boxes whose CA was rotated by an older release. **Create Client Certificate** gives the group step 2 minutes on a busy server, and says so plainly if the certificate was created but the groups weren't set.
+
+**Authentik 2026.8.4.** Authentik moves from 2026.5.7 to 2026.8.4, the current patch of the 2026.8 line. It carries the same security fixes as 2026.5.7, fixes a memory leak in the LDAP outpost, and reads list settings such as the trusted proxy ranges correctly. After updating the console, press **Update** on the Authentik card.
+
+**Older Authentik installs update in two steps.** Authentik 2026.8 will not start on a database that skipped a release. A server still on Authentik 2026.2 or older is updated to 2026.5.7 first (the Update button says so); press **Update** again to reach 2026.8.4.
+
+**Authentik on a separate server.** Authentik 2026.8 accepts Caddy's forwarded headers only from addresses it trusts. When Authentik runs on its own server, Update now adds the console's IP to that list. Set **Settings → Server IP** before you update.
+
+**Also in this release.**
+- **TAK Portal Update (GH #214):** Update to 2.0.15 reported "2.0.14" and kept offering 2.0.15, because upstream's 2.0.15 tag still says 2.0.14 in one field. The console now reports the release it installed. After a reboot the page no longer shows TAK Portal as **Stopped** while it is running.
+- **Choose Caddy's ports (GH #206):** the Caddy page has HTTPS/HTTP port fields (443/80 by default) for hosts where another service already owns those ports. Leave them alone and nothing changes.
+- **TAK Portal build time:** a fresh TAK Portal deploy or update gets the full 15 minutes to build (it was cut off at 10 minutes on smaller boxes), and a failed build now shows the real error.
+- **CloudTAK video alert:** Guard Dog no longer sends a false "CloudTAK video config drift" alert while Docker restarts during a package upgrade.
+- **Rotate CA:** the truststore listing during Rotate Intermediate/Root CA runs without a shell.
 
 ### v10.2.25-alpha — 2026-10-21 — Hotfix: Node-RED feeds and TAK clients get their groups back after an update or Authentik restart; Node-RED on the newest Node 22; Rotate Intermediate CA keeps older CAs trusted
 
