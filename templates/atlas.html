@@ -966,7 +966,7 @@ function instanceRow(i){
   // comes to link somewhere nothing answers.
   const link = document.createElement('a');
   link.className = 'mono atlas-link';
-  link.href = 'https://' + hostFor(i.slug) + '/';
+  link.href = 'https://' + hostFor(i.slug) + ((capacityState && capacityState.https_suffix) || '') + '/';
   link.target = '_blank';
   link.rel = 'noopener noreferrer';
   link.textContent = hostFor(i.slug);

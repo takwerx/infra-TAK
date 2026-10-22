@@ -176,7 +176,8 @@ def _func(name):
 
 def test_kernel_patch_status_not_patched_while_restart_pending():
     body = _func('kernel_patch_status_api')
-    assert "'patched': upgradable_count == 0 and not reboot_pending" in body
+    # ops #152's "the package manager answered" condition stays alongside it.
+    assert "'patched': upgradable_count == 0 and not check_err and not reboot_pending" in body
     assert 'upgradable_count > 0 or reboot_pending' in body
 
 

@@ -530,7 +530,8 @@ def deploy(ctx, job, params):
             tvr_host = (ctx['_get_service_domain'](s, 'tak_video_restreamer') or '').strip()
         except Exception:
             tvr_host = ''
-        plog(f'  Web UI: https://{tvr_host}/  (admin / {admin_pass})' if tvr_host else
+        _ph = ctx.get('_pub_hostport')
+        plog(f'  Web UI: https://{_ph(tvr_host, s) if _ph else tvr_host}/  (admin / {admin_pass})' if tvr_host else
              f'  Web UI: http://localhost:3100/  (admin / {admin_pass})')
         plog(f'  Publishing needs a login: user {TVR_PUBLISH_USER}, password on the TAK Video Restreamer page')
         plog(f'  RTSP:   rtsp://{TVR_PUBLISH_USER}:<password>@<host>:8554/<stream>')
