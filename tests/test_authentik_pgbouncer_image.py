@@ -22,8 +22,10 @@ _ensure_authentik_pgbouncer_image() is cut out of app.py and run against a temp 
 with docker, ldapsearch and the clock stubbed.
 
 ops #123: after the v10.2.22 swap to v1.26.1-p0, TAK users reconnected with no groups.
-The pin goes back to v1.25.1-p0, and a swap is only accepted once a live adm_ldapservice
+The pin went back to v1.25.1-p0, and a swap is only accepted once a live adm_ldapservice
 bind plus users' memberOf hold through the outpost.
+
+ops #151: the pin returns to v1.26.1-p0, so the fleet swaps 1.25.1 → 1.26.1 again.
 """
 
 import contextlib
@@ -40,7 +42,7 @@ import yaml
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 PIN = re.search(r"^_AUTHENTIK_PGBOUNCER_IMAGE = '([^']+)'", APP, re.M).group(1)
-OTHER = 'edoburu/pgbouncer:v1.26.1-p0'     # what v10.2.22 moved boxes onto
+OTHER = 'edoburu/pgbouncer:v1.25.1-p0'     # what v10.2.23 put boxes back on
 SA_PASS = 'sa-secret-do-not-log'
 
 
@@ -148,12 +150,12 @@ RESTART_SEQ = [['docker', 'compose', 'restart', 'server', 'worker'], ['wait-heal
                ['docker', 'compose', 'restart', 'ldap']]
 
 
-def test_pin_is_back_on_1_25_1_after_ops_123():
+def test_pin_is_1_26_1_after_ops_151():
     assert re.fullmatch(r'edoburu/pgbouncer:v\d+\.\d+\.\d+-p\d+', PIN), PIN
-    assert PIN == 'edoburu/pgbouncer:v1.25.1-p0'
+    assert PIN == 'edoburu/pgbouncer:v1.26.1-p0'
 
 
-def test_box_on_1_26_1_is_moved_back_to_the_pin(tmp_path):
+def test_box_on_1_25_1_is_moved_to_the_pin(tmp_path):
     out, compose, calls, settings, _, _ = _run(tmp_path, OTHER)
     assert out is True
     assert compose['services']['pgbouncer']['image'] == PIN
@@ -266,7 +268,7 @@ def test_still_failing_after_restart_rolls_back_and_restarts_again(tmp_path):
 
 
 def test_box_already_failing_before_the_swap_keeps_the_pin(tmp_path):
-    # A field box broken on 1.26.1 must not be rolled back INTO 1.26.1 for it.
+    # A field box already broken on the old image must not be rolled back INTO it.
     out, compose, calls, settings, log, _ = _run(tmp_path, OTHER, ldap=lambda live: (49, 0))
     assert out is True
     assert compose['services']['pgbouncer']['image'] == PIN

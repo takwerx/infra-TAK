@@ -60019,9 +60019,13 @@ def _authentik_apply_official_tunings(plog):
 # LDAP SA bind never came back and TAK users reconnected with no groups; test12
 # showed every user at memberOf=0 for ~10 s after the swap. The security bump
 # returns as its own change once the swap is verified end to end.
+# ops #151: v1.25.1-p0 → v1.26.1-p0 again (CVE-2026-19888, CVE-2026-6664), landed on
+# its own, after the v10.2.25 LDAP recycle/heal fix and in a later release than the
+# Authentik 2026.8.4 bump, so an LDAP regression points at one change. Gated on a
+# 3-box swap/reconnect/rollback T&E.
 # Existing boxes are moved onto this pin by _ensure_authentik_pgbouncer_image()
 # (the install path only writes it when it first adds the service), in either
-# direction, so boxes already on v1.26.1-p0 move back on their next console start.
+# direction, so re-pinning v1.25.1-p0 is the rollback.
 #
 # Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
 # through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
@@ -60029,7 +60033,7 @@ def _authentik_apply_official_tunings(plog):
 # for that pgbouncer version. Tags MUST be the exact DockerHub tag —
 # `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
 # `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
-_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.26.1-p0'
 
 
 def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
