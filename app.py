@@ -37332,6 +37332,33 @@ def _takportal_restore_env(portal_dir, saved, plog=None):
         _log(f'  could not restore .env: {e}')
 
 
+def _takportal_repoint_origin(portal_dir, plog=None):
+    """Move a stock pre-rename clone's origin to TAKPORTAL_REPO. Returns True if it did.
+
+    2026-10-22: upstream moved AdventureSeeker423 -> ValleyTacticalSolutions. Old clones
+    still fetch through GitHub's rename redirect, which dies the day a repo of that name
+    exists under the old account again. Only the stock URL is rewritten — a fork stays put.
+    Call it before every fetch from origin (Update and redeploy-over-existing-checkout).
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    _git = ['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}']
+    try:
+        _o = subprocess.run(_git + ['remote', 'get-url', 'origin'],
+                            capture_output=True, text=True, timeout=10)
+        if 'adventureseeker423/tak-portal' not in (_o.stdout or '').lower():
+            return False
+        _s = subprocess.run(_git + ['remote', 'set-url', 'origin', TAKPORTAL_REPO],
+                            capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        _log(f'  could not repoint origin: {str(e)[:120]}')
+        return False
+    if _s.returncode != 0:
+        _log(f'  could not repoint origin: {(_s.stderr or "").strip()[:120]}')
+        return False
+    _log(f'  origin repointed to {TAKPORTAL_REPO}')
+    return True
+
+
 def _takportal_update_git(portal_dir, plog=None):
     """Move ~/TAK-Portal onto its channel's ref. Returns a dict, never raises.
 
@@ -37363,15 +37390,7 @@ def _takportal_update_git(portal_dir, plog=None):
     _healed, _heal_err = _module_checkout_ownership_selfheal(portal_dir, plog=_log)
     if _heal_err:
         _log(f'  ownership self-heal did not complete: {_heal_err}')
-    # 2026-10-22: upstream moved AdventureSeeker423 -> ValleyTacticalSolutions. Old clones
-    # still fetch through GitHub's rename redirect, which dies the day a repo of that name
-    # exists under the old account again. Repoint only the stock URL — a fork stays put.
-    _o = subprocess.run(_git + ['remote', 'get-url', 'origin'], capture_output=True, text=True, timeout=10)
-    if 'adventureseeker423/tak-portal' in (_o.stdout or '').lower():
-        _s = subprocess.run(_git + ['remote', 'set-url', 'origin', TAKPORTAL_REPO],
-                            capture_output=True, text=True, timeout=10)
-        _log(f'  origin repointed to {TAKPORTAL_REPO}' if _s.returncode == 0 else
-             f'  could not repoint origin: {(_s.stderr or "").strip()[:120]}')
+    _takportal_repoint_origin(portal_dir, plog=_log)
     # Snapshot .env FIRST — before the discard below and before any ref moves. Upstream
     # tracked it through 1.4.6, so both steps can destroy it (v10.1.57 W9).
     _saved_env = _takportal_preserve_env(portal_dir, plog=_log)
@@ -38958,6 +38977,7 @@ def run_takportal_deploy():
             _h, _he = _module_checkout_ownership_selfheal(portal_dir, plog=plog)
             if _he:
                 plog(f"  ownership self-heal did not complete: {_he}")
+            _takportal_repoint_origin(portal_dir, plog=plog)
             subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
                             'fetch', '--tags', '--force', 'origin'],
                            capture_output=True, text=True, timeout=120)
