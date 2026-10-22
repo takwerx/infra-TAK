@@ -38233,6 +38233,19 @@ def _takportal_update_worker(portal_dir, job_id):
             _takportal_update_job.update({'running': False, 'result': result, 'code': code})
 
 
+# TAK Portal's image build (Deploy and Update). Through the broker the subprocess timeout
+# alone is not the limit: the broker kills its child at its own DEFAULT_TIMEOUT (600 s)
+# unless the request carries a longer one, so the 900 s both paths asked for never applied.
+# Portal 2.x builds two images (web + worker) and took just over 10 min on a 4-vCPU box,
+# so every fresh install on a box that size or slower failed. The caller waits 60 s past
+# the broker so the broker's own TIMEOUT answer comes back instead of a client-side kill.
+_TAKPORTAL_BUILD_TIMEOUT = 900
+
+
+def _takportal_build_env():
+    return {**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(_TAKPORTAL_BUILD_TIMEOUT)}
+
+
 @_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
     'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def _takportal_run_update(portal_dir):
@@ -38308,9 +38321,10 @@ def _takportal_run_update(portal_dir):
     _pull_base_images(portal_dir, wrap=_sudo_wrap)
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
-                               cwd=portal_dir, capture_output=True, text=True, timeout=900)
+                               cwd=portal_dir, capture_output=True, text=True,
+                               timeout=_TAKPORTAL_BUILD_TIMEOUT + 60, env=_takportal_build_env())
     except subprocess.TimeoutExpired:
-        plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+        plog_msg = f'Build timed out after {_TAKPORTAL_BUILD_TIMEOUT}s. The old container is still running the previous version.'
         print(f'[takportal] update: {plog_msg}', flush=True)
         _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
         return {'success': False, 'error': plog_msg}, 500
@@ -38854,15 +38868,22 @@ def run_takportal_deploy():
         # (an already-running container just gets re-seeded + restarted in Step 6).
         _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-        for line in r.stdout.strip().split('\n'):
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               timeout=_TAKPORTAL_BUILD_TIMEOUT + 60, env=_takportal_build_env())
+        except subprocess.TimeoutExpired:
+            plog(f"\u2717 Docker build did not finish within {_TAKPORTAL_BUILD_TIMEOUT // 60} min \u2014 press Deploy again (cached layers make the retry faster)")
+            takportal_deploy_status.update({'running': False, 'error': True})
+            return
+        for line in (r.stdout or '').strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
         if r.returncode != 0:
-            plog(f"\u2717 Docker build failed")
-            for line in r.stderr.strip().split('\n'):
-                if line.strip():
-                    takportal_deploy_log.append(f"  \u2717 {line.strip()}")
+            # stderr is merged into stdout above, so the build's own reason is already in
+            # the log; r.stderr is None here (reading it crashed every failed deploy with
+            # "'NoneType' object has no attribute 'strip'").
+            plog(f"\u2717 Docker build failed (exit {r.returncode}) \u2014 the build output above says why")
             takportal_deploy_status.update({'running': False, 'error': True})
             return
 
@@ -56559,7 +56580,7 @@ networks:
                     if r.returncode == 0:
                         plog("✓ TAK Server restarted")
                     else:
-                        plog(f"⚠ TAK Server restart issue: {r.stderr.strip()[:100]}")
+                        plog(f"⚠ TAK Server restart issue: {(r.stdout or '').strip()[-200:]}")
             else:
                 plog(f"⚠ CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
         else:
@@ -67346,7 +67367,7 @@ entries:
                         if r.returncode == 0:
                             plog("\u2713 TAK Server restarted")
                         else:
-                            plog(f"\u26a0 TAK Server restart issue: {r.stderr.strip()[:100]}")
+                            plog(f"\u26a0 TAK Server restart issue: {(r.stdout or '').strip()[-200:]}")
                 else:
                     plog(f"\u26a0 CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
             else:
