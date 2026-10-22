@@ -5083,7 +5083,7 @@ def _dnf_ignored_repos(stderr):
     return out
 
 
-def _dnf_check_update_run():
+def _dnf_check_update_run(security=False):
     """Run the read-only dnf check-update; return the CompletedProcess or raise.
 
     Ops #152 (Rocky 9): run as the console user, `dnf -C check-update`
@@ -5095,10 +5095,25 @@ def _dnf_check_update_run():
     network), and fall back to the console user only if that path is not
     available. If neither answers, raise: "could not check" must never become
     "nothing pending".
+
+    ops #168: `security=True` adds dnf's own `--security` filter (packages with a
+    security advisory in the repo's updateinfo) for the Guard Dog update email.
     """
-    attempts = [_sudo_wrap(['dnf'] + _DNF_CHECK_UPDATE_ARGS)]
+    args = list(_DNF_CHECK_UPDATE_ARGS)
+    if security:
+        args.insert(-1, '--security')
+    return _dnf_readonly_run(args, _DNF_CHECK_OK_RC)
+
+
+def _dnf_readonly_run(args, ok_rc):
+    """Run a read-only dnf query as root (broker) first, then as the console user.
+
+    Shared by check-update and updateinfo (ops #168); see _dnf_check_update_run for
+    why root's cache is asked first. Raises when neither answers with an `ok_rc`."""
+    attempts = [_sudo_wrap(['dnf'] + args)]
     if os.getuid() != 0:
-        attempts.append([_real_bin('dnf')] + _DNF_CHECK_UPDATE_ARGS)
+        attempts.append([_real_bin('dnf')] + args)
+    what = 'dnf ' + next((a for a in args if not a.startswith('-')), '')
     first_err = ''
     for argv in attempts:
         try:
@@ -5107,15 +5122,18 @@ def _dnf_check_update_run():
         except Exception as e:
             first_err = first_err or str(e)[:120]
             continue
-        if r.returncode in _DNF_CHECK_OK_RC:
+        if r.returncode in ok_rc:
             return r
-        first_err = first_err or ('dnf check-update failed (rc=%s): %s'
-                                  % (r.returncode, _dnf_error_tail(r.stderr)))
-    raise RuntimeError(first_err or 'dnf check-update did not run')
+        first_err = first_err or ('%s failed (rc=%s): %s'
+                                  % (what, r.returncode, _dnf_error_tail(r.stderr)))
+    raise RuntimeError(first_err or (what + ' did not run'))
 
 
-def _pending_os_updates(notes=None):
+def _pending_os_updates(notes=None, security=False):
     """Return [{name, old, new}] of packages a full upgrade would install.
+
+    ops #168: `security=True` returns only the security fixes among them — dnf's
+    own `--security` filter, or apt candidates published in a -security pocket.
 
     Read-only SIMULATION on both families, against the package lists already
     on disk — no network, no `apt-get update`. So the answer is exactly what the
@@ -5128,7 +5146,7 @@ def _pending_os_updates(notes=None):
     """
     try:
         if _pkg_mgr() == 'dnf':
-            r = _dnf_check_update_run()
+            r = _dnf_check_update_run(security=security)
             pend = _parse_dnf_check_update(r.stdout)
             skipped = _dnf_ignored_repos(r.stderr)
             if skipped and not pend:
@@ -5165,7 +5183,7 @@ def _pending_os_updates(notes=None):
             errs = [ln.strip() for ln in (r.stderr or '').splitlines() if ln.strip()]
             raise RuntimeError('apt-get simulation failed (rc=%s): %s'
                                % (r.returncode, (errs[-1] if errs else 'no output')[:120]))
-        return _parse_apt_simulation(r.stdout)
+        return _parse_apt_security(r.stdout) if security else _parse_apt_simulation(r.stdout)
     except Exception as _e:
         # v10.1.37: this used to `return []`, which made "I could not check"
         # indistinguishable from "nothing is pending" — the panel simply
@@ -5234,7 +5252,7 @@ def _auto_update_posture():
     _now = time.time()
     if _AUTO_POSTURE_CACHE['data'] is not None and (_now - _AUTO_POSTURE_CACHE['ts']) < _AUTO_POSTURE_TTL:
         return _AUTO_POSTURE_CACHE['data']
-    post = {'mechanism': None, 'installed': False, 'enabled': False,
+    post = {'mechanism': None, 'installed': False, 'enabled': False, 'applies': False,
             'third_party_allowed': None, 'origins': [], 'note': ''}
     try:
         if _pkg_mgr() == 'dnf':
@@ -5258,6 +5276,7 @@ def _auto_update_posture():
                     applies = bool(re.search(r'^\s*apply_updates\s*=\s*yes', fh.read(), re.M))
             except Exception:
                 pass
+            post['applies'] = bool(post['enabled'] and applies)
             post['third_party_allowed'] = True   # dnf-automatic has no origin allowlist
             post['note'] = ('dnf-automatic is applying updates automatically, and unlike Ubuntu it has no '
                             'allowlist — it can update TAK components too.') if (post['enabled'] and applies) else \
@@ -5270,6 +5289,7 @@ def _auto_update_posture():
                            capture_output=True, text=True, timeout=5)
         post['installed'] = (r.returncode == 0)
         post['enabled'] = ((r.stdout or '').strip() == 'enabled')
+        post['applies'] = post['enabled']
         r = subprocess.run([_real_bin('apt-config'), 'dump'], capture_output=True, text=True, timeout=15)
         origins = re.findall(r'Unattended-Upgrade::Allowed-Origins::\s*"([^"]*)"', r.stdout or '')
         post['origins'] = origins
@@ -5350,6 +5370,126 @@ def os_updates_api():
     data['reboot'] = rb
     data['reboot_required'] = bool(data.get('reboot_required') or rb['pending'])
     return jsonify(data)
+
+
+# ---------------------------------------------------------------------------
+# ops #168: which pending OS updates are SECURITY fixes, for the Guard Dog update
+# email ("Security update: you should update this machine"). Read-only, against the
+# package lists already on disk, like the panel. The rule throughout: a security
+# claim needs positive evidence from the package manager. "Could not check" raises
+# (or returns None) and is never reported as a security update — nor as "none".
+# ---------------------------------------------------------------------------
+
+# An apt archive is a security pocket when its suite ends in -security: jammy-security,
+# and Ubuntu Pro's jammy-infra-security / jammy-apps-security.
+_APT_SECURITY_SUITE_RE = re.compile(r'[\w.+~]+-security(?=[/,\s\])]|$)')
+# `dnf updateinfo list` row: `RLSA-2026:1234 Important/Sec. openssl-libs-1:3.2.2-6.el9_5.x86_64`
+# (severity is absent on repos that do not publish one: `Sec.` alone).
+_DNF_SEC_ADVISORY_RE = re.compile(r'^(\S+)\s+(?:([A-Za-z]+)/)?Sec\.\s+(\S+)\s*$')
+_DNF_SEVERITY_RANK = {'critical': 4, 'important': 3, 'moderate': 2, 'low': 1}
+
+
+def _parse_apt_security(out):
+    """[{name, old, new}] from `apt-get -s full-upgrade` whose candidate is in a
+    -security pocket. apt lists every archive that carries the candidate version:
+    `Inst libssl3 [3.0.2-0ubuntu1.15] (3.0.2-0ubuntu1.16 Ubuntu:22.04/jammy-updates,
+    Ubuntu:22.04/jammy-security [amd64])`."""
+    sec = []
+    rx = re.compile(r'^Inst\s+(\S+)\s+(?:\[([^\]]+)\]\s+)?\((\S+)\s+([^)]*)\)')
+    for line in (out or '').splitlines():
+        m = rx.match(line.strip())
+        if m and _APT_SECURITY_SUITE_RE.search(m.group(4)):
+            sec.append({'name': m.group(1), 'old': m.group(2) or '', 'new': m.group(3)})
+    return sec
+
+
+def _parse_dnf_security_advisories(out):
+    """`dnf -q updateinfo list --security` rows -> [{id, severity, nevra}]."""
+    rows = []
+    for line in (out or '').splitlines():
+        m = _DNF_SEC_ADVISORY_RE.match(line.strip())
+        if m:
+            rows.append({'id': m.group(1), 'severity': (m.group(2) or '').capitalize(),
+                         'nevra': m.group(3)})
+    return rows
+
+
+def _dnf_security_advisories(extra=()):
+    """Security advisories from root's cached updateinfo (broker first, as for check-update)."""
+    r = _dnf_readonly_run(['-C', '-q', '--assumeno', '--setopt=skip_if_unavailable=True',
+                           'updateinfo', 'list', '--security'] + list(extra), (0,))
+    return _parse_dnf_security_advisories(r.stdout)
+
+
+def _pending_security_os_updates():
+    """Pending OS updates that are security fixes.
+
+    Returns {'packages': [{name, old, new}], 'advisories': [{id, severity}]}; an
+    empty package list is a real "no security patches pending". Raises when the
+    package manager could not answer (same checks as the panel's list). The
+    advisory ids are a best-effort extra for the email on dnf (a failure there
+    drops the ids, never the packages). apt has no offline advisory ids — the
+    pocket is the evidence, and the email names the packages.
+    """
+    pend = _pending_os_updates(security=True)
+    adv = []
+    if pend and _pkg_mgr() == 'dnf':
+        try:
+            best = {}
+            for a in _dnf_security_advisories():
+                cur = best.get(a['id'])
+                if not cur or (_DNF_SEVERITY_RANK.get(a['severity'].lower(), 0)
+                               > _DNF_SEVERITY_RANK.get(cur['severity'].lower(), 0)):
+                    best[a['id']] = {'id': a['id'], 'severity': a['severity']}
+            adv = sorted(best.values(), key=lambda a: (
+                -_DNF_SEVERITY_RANK.get(a['severity'].lower(), 0), a['id']))
+        except Exception:
+            adv = []
+    return {'packages': pend, 'advisories': adv}
+
+
+def _apt_policy_installed_from_security(out):
+    """True when `apt-cache policy <pkg>` shows the INSTALLED (***) version is
+    published in a -security pocket. Only the origin rows under the *** line count."""
+    in_installed = False
+    for ln in (out or '').splitlines():
+        s = ln.strip()
+        if s.startswith('***'):
+            in_installed = True
+            continue
+        if not in_installed:
+            continue
+        # origin rows: `500 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages`
+        #              `100 /var/lib/dpkg/status`
+        m = re.match(r'^\d+\s+(?:\S+://\S+|/\S+)(.*)$', s)
+        if not m:
+            return False          # the next version row: the installed block is over
+        if _APT_SECURITY_SUITE_RE.search(m.group(1)):
+            return True
+    return False
+
+
+def _staged_kernel_security(rb):
+    """What the installed-but-not-running kernel fixes, when it is a VERIFIED security
+    fix: a CVE from _KERNEL_CVE_FIXES, the dnf advisory id, or Ubuntu's security pocket.
+    None when it is not one. Raises when the package manager could not answer, so the
+    caller can tell "not security" from "could not tell" (never a guess either way)."""
+    if not rb or not rb.get('kernel') or not rb.get('staged'):
+        return None
+    staged = rb['staged']
+    cve = _kernel_cve_banner(rb.get('running'))
+    if cve and _kernel_cve_banner(staged) != cve:
+        return cve
+    if _pkg_mgr() == 'dnf':
+        for a in _dnf_security_advisories(['--installed', 'kernel-core']):
+            if staged in a['nevra']:
+                return a['id'] + (' (%s)' % a['severity'] if a['severity'] else '')
+        return None
+    r = subprocess.run([_real_bin('apt-cache'), 'policy', 'linux-image-' + staged],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError('apt-cache policy failed (rc=%s)' % r.returncode)
+    return 'Ubuntu security update' if _apt_policy_installed_from_security(r.stdout) else None
 
 
 def _get_unattended_upgrades_status():
@@ -24772,32 +24912,235 @@ def _console_pending_update(settings):
         return tuple(int(p) for p in v.lstrip('vV').replace('-alpha', '').replace('-beta', '').split('.'))
     try:
         if tag and _vt(tag) > _vt(VERSION):
-            return {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
-                    'target': tag, 'identity': tag}
+            item = {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
+                    'target': tag, 'identity': tag,
+                    'how': 'Console page → Update Now.'}
+            # ops #168: name every security release between what runs here and the
+            # target — skipping one (installed .20, security .22, latest .25) still
+            # leaves the box exposed. Unreadable release list = unknown, not security.
+            try:
+                req = urllib.request.Request(
+                    f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50', headers=gh_headers)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    rels = json.loads(resp.read().decode())
+                sec = []
+                for rel in rels if isinstance(rels, list) else []:
+                    rtag = (rel.get('tag_name') or '').strip()
+                    if rel.get('draft') or not rtag:
+                        continue
+                    try:
+                        if not (_vt(VERSION) < _vt(rtag) <= _vt(tag)):
+                            continue
+                    except Exception:
+                        continue
+                    what = _release_security_summary(rel.get('body'))
+                    if what:
+                        sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
+                item['security'] = [s for _, s in sorted(sec)]
+            except Exception as e:
+                item['security_unknown'] = True
+                print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
+            return item
     except Exception:
         pass
     return None
 
 
-def _collect_pending_updates(settings):
-    """All currently-pending updates as [{key,label,installed,target,identity}].
-    Read-only; each source shielded so one failure never hides the rest."""
+# ops #168: the ship skill already opens a security release's notes with this headline
+# (v10.2.21/22 `## Security release: …`, v10.2.24 `## Security: …`). Only the FIRST
+# line counts — a "### Security" section deeper in ordinary notes is not a flag.
+_SECURITY_RELEASE_HEADLINE_RE = re.compile(
+    r'^\s*#{1,6}\s*[*_]*\s*security(?:\s+release)?\s*[*_]*\s*:\s*[*_]*\s*(.+?)\s*[*_]*\s*$', re.I)
+
+
+def _release_security_summary(body):
+    """What a release fixes when its notes open with the security headline, else None."""
+    for ln in (body or '').splitlines():
+        if ln.strip():
+            m = _SECURITY_RELEASE_HEADLINE_RE.match(ln)
+            return m.group(1)[:240] if m else None
+    return None
+
+
+def _semver_tuple(v):
+    """'v13.49.0' / '13.49' -> (13, 49, 0); None when it is not plain dotted numbers."""
+    m = re.match(r'^\s*v?(\d+(?:\.\d+)*)\s*$', v or '')
+    if not m:
+        return None
+    t = tuple(int(x) for x in m.group(1).split('.'))
+    return t + (0,) * (3 - len(t)) if len(t) < 3 else t
+
+
+def _version_in_range(version, spec):
+    """True/False for a GitHub advisory range (`<= 13.49.0`, `>= 1.0, < 1.2.3`),
+    None when either side cannot be parsed — the caller must then claim nothing."""
+    ver = _semver_tuple(version)
+    if ver is None or not (spec or '').strip():
+        return None
+    ops = {'<': lambda a, b: a < b, '<=': lambda a, b: a <= b, '>': lambda a, b: a > b,
+           '>=': lambda a, b: a >= b, '=': lambda a, b: a == b}
+    for part in spec.split(','):
+        m = re.match(r'^\s*(<=|>=|<|>|=)?\s*(\S+)\s*$', part)
+        bound = _semver_tuple(m.group(2)) if m else None
+        if bound is None:
+            return None
+        if not ops[m.group(1) or '='](ver, bound):
+            return False
+    return True
+
+
+def _gh_advisories_fixed_by(repo, installed, target):
+    """Published GitHub security advisories of `repo` that `installed` is exposed to and
+    `target` is not: ['GHSA-… (high): summary', …]. Raises when GitHub cannot be read.
+    An advisory whose ranges do not parse is skipped — never claimed."""
+    import urllib.request
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/{repo}/security-advisories?per_page=100',
+        headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        advs = json.loads(resp.read().decode())
+    out = []
+    for a in advs if isinstance(advs, list) else []:
+        if a.get('state') not in (None, 'published') or a.get('withdrawn_at'):
+            continue
+        for v in a.get('vulnerabilities') or []:
+            rng = v.get('vulnerable_version_range') or ''
+            if _version_in_range(installed, rng) is not True:
+                continue
+            if _version_in_range(target, rng) is not False:
+                continue
+            patched = (v.get('patched_versions') or '').strip()
+            if patched and _version_in_range(target, patched) is not True:
+                continue
+            ident = a.get('cve_id') or a.get('ghsa_id') or 'advisory'
+            sev = (a.get('severity') or '').lower()
+            out.append(f"{ident}{' (' + sev + ')' if sev else ''}: {(a.get('summary') or '').strip()[:160]}")
+            break
+    return out
+
+
+def _apply_security_identity(item):
+    """ops #168: a pending version that turns out to be a security release mails once
+    more (identity + '+security'); a sweep that could not tell accepts whichever
+    identity was already mailed, so a GitHub blip neither re-mails nor drops the flag."""
+    base = item['identity']
+    if item.get('security'):
+        item['identity'] = base + '+security'
+    elif item.get('security_unknown'):
+        item['seen_ok'] = [base, base + '+security']
+    return item
+
+
+# ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
+# patch is normally installed by the next daily run (lists refresh twice a day with up to
+# 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
+# that window — otherwise every Ubuntu box would get a "you should update" email every
+# few days for patches that install themselves. With automatic updates off: next sweep.
+OS_SECURITY_AUTO_GRACE_S = 36 * 3600
+
+
+def _os_security_items(seen, unknown, now=None):
+    """Update-email items for this box's OS (ops #168): pending security patches, and a
+    security kernel that is installed but not running.
+
+    `seen` is the persisted {name=version: first-seen epoch} map, updated in place.
+    A key whose state could not be read this sweep goes into `unknown`, so the
+    caller carries its dedup state instead of pruning it (no re-mail after a blip)."""
+    now = now or time.time()
+    items = []
+    try:
+        sec = _pending_security_os_updates()
+    except Exception as e:
+        sec = None
+        unknown.add('os-security')
+        print(f"[update-notify] OS security check failed: {e}", flush=True)
+    if sec is not None:
+        pkgs = sec['packages']
+        ids = ['%s=%s' % (p['name'], p['new']) for p in pkgs]
+        for k in [k for k in seen if k not in ids]:
+            del seen[k]
+        for k in ids:
+            seen.setdefault(k, now)
+        posture = _auto_update_posture() if pkgs else {}
+        auto = bool(posture.get('applies'))
+        due = [(p, k) for p, k in zip(pkgs, ids)
+               if not auto or now - seen[k] >= OS_SECURITY_AUTO_GRACE_S]
+        if due:
+            names = sorted({p['name'] for p, _ in due})
+            fixes = ['Packages: ' + ', '.join(names[:10])
+                     + (f' (+{len(names) - 10} more)' if len(names) > 10 else '')]
+            adv = sec.get('advisories') or []
+            if adv:
+                fixes.append('Advisories: ' + ', '.join(
+                    a['id'] + (f" ({a['severity']})" if a['severity'] else '') for a in adv[:6])
+                    + (f' (+{len(adv) - 6} more)' if len(adv) > 6 else ''))
+            if auto:
+                fixes.append(f"Automatic updates ({posture.get('mechanism') or 'on'}) have not "
+                             'installed these for over a day.')
+            n = len(due)
+            items.append({
+                'key': 'os-security', 'label': 'Operating system',
+                'installed': f'{n} package{"s" if n != 1 else ""}', 'target': 'security patches',
+                'summary': f'Operating system: {n} security patch{"es" if n != 1 else ""} pending',
+                'identity': hashlib.sha256('\n'.join(sorted(k for _, k in due)).encode()).hexdigest()[:16],
+                'security': fixes,
+                'how': 'Console page → "Operating system updates available" → Install updates.'})
+    rb = _kernel_reboot_state()
+    if rb.get('kernel'):
+        try:
+            what = _staged_kernel_security(rb)
+        except Exception as e:
+            what = None
+            unknown.add('kernel-security')
+            print(f"[update-notify] kernel security check failed: {e}", flush=True)
+        if what:
+            items.append({
+                'key': 'kernel-security', 'label': 'Linux kernel',
+                'installed': rb['running'], 'target': rb['staged'],
+                'summary': 'Linux kernel: a security fix is installed but not running',
+                'identity': rb['sig'],
+                'security': [f"Kernel {rb['staged']} ({what}) is installed, but this box is still "
+                             f"running {rb['running']} and is not protected until it restarts."],
+                'how': 'Console page → Reboot now (the box is back in 1-3 minutes).'})
+    return items
+
+
+def _collect_pending_updates(settings, seen=None, unknown=None):
+    """All currently-pending updates as [{key,label,installed,target,identity}], plus
+    (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
+    source shielded so one failure never hides the rest. `seen`/`unknown`: see
+    _os_security_items."""
+    seen = {} if seen is None else seen
+    unknown = set() if unknown is None else unknown
     pending = []
     try:
         c = _console_pending_update(settings)
         if c:
-            pending.append({**c, 'key': 'console'})
+            pending.append(_apply_security_identity({**c, 'key': 'console'}))
     except Exception as e:
         print(f"[update-notify] console check failed: {e}", flush=True)
     try:
         if os.path.isdir(os.path.expanduser('~/CloudTAK')):
             info = _get_cloudtak_version_info()
             if info.get('version') and info.get('update_available') and info.get('latest'):
-                pending.append({'key': 'cloudtak', 'label': 'CloudTAK',
-                                'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
-                                'identity': str(info['latest'])})
+                ct = {'key': 'cloudtak', 'label': 'CloudTAK',
+                      'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
+                      'identity': str(info['latest']), 'how': 'CloudTAK page → Update.'}
+                # ops #168: CloudTAK publishes GitHub advisories with version ranges.
+                try:
+                    ct['security'] = ['Fixes ' + a for a in _gh_advisories_fixed_by(
+                        'dfpc-coe/CloudTAK', info['version'], info['latest'])]
+                except Exception as e:
+                    ct['security_unknown'] = True
+                    print(f"[update-notify] CloudTAK advisories unreadable: {e}", flush=True)
+                pending.append(_apply_security_identity(ct))
     except Exception as e:
         print(f"[update-notify] CloudTAK check failed: {e}", flush=True)
+    try:
+        pending.extend(_os_security_items(seen, unknown))
+    except Exception as e:
+        unknown.update({'os-security', 'kernel-security'})
+        print(f"[update-notify] OS security check failed: {e}", flush=True)
     try:
         for p in _detect_cloudtak_plugins():
             if p.get('installed') and p.get('update_available') and not p.get('local'):
@@ -24822,22 +25165,47 @@ def _update_notify_check_once():
         return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
     if settings.get('guarddog_update_email_enabled') is False:
         return {'pending': [], 'emailed': False, 'skipped': 'update emails disabled'}
-    pending = _collect_pending_updates(settings)
     state = _update_notify_state_load()
-    new_items = [p for p in pending if state.get(p['key']) != p['identity']]
+    seen = state.get('_os_security_seen')
+    seen = dict(seen) if isinstance(seen, dict) else {}
+    unknown = set()
+    pending = _collect_pending_updates(settings, seen=seen, unknown=unknown)
+
+    def _mailed(p):
+        return state.get(p['key']) in (p.get('seen_ok') or [p['identity']])
+
+    new_items = [p for p in pending if not _mailed(p)]
     emailed = False
     if new_items:
         server_id = _guarddog_server_identifier(settings) or socket.gethostname()
-        lines = [f"The following updates are pending on {server_id}:", '']
-        for p in pending:
+        sec_items = [p for p in pending if p.get('security')]
+        other = [p for p in pending if not p.get('security')]
+        lines = []
+        if sec_items:
+            # ops #168: say it plainly, say what it fixes, say where to click.
+            lines += [f"SECURITY UPDATE: you should update this machine ({server_id}).", '']
+            for p in sec_items:
+                lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
+                lines += [f"      {s}" for s in p['security']]
+                if p.get('how'):
+                    lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
+                lines.append('')
+            if other:
+                lines.append('Other pending updates:')
+        else:
+            lines += [f"The following updates are pending on {server_id}:", '']
+        for p in other:
             lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
                   f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
                   '', 'You get one email per new pending version — not a reminder per sweep.']
-        subj = (f"⬆ Update pending on {server_id}" if len(pending) == 1
-                else f"⬆ {len(pending)} updates pending on {server_id}")
+        if sec_items:
+            subj = f"🔒 Security update pending on {server_id} — update this machine"
+        else:
+            subj = (f"⬆ Update pending on {server_id}" if len(pending) == 1
+                    else f"⬆ {len(pending)} updates pending on {server_id}")
         try:
             _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines))
             emailed = True
@@ -24847,7 +25215,13 @@ def _update_notify_check_once():
             print(f"[update-notify] email send failed: {e}", flush=True)
     # Persist ONLY what was successfully mailed (a failed send retries next sweep);
     # prune entries no longer pending so the same target re-mails if it reappears.
-    new_state = {p['key']: p['identity'] for p in pending}
+    new_state = {p['key']: (state[p['key']] if _mailed(p) else p['identity']) for p in pending}
+    # ops #168: a source that could not be read this sweep is not "no longer pending".
+    for k in unknown:
+        if k in state and k not in new_state:
+            new_state[k] = state[k]
+    if seen:
+        new_state['_os_security_seen'] = seen
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
     return {'pending': pending, 'emailed': emailed}
