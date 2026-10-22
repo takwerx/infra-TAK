@@ -89391,11 +89391,94 @@ def _startup_harden_tak_portal_ports():
 _startup_harden_tak_portal_ports()
 
 
+# ops #175: the CloudTAK hardening recreate must survive being killed partway.
+#
+# Both writers (this startup migration and the post-update hardening) change the override /
+# base compose FIRST and recreate AFTER. A kill in between (console restart, crash, reboot)
+# left the files already "converged", so the next start saw nothing to do and never finished
+# the recreate. And on a non-root box the `docker compose up` runs in the root broker, not
+# the console, so it outlives the killed console: on aws-arm (ops #165, 2026-10-22) the new
+# console healed cloudtak-media at 12:07:27 and the orphaned recreate replaced the container
+# at 12:07:41, leaving it on the stock HLS profile until the next restart.
+#
+# So the recreate is a journaled step: the marker is written before any file can change and
+# removed only once the recreate AND the media heal have both succeeded. A console that finds
+# it waits for any compose run still in flight, then redoes the recreate + heal.
+_CLOUDTAK_RECREATE_PENDING = os.path.join(CONFIG_DIR, 'cloudtak-recreate-pending.json')
+_CLOUDTAK_RECREATE_MAX_TRIES = 3      # then stop force-recreating a stack that never comes up
+_CLOUDTAK_COMPOSE_UP_RE = re.compile(r'\bcompose\b.*\sup(?:\s|$)')
+
+
+def _ct_recreate_pending():
+    """The pending-recreate marker as a dict, or None if there is none."""
+    try:
+        with open(_CLOUDTAK_RECREATE_PENDING) as _f:
+            _d = json.load(_f)
+        return _d if isinstance(_d, dict) else {'tries': 0}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {'tries': 0}         # unreadable still means a recreate was cut off
+
+
+def _ct_recreate_arm(tries=None):
+    """Write the marker before the override/compose can change (keeps `since` and `tries`
+    of a marker that is already there unless `tries` is given)."""
+    try:
+        _d = _ct_recreate_pending() or {}
+        _d.setdefault('since', int(time.time()))
+        _d['tries'] = int(_d.get('tries') or 0) if tries is None else int(tries)
+        _d['pid'] = os.getpid()
+        _tmp = _CLOUDTAK_RECREATE_PENDING + '.tmp'
+        with open(_tmp, 'w') as _f:
+            json.dump(_d, _f)
+        os.replace(_tmp, _CLOUDTAK_RECREATE_PENDING)
+    except Exception as _e:
+        print(f"CloudTAK recreate marker write failed (non-fatal): {_e}")
+
+
+def _ct_recreate_clear():
+    try:
+        os.remove(_CLOUDTAK_RECREATE_PENDING)
+    except FileNotFoundError:
+        pass
+    except Exception as _e:
+        print(f"CloudTAK recreate marker clear failed (non-fatal): {_e}")
+
+
+def _ct_wait_compose_idle(timeout=300, log=None):
+    """Wait until no `docker compose ... up` is running on the box — the one a killed console
+    started may still be running in the broker. Returns True when idle, False on timeout."""
+    _log = log or (lambda m: print(m, flush=True))
+    _deadline = time.time() + timeout
+    _said = False
+    while True:
+        try:
+            _ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
+            _busy = [l.strip() for l in (_ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_UP_RE.search(l)]
+        except Exception:
+            return True             # cannot tell: don't hold up startup
+        if not _busy:
+            return True
+        if time.time() >= _deadline:
+            _log(f"CloudTAK: a compose run is still going after {timeout}s ({_busy[0][:120]}) — continuing anyway")
+            return False
+        if not _said:
+            _log(f"CloudTAK: waiting for a compose run left by the previous console to finish ({_busy[0][:120]})")
+            _said = True
+        time.sleep(3)
+
+
 def _startup_harden_cloudtak_ports():
     try:
         _ct_dir = os.path.expanduser('~/CloudTAK')
         if not os.path.isdir(_ct_dir):
             return
+        _pending = _ct_recreate_pending()
+        if _pending is not None:
+            print(f"Startup migration: CloudTAK recreate was cut off (marker from pid {_pending.get('pid')}, "
+                  f"try {int(_pending.get('tries') or 0) + 1}) — resuming")
+        _ct_recreate_arm()
         # Refresh the override file (clears stale `ports: !reset` content
         # from v0.9.12 pre-fix installs, keeps extra_hosts/env current).
         _override_changed = False
@@ -89420,7 +89503,19 @@ def _startup_harden_cloudtak_ports():
         _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
-        _needs_recreate = _changed or _override_changed
+        _needs_recreate = _changed or _override_changed or _pending is not None
+        if os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt')):
+            # Post-update hardening left it STOPPED for Remove + Reinstall — never bring it back.
+            if _needs_recreate:
+                print("Startup migration: CloudTAK compromise banner present — not recreating")
+            _ct_recreate_clear()
+            _needs_recreate = False
+        elif _pending is not None and int(_pending.get('tries') or 0) >= _CLOUDTAK_RECREATE_MAX_TRIES:
+            print(f"Startup migration: ⚠ CloudTAK recreate did not complete after {_CLOUDTAK_RECREATE_MAX_TRIES} "
+                  "tries — giving up; check `docker compose ps` in ~/CloudTAK")
+            _ct_recreate_clear()
+            _pending = None
+            _needs_recreate = _changed or _override_changed
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
@@ -89432,8 +89527,13 @@ def _startup_harden_cloudtak_ports():
                     print("Startup migration: CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
             except Exception:
                 pass
-        if _needs_recreate:
-            if _override_changed:
+        if not _needs_recreate:
+            _ct_recreate_clear()
+        else:
+            if _pending is not None:
+                _ct_wait_compose_idle(log=lambda m: print(f"Startup migration: {m}", flush=True))
+            _ct_recreate_arm(tries=int((_pending or {}).get('tries') or 0) + 1)
+            if _override_changed or _pending is not None:
                 # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
                 # Download it before the recreate so `up -d` doesn't spend its 240 s budget
                 # on the pull — the stack keeps running meanwhile.
@@ -89446,7 +89546,10 @@ def _startup_harden_cloudtak_ports():
                 print("Startup migration: CloudTAK recreated with hardened port bindings")
                 # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
                 # re-apply the self-heal (HLS config + ephemeral-aware reaper).
-                _cloudtak_media_hls_heal(wait=True)
+                if _cloudtak_media_hls_heal(wait=True):
+                    _ct_recreate_clear()
+                else:
+                    print("Startup migration: CloudTAK media heal did not confirm — recreate stays pending")
             else:
                 print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
         # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
@@ -95071,6 +95174,10 @@ def _post_update_auto_deploy():
                             pass
 
                     # 4. Write hardened override (always, idempotent)
+                    # ops #175: journal the recreate before anything below can change, so a
+                    # console killed between the write and the recreate finishes it next start.
+                    if not _compromised:
+                        _ct_recreate_arm()
                     _override_written = False
                     try:
                         _override_path = os.path.join(_cloudtak_dir, 'docker-compose.override.yml')
@@ -95175,6 +95282,7 @@ def _post_update_auto_deploy():
                             _needs_recreate = True      # cannot tell: keep the old behavior
                     if not _compromised:
                         if not _needs_recreate:
+                            _ct_recreate_clear()
                             print("  CloudTAK already hardened — stack left running (no recreate)")
                         else:
                             try:
@@ -95185,7 +95293,8 @@ def _post_update_auto_deploy():
                                     print("  CloudTAK recreated with hardened port bindings")
                                     # v0.9.48 (Part B+C/D): force-recreate reverted cloudtak-media
                                     # to image default — re-apply self-heal (HLS + ephemeral reaper).
-                                    _cloudtak_media_hls_heal(wait=True)
+                                    if _cloudtak_media_hls_heal(wait=True):
+                                        _ct_recreate_clear()
                                 else:
                                     print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
                             except Exception as _re:
