@@ -19441,6 +19441,32 @@ def _f2b_banaction_media():
             f'         iptables-multiport[name=mediamtx-udp, port="{_F2B_MEDIA_PORTS_UDP}", protocol=udp]')
 
 
+# TAK Server's client-facing TLS listeners: streaming (8089), cert-auth HTTPS (8443),
+# enrollment / web (8446), and TAK Server's own federation v1/v2 (9000/9001). A fleet
+# constant: the federation ports are listed whether or not federation is on, because
+# blocking a port nothing listens on costs nothing and keeps every box identical.
+_F2B_TAK_PORTS_TCP = '8089,8443,8446,9000,9001'
+
+
+def _f2b_banaction_tak():
+    """Ban action for the takserver jail ONLY: block TAK Server's ports, nothing else.
+
+    Second deliberate exception to the all-ports `_f2b_banaction()`, same reasoning as
+    `_f2b_banaction_media()`. This jail counts failed TLS handshakes, and the commonest
+    source of those is not an attacker: it is a real ATAK/iTAK device with an old
+    certificate (stale profile, cert issued before a CA change), retrying every 15 s.
+    20 of those in 5 minutes banned the admin's own address on test12 (2026-10-21), and
+    with `ufw` that meant every port: the console on 443/5001, Authentik, SSH. Three such
+    bans a day escalated through recidive to 7 days, all ports, with the unban button on
+    the console they could no longer reach.
+
+    Now a bad-cert device loses TAK and nothing else. The console, Authentik, Portal and
+    SSH keep their own jails, so brute force against those is still banned there.
+    iptables-multiport handles IPv4 and IPv6 and runs on both families (see the media
+    action); TAK's listeners are all TCP, so one instance is enough."""
+    return f'iptables-multiport[name=takserver, port="{_F2B_TAK_PORTS_TCP}", protocol=tcp]'
+
+
 def _f2b_sshd_logpath():
     """sshd auth log path, or '' when this box has no syslog file to tail.
 
@@ -21008,9 +21034,111 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_tak()}{guarddog_action}\n"
     )
     _write_priv(jail_path, jail_conf)
+
+
+# One TAK handshake failure, as TAK Server logs it (real line, address changed):
+#   ... NioNettyServerHandler error. Cause: javax.net.ssl.SSLHandshakeException: General
+#   OpenSslEngine problem. Additional info: Remote address: 203.0.113.9; Remote port: 48372;
+#   Local port: 8089; Certificate error: peer not verified;
+# When TAK got far enough to read the client certificate it logs
+# `Peer certificate Subject DN: CN=..., O=...;` in place of the certificate error.
+_F2B_TAK_FAIL_RE = re.compile(
+    r'NioNettyServerHandler error\. Cause: (?P<cause>.*?)\. Additional info: '
+    r'Remote address: (?P<ip>[^;\s]+);(?P<rest>.*)$')
+_F2B_TAK_SUBJECT_RE = re.compile(r'Peer certificate Subject DN: ([^;]+);')
+
+
+def _f2b_tak_failure_kind(cause, rest):
+    """Plain category of one TAK handshake failure: bad_cert, no_cert, not_tak or other."""
+    if 'PEER_DID_NOT_RETURN_A_CERTIFICATE' in cause:
+        return 'no_cert'
+    if any(k in cause for k in ('NotSslRecordException', 'UNSUPPORTED_PROTOCOL',
+                                'NO_SHARED_CIPHER', 'NO_SHARED_GROUP', 'WRONG_VERSION')):
+        return 'not_tak'
+    if 'SSLHandshakeException' in cause or 'Certificate error' in rest:
+        return 'bad_cert'
+    return 'other'
+
+
+def _f2b_tak_failures(lines, ips):
+    """{ip: {'kind', 'count', 'subject'}} from TAK messaging-log lines, for the given IPs.
+    Connection resets are skipped, the same as the jail's ignoreregex. `kind` is the most
+    frequent category for that address; `subject` is the last client cert TAK named."""
+    want = set(ips)
+    out = {}
+    for line in lines:
+        if 'NioNettyServerHandler error' not in line:
+            continue
+        m = _F2B_TAK_FAIL_RE.search(line)
+        if not m or m.group('ip') not in want or 'recvAddress(..) failed' in m.group('cause'):
+            continue
+        rec = out.setdefault(m.group('ip'), {'kinds': {}, 'count': 0, 'subject': ''})
+        kind = _f2b_tak_failure_kind(m.group('cause'), m.group('rest'))
+        rec['kinds'][kind] = rec['kinds'].get(kind, 0) + 1
+        rec['count'] += 1
+        s = _F2B_TAK_SUBJECT_RE.search(m.group('rest'))
+        if s:
+            rec['subject'] = s.group(1).strip()[:200]
+    for rec in out.values():
+        kinds = rec.pop('kinds')
+        rec['kind'] = max(kinds, key=kinds.get)
+    return out
+
+
+def _f2b_duration_label(seconds):
+    """'1 h', '30 min', '2 days' — for the plain-words ban explanations."""
+    seconds = int(seconds or 0)
+    if seconds >= 86400 and seconds % 86400 == 0:
+        n = seconds // 86400
+        return f'{n} day' if n == 1 else f'{n} days'
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f'{seconds // 3600} h'
+    return f'{max(1, seconds // 60)} min'
+
+
+def _f2b_tak_ban_explain(ip, kind, subject, duration):
+    """What a takserver-jail ban means, in words an operator can act on. Kept in step with
+    the copy inside infratak-f2b-notify (the ban e-mail); a test holds them together."""
+    if kind == 'bad_cert':
+        msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
+               f"TAK for {duration}. Usually that's an ATAK/iTAK profile with an old "
+               f"certificate. Re-enroll it or remove that server from the device.")
+    elif kind == 'no_cert':
+        msg = (f"{ip} kept connecting to TAK without a client certificate, so it's blocked "
+               f"from TAK for {duration}. That is usually an internet scanner.")
+    elif kind == 'not_tak':
+        msg = (f"{ip} kept sending traffic that isn't a TAK connection, so it's blocked from "
+               f"TAK for {duration}. That is what internet scanners do.")
+    else:
+        msg = f"{ip} kept failing to connect to TAK, so it's blocked from TAK for {duration}."
+    if subject:
+        msg += f" Certificate: {subject}."
+    return msg
+
+
+_F2B_TAK_LOG = '/opt/tak/logs/takserver-messaging.log'
+_F2B_TAK_LOG_TAIL_BYTES = 16 * 1024 * 1024
+
+
+def _f2b_tak_ban_details(ips, bantime):
+    """{ip: {'kind', 'subject', 'count', 'explain'}} for the takserver jail's banned IPs.
+    Reads the tail of TAK's messaging log directly (it is world-readable; never through the
+    broker, see _diag_tail). An address with no lines left in the tail still gets a generic
+    explanation rather than none."""
+    if not ips:
+        return {}
+    lines = _diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or []
+    found = _f2b_tak_failures(lines, ips)
+    duration = _f2b_duration_label(bantime)
+    out = {}
+    for ip in ips:
+        rec = found.get(ip) or {'kind': 'other', 'count': 0, 'subject': ''}
+        rec['explain'] = _f2b_tak_ban_explain(ip, rec['kind'], rec['subject'], duration)
+        out[ip] = rec
+    return out
 
 def _f2b_ssh_jail_enabled():
     """Return True if the infratak-sshd jail config file exists."""
@@ -21279,6 +21407,13 @@ def fail2ban_tak_status_api():
             status.update(_f2b_parse_status(r.stdout))
         except Exception as e:
             status['error'] = str(e)[:200]
+        # Why each address is banned, in plain words. Capped so a scanner flood can't
+        # make every page refresh parse the log for hundreds of addresses.
+        try:
+            status['ban_details'] = _f2b_tak_ban_details(status['banned_ips'][:50],
+                                                         cfg.get('bantime', 3600))
+        except Exception:
+            status['ban_details'] = {}
     return jsonify(status)
 
 @app.route('/api/fail2ban/takserver/config', methods=['POST'])
@@ -22375,7 +22510,10 @@ def _f2b_write_recidive_config(maxretry, findtime):
         # reachable in his own situation, a phone behind carrier NAT sharing one
         # public IP. Repeat media abuse keeps earning media-scoped bans instead.
         # Caught by /security-review before ship, 2026-08-13.
-        "ignoreregex = \\[mediamtx-rtsp\\] Ban\n"
+        # 2026-10-21: the same for takserver bans, now TAK-ports-only. Its commonest
+        # repeat offender is an operator's own phone with an old certificate, which
+        # re-trips every hour; escalating that cost the admin the console for 7 days.
+        "ignoreregex = \\[(?:mediamtx-rtsp|takserver)\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -22476,7 +22614,41 @@ def fail2ban_recidive_status_api():
             status.update(_f2b_parse_status(r.stdout))
         except Exception as e:
             status['error'] = str(e)[:200]
+        status['not_enforced'] = _f2b_recidive_not_enforced(status['banned_ips'])
     return jsonify(status)
+
+
+def _f2b_ufw_blocked_ips():
+    """Addresses ufw currently REJECTs/DENYs as a source, or None when that can't be read
+    (no ufw: RHEL runs recidive on iptables-allports, which the broker cannot list)."""
+    if _distro_family() == 'rhel':
+        return None
+    try:
+        r = subprocess.run(_sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0 or 'Status:' not in r.stdout:
+        return None
+    blocked = set()
+    for line in r.stdout.splitlines():
+        # "Anywhere                   REJECT      203.0.113.50   # comment"
+        m = re.match(r'^\S.*?\s(?:REJECT|DENY)(?: IN)?\s+(\S+)', line)
+        if m:
+            blocked.add(m.group(1))
+    return blocked
+
+
+def _f2b_recidive_not_enforced(banned_ips):
+    """Recidive bans the firewall is NOT actually enforcing. fail2ban keeps its own ban list
+    (and restores it from its database), so when the ufw rule is removed by hand the panel
+    kept listing an address as banned for days while it could connect normally: test12,
+    2026-10-21, the admin's own home address listed since Oct 19 with no rule behind it."""
+    if not banned_ips:
+        return []
+    blocked = _f2b_ufw_blocked_ips()
+    if blocked is None:
+        return []
+    return [ip for ip in banned_ips if ip not in blocked]
 
 
 @app.route('/api/fail2ban/recidive/config', methods=['POST'])
@@ -87422,6 +87594,98 @@ def _startup_converge_recidive_bantime():
         print('Startup migration: recidive bantime converge warning (non-fatal): %s' % _e)
 
 
+def _f2b_read_text(path):
+    """Contents of a fail2ban-side file, or None when it is absent/unreadable."""
+    try:
+        with open(path) as _f:
+            return _f.read()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        try:
+            return _read_priv(path)
+        except Exception:
+            return None
+
+
+def _startup_converge_tak_banaction():
+    """2026-10-21: the takserver jail bans TAK's ports only, and says why.
+
+    One ATAK device with an old certificate retrying every 15 s banned the admin's own
+    address on test12 with `action = ufw`: every port, so the console, Authentik and SSH
+    went with TAK. Same convergence gap as `_startup_converge_mediamtx_banaction()`:
+    nothing rewrites an existing jail's action, so without this every installed box keeps
+    the all-ports ban. Also brings the Guard Dog action (it called every ban a "port
+    scan") and the ban notifier (which now explains a bad-certificate ban) up to date;
+    both were written once at setup and never again.
+
+    Narrow: each file only when it differs, the jail through `_f2b_write_tak_jail_config()`
+    so thresholds and the operator's whitelist survive.
+
+    A changed jail action needs `reload --restart takserver`, not a plain reload. fail2ban
+    0.11.2's reload drops an action that is NEW to a running jail ("Flush ticket(s) with
+    iptables-multiport" in fail2ban.log), so the jail ended up with no ban action at all:
+    test6, 2026-10-21. The restart stops the jail (its old ufw rules go with it) and starts
+    it again, restoring current bans from fail2ban's database onto the TAK-only action."""
+    try:
+        reload_needed = False
+        jail_changed = False
+        act_path = '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf'
+        cur = _f2b_read_text(act_path)
+        if cur is not None and cur != _F2B_TAK_GUARDDOG_ACTION:
+            _write_priv(act_path, _F2B_TAK_GUARDDOG_ACTION)
+            reload_needed = True
+        notify_path = '/usr/local/sbin/infratak-f2b-notify'
+        cur = _f2b_read_text(notify_path)
+        if cur is not None and cur != _F2B_NOTIFY_SCRIPT:
+            _write_priv(notify_path, _F2B_NOTIFY_SCRIPT, perm=0o755)
+            print('Startup migration: ✓ fail2ban ban notifier updated (explains TAK '
+                  'bad-certificate bans)')
+        if _f2b_tak_jail_enabled():
+            cur = _f2b_read_text('/etc/fail2ban/jail.d/infratak-takserver.conf') or ''
+            if _f2b_banaction_tak() not in cur:
+                c = _f2b_read_tak_jail_config()
+                _f2b_write_tak_jail_config(c['maxretry'], c['findtime'], c['bantime'],
+                                           _f2b_operator_extra(c.get('ignoreip', '')))
+                jail_changed = True
+                print('Startup migration: ✓ takserver jail now bans TAK ports only — it was '
+                      'banning on EVERY port, so a device with an old certificate locked its '
+                      'owner out of the console and SSH')
+        if jail_changed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload', '--restart', 'takserver']),
+                           capture_output=True, timeout=30)
+        elif reload_needed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, timeout=15)
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: takserver banaction converge warning (non-fatal): %s' % _e)
+
+
+def _startup_converge_recidive_tak_exempt():
+    """2026-10-21: recidive no longer escalates takserver bans. Separate from
+    `_startup_converge_recidive_media_exempt()` because that one returns as soon as
+    `mediamtx-rtsp` is in the file, which is every box since v10.1.30 (the same trap
+    `_startup_converge_recidive_bantime()` documents)."""
+    try:
+        if not _f2b_recidive_enabled():
+            return
+        cur = _f2b_read_text('/etc/fail2ban/jail.d/infratak-recidive.conf')
+        if cur is None or 'takserver' in cur:
+            return
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: ✓ recidive now ignores takserver bans — three bans of a '
+              'phone with an old certificate escalated to a 7-day ALL-ports ban')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: recidive takserver-exempt converge warning (non-fatal): %s' % _e)
+
+
 # NOT invoked here. This function is broker-dependent (_f2b_write_mediamtx_jail writes
 # under /etc), and module level runs before the broker-ready gate in _startup_migrations().
 # It is called from the fail2ban self-heal block there instead — see the note at that call.
@@ -88537,36 +88801,11 @@ def _fail2ban_install_and_configure(plog):
     return True
 
 
-def _fail2ban_add_guarddog_hook(plog):
-    """Add Guard Dog email notification + dashboard log hook to fail2ban (v0.9.0 — idempotent).
-
-    1. Writes /usr/local/sbin/infratak-f2b-notify — a Python script that reads
-       guarddog_alert_email from settings.json and sends a ban alert via the
-       same localhost:25 Postfix relay that Guard Dog uses.
-    2. Writes /etc/fail2ban/action.d/infratak-guarddog.conf — appends an ISO
-       line to /var/log/takguard/restarts.log AND calls the email notify script.
-    3. Rewrites the jail config to include the infratak-guarddog action alongside ufw.
-    4. Reloads fail2ban.
-
-    Prerequisites: fail2ban must be installed (/etc/fail2ban must exist).
-    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied_v2'.
-    """
-    import datetime as _dt3
-    if not os.path.exists('/etc/fail2ban'):
-        plog("fail2ban guarddog hook: SKIPPED — fail2ban not installed yet")
-        return False
-
-    s = load_settings()
-    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v3':
-        plog("fail2ban guarddog hook: idempotent-noop (already applied)")
-        return False
-
-    plog("fail2ban guarddog hook: writing email notify script and action file")
-
-    # ── Step 1: Python email notification helper ───────────────────────────────
-    notify_script = r'''#!/usr/bin/env python3
-"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik jail).
-Called by fail2ban action: infratak-f2b-notify <ip>
+# The ban notifier fail2ban runs as root. Module level so the startup converge can bring
+# an existing box's copy up to date: the hook below writes it once and never again.
+_F2B_NOTIFY_SCRIPT = r'''#!/usr/bin/env python3
+"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik / TAK Server jails).
+Called by fail2ban action: infratak-f2b-notify <ip> [jail]
 Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
@@ -88595,6 +88834,85 @@ def _find_settings():
         if os.path.exists(p):
             return p
     return None
+
+
+# takserver jail: say WHY in plain words. Same categories and wording as the console's
+# _f2b_tak_failure_kind() / _f2b_tak_ban_explain(); a test holds the two copies together.
+TAK_LOG = '/opt/tak/logs/takserver-messaging.log'
+TAK_JAIL = '/etc/fail2ban/jail.d/infratak-takserver.conf'
+_TAK_FAIL_RE = re.compile(
+    r'NioNettyServerHandler error\. Cause: (?P<cause>.*?)\. Additional info: '
+    r'Remote address: (?P<ip>[^;\s]+);(?P<rest>.*)$')
+_TAK_SUBJECT_RE = re.compile(r'Peer certificate Subject DN: ([^;]+);')
+
+
+def _tak_failure_kind(cause, rest):
+    if 'PEER_DID_NOT_RETURN_A_CERTIFICATE' in cause:
+        return 'no_cert'
+    if any(k in cause for k in ('NotSslRecordException', 'UNSUPPORTED_PROTOCOL',
+                                'NO_SHARED_CIPHER', 'NO_SHARED_GROUP', 'WRONG_VERSION')):
+        return 'not_tak'
+    if 'SSLHandshakeException' in cause or 'Certificate error' in rest:
+        return 'bad_cert'
+    return 'other'
+
+
+def _tak_explain(ip, kind, subject, duration):
+    if kind == 'bad_cert':
+        msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
+               f"TAK for {duration}. Usually that's an ATAK/iTAK profile with an old "
+               f"certificate. Re-enroll it or remove that server from the device.")
+    elif kind == 'no_cert':
+        msg = (f"{ip} kept connecting to TAK without a client certificate, so it's blocked "
+               f"from TAK for {duration}. That is usually an internet scanner.")
+    elif kind == 'not_tak':
+        msg = (f"{ip} kept sending traffic that isn't a TAK connection, so it's blocked from "
+               f"TAK for {duration}. That is what internet scanners do.")
+    else:
+        msg = f"{ip} kept failing to connect to TAK, so it's blocked from TAK for {duration}."
+    if subject:
+        msg += f" Certificate: {subject}."
+    return msg
+
+
+def _duration_label(seconds):
+    if seconds >= 86400 and seconds % 86400 == 0:
+        n = seconds // 86400
+        return f'{n} day' if n == 1 else f'{n} days'
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f'{seconds // 3600} h'
+    return f'{max(1, seconds // 60)} min'
+
+
+def _tak_reason(ip):
+    bantime = 3600
+    try:
+        with open(TAK_JAIL) as f:
+            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
+        if m:
+            bantime = int(m.group(1))
+    except Exception:
+        pass
+    kinds, subject = {}, ''
+    try:
+        with open(TAK_LOG, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4 * 1024 * 1024))
+            for line in f.read().decode('utf-8', 'replace').splitlines():
+                m = _TAK_FAIL_RE.search(line)
+                if not m or m.group('ip') != ip or 'recvAddress(..) failed' in m.group('cause'):
+                    continue
+                k = _tak_failure_kind(m.group('cause'), m.group('rest'))
+                kinds[k] = kinds.get(k, 0) + 1
+                s = _TAK_SUBJECT_RE.search(m.group('rest'))
+                if s:
+                    subject = s.group(1).strip()[:200]
+    except Exception:
+        pass
+    kind = max(kinds, key=kinds.get) if kinds else 'other'
+    return (_tak_explain(ip, kind, subject, _duration_label(bantime)) +
+            "\n\nOnly TAK's ports are blocked. The console, Authentik and SSH still work "
+            "from that address.")
 
 
 def main():
@@ -88651,10 +88969,11 @@ def main():
 
     _reasons = {
         'authentik':  'Too many failed Authentik login attempts',
-        'takserver':  'Too many failed TAK Server connection attempts (port scan / cert probe)',
+        'takserver':  'Too many failed TAK Server connection attempts (bad certificate or scanner)',
     }
     reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
     jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server'}.get(jail.lower(), jail)
+    explain    = _tak_reason(ip) + '\n\n' if jail.lower() == 'takserver' else ''
 
     subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
     body = (
@@ -88664,6 +88983,7 @@ def main():
         f'  Server: {server_id}\n'
         f'  Time:   {ts}\n'
         f'  Reason: {reason}\n\n'
+        f'{explain}'
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
 
@@ -88686,8 +89006,37 @@ def main():
 if __name__ == '__main__':
     main()
 '''
+
+
+def _fail2ban_add_guarddog_hook(plog):
+    """Add Guard Dog email notification + dashboard log hook to fail2ban (v0.9.0 — idempotent).
+
+    1. Writes /usr/local/sbin/infratak-f2b-notify — a Python script that reads
+       guarddog_alert_email from settings.json and sends a ban alert via the
+       same localhost:25 Postfix relay that Guard Dog uses.
+    2. Writes /etc/fail2ban/action.d/infratak-guarddog.conf — appends an ISO
+       line to /var/log/takguard/restarts.log AND calls the email notify script.
+    3. Rewrites the jail config to include the infratak-guarddog action alongside ufw.
+    4. Reloads fail2ban.
+
+    Prerequisites: fail2ban must be installed (/etc/fail2ban must exist).
+    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied_v2'.
+    """
+    import datetime as _dt3
+    if not os.path.exists('/etc/fail2ban'):
+        plog("fail2ban guarddog hook: SKIPPED — fail2ban not installed yet")
+        return False
+
+    s = load_settings()
+    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v3':
+        plog("fail2ban guarddog hook: idempotent-noop (already applied)")
+        return False
+
+    plog("fail2ban guarddog hook: writing email notify script and action file")
+
+    # ── Step 1: Python email notification helper ───────────────────────────────
     notify_path = '/usr/local/sbin/infratak-f2b-notify'
-    _write_priv(notify_path, notify_script, perm=0o755)
+    _write_priv(notify_path, _F2B_NOTIFY_SCRIPT, perm=0o755)
     plog(f"fail2ban guarddog hook: wrote {notify_path}")
 
     # ── Step 2: fail2ban action definition ────────────────────────────────────
@@ -88724,6 +89073,19 @@ if __name__ == '__main__':
     save_settings(s2)
     plog("fail2ban guarddog hook: complete — email alerts + dashboard log active")
     return True
+
+
+# Guard Dog's log line + the ban e-mail for the takserver jail. Module level so the startup
+# converge can replace a box's old copy, which called every ban a "port scan".
+_F2B_TAK_GUARDDOG_ACTION = (
+    "[Definition]\n"
+    "actionban  = mkdir -p /var/log/takguard"
+    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Banned <ip> (TAK Server: failed TLS handshakes, blocked from TAK ports only)\""
+    " >> /var/log/takguard/restarts.log"
+    " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
+    "actionunban =\n"
+)
 
 
 def _fail2ban_takserver_filter(plog):
@@ -88765,17 +89127,8 @@ def _fail2ban_takserver_filter(plog):
     # ── Guard Dog action for TAK Server jail ──────────────────────────────────
     _makedirs_priv('/var/log/takguard', exist_ok=True)
     _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
-    tak_action_conf = (
-        "[Definition]\n"
-        "actionban  = mkdir -p /var/log/takguard"
-        " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
-        " | fail2ban: Banned <ip> (TAK Server port scan)\""
-        " >> /var/log/takguard/restarts.log"
-        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
-        "actionunban =\n"
-    )
     tak_action_path = '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf'
-    _write_priv(tak_action_path, tak_action_conf)
+    _write_priv(tak_action_path, _F2B_TAK_GUARDDOG_ACTION)
     plog(f"fail2ban takserver filter: wrote {tak_action_path}")
 
     # Reload so the new filter is recognized (jail stays disabled until operator enables it)
@@ -89642,6 +89995,16 @@ def _startup_migrations():
             _startup_converge_recidive_bantime()
         except Exception as _f2b_e3d:
             print(f"Startup migration: recidive bantime converge error (non-fatal): {_f2b_e3d}", flush=True)
+        # 2026-10-21 — the takserver jail bans TAK ports only, and recidive stops escalating
+        # it. A phone with an old certificate locked the admin out of the console (test12).
+        try:
+            _startup_converge_tak_banaction()
+        except Exception as _f2b_e3e:
+            print(f"Startup migration: takserver banaction converge error (non-fatal): {_f2b_e3e}", flush=True)
+        try:
+            _startup_converge_recidive_tak_exempt()
+        except Exception as _f2b_e3f:
+            print(f"Startup migration: recidive takserver-exempt converge error (non-fatal): {_f2b_e3f}", flush=True)
 
         # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
         # _startup_migrations() rather than at import time: it writes a privileged path and
