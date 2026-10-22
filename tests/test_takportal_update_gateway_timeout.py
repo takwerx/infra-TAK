@@ -253,7 +253,8 @@ def ns(tmp_path):
          'app': types.SimpleNamespace(jinja_env=types.SimpleNamespace(globals={}),
                                       route=lambda *a, **k: (lambda f: f)),
          'login_required': lambda f: f, 'jsonify': lambda d: d,
-         '_get_takportal_version_info': lambda: {'version': '2.0.11'}}
+         '_get_takportal_version_info': lambda: {'version': '2.0.11'},
+         '_patch_takportal_compose_ports': lambda pd=None: False}
     exec(compile(rec, 'app.py', 'exec'), n)
     exec(compile(JOB, 'app.py', 'exec'), n)
     return n
