@@ -2806,6 +2806,19 @@ def _rotate_tak_cert_cmd(cmd):
                 f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(cmd)} 2>&1")
     return cmd
 
+def _rotate_tak_cert_argv(argv):
+    """argv twin of _rotate_tak_cert_cmd() for `runuser -u tak -- <tool ...>` (ops #163): the
+    same command, with no host shell. Native → `runuser -u tak -- <tool ...>`, resolved through
+    the same PATH (broker shims) the shell used. Container → the same `docker run --rm ...
+    --entrypoint bash {TAK_CONTAINER} -c '<tool ...> 2>&1'`, the inner string built by
+    shlex.join so every value is one quoted word."""
+    argv = list(argv)
+    if not _tak_is_container():
+        return ['runuser', '-u', 'tak', '--'] + argv
+    tak_real = os.path.realpath('/opt/tak')
+    return ['docker', 'run', '--rm', '-v', f'{tak_real}:/opt/tak:z',
+            '--entrypoint', 'bash', TAK_CONTAINER, '-c', shlex.join(argv) + ' 2>&1']
+
 def _tak_systemctl(action):
     """Return a shell string for a TAK Server lifecycle action.
       native    → `systemctl <action> takserver`
@@ -74362,11 +74375,13 @@ def _rotate_refresh_integrations(log):
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
 
 
-def _rotate_sh(cmd, timeout=120):
-    """Container-aware shell runner that keeps the output: (ok, stdout+stderr)."""
+def _rotate_sh(argv, timeout=120):
+    """Runs `runuser -u tak -- <argv>`, container-aware, and keeps the output: (ok, stdout+stderr).
+    An argv list, not a shell string: the truststore password goes in as one word."""
     try:
-        r = subprocess.run(_rotate_tak_cert_cmd(cmd), shell=True, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+        r = subprocess.run(_rotate_tak_cert_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout or ''
     except Exception as e:
         return False, str(e)
 
@@ -74395,9 +74410,8 @@ def _pem_key(pem):
 
 def _rotate_truststore_entries(ts_path, storepass, sh):
     """[(alias, pem)] for every trustedCertEntry in a truststore, via `keytool -list -rfc`.
-    None if keytool cannot read it. sh(cmd) -> (ok, output)."""
-    ok, out = sh(f'runuser -u tak -- keytool -list -rfc -keystore {shlex.quote(ts_path)} '
-                 f'-storepass {shlex.quote(storepass)} 2>&1')
+    None if keytool cannot read it. sh(argv) -> (ok, output), argv run as `tak`."""
+    ok, out = sh(['keytool', '-list', '-rfc', '-keystore', ts_path, '-storepass', storepass])
     if not ok or 'Alias name:' not in out:
         return None
     entries = []
