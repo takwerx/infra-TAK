@@ -64,10 +64,13 @@ def test_coturn_flags_avoid_the_ones_418_removed():
         assert gone not in body
 
 
-def test_netbird_dev_candidate_is_past_the_relay_fix_and_main_is_unchanged_until_promoted():
-    dev = re.search(r'^NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:([^"]+)"', APP, re.M).group(1)
-    assert _v(dev) >= (0, 75, 0)
-    assert re.search(r'^NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v[0-9.]+"', APP, re.M)
+def test_netbird_vetted_and_dev_pins_are_past_the_relay_fix():
+    # ops #150: 0.80.0 / v2.94.0 promoted dev -> vetted, so main boxes leave 0.74.4 too.
+    for name in ('NETBIRD_SERVER_IMAGE', 'NETBIRD_SERVER_DEV_IMAGE'):
+        pin = re.search(rf'^{name} = "netbirdio/netbird-server:([^"]+)"', APP, re.M).group(1)
+        assert _v(pin) >= (0, 75, 0), name
+    for name in ('NETBIRD_DASHBOARD_IMAGE', 'NETBIRD_DASHBOARD_DEV_IMAGE'):
+        assert re.search(rf'^{name} = "netbirdio/dashboard:v[0-9.]+"', APP, re.M), name
     # every pin is an exact tag, never a moving one
     for name in ('NETBIRD_SERVER_IMAGE', 'NETBIRD_DASHBOARD_IMAGE',
                  'NETBIRD_SERVER_DEV_IMAGE', 'NETBIRD_DASHBOARD_DEV_IMAGE'):

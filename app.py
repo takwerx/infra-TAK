@@ -1314,12 +1314,18 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # test12 (2026-07-18). The promotion depended on two fixes shipped first: the persistent
 # server.store.encryptionKey (0.73+ minted an ephemeral key per start, orphaning users) and
 # the orphaned-store self-heal. Dev pins stay == vetted until a newer pair is under trial.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.74.4"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.90.4"
-# v10.2.8 W9: 0.80.0 / v2.94.0 UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4 carries
-# GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated bytes before the HMAC check; fixed 0.75.0).
-# Promote to VETTED only after dashboard login + peer connect on dev, per the comment above.
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"
+# v10.2.8 W9: 0.80.0 / v2.94.0 went UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4
+# carries GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated Hello bytes before the HMAC
+# check; fixed 0.75.0) and the relay is internet-reachable through Caddy's /relay route, so it
+# is pre-auth. PROMOTED to VETTED (security) on the gate above: dashboard login + peer connect
+# on 0.80.0, and a 0.74.4 → 0.80.0 upgrade with existing users, PAT, setup keys and peers intact.
+# Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.74.4 / v2.90.4; the pin-
+# restore heal converges boxes back on console boot. 0.74.4 was checked to start clean on a
+# 0.80-migrated store (users, PAT, setup keys, peers intact). Upstream latest is 0.81.x; not
+# under trial yet.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"  # == vetted until a newer pair is under trial
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
 
 
