@@ -33615,16 +33615,26 @@ def generate_caddyfile(settings=None):
         lines.append(f"    handle @netbird_mgmt {{")
         lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
         lines.append(f"    }}")
-        # Signal exchange (gRPC)
+        # Signal exchange (gRPC). The combined netbird-server serves signal on its one
+        # listener ("Signal server registered on port :443"); nothing listens on 10000,
+        # so peers registered but never connected (ops #150).
         lines.append(f"    @netbird_signal {{")
         lines.append(f"        path /signalexchange.*")
         lines.append(f"    }}")
         lines.append(f"    handle @netbird_signal {{")
-        lines.append(f"        reverse_proxy h2c://127.0.0.1:10000")
+        lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
         lines.append(f"    }}")
-        # Embedded Dex IDP OIDC endpoints + relay WebSocket
+        # Relay + browser-client WebSockets need plain HTTP/1.1: a WebSocket upgrade
+        # over h2c is a 502. Upstream: https://docs.netbird.io/selfhosted/reverse-proxy
+        lines.append(f"    @netbird_ws {{")
+        lines.append(f"        path /relay /relay/* /ws-proxy/*")
+        lines.append(f"    }}")
+        lines.append(f"    handle @netbird_ws {{")
+        lines.append(f"        reverse_proxy 127.0.0.1:33073")
+        lines.append(f"    }}")
+        # Embedded Dex IDP OIDC endpoints
         lines.append(f"    @netbird_idp {{")
-        lines.append(f"        path /oauth2 /oauth2/* /.well-known/* /auth /auth/* /token /keys /callback /userinfo /device /device/* /approval /approval/* /relay")
+        lines.append(f"        path /oauth2 /oauth2/* /.well-known/* /auth /auth/* /token /keys /callback /userinfo /device /device/* /approval /approval/*")
         lines.append(f"    }}")
         lines.append(f"    handle @netbird_idp {{")
         lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
@@ -89944,6 +89954,23 @@ def _startup_migrations():
             else:
                 print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
                       f"(retries next restart): {_last_err}", flush=True)
+
+        # ops #150: the NetBird vhost sent signal to :10000 (nothing listens there on the
+        # combined server) and the relay WebSocket over h2c (502), so peers registered but
+        # never connected. Keyed on the live file, so it runs once and retries if rejected.
+        try:
+            _cf = _read_priv(CADDYFILE_PATH) or ''
+            if (s.get('fqdn') or '').strip() and 'reverse_proxy h2c://127.0.0.1:10000' in _cf:
+                generate_caddyfile(s)
+                if 'reverse_proxy h2c://127.0.0.1:10000' not in (_read_priv(CADDYFILE_PATH) or ''):
+                    _caddy_reload()
+                    print("Startup migration: NetBird vhost — signal + relay routed to the combined "
+                          "server (peers can connect)", flush=True)
+                else:
+                    print("Startup migration: ⚠ NetBird vhost NOT regenerated (rejected and restored?) "
+                          "— retries next restart", flush=True)
+        except Exception as _nbc_e:
+            print(f"Startup migration: NetBird vhost regenerate error (non-fatal): {_nbc_e}", flush=True)
 
         # v10.1.1 S1: arm the proxy-auth gate (belt-and-suspenders for the bypass
         # class above). Regenerate the Caddyfile so forward_auth-passed requests
