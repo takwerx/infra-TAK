@@ -1314,12 +1314,18 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # test12 (2026-07-18). The promotion depended on two fixes shipped first: the persistent
 # server.store.encryptionKey (0.73+ minted an ephemeral key per start, orphaning users) and
 # the orphaned-store self-heal. Dev pins stay == vetted until a newer pair is under trial.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.74.4"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.90.4"
-# v10.2.8 W9: 0.80.0 / v2.94.0 UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4 carries
-# GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated bytes before the HMAC check; fixed 0.75.0).
-# Promote to VETTED only after dashboard login + peer connect on dev, per the comment above.
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"
+# v10.2.8 W9: 0.80.0 / v2.94.0 went UNDER TRIAL on dev (latest stable pair, 2026-10-08). 0.74.4
+# carries GHSA-v5w2-pqxj-6r94 (relay gob-decodes unauthenticated Hello bytes before the HMAC
+# check; fixed 0.75.0) and the relay is internet-reachable through Caddy's /relay route, so it
+# is pre-auth. PROMOTED to VETTED (security) on the gate above: dashboard login + peer connect
+# on 0.80.0, and a 0.74.4 → 0.80.0 upgrade with existing users, PAT, setup keys and peers intact.
+# Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.74.4 / v2.90.4; the pin-
+# restore heal converges boxes back on console boot. 0.74.4 was checked to start clean on a
+# 0.80-migrated store (users, PAT, setup keys, peers intact). Upstream latest is 0.81.x; not
+# under trial yet.
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"  # == vetted until a newer pair is under trial
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
 
 
@@ -2799,6 +2805,19 @@ def _rotate_tak_cert_cmd(cmd):
         return (f"docker run --rm -v {shlex.quote(tak_real)}:/opt/tak:z "
                 f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(cmd)} 2>&1")
     return cmd
+
+def _rotate_tak_cert_argv(argv):
+    """argv twin of _rotate_tak_cert_cmd() for `runuser -u tak -- <tool ...>` (ops #163): the
+    same command, with no host shell. Native → `runuser -u tak -- <tool ...>`, resolved through
+    the same PATH (broker shims) the shell used. Container → the same `docker run --rm ...
+    --entrypoint bash {TAK_CONTAINER} -c '<tool ...> 2>&1'`, the inner string built by
+    shlex.join so every value is one quoted word."""
+    argv = list(argv)
+    if not _tak_is_container():
+        return ['runuser', '-u', 'tak', '--'] + argv
+    tak_real = os.path.realpath('/opt/tak')
+    return ['docker', 'run', '--rm', '-v', f'{tak_real}:/opt/tak:z',
+            '--entrypoint', 'bash', TAK_CONTAINER, '-c', shlex.join(argv) + ' 2>&1']
 
 def _tak_systemctl(action):
     """Return a shell string for a TAK Server lifecycle action.
@@ -4563,6 +4582,37 @@ def _no_retention_bar(settings):
             'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
 
 
+def _tak_cert_names_bar(settings):
+    """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
+
+    v10.2.26. Every box deployed before 10.2.26 has a server cert that names only
+    `takserver`, so integrations that check the hostname (cUAS feeds, TAK Portal with
+    the system CA) refuse the server while ATAK keeps working and nobody notices — on
+    TryTAK it surfaced as NineHills failing every 5 minutes. The fix is one button on
+    the TAK Server page; this bar is how an operator finds out it is needed.
+
+    Reads the CACHED live-cert result (no handshake on the render path). It clears the
+    moment TAK is presenting every name, because the Fix job stores its own verified
+    result; it stays silent while TAK is down or before the first check lands."""
+    try:
+        if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+            return None
+        st = _tak_server_cert_status_cached(settings)
+    except Exception:
+        return None
+    if not st or st.get('state') != 'missing':
+        return None
+    miss = st.get('missing') or []
+    dom = st.get('domain') or ''
+    name = dom if dom in miss else miss[0]
+    body = (f"⚠ TAK Server's certificate doesn't include {html.escape(name)} — integrations "
+            'that check the hostname will reject it. '
+            '<a href="/takserver" style="color:inherit;text-decoration:underline">Fix it →</a>')
+    # Keyed to the missing names, so dismissing it today can't hide a new domain tomorrow.
+    return {'cls': 'takcert-banner', 'key': 'takcertnames:' + ','.join(miss),
+            'fg': '#eab308', 'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def render_notice_bars(settings):
     """Render every fixed notice bar in ONE place.
 
@@ -4592,7 +4642,8 @@ def render_notice_bars(settings):
 
 
 def _render_notice_bars_inner(settings):
-    specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings)) if b]
+    specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
+                         _tak_cert_names_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -34155,16 +34206,26 @@ def generate_caddyfile(settings=None):
         lines.append(f"    handle @netbird_mgmt {{")
         lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
         lines.append(f"    }}")
-        # Signal exchange (gRPC)
+        # Signal exchange (gRPC). The combined netbird-server serves signal on its one
+        # listener ("Signal server registered on port :443"); nothing listens on 10000,
+        # so peers registered but never connected (ops #150).
         lines.append(f"    @netbird_signal {{")
         lines.append(f"        path /signalexchange.*")
         lines.append(f"    }}")
         lines.append(f"    handle @netbird_signal {{")
-        lines.append(f"        reverse_proxy h2c://127.0.0.1:10000")
+        lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
         lines.append(f"    }}")
-        # Embedded Dex IDP OIDC endpoints + relay WebSocket
+        # Relay + browser-client WebSockets need plain HTTP/1.1: a WebSocket upgrade
+        # over h2c is a 502. Upstream: https://docs.netbird.io/selfhosted/reverse-proxy
+        lines.append(f"    @netbird_ws {{")
+        lines.append(f"        path /relay /relay/* /ws-proxy/*")
+        lines.append(f"    }}")
+        lines.append(f"    handle @netbird_ws {{")
+        lines.append(f"        reverse_proxy 127.0.0.1:33073")
+        lines.append(f"    }}")
+        # Embedded Dex IDP OIDC endpoints
         lines.append(f"    @netbird_idp {{")
-        lines.append(f"        path /oauth2 /oauth2/* /.well-known/* /auth /auth/* /token /keys /callback /userinfo /device /device/* /approval /approval/* /relay")
+        lines.append(f"        path /oauth2 /oauth2/* /.well-known/* /auth /auth/* /token /keys /callback /userinfo /device /device/* /approval /approval/*")
         lines.append(f"    }}")
         lines.append(f"    handle @netbird_idp {{")
         lines.append(f"        reverse_proxy h2c://127.0.0.1:33073")
@@ -38368,6 +38429,19 @@ def _takportal_update_worker(portal_dir, job_id):
             _takportal_update_job.update({'running': False, 'result': result, 'code': code})
 
 
+# TAK Portal's image build (Deploy and Update). Through the broker the subprocess timeout
+# alone is not the limit: the broker kills its child at its own DEFAULT_TIMEOUT (600 s)
+# unless the request carries a longer one, so the 900 s both paths asked for never applied.
+# Portal 2.x builds two images (web + worker) and took just over 10 min on a 4-vCPU box,
+# so every fresh install on a box that size or slower failed. The caller waits 60 s past
+# the broker so the broker's own TIMEOUT answer comes back instead of a client-side kill.
+_TAKPORTAL_BUILD_TIMEOUT = 900
+
+
+def _takportal_build_env():
+    return {**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(_TAKPORTAL_BUILD_TIMEOUT)}
+
+
 @_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
     'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def _takportal_run_update(portal_dir):
@@ -38446,9 +38520,10 @@ def _takportal_run_update(portal_dir):
     _pull_base_images(portal_dir, wrap=_sudo_wrap)
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
-                               cwd=portal_dir, capture_output=True, text=True, timeout=900)
+                               cwd=portal_dir, capture_output=True, text=True,
+                               timeout=_TAKPORTAL_BUILD_TIMEOUT + 60, env=_takportal_build_env())
     except subprocess.TimeoutExpired:
-        plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
+        plog_msg = f'Build timed out after {_TAKPORTAL_BUILD_TIMEOUT}s. The old container is still running the previous version.'
         print(f'[takportal] update: {plog_msg}', flush=True)
         _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
         return {'success': False, 'error': plog_msg}, 500
@@ -39001,15 +39076,22 @@ def run_takportal_deploy():
         # (an already-running container just gets re-seeded + restarted in Step 6).
         _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-        for line in r.stdout.strip().split('\n'):
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               timeout=_TAKPORTAL_BUILD_TIMEOUT + 60, env=_takportal_build_env())
+        except subprocess.TimeoutExpired:
+            plog(f"\u2717 Docker build did not finish within {_TAKPORTAL_BUILD_TIMEOUT // 60} min \u2014 press Deploy again (cached layers make the retry faster)")
+            takportal_deploy_status.update({'running': False, 'error': True})
+            return
+        for line in (r.stdout or '').strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
         if r.returncode != 0:
-            plog(f"\u2717 Docker build failed")
-            for line in r.stderr.strip().split('\n'):
-                if line.strip():
-                    takportal_deploy_log.append(f"  \u2717 {line.strip()}")
+            # stderr is merged into stdout above, so the build's own reason is already in
+            # the log; r.stderr is None here (reading it crashed every failed deploy with
+            # "'NoneType' object has no attribute 'strip'").
+            plog(f"\u2717 Docker build failed (exit {r.returncode}) \u2014 the build output above says why")
             takportal_deploy_status.update({'running': False, 'error': True})
             return
 
@@ -39345,7 +39427,7 @@ def certs_page():
     if os.path.isdir(cert_dir):
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp):
+            if os.path.isfile(fp) and not _is_ca_private_material(fn):  # v10.2.26 W6
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -50770,12 +50852,34 @@ def _ensure_netbird_store_key_setting(settings=None):
     generating a new key'), so any restart orphans every previously-encrypted row —
     SSO then 401s 'token invalid' via 'decrypt email: cipher: message authentication
     failed' (test12 2026-07-17, WS2 validation). Key format matches netbird's own
-    generator: 32 bytes base64."""
+    generator: 32 bytes base64.
+
+    A key already in config.yaml but missing from settings is ADOPTED, never replaced:
+    minting a new one here would make the next deploy rewrite config.yaml and orphan
+    every row the running server wrote (test6 carried exactly that split, ops #150)."""
     s = settings if settings is not None else load_settings()
     k = (s.get('netbird_store_encryption_key') or '').strip()
     if not k:
+        for d in (os.path.expanduser('~/netbird'), '/root/netbird'):
+            cfg_path = os.path.join(d, 'config.yaml')
+            if not os.path.isfile(cfg_path):
+                continue
+            try:
+                try:
+                    with open(cfg_path) as f:
+                        txt = f.read()
+                except Exception:
+                    txt = _read_priv(cfg_path)
+                m = re.search(r'^\s*encryptionKey:\s*"?([A-Za-z0-9+/=]{40,})"?\s*$', txt or '', re.M)
+            except Exception:
+                m = None
+            if m:
+                k = m.group(1)
+                break
+    if not k:
         import base64 as _b64
         k = _b64.b64encode(os.urandom(32)).decode()
+    if (s.get('netbird_store_encryption_key') or '').strip() != k:
         s['netbird_store_encryption_key'] = k
         save_settings(s)
     return k
@@ -50895,8 +50999,12 @@ def _heal_netbird_orphaned_store(plog=None):
                 return False
             if _users == 0 and _inst.get('setup_required') is False and settings.get('netbird_enabled'):
                 _torn = True
-            else:
+            elif not (_users > 0 and _inst.get('setup_required') is False and settings.get('netbird_enabled')):
                 return False  # no PAT but nothing provably wrong — don't guess
+            # else: populated store and no PAT to probe with (a lost PAT is a normal,
+            # working state). Only the decrypt signature below can condemn it: test6
+            # and test8 (ops #150) sat here with every user row orphaned and no PAT,
+            # so the heal never ran and SSO login spun on 401 'token invalid'.
         elif _netbird_pat_is_valid(pat):
             return False  # healthy
         # PAT failed — the probe above just forced the server to log WHY. Only the
@@ -50909,7 +51017,7 @@ def _heal_netbird_orphaned_store(plog=None):
                            capture_output=True, text=True, timeout=20)
         _recent = (r.stdout or '') + (r.stderr or '')
         if not _torn and 'message authentication failed' not in _recent:
-            if not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
+            if pat and not getattr(_heal_netbird_orphaned_store, '_ambig_logged', False):
                 _heal_netbird_orphaned_store._ambig_logged = True
                 _log('  netbird: stored PAT invalid but no orphaned-store signature yet — watching. '
                      'If SSO login fails with 401, the failed attempt itself will confirm the '
@@ -56728,7 +56836,7 @@ networks:
                     if r.returncode == 0:
                         plog("✓ TAK Server restarted")
                     else:
-                        plog(f"⚠ TAK Server restart issue: {r.stderr.strip()[:100]}")
+                        plog(f"⚠ TAK Server restart issue: {(r.stdout or '').strip()[-200:]}")
             else:
                 plog(f"⚠ CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
         else:
@@ -67571,7 +67679,7 @@ entries:
                         if r.returncode == 0:
                             plog("\u2713 TAK Server restarted")
                         else:
-                            plog(f"\u26a0 TAK Server restart issue: {r.stderr.strip()[:100]}")
+                            plog(f"\u26a0 TAK Server restart issue: {(r.stdout or '').strip()[-200:]}")
                 else:
                     plog(f"\u26a0 CoreConfig LDAP patch failed: {_et_msg} — use Connect TAK Server to LDAP after deploy")
             else:
@@ -74282,6 +74390,201 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     return names
 
 
+# v10.2.26 — the names on TAK Server's own certificate (8089/8443). TAK's makeCert.sh gives a
+# server cert exactly one SAN (`[alt_names] DNS.1 = <name>`), so every box we deployed carried
+# only DNS:takserver. ATAK/iTAK/WinTAK/CloudTAK never check the hostname on 8089, so nothing
+# noticed; anything that does — NineHills cUAS dialing takserver.trytak.org (2026-10-22, 50/50
+# handshakes refused with BAD_CERTIFICATE), TAK Portal with --use-system-ca (nuc, 2026-08-06,
+# ERR_TLS_CERT_ALTNAME_INVALID) — rejects the server outright.
+#
+# makeCert builds the server cert's extfile as a copy of certs/config.cfg with
+# `subjectAltName = @alt_names` + `[alt_names] DNS.1 = <name>` appended, and OpenSSL merges a
+# repeated section. So a managed [alt_names] block placed ABOVE `[ server ]` in config.cfg adds
+# this box's names to the cert makeCert issues — verified on OpenSSL 3.0.2 (Ubuntu 22.04) and
+# 3.6. The stock script, its key/keystore handling and the broker's makeCert-only carve-out
+# stay exactly as they were; client and CA certs never reference @alt_names. CN stays
+# `takserver` (it is what federation partners see) and so do the file names.
+_TAK_CERTS_CONFIG = '/opt/tak/certs/config.cfg'
+_TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits are replaced) >>>'
+_TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
+_TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+                              r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
+
+
+def _tak_server_cert_names(settings):
+    """Every name TAK Server's certificate should carry, as 'DNS:x' / 'IP:y'.
+
+    makeCert's own DNS:takserver first (anything that dials the old name keeps working), then
+    the TAK domain, the bare domain, the server IP and loopback. Every value is validated here
+    because it ends up in a file makeCert hands to openssl."""
+    names = ['DNS:takserver']
+
+    def add(entry):
+        if entry not in names:
+            names.append(entry)
+    for host in (_get_service_domain(settings, 'takserver'), settings.get('fqdn')):
+        h = str(host or '').strip().lower().rstrip('.')
+        if h and _TAK_SAN_HOST_RE.match(h):
+            add(f'DNS:{h}')
+    sip = settings.get('server_ip')
+    if isinstance(sip, str):  # a list here is the server-ip tuple corruption; skip it, don't guess
+        try:
+            add(f'IP:{ipaddress.ip_address(sip.strip())}')
+        except ValueError:
+            pass
+    add('DNS:localhost')
+    add('IP:127.0.0.1')
+    return names
+
+
+def _tak_config_cfg_with_names(text, names):
+    """config.cfg with the managed [alt_names] block (re)placed directly above `[ server ]`.
+
+    Returns None when there is no `[ server ]` section, or a managed block with no end marker:
+    a config this code does not recognize is left alone rather than guessed at."""
+    kept, inside, after_block = [], False, False
+    for line in text.splitlines(keepends=True):
+        s = line.strip()
+        if s == _TAK_SAN_BEGIN:
+            inside = True
+        elif inside:
+            inside = s != _TAK_SAN_END
+            after_block = not inside
+        elif after_block and not s:
+            after_block = False          # the blank line we put after our own block
+        else:
+            after_block = False
+            kept.append(line)
+    if inside:
+        return None
+    at = next((i for i, line in enumerate(kept) if re.match(r'^\s*\[\s*server\s*\]\s*$', line)), None)
+    if at is None:
+        return None
+    # makeCert writes DNS.1 itself, so ours start at .2 (IP too, in case a name is ever an IP).
+    counter = {'DNS': 1, 'IP': 1}
+    block = [_TAK_SAN_BEGIN + '\n', '[ alt_names ]\n']
+    for entry in names:
+        if entry == 'DNS:takserver':
+            continue
+        kind, value = entry.split(':', 1)
+        counter[kind] += 1
+        block.append(f'{kind}.{counter[kind]} = {value}\n')
+    block += [_TAK_SAN_END + '\n', '\n']
+    if at and not kept[at - 1].endswith('\n'):
+        kept[at - 1] += '\n'
+    return ''.join(kept[:at] + block + kept[at:])
+
+
+def _tak_server_cert_prepare(settings, log=None):
+    """Write this box's names into certs/config.cfg so the next `makeCert.sh server` carries them.
+
+    Call it before every makeCert server run. Never raises and never blocks the caller: a box
+    whose config.cfg cannot be read or extended still gets the stock DNS:takserver cert, exactly
+    as before, and the TAK Server page's certificate row shows it. Returns True when in place."""
+    say = log or (lambda _m: None)
+    try:
+        cur = _read_priv(_TAK_CERTS_CONFIG)
+    except Exception as e:
+        say(f"  ⚠ Could not read {_TAK_CERTS_CONFIG} ({str(e)[:120]}) — server certificate keeps only DNS:takserver")
+        return False
+    names = _tak_server_cert_names(settings)
+    new = _tak_config_cfg_with_names(cur or '', names)
+    if new is None:
+        say(f"  ⚠ {_TAK_CERTS_CONFIG} has no [ server ] section — server certificate keeps only DNS:takserver")
+        return False
+    if new != cur:
+        try:
+            _write_priv(_TAK_CERTS_CONFIG, new)
+        except Exception as e:
+            say(f"  ⚠ Could not update {_TAK_CERTS_CONFIG} ({str(e)[:120]}) — server certificate keeps only DNS:takserver")
+            return False
+    say("  Server certificate names: " + ', '.join(n.split(':', 1)[1] for n in names))
+    return True
+
+
+def _cert_san_entries(pem):
+    """SANs of a PEM certificate as 'DNS:x' / 'IP:y' (IPs normalized), or None if unreadable."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'subjectAltName'],
+                           input=pem, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for part in r.stdout.split('\n', 1)[-1].split(','):
+        p = part.strip()
+        if p.startswith('DNS:'):
+            out.append('DNS:' + p[4:].lower())
+        elif p.startswith('IP Address:'):
+            try:
+                out.append(f"IP:{ipaddress.ip_address(p.split(':', 1)[1].strip())}")
+            except ValueError:
+                pass
+    return out
+
+
+def _tak_server_cert_live_names():
+    """SANs on the certificate TAK Server is presenting RIGHT NOW, or None if it isn't answering.
+
+    Reads 8443, not 8089: both are served from the same <tls> keystore, and a client-certless
+    handshake on 8089 writes an ERROR line into takserver-messaging.log on every probe, while
+    8443 stays quiet. s_client gets the server's cert before TAK asks for ours; nothing is sent."""
+    try:
+        r = subprocess.run(['openssl', 's_client', '-connect', '127.0.0.1:8443'],
+                           input='', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', r.stdout, re.S)
+    return _cert_san_entries(m.group(0)) if m else None
+
+
+def _tak_server_cert_status(settings):
+    """What the TAK Server page's certificate row shows. Judged from the LIVE cert, so the row
+    only turns green once TAK is actually presenting the names, not when a file was written."""
+    want = _tak_server_cert_names(settings)
+    tak_domain = (_get_service_domain(settings, 'takserver') or '').lower()
+    live = _tak_server_cert_live_names()
+    st = {'expected': [n.split(':', 1)[1] for n in want], 'domain': tak_domain}
+    if live is None:
+        return {**st, 'state': 'unknown', 'live': [], 'missing': []}
+    missing = [n.split(':', 1)[1] for n in want if n not in live]
+    return {**st, 'state': 'missing' if missing else 'ok',
+            'live': [n.split(':', 1)[1] for n in live], 'missing': missing}
+
+
+_tak_cert_status_cache = {'at': 0.0, 'status': None, 'refreshing': False}
+_TAK_CERT_STATUS_TTL = 600
+
+
+def _tak_server_cert_status_remember(status):
+    _tak_cert_status_cache.update(at=time.time(), status=status)
+    return status
+
+
+def _tak_server_cert_status_cached(settings):
+    """The last live result, for callers on every page render (the notice bar) that must not
+    run a TLS handshake inline. When stale, a background thread refreshes it and this call
+    returns the previous result (None before the first one lands). The TAK Server page and
+    the Fix job store fresh results directly, so the bar follows them without waiting."""
+    c = _tak_cert_status_cache
+    if (time.time() - c['at'] > _TAK_CERT_STATUS_TTL and not c['refreshing']
+            and not tak_server_cert_job['running']):
+        c['refreshing'] = True
+        snap = dict(settings or {})
+
+        def _refresh():
+            try:
+                _tak_server_cert_status_remember(_tak_server_cert_status(snap))
+            except Exception:
+                pass
+            finally:
+                c['refreshing'] = False
+        threading.Thread(target=_refresh, daemon=True).start()
+    return c['status']
+
+
 def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
     """`makeCert.sh <kind> NAME` that really replaces NAME.p12 and NAME.jks. Returns True on success.
 
@@ -74343,11 +74646,13 @@ def _rotate_refresh_integrations(log):
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
 
 
-def _rotate_sh(cmd, timeout=120):
-    """Container-aware shell runner that keeps the output: (ok, stdout+stderr)."""
+def _rotate_sh(argv, timeout=120):
+    """Runs `runuser -u tak -- <argv>`, container-aware, and keeps the output: (ok, stdout+stderr).
+    An argv list, not a shell string: the truststore password goes in as one word."""
     try:
-        r = subprocess.run(_rotate_tak_cert_cmd(cmd), shell=True, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+        r = subprocess.run(_rotate_tak_cert_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout or ''
     except Exception as e:
         return False, str(e)
 
@@ -74376,9 +74681,8 @@ def _pem_key(pem):
 
 def _rotate_truststore_entries(ts_path, storepass, sh):
     """[(alias, pem)] for every trustedCertEntry in a truststore, via `keytool -list -rfc`.
-    None if keytool cannot read it. sh(cmd) -> (ok, output)."""
-    ok, out = sh(f'runuser -u tak -- keytool -list -rfc -keystore {shlex.quote(ts_path)} '
-                 f'-storepass {shlex.quote(storepass)} 2>&1')
+    None if keytool cannot read it. sh(argv) -> (ok, output), argv run as `tak`."""
+    ok, out = sh(['keytool', '-list', '-rfc', '-keystore', ts_path, '-storepass', storepass])
     if not ok or 'Alias name:' not in out:
         return None
     entries = []
@@ -74664,6 +74968,7 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 3/7: Creating new server certificate (signed by new CA)...")
+            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
             if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
                 raise Exception('Failed to create new server certificate')
             log("✓ Server certificate regenerated (signed by new CA)")
@@ -74791,6 +75096,7 @@ def takserver_revoke_old_ca():
         # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
+            _tak_server_cert_prepare(load_settings())  # v10.2.26: real names, not just `takserver`
             r = subprocess.run(
                 _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
                 shell=True, capture_output=True, text=True, timeout=120)
@@ -74975,6 +75281,7 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 4/8: Creating new server certificate...")
+            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
             if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
                 raise Exception('Failed to create server certificate')
             log("✓ Server certificate created")
@@ -75076,6 +75383,134 @@ def takserver_rotate_rootca_status():
     return jsonify({'log': rotate_rootca_log, **rotate_rootca_status})
 
 
+@app.route('/api/takserver/server-cert')
+@login_required
+def takserver_server_cert_status():
+    """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
+    plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
+    job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
+    job['log'] = list(tak_server_cert_job['log'])
+    if tak_server_cert_job['running']:
+        return jsonify({'job': job, 'status': None})
+    return jsonify({'job': job,
+                    'status': _tak_server_cert_status_remember(_tak_server_cert_status(load_settings()))})
+
+
+@app.route('/api/takserver/server-cert/fix', methods=['POST'])
+@login_required
+def takserver_server_cert_fix():
+    """v10.2.26 — reissue TAK Server's certificate with this box's names, same CA.
+
+    Backs up takserver.{pem,key,p12,jks,csr}, writes the names into certs/config.cfg, reissues
+    through the stock makeCert.sh, checks the new file carries every name, restarts TAK and
+    waits until the LIVE cert does. Any failure before the restart puts the old files back
+    untouched; a TAK that doesn't come back presenting the new cert gets the old one restored
+    and restarted. Enrolled devices trust the CA, not this cert, so nobody re-enrolls."""
+    if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+            or rotate_intca_status.get('running')):
+        return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
+    settings = load_settings()
+    want = _tak_server_cert_names(settings)
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
+
+    def do_fix():
+        log = tak_server_cert_job['log'].append
+        cert_dir = '/opt/tak/certs/files'
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
+        backed = []
+
+        # The same shell-string runner the CA rotations use: _rotate_reissue_cert() hands it
+        # `cd … && echo "y" | runuser -u tak -- makeCert.sh …` and mv/rm/cp strings. NOT
+        # _rotate_sh(): ops #163 made that one argv-only (`runuser -u tak -- <argv>`), so a
+        # string reached runuser one character at a time — "runuser: failed to execute c"
+        # on test12, 2026-10-22 (the backup step refused, nothing changed).
+        def run(cmd, check=True):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
+                return False
+
+        def restore():
+            ok = all(run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed)
+            log("  ✓ Previous certificate restored" if ok else "  ✗ Restore incomplete — backups are "
+                f"{cert_dir}/takserver.*.{stamp}")
+            return ok
+
+        def wait_live(seconds):
+            end = time.time() + seconds
+            live = None
+            while time.time() < end:
+                time.sleep(5)
+                live = _tak_server_cert_live_names()
+                if live is not None and all(n in live for n in want):
+                    return live
+            return live
+
+        try:
+            log("━━━ Fixing TAK Server's certificate names ━━━")
+            log("Step 1/4: Backing up the current server certificate...")
+            for p in files:
+                if _exists_priv(p):
+                    if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + "." + stamp)}'):
+                        raise Exception('Backup failed — nothing was changed')
+                    backed.append(p)
+            log(f"  ✓ Saved as {cert_dir}/takserver.*.{stamp}")
+
+            log("Step 2/4: Writing this server's names into the certificate config...")
+            if not _tak_server_cert_prepare(settings, log):
+                raise Exception('Could not write the names — nothing was changed')
+
+            log("Step 3/4: Reissuing the server certificate (same CA)...")
+            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+                restore()
+                raise Exception('makeCert.sh failed')
+            got = _cert_san_entries(_read_priv(f'{cert_dir}/takserver.pem')) or []
+            short = [n.split(':', 1)[1] for n in want if n not in got]
+            if short:
+                restore()
+                raise Exception('The new certificate is missing ' + ', '.join(short))
+            log("  ✓ New certificate carries: " + ', '.join(n.split(':', 1)[1] for n in got))
+
+            log("Step 4/4: Restarting TAK Server (devices reconnect on their own)...")
+            if not run('systemctl restart takserver 2>&1'):
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server restart failed')
+            live = wait_live(300)
+            if live is None or not all(n in live for n in want):
+                log("  ✗ TAK Server didn't come back presenting the new certificate within 5 minutes")
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server did not pick up the new certificate')
+            log("  ✓ TAK Server is presenting the new certificate")
+            _tak_server_cert_status_remember(_tak_server_cert_status(settings))
+            log("")
+            log("━━━ DONE ━━━")
+            tak_server_cert_job.update(running=False, complete=True, error=False)
+        except Exception as e:
+            log("")
+            log(f"✗ FAILED: {e}")
+            tak_server_cert_job.update(running=False, complete=True, error=True)
+
+    threading.Thread(target=do_fix, daemon=True).start()
+    return jsonify({'success': True, 'started': True})
+
+
 @app.route('/api/takserver/create-client-cert', methods=['POST'])
 @login_required
 def takserver_create_client_cert():
@@ -75091,7 +75526,12 @@ def takserver_create_client_cert():
         return jsonify({'error': 'Name too long (max 64 chars)'}), 400
 
     cert_dir = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(cert_dir, f'{cert_name}.p12')):
+    # ops #169: makeCert.sh client NAME writes NAME.key/.pem/.p12 over whatever is there, so a
+    # name that is a CA's (ca, INT-CA-09, …-signing, …-do-not-share) would overwrite CA files.
+    if (cert_name in _NOT_CLIENT_CERT_NAMES or _is_ca_private_material(f'{cert_name}.p12')
+            or cert_name.lower().startswith('truststore-')):
+        return jsonify({'error': f'"{cert_name}" is reserved for TAK Server and CA files'}), 400
+    if any(os.path.exists(os.path.join(cert_dir, f'{cert_name}{ext}')) for ext in ('.p12', '.pem', '.key')):
         return jsonify({'error': f'Certificate "{cert_name}" already exists'}), 400
 
     def _normalize_groups(values):
@@ -75128,22 +75568,35 @@ def takserver_create_client_cert():
         if not os.path.exists(p12_path):
             return jsonify({'error': 'Certificate file was not created'}), 500
 
+        group_warning = ''
         if groups_in or groups_out or groups_both:
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
-            cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
+            argv = ['java', '-jar', '/opt/tak/utils/UserManager.jar', 'certmod']
             for g in groups_both:
-                cmd += f' -g {shlex.quote(g)}'
+                argv += ['-g', g]
             for g in groups_in:
-                cmd += f' -ig {shlex.quote(g)}'
+                argv += ['-ig', g]
             for g in groups_out:
-                cmd += f' -og {shlex.quote(g)}'
-            cmd += f' {shlex.quote(pem_path)}'
+                argv += ['-og', g]
+            argv.append(pem_path)
             # v10.0.1 container: java + UserManager.jar live ONLY inside the takserver container
-            # (no host JDK), so run the group-assignment in-container; native path unchanged.
-            full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
-            gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=15)
-            if gr.returncode != 0:
-                pass  # cert still created, group assignment is best-effort
+            # (no host JDK), so run the group-assignment in-container (the same `docker exec ...
+            # bash -c` form _tak_exec() builds). v10.2.26: an argv list with no host shell, so a
+            # group name is always one word and never re-parsed.
+            full = (['docker', 'exec', TAK_CONTAINER, 'bash', '-c', shlex.join(argv)]
+                    if _tak_is_container() else argv)
+            # v10.2.26: 15 s was a JVM start on an idle box. test12 under load took 16.1 s, the
+            # TimeoutExpired fell to the outer except and the page said the create FAILED while
+            # the cert existed with no groups. Give it room, and when the groups don't land, say
+            # exactly that next to a cert that was created.
+            try:
+                gr = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                if gr.returncode != 0:
+                    group_warning = ('Certificate created, but TAK Server did not accept the group '
+                                     f'assignment: {(gr.stdout or "").strip()[-200:]}')
+            except subprocess.TimeoutExpired:
+                group_warning = ('Certificate created, but assigning its groups took over 2 minutes '
+                                 'and was stopped. Assign the groups in TAK Server before using it.')
 
         return jsonify({
             'success': True,
@@ -75152,10 +75605,224 @@ def takserver_create_client_cert():
             'download_url': f'/api/certs/download/{cert_name}.p12',
             'groups_both': groups_both,
             'groups_in': groups_in,
-            'groups_out': groups_out
+            'groups_out': groups_out,
+            'package_url': f'/api/takserver/client-cert/{cert_name}/package',
+            'group_warning': group_warning,
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
+
+
+# v10.2.26 W5 — integration package. A third-party system (cUAS cloud, CAD, SIEM) needs PEM
+# files and a "trust this server" CA file, not the one TAK-format .p12 the console used to hand
+# out. Cert-only by design: the groups are the ones put on the cert at creation, as Create
+# Client Certificate always did — no Authentik user, no data feed.
+_CERT_FILES_DIR = '/opt/tak/certs/files'
+_CLIENT_CERT_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+_NOT_CLIENT_CERT_NAMES = {'takserver', 'ca', 'root-ca'}
+
+
+def _cert_file_bytes(path):
+    """A file from the TAK cert dir. Client .p12/.key are 0600 tak:tak, so a non-root console
+    takes the privileged read when the plain one is refused (same as the .p12 download)."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError:
+        return _read_priv_bytes(path)
+
+
+def _is_client_cert_pem(pem):
+    """True only for a leaf client cert: CA:FALSE and clientAuth WITHOUT serverAuth. The server
+    cert (both EKUs), the CAs and anything unreadable are refused."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'basicConstraints,extendedKeyUsage'],
+                           input=pem, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    out = r.stdout
+    return (r.returncode == 0 and 'CA:FALSE' in out and 'TLS Web Client Authentication' in out
+            and 'TLS Web Server Authentication' not in out)
+
+
+def _client_cert_pem_or_none(name):
+    if name in _NOT_CLIENT_CERT_NAMES or not _CLIENT_CERT_NAME_RE.match(name or ''):
+        return None
+    # ops #169: a CA:FALSE leaf left as INT-CA-NN-signing.pem/.key by the old Rotate CA bug
+    # passed the leaf test, and the package then zipped INT-CA-NN-signing.p12 — the CA's own
+    # signing keystore. Any name whose .p12 is CA material is never a client cert here.
+    if _is_ca_private_material(f'{name}.p12'):
+        return None
+    try:
+        pem = _cert_file_bytes(os.path.join(_CERT_FILES_DIR, f'{name}.pem')).decode(errors='replace')
+    except Exception:
+        return None
+    return pem if _is_client_cert_pem(pem) else None
+
+
+def _cert_pubkey(pem):
+    """The public key of a PEM certificate, or b'' when it can't be read."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-pubkey'], input=pem.encode(),
+                           capture_output=True, timeout=10)
+    except Exception:
+        return b''
+    return r.stdout.strip() if r.returncode == 0 else b''
+
+
+def _private_key_pubkey(data, password, p12=False):
+    """The public half of the private key in a PEM .key, or in a .p12 holding exactly one key.
+    b'' when it can't be read — the caller treats that as "does not match". The password
+    travels in the environment, never argv."""
+    import tempfile as _tf
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-keychk-') as td:
+            os.chmod(td, 0o700)
+            path = os.path.join(td, 'in')
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(data)
+            if not p12:
+                r = subprocess.run(['openssl', 'pkey', '-in', path, '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                                   capture_output=True, env=env, timeout=10)
+                return r.stdout.strip() if r.returncode == 0 else b''
+            # makeCert.sh writes RC2-40 .p12, which OpenSSL 3 opens only with -legacy.
+            for extra in ([], ['-legacy']):
+                r = subprocess.run(['openssl', 'pkcs12', '-in', path, '-nocerts', '-nodes',
+                                    '-passin', 'env:ITK_P12_PASS'] + extra,
+                                   capture_output=True, env=env, timeout=10)
+                if r.returncode == 0 and b'PRIVATE KEY-----' in r.stdout:
+                    break
+            else:
+                return b''
+            if r.stdout.count(b'-----BEGIN ') != 1:
+                return b''
+            r = subprocess.run(['openssl', 'pkey', '-pubout'], input=r.stdout, capture_output=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else b''
+    except Exception:
+        return b''
+
+
+def _modern_p12(pem_path, key_path, chain_pem, name, password):
+    """Re-wrap the client cert + key as a PKCS#12 OpenSSL 3, Node and Python can open.
+
+    makeCert.sh writes .p12 as pbeWithSHA1And40BitRC2-CBC (ATAK needs it), which modern stacks
+    refuse ("RC2-40-CBC unsupported"). OpenSSL 3's export defaults are AES-256-CBC + PBKDF2 +
+    SHA-256 MAC. The password travels in the environment, never argv. Returns bytes or None."""
+    import tempfile as _tf
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-p12-') as td:
+            os.chmod(td, 0o700)
+            key_tmp, pem_tmp, chain_tmp = (os.path.join(td, n) for n in ('k', 'c', 'ca'))
+            for p, data in ((key_tmp, _cert_file_bytes(key_path)), (pem_tmp, _cert_file_bytes(pem_path)),
+                            (chain_tmp, chain_pem.encode())):
+                with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                    f.write(data)
+            env = dict(os.environ, ITK_P12_PASS=password)
+            r = subprocess.run(['openssl', 'pkcs12', '-export', '-in', pem_tmp, '-inkey', key_tmp,
+                                '-certfile', chain_tmp, '-name', name,
+                                '-passin', 'env:ITK_P12_PASS', '-passout', 'env:ITK_P12_PASS'],
+                               capture_output=True, env=env, timeout=20)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+    except Exception:
+        return None
+
+
+@app.route('/api/takserver/client-certs')
+@login_required
+def takserver_client_certs():
+    """v10.2.26 W5 — client certs an integration package can be built for."""
+    try:
+        files = sorted(os.listdir(_CERT_FILES_DIR))
+    except OSError:
+        return jsonify({'certs': []})
+    have = set(files)
+    names = [f[:-4] for f in files
+             if f.endswith('.pem') and not f.endswith('-trusted.pem')
+             and f'{f[:-4]}.key' in have and _client_cert_pem_or_none(f[:-4])]
+    return jsonify({'certs': names})
+
+
+@app.route('/api/takserver/client-cert/<name>/package')
+@login_required
+def takserver_client_cert_package(name):
+    """v10.2.26 W5 — <name>-integration.zip: the client cert in every form a third-party system
+    asks for, this server's CA as plain PEM, and a README. The cert password is deliberately NOT
+    in the zip — it is shown beside the button for the operator to send separately."""
+    from flask import send_file
+    import io
+    import zipfile
+    pem = _client_cert_pem_or_none(name)
+    if not pem:
+        return jsonify({'error': f'"{name}" is not a client certificate on this server'}), 404
+    d = _CERT_FILES_DIR
+    try:
+        key = _cert_file_bytes(os.path.join(d, f'{name}.key'))
+        ca = _cert_file_bytes(os.path.join(d, 'ca.pem')).decode(errors='replace')
+    except Exception as e:
+        return jsonify({'error': f'Could not read the certificate files: {str(e)[:160]}'}), 500
+    try:
+        root = _cert_file_bytes(os.path.join(d, 'root-ca.pem')).decode(errors='replace')
+    except Exception:
+        root = ''
+    chain = ca.strip() + '\n' + (root.strip() + '\n' if root.strip() and root.strip() != ca.strip() else '')
+    settings = load_settings()
+    password = _get_tak_cert_password(settings)
+    # ops #169: only private keys that belong to THIS cert go in the zip. A .key or .p12 sitting
+    # next to the .pem under the same name is not proof — check the key against the cert.
+    pub = _cert_pubkey(pem)
+    if not pub or _private_key_pubkey(key, password) != pub:
+        audit('integration_package_refused', f'cert={name} reason=key-mismatch')
+        return jsonify({'error': f'The private key for "{name}" does not match its certificate; '
+                                 'no package was built'}), 409
+    try:
+        legacy_p12 = _cert_file_bytes(os.path.join(d, f'{name}.p12'))
+    except Exception:
+        legacy_p12 = b''
+    if legacy_p12 and _private_key_pubkey(legacy_p12, password, p12=True) != pub:
+        audit('integration_package_p12_skipped', f'cert={name} reason=key-mismatch')
+        legacy_p12 = b''
+    trust = next((f for f in sorted(os.listdir(d))
+                  if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
+    try:
+        trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
+    except Exception:
+        trust_p12 = b''
+    modern_p12 = _modern_p12(os.path.join(d, f'{name}.pem'), os.path.join(d, f'{name}.key'),
+                             chain, name, password)
+    host = _get_takserver_host(settings) or (settings.get('server_ip') or '').strip() or '<this server>'
+
+    files = []  # (zip name, bytes, README line)
+    if modern_p12:
+        files.append((f'{name}.p12', modern_p12, 'Client certificate + private key (PKCS#12 / .pfx, AES-256).'
+                                                 ' Use this if your system takes a .p12 or .pfx.'))
+    if legacy_p12:
+        files.append((f'{name}-legacy.p12' if modern_p12 else f'{name}.p12', legacy_p12,
+                      'The same, in the older RC2 format TAK clients (ATAK) and older systems expect.'))
+    files += [(f'{name}.pem', pem.encode(), 'Client certificate (PEM).          } use these two if your system wants'),
+              (f'{name}.key', key, 'Client private key (PEM, encrypted). } separate certificate and key files'),
+              ('ca-chain.pem', chain.encode(), "This server's certificate authority (PEM). Add it as the trusted /"
+                                               ' server CA so your system trusts TAK Server.')]
+    if trust_p12:
+        files.append((trust, trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
+    w = max(len(f[0]) for f in files)
+    readme = '\n'.join(
+        [f'TAK Server integration package: {name}',
+         f'Created {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC by infra-TAK v{VERSION}', '',
+         f'Server:  {host}',
+         'Port:    8089 (TLS, client certificate required)', '', 'Files:']
+        + [f'  {fn.ljust(w)}  {line}' for fn, _b, line in files]
+        + ['', 'Password: the .p12 files and the .key are protected with the TAK certificate password.',
+           'It is not included in this package; get it from your TAK Server administrator.', ''])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for fn, data, _line in files:
+            z.writestr(fn, data)
+        z.writestr('README.txt', readme)
+    audit('integration_package', f'cert={name} files={",".join(f[0] for f in files)}')
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f'{name}-integration.zip',
+                     mimetype='application/zip')
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
@@ -82371,6 +83038,7 @@ def _deploy_takserver_container(config):
         if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
             return
         log_step("Creating server certificate...")
+        _tak_server_cert_prepare(load_settings(), log_step)  # v10.2.26: real names, not just `takserver`
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
             return
         log_step("Creating admin certificate...")
@@ -83159,6 +83827,8 @@ def run_takserver_deploy(config):
         # still reported all certificates created AND the truststore imported. A
         # TAK Server with no certificates cannot serve a single client, so this is
         # not a warning — it ends the deploy.
+        # v10.2.26: the server cert carries this box's real names, not just `takserver`.
+        _tak_server_cert_prepare(load_settings(), log_step)
         _cert_steps = [
             ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
             ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
@@ -84451,7 +85121,7 @@ def list_cert_files():
     files = []
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp):
+        if os.path.isfile(fp) and not _is_ca_private_material(f):
             files.append({'name': f, 'size': os.path.getsize(fp),
                 'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
@@ -84462,7 +85132,19 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
+    if _is_ca_private_material(filename):
+        audit('cert_download_refused', f'file={filename}')
+        return jsonify({'error': 'CA private keys are never downloaded from the console'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
+
+
+def _is_ca_private_material(filename):
+    """v10.2.26 W6 — the CA's private key in any form: `*-do-not-share.key` (makeRootCa /
+    makeCert ca) and `<CA>-signing.{jks,p12}` (the keystore TAK signs enrollments with). Browse
+    Certificates used to serve these to any logged-in session; nothing on the console needs to
+    hand them to a browser, and whoever holds them can mint certs this server trusts."""
+    f = (filename or '').lower()
+    return 'do-not-share' in f or re.search(r'-signing\.(jks|p12|pem|key)$', f) is not None
 
 @app.route('/api/deploy/log')
 @login_required
@@ -90923,6 +91605,27 @@ def _startup_migrations():
             else:
                 print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
                       f"(retries next restart): {_last_err}", flush=True)
+
+        # ops #150: the NetBird vhost sent signal to :10000 (nothing listens there on the
+        # combined server) and the relay WebSocket over h2c (502), so peers registered but
+        # never connected. Keyed on the live file, so it runs once and retries if rejected.
+        try:
+            _cf = _read_priv(CADDYFILE_PATH) or ''
+            if (s.get('fqdn') or '').strip() and 'reverse_proxy h2c://127.0.0.1:10000' in _cf:
+                generate_caddyfile(s)
+                if not _CADDY_REGISTRY_READY.is_set():
+                    # Write deferred to the post-registry regen + reload (seen on test6).
+                    print("Startup migration: NetBird vhost signal/relay fix queued — written with "
+                          "the post-registry Caddyfile regen", flush=True)
+                elif 'reverse_proxy h2c://127.0.0.1:10000' not in (_read_priv(CADDYFILE_PATH) or ''):
+                    _caddy_reload_if_changed(timeout=60)
+                    print("Startup migration: NetBird vhost — signal + relay routed to the combined "
+                          "server (peers can connect)", flush=True)
+                else:
+                    print("Startup migration: ⚠ NetBird vhost NOT regenerated (rejected and restored?) "
+                          "— retries next restart", flush=True)
+        except Exception as _nbc_e:
+            print(f"Startup migration: NetBird vhost regenerate error (non-fatal): {_nbc_e}", flush=True)
 
         # v10.1.1 S1: arm the proxy-auth gate (belt-and-suspenders for the bypass
         # class above). Regenerate the Caddyfile so forward_auth-passed requests
