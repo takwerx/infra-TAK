@@ -284,7 +284,7 @@ async function createClientCert(){
     var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
-    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    if(msg){msg.textContent=d.group_warning||'';msg.style.color=d.group_warning?'var(--yellow)':'var(--text-dim)';}
     if(result){
       result.style.display='block';
       document.getElementById('cc-result-name').textContent=d.name+'.p12';
@@ -343,6 +343,18 @@ function _takCertStyle(el,tone){
          bad:['rgba(239,68,68,0.08)','rgba(239,68,68,0.35)'],busy:['rgba(59,130,246,0.08)','rgba(59,130,246,0.3)']}[tone];
   el.style.background=t[0];el.style.border='1px solid '+t[1];el.style.display='block';
 }
+var _takCertSawRun=false,_takCertTries=0;
+// The console-wide "certificate doesn't include …" bar is drawn at page load; once the row
+// confirms the live cert is fixed, take it down here instead of waiting for a reload, and
+// re-stack whatever notice bars are left (same layout the bars' own dismiss uses).
+function _takCertDropBar(){
+  var b=document.querySelector('.takcert-banner');if(!b||!b.parentNode)return;
+  b.parentNode.removeChild(b);
+  var bars=[].slice.call(document.querySelectorAll('.itk-notice'));
+  var base=parseInt(b.getAttribute('data-base'),10)||0,h=parseInt(b.getAttribute('data-h'),10)||34;
+  bars.forEach(function(x,i){x.style.top=(base+i*h)+'px';});
+  document.body.style.setProperty('padding-top',(base+bars.length*h)+'px','important');
+}
 function _takCertLog(job){
   return '<div style="margin-top:12px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap">'+escapeHtml((job.log||[]).join('\n'))+'</div>';
 }
@@ -350,21 +362,49 @@ var _takCertFixBtn='<button type="button" id="tak-cert-fix-btn" onclick="fixTakC
 async function loadTakCertRow(){
   var el=document.getElementById('tak-cert-row');if(!el)return;
   var d;
-  try{var r=await fetch('/api/takserver/server-cert');d=await r.json();}catch(e){return;}
+  try{var r=await fetch('/api/takserver/server-cert');d=await r.json();}catch(e){d={job:{},status:null};}
   var job=d.job||{},st=d.status;
   if(job.running){
+    _takCertSawRun=true;
     _takCertStyle(el,'busy');
-    el.innerHTML='<div style="font-weight:600;color:var(--accent)">Fixing TAK Server\'s certificate… devices reconnect on their own when TAK Server is back.</div>'+_takCertLog(job);
+    var steps=(job.log||[]).filter(function(l){return /^Step \d\/4/.test(l);});
+    var step=steps.length?steps[steps.length-1]:'Starting…';
+    var secs=job.elapsed||0,el_t=(secs>=60?Math.floor(secs/60)+'m ':'')+(secs%60)+'s';
+    var restarting=/^Step 4\/4/.test(step);
+    el.innerHTML='<div style="display:flex;align-items:center;gap:12px">'
+      +'<span style="width:18px;height:18px;flex:none;border:2px solid rgba(59,130,246,0.25);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite"></span>'
+      +'<div><div style="font-weight:600;color:var(--accent)">Fixing TAK Server\'s certificate… <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
+      +'<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">'+escapeHtml(step)
+      +(restarting?' TAK Server usually takes 1–3 minutes to come back; devices reconnect on their own.':'')+'</div></div></div>'
+      +_takCertLog(job);
     var lg=el.lastChild;if(lg)lg.scrollTop=lg.scrollHeight;
     setTimeout(loadTakCertRow,2000);return;
   }
-  if(!st||st.state==='unknown'){el.style.display='none';return;}
+  // Never vanish: a busy box can miss one read (test12 under load, 2026-10-22). Say we're
+  // checking, retry a few times, then say plainly that it couldn't be read, with a retry.
+  if(!st||st.state==='unknown'){
+    _takCertStyle(el,'busy');el.style.padding='8px 16px';
+    if(_takCertTries<3){
+      _takCertTries++;
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Checking TAK Server\'s certificate…</div>';
+      setTimeout(loadTakCertRow,5000);
+    }else{
+      el.innerHTML='<div style="font-size:12px;color:var(--text-secondary)">Couldn\'t read TAK Server\'s certificate right now (TAK Server isn\'t answering on 8443). '
+        +'<a href="#" onclick="_takCertTries=0;loadTakCertRow();return false;" style="color:var(--cyan)">Check again</a></div>';
+    }
+    return;
+  }
+  _takCertTries=0;
   var dom=st.domain||'',names=(st.live||[]).map(escapeHtml).join(', ');
   if(st.state==='ok'){
+    _takCertDropBar();
+    // Steady state is one quiet line; the names are in the tooltip. The "Fixed" sentence only
+    // shows on the page that watched the fix run — not on every reload after it.
+    var justFixed=_takCertSawRun&&job.complete&&!job.error;
     _takCertStyle(el,'ok');
-    el.innerHTML='<div style="font-weight:600;color:var(--green)">✓ Your TAK Server certificate covers '+escapeHtml(dom||st.expected[0]||'this server')+'</div>'
-      +'<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Names on the certificate: '+names+'</div>'
-      +(job.complete&&!job.error?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Fixed. TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
+    el.style.padding=justFixed?'14px 20px':'8px 16px';
+    el.innerHTML='<div title="Names on the certificate: '+escapeHtml((st.live||[]).join(', '))+'" style="font-weight:600;color:var(--green);font-size:12px">✓ TAK Server certificate covers '+escapeHtml(dom||st.expected[0]||'this server')+'</div>'
+      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Fixed. TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
     return;
   }
   var miss=st.missing||[],head=(dom&&miss.indexOf(dom)>=0)?dom:miss[0];

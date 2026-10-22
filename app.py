@@ -1171,7 +1171,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.26-alpha"
+VERSION = "10.2.27-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -74517,7 +74517,7 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': []}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
 
 
 def _tak_server_cert_names(settings):
@@ -75497,6 +75497,7 @@ def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
     job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
         return jsonify({'job': job, 'status': None})
@@ -75526,7 +75527,7 @@ def takserver_server_cert_fix():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[])
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
 
     def do_fix():
         log = tak_server_cert_job['log'].append
@@ -75535,12 +75536,22 @@ def takserver_server_cert_fix():
         files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
         backed = []
 
+        # The same shell-string runner the CA rotations use: _rotate_reissue_cert() hands it
+        # `cd … && echo "y" | runuser -u tak -- makeCert.sh …` and mv/rm/cp strings. NOT
+        # _rotate_sh(): ops #163 made that one argv-only (`runuser -u tak -- <argv>`), so a
+        # string reached runuser one character at a time — "runuser: failed to execute c"
+        # on test12, 2026-10-22 (the backup step refused, nothing changed).
         def run(cmd, check=True):
-            ok, out = _rotate_sh(cmd, timeout=180)  # container-aware, same runner as the CA rotations
-            if check and not ok:
-                log(f"  ✗ {(out or '').strip()[:200]}")
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
                 return False
-            return True
 
         def restore():
             ok = all(run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed)
@@ -75623,7 +75634,12 @@ def takserver_create_client_cert():
         return jsonify({'error': 'Name too long (max 64 chars)'}), 400
 
     cert_dir = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(cert_dir, f'{cert_name}.p12')):
+    # ops #169: makeCert.sh client NAME writes NAME.key/.pem/.p12 over whatever is there, so a
+    # name that is a CA's (ca, INT-CA-09, …-signing, …-do-not-share) would overwrite CA files.
+    if (cert_name in _NOT_CLIENT_CERT_NAMES or _is_ca_private_material(f'{cert_name}.p12')
+            or cert_name.lower().startswith('truststore-')):
+        return jsonify({'error': f'"{cert_name}" is reserved for TAK Server and CA files'}), 400
+    if any(os.path.exists(os.path.join(cert_dir, f'{cert_name}{ext}')) for ext in ('.p12', '.pem', '.key')):
         return jsonify({'error': f'Certificate "{cert_name}" already exists'}), 400
 
     def _normalize_groups(values):
@@ -75660,22 +75676,35 @@ def takserver_create_client_cert():
         if not os.path.exists(p12_path):
             return jsonify({'error': 'Certificate file was not created'}), 500
 
+        group_warning = ''
         if groups_in or groups_out or groups_both:
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
-            cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
+            argv = ['java', '-jar', '/opt/tak/utils/UserManager.jar', 'certmod']
             for g in groups_both:
-                cmd += f' -g {shlex.quote(g)}'
+                argv += ['-g', g]
             for g in groups_in:
-                cmd += f' -ig {shlex.quote(g)}'
+                argv += ['-ig', g]
             for g in groups_out:
-                cmd += f' -og {shlex.quote(g)}'
-            cmd += f' {shlex.quote(pem_path)}'
+                argv += ['-og', g]
+            argv.append(pem_path)
             # v10.0.1 container: java + UserManager.jar live ONLY inside the takserver container
-            # (no host JDK), so run the group-assignment in-container; native path unchanged.
-            full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
-            gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=15)
-            if gr.returncode != 0:
-                pass  # cert still created, group assignment is best-effort
+            # (no host JDK), so run the group-assignment in-container (the same `docker exec ...
+            # bash -c` form _tak_exec() builds). v10.2.26: an argv list with no host shell, so a
+            # group name is always one word and never re-parsed.
+            full = (['docker', 'exec', TAK_CONTAINER, 'bash', '-c', shlex.join(argv)]
+                    if _tak_is_container() else argv)
+            # v10.2.26: 15 s was a JVM start on an idle box. test12 under load took 16.1 s, the
+            # TimeoutExpired fell to the outer except and the page said the create FAILED while
+            # the cert existed with no groups. Give it room, and when the groups don't land, say
+            # exactly that next to a cert that was created.
+            try:
+                gr = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                if gr.returncode != 0:
+                    group_warning = ('Certificate created, but TAK Server did not accept the group '
+                                     f'assignment: {(gr.stdout or "").strip()[-200:]}')
+            except subprocess.TimeoutExpired:
+                group_warning = ('Certificate created, but assigning its groups took over 2 minutes '
+                                 'and was stopped. Assign the groups in TAK Server before using it.')
 
         return jsonify({
             'success': True,
@@ -75686,6 +75715,7 @@ def takserver_create_client_cert():
             'groups_in': groups_in,
             'groups_out': groups_out,
             'package_url': f'/api/takserver/client-cert/{cert_name}/package',
+            'group_warning': group_warning,
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -75726,11 +75756,59 @@ def _is_client_cert_pem(pem):
 def _client_cert_pem_or_none(name):
     if name in _NOT_CLIENT_CERT_NAMES or not _CLIENT_CERT_NAME_RE.match(name or ''):
         return None
+    # ops #169: a CA:FALSE leaf left as INT-CA-NN-signing.pem/.key by the old Rotate CA bug
+    # passed the leaf test, and the package then zipped INT-CA-NN-signing.p12 — the CA's own
+    # signing keystore. Any name whose .p12 is CA material is never a client cert here.
+    if _is_ca_private_material(f'{name}.p12'):
+        return None
     try:
         pem = _cert_file_bytes(os.path.join(_CERT_FILES_DIR, f'{name}.pem')).decode(errors='replace')
     except Exception:
         return None
     return pem if _is_client_cert_pem(pem) else None
+
+
+def _cert_pubkey(pem):
+    """The public key of a PEM certificate, or b'' when it can't be read."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-pubkey'], input=pem.encode(),
+                           capture_output=True, timeout=10)
+    except Exception:
+        return b''
+    return r.stdout.strip() if r.returncode == 0 else b''
+
+
+def _private_key_pubkey(data, password, p12=False):
+    """The public half of the private key in a PEM .key, or in a .p12 holding exactly one key.
+    b'' when it can't be read — the caller treats that as "does not match". The password
+    travels in the environment, never argv."""
+    import tempfile as _tf
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-keychk-') as td:
+            os.chmod(td, 0o700)
+            path = os.path.join(td, 'in')
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(data)
+            if not p12:
+                r = subprocess.run(['openssl', 'pkey', '-in', path, '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                                   capture_output=True, env=env, timeout=10)
+                return r.stdout.strip() if r.returncode == 0 else b''
+            # makeCert.sh writes RC2-40 .p12, which OpenSSL 3 opens only with -legacy.
+            for extra in ([], ['-legacy']):
+                r = subprocess.run(['openssl', 'pkcs12', '-in', path, '-nocerts', '-nodes',
+                                    '-passin', 'env:ITK_P12_PASS'] + extra,
+                                   capture_output=True, env=env, timeout=10)
+                if r.returncode == 0 and b'PRIVATE KEY-----' in r.stdout:
+                    break
+            else:
+                return b''
+            if r.stdout.count(b'-----BEGIN ') != 1:
+                return b''
+            r = subprocess.run(['openssl', 'pkey', '-pubout'], input=r.stdout, capture_output=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else b''
+    except Exception:
+        return b''
 
 
 def _modern_p12(pem_path, key_path, chain_pem, name, password):
@@ -75796,9 +75874,21 @@ def takserver_client_cert_package(name):
     except Exception:
         root = ''
     chain = ca.strip() + '\n' + (root.strip() + '\n' if root.strip() and root.strip() != ca.strip() else '')
+    settings = load_settings()
+    password = _get_tak_cert_password(settings)
+    # ops #169: only private keys that belong to THIS cert go in the zip. A .key or .p12 sitting
+    # next to the .pem under the same name is not proof — check the key against the cert.
+    pub = _cert_pubkey(pem)
+    if not pub or _private_key_pubkey(key, password) != pub:
+        audit('integration_package_refused', f'cert={name} reason=key-mismatch')
+        return jsonify({'error': f'The private key for "{name}" does not match its certificate; '
+                                 'no package was built'}), 409
     try:
         legacy_p12 = _cert_file_bytes(os.path.join(d, f'{name}.p12'))
     except Exception:
+        legacy_p12 = b''
+    if legacy_p12 and _private_key_pubkey(legacy_p12, password, p12=True) != pub:
+        audit('integration_package_p12_skipped', f'cert={name} reason=key-mismatch')
         legacy_p12 = b''
     trust = next((f for f in sorted(os.listdir(d))
                   if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
@@ -75806,9 +75896,8 @@ def takserver_client_cert_package(name):
         trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
     except Exception:
         trust_p12 = b''
-    settings = load_settings()
     modern_p12 = _modern_p12(os.path.join(d, f'{name}.pem'), os.path.join(d, f'{name}.key'),
-                             chain, name, _get_tak_cert_password(settings))
+                             chain, name, password)
     host = _get_takserver_host(settings) or (settings.get('server_ip') or '').strip() or '<this server>'
 
     files = []  # (zip name, bytes, README line)
@@ -75823,7 +75912,7 @@ def takserver_client_cert_package(name):
               ('ca-chain.pem', chain.encode(), "This server's certificate authority (PEM). Add it as the trusted /"
                                                ' server CA so your system trusts TAK Server.')]
     if trust_p12:
-        files.append(('truststore.p12', trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
+        files.append((trust, trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
     w = max(len(f[0]) for f in files)
     readme = '\n'.join(
         [f'TAK Server integration package: {name}',
