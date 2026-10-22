@@ -91,8 +91,11 @@ class Box:
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
-                 gd_restart=None):
+                 gd_restart=None, ghosts=(), ghosts_leave=False):
         self.t = T0
+        # ops #172: connections TAK still lists but refuses to drop (HTTP 400); with
+        # `ghosts_leave` they are off the list right after the refused delete
+        self.ghosts, self.ghosts_leave = set(ghosts), ghosts_leave
         self.tak_start = tak_start
         self.ldap_start = ldap_start
         self.container = container
@@ -197,6 +200,10 @@ class Box:
             return True, None
         if method == 'DELETE' and url.startswith(f'{API}/subscriptions/delete/'):
             uid = urllib.parse.unquote(url.rsplit('/', 1)[1])
+            if uid in self.ghosts:
+                if self.ghosts_leave:
+                    self.subs = [s for s in self.subs if s['subscriptionUid'] != uid]
+                return None, 'http_400'
             gone = [s for s in self.subs if s['subscriptionUid'] == uid]
             if not gone:
                 return None, 'http_400'
@@ -498,6 +505,83 @@ def test_client_that_stays_offline_is_not_a_failure():
     assert box.recycle() is False
     assert box.restarts() == []
     assert any("didn't reconnect within" in l for l in box.log)
+
+
+# ── ops #172: a connection TAK won't drop, which a newer one from the client replaced ──
+
+def ghost_box(newer=None, **kw):
+    """test6 2026-10-22: the emulator's tls:29 was added and removed in the same ms, TAK still
+    listed it 3 min later with no user and no groups, and its delete got HTTP 400; the real
+    connection was tls:30, with groups."""
+    kw.setdefault('ghosts', {'tls:29'})
+    box = healthy_box(**kw)
+    box.subs.append(sess(29, 'takdev-emu', (), unmapped=True))
+    if newer is not None:
+        box.subs.append(newer)
+    return box
+
+
+def test_ops172_ghost_replaced_by_a_newer_connection_with_groups_is_not_a_restart():
+    box = ghost_box(sess(30, 'takdev-emu'), tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:29']
+    assert any("couldn't drop TAKDEV-EMU (takdev-emu) (tls:29): http_400" in l for l in box.log)
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced" in l and 'TAKDEV-EMU' in l
+               for l in box.log)
+    assert not any('still with no groups although LDAP is healthy' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops172_refused_drop_of_a_connection_that_left_the_list_is_not_a_restart():
+    box = ghost_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, ghosts_leave=True)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops172_ghost_reconnect_that_heals_in_the_same_run_counts_as_its_replacement():
+    # The newer connection also came in empty: it is dropped, comes back with groups, and
+    # then stands in for the ghost too.
+    box = ghost_box(sess(30, 'takdev-emu', (), unmapped=True), tak_start=T0 - 3 * 24 * HOUR,
+                    ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:29', 'tls:30']
+    assert box.live('takdev-emu')[-1]['groups']
+
+
+def test_ops172_undroppable_with_no_replacement_still_restarts_tak_once():
+    box = ghost_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert any('still with no groups although LDAP is healthy' in l and 'TAKDEV-EMU' in l for l in box.log)
+    assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+@pytest.mark.parametrize('newer', [
+    sess(30, 'takdev-emu', client='ANDROID-other-device'),   # same user, another device
+    sess(30, 'takdev-emu', ()),                              # same client, but no groups either
+    sess(28, 'takdev-emu'),                                  # older, not a reconnect
+], ids=['other-device', 'no-groups', 'older'])
+def test_ops172_only_a_newer_connection_of_the_same_client_with_groups_replaces_it(newer):
+    box = ghost_box(newer, tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, tak_ldap_ok=False)
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops172_unreadable_list_after_a_refused_drop_keeps_the_restart_fallback():
+    box = ghost_box(sess(30, 'takdev-emu'), tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    marti = box.marti
+
+    def no_reads_after_the_drop(url, timeout=12, method='GET', json_body=None):
+        if method == 'GET' and url == f'{API}/subscriptions/all' and box.drops():
+            return None, 'curl_exit_28'
+        return marti(url, timeout, method, json_body)
+    box.marti = no_reads_after_the_drop
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
 
 
 # ── ops #139: TAK's HTTPS/API side, which the 8089 connections say nothing about ─────

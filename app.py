@@ -62340,6 +62340,8 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
        history can't name it (test12, ops #131: the history left that device out). TAK names
        every cert connection whose lookup completes — a user LDAP doesn't know still gets
        its name and __ANON__ — so "no user, no groups" is a lookup that failed.
+       One TAK refuses to drop counts as gone when it has left the list since, or a newer
+       connection from the same client has its groups (ops #172: a ghost TAK still lists).
     3. Wait for those clients to reconnect (same device uid); repeat once for any that came
        back empty. One that comes back named, with no groups, as a user LDAP gives none is
        fine: that is what it is.
@@ -62459,6 +62461,23 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
             break
         plog(f"  {tag}: round {rnd}: {len(owed)} client(s) reconnected still with no groups: "
              + ', '.join(_label(s) for s in owed[:15]))
+    # ops #172: TAK can refuse to drop a connection it no longer really has. test6: the
+    # emulator's old connection was added and removed in the same ms, TAK still listed it
+    # 3 min later with no groups, and the delete got HTTP 400 while the emulator's newer
+    # connection had its groups. If the refused one is gone now, or a newer connection from
+    # the same client has its groups, TAK's LDAP path works: it is gone, not a reason to
+    # restart TAK.
+    replaced = []
+    if undroppable:
+        now = _tak_client_sessions(devices)
+        if now is not None:
+            live = {s['uid'] for s in now}
+            replaced = [d for d in undroppable
+                        if d['uid'] not in live or any(s['groups'] and _same_client(d, s) for s in now)]
+            undroppable = [d for d in undroppable if d not in replaced]
+            if replaced:
+                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced by a newer "
+                     "connection from the same client with its groups: " + ', '.join(_label(s) for s in replaced[:15]))
     stuck = owed + undroppable
     healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
 
@@ -62469,6 +62488,9 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     if gone:
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
+    if replaced:
+        parts.append(f"{len(replaced)} TAK couldn't drop already gone or replaced by a newer connection "
+                     "with its groups")
     if blind:
         parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
                      "they reconnect by themselves and are looked up again")
