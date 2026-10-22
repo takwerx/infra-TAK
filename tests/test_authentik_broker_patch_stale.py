@@ -157,6 +157,9 @@ def _converge(ak, docker):
         '_w1_ak_ctx': lambda: (None, None, None),
         'load_settings': lambda: {'ak_event_backlog_reclaimed': {'done': True}},
         'print': lambda *a, **k: None,
+        # ops #178: the compose `up -d` goes through the locked runner; no lock in this sandbox.
+        '_ak_compose_subprocess': lambda argv, holder, plog=None, wait=None, **kw: docker.run(argv, **kw),
+        '_AK_COMPOSE_LOCK_WAIT_LONG_S': 420,
     }
     exec(compile(SRC, 'app.py', 'exec'), ns)
     ns['_startup_authentik_idle_load_converge'](log=logs.append)
