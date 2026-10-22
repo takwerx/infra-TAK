@@ -84299,8 +84299,12 @@ def _kernel_patch_start_job():
             'done\n'
             'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
             'UPGLOG="$(mktemp)"\n'
-            "dnf -y upgrade --exclude='takserver*' 2>&1 | tee \"$UPGLOG\"\n"
+            # Ops #152: one unreachable repo (EPEL mirrors timing out) must not
+            # fail the whole patch run. It is skipped, and named below.
+            "dnf -y upgrade --setopt=skip_if_unavailable=True --exclude='takserver*' 2>&1 | tee \"$UPGLOG\"\n"
             'rc=${PIPESTATUS[0]}\n'
+            'SKIPPED="$(sed -n \'s/.*Ignoring repositories: *//p\' "$UPGLOG" | tail -n 1)"\n'
+            '[ -n "$SKIPPED" ] && echo "[$(TS)] WARNING: could not reach $SKIPPED — updates from there were NOT installed. Run Install updates again later to pick them up."\n'
             'if [ "$rc" -ne 0 ]; then\n'
             # Message parity with the apt leg. dnf already defaults to retries=10, so no
             # retry knob is added here — only the honest fetch-vs-install distinction.

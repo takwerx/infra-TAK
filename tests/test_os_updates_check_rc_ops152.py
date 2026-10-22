@@ -306,3 +306,37 @@ def test_broker_allows_the_os_updates_check(broker):
 def test_broker_still_denies_every_other_setopt(broker, opt):
     with pytest.raises(broker.Denied):
         broker._check_pkgmgr(['dnf', '-C', opt, 'check-update'])
+
+
+# ── the dnf Install updates job ────────────────────────────────────────────────
+
+def _dnf_job_script():
+    """The `script = (...)` literal inside `if pkg_mgr == 'dnf':` of the job."""
+    import ast
+    fn = ast.parse(_cut('_kernel_patch_start_job')).body[0]
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and getattr(node.test.left, 'id', '') == 'pkg_mgr'
+                and getattr(node.test.comparators[0], 'value', '') == 'dnf'):
+            for st in node.body:
+                if isinstance(st, ast.Assign) and getattr(st.targets[0], 'id', '') == 'script':
+                    return ast.literal_eval(st.value)
+    raise AssertionError('dnf job script not found')
+
+
+def test_dnf_install_job_skips_and_names_an_unreachable_repo(tmp_path):
+    script = _dnf_job_script()
+    assert "dnf -y upgrade --setopt=skip_if_unavailable=True --exclude='takserver*'" in script
+    assert 'WARNING: could not reach $SKIPPED' in script
+    f = tmp_path / 'job.sh'
+    f.write_text(script)
+    assert _real_subprocess.run(['bash', '-n', str(f)]).returncode == 0
+    # the SKIPPED= line pulls the repo ids out of dnf's own summary line
+    skipped_line = next(ln for ln in script.splitlines() if ln.startswith('SKIPPED='))
+    log = tmp_path / 'upg.log'
+    log.write_text("Error: Failed to download metadata for repo 'epel'\n"
+                   'Ignoring repositories: epel, pgdg-common\n')
+    r = _real_subprocess.run(['bash', '-c', skipped_line + '\necho "$SKIPPED"'],
+                             env={'UPGLOG': str(log), 'PATH': os.environ['PATH']},
+                             capture_output=True, text=True, timeout=10)
+    assert r.stdout.strip() == 'epel, pgdg-common'
