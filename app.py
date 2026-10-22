@@ -38419,9 +38419,12 @@ def _takportal_run_update(portal_dir):
     # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
     # a Node security release when TAK Portal itself has not changed.
     _pull_base_images(portal_dir, wrap=_sudo_wrap)
+    # ops #160: forward the 900s to the broker hop too. On a non-root box _sudo_wrap() routes
+    # this through the broker client, which kills it at the broker's 600s default otherwise.
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
-                               cwd=portal_dir, capture_output=True, text=True, timeout=900)
+                               cwd=portal_dir, capture_output=True, text=True, timeout=900,
+                               env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '900'})
     except subprocess.TimeoutExpired:
         plog_msg = 'Build timed out after 900s. The old container is still running the previous version.'
         print(f'[takportal] update: {plog_msg}', flush=True)
@@ -38976,7 +38979,9 @@ def run_takportal_deploy():
         # (an already-running container just gets re-seeded + restarted in Step 6).
         _gd_maintenance_begin('takportal', 2 * 900 + 180)  # v10.1.60 W4; _takportal_restart() at the end shrinks it
         _pull_base_images(portal_dir, wrap=_sudo_wrap, plog=plog)  # ops #135
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+        # ops #160: the broker hop gets the same 900s (its default is 600s on non-root boxes).
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build', '--no-start']), cwd=portal_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900,
+                           env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '900'})
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
