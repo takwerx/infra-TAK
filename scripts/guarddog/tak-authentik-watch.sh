@@ -6,6 +6,8 @@
 # - LDAP failure × 3 → targeted LDAP recreate (doesn't nuke the whole stack)
 # - LDAP flow herd that does not drain (8 of the last 10 min busy) → same restart as HTTP (ops #38),
 #   held while it is clearly falling from its peak (ops #64)
+# - console Authentik Update in progress → skip the tick, no alert (ops #167, 30 min stale cap)
+# - HTTP failure while the server is running its migrations → hold, no restart (ops #167, max 1h)
 # - 10-min boot grace period; HTTP cooldown 15 min, doubling per restart in the last 6h (max 2h).
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -17,6 +19,8 @@ COOLDOWN_LDAP="$STATE_DIR/authentik_ldap_last_restart"
 RESTART_HIST="$STATE_DIR/authentik_restart_history"
 HOLD_SINCE="$STATE_DIR/authentik_hold_since"
 HOLD_ALERTED="$STATE_DIR/authentik_hold_alerted"
+UPDATE_MARKER="$STATE_DIR/authentik_update_in_progress"
+MIGRATE_SINCE="$STATE_DIR/authentik_migrate_since"
 MAX_FAILS=3
 COOLDOWN_SECS=900
 COOLDOWN_MAX_SECS=7200
@@ -24,6 +28,8 @@ HISTORY_WINDOW_SECS=21600
 HOLD_MAX_SECS=7200
 HOLD_ALERT_EVERY_SECS=3600
 PROBE_MAX_SECS=30
+UPDATE_MAX_SECS=1800        # app.py _GD_AUTHENTIK_UPDATE_MAX_S
+MIGRATE_HOLD_MAX_SECS=3600
 
 mkdir -p "$STATE_DIR"
 
@@ -344,6 +350,66 @@ ak_http_ok() {
   return 1
 }
 
+# ── Console Authentik Update in progress (ops #167) ──────────────────────────
+# The console's Update returns once the new image is running; the server then runs its
+# migrations and serves 503 until they finish. test6, 2026-10-22 (2026.5.7 → 2026.8.4):
+# 58 migrations ran 06:50:08–06:51:59 UTC, and this script counted three 503s and
+# restarted server+worker at 06:52:02, before the server had released its migration
+# lock. On a bigger database that lands mid-migration, and the next boot starts over.
+# The console writes "<epoch> <what>" here before it pulls and removes it once Authentik
+# answers again. A marker older than UPDATE_MAX_SECS (or unreadable) is a console that
+# died mid-update: ignore it, remove it, and watch normally.
+_update_in_progress() {
+  [ -f "$UPDATE_MARKER" ] || return 1
+  local since
+  since=$(awk 'NR == 1 { print $1 }' "$UPDATE_MARKER" 2>/dev/null)
+  case "$since" in ''|*[!0-9]*) since=0 ;; esac
+  UPDATE_AGE=$(( $(date +%s) - since ))
+  if [ "$UPDATE_AGE" -lt 0 ] || [ "$UPDATE_AGE" -ge "$UPDATE_MAX_SECS" ]; then
+    _log "update-skip | ignoring a stale update marker (written ${UPDATE_AGE}s ago, limit ${UPDATE_MAX_SECS}s) — watching normally"
+    rm -f "$UPDATE_MARKER"
+    return 1
+  fi
+  return 0
+}
+
+# ── Migrations running (ops #167) ────────────────────────────────────────────
+# Covers what the marker cannot: an update by hand, a reboot onto a new image, this
+# script's own restart re-checking migrations, a console restarted mid-update. Authentik's
+# lifecycle/migrate.py logs "waiting to acquire database lock", "applying django
+# migrations", then one "Applying <app>.<NNNN>..." per migration and "releasing database
+# lock"; gunicorn starts after that. So the server is migrating when the last of those
+# lines since it started is not the release (or gunicorn's start). They are only logged
+# at start, so --tail bounds the read on a server that has been up for weeks: its last
+# lines hold none of them, which reads as "not migrating". Sets MIGRATE_LAST.
+#
+# Each line is matched in the exact shape Authentik writes it, never as a bare substring:
+# the server logs every request's User-Agent verbatim, so a client sending "waiting to
+# acquire database lock" could otherwise hold this watchdog off a wedged server. Request
+# text only ever sits inside an escaped JSON string, so it can neither start a line nor
+# produce an unescaped "event": key.
+_AK_MIG_RE='waiting to acquire database lock|applying django migrations|releasing database lock'
+_ak_migrating() {
+  local st started
+  st=$(timeout 15 docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' authentik-server-1 2>/dev/null)
+  case "$st" in "true "*) started="${st#true }" ;; *) return 1 ;; esac
+  MIGRATE_LAST=$(timeout 30 docker logs --since "$started" --tail 20000 authentik-server-1 2>&1 \
+    | grep -E "^  Applying [A-Za-z0-9_]+\.[0-9]{4}|^[0-9-]{10} [0-9:]{8} \[info +\] ($_AK_MIG_RE)|^\{.*\"event\": ?\"($_AK_MIG_RE|Starting gunicorn[^\"]*)\"" \
+    | tail -n 1 \
+    | grep -oE "Applying [A-Za-z0-9_]+\.[0-9]{4}[A-Za-z0-9_]*|$_AK_MIG_RE|Starting gunicorn" | head -n 1)
+  case "$MIGRATE_LAST" in
+    ''|'releasing database lock'|'Starting gunicorn') return 1 ;;
+  esac
+  return 0
+}
+
+if _update_in_progress; then
+  _log "update-skip | console Authentik update in progress (${UPDATE_AGE}s) — not checking this tick"
+  echo 0 > "$FAIL_HTTP"
+  echo 0 > "$FAIL_LDAP"
+  exit 0
+fi
+
 HTTP_OK=0
 if ak_http_ok; then
   HTTP_OK=1
@@ -358,6 +424,7 @@ if [ "$HTTP_OK" -eq 1 ]; then
     _log "hold | Authentik HTTP healthy again — recovered without a restart"
     rm -f "$HOLD_SINCE" "$HOLD_ALERTED"
   fi
+  rm -f "$MIGRATE_SINCE"
 else
   CODE="${AK_LAST_CODE:-000}"
   case "${AK_LAST_RC:-0}" in
@@ -365,6 +432,23 @@ else
     28) PROBE_DESC="HTTP $CODE, no answer within ${PROBE_MAX_SECS}s" ;;
     *)  PROBE_DESC="HTTP $CODE in ${AK_LAST_SECS:-?}s" ;;
   esac
+
+  # ops #167: a 503 while the server migrates is expected. Hold without counting, for at
+  # most MIGRATE_HOLD_MAX_SECS from the first held tick (kept across server restarts, so a
+  # migration that crash-loops still reaches the restart and its alert below).
+  if _ak_migrating; then
+    NOW=$(date +%s)
+    MIG_START=$(cat "$MIGRATE_SINCE" 2>/dev/null)
+    case "$MIG_START" in ''|*[!0-9]*) MIG_START="$NOW"; echo "$NOW" > "$MIGRATE_SINCE" ;; esac
+    MIG_HELD=$(( NOW - MIG_START ))
+    if [ "$MIG_HELD" -lt "$MIGRATE_HOLD_MAX_SECS" ]; then
+      echo 0 > "$FAIL_HTTP"
+      _log "hold | Authentik HTTP unhealthy ($PROBE_DESC) while its migrations run (last: $MIGRATE_LAST) — expected, NOT restarting (held ${MIG_HELD}s)"
+      exit 0   # the LDAP and herd checks below only run when HTTP is OK
+    fi
+    _log "hold | Authentik migrations still running after ${MIG_HELD}s (last: $MIGRATE_LAST) — counting HTTP failures again"
+  fi
+
   FAILS=$(( $(cat "$FAIL_HTTP" 2>/dev/null || echo 0) + 1 ))
   echo "$FAILS" > "$FAIL_HTTP"
 
