@@ -2931,12 +2931,29 @@ def _pkg_remove(pkgs, purge=False, timeout=600):
         return False, str(e)
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
+def _host_has_bin(name):
+    """True when the REAL `name` is installed on this host, ignoring the broker shims.
+
+    Not `command -v`: the non-root console puts .shims first on PATH, and
+    install-shims.sh writes a ufw AND a firewall-cmd shim on every box whether or
+    not the tool exists — so `command -v ufw` always said yes. GH #242 (Armbian,
+    ARM64, which ships without ufw): the Firewall page drove the shim and the
+    broker failed with `FileNotFoundError: 'ufw'`, while Cyber Controls reported
+    "UFW installed but not enabled" for a ufw that was never there."""
+    shim = os.path.realpath(_BROKER_SHIM_DIR)
+    dirs = [d for d in os.environ.get('PATH', '').split(os.pathsep)
+            if d and os.path.realpath(d) != shim]
+    for d in ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'):
+        if d not in dirs:
+            dirs.append(d)
+    return shutil.which(name, path=os.pathsep.join(dirs)) is not None
+
 def _fw_backend():
     """'ufw' | 'firewalld' | None — which host firewall to drive. Prefers the
     family-native tool when both are present (Debian→ufw, RHEL→firewalld), so a
     box converges to one backend deterministically."""
-    have_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
-    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+    have_ufw = _host_has_bin('ufw')
+    have_fwd = _host_has_bin('firewall-cmd')
     if _distro_family() == 'rhel':
         if have_fwd:
             return 'firewalld'
@@ -3003,8 +3020,8 @@ def _fw_ensure_installed(log=None):
     LOCKOUT SAFETY: SSH must stay reachable. firewalld's default `public` zone ships
     with the `ssh` service open, but we add it explicitly BEFORE enabling so a box
     behind a cloud security group (SSH arrives via the SG, not a host rule) is never
-    cut off when firewalld goes default-deny. Debian path is unchanged (start.sh owns
-    ufw). Returns the active backend ('ufw'|'firewalld'|None)."""
+    cut off when firewalld goes default-deny. Debian path only installs a missing ufw
+    (GH #242); it never enables it. Returns the active backend ('ufw'|'firewalld'|None)."""
     def _log(m):
         if log:
             try:
@@ -3012,8 +3029,19 @@ def _fw_ensure_installed(log=None):
             except Exception:
                 pass
     if _distro_family() != 'rhel':
-        return _fw_backend()  # Debian/Ubuntu: ufw is ensured by start.sh
-    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+        # Ubuntu ships ufw; some Debian-family images don't (Armbian — GH #242), and nothing
+        # else installs it. Install only — do NOT enable here: the TAK Server deploy enables
+        # ufw after allowing SSH, exactly as on a stock Ubuntu box. Skipped when firewalld is
+        # the host firewall. --no-remove: ufw conflicts with iptables-persistent, and we never
+        # trade an operator's own firewall for ours — apt aborts instead.
+        if not _host_has_bin('ufw') and not _host_has_bin('firewall-cmd'):
+            _log("  firewall: installing ufw (this image does not ship it)…")
+            _pkg_lock_wait(log_fn=log)
+            ok, _out = _pkg_install(['--no-remove', 'ufw'], log_fn=log, timeout=600)
+            _log("  ✓ ufw installed (not enabled)" if ok and _host_has_bin('ufw')
+                 else "  ⚠ ufw install failed — the Firewall page stays unavailable until ufw is installed")
+        return _fw_backend()
+    have_fwd = _host_has_bin('firewall-cmd')
     if not have_fwd:
         _log("  firewall: installing firewalld (RHEL always-on host firewall)…")
         try:
@@ -18392,8 +18420,7 @@ def _firewall_status_local():
     be = _fw_backend()
     if be == 'firewalld':
         return _firewalld_status_local()
-    has_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
-    if not has_ufw:
+    if be != 'ufw':
         return {'supported': False, 'error': 'No supported firewall (UFW/firewalld) installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
     try:
         r = subprocess.run(
@@ -83683,6 +83710,7 @@ def _deploy_takserver_container(config):
                 log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
                          "provider security group; TAK ports left reachable")
         else:
+            _fw_ensure_installed(log=log_step)   # GH #242: Armbian ships no ufw
             for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
                 run_cmd(f'ufw allow {p} > /dev/null 2>&1', check=False)
             run_cmd('ufw --force enable > /dev/null 2>&1', check=False)
@@ -84479,6 +84507,7 @@ def run_takserver_deploy(config):
                 log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
                          "provider security group; TAK ports left reachable")
         else:
+            _fw_ensure_installed(log=log_step)   # GH #242: Armbian ships no ufw
             for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
                 run_cmd(f'ufw allow {p} > /dev/null 2>&1')
             run_cmd('ufw --force enable > /dev/null 2>&1')
@@ -90090,6 +90119,22 @@ def _startup_ensure_metrics_collector():
         print(f"Startup migration: metrics collector ensure error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_ensure_metrics_collector, daemon=True).start()
+
+
+def _startup_ensure_debian_ufw():
+    """GH #242: a Debian-family box whose image has no ufw (Armbian) had no host firewall
+    and nothing that would ever install one — the TAK deploy's `ufw allow`/`enable` failed
+    silently and the Firewall page could not add a rule. Install it on boot so a plain
+    update heals already-fielded boxes. Installs only; never enables. Daemon thread so an
+    apt lock never blocks console boot. RHEL is untouched (start.sh owns firewalld)."""
+    try:
+        if _distro_family() == 'rhel' or _host_has_bin('ufw'):
+            return
+        _fw_ensure_installed(log=lambda m: print(f"Startup migration: {m.strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup migration: ufw ensure error (non-fatal): {_e}", flush=True)
+
+threading.Thread(target=_startup_ensure_debian_ufw, daemon=True).start()
 
 
 # v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
