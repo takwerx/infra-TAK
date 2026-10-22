@@ -74289,13 +74289,13 @@ def takserver_ca_info():
     if info['root_ca'] and info['root_ca']['name']:
         info['suggested_new_root_name'] = _increment_name(info['root_ca']['name'])
         info['suggested_new_root_int_name'] = _increment_name(info.get('suggested_new_name', 'INT-CA-01'))
-    # List CAs in current truststore (to show old CAs that can be revoked)
-    import glob as _glob
-    ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
-    ts_files = [f for f in ts_files if 'root' not in os.path.basename(f)]
-    if ts_files:
-        ts_path = ts_files[-1]
-        info['truststore_file'] = os.path.basename(ts_path)
+    # List CAs in current truststore (to show old CAs that can be revoked).
+    # ops #174: the one TAK Server enforces, not the last name in sort order. When it can't be
+    # told, no truststore is shown and no Revoke button appears.
+    ts_name = _live_truststore(cert_dir, '.jks')
+    if ts_name:
+        ts_path = os.path.join(cert_dir, ts_name)
+        info['truststore_file'] = ts_name
         try:
             if _tak_is_container():
                 # v10.0.1: no host keytool on a container box (JDK is inside the container) —
@@ -75062,12 +75062,13 @@ def takserver_revoke_old_ca():
 
     cert_dir = '/opt/tak/certs/files'
     cert_pass = _get_tak_cert_password(load_settings())
-    import glob as _glob
-    ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
-    ts_files = [f for f in ts_files if 'root' not in os.path.basename(f)]
-    if not ts_files:
-        return jsonify({'error': 'No truststore found'}), 500
-    ts_path = ts_files[-1]
+    # ops #174: delete from the truststore TAK Server enforces. The last name in sort order could
+    # be a stale one, and a guess here removes a CA from the wrong file.
+    ts_name = _live_truststore(cert_dir, '.jks')
+    if not ts_name:
+        return jsonify({'error': 'Could not tell which truststore TAK Server is using '
+                                 '(CoreConfig.xml and ca.pem name none here). Nothing was changed.'}), 500
+    ts_path = os.path.join(cert_dir, ts_name)
 
     try:
         # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
@@ -75609,16 +75610,17 @@ def _cert_file_bytes(path):
         return _read_priv_bytes(path)
 
 
-def _is_int_truststore_p12(f):
-    return f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f
+def _is_int_truststore(f, ext='.p12'):
+    return f.startswith('truststore-') and f.endswith(ext) and 'root' not in f
 
 
-def _live_truststore_p12(cert_dir=None):
-    """The truststore-<CA>.p12 of the intermediate TAK Server uses now, or ''.
+def _live_truststore(cert_dir=None, ext='.p12'):
+    """The truststore-<CA><ext> (.p12 or .jks) of the intermediate TAK Server uses now, or ''.
     ops #170: Rotate CA leaves every earlier truststore-INT-CA-NN.p12 behind, and taking the
     first one alphabetically handed out INT-CA-01 on a box running INT-CA-14. CoreConfig's
     <tls> truststoreFile names the live CA, ca.pem's CN is the fallback, and a lone candidate
-    is unambiguous. Between several, never guess."""
+    is unambiguous. Between several, never guess. ops #174: the CA-info panel and Revoke Old
+    CA take the .jks from here too, so a revoke never edits a stale truststore."""
     d = cert_dir or _CERT_FILES_DIR
     try:
         have = set(os.listdir(d))
@@ -75629,19 +75631,19 @@ def _live_truststore_p12(cert_dir=None):
         ts, _pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
         base = os.path.basename(ts)
         if base.endswith('.jks'):
-            wanted.append(base[:-4] + '.p12')
+            wanted.append(base[:-4] + ext)
     except Exception:
         pass
     try:
         cn, _end = _pem_cn_and_expiry(_cert_file_bytes(os.path.join(d, 'ca.pem')).decode(errors='replace'))
         if cn:
-            wanted.append(f'truststore-{cn}.p12')
+            wanted.append(f'truststore-{cn}{ext}')
     except Exception:
         pass
     for f in wanted:
-        if f in have and _is_int_truststore_p12(f):
+        if f in have and _is_int_truststore(f, ext):
             return f
-    cands = [f for f in have if _is_int_truststore_p12(f)]
+    cands = [f for f in have if _is_int_truststore(f, ext)]
     return cands[0] if len(cands) == 1 else ''
 
 
@@ -75795,7 +75797,7 @@ def takserver_client_cert_package(name):
     if legacy_p12 and _private_key_pubkey(legacy_p12, password, p12=True) != pub:
         audit('integration_package_p12_skipped', f'cert={name} reason=key-mismatch')
         legacy_p12 = b''
-    trust = _live_truststore_p12(d)
+    trust = _live_truststore(d)
     try:
         trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
     except Exception:
@@ -84393,7 +84395,7 @@ def download_user_cert():
 @login_required
 def download_truststore():
     p = '/opt/tak/certs/files'
-    f = _live_truststore_p12(p)  # ops #170: the live CA's, not whichever listdir returns first
+    f = _live_truststore(p)  # ops #170: the live CA's, not whichever listdir returns first
     if f:
         # truststore-*.p12 is 0600 tak:tak too (GH #52) — same privileged read.
         return _send_cert_file_priv(p, f)

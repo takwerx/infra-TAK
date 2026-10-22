@@ -46,7 +46,7 @@ ROTATED = [f'INT-CA-{n:02d}' for n in range(1, 15)]
 
 FUNCS = ('_is_ca_private_material', '_cert_file_bytes', '_is_client_cert_pem', '_client_cert_pem_or_none',
          '_cert_pubkey', '_private_key_pubkey', '_modern_p12', '_rotate_coreconfig_truststore',
-         '_pem_cn_and_expiry', '_is_int_truststore_p12', '_live_truststore_p12',
+         '_pem_cn_and_expiry', '_is_int_truststore', '_live_truststore',
          'takserver_client_cert_package', 'download_truststore')
 
 
@@ -163,13 +163,13 @@ def _cns(p12_bytes):
 
 def test_the_live_truststore_is_the_one_coreconfig_points_at(box):
     _c, ns, d, _s = box
-    assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+    assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 def test_coreconfig_wins_over_ca_pem(box):
     _c, ns, d, state = box
     state['coreconfig'] = _coreconfig('truststore-INT-CA-09.jks')
-    assert ns['_live_truststore_p12'](str(d)) == 'truststore-INT-CA-09.p12'
+    assert ns['_live_truststore'](str(d)) == 'truststore-INT-CA-09.p12'
 
 
 def test_not_the_first_alphabetically_whatever_the_listdir_order(box, monkeypatch):
@@ -177,25 +177,25 @@ def test_not_the_first_alphabetically_whatever_the_listdir_order(box, monkeypatc
     real = os.listdir
     for order in (sorted, lambda xs: sorted(xs, reverse=True)):
         monkeypatch.setattr(os, 'listdir', lambda p, _o=order: _o(real(p)))
-        assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+        assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 def test_ca_pem_is_the_fallback_when_coreconfig_cannot_be_read(box):
     _c, ns, d, state = box
     state['coreconfig'] = None
-    assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+    assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 def test_ca_pem_is_the_fallback_when_coreconfig_names_a_missing_file(box):
     _c, ns, d, state = box
     state['coreconfig'] = _coreconfig('truststore-INT-CA-99.jks')
-    assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+    assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 def test_stock_root_truststore_in_coreconfig_falls_back_to_ca_pem(box):
     _c, ns, d, state = box
     state['coreconfig'] = _coreconfig('truststore-root.jks')
-    assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+    assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 def test_the_federation_truststore_is_not_mistaken_for_the_live_one(box):
@@ -205,14 +205,14 @@ def test_the_federation_truststore_is_not_mistaken_for_the_live_one(box):
     state['coreconfig'] = cc.replace(fed, '').replace('<Configuration>', '<Configuration>' + fed)
     assert cc.index('truststore-INT-CA-03') > 0 and state['coreconfig'].index('fed-truststore') < \
         state['coreconfig'].index('truststore-INT-CA-03')
-    assert ns['_live_truststore_p12'](str(d)) == 'truststore-INT-CA-03.p12'
+    assert ns['_live_truststore'](str(d)) == 'truststore-INT-CA-03.p12'
 
 
 def test_several_candidates_and_no_live_ca_is_no_guess(box):
     _c, ns, d, state = box
     state['coreconfig'] = None
     (d / 'ca.pem').unlink()
-    assert ns['_live_truststore_p12'](str(d)) == ''
+    assert ns['_live_truststore'](str(d)) == ''
 
 
 def test_a_single_unrotated_truststore_still_works_without_coreconfig(box):
@@ -221,7 +221,7 @@ def test_a_single_unrotated_truststore_still_works_without_coreconfig(box):
     (d / 'ca.pem').unlink()
     for name in ROTATED[:-1]:
         (d / f'truststore-{name}.p12').unlink()
-    assert ns['_live_truststore_p12'](str(d)) == f'truststore-{LIVE}.p12'
+    assert ns['_live_truststore'](str(d)) == f'truststore-{LIVE}.p12'
 
 
 # --- the two routes --------------------------------------------------------------------------
@@ -270,5 +270,5 @@ def test_the_download_404s_rather_than_guess(box):
 def test_neither_route_picks_a_truststore_by_listing_order():
     for name in ('takserver_client_cert_package', 'download_truststore'):
         body = _func(name)
-        assert '_live_truststore_p12(' in body, name
+        assert '_live_truststore(' in body, name
         assert "startswith('truststore-')" not in body, f'{name} picks a truststore itself again'
