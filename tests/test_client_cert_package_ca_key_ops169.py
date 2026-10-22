@@ -44,7 +44,7 @@ PASSWORD = 'atakatak'
 
 FUNCS = ('_is_ca_private_material', '_cert_file_bytes', '_is_client_cert_pem', '_client_cert_pem_or_none',
          '_cert_pubkey', '_private_key_pubkey', '_modern_p12', '_rotate_coreconfig_truststore',
-         '_pem_cn_and_expiry', '_is_int_truststore_p12', '_live_truststore_p12', 'takserver_client_certs',
+         '_pem_cn_and_expiry', '_is_int_truststore', '_live_truststore', 'takserver_client_certs',
          'takserver_client_cert_package', 'takserver_create_client_cert')
 
 
