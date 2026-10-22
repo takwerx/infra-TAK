@@ -637,10 +637,13 @@ def test_https_check_retries_while_the_api_warms_up_after_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
                       https_after_restart='down')
     orig = box.user_req
+    down = []
 
     def warming(cert, key, url, method='GET', timeout=20):
-        if box.https == 'down' and len([u for u in box.user_api if u[1] == 'GET']) >= 6:
-            box.https = 'ok'                       # the API serves a few rounds after 8443 opens
+        if box.https == 'down':
+            down.append(url)
+            if len(down) > 4:
+                box.https = 'ok'                   # the API serves a few rounds after 8443 opens
         return orig(cert, key, url, method, timeout)
     box.user_req = warming
     assert box.recycle() is True
@@ -695,11 +698,14 @@ def test_https_no_answer_is_unknown_not_a_restart():
 def test_cert_that_cant_be_made_is_unknown_not_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
 
+    failed_at = []
+
     def no_ca(cn, workdir):
+        failed_at.append(box.t)
         raise RuntimeError('CoreConfig has no enrollment CA (TAKServerCAConfig)')
     box.leaf_cert = no_ca
-    t0 = box.t
     assert box.recycle() is False
+    t0 = failed_at[0]                              # not before: the recycle holds LDAP 45 s first
     assert box.restarts() == [] and box.workdirs == []
     assert any("couldn't make a test cert for ADSB_PS: CoreConfig has no enrollment CA" in l for l in box.log)
     assert not any('HTTPS check round' in l for l in box.log)   # no cert won't change by waiting
