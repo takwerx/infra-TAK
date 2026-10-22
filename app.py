@@ -39377,7 +39377,7 @@ def certs_page():
     if os.path.isdir(cert_dir):
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp):
+            if os.path.isfile(fp) and not _is_ca_private_material(fn):  # v10.2.26 W6
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -75476,10 +75476,164 @@ def takserver_create_client_cert():
             'download_url': f'/api/certs/download/{cert_name}.p12',
             'groups_both': groups_both,
             'groups_in': groups_in,
-            'groups_out': groups_out
+            'groups_out': groups_out,
+            'package_url': f'/api/takserver/client-cert/{cert_name}/package',
         })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
+
+
+# v10.2.26 W5 — integration package. A third-party system (cUAS cloud, CAD, SIEM) needs PEM
+# files and a "trust this server" CA file, not the one TAK-format .p12 the console used to hand
+# out. Cert-only by design: the groups are the ones put on the cert at creation, as Create
+# Client Certificate always did — no Authentik user, no data feed.
+_CERT_FILES_DIR = '/opt/tak/certs/files'
+_CLIENT_CERT_NAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+_NOT_CLIENT_CERT_NAMES = {'takserver', 'ca', 'root-ca'}
+
+
+def _cert_file_bytes(path):
+    """A file from the TAK cert dir. Client .p12/.key are 0600 tak:tak, so a non-root console
+    takes the privileged read when the plain one is refused (same as the .p12 download)."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError:
+        return _read_priv_bytes(path)
+
+
+def _is_client_cert_pem(pem):
+    """True only for a leaf client cert: CA:FALSE and clientAuth WITHOUT serverAuth. The server
+    cert (both EKUs), the CAs and anything unreadable are refused."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'basicConstraints,extendedKeyUsage'],
+                           input=pem, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    out = r.stdout
+    return (r.returncode == 0 and 'CA:FALSE' in out and 'TLS Web Client Authentication' in out
+            and 'TLS Web Server Authentication' not in out)
+
+
+def _client_cert_pem_or_none(name):
+    if name in _NOT_CLIENT_CERT_NAMES or not _CLIENT_CERT_NAME_RE.match(name or ''):
+        return None
+    try:
+        pem = _cert_file_bytes(os.path.join(_CERT_FILES_DIR, f'{name}.pem')).decode(errors='replace')
+    except Exception:
+        return None
+    return pem if _is_client_cert_pem(pem) else None
+
+
+def _modern_p12(pem_path, key_path, chain_pem, name, password):
+    """Re-wrap the client cert + key as a PKCS#12 OpenSSL 3, Node and Python can open.
+
+    makeCert.sh writes .p12 as pbeWithSHA1And40BitRC2-CBC (ATAK needs it), which modern stacks
+    refuse ("RC2-40-CBC unsupported"). OpenSSL 3's export defaults are AES-256-CBC + PBKDF2 +
+    SHA-256 MAC. The password travels in the environment, never argv. Returns bytes or None."""
+    import tempfile as _tf
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-p12-') as td:
+            os.chmod(td, 0o700)
+            key_tmp, pem_tmp, chain_tmp = (os.path.join(td, n) for n in ('k', 'c', 'ca'))
+            for p, data in ((key_tmp, _cert_file_bytes(key_path)), (pem_tmp, _cert_file_bytes(pem_path)),
+                            (chain_tmp, chain_pem.encode())):
+                with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                    f.write(data)
+            env = dict(os.environ, ITK_P12_PASS=password)
+            r = subprocess.run(['openssl', 'pkcs12', '-export', '-in', pem_tmp, '-inkey', key_tmp,
+                                '-certfile', chain_tmp, '-name', name,
+                                '-passin', 'env:ITK_P12_PASS', '-passout', 'env:ITK_P12_PASS'],
+                               capture_output=True, env=env, timeout=20)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+    except Exception:
+        return None
+
+
+@app.route('/api/takserver/client-certs')
+@login_required
+def takserver_client_certs():
+    """v10.2.26 W5 — client certs an integration package can be built for."""
+    try:
+        files = sorted(os.listdir(_CERT_FILES_DIR))
+    except OSError:
+        return jsonify({'certs': []})
+    have = set(files)
+    names = [f[:-4] for f in files
+             if f.endswith('.pem') and not f.endswith('-trusted.pem')
+             and f'{f[:-4]}.key' in have and _client_cert_pem_or_none(f[:-4])]
+    return jsonify({'certs': names})
+
+
+@app.route('/api/takserver/client-cert/<name>/package')
+@login_required
+def takserver_client_cert_package(name):
+    """v10.2.26 W5 — <name>-integration.zip: the client cert in every form a third-party system
+    asks for, this server's CA as plain PEM, and a README. The cert password is deliberately NOT
+    in the zip — it is shown beside the button for the operator to send separately."""
+    from flask import send_file
+    import io
+    import zipfile
+    pem = _client_cert_pem_or_none(name)
+    if not pem:
+        return jsonify({'error': f'"{name}" is not a client certificate on this server'}), 404
+    d = _CERT_FILES_DIR
+    try:
+        key = _cert_file_bytes(os.path.join(d, f'{name}.key'))
+        ca = _cert_file_bytes(os.path.join(d, 'ca.pem')).decode(errors='replace')
+    except Exception as e:
+        return jsonify({'error': f'Could not read the certificate files: {str(e)[:160]}'}), 500
+    try:
+        root = _cert_file_bytes(os.path.join(d, 'root-ca.pem')).decode(errors='replace')
+    except Exception:
+        root = ''
+    chain = ca.strip() + '\n' + (root.strip() + '\n' if root.strip() and root.strip() != ca.strip() else '')
+    try:
+        legacy_p12 = _cert_file_bytes(os.path.join(d, f'{name}.p12'))
+    except Exception:
+        legacy_p12 = b''
+    trust = next((f for f in sorted(os.listdir(d))
+                  if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f), '')
+    try:
+        trust_p12 = _cert_file_bytes(os.path.join(d, trust)) if trust else b''
+    except Exception:
+        trust_p12 = b''
+    settings = load_settings()
+    modern_p12 = _modern_p12(os.path.join(d, f'{name}.pem'), os.path.join(d, f'{name}.key'),
+                             chain, name, _get_tak_cert_password(settings))
+    host = _get_takserver_host(settings) or (settings.get('server_ip') or '').strip() or '<this server>'
+
+    files = []  # (zip name, bytes, README line)
+    if modern_p12:
+        files.append((f'{name}.p12', modern_p12, 'Client certificate + private key (PKCS#12 / .pfx, AES-256).'
+                                                 ' Use this if your system takes a .p12 or .pfx.'))
+    if legacy_p12:
+        files.append((f'{name}-legacy.p12' if modern_p12 else f'{name}.p12', legacy_p12,
+                      'The same, in the older RC2 format TAK clients (ATAK) and older systems expect.'))
+    files += [(f'{name}.pem', pem.encode(), 'Client certificate (PEM).          } use these two if your system wants'),
+              (f'{name}.key', key, 'Client private key (PEM, encrypted). } separate certificate and key files'),
+              ('ca-chain.pem', chain.encode(), "This server's certificate authority (PEM). Add it as the trusted /"
+                                               ' server CA so your system trusts TAK Server.')]
+    if trust_p12:
+        files.append(('truststore.p12', trust_p12, 'The same CA as a PKCS#12 truststore, for TAK clients that ask for one.'))
+    w = max(len(f[0]) for f in files)
+    readme = '\n'.join(
+        [f'TAK Server integration package: {name}',
+         f'Created {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC by infra-TAK v{VERSION}', '',
+         f'Server:  {host}',
+         'Port:    8089 (TLS, client certificate required)', '', 'Files:']
+        + [f'  {fn.ljust(w)}  {line}' for fn, _b, line in files]
+        + ['', 'Password: the .p12 files and the .key are protected with the TAK certificate password.',
+           'It is not included in this package; get it from your TAK Server administrator.', ''])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for fn, data, _line in files:
+            z.writestr(fn, data)
+        z.writestr('README.txt', readme)
+    audit('integration_package', f'cert={name} files={",".join(f[0] for f in files)}')
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f'{name}-integration.zip',
+                     mimetype='application/zip')
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
@@ -84778,7 +84932,7 @@ def list_cert_files():
     files = []
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp):
+        if os.path.isfile(fp) and not _is_ca_private_material(f):
             files.append({'name': f, 'size': os.path.getsize(fp),
                 'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
@@ -84789,7 +84943,19 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
+    if _is_ca_private_material(filename):
+        audit('cert_download_refused', f'file={filename}')
+        return jsonify({'error': 'CA private keys are never downloaded from the console'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
+
+
+def _is_ca_private_material(filename):
+    """v10.2.26 W6 — the CA's private key in any form: `*-do-not-share.key` (makeRootCa /
+    makeCert ca) and `<CA>-signing.{jks,p12}` (the keystore TAK signs enrollments with). Browse
+    Certificates used to serve these to any logged-in session; nothing on the console needs to
+    hand them to a browser, and whoever holds them can mint certs this server trusts."""
+    f = (filename or '').lower()
+    return 'do-not-share' in f or re.search(r'-signing\.(jks|p12|pem|key)$', f) is not None
 
 @app.route('/api/deploy/log')
 @login_required

@@ -235,6 +235,27 @@ function ccGroupChanged(cb,type){
     b.checked=(r.checked&&w.checked);
   }
 }
+// v10.2.26 W5 — integration package for an existing client cert. The list is loaded the first
+// time the picker is opened (the server checks each cert with openssl), not on every page load.
+var _pkgCertsLoaded=false;
+async function loadPackageCerts(){
+  if(_pkgCertsLoaded)return;_pkgCertsLoaded=true;
+  var sel=document.getElementById('cc-pkg-select'),msg=document.getElementById('cc-pkg-msg');if(!sel)return;
+  try{
+    var r=await fetch('/api/takserver/client-certs');var d=await r.json();var certs=d.certs||[];
+    var cur=sel.value;
+    sel.innerHTML='<option value="">'+(certs.length?'Choose a client certificate…':'No client certificates found')+'</option>'
+      +certs.map(function(n){return '<option value="'+escapeHtml(n)+'">'+escapeHtml(n)+'</option>';}).join('');
+    if(cur)sel.value=cur;
+  }catch(e){_pkgCertsLoaded=false;if(msg){msg.textContent='Could not load certificates';msg.style.color='var(--red)';}}
+}
+function downloadIntegrationPackage(){
+  var sel=document.getElementById('cc-pkg-select'),msg=document.getElementById('cc-pkg-msg');
+  var n=sel?sel.value:'';
+  if(!n){if(msg){msg.textContent='Choose a certificate first.';msg.style.color='var(--red)';}return;}
+  if(msg)msg.textContent='';
+  window.location.href='/api/takserver/client-cert/'+encodeURIComponent(n)+'/package';
+}
 async function createClientCert(){
   var nameEl=document.getElementById('cc-name');
   var btn=document.getElementById('cc-create-btn');
@@ -268,7 +289,9 @@ async function createClientCert(){
       result.style.display='block';
       document.getElementById('cc-result-name').textContent=d.name+'.p12';
       document.getElementById('cc-download-link').href=d.download_url;
+      var pk=document.getElementById('cc-package-link');if(pk&&d.package_url)pk.href=d.package_url;
     }
+    _pkgCertsLoaded=false;
     if(btn)btn.disabled=false;
     if(nameEl)nameEl.value='';
   }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
