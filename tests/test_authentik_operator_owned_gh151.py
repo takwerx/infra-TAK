@@ -146,6 +146,7 @@ class Box:
             'detect_modules': lambda fresh=False: {},
             '_is_module_deployed': lambda s, k: k in self.deployed,
             '_get_service_domain': lambda s, k: f'{k}.example.com',
+            '_pub_hostport': lambda h, s=None: h,
             '_outpost_add_providers_safe': lambda *a, **k: False,
             '_deregister_authentik_proxy_app': lambda *a, **k: None,
             '_get_fedhub_deployment_config': lambda s: {},

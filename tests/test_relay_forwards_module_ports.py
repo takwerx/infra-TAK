@@ -227,6 +227,8 @@ def _verify_ports(settings, **overrides):
         'REMOTE_ASSIST_INSTALL_DIR': '/nonexistent/eud-remote-assist',
         '_get_module_deployment_config': lambda s, k: s.get(k),
         '_get_cloudtak_deployment_config': lambda s: s.get('cloudtak_deployment') or {},
+        '_caddy_https_port': lambda s=None: (s or {}).get('caddy_https_port') or 443,
+        '_caddy_http_port': lambda s=None: (s or {}).get('caddy_http_port') or 80,
     }
     ns.update(overrides)
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)

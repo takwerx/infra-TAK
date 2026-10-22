@@ -112,6 +112,7 @@ def _load(nb, settings, tmp_path, monkeypatch):
         '_ensure_authentik_netbird_app': lambda s, plog=None: ('client-id-123456', 'secret'),
         '_w1_reassert_app_mfa': lambda plog: None,
         '_get_service_domain': lambda s, name: f'{name}.example.com',
+        '_pub_hostport': lambda h, s=None: h,
         '_get_authentik_api_url': lambda s: 'http://ak',
         '_get_authentik_env_value': lambda s, k: None,
         '_ensure_app_access_policies': lambda *a: None,
@@ -189,6 +190,7 @@ def _register(idps, put_error=None):
 
     ns = {'json': json, '_netbird_mgmt_request': mgmt,
           '_get_service_domain': lambda s, name: 'netbird.example.com',
+          '_pub_hostport': lambda h, s=None: h,
           '_netbird_patch_authentik_idp_redirect': lambda *a, **k: None}
     exec(compile(src, 'app.py', 'exec'), ns)
     ok = ns['_netbird_register_authentik_idp']('pat', 'https://ak/application/o/netbird/', 'cid', 'sec', {}, lambda m: None)
