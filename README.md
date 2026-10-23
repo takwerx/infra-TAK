@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.26-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.26-alpha)**
+**Current release: [v10.2.27-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.27-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,29 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.27-alpha — 2026-10-22 — Security: PgBouncer 1.26.1 and TAK Video Restreamer packages; Guard Dog no longer restarts Authentik mid-update; TAK clients keep their groups after a Reconfigure; TAK Portal hides admin accounts and follows its new home; Firewall page on Armbian
+
+**Headline: Authentik's PgBouncer moves to 1.26.1 (CVE-2026-19888, CVE-2026-6664) and TAK Video Restreamer gets current Python packages. Every Authentik start, stop, update and repair now takes one lock, so Guard Dog can no longer restart Authentik halfway through an update. A TAK client that reconnects during an Authentik Reconfigure no longer stays on `__ANON__`. TAK Portal hides akadmin, webadmin and ROLE_ADMIN again on 2.x, and Update follows TAK Portal to its new GitHub home. Plus: security updates are flagged in the update notice and Guard Dog email (including CloudTAK 13.112.2), the client-certificate package uses the live CA on rotated servers, and the Firewall page finds the real ufw on Armbian.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.27-alpha))
+
+**Security: Authentik PgBouncer 1.26.1.** The PgBouncer sidecar moves from 1.25.1 to 1.26.1, which fixes pre-auth crashes and hangs and a SCRAM login flaw (CVE-2026-19888, CVE-2026-6664). Existing boxes switch when the console starts. The switch is kept only once the LDAP service account and users' groups check out, and is rolled back otherwise.
+
+**Security: TAK Video Restreamer Python packages.** The Restreamer image now builds with current Flask, Flask-SocketIO, Flask-CORS, python-socketio, python-engineio, eventlet, gunicorn and requests instead of upstream's old pins. Boxes built before this release show "Security update available for TAK Video Restreamer"; press **Update** on its card.
+
+**Guard Dog no longer restarts Authentik mid-update.** The console's Update, Reconfigure, Start, Stop and Restart, the first Deploy, LDAP repairs, the PgBouncer swap, uninstall, Guard Dog's watcher and the boot scripts all take the same Authentik lock. Guard Dog waits while Authentik updates or migrates instead of restarting it.
+
+**TAK clients keep their groups after a Reconfigure.** An Authentik Reconfigure (including the automatic one after Update Now) recreates the LDAP outpost. A TAK client that reconnected in that window could stay on `__ANON__`. Both Reconfigure paths now heal TAK clients as their last step, and a heal interrupted by the console restart finishes at the next start. Guard Dog emails "TAK client list unreadable" if TAK Server's client list keeps failing. The LDAP heal also no longer restarts TAK Server over a connection whose client already reconnected with its groups, and waits out the outpost restart before deciding.
+
+**TAK Portal.**
+- TAK Portal 2.x ships its own hide lists, so akadmin, webadmin and ROLE_ADMIN had reappeared on its Users and Groups pages. infra-TAK now adds its entries to TAK Portal's lists without replacing anything an operator put there. Existing boxes are fixed when the console starts.
+- TAK Portal's GitHub home moved to `ValleyTacticalSolutions/TAK-Portal`. New installs clone it from there, and **Update** moves existing installs over (forks are left alone).
+
+**Also in this release.**
+- **Security update notices:** the update notice and the Guard Dog update email mark security releases and say where to fix them. CloudTAK 13.112.2 is flagged as a security update.
+- **Rotated CAs:** the client-certificate package, truststore download, CA panel and Revoke Old CA use the live CA's truststore on servers whose CA was rotated.
+- **Firewall on Armbian / ARM64 (GH #242):** the Firewall page detects the real ufw and can install a missing one.
+- **CloudTAK hardening:** the port-hardening recreate picks up where it left off if it was killed partway.
+- **Nightly console restart:** leaves a console that has just started alone.
 
 ### v10.2.26-alpha — 2026-10-22 — Security: a TAK client with a bad certificate no longer locks the admin out; NetBird 0.80.0; Authentik 2026.8.4; restart prompt after a kernel security update; TAK Server certificate names; choose Caddy's ports
 
