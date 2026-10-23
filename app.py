@@ -44700,25 +44700,46 @@ services: {}
 """
 
 
-def _cloudtak_compose_file_value(cloudtak_dir):
+# TAK Portal's CloudTAK marketplace pins its CSP overlay into the same COMPOSE_FILE (relative
+# name, matched exactly by its own script), so it must survive our rewrite — and a Deploy, which
+# writes .env from scratch, must put it back.
+_CLOUDTAK_TAKPORTAL_CSP_COMPOSE = 'docker-compose.marketplace.yml'
+
+
+def _cloudtak_compose_file_value(cloudtak_dir, current=''):
     """COMPOSE_FILE for the CloudTAK project: base file, infra-TAK's override (when present),
-    then the operator's file. Absolute and ':'-separated (Linux only, like the rest)."""
+    every other file already listed in `current` (kept verbatim — TAK Portal's marketplace adds
+    its own), then the operator's file last. A listed file that no longer exists is dropped:
+    compose refuses to run at all with one missing. ':'-separated (Linux only, like the rest)."""
     d = os.path.abspath(cloudtak_dir)
     base = 'docker-compose.yml'
     if not os.path.exists(os.path.join(d, base)) and os.path.exists(os.path.join(d, 'compose.yaml')):
         base = 'compose.yaml'
-    files = [base]
+    ours = [base]
     if os.path.exists(os.path.join(d, 'docker-compose.override.yml')):
-        files.append('docker-compose.override.yml')
-    files.append(CLOUDTAK_CUSTOM_COMPOSE)
-    return ':'.join(os.path.join(d, f) for f in files)
+        ours.append('docker-compose.override.yml')
+    files = [os.path.join(d, f) for f in ours]
+    seen = {os.path.join(d, n) for n in ('docker-compose.yml', 'compose.yaml',
+                                         'docker-compose.override.yml', CLOUDTAK_CUSTOM_COMPOSE)}
+    others = [i.strip() for i in (current or '').strip().strip('"\'').split(':')]
+    if os.path.exists(os.path.join(d, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE)):
+        others.append(_CLOUDTAK_TAKPORTAL_CSP_COMPOSE)
+    for item in others:
+        p = os.path.normpath(os.path.join(d, item)) if item else ''
+        if not p or p in seen or not os.path.exists(p):
+            continue
+        seen.add(p)
+        files.append(item)
+    files.append(os.path.join(d, CLOUDTAK_CUSTOM_COMPOSE))
+    return ':'.join(files)
 
 
 def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
     """GH #261: create the operator's CloudTAK compose file if it is missing (never touch one
     that exists — even an empty file or a symlink is theirs), and point COMPOSE_FILE in
-    CloudTAK's .env at base + override + it. Run before every compose action and after every
-    .env rewrite; idempotent. Returns True when anything changed. Never raises."""
+    CloudTAK's .env at base + override + any others listed (TAK Portal's) + it. Run before
+    every compose action and after every .env rewrite; idempotent. Returns True when anything
+    changed. Never raises."""
     _log = plog or (lambda m: print(m, flush=True))
     try:
         env_path = os.path.join(cloudtak_dir, '.env')
@@ -44731,8 +44752,9 @@ def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
                 f.write(_CLOUDTAK_CUSTOM_COMPOSE_SEED)
             _log(f"  Created {custom} for your own CloudTAK services (infra-TAK never edits it)")
             changed = True
-        want = _cloudtak_compose_file_value(cloudtak_dir)
-        if _cloudtak_env_read(env_path).get('COMPOSE_FILE') != want:
+        cur = _cloudtak_env_read(env_path).get('COMPOSE_FILE') or ''
+        want = _cloudtak_compose_file_value(cloudtak_dir, cur)
+        if cur != want:
             _cloudtak_env_set(env_path, {'COMPOSE_FILE': want})
             changed = True
         return changed
@@ -44750,6 +44772,15 @@ def _cloudtak_remote_custom_compose_sh():
         f'printf %s {shlex.quote(_CLOUDTAK_CUSTOM_COMPOSE_SEED)} > {CLOUDTAK_CUSTOM_COMPOSE}; }} && '
         'b=docker-compose.yml; { [ -f "$b" ] || [ ! -f compose.yaml ]; } || b=compose.yaml; '
         'f="$PWD/$b"; [ -f docker-compose.override.yml ] && f="$f:$PWD/docker-compose.override.yml"; '
+        # keep every other listed file that still exists (TAK Portal's), verbatim, once
+        "cur=$(grep '^COMPOSE_FILE=' .env | tail -n 1 | cut -d= -f2- | tr -d '\\042\\047'); "
+        f'[ -f {_CLOUDTAK_TAKPORTAL_CSP_COMPOSE} ] && cur="$cur:{_CLOUDTAK_TAKPORTAL_CSP_COMPOSE}"; '
+        'o=$IFS; IFS=:; for i in $cur; do '
+        'case "$i" in ""|docker-compose.yml|compose.yaml|docker-compose.override.yml|'
+        f'{CLOUDTAK_CUSTOM_COMPOSE}|"$PWD/docker-compose.yml"|"$PWD/compose.yaml"|'
+        f'"$PWD/docker-compose.override.yml"|"$PWD/{CLOUDTAK_CUSTOM_COMPOSE}") continue;; esac; '
+        '[ -e "$i" ] || continue; case ":$f:" in *":$i:"*) continue;; esac; f="$f:$i"; '
+        'done; IFS=$o; '
         f'f="$f:$PWD/{CLOUDTAK_CUSTOM_COMPOSE}"; '
         "grep -v '^COMPOSE_FILE=' .env > .env.ct261.tmp; echo \"COMPOSE_FILE=$f\" >> .env.ct261.tmp && "
         'cat .env.ct261.tmp > .env; rm -f .env.ct261.tmp; fi'

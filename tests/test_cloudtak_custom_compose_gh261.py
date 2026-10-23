@@ -64,6 +64,7 @@ def _helpers():
     ns = {'os': os, 're': re, 'shlex': shlex}
     src = '\n\n'.join([_assign('_CT_ENV_LINE_RE'), _assign('CLOUDTAK_CUSTOM_COMPOSE'),
                        _assign('_CLOUDTAK_CUSTOM_COMPOSE_SEED'),
+                       _assign('_CLOUDTAK_TAKPORTAL_CSP_COMPOSE'),
                        _fn('_cloudtak_env_read'), _fn('_cloudtak_env_set'),
                        _fn('_cloudtak_compose_file_value'), _fn('_cloudtak_ensure_custom_compose'),
                        _fn('_cloudtak_remote_custom_compose_sh')])
@@ -224,6 +225,71 @@ def test_remote_sh_not_deployed_is_a_no_op(ct):
     os.remove(ct / '.env')
     _run_remote(ct.parent)
     assert not (ct / 'docker-compose.custom.yml').exists()
+
+
+# ── TAK Portal's marketplace pins its CSP overlay into the same COMPOSE_FILE ──
+# Its script appends the relative name `docker-compose.marketplace.yml` and later checks for
+# it with an exact match (`tr ':' '\n' | grep -Fxq`). Our rewrite must keep it, verbatim.
+
+MARKET = 'docker-compose.marketplace.yml'
+
+
+def _takportal_sees_its_pin(d):
+    r = subprocess.run(['sh', '-c', f"printf '%s\\n' \"$1\" | tr ':' '\\n' | grep -Fxq {MARKET}",
+                        'sh', _compose_file(d)], timeout=10)
+    return r.returncode == 0
+
+
+def _with_market(d):
+    return ':'.join([str(d / 'docker-compose.yml'), str(d / 'docker-compose.override.yml'),
+                     MARKET, str(d / 'docker-compose.custom.yml')])
+
+
+def _takportal_pins(d):
+    # what TAK Portal's pin_csp_compose_file() leaves behind after ours: its file appended
+    (d / MARKET).write_text('# Managed by TAK Portal CloudTAK marketplace.\nservices: {}\n')
+    env = (d / '.env').read_text()
+    cur = _compose_file(d)
+    (d / '.env').write_text(env.replace(f'COMPOSE_FILE={cur}', f'COMPOSE_FILE={cur}:{MARKET}'))
+
+
+@pytest.mark.parametrize('remote', [False, True])
+def test_takportal_csp_pin_survives_and_ours_stays_last(ct, remote):
+    h = _helpers()
+    run = (lambda: _run_remote(ct.parent)) if remote else \
+        (lambda: h['_cloudtak_ensure_custom_compose'](str(ct), lambda m: None))
+    run()
+    _takportal_pins(ct)
+    run()
+    assert _compose_file(ct) == _with_market(ct)
+    assert _takportal_sees_its_pin(ct)
+    run()                                                 # idempotent
+    assert _compose_file(ct) == _with_market(ct)
+
+
+@pytest.mark.parametrize('remote', [False, True])
+def test_deploy_rewriting_env_puts_takportal_overlay_back(ct, remote):
+    h = _helpers()
+    (ct / MARKET).write_text('services: {}\n')
+    (ct / '.env').write_text(ENV)                         # Deploy: .env from scratch
+    if remote:
+        _run_remote(ct.parent)
+    else:
+        h['_cloudtak_ensure_custom_compose'](str(ct), lambda m: None)
+    assert _compose_file(ct) == _with_market(ct)
+
+
+@pytest.mark.parametrize('remote', [False, True])
+def test_a_listed_file_that_is_gone_is_dropped(ct, remote):
+    # compose refuses to run at all if one COMPOSE_FILE entry is missing
+    h = _helpers()
+    with open(ct / '.env', 'a') as f:
+        f.write(f'COMPOSE_FILE=docker-compose.yml:gone.yml:{ct}/docker-compose.yml\n')
+    if remote:
+        _run_remote(ct.parent)
+    else:
+        h['_cloudtak_ensure_custom_compose'](str(ct), lambda m: None)
+    assert _compose_file(ct) == _expected(ct)
 
 
 # ── every compose action sets it up first ────────────────────────────────────
