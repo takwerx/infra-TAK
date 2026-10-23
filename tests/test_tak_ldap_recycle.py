@@ -323,7 +323,8 @@ class Box:
             'os': types.SimpleNamespace(path=types.SimpleNamespace(
                 exists=lambda p: box.coreconfig if p == '/opt/tak/CoreConfig.xml' else os.path.exists(p),
                 join=os.path.join)),
-            'subprocess': types.SimpleNamespace(run=self.run, TimeoutExpired=subprocess.TimeoutExpired),
+            'subprocess': types.SimpleNamespace(run=self.run, TimeoutExpired=subprocess.TimeoutExpired,
+                                                PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT),
             'time': types.SimpleNamespace(time=lambda: box.t, monotonic=lambda: box.t - BOOT, sleep=self.sleep),
             'datetime': datetime.datetime,
             'json': json,
@@ -663,7 +664,7 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
                and "gave ADSB_PS no groups on groups/all, while LDAP gives 1 (OPS)" in l for l in box.log)
     assert any('falling back to restarting TAK Server' in l for l in box.log)
     assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
-    rounds = [l for l in box.log if 'HTTPS check round' in l]
+    rounds = [l for l in box.log if 'HTTPS check round' in l and 'trying again in' in l]
     tries = _const('_TAK_API_CHECK_TRIES')
     assert rounds and all(f'({tries} login(s))' in l for l in rounds)
     assert len(box.leaf_certs) == (len(rounds) + 1) * tries + 1     # + the one after the restart
@@ -734,7 +735,8 @@ def test_ops158_early_restart_only_before_the_restart_not_while_the_api_warms_up
     assert len([l for l in box.log if 'not waiting the rest of the' in l]) == 1
     after = box.log[next(i for i, l in enumerate(box.log) if 'TAK Server restarted after LDAP settled' in l):]
     assert any('STILL BROKEN after the TAK Server restart' in l for l in after)
-    assert not any('outpost' in l or 'looks other users up' in l for l in after)
+    assert not any('not waiting the rest of the' in l or 'keeping the 300s wait' in l or 'after the full' in l
+                   for l in after)
 
 
 def test_ops158_outpost_log_reader_counts_only_tak_user_lookups():
