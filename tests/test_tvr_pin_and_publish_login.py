@@ -166,6 +166,72 @@ def test_dockerfile_patch_fails_closed():
         tvr.patch_dockerfile(UPSTREAM_DOCKERFILE, 'armv7')
 
 
+# ── Python packages in the image ──────────────────────────────────────────────
+
+# Upstream's requirements.txt, verbatim at TVR_SHA (test deps trimmed to two).
+UPSTREAM_REQUIREMENTS = (
+    '# Core dependencies for TAK Video Restreamer\n'
+    'Flask==3.0.0\nFlask-SocketIO==5.3.5\nFlask-CORS==4.0.0\nFlask-Login==0.6.3\n'
+    'Flask-Limiter==3.5.0\npython-socketio==5.10.0\nrequests==2.31.0\npython-engineio==4.8.0\n'
+    'eventlet==0.35.1\ngunicorn==21.2.0\nklvdata>=0.0.3\n\n'
+    '# Core testing framework\npytest==7.4.3\n'
+    '# HTTP testing\nrequests-mock==1.11.0\n')
+
+
+def _pins(text):
+    return dict(re.findall(r'^([A-Za-z0-9._-]+)==(\S+)$', text, re.M))
+
+
+def test_python_pins_are_at_or_past_the_fixed_releases():
+    floor = {'python-engineio': '4.13.2', 'python-socketio': '5.16.2', 'gunicorn': '22.0.0',
+             'eventlet': '0.40.3', 'Flask-CORS': '6.0.0', 'Flask': '3.1.3', 'requests': '2.34.0'}
+    for name, fixed in floor.items():
+        assert _v(tvr.TVR_PY_PINS[name][1]) >= _v(fixed), name
+    # TVR's start.sh runs the eventlet worker, which gunicorn 26 removed
+    assert _v(tvr.TVR_PY_PINS['gunicorn'][1]) < (26,)
+
+
+def test_requirements_are_rewritten_and_nothing_else_moves():
+    out = tvr.patch_requirements(UPSTREAM_REQUIREMENTS)
+    got = _pins(out)
+    for name, (_up, ours) in tvr.TVR_PY_PINS.items():
+        assert got[name] == ours, name
+    # untouched: packages we don't pin, unpinned lines, comments, test deps
+    assert got['Flask-Login'] == '0.6.3' and got['Flask-Limiter'] == '3.5.0'
+    assert got['pytest'] == '7.4.3' and got['requests-mock'] == '1.11.0'
+    assert 'klvdata>=0.0.3\n' in out and out.startswith('# Core dependencies')
+    assert out.count('\n') == UPSTREAM_REQUIREMENTS.count('\n')
+    # re-patching an already-patched file is a no-op, not a failure
+    assert tvr.patch_requirements(out) == out
+
+
+def test_requirements_patch_matches_names_the_way_pip_does():
+    out = tvr.patch_requirements(UPSTREAM_REQUIREMENTS.replace('Flask-SocketIO==', 'flask_socketio == '))
+    assert f"flask_socketio=={tvr.TVR_PY_PINS['Flask-SocketIO'][1]}\n" in out
+
+
+def test_requirements_patch_fails_closed_when_upstream_moves():
+    with pytest.raises(RuntimeError, match='expected 4.8.0'):
+        tvr.patch_requirements(UPSTREAM_REQUIREMENTS.replace('python-engineio==4.8.0', 'python-engineio==4.9.0'))
+    with pytest.raises(RuntimeError, match='no pin for gunicorn'):
+        tvr.patch_requirements(UPSTREAM_REQUIREMENTS.replace('gunicorn==21.2.0\n', ''))
+    with pytest.raises(RuntimeError, match='no pin for eventlet'):
+        tvr.patch_requirements(UPSTREAM_REQUIREMENTS.replace('eventlet==0.35.1', 'eventlet>=0.35'))
+    with pytest.raises(RuntimeError, match='twice'):
+        tvr.patch_requirements(UPSTREAM_REQUIREMENTS + 'Flask==3.0.0\n')
+
+
+def test_deploy_and_update_both_patch_requirements_and_record_it():
+    assert '_rf.write(patch_requirements(_rqc))' in SRC                           # deploy
+    assert "ctx['_write_priv'](_tvr_reqs, patch_requirements(ctx['_read_priv'](_tvr_reqs)))" in SRC  # update
+    assert SRC.count("s['tak_video_restreamer_py_pins'] = TVR_PY_PINS_REV") == 2
+    # the patch runs after checkout_pin() (which discards it) and before the build
+    for start, build in (('commit_sha = checkout_pin(', "'up', '-d', '--build'"),
+                         ('new_sha = checkout_pin(', "'up -d --build'")):
+        a = SRC.index(start)
+        assert a < SRC.index('patch_requirements(', a) < SRC.index(build, a)
+
+
 def test_arm64_is_no_longer_a_warn_and_carry_on_patch():
     assert "_dfc.replace('_linux_amd64', '_linux_arm64')" not in SRC
     assert 'bundled mediamtx may be wrong-arch' not in SRC
@@ -244,7 +310,8 @@ def _ctx(settings, head=tvr.TVR_SHA):
 
 
 CURRENT = {'tak_video_restreamer_publish_password': 'p',
-           'tak_video_restreamer_mediamtx_version': tvr.TVR_MEDIAMTX_VERSION}
+           'tak_video_restreamer_mediamtx_version': tvr.TVR_MEDIAMTX_VERSION,
+           'tak_video_restreamer_py_pins': tvr.TVR_PY_PINS_REV}
 
 
 def test_up_to_date_box_has_no_update():
@@ -259,6 +326,16 @@ def test_box_built_before_this_release_gets_the_security_update():
     old_mtx = dict(CURRENT, tak_video_restreamer_mediamtx_version='v1.19.2')
     info = tvr.get_version_info(_ctx(old_mtx))
     assert info['security_update'] and not info['publish_login_new']
+
+
+def test_box_built_with_old_python_pins_gets_the_security_update():
+    for rev in (None, '0' * 12):
+        s = dict(CURRENT)
+        s.pop('tak_video_restreamer_py_pins')
+        if rev:
+            s['tak_video_restreamer_py_pins'] = rev
+        info = tvr.get_version_info(_ctx(s))
+        assert info['update_available'] and info['security_update'] and not info['publish_login_new']
 
 
 def test_box_off_the_pin_gets_an_ordinary_update():

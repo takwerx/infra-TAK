@@ -1287,6 +1287,11 @@ if [ "$PKG_MGR" = "dnf" ]; then
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 else
+    # Some Debian-family images ship without ufw (Armbian — GH #242). Install it, never
+    # enable it here. --no-remove: apt aborts rather than drop iptables-persistent.
+    if ! command -v ufw >/dev/null 2>&1 && ! command -v firewall-cmd >/dev/null 2>&1; then
+        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove ufw >/dev/null 2>&1 || true
+    fi
     if command -v ufw >/dev/null 2>&1; then
         ufw allow 5001/tcp >/dev/null 2>&1 || true
     fi

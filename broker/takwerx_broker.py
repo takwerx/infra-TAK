@@ -338,6 +338,10 @@ PKGMGR_SUBCMDS = {
     # bucket as copr. The dangerous `--add-repo <url>` still installs a repo def
     # but cannot run code until an install (gated). -o/--setopt stays blocked.
     'config-manager',
+    # ops #168: `dnf -C updateinfo list --security` — which pending/installed
+    # packages carry a security advisory, for the Guard Dog update email. A
+    # metadata QUERY (no transaction, no scriptlets); same bucket as check-update.
+    'updateinfo',
 }
 
 # Never executable through the broker — escalation primitives (defence in depth;

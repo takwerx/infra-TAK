@@ -175,6 +175,9 @@ def load(tmp_path, monkeypatch):
             '_tak_recycle_after_ldap_outage': lambda plog, trigger, check_outpost=True, final=False:
                 box.recycles.append((trigger, check_outpost)),
         }
+        # ops #178: the compose calls go through the locked runner; no lock in this sandbox.
+        ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
+        ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
         for name in ('_LDAP_FQDN_MOVE_BACKOFF_S', '_LDAP_FQDN_MOVE_BACKOFF_MAX_S', '_ldap_outpost_fqdn_precheck',
                      '_ldap_fqdn_move_backoff', '_ldap_fqdn_move_failed', '_rewrite_ldap_compose_to_fqdn',
                      '_record_spiral_repair_attempt', '_apply_authentik_ldap_routing_repair',

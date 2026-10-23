@@ -20,6 +20,7 @@ source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
 MAX_WAIT=120
 INTERVAL=5
+AK_LOCK_WAIT=60
 
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') boot-sequencer: $1"
@@ -87,7 +88,18 @@ elif [ "$_uptime_sec" -lt 600 ]; then
 
   _ak_d="$(gd_find_stack_dir authentik authentik-server-1)"
   if [ -n "$_ak_d" ]; then
-    cd "$_ak_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
+    # ops #180: under the console's compose lock. Busy means the console is mid-compose
+    # on Authentik; stopping under it is the race, and Authentik running alongside TAK's
+    # start only costs CPU. 60s, not the usual 180: this is an ExecStartPre inside
+    # takserver.service's 300s TimeoutStartSec, which also covers the 120s DB wait below.
+    gd_ak_lock_take "$AK_LOCK_WAIT"; _lk=$?
+    if [ "$_lk" -eq 1 ]; then
+      _log "Authentik compose lock busy for ${AK_LOCK_WAIT}s (console is mid-compose on Authentik) — leaving Authentik running"
+    else
+      [ "$_lk" -ne 0 ] && _log "Authentik compose lock: ${GD_AK_LOCK_WHY:-lock helper missing} — stopping Authentik UNLOCKED"
+      cd "$_ak_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
+      [ "$_lk" -eq 0 ] && gd_ak_lock_drop
+    fi
   else
     # Last resort: stop by container name so `restart: unless-stopped` cannot
     # race TAK's start even when no compose dir is discoverable.

@@ -91,8 +91,11 @@ class Box:
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
-                 gd_restart=None):
+                 gd_restart=None, ghosts=(), ghosts_leave=False):
         self.t = T0
+        # ops #172: connections TAK still lists but refuses to drop (HTTP 400); with
+        # `ghosts_leave` they are off the list right after the refused delete
+        self.ghosts, self.ghosts_leave = set(ghosts), ghosts_leave
         self.tak_start = tak_start
         self.ldap_start = ldap_start
         self.container = container
@@ -119,7 +122,8 @@ class Box:
         self.calls, self.api, self.log = [], [], []
         # TAK's HTTPS/API side (ops #139), apart from the 8089 connections above: 'ok', 'no_groups'
         # (test8: groups/all empty, so missions empty and create 403), 'create_403', 'down' (no
-        # answer). `https_flaky` = that many rounds give no groups first (a dead pooled connection).
+        # answer). `https_flaky` = that many logins give no groups first (dead pooled connections
+        # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
 
@@ -196,6 +200,10 @@ class Box:
             return True, None
         if method == 'DELETE' and url.startswith(f'{API}/subscriptions/delete/'):
             uid = urllib.parse.unquote(url.rsplit('/', 1)[1])
+            if uid in self.ghosts:
+                if self.ghosts_leave:
+                    self.subs = [s for s in self.subs if s['subscriptionUid'] != uid]
+                return None, 'http_400'
             gone = [s for s in self.subs if s['subscriptionUid'] == uid]
             if not gone:
                 return None, 'http_400'
@@ -304,8 +312,8 @@ class Box:
         }
         for c in ('_PGB_SWAP_LDAP_WINDOW_S', '_PGB_SWAP_LDAP_STABLE_S', '_PGB_SWAP_LDAP_EVERY_S',
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
-                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_ATTEMPTS',
-                  '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_AFTER_RESTART_ATTEMPTS',
+                  '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_TRIES',
+                  '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S'):
             ns[c] = _const(c)
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
@@ -499,6 +507,83 @@ def test_client_that_stays_offline_is_not_a_failure():
     assert any("didn't reconnect within" in l for l in box.log)
 
 
+# ── ops #172: a connection TAK won't drop, which a newer one from the client replaced ──
+
+def ghost_box(newer=None, **kw):
+    """test6 2026-10-22: the emulator's tls:29 was added and removed in the same ms, TAK still
+    listed it 3 min later with no user and no groups, and its delete got HTTP 400; the real
+    connection was tls:30, with groups."""
+    kw.setdefault('ghosts', {'tls:29'})
+    box = healthy_box(**kw)
+    box.subs.append(sess(29, 'takdev-emu', (), unmapped=True))
+    if newer is not None:
+        box.subs.append(newer)
+    return box
+
+
+def test_ops172_ghost_replaced_by_a_newer_connection_with_groups_is_not_a_restart():
+    box = ghost_box(sess(30, 'takdev-emu'), tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:29']
+    assert any("couldn't drop TAKDEV-EMU (takdev-emu) (tls:29): http_400" in l for l in box.log)
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced" in l and 'TAKDEV-EMU' in l
+               for l in box.log)
+    assert not any('still with no groups although LDAP is healthy' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops172_refused_drop_of_a_connection_that_left_the_list_is_not_a_restart():
+    box = ghost_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, ghosts_leave=True)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops172_ghost_reconnect_that_heals_in_the_same_run_counts_as_its_replacement():
+    # The newer connection also came in empty: it is dropped, comes back with groups, and
+    # then stands in for the ghost too.
+    box = ghost_box(sess(30, 'takdev-emu', (), unmapped=True), tak_start=T0 - 3 * 24 * HOUR,
+                    ldap_start=T0 - HOUR)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:29', 'tls:30']
+    assert box.live('takdev-emu')[-1]['groups']
+
+
+def test_ops172_undroppable_with_no_replacement_still_restarts_tak_once():
+    box = ghost_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert any('still with no groups although LDAP is healthy' in l and 'TAKDEV-EMU' in l for l in box.log)
+    assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+@pytest.mark.parametrize('newer', [
+    sess(30, 'takdev-emu', client='ANDROID-other-device'),   # same user, another device
+    sess(30, 'takdev-emu', ()),                              # same client, but no groups either
+    sess(28, 'takdev-emu'),                                  # older, not a reconnect
+], ids=['other-device', 'no-groups', 'older'])
+def test_ops172_only_a_newer_connection_of_the_same_client_with_groups_replaces_it(newer):
+    box = ghost_box(newer, tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, tak_ldap_ok=False)
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops172_unreadable_list_after_a_refused_drop_keeps_the_restart_fallback():
+    box = ghost_box(sess(30, 'takdev-emu'), tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    marti = box.marti
+
+    def no_reads_after_the_drop(url, timeout=12, method='GET', json_body=None):
+        if method == 'GET' and url == f'{API}/subscriptions/all' and box.drops():
+            return None, 'curl_exit_28'
+        return marti(url, timeout, method, json_body)
+    box.marti = no_reads_after_the_drop
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+
+
 # ── ops #139: TAK's HTTPS/API side, which the 8089 connections say nothing about ─────
 
 def test_healthy_box_checks_https_as_a_live_non_admin_user_and_cleans_up():
@@ -523,8 +608,10 @@ def test_healthy_box_checks_https_as_a_live_non_admin_user_and_cleans_up():
 def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
     # test8 2026-10-21: every ATAK had its 8089 groups, but over HTTPS TAK gave cert users 0
     # groups (empty mission list, 403 on create). The old check said "all clients have their
-    # groups" eight times. Now: one TAK restart, and the check repeated after it.
+    # groups" eight times. Now: one TAK restart, only after the HTTPS check has kept failing
+    # for _TAK_API_CHECK_WAIT_S, and the check repeated after it.
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    t0 = box.t
     assert box.recycle() is True
     assert box.restarts() == [['systemctl', 'restart', 'takserver']]
     assert box.drops() == []                       # the 8089 clients were fine, none dropped
@@ -533,10 +620,55 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
                and "gave ADSB_PS no groups on groups/all, while LDAP gives 1 (OPS)" in l for l in box.log)
     assert any('falling back to restarting TAK Server' in l for l in box.log)
     assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
-    assert len([c for c in box.leaf_certs]) == _const('_TAK_API_CHECK_ATTEMPTS') + 1
+    rounds = [l for l in box.log if 'HTTPS check round' in l]
+    tries = _const('_TAK_API_CHECK_TRIES')
+    assert rounds and all(f'({tries} login(s))' in l for l in rounds)
+    assert len(box.leaf_certs) == (len(rounds) + 1) * tries + 1     # + the one after the restart
+    restart_at = next(i for i, c in enumerate(box.calls) if c[1:2] == ['restart'])
+    assert box.t - t0 >= _const('_TAK_API_CHECK_WAIT_S') and restart_at
     st = box.settings['tak_ldap_recycle']
     assert st['last_outcome'] == 'restarted' and 'healed_ldap_start' not in st
     assert box.workdirs == []
+
+
+def test_ops158_dead_pooled_connections_on_the_api_side_heal_without_a_restart():
+    # test8 2026-10-21 (v10.2.25 T&E): the update restarted the outpost under TAK; TAK's API
+    # held 4 pooled LDAP connections, all dead. Two logins 15 s apart both hit one and TAK
+    # was restarted. Logging in again with a fresh cert gets past them.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=4)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert len(box.leaf_certs) == 5 and box.workdirs == []      # a fresh cert each, all removed
+    assert not any('trying again in' in l for l in box.log)               # no wait: the same round
+    assert any('HTTPS check passed on login 5 of round 1' in l for l in box.log)
+    assert any('no TAK Server restart needed' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients fine, no restart'
+
+
+def test_more_dead_connections_than_one_round_heal_in_a_later_round():
+    tries = _const('_TAK_API_CHECK_TRIES')
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=tries + 2)
+    t0 = box.t
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any(f'HTTPS check round 1 ({tries} login(s))' in l and 'trying again in 15s' in l for l in box.log)
+    assert any('HTTPS check passed on login 3 of round 2' in l for l in box.log)
+    assert box.t - t0 < _const('_TAK_API_CHECK_WAIT_S')
+
+
+def test_https_check_backs_off_and_is_bounded():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    waits = []
+    real_sleep = box.sleep
+
+    def sleep(s):
+        if any('HTTPS check round' in l for l in box.log[-1:]):
+            waits.append(s)
+        real_sleep(s)
+    box.sleep = sleep
+    box.recycle()
+    assert waits[:4] == [15, 30, 60, 60] and max(waits) == _const('_TAK_API_CHECK_RETRY_MAX_S')
+    assert sum(waits) == _const('_TAK_API_CHECK_WAIT_S')
 
 
 def test_https_403_on_create_restarts_tak():
@@ -559,14 +691,22 @@ def test_https_still_broken_after_the_restart_is_logged_and_not_restarted_again(
     assert len(box.restarts()) == 1
 
 
-def test_one_bad_https_round_is_retried_before_any_restart():
+def test_one_bad_https_login_is_retried_before_any_restart():
     # The API's first lookup can hit a dead pooled LDAP connection, like the streaming side.
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_flaky=1)
     assert box.recycle() is False
     assert box.restarts() == []
-    assert len(box.leaf_certs) == 2                # a fresh cert for the second round
-    assert any('HTTPS check round 1' in l and 'trying again' in l for l in box.log)
+    assert len(box.leaf_certs) == 2                # a fresh cert for the second login
+    assert any('HTTPS check passed on login 2 of round 1' in l for l in box.log)
     assert any('no TAK Server restart needed' in l for l in box.log)
+
+
+def test_api_that_does_not_answer_is_not_logged_into_again_within_a_round():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='down')
+    assert box.recycle() is False
+    rounds = [l for l in box.log if 'HTTPS check round' in l]
+    assert rounds and all('(1 login(s))' in l for l in rounds)
+    assert len(box.leaf_certs) == len(rounds) + 1
 
 
 def test_streaming_restart_fallback_also_checks_https_after():
@@ -581,10 +721,13 @@ def test_https_check_retries_while_the_api_warms_up_after_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
                       https_after_restart='down')
     orig = box.user_req
+    down = []
 
     def warming(cert, key, url, method='GET', timeout=20):
-        if box.https == 'down' and len([u for u in box.user_api if u[1] == 'GET']) >= 6:
-            box.https = 'ok'                       # the API serves a few rounds after 8443 opens
+        if box.https == 'down':
+            down.append(url)
+            if len(down) > 4:
+                box.https = 'ok'                   # the API serves a few rounds after 8443 opens
         return orig(cert, key, url, method, timeout)
     box.user_req = warming
     assert box.recycle() is True
@@ -639,12 +782,18 @@ def test_https_no_answer_is_unknown_not_a_restart():
 def test_cert_that_cant_be_made_is_unknown_not_a_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
 
+    failed_at = []
+
     def no_ca(cn, workdir):
+        failed_at.append(box.t)
         raise RuntimeError('CoreConfig has no enrollment CA (TAKServerCAConfig)')
     box.leaf_cert = no_ca
     assert box.recycle() is False
+    t0 = failed_at[0]                              # not before: the recycle holds LDAP 45 s first
     assert box.restarts() == [] and box.workdirs == []
     assert any("couldn't make a test cert for ADSB_PS: CoreConfig has no enrollment CA" in l for l in box.log)
+    assert not any('HTTPS check round' in l for l in box.log)   # no cert won't change by waiting
+    assert box.t - t0 < _const('_TAK_API_CHECK_RETRY_S')
 
 
 def test_group_tak_already_reports_is_used_so_a_fresh_portal_add_cannot_restart_tak():
@@ -921,6 +1070,132 @@ def test_no_local_outpost_container_does_nothing():
     box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=None)
     assert box.recycle() is False
     assert box.restarts() == [] and box.api == []
+
+
+# ── ops #184: Authentik Reconfigure, and a heal cut short by a console restart ──────
+
+def reconfigure_heal(box, ns=None):
+    """What the end of an Authentik Reconfigure runs."""
+    ns = ns or box.ns()
+    exec(compile(_src('_authentik_reconfigure_heal_tak_clients'), 'app.py', 'exec'), ns)
+    ns['_authentik_reconfigure_heal_tak_clients'](box.log.append)
+
+
+def test_ops184_reconfigure_soon_after_tak_started_heals_the_client_it_left_empty():
+    # test12 (ops #180): TAK started 17:44:18Z; the post-update Reconfigure's flow fix
+    # recreated the outpost at 17:48:21Z and the emulator reconnected 11 s later: no user,
+    # no groups. Outpost started under 5 min after TAK, so the start-time check (the boot
+    # guard) never counts it and nothing would ever heal that client.
+    gap = _const('_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S') - 60
+    box = outage_box(tak_start=T0 - gap - 30, ldap_start=T0 - 30)
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.api == []                                 # the gap: nothing heals it
+    reconfigure_heal(box)
+    assert box.restarts() == []
+    assert box.drops() == ['tls:16']
+    [now] = box.live('takdev-emu')
+    assert now['username'] == 'takdev-emu' and now['groups']
+    assert any('(end of Authentik Reconfigure): TAK Server ran through an LDAP outage — '
+               'Authentik Reconfigure recreated the LDAP outpost' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert 'pending' not in st and st['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops184_reconfigure_inside_a_console_update_leaves_it_to_the_update_end():
+    box = outage_box(tak_start=T0 - 200, ldap_start=T0 - 30, update_in_progress=True)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert box.settings['tak_ldap_recycle']['pending'] == ['Authentik Reconfigure recreated the LDAP outpost']
+    assert any('client check deferred to the end of the console update' in l for l in box.log)
+    box.t += 300
+    box.update_in_progress = False
+    assert box.recycle(final=True) is False           # the update's last step
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    assert box.live('takdev-emu')[0]['groups']
+
+
+def test_ops184_tak_started_after_the_reconfigure_request_is_left_alone():
+    # TAK (re)started after the request (e.g. it was still coming up): it looked every
+    # client up against the healed LDAP already.
+    box = outage_box(tak_start=T0 + 5, ldap_start=T0 - 30)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert any('reusing that restart' in l for l in box.log)
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+def test_ops184_reconfigure_with_tak_not_on_ldap_does_nothing():
+    box = outage_box(tak_start=T0 - 200, ldap_start=T0 - 30, coreconfig=False)
+    reconfigure_heal(box)
+    assert box.api == [] and box.restarts() == []
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+class ConsoleRestarted(BaseException):
+    """systemctl restart takwerx-console: the heal's thread just stops."""
+
+
+def test_ops184_heal_killed_by_a_console_restart_is_finished_by_the_next_console_start():
+    # test12 (ops #180): the update's final heal started at 17:53:35Z for an outpost
+    # restarted under TAK; the console was restarted at 17:53:38Z. That reason was never
+    # saved, and the restarted console carries out only pending requests.
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - 120)
+    marti = box.marti
+
+    def killed(url, timeout=12, method='GET', json_body=None):
+        raise ConsoleRestarted()
+    box.marti = killed
+    with pytest.raises(ConsoleRestarted):
+        box.recycle()
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'in progress'
+    assert st['pending'] == ['LDAP outpost restarted while TAK Server was running (TAK up 95h58m at the time)']
+    box.marti = marti
+    box.t += 60
+    assert box.recycle(trigger='console start', check_outpost=False, final=True) is False
+    assert box.drops() == ['tls:16'] and box.restarts() == []
+    assert box.live('takdev-emu')[0]['groups']
+    st = box.settings['tak_ldap_recycle']
+    assert 'pending' not in st and st['last_outcome'] == 'clients healed, no restart'
+
+
+def test_ops184_saving_the_reason_first_does_not_swallow_a_newer_request():
+    box = outage_box(tak_start=T0 - 4 * 24 * HOUR, ldap_start=T0 - 120)
+    box.request('PgBouncer image swap')
+    req = box.settings['tak_ldap_recycle']['requested_epoch']
+    real_load = box.ns
+
+    def ns_with_a_late_request():
+        ns = real_load()
+        load = ns['load_settings']
+        state = {'n': 0}
+
+        def load_settings():
+            state['n'] += 1
+            if state['n'] == 2:                        # between the first read and the save
+                box.t += 1
+                box.request('late step')
+            return load()
+        ns['load_settings'] = load_settings
+        return ns
+    box.ns = ns_with_a_late_request
+    box.recycle()
+    st = box.settings['tak_ldap_recycle']
+    assert st['requested_epoch'] > req and st['pending'] == ['PgBouncer image swap', 'late step']
+
+
+def test_ops184_both_reconfigure_paths_heal_last():
+    local = APP[APP.index('def run_authentik_deploy('):]
+    local = local[:local.index('_authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)')]
+    tail = local[local.rindex('_sync_webadmin_after_authentik_reconfigure(plog)'):].split('\n')
+    assert [l.strip() for l in tail if l.strip() and not l.strip().startswith('#')] == [
+        '_sync_webadmin_after_authentik_reconfigure(plog)', '_authentik_reconfigure_heal_tak_clients(plog)', 'plog("")']
+    remote = _src('_run_authentik_reconfigure_remote')
+    tail = remote[remote.index('_sync_webadmin_after_authentik_reconfigure(plog)'):]
+    assert tail.index('_authentik_reconfigure_heal_tak_clients(plog)') < tail.index('_authentik_reconfigure_finish(')
+    src = _src('_authentik_reconfigure_heal_tak_clients')
+    assert src.index('_tak_ldap_recycle_request(') < src.index('_tak_recycle_after_ldap_outage(')
+    assert 'final=True' not in src                     # inside an update it must defer
 
 
 # ── GH #207: Guard Dog restarting Authentik under a running TAK ─────────────────────

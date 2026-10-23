@@ -91,7 +91,7 @@ def _load(names, ns=None):
     ns = {'json': json} if ns is None else dict({'json': json}, **ns)
     exec(compile(_consts('TAKPORTAL_TEMPLATE_PLACEHOLDERS', 'TAKPORTAL_TEMPLATE_TAK_CONNECTION',
                          'TAKPORTAL_AUTHORITATIVE_KEYS', 'TAKPORTAL_DOMAIN_KEYS', 'TAKPORTAL_AUTH_ADOPT_KEYS',
-                         'EMAIL_TRANSPORT_KEYS'),
+                         'EMAIL_TRANSPORT_KEYS', 'TAKPORTAL_REQUIRED_PREFIXES'),
                  'app.py', 'exec'), ns)
     exec(compile('\n\n'.join(_func(n) for n in names), 'app.py', 'exec'), ns)
     return ns
@@ -103,7 +103,7 @@ def _keys(existing):
 
 def _merge(existing):
     ns = _load(['_takportal_settings_value_is_blank', '_takportal_template_placeholder_keys',
-                '_takportal_merged_settings_json'],
+                '_takportal_with_required_prefixes', '_takportal_merged_settings_json'],
                {'_takportal_get_existing_settings': lambda: dict(existing),
                 '_takportal_build_settings_dict': lambda s: dict(BUILT)})
     return json.loads(ns['_takportal_merged_settings_json']({}))
@@ -151,8 +151,9 @@ def test_merge_reseeds_the_placeholders_on_a_reset_file():
     out = _merge(TEMPLATE)
     for k in RESEEDED:
         assert out[k] == BUILT[k], k
-    assert out['USERS_HIDDEN_PREFIXES'] == TEMPLATE['USERS_HIDDEN_PREFIXES'], \
-        'a real-looking template default is not a placeholder — hands off'
+    # A real-looking template default is not a placeholder, so it is not replaced; only our own
+    # admin accounts are added to it (TAKPORTAL_REQUIRED_PREFIXES, operator decision 2026-10-21).
+    assert out['USERS_HIDDEN_PREFIXES'] == TEMPLATE['USERS_HIDDEN_PREFIXES'] + ',akadmin,webadmin'
 
 
 def test_merge_never_touches_a_real_operator_value():
