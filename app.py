@@ -45048,6 +45048,55 @@ def _patch_cloudtak_minio_registry(cloudtak_dir=None):
     return changed
 
 
+# ops #193 (GH #256): CloudTAK builds the RTSP/RTMP/SRT URLs it hands out (the lease
+# "stream" URL ATAK publishes to, and every read URL) from the media container's OWN
+# listen addresses — video-service.ts protocols(): url.port = config.rtspAddress — not
+# from the host port Docker publishes. Upstream maps host ${MEDIA_PORT_*} → container
+# 8554/1935/8890, and infra-TAK sets MEDIA_PORT_* to 18554/11935/18890 so the standalone
+# MediaMTX keeps 8554/1935/8890. So every URL CloudTAK gave out pointed at the standalone
+# MediaMTX (or at nothing): ATAK's broadcast started, was refused, and ended. Make media
+# listen on the host port itself (MediaMTX's MTX_* env overrides) and publish it 1:1, so
+# the advertised URL is the reachable one. SRT is UDP; upstream published it TCP-only.
+_CT_MEDIA_STREAM_PORTS = (
+    # (compose var, upstream container port, infra-TAK host port, MediaMTX key, proto suffix)
+    ('MEDIA_PORT_RTSP', 8554, 18554, 'MTX_RTSPADDRESS', ''),
+    ('MEDIA_PORT_RTMP', 1935, 11935, 'MTX_RTMPADDRESS', ''),
+    ('MEDIA_PORT_SRT', 8890, 18890, 'MTX_SRTADDRESS', '/udp'),
+)
+
+
+def _cloudtak_media_listen_patch(text):
+    """Return CloudTAK compose text with media's RTSP/RTMP/SRT listening on the published
+    host port (see _CT_MEDIA_STREAM_PORTS). All-or-nothing: if any of the three upstream
+    port lines or the media `environment:` list is not where we expect, the text comes back
+    unchanged — a half patch (MediaMTX on 18554 behind an 18554→8554 publish) would break
+    streaming outright, where the unpatched file is only wrong about the URL. Idempotent."""
+    out = text
+    for var, cport, hport, _key, proto in _CT_MEDIA_STREAM_PORTS:
+        new_line = f'"${{{var}:-{hport}}}:${{{var}:-{hport}}}{proto}"'
+        if new_line in out:
+            continue
+        pat = re.compile(r'"\$\{' + var + r':-\d+\}:' + str(cport) + r'(?:/(?:tcp|udp))?"')
+        if len(pat.findall(out)) != 1:
+            return text
+        out = pat.sub(new_line, out)
+    # media's environment list: `  media:` → its `environment:` → first `- ` item (indent).
+    # `\S` pins where each line's indent ends — without it `[ \t]+.*` can split the same
+    # indent many ways and a non-matching file backtracks for minutes.
+    m = re.search(r'(?m)^([ \t]+)media:[ \t]*\n((?:\1[ \t]+\S.*\n|[ \t]*\n)*?)'
+                  r'(\1[ \t]+)environment:[ \t]*\n([ \t]+)- ', out)
+    if not m:
+        return text
+    item_indent = m.group(4)
+    missing = [f'{item_indent}- {key}=:${{{var}:-{hport}}}\n'
+               for var, _c, hport, key, _p in _CT_MEDIA_STREAM_PORTS
+               if f'- {key}=' not in out]
+    if missing:
+        at = m.end() - len(item_indent) - 2   # start of the first `- ` item line
+        out = out[:at] + ''.join(missing) + out[at:]
+    return out
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -45072,7 +45121,8 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
       events 5003     Tier 4 → removed (Docker-internal only)
       media 9997      Tier 3 → 127.0.0.1:9997:9997 (HLS admin)
       media 8888 HLS  Tier 3 → 127.0.0.1:PORT:8888 (via MEDIA_PORT_HLS)
-      media RTSP/RTMP/SRT  Tier 1 → untouched (public streaming)
+      media RTSP/RTMP/SRT  Tier 1 → public, but listen on + publish the host port 1:1
+                       (18554, 11935, 18890/udp) — _cloudtak_media_listen_patch()
       postgis 5433    Tier 4 → removed
       store 9000      Tier 4 → removed
       store 9002      Tier 3 → 127.0.0.1:9002:9002
@@ -45128,6 +45178,10 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
                 r'\g<1>127.0.0.1:\g<2>18888\g<3>',
                 _ct
             )
+
+            # Tier 1: media RTSP/RTMP/SRT listen on the host port and publish 1:1, so the
+            # stream URLs CloudTAK hands out are reachable (ops #193, GH #256).
+            _ct = _cloudtak_media_listen_patch(_ct)
 
             # Tier 4: postgis 5433 — remove the ports block entirely
             _ct = _re.sub(
