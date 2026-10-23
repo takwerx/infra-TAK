@@ -63247,6 +63247,67 @@ _TAK_API_CHECK_TRIES = 8
 _TAK_API_CHECK_WAIT_S = 300
 _TAK_API_CHECK_RETRY_S = 15
 _TAK_API_CHECK_RETRY_MAX_S = 60
+# ops #158, long-uptime TAK: test8, TAK up 12 h, an update's outpost restart. Within 15 s TAK
+# was looking other users up in LDAP again (admin, mepsteinparsons) but it sent not one search
+# for the check user in 48 logins over 5 min, and only the TAK restart fixed it. A TAK in its
+# normal window after an outpost restart looks different: no lookup for anyone until its API
+# reconnects (54 s on a fresh test8 TAK), then the user's next login is looked up and passes.
+# So once TAK has looked others up for this long, with at least a round of logins in it and no
+# search for the user, waiting out the rest of the 5 min only keeps Data Sync broken.
+_TAK_API_CHECK_STUCK_S = 30
+
+
+def _ldap_outpost_tak_searches(since):
+    """TAK's user lookups the local LDAP outpost logged since epoch `since`, as a list of
+    (epoch, lower-cased user cn). TAK looks a user up with a base search on cn=<user>,…
+    asking for memberOf and ntUserWorkstations; the console's own ldapsearch reads the
+    users OU, so it isn't counted. None when there is no local outpost or its log can't be
+    read (remote Authentik)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', str(int(since)), 'authentik-ldap-1']),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    seen = []
+    for line in (r.stdout or '').splitlines():
+        if 'ntUserWorkstations' not in line:
+            continue
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(j, dict) or j.get('event') != 'Search request' \
+                or 'ntUserWorkstations' not in (j.get('attributes') or []):
+            continue
+        m = re.match(r'cn=([^,]+),', j.get('baseDN') or '', re.I)
+        ts = _epoch_from_rfc3339(j.get('timestamp') or '')
+        if m and ts is not None:
+            seen.append((ts, m.group(1).lower()))
+    return seen
+
+
+def _tak_api_check_stuck(cn, since, logins):
+    """While the HTTPS check keeps getting no groups for `cn`: is TAK even asking LDAP for
+    it? `logins` = epoch of every login since `since`. Returns (path, why); path 'stuck' =
+    TAK looks other users up but not `cn` (see _TAK_API_CHECK_STUCK_S), anything else =
+    keep waiting."""
+    seen = _ldap_outpost_tak_searches(since)
+    if seen is None:
+        return 'blind', "can't read the local LDAP outpost's log to see what TAK asks LDAP"
+    mine = sum(1 for _, u in seen if u == cn.lower())
+    if mine:
+        return 'asking', f"TAK is looking {cn} up in LDAP ({mine} search(es) since the check began)"
+    others = [ts for ts, u in seen if u != cn.lower()]
+    if not others:
+        return 'quiet', "TAK hasn't looked anyone up in LDAP since the check began (still reconnecting?)"
+    first = min(others)
+    after = [t for t in logins if t >= first + 1]   # the log has whole seconds
+    if len(after) < _TAK_API_CHECK_TRIES or after[-1] - first < _TAK_API_CHECK_STUCK_S:
+        return 'others', f"TAK is looking other users up in LDAP again, not yet {cn}"
+    return 'stuck', (f"TAK looks other users up in LDAP ({len(others)} search(es)) but sent none for {cn} "
+                     f"in {len(after)} login(s) over {int(after[-1] - first)}s")
 
 
 def _tak_user_leaf_cert(cn, workdir):
@@ -63367,7 +63428,7 @@ def _tak_api_user_check_once(cn, ldap_groups):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
+def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
     Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
@@ -63377,7 +63438,8 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
     list) and deletes it again. A fresh cert for every login. A round is up to
     `_TAK_API_CHECK_TRIES` logins in a row while TAK's API says no groups (each one gets
     past one dead pooled LDAP connection, ops #158); failed rounds are retried, backing
-    off, for up to `wait_s`.
+    off, for up to `wait_s`. `early`: from round 2 on, stop waiting as soon as TAK is
+    plainly not asking LDAP for the user while it asks for others (`_tak_api_check_stuck`).
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
     refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
     check with, or the cert or the API couldn't be used)."""
@@ -63404,9 +63466,11 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
     cn, ldap_groups = pick
     t0 = time.time()
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
+    logins, said = [], None
     while True:
         rnd += 1
         for n in range(1, _TAK_API_CHECK_TRIES + 1):
+            logins.append(time.time())
             verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
             if verdict != 'broken':
                 break   # ok, or the API / cert can't be used: logging in again right away won't help
@@ -63416,8 +63480,19 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
             return verdict, summary
         if verdict == 'nocert':
             return 'unknown', summary
+        if early and verdict == 'broken' and rnd >= 2:
+            path, why = _tak_api_check_stuck(cn, t0, logins)
+            if path == 'stuck':
+                plog(f"  {tag}: HTTPS check round {rnd}: {why} — not waiting the rest of the {wait_s}s, "
+                     f"TAK Server needs a restart")
+                return verdict, f"{summary}; {why}"
+            if path != said:
+                plog(f"  {tag}: HTTPS check round {rnd}: {why} — keeping the {wait_s}s wait")
+                said = path
         left = wait_s - (time.time() - t0)
         if left <= 0:
+            if early:
+                plog(f"  {tag}: HTTPS check: still no groups for {cn} after the full {wait_s}s wait")
             return verdict, summary
         wait = int(min(delay, left))
         plog(f"  {tag}: HTTPS check round {rnd} ({n} login(s)): {summary} — trying again in {wait}s")
@@ -63597,10 +63672,10 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         if verdict in ('ok', 'healed'):
             # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass)
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=True)
             except Exception as e:
                 api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
-            outcome = 'clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
+            outcome ='clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
             if api_verdict == 'ok':
                 plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
                 _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
