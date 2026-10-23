@@ -41748,6 +41748,10 @@ WantedBy=multi-user.target
             plog(f"   SRT:  srt://[server]:8890?streamid=[stream]")
             plog(f"   HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            try:
+                _mediamtx_converge_cloudtak_read(plog)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             mediamtx_deploy_status.update({'running': False, 'complete': True, 'error': False})
         else:
             plog("✗ MediaMTX service not active after deploy — check logs")
@@ -46473,6 +46477,10 @@ def run_cloudtak_deploy(cfg=None):
             plog("  Once you see 'ok - http://localhost:5000' the URL above will work.")
         # cfg['deployed']=True already saved in early-Caddy step; keep settings consistent.
         _update_boot_stagger_service()
+        try:
+            _mediamtx_converge_cloudtak_read(plog)
+        except Exception as _ct_rd_e:
+            plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
@@ -46694,6 +46702,10 @@ def run_cloudtak_redeploy(cfg=None):
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        try:
+            _mediamtx_converge_cloudtak_read(plog)
+        except Exception as _ct_rd_e:
+            plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         plog("✓ Update config & restart done")
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -47770,6 +47782,10 @@ def run_cloudtak_update():
             threading.Thread(target=_post_update_icon_watch, daemon=True,
                              name='cloudtak-update-icon-heal').start()
             plog("  (sprite-regen self-heal armed for the next ~15 min — dfpc-coe/CloudTAK#1623)")
+            try:
+                _mediamtx_converge_cloudtak_read(plog)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -89260,6 +89276,101 @@ def _startup_reapply_f2b_trusted_ignoreip():
 _startup_reapply_f2b_trusted_ignoreip()
 
 
+# ops #193 (GH #256): CloudTAK plays an ATAK video feed by having its OWN media container
+# pull the feed's URL. When that URL is the standalone MediaMTX on the same box, the pull
+# arrives from the container's Docker network address, not localhost — and the standalone
+# MediaMTX only lets localhost read without a password, so CloudTAK's play button got a
+# 401. This entry lets exactly that Docker network read (never publish), written above
+# the other users and found again by its marker line so it can follow the subnet.
+_MTX_CLOUDTAK_READ_MARK = ('# infra-TAK: CloudTAK\'s media server (its Docker network) may watch '
+                           'streams without a password (GH #256)')
+
+
+def _mediamtx_cloudtak_read_patch(text, subnets):
+    """Return mediamtx.yml text with our CloudTAK read entry set to `subnets` (removed when
+    `subnets` is empty). Only the entry under our marker line is ever touched — an operator's
+    own users are left alone. No top-level `authInternalUsers:` list → text unchanged."""
+    out = re.sub(r'(?m)^' + re.escape(_MTX_CLOUDTAK_READ_MARK) + r'\n- user: any\n'
+                 r'  ips: \[[^\]\n]*\]\n  permissions:\n  - action: read\n', '', text)
+    if subnets:
+        m = re.search(r'(?m)^authInternalUsers:[ \t]*\n(?=- )', out)
+        if not m:
+            return text
+        ips = ', '.join(f"'{s}'" for s in subnets)
+        out = (out[:m.end()] + f'{_MTX_CLOUDTAK_READ_MARK}\n- user: any\n  ips: [{ips}]\n'
+               '  permissions:\n  - action: read\n' + out[m.end():])
+    return out
+
+
+def _cloudtak_media_subnets():
+    """Subnets of the Docker networks the local CloudTAK media container is attached to.
+    [] when it does not exist, None when Docker could not be asked. Only private ranges no
+    wider than a Docker pool are returned, and never the shared default `bridge` (every
+    non-compose container sits there)."""
+    r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                   '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}',
+                                   'cloudtak-media-1']),
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return [] if 'no such' in (r.stderr or '').lower() else None
+    subnets = []
+    for net in (r.stdout or '').split():
+        if net in ('bridge', 'host', 'none'):
+            continue
+        n = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                       '{{range .IPAM.Config}}{{.Subnet}} {{end}}', net]),
+                           capture_output=True, text=True, timeout=20)
+        if n.returncode != 0:
+            return None
+        for s in (n.stdout or '').split():
+            try:
+                ipn = ipaddress.ip_network(s, strict=False)
+            except ValueError:
+                continue
+            if ipn.is_private and not ipn.is_loopback and ipn.prefixlen >= (12 if ipn.version == 4 else 48):
+                subnets.append(str(ipn))
+    return sorted(set(subnets))
+
+
+def _mediamtx_converge_cloudtak_read(log=None):
+    """ops #193 (GH #256): keep the standalone MediaMTX's CloudTAK read entry matching the
+    CloudTAK media container's Docker network on this box. Runs at console start and after
+    a local MediaMTX or CloudTAK deploy/update (a `compose down` can hand CloudTAK a new
+    subnet). CloudTAK gone (no container, no ~/CloudTAK compose) → the entry is removed;
+    container missing mid-deploy, or Docker not answering → no change. Restarts MediaMTX
+    only when the file changed and the operator has not stopped it. Returns True if changed."""
+    _log = log or (lambda m: print(m, flush=True))
+    cfg_path = '/usr/local/etc/mediamtx.yml'
+    if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
+        return False
+    subnets = _cloudtak_media_subnets()
+    if subnets is None:
+        return False
+    if not subnets and (os.path.exists(os.path.expanduser('~/CloudTAK/docker-compose.yml'))
+                        or os.path.exists(os.path.expanduser('~/CloudTAK/compose.yaml'))):
+        return False
+    try:
+        with open(cfg_path) as _cf:
+            cur = _cf.read()
+    except OSError:
+        cur = _read_priv(cfg_path)
+    patched = _mediamtx_cloudtak_read_patch(cur, subnets)
+    if patched == cur:
+        return False
+    _write_priv(cfg_path, patched)
+    st = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                        capture_output=True, text=True, timeout=15)
+    if (st.stdout or '').strip() != 'inactive':
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']),
+                       capture_output=True, timeout=60)
+    if subnets:
+        _log(f"  ✓ MediaMTX: CloudTAK's media server ({', '.join(subnets)}) may now watch "
+             "streams without a password (read only)")
+    else:
+        _log("  ✓ MediaMTX: CloudTAK read access removed (CloudTAK is not on this box)")
+    return True
+
+
 def _startup_converge_mediamtx_moq():
     """v10.1.33: disable MoQ in an existing mediamtx.yml — on v1.20.0+ it crash-loops
     mediamtx.service wherever the unit runs as takwerx.
@@ -92564,6 +92675,13 @@ def _startup_migrations():
             _startup_converge_mediamtx_editor_write()
         except Exception as _mtx_ed_e:
             print(f"Startup migration: mediamtx editor-write converge error (non-fatal): {_mtx_ed_e}", flush=True)
+
+        # ops #193 (GH #256) — let CloudTAK's media container watch the standalone MediaMTX.
+        # Last: it may restart mediamtx, after the converges above have settled it.
+        try:
+            _mediamtx_converge_cloudtak_read(lambda m: print(f"Startup migration:{m}", flush=True))
+        except Exception as _mtx_ct_e:
+            print(f"Startup migration: mediamtx CloudTAK-read converge error (non-fatal): {_mtx_ct_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
