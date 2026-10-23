@@ -45,17 +45,34 @@ fi
 # 2026-09-10). Reading `dash -version` finds no "17" and would have emailed a WRONG-JVM
 # alert from every healthy box in the fleet. No loose fallback for the same reason —
 # matching the wrong process is worse than reporting unknown.
-PID=$(pgrep -f -- '-Dspring.profiles.active=api' 2>/dev/null | head -1)
-if [ -z "$PID" ]; then
+PIDS=$(pgrep -f -- '-Dspring.profiles.active=api' 2>/dev/null)
+if [ -z "$PIDS" ]; then
   # TAK is not running — that is the process monitor's job to alert on, not ours.
   echo "running=0" > "$STATUS_FILE" 2>/dev/null
   exit 0
 fi
 
-JVM_EXE=$(readlink -f "/proc/$PID/exe" 2>/dev/null)
-if [ -z "$JVM_EXE" ] || [ ! -f "$JVM_EXE" ]; then
-  # Unreadable /proc entry (non-root console user vs a root-owned JVM) — report unknown
-  # rather than guessing. An unknown must never become a false "wrong JVM" alert.
+# Take the first PID that is actually a java launcher, never just `head -1`. pgrep skips
+# only ITSELF: when the console runs this same pgrep at the same moment, that pgrep is
+# listed too (its argv carries the pattern), and once the PID counter has wrapped it sorts
+# AHEAD of the TAK JVM. `head -1` then picked it, /proc/PID/exe was /usr/bin/pgrep — root-
+# owned, under /usr/bin, so it passed every gate below — and `pgrep -version` emailed a
+# WRONG-JVM alert from a healthy box (TryTAK, 2026-10-23: "Reported as: /usr/bin/pgrep:
+# invalid option -- 'e'"). The console's _trusted_java_exe() always refused non-java names.
+PID=""
+JVM_EXE=""
+for _p in $PIDS; do
+  _e=$(readlink -f "/proc/$_p/exe" 2>/dev/null)
+  # Gone already (the other pgrep), or an unreadable /proc entry — not our JVM.
+  [ -n "$_e" ] && [ -f "$_e" ] || continue
+  [ "${_e##*/}" = "java" ] || continue
+  PID=$_p
+  JVM_EXE=$_e
+  break
+done
+if [ -z "$PID" ]; then
+  # Nothing in the list is a java launcher we can read — report unknown rather than
+  # guessing. An unknown must never become a false "wrong JVM" alert.
   echo "unknown=1" > "$STATUS_FILE" 2>/dev/null
   exit 0
 fi
@@ -77,7 +94,17 @@ if [ "$_OWNER" != "0" ] || [ -z "$_PERM" ] || [ $((0$_PERM & 022)) -ne 0 ]; then
   exit 0
 fi
 
-JVM_VER=$("$JVM_EXE" -version 2>&1 | head -1)
+# The version line, not just line 1: a JVM prints "Picked up JAVA_TOOL_OPTIONS: ..." first
+# when that is set, and that line has no version in it.
+_JOUT=$("$JVM_EXE" -version 2>&1)
+JVM_VER=$(printf '%s\n' "$_JOUT" | grep -m1 'version "')
+if [ -z "$JVM_VER" ]; then
+  # No Java version string at all, so whatever answered is not telling us its JVM. That is
+  # unknown, not wrong. Only a real Java version that is not 17 may page someone.
+  printf 'unknown=1\npid=%s\nexe=%s\nreported=%s\n' "$PID" "$JVM_EXE" \
+    "$(printf '%s\n' "$_JOUT" | head -1)" > "$STATUS_FILE" 2>/dev/null
+  exit 0
+fi
 printf 'pid=%s\nexe=%s\nversion=%s\n' "$PID" "$JVM_EXE" "$JVM_VER" > "$STATUS_FILE" 2>/dev/null
 
 case "$JVM_VER" in
