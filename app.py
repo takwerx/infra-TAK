@@ -43747,6 +43747,8 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
         # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        # GH #252: a past Update wiped TAK Portal's lint skip for its plugins — put it back.
+        _cloudtak_shield_foreign_plugins(ct_dir, plog)
         # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
         _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
         if not _hok:
@@ -44858,6 +44860,143 @@ def _cloudtak_web_dir(ct_dir):
 def _cloudtak_plugins_dir(ct_dir):
     """Where Vite's plugin glob looks in THIS tree."""
     return os.path.join(_cloudtak_web_dir(ct_dir), 'plugins')
+
+
+# GH #252: TAK Portal's CloudTAK Marketplace makes the image build skip lint/typecheck for the
+# plugins it installs by editing TRACKED files (app/package.json, api/eslint.config.js). Our
+# Update / revert `checkout -f` puts those back to stock while the plugin folders (untracked)
+# stay, so every later build lints third-party plugins and dies (a TAK Simulator install failed
+# on 271 ESLint errors, all in marketplace plugins). Before each build we re-apply the same
+# edits whenever the plugins dir holds a plugin we did not install. Same text and markers as
+# TAK Portal's cloudtakMarketplace.align.js, so its next align treats them as its own.
+_CT_MARKETPLACE_TSCONFIG = 'tsconfig.marketplace.json'
+_CT_MARKETPLACE_ROUTES_RE = re.compile(
+    r'[ \t]*/\* cloudtak-marketplace-routes \*/\r?\n[ \t]*\{ ignores: \[[^\]]*\] \},')
+
+
+def _cloudtak_foreign_plugins(ct_dir):
+    """Plugin folders in this tree that are neither ours (CLOUDTAK_PLUGINS) nor upstream's."""
+    base = _cloudtak_plugins_dir(ct_dir)
+    try:
+        names = sorted(n for n in os.listdir(base)
+                       if not n.startswith('.') and os.path.isdir(os.path.join(base, n)))
+    except OSError:
+        return []
+    ours = {p['install_dir'] for p in CLOUDTAK_PLUGINS}
+    names = [n for n in names if n not in ours]
+    if not names:
+        return []
+    rel = os.path.relpath(base, ct_dir)
+    try:
+        r = subprocess.run(['git', '-c', f'safe.directory={ct_dir}', '-C', ct_dir, 'ls-files', '--', rel],
+                           capture_output=True, text=True, timeout=60)
+        tracked = {ln[len(rel) + 1:].split('/', 1)[0] for ln in r.stdout.splitlines()
+                   if ln.startswith(rel + '/')} if r.returncode == 0 else set()
+    except Exception:
+        tracked = set()
+    return [n for n in names if n not in tracked]
+
+
+def _cloudtak_has_ts_nocheck(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return '@ts-nocheck' in f.read(4000)
+    except OSError:
+        return False
+
+
+def _cloudtak_rewrite_in_place(path, text):
+    # In place, not replace: the file keeps its owner and mode (non-root boxes).
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _cloudtak_shield_foreign_plugins(ct_dir, plog):
+    """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
+    raises and never blocks the build: at worst the build fails as it would have anyway."""
+    try:
+        foreign = _cloudtak_foreign_plugins(ct_dir)
+        if not foreign:
+            return
+        changed = []
+        web = _cloudtak_web_dir(ct_dir)
+        pkg = os.path.join(web, 'package.json')
+        if os.path.isfile(pkg):
+            with open(pkg, encoding='utf-8') as f:
+                text = f.read()
+
+            def _lint(m):
+                script = m.group(2)
+                new = re.sub(r'(?:^|\s)\./plugins/?(?=\s|$)', '', script)
+                new = re.sub(r'[ \t]{2,}', ' ', new).strip()
+                return m.group(1) + new + m.group(3) if new and new != script else m.group(0)
+
+            def _check(m):
+                script = m.group(2)
+                if not re.search(r'\bvue-tsc\b', script) or _CT_MARKETPLACE_TSCONFIG in script:
+                    return m.group(0)
+                new = re.sub(r'(?:--project|-p)\s+\S+', ' ', script)
+                new = re.sub(r'[ \t]{2,}', ' ', new).strip()
+                new = re.sub(r'\bvue-tsc\b', 'vue-tsc --project ' + _CT_MARKETPLACE_TSCONFIG, new, count=1)
+                return m.group(1) + new + m.group(3) if new != script else m.group(0)
+
+            new = re.sub(r'("lint"\s*:\s*")((?:\\.|[^"\\])*)(")', _lint, text, count=1)
+            new = re.sub(r'("check"\s*:\s*")((?:\\.|[^"\\])*)(")', _check, new, count=1)
+            if new != text:
+                _cloudtak_rewrite_in_place(pkg, new)
+                changed.append(os.path.relpath(pkg, ct_dir))
+            if _CT_MARKETPLACE_TSCONFIG in new:
+                overlay = os.path.join(web, _CT_MARKETPLACE_TSCONFIG)
+                want = json.dumps({'extends': './tsconfig.json',
+                                   'exclude': ['plugins', 'node_modules', 'dist']}, indent=2) + '\n'
+                try:
+                    with open(overlay, encoding='utf-8') as f:
+                        have = f.read()
+                except OSError:
+                    have = None
+                if have != want:
+                    _cloudtak_rewrite_in_place(overlay, want)
+                    changed.append(os.path.relpath(overlay, ct_dir))
+        # The api's own lint covers plugin server routes, and the marketplace files it marked
+        # @ts-nocheck (those marks are in untracked files, so they survive the checkout).
+        api = os.path.join(ct_dir, 'api')
+        cfg = os.path.join(api, 'eslint.config.js')
+        if os.path.isfile(cfg):
+            extras = set()
+            routes = os.path.join(api, 'stateless', 'routes')
+            if os.path.isdir(routes):
+                for n in os.listdir(routes):
+                    if (re.fullmatch(r'[A-Za-z0-9._-]+\.ts', n) and not n.startswith('plugin-')
+                            and _cloudtak_has_ts_nocheck(os.path.join(routes, n))):
+                        extras.add('stateless/routes/' + n)
+            for sub in ('stateless/lib', 'stateful/lib', 'common', 'test'):
+                for root, dirs, files in os.walk(os.path.join(api, sub)):
+                    dirs[:] = [d for d in dirs if d not in ('node_modules', 'dist')]
+                    for n in files:
+                        p = os.path.join(root, n)
+                        if n.endswith('.ts') and _cloudtak_has_ts_nocheck(p):
+                            extras.add(os.path.relpath(p, api).replace(os.sep, '/'))
+            patterns = ['stateless/routes/plugin-*.ts'] + sorted(extras)
+            block = ('    /* cloudtak-marketplace-routes */\n    { ignores: ['
+                     + ', '.join("'" + p.replace("'", '') + "'" for p in patterns) + '] },')
+            with open(cfg, encoding='utf-8') as f:
+                text = f.read()
+            needle = 'export default tseslint.config('
+            if _CT_MARKETPLACE_ROUTES_RE.search(text):
+                new = _CT_MARKETPLACE_ROUTES_RE.sub(lambda _m: block, text, count=1)
+            elif needle in text:
+                at = text.index(needle) + len(needle)
+                new = text[:at] + '\n' + block + text[at:]
+            else:
+                new = text
+            if new != text:
+                _cloudtak_rewrite_in_place(cfg, new)
+                changed.append(os.path.relpath(cfg, ct_dir))
+        if changed:
+            plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
+                 f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
+    except Exception as e:
+        plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
 
 
 # v10.2.7 — the same Garage step for a CloudTAK that lives on another host. There the SSH user is
@@ -46168,6 +46307,9 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as e:
             plog(f"    ⚠ Could not check resources: {e}")
 
+        # GH #252: a redeploy over a tree with TAK Portal marketplace plugins must not lint them.
+        _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
+
         # Build with retry logic (up to 2 attempts)
         MAX_BUILD_ATTEMPTS = 2
         BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
@@ -47110,6 +47252,7 @@ def _run_cloudtak_prebuild_hooks(cloudtak_dir, phase, plog, tag='', prev_sha='')
 def _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog):
     """#150: a revert's checkout -f wipes the operator's patch too — put it back, or the next
     plugin rebuild bakes stock source. Never fails the caller."""
+    _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)   # GH #252: same for TAK Portal's lint skip
     _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert', plog, prev_sha=prev_sha)
     if not _hok:
         plog(f"  ⚠ Pre-build hook {_hname} failed on the reverted tree — the running "
@@ -47648,6 +47791,8 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+            # GH #252: the checkout just reset TAK Portal's lint skip for its plugins.
+            _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
             # #150: the operator's own source patches, after ours and before the build.
             # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
             _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
