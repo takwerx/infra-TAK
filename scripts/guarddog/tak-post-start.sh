@@ -53,6 +53,7 @@ source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 MAX_WAIT_TAK=900
 MAX_WAIT_AK=300
 INTERVAL=10
+AK_LOCK_WAIT=180            # app.py _AK_COMPOSE_LOCK_WAIT_S
 
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') post-start: $1"
@@ -87,23 +88,37 @@ AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
 if [ -n "$AK_DIR" ]; then
   cd "$AK_DIR"
 
-  # Stagger: start PostgreSQL first and wait for it to accept connections
-  _log "Starting Authentik PostgreSQL..."
-  docker compose up -d postgresql 2>/dev/null
-  _pg_t=0
-  while [ $_pg_t -lt 60 ]; do
-    if docker compose exec -T postgresql pg_isready -U authentik 2>/dev/null; then
-      _log "PostgreSQL ready (${_pg_t}s)"
-      break
-    fi
-    sleep 2
-    _pg_t=$((_pg_t + 2))
-  done
-  [ $_pg_t -ge 60 ] && _log "PostgreSQL not ready after 60s, starting server anyway"
+  # ops #180: the starts below run under the console's compose lock, ONE hold for the
+  # whole stagger, as the watcher does for its down+up. At boot the console runs its own
+  # `docker compose up -d` on this project (idle-load converge, stack-down heal) in these
+  # same minutes. Busy means the console is mid-compose: skip, as every other caller
+  # does. The console's run starts Authentik itself, the checks below still watch it come
+  # up, and Guard Dog's watcher takes over after its 10-minute boot grace.
+  gd_ak_lock_take "$AK_LOCK_WAIT"; _lk=$?
+  if [ "$_lk" -eq 1 ]; then
+    _log "Authentik compose lock busy for ${AK_LOCK_WAIT}s (console is mid-compose on Authentik) — not starting it here"
+  else
+    [ "$_lk" -ne 0 ] && _log "Authentik compose lock: ${GD_AK_LOCK_WHY:-lock helper missing} — starting Authentik UNLOCKED"
 
-  # Start remaining services (compose depends_on handles ordering)
-  _log "Starting Authentik server and worker..."
-  docker compose up -d 2>/dev/null
+    # Stagger: start PostgreSQL first and wait for it to accept connections
+    _log "Starting Authentik PostgreSQL..."
+    docker compose up -d postgresql 2>/dev/null
+    _pg_t=0
+    while [ $_pg_t -lt 60 ]; do
+      if docker compose exec -T postgresql pg_isready -U authentik 2>/dev/null; then
+        _log "PostgreSQL ready (${_pg_t}s)"
+        break
+      fi
+      sleep 2
+      _pg_t=$((_pg_t + 2))
+    done
+    [ $_pg_t -ge 60 ] && _log "PostgreSQL not ready after 60s, starting server anyway"
+
+    # Start remaining services (compose depends_on handles ordering)
+    _log "Starting Authentik server and worker..."
+    docker compose up -d 2>/dev/null
+    [ "$_lk" -eq 0 ] && gd_ak_lock_drop
+  fi
 
   _t=0
   while [ $_t -lt $MAX_WAIT_AK ]; do
@@ -158,7 +173,15 @@ if [ -n "$AK_DIR" ]; then
 
   if [ $_ldap_ok -eq 0 ]; then
     _log "LDAP outpost NOT resolving groups after ${_MAX_LDAP}s — force-recreating (this is the GH #64 boot race)"
-    cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>/dev/null
+    # ops #180: under the compose lock too. Busy: skip, and the check below says so.
+    gd_ak_lock_take "$AK_LOCK_WAIT"; _lk=$?
+    if [ "$_lk" -eq 1 ]; then
+      _log "Authentik compose lock busy for ${AK_LOCK_WAIT}s (console is mid-compose on Authentik) — LDAP recreate skipped"
+    else
+      [ "$_lk" -ne 0 ] && _log "Authentik compose lock: ${GD_AK_LOCK_WHY:-lock helper missing} — recreating LDAP UNLOCKED"
+      cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>/dev/null
+      [ "$_lk" -eq 0 ] && gd_ak_lock_drop
+    fi
     sleep 30
     if gd_ldap_groups_ok "$AK_DIR"; then
       _log "LDAP outpost recovered after recreate — groups resolving"

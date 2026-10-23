@@ -461,3 +461,38 @@ gd_dbserver_standdown() {
   fi
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# ops #180: the Authentik compose lock, for the boot scripts.
+#
+# The console (fcntl.flock in app.py's _authentik_compose_lock) and
+# tak-authentik-watch.sh (flock(1)) already serialise every Authentik `docker compose`
+# on this file. tak-boot-sequencer.sh and tak-post-start.sh did not, and they run in
+# exactly the minutes the console is busiest with Authentik: right after boot the
+# console's idle-load converge and stack-down heal run `docker compose up -d` on the
+# same project while post-start runs its own `up -d` and the sequencer its `stop`.
+# Two compose runs on one project is what left `<hash>_authentik-server-1` behind
+# (ops #173). The watcher sits out the first 10 minutes of uptime, so it never met them.
+#
+# Same path and same open as the watcher; see the comments there. Read-only (`9<`)
+# because fs.protected_regular=2 refuses root's O_CREAT open of the console's file in
+# sticky /tmp; create it only when missing, 0666, and never chmod an existing one.
+GD_AK_LOCK="/tmp/takwerx-authentik-compose.lock"
+
+# gd_ak_lock_take <wait_secs>  -> 0 = held on fd 9; 1 = busy for wait_secs, nothing held,
+# do NOT run the compose call; 2 = no lock possible here (GD_AK_LOCK_WHY says why), run
+# as before rather than stop managing Authentik — the console and watcher do the same.
+gd_ak_lock_take() {
+  GD_AK_LOCK_WHY=""
+  command -v flock >/dev/null 2>&1 || { GD_AK_LOCK_WHY="flock unavailable"; return 2; }
+  [ -e "$GD_AK_LOCK" ] || [ -L "$GD_AK_LOCK" ] || ( umask 000; : >> "$GD_AK_LOCK" ) 2>/dev/null
+  { exec 9<"$GD_AK_LOCK"; } 2>/dev/null || { GD_AK_LOCK_WHY="cannot open $GD_AK_LOCK"; return 2; }
+  flock -w "$1" 9 && return 0
+  exec 9<&-
+  return 1
+}
+
+gd_ak_lock_drop() {
+  flock -u 9 2>/dev/null || true
+  exec 9<&- 2>/dev/null || true
+}

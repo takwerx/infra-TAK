@@ -56,7 +56,7 @@ exec('\n'.join(_CONST_SRC), _c)
 WEBODM_NOTE = _c['WEBODM_REDEPLOY_NOTE']
 
 
-def _run(step_warnings=(), status=None):
+def _run(step_warnings=(), status=None, heal_lines=()):
     """Run a remote reconfigure. step_warnings: ⚠ lines that API steps log, as in the field."""
     parts = [ast.get_source_segment(APP, n) for n in _TREE.body
              if isinstance(n, ast.FunctionDef) and n.name in _WANT]
@@ -87,6 +87,8 @@ def _run(step_warnings=(), status=None):
         '_is_module_deployed': lambda s, m: True,
         '_get_fedhub_deployment_config': lambda s: {},
         '_sync_webadmin_after_authentik_reconfigure': step,
+        # ops #184: the TAK client heal at the end (tested in test_tak_ldap_recycle.py)
+        '_authentik_reconfigure_heal_tak_clients': lambda plog: [plog(l) for l in heal_lines],
     }
     for name in ('_ensure_proxy_providers_cookie_domain', '_sync_authentik_takportal_provider_url',
                  '_ensure_authentik_nodered_app', '_ensure_authentik_webodm_app',
@@ -124,6 +126,14 @@ def test_a_late_failure_in_webadmin_sync_is_counted():
     # The WebAdmin/Caddy sync runs last; it used to run after "complete" was printed.
     status, log = _run(['  ⚠ WebAdmin sync failed: boom'])
     assert status['partial'], log
+
+
+def test_ops184_a_tak_client_heal_that_could_not_run_makes_the_run_partial():
+    line = '  ✗ TAK LDAP recycle: LDAP is not healthy — TAK clients NOT healed, TAK Server NOT restarted'
+    status, log = _run(heal_lines=['  TAK LDAP recycle (end of Authentik Reconfigure): checking LDAP first...', line])
+    assert status['partial'] and status['issues'] == [line.strip()], log
+    status, log = _run(heal_lines=['  ✓ TAK LDAP recycle: all 3 client connection(s) have their groups'])
+    assert status['complete'] and not status['partial'], log
 
 
 def test_a_new_run_clears_the_previous_partial():

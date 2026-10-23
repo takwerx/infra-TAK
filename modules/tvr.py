@@ -46,6 +46,26 @@ TVR_MEDIAMTX_SHA256 = {
     'arm64': '180a235374a548d9133cdd5e20f5dbd8b01317be1c86e0d7e66df585dc42ed6f',
 }
 
+# Security update — the Python packages inside the TVR image. Upstream's requirements.txt
+# (at TVR_SHA) pins releases with known flaws; patch_requirements() rewrites those pins
+# before the build. name: (upstream's pin at TVR_SHA, ours). Moving TVR_SHA means
+# re-checking the left column — the patch refuses to build if it no longer matches.
+TVR_PY_PINS = {
+    'Flask':           ('3.0.0', '3.1.3'),
+    'Flask-SocketIO':  ('5.3.5', '5.7.0'),
+    'Flask-CORS':      ('4.0.0', '6.0.5'),
+    'python-socketio': ('5.10.0', '5.17.0'),
+    'requests':        ('2.31.0', '2.34.2'),
+    'python-engineio': ('4.8.0', '4.14.0'),
+    'eventlet':        ('0.35.1', '0.41.3'),
+    # Not 24+: TVR's start.sh runs `gunicorn --worker-class eventlet`, which 25.x deprecates
+    # and 26.0 removes. 23.0.0 is the console's own gunicorn.
+    'gunicorn':        ('21.2.0', '23.0.0'),
+}
+# Recorded in settings at build time, so a box built with older pins is offered the update.
+TVR_PY_PINS_REV = hashlib.sha256(
+    ','.join(f'{n}=={v[1]}' for n, v in sorted(TVR_PY_PINS.items())).encode()).hexdigest()[:12]
+
 # v10.2.21: field publishers (cameras, drones, OBS) log in as this user with a per-box
 # password (settings 'tak_video_restreamer_publish_password'). Publishing used to be open
 # to anyone who could reach the stream ports. TVR's own publishers (pull sources, test
@@ -268,6 +288,40 @@ def patch_dockerfile(text, arch):
     return patched
 
 
+def _req_name(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+_REQ_PIN_RE = re.compile(r'^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*==[ \t]*(?P<ver>[^\s#;]+)', re.M)
+
+
+def patch_requirements(text):
+    """Rewrite upstream's pins for every TVR_PY_PINS package to ours. Re-patching is a
+    no-op. Raises if a package is missing or pinned to a version we don't know — building
+    whatever upstream picked is what this prevents."""
+    pins = {_req_name(n): (n, up, ours) for n, (up, ours) in TVR_PY_PINS.items()}
+    seen = set()
+
+    def _sub(m):
+        key = _req_name(m.group('name'))
+        if key not in pins:
+            return m.group(0)
+        name, up, ours = pins[key]
+        if key in seen:
+            raise RuntimeError(f'TVR requirements.txt pins {name} twice — refusing to build')
+        seen.add(key)
+        if m.group('ver') not in (up, ours):
+            raise RuntimeError(f'TVR requirements.txt pins {name}=={m.group("ver")}, expected {up} — '
+                               'refusing to build until the console\'s Python pins are re-checked')
+        return f'{m.group("name")}=={ours}'
+
+    patched = _REQ_PIN_RE.sub(_sub, text)
+    missing = sorted(pins[k][0] for k in set(pins) - seen)
+    if missing:
+        raise RuntimeError(f'TVR requirements.txt has no pin for {", ".join(missing)} — refusing to build')
+    return patched
+
+
 def checkout_pin(git, plog):
     """Bring a TVR clone to TVR_SHA and return it. `git(*args)` runs git in the clone.
 
@@ -325,7 +379,7 @@ def get_version_info(ctx):
     """Return {version, update_available, latest, security_update, publish_login_new} for
     TAK Video Restreamer. Compares the FULL local SHA against the pin TVR_SHA (since
     v10.2.21 — it used to chase upstream main). The commit is not the whole story: the
-    MediaMTX inside the image and the publish login come from this console, so a box that
+    MediaMTX and Python pins inside the image and the publish login come from this console, so a box that
     has not been rebuilt since gets the update too (security_update). publish_login_new
     tells the page the update will start asking publishers for a login."""
     info = {'version': '', 'update_available': False, 'latest': TVR_SHA[:7],
@@ -342,7 +396,8 @@ def get_version_info(ctx):
     s = ctx['load_settings']()
     info['publish_login_new'] = not s.get('tak_video_restreamer_publish_password')
     info['security_update'] = (info['publish_login_new'] or
-                               s.get('tak_video_restreamer_mediamtx_version') != TVR_MEDIAMTX_VERSION)
+                               s.get('tak_video_restreamer_mediamtx_version') != TVR_MEDIAMTX_VERSION or
+                               s.get('tak_video_restreamer_py_pins') != TVR_PY_PINS_REV)
     info['update_available'] = info['security_update'] or bool(local_full and local_full != TVR_SHA)
     return info
 
@@ -433,6 +488,12 @@ def deploy(ctx, job, params):
         with open(_tvr_dockerfile, 'w') as _df:
             _df.write(patch_dockerfile(_dfc, arch))
         plog(f'  ✓ Dockerfile: MediaMTX {TVR_MEDIAMTX_VERSION} ({arch}, checksum-verified at build)')
+        _tvr_reqs = os.path.join(tvr_dir_, 'requirements.txt')
+        with open(_tvr_reqs) as _rf:
+            _rqc = _rf.read()
+        with open(_tvr_reqs, 'w') as _rf:
+            _rf.write(patch_requirements(_rqc))
+        plog(f'  ✓ requirements.txt: {len(TVR_PY_PINS)} Python packages moved to patched releases')
 
         # Step 3: Write infra-TAK compose + mediaMTX.yml
         plog('')
@@ -500,6 +561,7 @@ def deploy(ctx, job, params):
         s['tak_video_restreamer_publish_password'] = publish_pass
         s['tak_video_restreamer_commit_sha'] = commit_sha
         s['tak_video_restreamer_mediamtx_version'] = TVR_MEDIAMTX_VERSION
+        s['tak_video_restreamer_py_pins'] = TVR_PY_PINS_REV
         ctx['save_settings'](s)
         ctx['generate_caddyfile'](s)
         # v10.1.50: ctx['_caddy_reload'] never raises and never hangs. The try/except that
@@ -632,6 +694,9 @@ def _run_update(ctx):
         _tvr_dockerfile = os.path.join(dirpath, 'Dockerfile')
         ctx['_write_priv'](_tvr_dockerfile, patch_dockerfile(ctx['_read_priv'](_tvr_dockerfile), arch))
         plog(f'✓ Dockerfile: MediaMTX {TVR_MEDIAMTX_VERSION} ({arch}, checksum-verified at build)')
+        _tvr_reqs = os.path.join(dirpath, 'requirements.txt')
+        ctx['_write_priv'](_tvr_reqs, patch_requirements(ctx['_read_priv'](_tvr_reqs)))
+        plog(f'✓ requirements.txt: {len(TVR_PY_PINS)} Python packages moved to patched releases')
 
         plog('')
         plog('━━━ Step 3/4: Rebuilding Docker image ━━━')
@@ -645,6 +710,7 @@ def _run_update(ctx):
         s = ctx['load_settings']()
         s['tak_video_restreamer_commit_sha'] = new_sha
         s['tak_video_restreamer_mediamtx_version'] = TVR_MEDIAMTX_VERSION
+        s['tak_video_restreamer_py_pins'] = TVR_PY_PINS_REV
         ctx['save_settings'](s)
         plog(f'✓ TAK Video Restreamer updated to {new_sha}')
         _update_status.update({'running': False, 'complete': True, 'error': False})
@@ -754,5 +820,6 @@ def register(ctx):
         'service_units': [],           # docker compose only — no systemd unit
         'settings_keys': ['tak_video_restreamer_enabled', 'tak_video_restreamer_admin_password',
                           'tak_video_restreamer_secret_key', 'tak_video_restreamer_commit_sha',
-                          'tak_video_restreamer_publish_password', 'tak_video_restreamer_mediamtx_version'],
+                          'tak_video_restreamer_publish_password', 'tak_video_restreamer_mediamtx_version',
+                          'tak_video_restreamer_py_pins'],
     })
