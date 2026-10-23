@@ -45734,30 +45734,73 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
     decisive matched.
 
     Never raises: a hint is a convenience, and must not turn a build failure into a
-    traceback that hides the failure it was meant to explain."""
+    traceback that hides the failure it was meant to explain.
+
+    GH #249: npm 10+ (every CloudTAK image since node:22) prints `npm error`, not
+    `npm ERR!`, so an npm failure matched nothing and the operator got the bare exit code.
+    A step killed for memory also exits 1 through npm, and a lint or vite failure prints no
+    npm line at all — each of those is named here too."""
     try:
         ts_plugin = {}
         ts_other = None
         npm_err = None
+        npm_net = None
         apt_fail = None
         disk_full = False
         rate_limited = False
+        out_of_memory = None
+        lint_fail = None
+        lint_file = None
+        lint_plugins = []
+        vite_fail = None
+        failed_step = None
 
         for ln in lines:
+            # ESLint prints each file's path, then its "12:5  error ..." lines
+            m = re.search(r'\s(/\S+\.(?:ts|js|vue|mjs|cjs))\s*$', ln)
+            if m:
+                lint_file = m.group(1)
+            elif lint_file and re.search(r'\s\d+:\d+\s+error\s', ln):
+                m = re.search(r'/app/plugins/([\w.-]+)/', lint_file)
+                if m and m.group(1) not in lint_plugins:
+                    lint_plugins.append(m.group(1))
             if 'error TS' in ln:
                 m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
                 if m:
                     ts_plugin.setdefault(m.group(2), ln.strip())
                 elif ts_other is None:
                     ts_other = ln.strip()
-            elif npm_err is None and 'npm ERR!' in ln:
-                npm_err = ln.strip()
+            elif re.search(r'npm (?:ERR!|error) ', ln):
+                _said = re.split(r'npm (?:ERR!|error) ', ln, maxsplit=1)[1].strip()
+                if npm_net is None and re.search(
+                        r'\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|'
+                        r'ERR_SOCKET_TIMEOUT|network)\b', _said):
+                    npm_net = ln.strip()
+                if out_of_memory is None and re.search(r'signal SIGKILL|\bENOMEM\b', _said):
+                    out_of_memory = ln.strip()
+                # npm's own bookkeeping lines say nothing about the cause
+                if npm_err is None and _said and not re.match(
+                        r'(?:A complete log|command|path|workspace|location|code 1$|signal)', _said):
+                    npm_err = ln.strip()
+            elif out_of_memory is None and re.search(
+                    r'JavaScript heap out of memory|Reached heap limit|exit code: 137\b|'
+                    r'\bKilled\s*$|\bENOMEM\b', ln):
+                out_of_memory = ln.strip()
             elif apt_fail is None and 'exit code: 100' in ln:
                 apt_fail = ln.strip()
             elif 'no space left on device' in ln:
                 disk_full = True
             elif 'toomanyrequests' in ln or 'pull rate limit' in ln:
                 rate_limited = True
+            # a passing lint prints "✖ 119 problems (0 errors, 119 warnings)" too
+            elif lint_fail is None and re.search(r'✖ \d+ problems? \([1-9]\d* errors?', ln):
+                lint_fail = ln.strip()
+            elif vite_fail is None and 'error during build' in ln:
+                vite_fail = ln.strip()
+            if failed_step is None and 'did not complete successfully' in ln:
+                m = re.search(r'process "(?:/bin/sh -c )?(.+?)" did not complete', ln)
+                if m:
+                    failed_step = m.group(1).strip()
 
         out = []
         if ts_plugin:
@@ -45783,6 +45826,29 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the disk filled up during the build.')
             out.append('  Free space and retry - see the Disk card on the dashboard.')
+        elif out_of_memory:
+            out.append('')
+            out.append('Likely cause: the build ran out of memory (the step was killed).')
+            out.append('  %s' % out_of_memory[:220])
+            out.append('  The CloudTAK build needs about 4 GB free RAM on top of what is running.')
+            out.append('  Add RAM or swap, or retry when the server is quieter.')
+        elif npm_net:
+            out.append('')
+            out.append('Likely cause: npm could not download packages (network).')
+            out.append('  %s' % npm_net[:220])
+            out.append('  Check this server can reach registry.npmjs.org, then retry.')
+        elif lint_fail:
+            out.append('')
+            out.append('Likely cause: the CloudTAK lint check (ESLint) failed.')
+            out.append('  %s' % lint_fail[:220])
+            if lint_plugins:
+                out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
+                           % ', '.join(lint_plugins))
+                out.append('  CloudTAK itself is not the problem - update or remove the plugin(s), then retry.')
+        elif vite_fail:
+            out.append('')
+            out.append('Likely cause: the CloudTAK web app build (vite) failed.')
+            out.append('  %s' % vite_fail[:220])
         elif rate_limited:
             out.append('')
             out.append('Likely cause: Docker Hub pull rate limit.')
@@ -45795,6 +45861,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: an npm step failed inside the build.')
             out.append('  %s' % npm_err[:220])
+        if failed_step:
+            if not out:
+                out.append('')
+                out.append('The build step that failed (its own error is in the output above it):')
+            out.append('  Failed step: %s' % failed_step[:220])
         return out
     except Exception:
         return []
