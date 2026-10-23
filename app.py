@@ -85671,6 +85671,21 @@ def run_takserver_deploy(config):
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
                 _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
 
+        # ops #195: Step 7 generated a NEW CA + admin.p12, so a TAK Portal that was already
+        # installed still holds the OLD CA and client cert. The container deploy has re-synced
+        # them since v10.0.1; this native path never did, so a .deb/.rpm reinstall left the
+        # portal failing every API call (SELF_SIGNED_CERT_IN_CHAIN on 8443) and every 8089
+        # stream handshake ("peer not verified") — dashboard says TAK Server not connected,
+        # no clients, silently, until someone pressed Sync Portal CA. No-ops when TAK Portal
+        # isn't installed. See memory takportal-stale-client-cert-on-redeploy.
+        try:
+            if _takportal_web_running():
+                log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
+                log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+        except Exception as _tpe:
+            log_step(f"  ⚠ TAK Portal cert sync skipped (non-fatal): {str(_tpe)[:120]}")
+
         log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
         log_step(f"  WebGUI (cert):     https://{ip}:8443")
         if webadmin_pass:
