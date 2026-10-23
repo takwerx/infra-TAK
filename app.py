@@ -62831,12 +62831,23 @@ def _authentik_server_direct_live():
         r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-server-1', 'ak', 'dump_config']),
                            capture_output=True, text=True, timeout=60)
         out = r.stdout or ''
-        if r.returncode != 0 or '{' not in out:
+        if r.returncode != 0:
             return None
-        cfg = json.loads(out[out.find('{'):])
     except Exception:
         return None
-    direct = (cfg.get('postgresql') or {}).get('direct') if isinstance(cfg, dict) else None
+    # The dump is one indented JSON object; skip any one-line JSON log events before it.
+    cfg = None
+    for m in re.finditer(r'^\{', out, re.M):
+        try:
+            obj = json.JSONDecoder().raw_decode(out[m.start():])[0]
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and 'postgresql' in obj:
+            cfg = obj
+            break
+    if cfg is None:
+        return None
+    direct = (cfg.get('postgresql') or {}).get('direct')
     return direct if isinstance(direct, dict) else {}
 
 
@@ -62933,9 +62944,9 @@ def _ensure_authentik_server_direct_listen(plog):
         new_lines.append(ln)
     missing = [want for k, want in keys.items() if k not in placed]
     if missing:
-        if new_lines and new_lines[-1].strip():
-            new_lines.append('')
         if not any(ln.startswith('# ops #177:') for ln in new_lines):
+            if new_lines and new_lines[-1].strip():
+                new_lines.append('')
             new_lines += _AK_DIRECT_ENV_COMMENT
         new_lines += missing
     new_text = '\n'.join(new_lines) + '\n'
