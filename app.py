@@ -24010,8 +24010,8 @@ def _monitor_health_check(monitor_id):
                 # reading rather than reporting unknown forever on most of the fleet.
                 _kv = _jvm_status_from_guarddog(_pid)
                 _jv = (_kv or {}).get('version', '')
-            if not _jv.strip():
-                return None          # unknown is grey, never a false red
+            if 'version "' not in _jv:
+                return None          # no Java version string = unknown: grey, never a false red
             return ('version "17.' in _jv) or ('version "17"' in _jv)
         if monitor_id == 'intca':
             for name in ('ca.pem', 'ca-do-not-delete.pem', 'intermediate-ca.pem'):
@@ -87772,14 +87772,37 @@ def _trusted_java_exe(pid):
 
 def _tak_api_pid():
     """PID of the TAK API JVM, or None. `pgrep` works as any user — only reading
-    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles."""
+    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles.
+
+    The first PID that is a java process, not just the first one listed. pgrep skips only
+    itself, so tak-jvm-watch.sh running the same pgrep at the same moment shows up too, and
+    after a PID wrap it sorts ahead of the JVM (TryTAK, 2026-10-23). The exe name is read
+    when we may; a non-root console falls back to /proc/<pid>/comm, which any user can read.
+    A PID we cannot classify at all is kept, as before.
+    """
     try:
         r = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
                            capture_output=True, text=True, timeout=5)
         pids = (r.stdout or '').split()
-        return pids[0] if pids else None
     except Exception:
         return None
+    for pid in pids:
+        try:
+            name = os.path.basename(os.readlink(f'/proc/{pid}/exe'))
+        except FileNotFoundError:
+            continue                         # exited since pgrep — the other pgrep, usually
+        except OSError:
+            try:
+                with open(f'/proc/{pid}/comm') as f:
+                    name = f.read().strip()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                name = None
+        # A JDK upgraded under a running JVM reads 'java (deleted)'; that is still the JVM.
+        if name is None or name.split(' ')[0] == 'java':
+            return pid
+    return None
 
 
 def _jvm_status_from_guarddog(api_pid):
