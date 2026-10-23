@@ -16117,12 +16117,16 @@ _remote_assist_uninstall_status = {'running': False, 'complete': False, 'error':
 
 
 def _remote_assist_restore_tracked_files(ra_dir):
-    """Discard legacy infra-TAK patches to tracked files so git pull succeeds (v2.1.0+ uses .env only)."""
+    """Discard infra-TAK patches to tracked files so git pull succeeds (v2.1.0+ uses .env only).
+    server/package.json carries the build-time npm security pin (ops #190), rewritten before
+    every build."""
     import subprocess as _sp
     if not os.path.isdir(os.path.join(ra_dir, '.git')):
         return
-    _sp.run(['git', '-C', ra_dir, 'checkout', '--', 'docker-compose.yml'],
-            capture_output=True, text=True, timeout=30)
+    # One file per call: git refuses the whole pathspec if any one path is unknown.
+    for _f in ('docker-compose.yml', 'server/package.json'):
+        _sp.run(['git', '-C', ra_dir, 'checkout', '--', _f],
+                capture_output=True, text=True, timeout=30)
 
 
 def _remote_assist_read_version_file(ra_dir):
@@ -16205,6 +16209,95 @@ def _pull_base_images(build_dir, wrap=None, plog=None, timeout=300):
         else:
             _log(f'  ✓ {img} current')
     return failed
+
+
+# ops #190 (GHSA-27r3-jxmh-p828, High): body-parser below 1.20.9 / 2.4.0 lets one request
+# with a compressed body crash the whole Node process. Parsing runs before routing, so it
+# needs no login and no real route. TAK Portal (2.3.0) and Remote Assist (1.20.5) are built
+# ON THE BOX from upstream lockfiles that still pin the old release, so every image build
+# first writes an npm `overrides` entry into the checkout's package.json — the npm side of
+# what modules/tvr.py patch_requirements() does for TVR's Python pins. A checkout discards
+# it (both Update paths reset tracked files) and the next build writes it again.
+# Driven by the LOCKFILE, not by a fixed version: it fires only while the lock resolves a
+# release below the fix, and always as `^fix` on the major the lock already uses (Express 4
+# uses body-parser 1.x, Express 5 uses 2.x). Once upstream bumps the lock it does nothing.
+# https://docs.npmjs.com/cli/v10/configuring-npm/package-json#overrides
+NPM_SECURITY_FLOORS = {
+    'body-parser': ('1.20.9', '2.4.0'),   # GHSA-27r3-jxmh-p828
+}
+
+
+def _npm_security_overrides(pkg, lock, floors=None):
+    """npm `overrides` entries a project needs so its build resolves NPM_SECURITY_FLOORS.
+
+    `pkg` / `lock` are the parsed package.json / package-lock.json. Returns
+    ({name: '^fix'}, [note, ...]). Adds nothing when the lock is already at or above the
+    fix, when upstream already overrides the package (their call), when it is a direct
+    dependency (npm rejects an override that differs from one), or when the lock carries
+    more than one major of it (a single override would force them all onto one)."""
+    floors = NPM_SECURITY_FLOORS if floors is None else floors
+    add, notes = {}, []
+    packages = (lock or {}).get('packages') or {}
+    direct = set()
+    for k in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+        direct.update(((pkg or {}).get(k) or {}).keys())
+    existing = (pkg or {}).get('overrides') or {}
+    for name, fixes in floors.items():
+        versions = sorted({str(v.get('version') or '') for k, v in packages.items()
+                           if k == f'node_modules/{name}' or k.endswith(f'/node_modules/{name}')})
+        found = [(v, _semver_tuple(v)) for v in versions]
+        if not found:
+            continue
+        if any(t is None for _, t in found):
+            notes.append(f'{name}: lockfile version not understood ({", ".join(versions)}) — left alone')
+            continue
+        majors = {t[0] for _, t in found}
+        if len(majors) != 1:
+            notes.append(f'{name}: lockfile has several major versions ({", ".join(versions)}) — left alone')
+            continue
+        fix = next((f for f in fixes if _semver_tuple(f)[0] in majors), None)
+        if fix is None or all(t >= _semver_tuple(fix) for _, t in found):
+            continue
+        if existing.get(name) == f'^{fix}':
+            continue                # ours, left by a checkout that did not reset the file
+        if name in existing:
+            notes.append(f'{name}: upstream already overrides it ({existing[name]!r}) — left alone')
+            continue
+        if name in direct:
+            notes.append(f'{name}: direct dependency at {", ".join(versions)} — cannot override, '
+                         f'needs upstream to move to {fix}')
+            continue
+        add[name] = f'^{fix}'
+        notes.append(f'{name} {", ".join(versions)} → ^{fix}')
+    return add, notes
+
+
+def _apply_npm_security_overrides(project_dir, plog=None):
+    """Write _npm_security_overrides() into project_dir/package.json before an image build.
+    Returns the entries added. Never raises: the build goes on without the bump rather than
+    not at all, and says so (the Caddy edge already strips the trigger — ops #190)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    pkg_path = os.path.join(project_dir, 'package.json')
+    try:
+        with open(pkg_path, encoding='utf-8') as f:
+            pkg = json.load(f)
+        try:
+            with open(os.path.join(project_dir, 'package-lock.json'), encoding='utf-8') as f:
+                lock = json.load(f)
+        except FileNotFoundError:
+            return {}
+        add, notes = _npm_security_overrides(pkg, lock)
+        for n in notes:
+            _log(f'  npm security pin: {n}')
+        if not add:
+            return {}
+        pkg['overrides'] = {**(pkg.get('overrides') or {}), **add}
+        with open(pkg_path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(pkg, indent=2, ensure_ascii=False) + '\n')
+        return add
+    except Exception as e:
+        _log(f'  ⚠ npm security pin not applied ({pkg_path}): {str(e)[:200]} — building upstream\'s lockfile as-is')
+        return {}
 
 
 def _remote_assist_compose_files(ra_dir):
@@ -16673,6 +16766,7 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        _apply_npm_security_overrides(os.path.join(ra_dir, 'server'), plog=plog)  # ops #190
         _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
@@ -16928,6 +17022,7 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        _apply_npm_security_overrides(os.path.join(ra_dir, 'server'), plog=plog)  # ops #190
         _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
@@ -25054,6 +25149,10 @@ KNOWN_SECURITY_RELEASES = (
     {'component': 'cloudtak', 'fixed_in': '13.112.2',
      'reason': 'Node.js security fixes CVE-2026-111497 and CVE-2026-106069 '
                '(API image rebuilt on Node 26)'},
+    # ops #190: CloudTAK's own GHSA list does not cover a dependency advisory.
+    {'component': 'cloudtak', 'fixed_in': '13.113.0',
+     'reason': 'body-parser security fix GHSA-27r3-jxmh-p828 (an unauthenticated request '
+               'could crash the API)'},
 )
 
 
@@ -33206,6 +33305,26 @@ def _caddy_stream_close_delay_lines(indent):
     return [f"{indent}stream_close_delay {CADDY_STREAM_CLOSE_DELAY}"]
 
 
+# ops #190 (GHSA-27r3-jxmh-p828): the edge half of the body-parser fix (the build half is
+# _apply_npm_security_overrides). A body-parser below 1.20.9 / 2.4.0 crashes the whole Node
+# process on a compressed request body with trailing bytes, before any route or login.
+# TAK Portal, Remote Assist, Node-RED and CloudTAK are Express apps and each has public
+# paths. None of their clients compresses a request body, so these vhosts drop the request's
+# Content-Encoding: the app reads the body as sent and never starts a decoder. This covers a
+# box the moment its Caddyfile regenerates, without waiting for a rebuild of each image.
+# Why strip rather than `respond 415`: in a Caddyfile, `respond` and a header-matched `route`
+# sort AFTER `handle` and after path-matched routes, so TAK Portal's public paths and the
+# Remote Assist device API would be proxied first. `request_header` sorts ahead of all of
+# them. https://caddyserver.com/docs/caddyfile/directives#directive-order
+CADDY_DROP_REQUEST_ENCODING = 'request_header -Content-Encoding'
+
+
+def _caddy_drop_request_encoding_lines(indent='    '):
+    """Site-level line for every vhost that fronts an Express app (ops #190)."""
+    return [f"{indent}# ops #190: no client compresses request bodies; drop the header (GHSA-27r3-jxmh-p828)",
+            f"{indent}{CADDY_DROP_REQUEST_ENCODING}"]
+
+
 def _caddy_rescue_html_oneline(root_url):
     """The callback-rescue page as ONE Caddyfile-safe token, for Caddy < 2.7.
 
@@ -33649,6 +33768,51 @@ def _startup_caddy_read_body_idle_converge():
     print('Startup migration: ✓ Caddyfile now keeps NetBird gRPC streams open '
           '(read_body_idle off) and Caddy %s' % ('reloaded' if _ok else
                                                  'reload FAILED: ' + _detail[:120]), flush=True)
+
+
+# Comment headers generate_caddyfile() writes above each vhost that gets the ops #190 line.
+_CADDY_EXPRESS_VHOST_MARKERS = ('# Node-RED flow editor', '# TAK Portal', '# CloudTAK Web UI',
+                                '# EUD Remote Assist')
+
+
+def _startup_caddy_request_encoding_converge():
+    """ops #190 — put CADDY_DROP_REQUEST_ENCODING into the Express vhosts on boxes that
+    already have them, so the console update itself closes GHSA-27r3-jxmh-p828 at the edge
+    (the image rebuilds only happen on the next Deploy/Update of each module). Same shape as
+    _startup_caddy_read_body_idle_converge(): one read on every box it does not apply to."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: request Content-Encoding converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if CADDY_DROP_REQUEST_ENCODING in generated:
+        return
+    if not any(m in generated for m in _CADDY_EXPRESS_VHOST_MARKERS):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: request Content-Encoding drop queued — written with the '
+              'post-registry Caddyfile regen (ops #190)', flush=True)
+        return
+    try:
+        after = _read_priv(CADDYFILE_PATH)
+        if CADDY_DROP_REQUEST_ENCODING not in after:
+            if any(m in after for m in _CADDY_EXPRESS_VHOST_MARKERS):
+                print('Startup migration: ⚠ request Content-Encoding converge FAILED — the '
+                      'regenerated Caddyfile was rejected and rolled back (ops #190).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Portal / Remote Assist / Node-RED / CloudTAK vhosts now drop '
+          'request Content-Encoding and Caddy %s (ops #190)'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
 def _startup_caddy_selfheal():
@@ -34264,6 +34428,7 @@ def generate_caddyfile(settings=None):
         nodered_up = _get_nodered_upstream(settings)
         lines.append(f"# Node-RED flow editor")
         lines.append(f"{nodered_host} {{")
+        lines += _caddy_drop_request_encoding_lines()
         if ak.get('installed'):
             lines.append(f"    route {{")
             _emit_outpost_callback_rescue(f"{_pub_url(nodered_host, settings)}/")
@@ -34382,6 +34547,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"            roll_keep_for 720h")
             lines.append(f"        }}")
             lines.append(f"    }}")
+        lines += _caddy_drop_request_encoding_lines()
         if ak.get('installed'):
             lines.append(f"    route {{")
             _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
@@ -34417,6 +34583,7 @@ def generate_caddyfile(settings=None):
         ct_up = _get_cloudtak_upstreams(settings)
         lines.append(f"# CloudTAK Web UI (flush for SSE channels / WebSocket; longer timeouts for channel sync)")
         lines.append(f"{ct_map} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['map']} {{")
         lines.append(f"        flush_interval -1")
         # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
@@ -34441,6 +34608,7 @@ def generate_caddyfile(settings=None):
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
         lines.append(f"# CloudTAK Tile Server")
         lines.append(f"{ct_tiles} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['tiles']}")
         lines.append(f"}}")
         lines.append("")
@@ -34454,6 +34622,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# do NOT split /stream/* back out to 18888 (that 404'd every external-HLS video")
         lines.append(f"# in CloudTAK while RTSP leases worked by accident; TN box, 2026-07-10).")
         lines.append(f"{ct_video} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['video_api']}")
         lines.append(f"}}")
         lines.append("")
@@ -34482,6 +34651,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
             lines.append(f"    bind {ct_bind_ip}")
+            lines += _caddy_drop_request_encoding_lines()
             lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
             lines.append("")
@@ -34828,6 +34998,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# EUD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
         lines.append(f"{ra_host} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    respond @ra_device 404")
         lines.append(f"    reverse_proxy {ra_up} {{")
@@ -34839,6 +35010,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# EUD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
         lines.append(f"{ra_host}:{REMOTE_ASSIST_DEVICE_PORT} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    handle @ra_device {{")
         lines.append(f"        reverse_proxy {ra_up} {{")
@@ -38764,6 +38936,7 @@ def takportal_control():
         _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
+        _apply_npm_security_overrides(portal_dir)  # ops #190
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -38969,6 +39142,8 @@ def _takportal_run_update(portal_dir):
     _patch_takportal_compose_ports(portal_dir)
     for _ep in _takportal_compose_exposed_ports(portal_dir):
         print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+    # ops #190: same window as the port patch — after the checkout, before the build.
+    _apply_npm_security_overrides(portal_dir, plog=lambda m: print(f'[takportal] update:{m}', flush=True))
     # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
     # build, not after. Both live under /usr/src/app/data, which is the project's named
     # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
@@ -39559,6 +39734,7 @@ def run_takportal_deploy():
             plog("  ✓ Published ports bound to 127.0.0.1 in docker-compose.yml (Caddy is the only way in)")
         for _ep in _takportal_compose_exposed_ports(portal_dir):
             plog(f"  ⚠ published port NOT bound to loopback: {_ep}")
+        _apply_npm_security_overrides(portal_dir, plog=plog)  # ops #190
 
         plog("  Building image (this may take a minute)...")
         # Build + create the container WITHOUT starting it. The first boot otherwise
@@ -94042,6 +94218,11 @@ def _startup_migrations():
             _startup_caddy_read_body_idle_converge()
         except Exception as _rbi_err:
             print(f"Startup migration: read_body_idle converge error (non-fatal): {_rbi_err}",
+                  flush=True)
+        try:
+            _startup_caddy_request_encoding_converge()
+        except Exception as _rce_err:
+            print(f"Startup migration: request Content-Encoding converge error (non-fatal): {_rce_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()

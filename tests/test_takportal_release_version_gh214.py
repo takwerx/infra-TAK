@@ -230,6 +230,7 @@ def _job(gitr, reported, calls):
          'load_settings': lambda: {}, '_takportal_merged_settings_json': lambda s: '{}',
          '_takportal_project_containers': lambda all_states=True: [],
          '_gd_maintenance_begin': lambda *a: None, '_pull_base_images': lambda *a, **k: None,
+         '_apply_npm_security_overrides': lambda *a, **k: {},  # ops #190
          '_sudo_wrap': lambda a: a,
          'subprocess': types.SimpleNamespace(
              run=lambda *a, **k: calls.append(a[0]) or subprocess.CompletedProcess(a[0], 0, '', ''),
