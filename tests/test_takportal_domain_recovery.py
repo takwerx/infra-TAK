@@ -75,7 +75,8 @@ def _consts(*names):
 
 def _load(names, ns=None, consts=('TAKPORTAL_DOMAIN_KEYS', '_TAKPORTAL_DOMAIN_KEY_INFO', 'TAKPORTAL_AUTH_ADOPT_KEYS',
                                   'TAKPORTAL_AUTHORITATIVE_KEYS', 'EMAIL_TRANSPORT_KEYS',
-                                  'TAKPORTAL_TEMPLATE_PLACEHOLDERS', 'TAKPORTAL_TEMPLATE_TAK_CONNECTION')):
+                                  'TAKPORTAL_TEMPLATE_PLACEHOLDERS', 'TAKPORTAL_TEMPLATE_TAK_CONNECTION',
+                                  'TAKPORTAL_REQUIRED_PREFIXES')):
     ns = {} if ns is None else ns
     for k, v in {'os': os, 're': re, 'json': json, 'ipaddress': ipaddress, 'urllib': urllib}.items():
         ns.setdefault(k, v)
@@ -128,7 +129,8 @@ def _merge_ns(existing, relay=False):
     ns = {'_takportal_get_existing_settings': lambda: dict(existing),
           '_takportal_build_settings_dict': lambda s: dict(BUILT),
           '_takportal_settings_value_is_blank': lambda v: v is None or (isinstance(v, str) and not v.strip())}
-    return _load(['_takportal_template_placeholder_keys', '_takportal_merged_settings_json'], ns)
+    return _load(['_takportal_template_placeholder_keys', '_takportal_with_required_prefixes',
+                  '_takportal_merged_settings_json'], ns)
 
 
 def test_merge_without_adopt_keeps_every_operator_value():
