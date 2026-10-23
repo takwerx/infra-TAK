@@ -49975,7 +49975,10 @@ def nodered_control():
     if not os.path.exists(compose):
         return jsonify({'error': 'Node-RED not deployed here'}), 400
     if action == 'start':
-        subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
+        # No `-f`: compose discovers its files in nr_dir, so an operator's
+        # docker-compose.override.yml (e.g. an extra published port) is applied.
+        # `-f docker-compose.yml` recreated the container without it (gh #246).
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'stop']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
     elif action == 'restart':
@@ -53480,12 +53483,17 @@ volumes:
   node_red_data:
 """)
         plog("✓ docker-compose.yml written (image pinned, hardening flags, scoped certs, host.docker.internal for CoT)")
+        # The rewrite above owns docker-compose.yml only. An operator's
+        # docker-compose.override.yml / compose.override.yaml in nr_dir is never
+        # written or removed here, and the pull + `up -d` below run WITHOUT `-f` so
+        # compose loads it — the same files Update Now's plain `up -d` uses (gh #246:
+        # an extra published UDP port vanished on every Deploy).
         plog("")
         plog("━━━ Step 2/4: Pulling the Node-RED image ━━━")
         plog("  ~200 MB from Docker Hub. On a slow link this is the long part of the")
         plog("  deploy — progress is reported below, so a stalled pull looks different")
         plog("  from a slow one.")
-        if not _docker_compose_pull(compose_yml, nr_dir, plog, timeout=1800, label='Node-RED image'):
+        if not _docker_compose_pull(None, nr_dir, plog, timeout=1800, label='Node-RED image'):
             nodered_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Image present locally")
@@ -53497,7 +53505,7 @@ volumes:
         # where the container may be running perfectly well, and skips every step
         # after it — the exact failure v10.1.50 fixed one step further down.
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
             _up_rc, _up_out = r.returncode, (r.stdout or '')
         except subprocess.TimeoutExpired:
             _up_rc, _up_out = None, ''
@@ -53524,7 +53532,7 @@ volumes:
             try:
                 subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
                                capture_output=True, text=True, timeout=60)
-                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']),
+                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                     timeout=180, cwd=nr_dir)
                 _up_rc, _up_out = r2.returncode, (r2.stdout or '')
