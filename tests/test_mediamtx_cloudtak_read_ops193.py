@@ -160,6 +160,12 @@ def test_no_container_is_empty_and_docker_down_is_unknown():
     assert _subnets('', {}, rc=1, stderr='Error: No such object: cloudtak-media-1') == []
     assert _subnets('', {}, rc=1, stderr='Cannot connect to the Docker daemon') is None
 
+    def no_docker(cmd, **kw):
+        raise FileNotFoundError('docker')
+    ns = _load('_cloudtak_media_subnets',
+               subprocess=types.SimpleNamespace(run=no_docker, TimeoutExpired=subprocess.TimeoutExpired))
+    assert ns['_cloudtak_media_subnets']() is None
+
 
 def _body(name):
     return ast.get_source_segment(APP, next(n for n in TREE.body if isinstance(n, ast.FunctionDef)

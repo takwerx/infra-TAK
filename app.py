@@ -89307,10 +89307,13 @@ def _cloudtak_media_subnets():
     [] when it does not exist, None when Docker could not be asked. Only private ranges no
     wider than a Docker pool are returned, and never the shared default `bridge` (every
     non-compose container sits there)."""
-    r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
-                                   '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}',
-                                   'cloudtak-media-1']),
-                       capture_output=True, text=True, timeout=20)
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                       '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}',
+                                       'cloudtak-media-1']),
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None                     # no Docker on this box, or it is not answering
     if r.returncode != 0:
         return [] if 'no such' in (r.stderr or '').lower() else None
     subnets = []
