@@ -292,6 +292,76 @@ def test_a_listed_file_that_is_gone_is_dropped(ct, remote):
     assert _compose_file(ct) == _expected(ct)
 
 
+# ── remote Deploy deletes and re-clones ~/CloudTAK ───────────────────────────
+
+FAKE_GIT = """#!/bin/sh
+# clone: make the target with a base compose file; anything else: pass
+for last; do :; done
+case "$1" in clone) [ "$FAIL" = 1 ] && exit 1; mkdir -p "$last" && echo 'services: {}' > "$last/docker-compose.yml" ;; esac
+exit 0
+"""
+FAKE_DOCKER = "#!/bin/sh\nexit 0\n"
+
+
+def _reclone(home, tag, fail=False):
+    sh = _helpers_reclone()['_cloudtak_remote_reclone_sh'](tag)
+    bin_ = home / 'bin'
+    bin_.mkdir(exist_ok=True)
+    for name, body in (('git', FAKE_GIT), ('docker', FAKE_DOCKER)):
+        (bin_ / name).write_text(body)
+        os.chmod(bin_ / name, 0o755)
+    return subprocess.run(['sh', '-c', sh], capture_output=True, text=True, timeout=30,
+                          env={'HOME': str(home), 'PATH': f"{bin_}:{os.environ['PATH']}",
+                               'FAIL': '1' if fail else '0'})
+
+
+def _helpers_reclone():
+    ns = {'shlex': shlex}
+    src = '\n\n'.join([_assign('CLOUDTAK_CUSTOM_COMPOSE'), _fn('_cloudtak_remote_reclone_sh')])
+    exec(compile(src, 'app.py', 'exec'), ns)
+    return ns
+
+
+@pytest.mark.parametrize('tag', ['v13.113.0', None])
+def test_remote_reclone_keeps_the_operator_file(ct, tag):
+    (ct / 'docker-compose.custom.yml').write_text(OPERATOR)
+    if tag is None:
+        assert not (ct / '.git').exists()                 # the no-tag path re-clones only then
+    r = _reclone(ct.parent, tag)
+    assert r.returncode == 0, r.stderr
+    assert (ct / 'docker-compose.custom.yml').read_text() == OPERATOR
+    assert not (ct / '.env').exists()                     # the tree really was replaced
+    assert not (ct.parent / '.cloudtak-custom-compose.keep').exists()
+
+
+def test_remote_reclone_without_an_operator_file_creates_none(ct):
+    r = _reclone(ct.parent, 'v13.113.0')
+    assert r.returncode == 0, r.stderr
+    assert not (ct / 'docker-compose.custom.yml').exists()   # seeded later, by the ensure step
+
+
+def test_remote_reclone_failure_keeps_it_for_the_next_run(ct):
+    (ct / 'docker-compose.custom.yml').write_text(OPERATOR)
+    assert _reclone(ct.parent, 'v13.113.0', fail=True).returncode != 0
+    assert (ct.parent / '.cloudtak-custom-compose.keep').read_text() == OPERATOR
+    assert _reclone(ct.parent, 'v13.113.0').returncode == 0
+    assert (ct / 'docker-compose.custom.yml').read_text() == OPERATOR
+
+
+def test_remote_deploy_uses_the_reclone_helper():
+    src = _fn('run_cloudtak_deploy')
+    assert 'prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)' in src
+    assert 'rm -rf ~/CloudTAK' not in src
+
+
+def test_local_reclone_fallback_carries_the_operator_file():
+    src = _fn('run_cloudtak_deploy')
+    i = src.find('docker-compose.yml missing — re-cloning')
+    seg = src[i:i + 1600]
+    _before(seg, 'CLOUDTAK_CUSTOM_COMPOSE), \'rb\')', "rm -rf {cloudtak_dir}")
+    _before(seg, 'git clone --depth 1{_rclone_branch}', "CLOUDTAK_CUSTOM_COMPOSE), 'wb')")
+
+
 # ── every compose action sets it up first ────────────────────────────────────
 
 def _before(src, first, then):

@@ -44787,6 +44787,41 @@ def _cloudtak_remote_custom_compose_sh():
     )
 
 
+def _cloudtak_remote_reclone_sh(release_tag=None):
+    """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
+    deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
+    first and put back after — it is theirs, and seeding a fresh one would silently drop their
+    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run."""
+    keep = '~/.cloudtak-custom-compose.keep'
+    custom = f'~/CloudTAK/{CLOUDTAK_CUSTOM_COMPOSE}'
+    save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
+    restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
+    if release_tag:
+        # Stop a stack that is already there before deleting its tree. The Garage store
+        # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+        # it came back during the rm -rf, Docker re-created the folder, and Garage
+        # initialized it with the OLD key; the new stack then crash-looped on a key
+        # mismatch (ops #33 box test, redeploy over an existing remote install).
+        return (
+            "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+            "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
+            + save +
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {shlex.quote(release_tag)} "
+            "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
+            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+        )
+    return (
+        "if [ -d ~/CloudTAK/.git ]; then "
+        "cd ~/CloudTAK && git pull --rebase --autostash; "
+        "else "
+        + save +
+        "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK"
+        + restore + "; "
+        "fi; "
+        "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+    )
+
+
 def _cloudtak_compose_run(cloudtak_dir, args, timeout=600):
     """`docker compose <args>` in the CloudTAK project — through the broker on a non-root box
     (it forwards our cwd; TAKWERX_BROKER_TIMEOUT rides to the CLI so long steps are not cut
@@ -46130,27 +46165,9 @@ def run_cloudtak_deploy(cfg=None):
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
-                # Stop a stack that is already there before deleting its tree. The Garage store
-                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
-                # it came back during the rm -rf, Docker re-created the folder, and Garage
-                # initialized it with the OLD key; the new stack then crash-looped on a key
-                # mismatch (ops #33 box test, redeploy over an existing remote install).
-                prep_cmd = (
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
-                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
             else:
                 plog("  ⚠ Could not fetch latest release tag — using main branch")
-                prep_cmd = (
-                    "if [ -d ~/CloudTAK/.git ]; then "
-                    "cd ~/CloudTAK && git pull --rebase --autostash; "
-                    "else "
-                    "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                    "fi; "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
+            prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)
             ok, out = _ssh_probe(remote_cfg, prep_cmd, timeout=600)
             if not ok:
                 plog(f"✗ CloudTAK repo prep failed on remote: {(out or '')[:220]}")
@@ -46430,10 +46447,23 @@ def run_cloudtak_deploy(cfg=None):
         compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
+            # GH #261: the operator's compose file is theirs — carry it across the re-clone.
+            _custom_keep = None
+            try:
+                with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'rb') as _ckf:
+                    _custom_keep = _ckf.read()
+            except OSError:
+                pass
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
             _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
+            if _custom_keep is not None and os.path.isdir(cloudtak_dir):
+                try:
+                    with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'wb') as _ckf:
+                        _ckf.write(_custom_keep)
+                except OSError as _cke:
+                    plog(f"  ⚠ Could not put back {CLOUDTAK_CUSTOM_COMPOSE}: {_cke}")
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
