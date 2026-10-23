@@ -63254,6 +63254,11 @@ _TAK_API_CHECK_RETRY_MAX_S = 60
 # reconnects (54 s on a fresh test8 TAK), then the user's next login is looked up and passes.
 # So once TAK has looked others up for this long, with at least a round of logins in it and no
 # search for the user, waiting out the rest of the 5 min only keeps Data Sync broken.
+# test8 2026-10-23 (TAK debug logs on): the same stuck API, but the check user was also on a
+# real ATAK device. TAK skipped the lookup for nearly every login (aj1cacor: 0 searches in ~130
+# logins), yet the device's own logins still got through now and then (17 searches in 7 min),
+# so "TAK is asking for the user" kept the full 5 min. A working TAK sends one search per
+# login, so the user only counts as looked up when its searches reach half the check's logins.
 _TAK_API_CHECK_STUCK_S = 30
 
 
@@ -63291,22 +63296,23 @@ def _ldap_outpost_tak_searches(since):
 def _tak_api_check_stuck(cn, since, logins):
     """While the HTTPS check keeps getting no groups for `cn`: is TAK even asking LDAP for
     it? `logins` = epoch of every login since `since`. Returns (path, why); path 'stuck' =
-    TAK looks other users up but not `cn` (see _TAK_API_CHECK_STUCK_S), anything else =
-    keep waiting."""
+    TAK looks other users up but `cn` for under half the check's logins, i.e. not for the
+    check's own (see _TAK_API_CHECK_STUCK_S); anything else = keep waiting."""
     seen = _ldap_outpost_tak_searches(since)
     if seen is None:
         return 'blind', "can't read the local LDAP outpost's log to see what TAK asks LDAP"
     mine = sum(1 for _, u in seen if u == cn.lower())
-    if mine:
-        return 'asking', f"TAK is looking {cn} up in LDAP ({mine} search(es) since the check began)"
     others = [ts for ts, u in seen if u != cn.lower()]
+    first = min(others) if others else None
+    after = [t for t in logins if first is not None and t >= first + 1]   # the log has whole seconds
+    if mine and 2 * mine >= len(after):
+        return 'asking', f"TAK is looking {cn} up in LDAP ({mine} search(es) since the check began)"
     if not others:
         return 'quiet', "TAK hasn't looked anyone up in LDAP since the check began (still reconnecting?)"
-    first = min(others)
-    after = [t for t in logins if t >= first + 1]   # the log has whole seconds
     if len(after) < _TAK_API_CHECK_TRIES or after[-1] - first < _TAK_API_CHECK_STUCK_S:
         return 'others', f"TAK is looking other users up in LDAP again, not yet {cn}"
-    return 'stuck', (f"TAK looks other users up in LDAP ({len(others)} search(es)) but sent none for {cn} "
+    sent = f"sent only {mine} for {cn} (from its own devices?)" if mine else f"sent none for {cn}"
+    return 'stuck', (f"TAK looks other users up in LDAP ({len(others)} search(es)) but {sent} "
                      f"in {len(after)} login(s) over {int(after[-1] - first)}s")
 
 

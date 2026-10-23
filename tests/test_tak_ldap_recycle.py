@@ -96,7 +96,9 @@ class Box:
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
-        # every login but never the user (test8, TAK up 12 h); 'blind' = no outpost log.
+        # every login but never the user (test8, TAK up 12 h); 'device' = the same, but the user
+        # is also on a real ATAK whose own logins are looked up every 15 s (test8, 2026-10-23);
+        # 'blind' = no outpost log.
         # `api_back_after` = a TAK in its window after an outpost restart: no lookups for anyone
         # and no groups for that many seconds from the first HTTPS login, then looked up and
         # fine (fresh test8 TAK, 54 s). `first_login` = when the HTTPS check began.
@@ -159,6 +161,10 @@ class Box:
                     self.searches += [(self.t, 'admin'), (self.t, self.leaf_cn)]
             elif self.outpost == 'others':
                 self.searches.append((self.t, 'admin'))
+            elif self.outpost == 'device':
+                self.searches.append((self.t, 'admin'))
+                if not any(u == self.leaf_cn and self.t - t < 15 for t, u in self.searches):
+                    self.searches.append((self.t, self.leaf_cn))    # the user's own ATAK, every 15 s
             else:
                 self.searches.append((self.t, self.leaf_cn))
         if self.https_flaky:
@@ -693,6 +699,34 @@ def test_ops158_tak_that_never_asks_ldap_for_the_user_is_restarted_early():
     assert any('falling back to restarting TAK Server' in l and 'but sent none for ADSB_PS' in l for l in box.log)
     assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
     assert box.settings['tak_ldap_recycle']['last_outcome'] == 'restarted' and box.workdirs == []
+
+
+def test_ops158_user_also_on_a_real_device_is_still_restarted_early():
+    # test8 2026-10-23, TAK debug logs on: the stuck API skipped the lookup for the check's
+    # logins, but the user's own ATAK still got one through now and then. Those searches are
+    # not the check's, so they must not keep the full 5 min wait.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='device')
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    waited = box.t - 20 - 120 - box.first_login
+    assert waited < 2 * _const('_TAK_API_CHECK_RETRY_MAX_S') + _const('_TAK_API_CHECK_STUCK_S')
+    assert not any('TAK is looking ADSB_PS up in LDAP' in l for l in box.log)
+    [early] = [l for l in box.log if 'not waiting the rest of the' in l]
+    assert 'but sent only' in early and 'for ADSB_PS (from its own devices?)' in early
+    assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
+
+
+def test_ops158_user_counts_as_looked_up_from_half_the_checks_logins():
+    box = healthy_box(tak_start=T0 - HOUR, ldap_start=T0 - HOUR)
+    stuck = box.ns()['_tak_api_check_stuck']
+    logins = [T0 + 2 + i for i in range(40)]
+    box.searches = [(T0 + 1, 'admin')] + [(T0 + 2 + i, 'aj1cacor') for i in range(20)]
+    assert stuck('aj1cacor', T0, logins)[0] == 'asking'                 # 20 of 40: looked up
+    box.searches = box.searches[:-1]
+    path, why = stuck('aj1cacor', T0, logins)                           # 19 of 40: not the check's
+    assert path == 'stuck' and 'sent only 19 for aj1cacor' in why and 'in 40 login(s) over 40s' in why
+    box.searches = [(T0 + 5, 'aj1cacor')]                               # nobody else looked up yet
+    assert stuck('aj1cacor', T0, logins)[0] == 'asking'
 
 
 def test_ops158_fresh_tak_still_reconnecting_to_ldap_heals_without_a_restart():
