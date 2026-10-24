@@ -125,6 +125,17 @@ def test_card_tells_user_issues_are_public_and_not_to_attach_the_report():
     assert 'material-symbols-outlined' in card and 'btn btn-primary' in card
 
 
+def test_every_help_page_icon_is_in_the_subset_icon_font():
+    # The icon font ships as a subset; a ligature missing from it paints as the raw
+    # word ("BUG_REPORT" on this very button, caught in the PR screenshot).
+    script = (REPO / 'tools' / 'build-icon-font.sh').read_text(encoding='utf-8')
+    ligs = set(re.search(r'^LIGS="([^"]*)"', script, re.M).group(1).split())
+    page = render(full_settings())
+    icons = set(re.findall(r'class="material-symbols-outlined"[^>]*>([a-z0-9_]+)<', page))
+    assert icons, 'no icons found on the Help page'
+    assert icons <= ligs, sorted(icons - ligs)
+
+
 def test_help_page_still_passes_settings_and_version_to_the_template():
     body = re.search(r'^def help_page\(.*?(?=^\S)', APP, re.S | re.M).group(0)
     assert "render_template('help.html', settings=settings, version=VERSION" in body
