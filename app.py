@@ -62935,6 +62935,20 @@ def _ensure_authentik_pgbouncer(plog):
     return True
 
 
+def _ak_compose_service_env(svc, key):
+    """`services.<svc>.environment[key]` from parsed compose (dict or list form), unquoted;
+    None when the service sets no such key."""
+    env = svc.get('environment') if isinstance(svc, dict) else None
+    if isinstance(env, dict):
+        v = env.get(key)
+        return None if v is None else str(v).strip().strip('"').strip("'")
+    if isinstance(env, list):
+        for item in env:
+            if isinstance(item, str) and item.startswith(key + '='):
+                return item.split('=', 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 def _ensure_authentik_worker_direct_pg(plog):
     """v10.2.1: connect the Authentik WORKER straight to Postgres; the server stays on PgBouncer.
 
@@ -62995,21 +63009,10 @@ def _ensure_authentik_worker_direct_pg(plog):
     if not isinstance(worker, dict):
         return False
 
-    def _svc_pg_host(svc):
-        env = svc.get('environment') if isinstance(svc, dict) else None
-        if isinstance(env, dict):
-            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
-            return None if v is None else str(v).strip().strip('"').strip("'")
-        if isinstance(env, list):
-            for item in env:
-                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
-                    return item.split('=', 1)[1].strip().strip('"').strip("'")
-        return None
-
-    worker_host = _svc_pg_host(worker)
+    worker_host = _ak_compose_service_env(worker, 'AUTHENTIK_POSTGRESQL__HOST')
     if worker_host == 'postgresql':
         return False
-    if worker_host != 'pgbouncer' or _svc_pg_host(services.get('server')) != 'pgbouncer':
+    if worker_host != 'pgbouncer' or _ak_compose_service_env(services.get('server'), 'AUTHENTIK_POSTGRESQL__HOST') != 'pgbouncer':
         plog(f"  worker direct-pg: worker host {worker_host!r} is not the bundled PgBouncer — left alone")
         return False
 
@@ -63108,6 +63111,234 @@ def _ensure_authentik_worker_direct_pg(plog):
     plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
          f"server unchanged on PgBouncer")
     _record('applied')
+    return True
+
+
+# ops #177: fleet constants (postgresql.direct.<key> = value). The fresh-install .env
+# carries the same lines. CONN_OPTIONS is base64 JSON {"options": "-c idle_session_timeout=0"}:
+# the bundled Postgres reaps sessions idle 300 s (_authentik_fix_pg_idle_timeout), and a
+# LISTEN connection is idle by design. Authentik holds `direct` connections open on purpose
+# (CONN_MAX_AGE=None) — once reaped, the next outpost message hit a dead connection
+# (IdleSessionTimeout), the websocket dropped and the push was lost (nuc 2026-10-23). Only
+# the direct alias is exempt; pooled ORM traffic keeps the 300 s reaper.
+_AK_DIRECT_ENV = (
+    ('host', 'postgresql'),
+    ('conn_options', 'eyJvcHRpb25zIjogIi1jIGlkbGVfc2Vzc2lvbl90aW1lb3V0PTAifQ=='),
+)
+_AK_DIRECT_ENV_LINES = ['AUTHENTIK_POSTGRESQL__DIRECT__%s=%s' % (k.upper(), v) for k, v in _AK_DIRECT_ENV]
+_AK_DIRECT_ENV_COMMENT = [
+    "# ops #177: the server's channel layer LISTENs on Postgres directly (PgBouncer's",
+    "# transaction pooling drops NOTIFY, so outposts got no config pushes). CONN_OPTIONS =",
+    "# base64 {\"options\": \"-c idle_session_timeout=0\"}: these connections stay open on purpose.",
+]
+
+
+def _authentik_server_direct_live():
+    """`postgresql.direct` as the running authentik-server-1 loaded it (`ak dump_config`):
+    a dict ({} when unset), or None when it can't be read. The dump holds secrets: never
+    log it."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-server-1', 'ak', 'dump_config']),
+                           capture_output=True, text=True, timeout=60)
+        out = r.stdout or ''
+        if r.returncode != 0:
+            return None
+    except Exception:
+        return None
+    # The dump is one indented JSON object; skip any one-line JSON log events before it.
+    cfg = None
+    for m in re.finditer(r'^\{', out, re.M):
+        try:
+            obj = json.JSONDecoder().raw_decode(out[m.start():])[0]
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and 'postgresql' in obj:
+            cfg = obj
+            break
+    if cfg is None:
+        return None
+    direct = (cfg.get('postgresql') or {}).get('direct')
+    return direct if isinstance(direct, dict) else {}
+
+
+def _authentik_server_direct_current(live):
+    return isinstance(live, dict) and all(str(live.get(k, '')) == v for k, v in _AK_DIRECT_ENV)
+
+
+def _ensure_authentik_server_direct_listen(plog):
+    """ops #177: give the Authentik SERVER a direct Postgres endpoint for its LISTEN.
+
+    The server hears outpost messages through django_channels_postgres, which LISTENs on
+    its own connection. Behind the transaction-pooling PgBouncer that LISTEN sits on a
+    pooled backend and never hears NOTIFY (pgbouncer.org/features.html: LISTEN "Never" in
+    transaction mode), so no outpost ever got a server push on infra-TAK: a provider change
+    sat unconsumed in the channel messages table and the LDAP outpost only saw it at its
+    5-min refresh (aws-arm 2026-10-23: 270 s). Authentik 2026.8 routes the channel layer
+    through a `direct` DB alias whenever any `postgresql.direct.*` key is set
+    (authentik/root/settings.py CHANNEL_LAYERS, upstream goauthentik/authentik#23013;
+    docs.goauthentik.io/install-config/configuration/). ORM traffic stays on PgBouncer;
+    only the channel layer, LISTEN and advisory locks go direct, exempt from the idle reaper
+    (see _AK_DIRECT_ENV).
+
+    Fleet constants in ~/authentik/.env, read by the server and the worker (not the LDAP
+    outpost). The worker is already on `postgresql` (_ensure_authentik_worker_direct_pg),
+    so the keys change nothing that matters for it and it is not recreated.
+
+    Acts only on the bundled topology: compose has `postgresql` and `pgbouncer` and the
+    server is on pgbouncer. A no-op once .env has the lines and the running server has them.
+    Recreates the SERVER only, verifies the runtime with `ak dump_config`, and puts .env
+    back if the server doesn't come up with it. The recreate is a short LDAP outage under
+    a running TAK Server, so it requests the TAK client heal (ops #126) either way.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(env_path) or not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  server direct-listen: PyYAML unavailable — skipped (next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            data = _yaml.safe_load(f.read())
+        with open(env_path) as f:
+            env_text = f.read()
+    except Exception as e:
+        plog(f"  server direct-listen: ~/authentik unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    if not isinstance(services, dict) or 'postgresql' not in services or 'pgbouncer' not in services:
+        return False
+    server = services.get('server')
+    if _ak_compose_service_env(server, 'AUTHENTIK_POSTGRESQL__HOST') != 'pgbouncer':
+        return False
+    env = server.get('environment')
+    svc_keys = env.keys() if isinstance(env, dict) else [str(i).split('=', 1)[0] for i in (env or [])]
+    if any(str(k).startswith('AUTHENTIK_POSTGRESQL__DIRECT__') for k in svc_keys):
+        # compose `environment:` beats env_file, so a .env line could never take effect.
+        plog("  server direct-listen: compose sets AUTHENTIK_POSTGRESQL__DIRECT__* on the server — left alone")
+        return False
+
+    lines = env_text.splitlines()
+    keys = {want.split('=', 1)[0]: want for want in _AK_DIRECT_ENV_LINES}
+
+    def _key(ln):
+        m = re.match(r'^\s*(AUTHENTIK_POSTGRESQL__DIRECT__[A-Z_]+)\s*=', ln)
+        return m.group(1) if m and m.group(1) in keys else None
+
+    have = [ln.strip() for ln in lines if _key(ln)]
+    if have == _AK_DIRECT_ENV_LINES:
+        live = _authentik_server_direct_live()
+        if _authentik_server_direct_current(live):
+            return False
+        if live is None:
+            # A server that isn't running is Guard Dog's / the stack heal's job, not a
+            # reason to recreate it on every boot.
+            plog("  server direct-listen: .env set, but the server's live config can't be read — next boot retries")
+            return False
+
+    # Fleet constants: each key's first line is rewritten in place, repeats dropped,
+    # missing keys appended.
+    new_lines, placed = [], set()
+    for ln in lines:
+        k = _key(ln)
+        if k:
+            if k not in placed:
+                new_lines.append(keys[k])
+                placed.add(k)
+            continue
+        new_lines.append(ln)
+    missing = [want for k, want in keys.items() if k not in placed]
+    if missing:
+        if not any(ln.startswith('# ops #177:') for ln in new_lines):
+            if new_lines and new_lines[-1].strip():
+                new_lines.append('')
+            new_lines += _AK_DIRECT_ENV_COMMENT
+        new_lines += missing
+    new_text = '\n'.join(new_lines) + '\n'
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    env_bak = f"{env_path}.bak.before-server-direct-listen.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            s['authentik_server_direct_listen'] = {
+                'last_outcome': outcome,
+                'last_attempt_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'version': VERSION,
+                'env_backup': env_bak,
+            }
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_server():
+        # Called with the lock below already held; re-taking it on this thread is a no-op.
+        return _ak_compose_subprocess(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server']),
+            'server-direct-listen', plog, cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    def _restore_env():
+        with open(env_path, 'w') as f:
+            f.write(env_text)
+
+    plog("  server direct-listen: setting AUTHENTIK_POSTGRESQL__DIRECT__HOST/CONN_OPTIONS and recreating "
+         "the Authentik server (outposts get no config pushes while its LISTEN goes through PgBouncer)")
+    with _authentik_compose_lock('server-direct-listen', plog=plog) as _locked:
+        if not _locked:
+            plog("  server direct-listen: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(env_bak, 'w') as f:
+                f.write(env_text)
+            os.chmod(env_bak, 0o600)
+            with open(env_path, 'w') as f:
+                f.write(new_text)
+        except Exception as e:
+            plog(f"  ✗ server direct-listen: .env write failed ({e}) — restoring")
+            try:
+                _restore_env()
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_server()
+        if r.returncode != 0:
+            plog(f"  ✗ server direct-listen: server recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+            _restore_env()
+            _compose_up_server()
+            _record('recreate-failed')
+            _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN, failed + rolled back)')
+            return None
+
+    healthy = _wait_for_authentik_stack_healthy(plog, timeout=240)
+    live = _authentik_server_direct_live()
+    if not healthy or not _authentik_server_direct_current(live):
+        # Never log `live` whole: an operator's direct.password would be in it.
+        seen = 'unreadable' if live is None else ', '.join(
+            f"{k} {'ok' if str(live.get(k, '')) == v else 'NOT set'}" for k, v in _AK_DIRECT_ENV)
+        plog(f"  ✗ server direct-listen: server {'healthy' if healthy else 'NOT healthy'}, "
+             f"live postgresql.direct: {seen} — rolling .env back")
+        with _authentik_compose_lock('server-direct-listen-rollback', plog=plog) as _locked:
+            if _locked:
+                _restore_env()
+                _compose_up_server()
+            else:
+                plog(f"  ✗ server direct-listen: compose lock busy — rollback NOT applied; "
+                     f"restore {env_bak} by hand")
+        _wait_for_authentik_stack_healthy(plog, timeout=240)
+        _record('rolled-back')
+        _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN, rolled back)')
+        return None
+    plog("  ✓ server direct-listen: server healthy, ak dump_config shows postgresql.direct host + "
+         "conn_options — outposts get config pushes again; ORM still on PgBouncer")
+    _record('applied')
+    _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN for outpost pushes)')
     return True
 
 
@@ -68803,7 +69034,7 @@ AUTHENTIK_HOST={_get_authentik_base_url(settings)}
 # Reputation policy, and fail2ban — instead of the Docker bridge gateway (172.18.0.1).
 # 172.16.0.0/12 covers every Docker bridge subnet infra-TAK uses (172.17–172.21).
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
-""" + (f"\n# Cookie domain so session is shared across subdomains (stream., infratak., etc.) — avoids redirect loop\nAUTHENTIK_COOKIE_DOMAIN=.{settings.get('fqdn').split(':')[0]}" if settings.get("fqdn") else "") + """
+""" + '\n'.join(_AK_DIRECT_ENV_COMMENT + _AK_DIRECT_ENV_LINES) + "\n" + (f"\n# Cookie domain so session is shared across subdomains (stream., infratak., etc.) — avoids redirect loop\nAUTHENTIK_COOKIE_DOMAIN=.{settings.get('fqdn').split(':')[0]}" if settings.get("fqdn") else "") + """
 # Email Configuration (uncomment and configure)
 # AUTHENTIK_EMAIL__HOST=smtp.example.com
 # AUTHENTIK_EMAIL__PORT=587
@@ -70237,6 +70468,7 @@ entries:
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             _ensure_authentik_pgbouncer(plog)
             _ensure_authentik_worker_direct_pg(plog)
+            _ensure_authentik_server_direct_listen(plog)
             plog("  ✓ redis + pgbouncer up inline — no restart needed")
         except Exception as _opt_e:
             plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
@@ -94647,6 +94879,14 @@ def _startup_migrations():
             _ensure_authentik_worker_direct_pg(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_wd_err:
             print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
+
+        # ops #177: the server's channel layer LISTEN has the same problem, so no outpost
+        # got a config push (LDAP waited for its 5-min refresh). Authentik 2026.8's
+        # postgresql.direct.* moves that LISTEN off PgBouncer; recreates the server only.
+        try:
+            _ensure_authentik_server_direct_listen(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_sdl_err:
+            print(f"Startup migration: server direct-listen error (non-fatal): {ak_sdl_err}")
 
         # v10.2.21: the install step above only writes the PgBouncer image when it first
         # adds the service, so existing boxes never left v1.25.1-p0. Converge them onto
