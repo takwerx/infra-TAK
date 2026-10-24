@@ -89333,7 +89333,8 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
             'echo "[$(TS)] rebuilding $INSTALL_DIR/.venv with $(python3 --version 2>&1)"\n'
             'rm -rf "$INSTALL_DIR/.venv"\n'
             'if runuser -u "$CONSOLE_USER" -- bash -c "cd \\"$INSTALL_DIR\\" && python3 -m venv .venv && .venv/bin/pip install --upgrade pip wheel && .venv/bin/pip install -r requirements.txt"; then\n'
-            '  echo "[$(TS)] venv rebuilt: $("$INSTALL_DIR/.venv/bin/python3" --version 2>&1)"\n'
+            # module-scan Low: the venv is console-user owned — never execute it as root.
+            '  echo "[$(TS)] venv rebuilt: $(runuser -u "$CONSOLE_USER" -- "$INSTALL_DIR/.venv/bin/python3" --version 2>&1)"\n'
             'else\n'
             '  rm -rf "$INSTALL_DIR/.venv"; cp -a "$PRE/venv" "$INSTALL_DIR/.venv"\n'
             '  fail venv-rebuild "pip install failed on the new python. The pre-upgrade venv was put back but it is built for python 3.10, so the console cannot start until it is rebuilt: run \'cd $INSTALL_DIR && sudo ./start.sh\'"\n'
