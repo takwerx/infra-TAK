@@ -1136,9 +1136,11 @@ def ensure_session_cookie_domain():
             return jsonify({'error': 'Too many requests. Please slow down.'}), 429
 
     # CSRF baseline for state-changing API calls (same-origin only).
-    # Exempt localhost-only Guard Dog script endpoint (not browser/session driven).
+    # Exempt localhost-only Guard Dog script endpoints (not browser/session driven; each one
+    # refuses anything but a loopback caller itself).
     if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/'):
-        if request.path not in ('/api/guarddog/send-sms', '/api/guarddog/send-alert-email'):
+        if request.path not in ('/api/guarddog/send-sms', '/api/guarddog/send-alert-email',
+                                '/api/guarddog/cloudtak-repair'):   # ops #197
             if not _same_origin_ok():
                 return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
 

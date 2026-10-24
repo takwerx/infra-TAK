@@ -403,6 +403,14 @@ def test_endpoint_is_loopback_only_and_refuses_caddy_proxied_requests():
     assert "@app.route('/api/guarddog/cloudtak-repair', methods=['POST'])" in APP
 
 
+def test_endpoint_is_exempt_from_the_browser_csrf_check():
+    # Guard Dog's curl sends no Origin/Referer; without the exemption every request got
+    # "CSRF validation failed" (found in the box test) and the repair never ran.
+    i = APP.index("# CSRF baseline for state-changing API calls")
+    block = APP[i:APP.index('_same_origin_ok()', i)]
+    assert "'/api/guarddog/cloudtak-repair'" in block
+
+
 # ── Guard Dog: tak-cloudtak-watch.sh ─────────────────────────────────────────
 
 PROFILE = 'hlsVariant: mpegts\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n'
