@@ -89370,7 +89370,7 @@ def _upgrade_mediamtx_certifi(log_fn=None):
     return r
 
 
-_GD_BAKED_REMOTE_KEYS =('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
+_GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
 
 
 def _gd_baked_remote_values(path):
