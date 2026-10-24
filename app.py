@@ -44799,18 +44799,30 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
     save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
     restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
     if release_tag:
+        tag = shlex.quote(release_tag)
+        # ops #198: a valid checkout is updated IN PLACE, the same as the local Deploy. The tree
+        # holds the store's live data (.docker-garage, or .docker-store on MinIO) and .env, all
+        # untracked, so `checkout -f` leaves them alone; the re-clone deleted the data with the
+        # tree. The re-clone below is only for a missing or broken checkout.
+        inplace = (
+            "if git -C ~/CloudTAK rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
+            f"cd ~/CloudTAK && git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
+            "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "else ")
         # Stop a stack that is already there before deleting its tree. The Garage store
         # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
         # it came back during the rm -rf, Docker re-created the folder, and Garage
         # initialized it with the OLD key; the new stack then crash-looped on a key
         # mismatch (ops #33 box test, redeploy over an existing remote install).
         return (
+            inplace +
             "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
             "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
             + save +
-            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {shlex.quote(release_tag)} "
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} "
             "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
-            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "fi"
         )
     return (
         "if [ -d ~/CloudTAK/.git ]; then "
@@ -45267,6 +45279,20 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
              else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
+def _cloudtak_foreign_containers(ps_output, project):
+    """IDs from `docker ps -a --format '{{.ID}} {{.Label "com.docker.compose.project"}}'` that
+    the compose project `project` did not create (other project, or no label at all).
+
+    Deploy's pre-start sweep removes only these (ops #198). Removing the project's own
+    containers dropped postgis's anonymous data volume: `up` then started an empty database."""
+    out = []
+    for line in (ps_output or '').splitlines():
+        parts = line.split()
+        if parts and parts[1:] != [project]:
+            out.append(parts[0])
+    return out
 
 
 def _cloudtak_env_secrets(env_text):
@@ -46162,6 +46188,16 @@ def run_cloudtak_deploy(cfg=None):
             _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
             _cloudtak_remote_media_bufs(remote_cfg, plog)
 
+            # ops #198: read the remote .env BEFORE the repo prep (its re-clone fallback deletes
+            # the tree) so a Deploy over an installed CloudTAK keeps its secrets, same as Update
+            # config. If it cannot be read, stop rather than write new secrets over a working install.
+            _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null; true', timeout=20)
+            if not _ok_env:
+                plog(f"✗ Could not read the remote CloudTAK .env: {(_rem_env or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            _rem_env = _rem_env or ''
+
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
@@ -46180,23 +46216,28 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 4/6: Writing CloudTAK config on remote ━━━")
             import secrets as _secrets
+            _env_signing, _env_store, _env_pg = _cloudtak_env_secrets(_rem_env)
             # v10.1.3+: Preserve postgres password across redeploys (same as local deploy)
             postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
             if not postgres_pass or len(postgres_pass) < 24:
-                postgres_pass = _secrets.token_hex(24)
+                postgres_pass = _env_pg or _secrets.token_hex(24)
                 settings['cloudtak_postgres_password'] = postgres_pass
                 try:
                     save_settings(settings)
                 except Exception:
                     pass
-            signing_secret = _secrets.token_hex(32)
-            minio_pass = _secrets.token_hex(16)
+            if _env_signing or _env_store:
+                plog("  Preserving existing secrets from the remote .env")
+            signing_secret = _env_signing or _secrets.token_hex(32)
+            minio_pass = _env_store or _secrets.token_hex(16)
             # The clone above already put CloudTAK's compose on the remote box, so a FRESH
             # install of a Garage-based CloudTAK is detected here rather than written wrong.
             env_content = _cloudtak_build_env_content(
                 settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
                 remote_host=remote_host,
                 store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
+            # keep every key we do not manage (GARAGE_RPC_SECRET above all), as Update config does
+            env_content = _cloudtak_env_preserve_unknown(env_content, _rem_env)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -46492,19 +46533,23 @@ def run_cloudtak_deploy(cfg=None):
         # failed' on every API boot. The .env fallback covers pre-v10.1.3 installs and
         # settings.json loss; _cloudtak_sync_postgis_password() after `up -d` converges
         # any box that already carries a mismatch.
+        # ops #198: Deploy over an installed CloudTAK keeps the secrets its .env already has,
+        # same as Update config. A new store key crash-loops Garage (it keeps the key it was
+        # first started with), a dropped GARAGE_RPC_SECRET gets regenerated and no longer
+        # matches .docker-garage, and a new SigningSecret logs every user out.
+        existing_env_text = ''
+        try:
+            with open(env_path) as _ef:
+                existing_env_text = _ef.read()
+        except Exception:
+            pass
+        _env_signing, _env_store, _env_pg = _cloudtak_env_secrets(existing_env_text)
         postgres_pass = settings.get('cloudtak_postgres_password', '')
         postgres_pass = postgres_pass.strip() if isinstance(postgres_pass, str) else ''
         if postgres_pass:
             plog("  Reusing stored postgis password (settings)")
         else:
-            try:
-                with open(env_path) as _ef:
-                    for _l in _ef:
-                        if _l.strip().startswith('POSTGRES_PASSWORD='):
-                            postgres_pass = _l.strip().split('=', 1)[1].strip()
-                            break
-            except Exception:
-                pass
+            postgres_pass = _env_pg
             if postgres_pass:
                 plog("  Reusing postgis password from existing .env")
             else:
@@ -46517,14 +46562,18 @@ def run_cloudtak_deploy(cfg=None):
             except Exception as e:
                 plog(f"  ⚠ Could not persist postgres password to settings: {e}")
 
-        signing_secret = _secrets.token_hex(32)
-        minio_pass = _secrets.token_hex(16)
+        if _env_signing or _env_store:
+            plog("  Preserving existing secrets from CloudTAK .env")
+        signing_secret = _env_signing or _secrets.token_hex(32)
+        minio_pass = _env_store or _secrets.token_hex(16)
 
         # The clone above is already on disk, so a FRESH install of a Garage-based CloudTAK
         # gets port 3900 instead of MinIO's 9000.
         env_content = _cloudtak_build_env_content(
             settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
-            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
+        # never delete a key CloudTAK grew that we know nothing about (GARAGE_RPC_SECRET above all)
+        env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
             f.write(env_content)
         try:
@@ -46794,11 +46843,18 @@ def run_cloudtak_deploy(cfg=None):
         # use"). A container left by a prior failed run doesn't carry the labels this
         # compose project expects, so `up` refuses the name instead of recreating it —
         # and the deploy path had NO teardown of its own (only uninstall did). A fresh
-        # deploy owns every cloudtak-* name by definition; volumes are untouched, so
-        # DB data survives.
-        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+        # deploy owns every cloudtak-* name by definition.
+        # ops #198: remove only containers this compose project did NOT create. postgis keeps
+        # its data in an ANONYMOUS volume (upstream's compose names none), and only
+        # `up --force-recreate` carries that over to the new container: after a `docker rm`
+        # compose made a fresh empty one, so a Deploy over an installed CloudTAK came back with
+        # an empty database (the old one orphaned on disk). Our own containers are recreated
+        # by `up` below, the same as the retry loop already leaves them for adoption.
+        _project = os.path.basename(cloudtak_dir).lower()
+        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak', '--format',
+                                          '{{.ID}} {{.Label "com.docker.compose.project"}}']),
                               capture_output=True, text=True, timeout=30)
-        _stale = (_pre.stdout or '').split()
+        _stale = _cloudtak_foreign_containers(_pre.stdout, _project)
         if _stale:
             plog(f"  Removing {len(_stale)} stale cloudtak container(s) from prior runs...")
             subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _stale), capture_output=True, timeout=120)
@@ -46816,7 +46872,6 @@ def run_cloudtak_deploy(cfg=None):
         #     it IS properly project-labeled, the next `up` simply ADOPTS it. So:
         #     retry up to 3 times, each pass removing only foreign holders and leaving
         #     project-labeled ones for adoption. Volumes/DB are never touched.
-        _project = os.path.basename(cloudtak_dir).lower()
         for _attempt in range(3):
             if r.returncode == 0 or 'already in use by container' not in (r.stdout or ''):
                 break
