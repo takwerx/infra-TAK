@@ -45,6 +45,7 @@ a later step (the thin console is far easier to confine than a root monolith).
 
 import base64
 import grp
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -2863,6 +2864,198 @@ def _do_java_cacerts_sync(req):
             **({} if hook_rc == 0 else {'error': f'hook rc {hook_rc}: {hook_out[-300:]}'})}
 
 
+# ---------------------------------------------------------------------------
+# ops #202 — the MediaMTX web editor's certifi drops distrusted roots (fixed-shape op)
+# ---------------------------------------------------------------------------
+# The MediaMTX module pip-installs requests, which brings certifi: Mozilla's CA list as of
+# the install. Every MediaMTX deploy and update runs `pip3 install -U certifi` since
+# v10.2.29, but Update Now deploys nothing, so an older install keeps its copy. Measured
+# 2026-10-24 on two Ubuntu 22.04 boxes: certifi 2026.02.25 in /usr/local, still carrying
+# emSign ECC Root CA - G3, for root's python3 and for the editor's (it runs as takwerx and
+# has no copy of its own, so it loads the same one).
+#
+# The op takes NO arguments and only acts where the web editor is installed. It asks root's
+# python3, then the editor user's, which certifi they load, and upgrades a pip-installed
+# copy that still holds a distrusted root (matched by public key): root's in /usr/local,
+# the user's own in its home with --user. A distro certifi is left alone: Debian and RHEL
+# patch theirs to hand out the OS bundle, which the OS updates.
+CERTIFI_EDITOR_DIR = '/opt/mediamtx-webeditor'
+CERTIFI_EDITOR_USER = 'takwerx'          # mediamtx-webeditor.service User=
+CERTIFI_PYTHON = '/usr/bin/python3'      # and its ExecStart interpreter
+CERTIFI_ROOT_PIP_PREFIX = '/usr/local/'  # where root's `pip3 install` puts packages
+# sha256 of the root's DER SubjectPublicKeyInfo. Add the next distrusted root here.
+CERTIFI_DISTRUSTED_SPKI = {
+    '8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782': 'emSign ECC Root CA - G3',
+}
+_CERTIFI_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C.UTF-8',
+                'PIP_DISABLE_PIP_VERSION_CHECK': '1', 'PIP_NO_INPUT': '1'}
+_CERTIFI_WHERE = 'import certifi, sys; sys.stdout.write(certifi.where())'
+_PEM_CERT = re.compile(rb'-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----', re.S)
+
+
+def _der_tlv(buf, i):
+    """(tag, content_start, end) of the DER element at buf[i]."""
+    tag, n = buf[i], buf[i + 1]
+    j = i + 2
+    if n & 0x80:
+        k = n & 0x7f
+        n = int.from_bytes(buf[j:j + k], 'big')
+        j += k
+    if j + n > len(buf):
+        raise ValueError('truncated DER')
+    return tag, j, j + n
+
+
+def _cert_spki_sha256(der):
+    """sha256 of a certificate's DER SubjectPublicKeyInfo — the same bytes `openssl x509
+    -pubkey | openssl pkey -pubin -outform DER` gives — or None when it does not parse."""
+    try:
+        _, i, _ = _der_tlv(der, 0)               # Certificate
+        _, i, end = _der_tlv(der, i)             # tbsCertificate
+        fields = []
+        while i < end and len(fields) < 7:
+            tag, _, nxt = _der_tlv(der, i)
+            fields.append((tag, i, nxt))
+            i = nxt
+        if fields and fields[0][0] == 0xA0:      # [0] version
+            fields = fields[1:]
+        # serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo
+        tag, a, b = fields[5]
+    except (IndexError, ValueError):
+        return None
+    return hashlib.sha256(der[a:b]).hexdigest() if tag == 0x30 else None
+
+
+def _bundle_distrusted(path):
+    """Names of the CERTIFI_DISTRUSTED_SPKI roots in a PEM bundle, or None if unreadable."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return None
+    found = []
+    for m in _PEM_CERT.finditer(data):
+        try:
+            der = base64.b64decode(b''.join(m.group(1).split()))
+        except ValueError:
+            continue
+        name = CERTIFI_DISTRUSTED_SPKI.get(_cert_spki_sha256(der))
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _certifi_runner(user):
+    """(argv prefix, python flags, env, home) to run CERTIFI_PYTHON as `user` (None: root),
+    or None. Root runs -I: pip's root installs go to /usr/local, never /root/.local. The
+    editor user runs -E only, because the service runs without -I and its user site counts."""
+    if user is None:
+        return [], ['-I'], dict(_CERTIFI_ENV, HOME='/root'), None
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return None
+    runuser = _sudoers_safe_binaries('runuser')
+    if not runuser:
+        return None
+    return ([runuser[0], '-u', user, '--'], ['-E'],
+            dict(_CERTIFI_ENV, HOME=home, USER=user, LOGNAME=user), home)
+
+
+def _certifi_view(user):
+    """What `user`'s python3 loads: {'where', 'pip', 'distrusted'}; {} for no certifi or a
+    distro one; None when it could not be asked."""
+    run = _certifi_runner(user)
+    if run is None:
+        return None
+    prefix, flags, env, home = run
+    try:
+        r = subprocess.run(prefix + [CERTIFI_PYTHON] + flags + ['-c', _CERTIFI_WHERE],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           timeout=60, env=env, cwd='/')
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    where = (r.stdout or '').strip() if r.returncode == 0 else ''
+    if not where:
+        return {}                                 # no certifi for this python
+    where = os.path.realpath(where)
+    if os.path.basename(os.path.dirname(where)) != 'certifi':
+        return {}                                 # distro certifi: the OS bundle
+    if user is None:
+        pip_copy = where.startswith(CERTIFI_ROOT_PIP_PREFIX)
+    else:
+        pip_copy = bool(home) and where.startswith(os.path.realpath(home).rstrip('/') + '/')
+    return {'where': where, 'pip': pip_copy, 'distrusted': _bundle_distrusted(where) or []}
+
+
+def _certifi_pip_upgrade(user):
+    """(ok, output tail) of `python3 -m pip install -U certifi` as `user` (None: root)."""
+    prefix, flags, env, _home = _certifi_runner(user)
+    argv = (prefix + [CERTIFI_PYTHON] + flags +
+            ['-m', 'pip', 'install', '--upgrade', '--only-binary', ':all:',
+             '--timeout', '30', '--retries', '2'] + ([] if user is None else ['--user']) +
+            ['certifi'])
+    out = ''
+    # An externally-managed python (Ubuntu 24.04, pip 23+) needs --break-system-packages;
+    # Ubuntu 22.04's pip 22.0 does not know the option. Same fallback as the deploy.
+    for extra in (['--break-system-packages'], []):
+        try:
+            r = subprocess.run(argv + extra, capture_output=True, text=True, encoding='utf-8',
+                               errors='replace', timeout=240, env=env, cwd='/')
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, str(e)[-300:]
+        out = ((r.stdout or '') + (r.stderr or '')).strip()
+        if r.returncode == 0:
+            return True, out[-300:]
+        if 'no such option' not in out:
+            break
+    return False, out[-300:]
+
+
+def _check_certifi_upgrade(req):
+    # Nothing in the request is read. Whether this box needs it is decided in
+    # _do_certifi_upgrade and reported as a skip, never a denial.
+    return
+
+
+def _do_certifi_upgrade(req):
+    if not os.path.isdir(CERTIFI_EDITOR_DIR):
+        return {'ok': True, 'skipped': 'MediaMTX web editor is not installed'}
+    try:
+        st = os.stat(CERTIFI_PYTHON)
+    except OSError:
+        return {'ok': True, 'skipped': f'no {CERTIFI_PYTHON}'}
+    # We run it as root, so it must be one only root could have put there.
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+        return {'ok': True, 'skipped': f'{CERTIFI_PYTHON} is not a root-owned file — not running it'}
+    users = [None]
+    try:
+        pwd.getpwnam(CERTIFI_EDITOR_USER)
+        users.append(CERTIFI_EDITOR_USER)
+    except KeyError:
+        pass
+    upgraded, still, errors = [], [], []
+    for user in users:                            # root first: the editor may share its copy
+        label = user or 'root'
+        before = _certifi_view(user)
+        if not before or not before['distrusted']:
+            continue
+        if not before['pip']:
+            still.append({'user': label, 'path': before['where'], 'roots': before['distrusted']})
+            continue
+        ok, out = _certifi_pip_upgrade(user)
+        after = _certifi_view(user) or {}
+        left = after.get('distrusted') or []
+        if left or after.get('where') is None:
+            still.append({'user': label, 'path': after.get('where') or before['where'],
+                          'roots': left or before['distrusted']})
+            errors.append(f'{label}: ' + (out if not ok else 'certifi still holds ' + ', '.join(left)))
+        else:
+            upgraded.append({'user': label, 'path': before['where'], 'removed': before['distrusted']})
+    return {'ok': not errors, 'upgraded': upgraded, 'still_stale': still,
+            **({'error': '; '.join(errors)[-600:]} if errors else {})}
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -2890,6 +3083,8 @@ def _evaluate(req):
             _check_tak58_setup_db(req)
         elif op == 'java_cacerts_sync':
             _check_java_cacerts_sync(req)
+        elif op == 'certifi_upgrade':
+            _check_certifi_upgrade(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -2972,12 +3167,14 @@ def _dispatch(req, peer):
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
-              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync'):
+              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
         elif op == 'java_cacerts_sync':
             summary = JAVA_CACERTS
+        elif op == 'certifi_upgrade':
+            summary = CERTIFI_EDITOR_DIR
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -3007,6 +3204,8 @@ def _dispatch(req, peer):
             return _do_tak58_setup_db(req)
         if op == 'java_cacerts_sync':
             return _do_java_cacerts_sync(req)
+        if op == 'certifi_upgrade':
+            return _do_certifi_upgrade(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
