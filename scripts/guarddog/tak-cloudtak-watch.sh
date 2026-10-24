@@ -218,9 +218,9 @@ is NOT required and will not help.
     fi
   else
     if [ -f "$_DRIFT_PENDING" ] && [ ! -f "$_DRIFT_STATE" ]; then
-      _log "drift | cloudtak-media HLS profile restored before the alert threshold — self-healed, not reported"
+      _log "drift | CloudTAK settings and HLS profile back before the alert threshold — repaired or self-healed, not reported"
     fi
-    [ -f "$_DRIFT_STATE" ] && _log "drift | cloudtak-media HLS profile restored"
+    [ -f "$_DRIFT_STATE" ] && _log "drift | CloudTAK settings and HLS profile restored"
     rm -f "$_DRIFT_STATE" "$_DRIFT_PENDING"
   fi
 fi
