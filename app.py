@@ -45678,6 +45678,182 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
 
 
+# ops #216: the same shield for a CloudTAK on another host. Remote Deploy and Update reset the
+# tracked files there too (`checkout -f`, `checkout -- .`) and then build, so TAK Portal's
+# plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
+# copy in shell, the functions above are sent as they are and run by the remote python3.
+_CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')
+_CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
+                    '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
+                    '_cloudtak_plugin_missing_deps', '_cloudtak_shield_foreign_plugins')
+
+
+def _cloudtak_shield_py():
+    """The shield as a standalone python3 script: `python3 - <CloudTAK dir>`."""
+    import inspect
+    g = globals()
+    parts = ['import json, os, re, subprocess, sys']
+    for n in _CT_SHIELD_CONSTS:
+        v = g[n]
+        parts.append(f'{n} = re.compile({v.pattern!r}, {int(v.flags)})' if isinstance(v, re.Pattern)
+                     else f'{n} = {v!r}')
+    parts.append('CLOUDTAK_PLUGINS = %r' % [{'install_dir': p['install_dir']} for p in CLOUDTAK_PLUGINS])
+    parts += [inspect.getsource(g[n]) for n in _CT_SHIELD_FUNCS]
+    parts.append("_cloudtak_shield_foreign_plugins(sys.argv[1], lambda m: print(m, flush=True))")
+    return '\n\n'.join(parts) + '\n'
+
+
+# Read now, at import: app.py on disk can be newer than this process after Update Now pulls.
+try:
+    _CT_SHIELD_PY = _cloudtak_shield_py()
+except Exception:
+    _CT_SHIELD_PY = ''
+
+
+def _cloudtak_remote_shield_sh():
+    """POSIX sh for the remote host (any cwd): run the shield on ~/CloudTAK. Exits 0 when the
+    host has no python3 — the build then fails as it would have, with the cause in the log."""
+    b64 = _b64.b64encode(_CT_SHIELD_PY.encode('utf-8')).decode('ascii')
+    return ("if command -v python3 >/dev/null 2>&1; then "
+            f"printf %s {b64} | base64 -d | python3 - ~/CloudTAK; "
+            "else echo '  ⚠ python3 not found on the CloudTAK host: TAK Portal plugins are not "
+            "shielded from this build'; fi")
+
+
+def _cloudtak_remote_shield(remote_cfg, plog):
+    """Run `_cloudtak_remote_shield_sh()` over SSH and log what it did. Never raises."""
+    try:
+        if not _CT_SHIELD_PY:
+            return
+        ok, out = _ssh_probe(remote_cfg, _cloudtak_remote_shield_sh(), timeout=120)
+        for line in (out or '').splitlines()[-12:]:
+            if line.strip():
+                plog(line if line.startswith(' ') else f'  {line}')
+        if not ok:
+            plog("  ⚠ Could not set the remote build to skip non-infra-TAK plugins (non-fatal)")
+    except Exception as e:
+        plog(f"  ⚠ Could not set the remote build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
+
+
+def _cloudtak_carry_plugins(ct_dir, plog):
+    """ops #216: move every plugin folder left in the web root this tree no longer builds from
+    (api/web/plugins <-> app/plugins, CloudTAK 13.102.0's move) to the one it does — TAK
+    Portal's as well as ours; only infra-TAK's were moved before, so a marketplace plugin dropped
+    out of the build. Untracked folders only, never over an existing one. Returns the
+    (old, new) moves so a rolled-back Update can put them back."""
+    import shutil as _shutil
+    new = _cloudtak_plugins_dir(ct_dir)
+    moves = []
+    for old in (os.path.join(ct_dir, 'app', 'plugins'), os.path.join(ct_dir, 'api', 'web', 'plugins')):
+        if old == new or not os.path.isdir(old):
+            continue
+        rel = os.path.relpath(old, ct_dir)
+        try:
+            r = subprocess.run(['git', '-c', f'safe.directory={ct_dir}', '-C', ct_dir, 'ls-files', '--', rel],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                continue
+            tracked = {ln[len(rel) + 1:].split('/', 1)[0] for ln in r.stdout.splitlines()
+                       if ln.startswith(rel + '/')}
+            names = sorted(os.listdir(old))
+        except Exception:
+            continue
+        for n in names:
+            src, dst = os.path.join(old, n), os.path.join(new, n)
+            if (n.startswith('.') or n in tracked or os.path.lexists(dst)
+                    or not (os.path.isdir(src) or os.path.islink(src))):
+                continue
+            try:
+                os.makedirs(new, exist_ok=True)
+                _shutil.move(src, dst)
+                moves.append((src, dst))
+                plog(f"  Moved plugin {n} to {os.path.relpath(new, ct_dir)}/ (CloudTAK moved its web app)")
+            except Exception as e:
+                plog(f"  ⚠ Could not move plugin {n} to {os.path.relpath(new, ct_dir)}/: {str(e)[:120]}")
+    return moves
+
+
+# ops #216: what a TAK Portal marketplace install leaves in the CloudTAK tree, outside git. A
+# re-clone (Deploy, when the checkout has no compose file) deletes the tree, so these are moved
+# aside first and put back wherever the fresh clone has nothing of that name.
+_CLOUDTAK_KEEP_FILES = (CLOUDTAK_CUSTOM_COMPOSE, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE, 'cloudtak-marketplace-plugins',
+                  '.plugin-src')
+_CLOUDTAK_KEEP_DIRS = (os.path.join('app', 'plugins'), os.path.join('api', 'web', 'plugins'),
+                 os.path.join('api', 'stateless', 'routes'))
+
+
+def _cloudtak_keep_aside(ct_dir):
+    """Move the untracked plugin state out of `ct_dir` into a sibling folder; returns it (or
+    None when there was nothing). Entries of the plugin and route dirs are moved one by one —
+    the fresh clone brings its own tracked ones back."""
+    import shutil as _shutil
+    import glob as _glob
+    try:
+        keep = tempfile.mkdtemp(prefix='.cloudtak-keep-', dir=os.path.dirname(os.path.abspath(ct_dir)))
+    except Exception:
+        return None
+    moved = 0
+    names = list(_CLOUDTAK_KEEP_FILES) + [os.path.basename(p) for p in
+                                    _glob.glob(os.path.join(ct_dir, 'docker-compose.plugin-*.yml'))]
+    for n in names:
+        src = os.path.join(ct_dir, n)
+        if os.path.lexists(src):
+            try:
+                _shutil.move(src, os.path.join(keep, n))
+                moved += 1
+            except Exception:
+                pass
+    for d in _CLOUDTAK_KEEP_DIRS:
+        try:
+            entries = os.listdir(os.path.join(ct_dir, d))
+        except OSError:
+            continue
+        os.makedirs(os.path.join(keep, d), exist_ok=True)
+        for n in entries:
+            try:
+                _shutil.move(os.path.join(ct_dir, d, n), os.path.join(keep, d, n))
+                moved += 1
+            except Exception:
+                pass
+    if not moved:
+        _shutil.rmtree(keep, ignore_errors=True)
+        return None
+    return keep
+
+
+def _cloudtak_put_back(keep, ct_dir, plog):
+    """Undo `_cloudtak_keep_aside()` into the fresh tree. A path the clone brought wins (upstream's
+    own route files, a plugin it now ships); ours is only put where there is nothing."""
+    import shutil as _shutil
+    if not keep:
+        return
+    put, left = [], []
+    for root, dirs, files in os.walk(keep):
+        rel_root = os.path.relpath(root, keep)
+        for n in list(dirs) + files:
+            rel = os.path.normpath(os.path.join(rel_root, n))
+            if rel in _CLOUDTAK_KEEP_DIRS or any(d.startswith(rel + os.sep) for d in _CLOUDTAK_KEEP_DIRS):
+                continue                    # descend: app/, api/, app/plugins/ ... are containers
+            if n in dirs:
+                dirs.remove(n)              # a kept folder goes back whole
+            dst = os.path.join(ct_dir, rel)
+            if os.path.lexists(dst):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                _shutil.move(os.path.join(keep, rel), dst)
+                put.append(rel)
+            except Exception:
+                left.append(rel)
+    if put:
+        plog(f"  Kept across the re-clone: {', '.join(sorted(put))}")
+    if left:
+        plog(f"  ⚠ Could not put back {', '.join(sorted(left))} — the old copies are in {keep}")
+    else:
+        _shutil.rmtree(keep, ignore_errors=True)
+
+
 # v10.2.7 — the same Garage step for a CloudTAK that lives on another host. There the SSH user is
 # the operator's own (root on every remote deploy we make), so upstream's own `cloudtak.sh
 # migrate-store` runs as-is; we only hand it the MinIO image we captured before the checkout.
@@ -46774,6 +46950,10 @@ def run_cloudtak_deploy(cfg=None):
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
 
+            # ops #216: a Deploy over a remote CloudTAK keeps TAK Portal's plugins (in-place
+            # checkout) but reset its build edits — put them back before the build.
+            _cloudtak_remote_shield(remote_cfg, plog)
+
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
             run_cmd = (
@@ -46988,22 +47168,16 @@ def run_cloudtak_deploy(cfg=None):
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             # GH #261: the operator's compose file is theirs — carry it across the re-clone.
-            _custom_keep = None
-            try:
-                with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'rb') as _ckf:
-                    _custom_keep = _ckf.read()
-            except OSError:
-                pass
+            # ops #216: and TAK Portal's plugins, route files, overlays and repo copies.
+            _keep = _cloudtak_keep_aside(cloudtak_dir)
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
             _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
-            if _custom_keep is not None and os.path.isdir(cloudtak_dir):
-                try:
-                    with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'wb') as _ckf:
-                        _ckf.write(_custom_keep)
-                except OSError as _cke:
-                    plog(f"  ⚠ Could not put back {CLOUDTAK_CUSTOM_COMPOSE}: {_cke}")
+            if _keep and os.path.isdir(cloudtak_dir):
+                _cloudtak_put_back(_keep, cloudtak_dir, plog)
+            elif _keep:
+                plog(f"  ⚠ Re-clone left no tree — your CloudTAK plugin files are kept in {_keep}")
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -47016,6 +47190,8 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"✗ No compose file found in {cloudtak_dir}")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
+        # ops #216: a Deploy over an installed CloudTAK can cross the api/web -> app/ move too.
+        _cloudtak_carry_plugins(cloudtak_dir, plog)
 
         # Step 3: Generate .env and docker-compose.override.yml
         plog("")
@@ -47180,11 +47356,14 @@ def run_cloudtak_deploy(cfg=None):
                 plog(f"━━━ Step 4/7 (Retry {build_attempt}/{MAX_BUILD_ATTEMPTS - 1}): Building Docker Images ━━━")
                 plog(f"  Waiting {RETRY_WAIT}s before retry...")
                 time.sleep(RETRY_WAIT)
-                # Clean up docker state from failed attempt (preserve volumes)
+                # Clean up docker state from failed attempt (preserve volumes). ops #216: no
+                # --remove-orphans — TAK Portal's Print / uDash containers come from their own
+                # docker-compose.plugin-<id>.yml in this project, look orphaned to us, and nothing
+                # here would start them again.
                 plog("  Cleaning up from previous build attempt...")
                 try:
                     subprocess.run(
-                        _sudo_wrap(['docker', 'compose', 'down', '--remove-orphans']),
+                        _sudo_wrap(['docker', 'compose', 'down']),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=120, cwd=cloudtak_dir
                     )
@@ -48555,6 +48734,8 @@ def run_cloudtak_update():
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #216: every plugin across the api/web -> app/ move, TAK Portal's included.
+            _plugin_moves.extend(_cloudtak_carry_plugins(cloudtak_dir, plog))
             # Restore any catalog plugins that the checkout wiped.
             plugins_base = _cloudtak_plugins_dir(cloudtak_dir)
             os.makedirs(plugins_base, exist_ok=True)
@@ -48648,6 +48829,8 @@ def run_cloudtak_update():
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
+            _cloudtak_remote_shield(remote_cfg, plog)
             if os.path.isdir(_cloudtak_hooks_dir()):
                 plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
@@ -91899,12 +92082,29 @@ def _ct_docker_out(args, timeout=20, stdin=None):
     return r.stdout if r.returncode == 0 else None
 
 
+def _cloudtak_override_services(ct_dir):
+    """Service names infra-TAK's docker-compose.override.yml configures (api, events, media,
+    postgis), read from the file itself. Empty set when it can't be read."""
+    try:
+        with open(os.path.join(ct_dir, 'docker-compose.override.yml'), encoding='utf-8') as f:
+            text = f.read()
+    except OSError:
+        return set()
+    m = re.search(r'^services:[ \t]*\n((?:[ \t]+.*\n|[ \t]*\n)*)', text + '\n', re.M)
+    return set(re.findall(r'^  ([A-Za-z0-9][\w.-]*):[ \t]*$', m.group(1), re.M)) if m else set()
+
+
 def _cloudtak_containers_without_override(ct_dir):
     """Running containers of the CloudTAK project that compose created WITHOUT
     docker-compose.override.yml (their config_files label), when the override exists — what
     TAK Portal's `-f docker-compose.yml -f docker-compose.marketplace.yml` recreate leaves
     (ops #197): stock media-infra / postgis images and no console CA in the api. [] when
-    clean or when docker can't tell."""
+    clean or when docker can't tell.
+
+    ops #216: only services the override configures count. TAK Portal starts Print and the uDash
+    sidecar from their own docker-compose.plugin-<id>.yml in the same project; they never carry
+    our override and nothing we recreate would change that, so counting them made every console
+    start recreate CloudTAK and Guard Dog repair it three times an hour, then alarm."""
     if not os.path.exists(os.path.join(ct_dir, 'docker-compose.override.yml')):
         return []
     proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
@@ -91912,11 +92112,16 @@ def _cloudtak_containers_without_override(ct_dir):
     if not proj:
         return []
     rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
-                             '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}']) or ''
+                             '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
+                             '|{{.Label "com.docker.compose.service"}}']) or ''
+    ours = _cloudtak_override_services(ct_dir)
     bad = []
     for row in rows.splitlines():
-        name, _, files = row.partition('|')
+        name, _, rest = row.partition('|')
+        files, _, service = rest.partition('|')
         files = [f.strip() for f in files.split(',') if f.strip()]
+        if ours and service.strip() not in ours:
+            continue
         if files and 'docker-compose.override.yml' not in {os.path.basename(f) for f in files}:
             bad.append(name.strip())
     return bad
