@@ -102,6 +102,7 @@ class Box:
             '_docker_compose_pull': lambda *a, **k: self.calls.append(['PULL']),
             '_cloudtak_media_hls_heal': self.heal,
             '_cloudtak_open_stream_ports': lambda *a, **k: None,
+            '_cloudtak_ensure_custom_compose': lambda *a, **k: False,   # GH #261, tested on its own
             'CONFIG_DIR': str(self.home / '.config'),
         }
         for c in ('_CLOUDTAK_RECREATE_PENDING', '_CLOUDTAK_RECREATE_MAX_TRIES', '_CLOUDTAK_COMPOSE_UP_RE'):

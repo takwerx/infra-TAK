@@ -43077,6 +43077,7 @@ def cloudtak_control():
             cmd = "cd ~/CloudTAK && [ -x ./cloudtak.sh ] && ./cloudtak.sh update || (docker compose pull && docker compose up -d)"
         else:
             return jsonify({'error': 'Invalid action'}), 400
+        cmd = "( " + _cloudtak_remote_custom_compose_sh() + " ); " + cmd   # GH #261
         ok, out = _ssh_probe(rcfg, cmd, timeout=900 if action == 'update' else 120)
         if not ok:
             return jsonify({'error': (out or 'Remote action failed')[:220]}), 400
@@ -43085,6 +43086,8 @@ def cloudtak_control():
         running = bool(ok and out and 'Up' in out)
     else:
         cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        if action in ('start', 'stop', 'restart', 'update'):
+            _cloudtak_ensure_custom_compose(cloudtak_dir)   # GH #261: before compose, every time
         if action == 'start':
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'stop':
@@ -43135,7 +43138,8 @@ def cloudtak_container_logs():
             capture_output=True, text=True, timeout=15)
     else:
         if os.path.exists(compose_yml):
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'logs', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
+            # No `-f`: COMPOSE_FILE in .env adds the operator's services' logs (GH #261).
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'logs', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
         else:
             r = subprocess.run(_sudo_wrap(['docker', 'logs', 'cloudtak-api-1', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
@@ -43753,6 +43757,7 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
         # GH #252: a past Update wiped TAK Portal's lint skip for its plugins — put it back.
         _cloudtak_shield_foreign_plugins(ct_dir, plog)
+        _cloudtak_ensure_custom_compose(ct_dir, plog)   # GH #261: the recreate keeps their services
         # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
         _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
         if not _hok:
@@ -44641,6 +44646,180 @@ def _cloudtak_env_set(env_path, updates=None, remove=()):
             out.append(f'{k}={v}')
     with open(env_path, 'w') as f:
         f.write('\n'.join(out) + '\n')
+
+
+# GH #261: the operator's own compose file for CloudTAK (a plugin's service such as the clptak
+# print container, an extra env var on `events`, a network...). It cannot be
+# docker-compose.override.yml: infra-TAK owns that one and regenerates it on every console
+# start, and CloudTAK Update resets docker-compose.yml. So it is a third file, created once and
+# never written again, and every compose run loads it LAST (so it wins) through COMPOSE_FILE in
+# CloudTAK's .env — which is how the bare `docker compose` calls all over this file, cloudtak.sh
+# and an operator's own shell pick it up without each growing a `-f` list. Absolute paths:
+# _broker_compose runs with `--project-directory`, not from inside ~/CloudTAK.
+CLOUDTAK_CUSTOM_COMPOSE = 'docker-compose.custom.yml'
+_CLOUDTAK_CUSTOM_COMPOSE_SEED = """\
+# ~/CloudTAK/docker-compose.custom.yml is YOURS. infra-TAK created it once and never writes it
+# again. Every CloudTAK action in infra-TAK (Deploy, Update, plugin install/rebuild, Start, Stop,
+# Restart, console restart) loads it after CloudTAK's docker-compose.yml and infra-TAK's
+# docker-compose.override.yml, so what you add here is applied last and survives all of them.
+# A plain `docker compose ...` in ~/CloudTAK loads it too (COMPOSE_FILE in .env).
+#
+# Do not edit those two files instead: infra-TAK regenerates docker-compose.override.yml on
+# every console start, and CloudTAK Update resets docker-compose.yml.
+#
+# Add your own services, or settings for CloudTAK's (api, events, tiles, media, postgis, store).
+# CloudTAK's containers reach yours by service name (e.g. http://print:5010).
+#
+# Browser access: infra-TAK's Caddy runs on the host, not in Docker, so it cannot resolve a
+# container name. Publish the port on loopback only, e.g. "127.0.0.1:5010:5010" (never on
+# 0.0.0.0), and route to it from a Caddy include such as
+#   /etc/caddy/sites.d/<CloudTAK map host>/print.caddy:
+#     @print path /print-api /print-api/*
+#     handle @print {
+#         reverse_proxy 127.0.0.1:5010
+#     }
+# then click Reload on the Caddy page.
+#
+# Example: replace the `services: {}` line below with
+#
+# services:
+#   print:
+#     build: ./cloudtak-plugin-print/service
+#     restart: unless-stopped
+#     env_file: .env
+#     environment:
+#       - API_INTERNAL_URL=http://api:5000
+#       - TILES_INTERNAL_URL=http://tiles:5002
+#     ports:
+#       - "127.0.0.1:5010:5010"
+#   events:
+#     environment:
+#       - GDAL_PDF_BANDS=4
+
+services: {}
+"""
+
+
+# TAK Portal's CloudTAK marketplace pins its CSP overlay into the same COMPOSE_FILE (relative
+# name, matched exactly by its own script), so it must survive our rewrite — and a Deploy, which
+# writes .env from scratch, must put it back.
+_CLOUDTAK_TAKPORTAL_CSP_COMPOSE = 'docker-compose.marketplace.yml'
+
+
+def _cloudtak_compose_file_value(cloudtak_dir, current=''):
+    """COMPOSE_FILE for the CloudTAK project: base file, infra-TAK's override (when present),
+    every other file already listed in `current` (kept verbatim — TAK Portal's marketplace adds
+    its own), then the operator's file last. A listed file that no longer exists is dropped:
+    compose refuses to run at all with one missing. ':'-separated (Linux only, like the rest)."""
+    d = os.path.abspath(cloudtak_dir)
+    base = 'docker-compose.yml'
+    if not os.path.exists(os.path.join(d, base)) and os.path.exists(os.path.join(d, 'compose.yaml')):
+        base = 'compose.yaml'
+    ours = [base]
+    if os.path.exists(os.path.join(d, 'docker-compose.override.yml')):
+        ours.append('docker-compose.override.yml')
+    files = [os.path.join(d, f) for f in ours]
+    seen = {os.path.join(d, n) for n in ('docker-compose.yml', 'compose.yaml',
+                                         'docker-compose.override.yml', CLOUDTAK_CUSTOM_COMPOSE)}
+    others = [i.strip() for i in (current or '').strip().strip('"\'').split(':')]
+    if os.path.exists(os.path.join(d, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE)):
+        others.append(_CLOUDTAK_TAKPORTAL_CSP_COMPOSE)
+    for item in others:
+        p = os.path.normpath(os.path.join(d, item)) if item else ''
+        if not p or p in seen or not os.path.exists(p):
+            continue
+        seen.add(p)
+        files.append(item)
+    files.append(os.path.join(d, CLOUDTAK_CUSTOM_COMPOSE))
+    return ':'.join(files)
+
+
+def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
+    """GH #261: create the operator's CloudTAK compose file if it is missing (never touch one
+    that exists — even an empty file or a symlink is theirs), and point COMPOSE_FILE in
+    CloudTAK's .env at base + override + any others listed (TAK Portal's) + it. Run before
+    every compose action and after every .env rewrite; idempotent. Returns True when anything
+    changed. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        env_path = os.path.join(cloudtak_dir, '.env')
+        if not os.path.isfile(env_path):
+            return False                 # not deployed (or remote): nothing runs compose here
+        changed = False
+        custom = os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE)
+        if not os.path.lexists(custom):
+            with open(custom, 'x') as f:  # 'x': a file that appeared meanwhile is not ours
+                f.write(_CLOUDTAK_CUSTOM_COMPOSE_SEED)
+            _log(f"  Created {custom} for your own CloudTAK services (infra-TAK never edits it)")
+            changed = True
+        cur = _cloudtak_env_read(env_path).get('COMPOSE_FILE') or ''
+        want = _cloudtak_compose_file_value(cloudtak_dir, cur)
+        if cur != want:
+            _cloudtak_env_set(env_path, {'COMPOSE_FILE': want})
+            changed = True
+        return changed
+    except Exception as e:
+        _log(f"  ⚠ Could not set up {CLOUDTAK_CUSTOM_COMPOSE} for CloudTAK: {e}")
+        return False
+
+
+def _cloudtak_remote_custom_compose_sh():
+    """`_cloudtak_ensure_custom_compose()` as POSIX sh for a remote CloudTAK host (run over SSH,
+    any cwd). The .env is rewritten through `cat >` so it keeps its owner and mode."""
+    return (
+        'cd ~/CloudTAK && if [ -f .env ]; then '
+        f'{{ [ -e {CLOUDTAK_CUSTOM_COMPOSE} ] || [ -L {CLOUDTAK_CUSTOM_COMPOSE} ] || '
+        f'printf %s {shlex.quote(_CLOUDTAK_CUSTOM_COMPOSE_SEED)} > {CLOUDTAK_CUSTOM_COMPOSE}; }} && '
+        'b=docker-compose.yml; { [ -f "$b" ] || [ ! -f compose.yaml ]; } || b=compose.yaml; '
+        'f="$PWD/$b"; [ -f docker-compose.override.yml ] && f="$f:$PWD/docker-compose.override.yml"; '
+        # keep every other listed file that still exists (TAK Portal's), verbatim, once
+        "cur=$(grep '^COMPOSE_FILE=' .env | tail -n 1 | cut -d= -f2- | tr -d '\\042\\047'); "
+        f'[ -f {_CLOUDTAK_TAKPORTAL_CSP_COMPOSE} ] && cur="$cur:{_CLOUDTAK_TAKPORTAL_CSP_COMPOSE}"; '
+        'o=$IFS; IFS=:; for i in $cur; do '
+        'case "$i" in ""|docker-compose.yml|compose.yaml|docker-compose.override.yml|'
+        f'{CLOUDTAK_CUSTOM_COMPOSE}|"$PWD/docker-compose.yml"|"$PWD/compose.yaml"|'
+        f'"$PWD/docker-compose.override.yml"|"$PWD/{CLOUDTAK_CUSTOM_COMPOSE}") continue;; esac; '
+        '[ -e "$i" ] || continue; case ":$f:" in *":$i:"*) continue;; esac; f="$f:$i"; '
+        'done; IFS=$o; '
+        f'f="$f:$PWD/{CLOUDTAK_CUSTOM_COMPOSE}"; '
+        "grep -v '^COMPOSE_FILE=' .env > .env.ct261.tmp; echo \"COMPOSE_FILE=$f\" >> .env.ct261.tmp && "
+        'cat .env.ct261.tmp > .env; rm -f .env.ct261.tmp; fi'
+    )
+
+
+def _cloudtak_remote_reclone_sh(release_tag=None):
+    """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
+    deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
+    first and put back after — it is theirs, and seeding a fresh one would silently drop their
+    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run."""
+    keep = '~/.cloudtak-custom-compose.keep'
+    custom = f'~/CloudTAK/{CLOUDTAK_CUSTOM_COMPOSE}'
+    save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
+    restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
+    if release_tag:
+        # Stop a stack that is already there before deleting its tree. The Garage store
+        # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+        # it came back during the rm -rf, Docker re-created the folder, and Garage
+        # initialized it with the OLD key; the new stack then crash-looped on a key
+        # mismatch (ops #33 box test, redeploy over an existing remote install).
+        return (
+            "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+            "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
+            + save +
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {shlex.quote(release_tag)} "
+            "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
+            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+        )
+    return (
+        "if [ -d ~/CloudTAK/.git ]; then "
+        "cd ~/CloudTAK && git pull --rebase --autostash; "
+        "else "
+        + save +
+        "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK"
+        + restore + "; "
+        "fi; "
+        "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+    )
 
 
 def _cloudtak_compose_run(cloudtak_dir, args, timeout=600):
@@ -45986,27 +46165,9 @@ def run_cloudtak_deploy(cfg=None):
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
-                # Stop a stack that is already there before deleting its tree. The Garage store
-                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
-                # it came back during the rm -rf, Docker re-created the folder, and Garage
-                # initialized it with the OLD key; the new stack then crash-looped on a key
-                # mismatch (ops #33 box test, redeploy over an existing remote install).
-                prep_cmd = (
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
-                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
             else:
                 plog("  ⚠ Could not fetch latest release tag — using main branch")
-                prep_cmd = (
-                    "if [ -d ~/CloudTAK/.git ]; then "
-                    "cd ~/CloudTAK && git pull --rebase --autostash; "
-                    "else "
-                    "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                    "fi; "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
+            prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)
             ok, out = _ssh_probe(remote_cfg, prep_cmd, timeout=600)
             if not ok:
                 plog(f"✗ CloudTAK repo prep failed on remote: {(out or '')[:220]}")
@@ -46051,7 +46212,8 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 mv_cmd = (
                     "mv /tmp/.env ~/CloudTAK/.env && "
-                    "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml"
+                    "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
+                    "( " + _cloudtak_remote_custom_compose_sh() + " )"   # GH #261
                 )
                 ok, out = _ssh_probe(remote_cfg, mv_cmd, timeout=40)
                 if not ok:
@@ -46285,10 +46447,23 @@ def run_cloudtak_deploy(cfg=None):
         compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
+            # GH #261: the operator's compose file is theirs — carry it across the re-clone.
+            _custom_keep = None
+            try:
+                with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'rb') as _ckf:
+                    _custom_keep = _ckf.read()
+            except OSError:
+                pass
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
             _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
+            if _custom_keep is not None and os.path.isdir(cloudtak_dir):
+                try:
+                    with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'wb') as _ckf:
+                        _ckf.write(_custom_keep)
+                except OSError as _cke:
+                    plog(f"  ⚠ Could not put back {CLOUDTAK_CUSTOM_COMPOSE}: {_cke}")
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -46365,6 +46540,9 @@ def run_cloudtak_deploy(cfg=None):
         with open(override_path, 'w') as f:
             f.write(override_yml)
         plog("  docker-compose.override.yml written (api → host.docker.internal for :5001)")
+        # GH #261: the .env above was written from scratch — put COMPOSE_FILE back so the
+        # pull/up below keep the operator's docker-compose.custom.yml services.
+        _cloudtak_ensure_custom_compose(cloudtak_dir, plog)
 
         # v0.9.56: harden base-compose port bindings BEFORE `up -d`. The Step-2 clone pulls
         # upstream CloudTAK, whose base compose republishes every port on 0.0.0.0 — incl. media
@@ -46954,6 +47132,7 @@ def run_cloudtak_redeploy(cfg=None):
             cmd = (
                 "mv /tmp/.env ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
+                "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
                 + _g_sh +
                 "cd ~/CloudTAK && docker compose up -d"
             )
@@ -47033,6 +47212,7 @@ def run_cloudtak_redeploy(cfg=None):
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
         with open(override_path, 'w') as f:
             f.write(_cloudtak_build_override_yml(settings))
+        _cloudtak_ensure_custom_compose(cloudtak_dir, plog)   # GH #261
         plog("✓ .env and override written")
         plog("  Restarting containers...")
         dcc = _compose_cmd()
@@ -47930,6 +48110,8 @@ def run_cloudtak_update():
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
             # GH #252: the checkout just reset TAK Portal's lint skip for its plugins.
             _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
+            # GH #261: build/up below load the operator's docker-compose.custom.yml too.
+            _cloudtak_ensure_custom_compose(cloudtak_dir, plog)
             # #150: the operator's own source patches, after ours and before the build.
             # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
             _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
@@ -47959,6 +48141,7 @@ def run_cloudtak_update():
             _ct_snap = _cloudtak_snapshot_images(None, remote_cfg=remote_cfg)
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
+            _ssh_probe(remote_cfg, _cloudtak_remote_custom_compose_sh(), timeout=30)   # GH #261
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
             ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
             if not ok:
@@ -90765,6 +90948,9 @@ def _startup_harden_cloudtak_ports():
                 os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
         except Exception:
             pass
+        # GH #261: before the recreate below, so it keeps the operator's own services.
+        if _cloudtak_ensure_custom_compose(_ct_dir, plog=lambda m: print(f"Startup migration: {m.strip()}", flush=True)):
+            print("Startup migration: CloudTAK compose now loads docker-compose.custom.yml")
         _minio_repointed = _patch_cloudtak_minio_registry(_ct_dir)
         _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
