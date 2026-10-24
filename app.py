@@ -2706,6 +2706,94 @@ def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
     return bool(patched)
 
 
+# ops #200 — CA roots the OS vendors have withdrawn trust from that Temurin's own bundled
+# cacerts still ships. Container TAK trusts that bundled store, not the host's, so an OS
+# update never reaches it. Measured 2026-10-23: Temurin 17.0.19+10 (TAK 5.8's hardened base)
+# and 17.0.20.1+1 (the newest 17) both still carry eMudhra's emSign ECC Root CA - G3. These
+# are Temurin's alias names, exactly as `keytool -list -cacerts` prints them; add the next
+# distrusted root here.
+_JDK_DISTRUSTED_CA_ALIASES = (
+    'cn_emsign_ecc_root_ca__g3,o_emudhra_technologies_limited,ou_emsign_pki,c_in [jdk]',
+)
+_JDK_DISTRUST_MARK = '# infra-TAK: CA trust store update'
+
+
+def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
+    """Drop _JDK_DISTRUSTED_CA_ALIASES from the TAK Server image's JDK truststore. Idempotent.
+
+    Adds one RUN after each FROM in the app Dockerfile, where the base image (eclipse-temurin,
+    root) is still the user, so it lands before TAK's own steps and any USER switch. An alias
+    the JDK does not have is not an error: a newer Temurin that already dropped the root, or
+    a stage that is not a JDK, builds exactly as before. Same contract as the patchers above:
+    a Dockerfile we cannot read or write is built as shipped."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not app_dockerfile:
+        return False
+    df = os.path.join(build_ctx, app_dockerfile)
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    if _JDK_DISTRUST_MARK in src:
+        return False
+    drop = ' ; '.join(f'keytool -delete -cacerts -storepass changeit -alias {shlex.quote(a)} >/dev/null 2>&1'
+                      for a in _JDK_DISTRUSTED_CA_ALIASES)
+    step = f'{_JDK_DISTRUST_MARK}\nRUN {drop} ; true\n'
+    new = re.sub(r'(?im)^(FROM\s[^\n]*\n)', lambda m: m.group(1) + step, src)
+    if new == src:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(new)
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(app_dockerfile)}: CA trust store update "
+         f"({len(_JDK_DISTRUSTED_CA_ALIASES)} root(s) the OS vendors no longer trust).")
+    return True
+
+
+def _tak_container_drop_distrusted_cas(log_fn=None):
+    """Same roots, out of the RUNNING TAK container's JDK, for installs whose image was built
+    before the patch above. Returns the aliases removed (empty when already clean), or None
+    when the container could not be asked. Takes effect from TAK's next restart.
+
+    `docker exec -u 0` with an argv, no shell: the JDK's cacerts is root's, not tak's. The
+    container's writable layer keeps it until the container is recreated, which only happens
+    from a freshly built image — and that one already has the patch."""
+    _log = log_fn or (lambda m: None)
+    removed = []
+    for alias in _JDK_DISTRUSTED_CA_ALIASES:
+        base = ['docker', 'exec', '-u', '0', TAK_CONTAINER, 'keytool']
+        try:
+            r = subprocess.run(_sudo_wrap(base + ['-list', '-cacerts', '-storepass', 'changeit', '-alias', alias]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            _log(f"TAK container trust store check skipped: {str(e)[:160]}")
+            return None
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0:
+            if 'does not exist' in out:
+                continue          # already gone
+            if 'No such container' not in out and 'is not running' not in out:
+                _log(f"TAK container trust store check skipped: {out.strip()[-160:]}")
+            return None           # stopped TAK is asked again on the next console start
+        try:
+            r = subprocess.run(_sudo_wrap(base + ['-delete', '-cacerts', '-storepass', 'changeit', '-alias', alias]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            _log(f"⚠ TAK container trust store: could not remove {alias}: {str(e)[:160]}")
+            continue
+        if r.returncode == 0:
+            removed.append(alias)
+        else:
+            _log(f"⚠ TAK container trust store: could not remove {alias}: "
+                 f"{((r.stdout or '') + (r.stderr or '')).strip()[-160:]}")
+    return removed
+
+
 def _tak_bundle_dockerfiles(ctx):
     """(app_dockerfile, db_dockerfile) relative to `ctx`, newest naming first.
 
@@ -82520,6 +82608,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -84514,6 +84603,7 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
@@ -88553,6 +88643,56 @@ def _pin_takserver_jvm(plog=None):
         _log(f"\u2713 TAK Server pinned to JDK 17 at {home} ({', '.join(changed)}). "
              f"Takes effect on the next TAK Server restart.")
     return {'java_home': home, 'changed': changed}
+
+
+def _sync_java_cacerts(log_fn=None):
+    """Bring Ubuntu's Java CA keystore back in step with the OS trust store (ops #200).
+
+    An OS update that distrusts a CA root removes it from /etc/ssl/certs but not from
+    /etc/ssl/certs/java/cacerts, which native TAK Server's OpenJDK trusts for outbound
+    HTTPS. The work, and the reason, live in the broker (`java_cacerts_sync`,
+    broker/takwerx_broker.py): the request carries nothing,
+    and on a root console we run that same function in-process rather than keep a copy.
+
+    Re-run on every console start, so the next distrust is picked up too. It does NOT
+    restart TAK Server: a running JVM keeps the truststore it started with, so the change
+    takes effect on TAK's next restart, the same as the JVM pin above.
+    Returns the broker's result dict, or None when the box could not be asked."""
+    _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
+    if _broker_should_route() and _broker_available():
+        try:
+            r = _broker_request({'op': 'java_cacerts_sync'}, timeout=600)
+        except Exception as e:
+            _log(f"Java trust store sync skipped (broker: {str(e)[:160]}) — retries next restart")
+            return None
+    elif os.getuid() == 0:
+        try:
+            m = _broker_module()
+            m._check_java_cacerts_sync({})
+            r = m._do_java_cacerts_sync({})
+        except Exception as e:
+            _log(f"Java trust store sync failed: {str(e)[:200]}")
+            return None
+    else:
+        return None
+    if r.get('skipped'):
+        return r
+    removed, added = r.get('removed') or [], r.get('added') or []
+    if removed or added:
+        names = ''
+        if removed:
+            names = ' (' + ', '.join(removed[:6]) + (', …' if len(removed) > 6 else '') + ')'
+        tak_note = (' Native TAK Server uses it from its next restart.'
+                    if os.path.isdir('/opt/tak') and not _tak_is_container() else '')
+        _log(f"✓ Java trust store synced to the OS: removed {len(removed)} CA root(s) the OS "
+             f"no longer trusts{names}, added {len(added)} the OS trusts. "
+             f"Backup: {r.get('backup')}.{tak_note}")
+    if not r.get('ok'):
+        _log(f"⚠ Java trust store sync: {(r.get('error') or 'failed')[:300]}")
+    elif r.get('still_stale') or r.get('still_missing'):
+        _log(f"⚠ Java trust store still differs from the OS after the sync: "
+             f"{len(r.get('still_stale') or [])} stale, {len(r.get('still_missing') or [])} missing")
+    return r
 
 
 _GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
@@ -93575,6 +93715,24 @@ def _startup_migrations():
             _startup_converge_recidive_tak_exempt()
         except Exception as _f2b_e3f:
             print(f"Startup migration: recidive takserver-exempt converge error (non-fatal): {_f2b_e3f}", flush=True)
+
+        # ops #200 — Ubuntu's Java CA keystore never drops a root the OS distrusts. Here and
+        # not at import time: on a non-root box it is a broker op.
+        try:
+            _sync_java_cacerts()
+        except Exception as _jca_e:
+            print(f"Startup migration: Java trust store sync error (non-fatal): {_jca_e}", flush=True)
+        # Container TAK runs on the JDK's bundled cacerts instead, which no OS update touches.
+        try:
+            if _tak_is_container():
+                _jca_rm = _tak_container_drop_distrusted_cas(
+                    lambda m: print(f"Startup migration: {m}", flush=True))
+                if _jca_rm:
+                    print(f"Startup migration: ✓ TAK container trust store: removed {len(_jca_rm)} CA "
+                          "root(s) the OS vendors no longer trust. TAK Server uses it from its next restart.",
+                          flush=True)
+        except Exception as _jca_e2:
+            print(f"Startup migration: TAK container trust store error (non-fatal): {_jca_e2}", flush=True)
 
         # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
         # _startup_migrations() rather than at import time: it writes a privileged path and
