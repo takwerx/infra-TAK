@@ -54,7 +54,8 @@ LEGACY = '''services:
 
 def _ns():
     """Exec the pins, the rewrite helper and the compose template out of app.py."""
-    want = {'WEBODM_VERSION', 'WEBODM_IMAGES', 'WEBODM_DOCKER_COMPOSE', '_webodm_pin_images'}
+    want = {'WEBODM_VERSION', 'WEBODM_IMAGES', 'WEBODM_DOCKER_COMPOSE', '_webodm_pin_images',
+            'WEBODM_OLEFILE_STRIP', '_webodm_strip_olefile'}
     ns = {'re': re}
     for node in TREE.body:
         names = ({t.id for t in node.targets if isinstance(t, ast.Name)} if isinstance(node, ast.Assign)
