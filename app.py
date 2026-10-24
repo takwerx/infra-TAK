@@ -40538,9 +40538,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
-    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1', timeout=120)
+    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1', timeout=120)
     if not ok:
-        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
+        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1', timeout=120)
     plog("✓ Python packages installed")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
@@ -41126,12 +41126,14 @@ def run_mediamtx_deploy():
                 return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
 
-        # Install Python packages (try with --break-system-packages for newer pip, else without)
+        # Install Python packages (try with --break-system-packages for newer pip, else without).
+        # ops #202: certifi -U on every deploy — pip pulls it in once with requests and nothing
+        # upgrades it after, so the host python kept roots the OS had since removed.
         plog("  Installing Python packages...")
-        r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
+        r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1',
             shell=True, capture_output=True, text=True, timeout=120)
         if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-            subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
+            subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
         plog("✓ Python packages installed")
 
@@ -41658,10 +41660,10 @@ WantedBy=multi-user.target
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
         if os.path.exists(editor_file):
             r = subprocess.run(
-                'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
+                'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-                r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
+                r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1',
                     shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog("  ⚠ pip install for web editor deps had issues (check logs); trying to start anyway")
@@ -43999,6 +44001,52 @@ MEDIA_INFRA_MULTIARCH = True
 POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
 POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
+# ops #202: containers that make outbound TLS trust the HOST's CA bundle, not the one baked
+# into their image. An image's bundle is frozen at build time, so when a CA update removes a
+# root, the host drops it and the container keeps trusting it.
+# The host bundle is kept current by the OS updater; mounting it read-only makes the container
+# follow it from its next start. Two mounts of the same file: over the image's standard path,
+# for anything that reads that path directly, and alone in a directory of its own, so
+# SSL_CERT_DIR names a directory with nothing stale in it — Go (MediaMTX, NetBird) and OpenSSL
+# also load every cert in the image's /etc/ssl/certs, which on Debian-based images is a
+# per-root copy of the same frozen set. REQUESTS_CA_BUNDLE covers Python requests/botocore
+# (certifi ignores the OS bundle). Node is the odd one: it trusts its own compiled-in roots
+# whatever the bundle says, and NODE_EXTRA_CA_CERTS only ADDS to them;
+# --use-openssl-ca makes it use SSL_CERT_FILE instead (checked against Node 24 and 26).
+HOST_CA_BUNDLES = {'debian': '/etc/ssl/certs/ca-certificates.crt',
+                   'rhel': '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem'}
+CONTAINER_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt'
+CONTAINER_CA_DIR = '/etc/ssl/infratak-ca'
+
+
+def _host_ca_bundle():
+    """The host OS CA bundle to share with containers, or None when it is missing or empty —
+    a bind mount of a missing file makes Docker create a directory in its place."""
+    path = HOST_CA_BUNDLES.get(_distro_family())
+    try:
+        if path and os.path.getsize(path) > 0:
+            return path
+    except OSError:
+        pass
+    return None
+
+
+def _container_ca_trust(node=False):
+    """(environment lines, volume lines) for one compose service, at service-key indent, that
+    make it trust the host CA bundle (see HOST_CA_BUNDLES). ('', '') without a host bundle,
+    so the service keeps its image's own and nothing is mounted."""
+    src = _host_ca_bundle()
+    if not src:
+        return '', ''
+    env = (f'      SSL_CERT_FILE: "{CONTAINER_CA_BUNDLE}"\n'
+           f'      SSL_CERT_DIR: "{CONTAINER_CA_DIR}"\n'
+           f'      REQUESTS_CA_BUNDLE: "{CONTAINER_CA_BUNDLE}"\n')
+    if node:
+        env += '      NODE_OPTIONS: "--use-openssl-ca"\n'
+    vols = (f'      - "{src}:{CONTAINER_CA_BUNDLE}:ro"\n'
+            f'      - "{src}:{CONTAINER_CA_DIR}/ca-certificates.crt:ro"\n')
+    return env, vols
+
 
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
@@ -44123,6 +44171,10 @@ def _cloudtak_build_override_yml(settings):
     # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
     # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
     postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
+    # ops #202: media (MediaMTX pulling external sources, Node for proxy leases) trusts the
+    # host CA bundle. Local only: the bundle path is this box's, like the console cert above.
+    media_ca_env, media_ca_vols = ('', '') if _ct_is_remote else _container_ca_trust(node=True)
+    media_ca_vol_block = f'    volumes:\n{media_ca_vols}' if media_ca_vols else ''
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -44177,7 +44229,7 @@ services:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
-  postgis:
+{media_ca_env}{media_ca_vol_block}  postgis:
     # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
     # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
     image: {postgis_image}
@@ -52649,6 +52701,64 @@ server:
         f.write(config_content)
     with open(compose_path, 'w') as f:
         f.write(compose_content)
+    _netbird_write_ca_override(nb_dir)
+
+
+NETBIRD_CA_OVERRIDE_HEADER = '# TAKWERX: NetBird server trusts the host CA bundle (ops #202). Written by the console.\n'
+
+
+def _netbird_write_ca_override(nb_dir):
+    """ops #202: docker-compose.override.yml beside NetBird's compose, giving netbird-server
+    the host CA bundle (see HOST_CA_BUNDLES) for its outbound TLS (IdP discovery, external
+    login providers). An override rather than a line in docker-compose.yml so an existing
+    install gets it without regenerating its compose; every NetBird compose call runs in
+    nb_dir with the default files, so Compose merges it. True when the file changed."""
+    env, vols = _container_ca_trust()
+    if not env:
+        return False
+    path = os.path.join(nb_dir, 'docker-compose.override.yml')
+    new = (NETBIRD_CA_OVERRIDE_HEADER + 'services:\n  netbird-server:\n'
+           f'    environment:\n{env}    volumes:\n{vols}')
+    try:
+        with open(path) as f:
+            if f.read() == new:
+                return False
+    except FileNotFoundError:
+        pass
+    except Exception:
+        try:
+            if _read_priv(path) == new:
+                return False
+        except Exception:
+            pass
+    try:
+        with open(path, 'w') as f:
+            f.write(new)
+    except Exception:
+        _write_priv(path, new)  # root-era /root/netbird the non-root console can't write
+    return True
+
+
+def _heal_netbird_ca_trust(plog=None):
+    """ops #202: give an existing NetBird server the host CA bundle — write the override and
+    recreate netbird-server only (the dashboard serves static files). A no-op once in place.
+    Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        nb_dir = next((d for d in (os.path.expanduser('~/netbird'), '/root/netbird')
+                       if os.path.isfile(os.path.join(d, 'docker-compose.yml'))), None)
+        if not nb_dir or not _netbird_write_ca_override(nb_dir):
+            return False
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        if r.returncode == 0:
+            _log('  ✓ netbird: server now trusts the host CA bundle (recreated)')
+            return True
+        _log(f"  ⚠ netbird: CA trust recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        return False
+    except Exception as e:
+        _log(f'  netbird: CA trust heal error (non-fatal): {e}')
+        return False
 
 
 def _netbird_read_auth_secret(nb_dir):
@@ -94840,6 +94950,12 @@ def _startup_migrations():
             )
         except Exception as nb_pin_err:
             print(f"Startup migration: netbird pin-restore error (non-fatal): {nb_pin_err}")
+
+        # ops #202 — NetBird server trusts the host CA bundle, not its image's frozen one.
+        try:
+            _heal_netbird_ca_trust(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as nb_ca_err:
+            print(f"Startup migration: netbird CA trust error (non-fatal): {nb_ca_err}")
 
         # v10.1.4 (WS2): orphaned-store recovery as a background WATCH, not a one-shot —
         # the confirming decrypt signature only appears after a real SSO login attempt
