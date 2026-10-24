@@ -565,7 +565,11 @@ def _within_realpath(path, root):
 # (dir/x -> /etc) and have the broker follow it out. These require realpath
 # containment; every other allowlisted prefix is root-owned, so the cheaper
 # lexical match in _abs stays safe.
-_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
+# The full-stack backup root (v10.3.0 W12) is root-owned, but it is on the write
+# allowlist and the console can `ln -s` inside it — so it gets realpath containment
+# too, or a planted link would turn a root cp/write into the backup tree into a
+# write anywhere.
+_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS + ('/var/lib/infratak-backups/',)
 
 
 def _path_allowed(path, readonly=False):

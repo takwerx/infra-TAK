@@ -174,7 +174,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="stackbk-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:0"></div>
 <pre id="stackbk-log" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:220px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 <div id="stackbk-list" style="margin-top:10px;font-size:11px"></div>
-<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-dim)"><label for="stackbk-pw">Console password (to restore or delete):</label><input id="stackbk-pw" type="password" autocomplete="current-password" style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-primary);font-size:11px;font-family:inherit" placeholder="password"></div>
+<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-dim)"><label for="stackbk-pw">Console password (to download, restore or delete):</label><input id="stackbk-pw" type="password" autocomplete="current-password" style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-primary);font-size:11px;font-family:inherit" placeholder="password"></div>
 </div>
 <script>
 (function(){
@@ -191,7 +191,7 @@ async function load(){
             var l=encodeURIComponent(b.label);
             return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid rgba(255,255,255,0.05)">'
               +'<div><span style="color:var(--text-primary)">'+esc(b.label)+'</span> <span style="color:var(--text-dim)">&middot; '+esc(b.created)+' &middot; '+mb(b.size)+' &middot; '+esc(b.source)+'</span><br>'+st+' <span style="color:var(--text-dim)">&middot; '+esc((b.modules||[]).join(', '))+'</span></div>'
-              +'<div style="display:flex;gap:6px"><a href="/api/console/stack-backup/'+l+'/download" style="padding:4px 10px;border:1px solid rgba(59,130,246,0.3);color:var(--text-secondary);border-radius:6px;text-decoration:none">Download</a>'
+              +'<div style="display:flex;gap:6px"><button type="button" data-label="'+esc(b.label)+'" onclick="stackbkDownload(this.dataset.label)" style="padding:4px 10px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--text-secondary);border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer">Download</button>'
               +(b.ok?'<button type="button" data-label="'+esc(b.label)+'" onclick="stackbkRestore(this.dataset.label)" style="padding:4px 10px;background:none;border:1px solid rgba(234,179,8,0.4);color:var(--yellow);border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer">Restore</button>':'')
               +'<button type="button" data-label="'+esc(b.label)+'" onclick="stackbkDelete(this.dataset.label)" style="padding:4px 10px;background:none;border:1px solid rgba(239,68,68,0.35);color:var(--red);border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer">Delete</button></div></div>';
         });
@@ -217,6 +217,14 @@ window.stackbkRun=async function(){
         if(!r.ok||!d.ok){if(e)e.textContent=d.error||('backup failed to start ('+r.status+')');setBusy(false);return;}
         startPoll();
     }catch(x){if(e)e.textContent='backup failed to start: '+x.message;setBusy(false);}
+};
+window.stackbkDownload=function(label){
+    var e=document.getElementById('stackbk-err'),pi=document.getElementById('stackbk-pw'),pw=pi?pi.value:'';
+    if(!pw){if(e)e.textContent='Enter the console password below to download a backup';if(pi)pi.focus();return;}
+    if(e)e.textContent='';
+    var f=document.createElement('form');f.method='POST';f.action='/api/console/stack-backup/'+encodeURIComponent(label)+'/download';f.style.display='none';
+    var i=document.createElement('input');i.type='hidden';i.name='admin_password';i.value=pw;f.appendChild(i);
+    document.body.appendChild(f);f.submit();document.body.removeChild(f);if(pi)pi.value='';
 };
 window.stackbkRestore=async function(label){
     var e=document.getElementById('stackbk-err'),pi=document.getElementById('stackbk-pw'),pw=pi?pi.value:'';

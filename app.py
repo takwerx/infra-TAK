@@ -83036,14 +83036,19 @@ def console_stack_backup_status_api():
                     'result': j.get('ok'), 'error': j.get('error') or '', 'log': (j.get('log') or [])[-200:]})
 
 
-@app.route('/api/console/stack-backup/<label>/download')
+@app.route('/api/console/stack-backup/<label>/download', methods=['POST'])
 @login_required
 def console_stack_backup_download_api(label):
     """Stream <label>.tar.gz: the backup dir, plus the TAK snapshot of the same label
     as takserver-snapshot/. Root-only trees are staged into a console-owned copy
-    under the backup root first (as the TAK snapshot download does)."""
+    under the backup root first (as the TAK snapshot download does).
+    POST + console password: the bundle holds every secret on the box (auth hash,
+    TLS keys, Authentik's database), so a session alone is not enough to take it."""
     if not _stack_backup_label_ok(label):
         return jsonify({'error': 'invalid label'}), 400
+    denied = _require_admin_password({'password': request.form.get('admin_password') or ''})
+    if denied:
+        return denied
     if not any(b.get('label') == label for b in (load_settings().get('stack_backups') or [])):
         return jsonify({'error': 'backup not found'}), 404
     src = os.path.join(STACK_BACKUP_DIR, label)
