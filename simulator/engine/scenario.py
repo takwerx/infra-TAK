@@ -91,6 +91,9 @@ _DOMAIN_UNKNOWN_TYPE = {'air': 'a-u-A', 'sea': 'a-u-S', 'ground': 'a-u-G'}
 EVENT_KINDS = ('chat', 'casevac', 'emergency', 'emergency_cancel', 'marker', 'route', 'polygon',
                'circle', 'spawn', 'despawn', 'callsign', 'team', 'remove')
 MAX_SWEEP_DEG_S = 360.0
+# Where a sensor cone looks: along the unit's heading (v1), or — for a unit on an orbit —
+# at the orbit's center, so a helicopter circling a scene keeps its FLIR on the scene.
+SENSOR_AIMS = ('heading', 'orbit_center')
 
 # ── director commands (W9): ops the live `/cmd` API accepts ──────────────────
 CMD_OPS = ('spawn', 'goto', 'route', 'orbit', 'heading', 'hold', 'alt', 'lostlink', 'rename',
@@ -358,7 +361,7 @@ def _validate_entity(v, e, path, areas, defaults):
     # validate again on reload.
     if o.get('sensor') is not None:
         s = v.obj(o['sensor'], f'{path}.sensor', allowed=('fov', 'range_m', 'vfov', 'elevation', 'sweep_deg_s',
-                                                          'detect'))
+                                                          'aim', 'detect'))
         if s is not None:
             out['sensor'] = {
                 'fov': v.number(s.get('fov', 60), f'{path}.sensor.fov', 1, 360),
@@ -368,6 +371,9 @@ def _validate_entity(v, e, path, areas, defaults):
                 # radar-style sweep: the cone's azimuth advances this many degrees per simulated
                 # second on top of the entity's heading (0 = fixed, looks along the heading)
                 'sweep_deg_s': v.number(s.get('sweep_deg_s', 0), f'{path}.sensor.sweep_deg_s', 0, MAX_SWEEP_DEG_S),
+                # 'orbit_center' only changes anything while the unit is circling an orbit;
+                # on any other path (or flying in to the ring) the cone looks along the heading
+                'aim': v.choice(s.get('aim', 'heading'), f'{path}.sensor.aim', SENSOR_AIMS),
                 # v2: absent/null = the cone is drawn but detects nothing (v1 behavior)
                 'detect': (None if s.get('detect') is None
                            else _validate_detect(v, s['detect'], f'{path}.sensor.detect', out['interval_s'])),
@@ -514,8 +520,9 @@ def validate(doc, name=None, live=False):
         'loop': v.boolean(o.get('loop', False), '$.loop'),
         'warn': (None if o.get('warn') is None else v.string(o['warn'], '$.warn', MAX_TEXT)),
         'default_tempo': v.choice(o.get('default_tempo', 1), '$.default_tempo', TEMPOS),
-        # v2: where the layout was made (written by /save) so it can be reopened there
-        # (W3 `recenter: false`); a preset has none — it runs wherever the operator centers it.
+        # The scenario's home location. A saved layout (/save) and a site-specific scenario
+        # (one written around a real place) carry it, and run there unless the operator
+        # deliberately moves it; a preset has none — it runs wherever the operator centers it.
         'center': None,
     }
     if o.get('center') is not None:
@@ -615,6 +622,8 @@ def validate_run_params(p, lane_ids_available):
     o = v.obj(p, 'run', allowed=('scenario', 'center', 'tempo', 'loop', 'lanes', 'exercise',
                                  'params', 'default_channel', 'confirm_exercise'),
               required=('scenario', 'center', 'lanes'))
+    # (`center` stays required here: Engine.start_run fills it from the scenario's home
+    # location before this runs, so only a run of a scenario without one can miss it.)
     if o is None:
         raise ScenarioError(v.errors)
     out = {}
@@ -863,4 +872,7 @@ def summarize(doc):
         # v2: what the picker says next to the counts ("3 sensors detecting, 5 silent targets")
         'silent': sum(1 for e in doc['entities'] if e['silent']),
         'sensors_detecting': sum(1 for e in doc['entities'] if e['sensor'] and e['sensor'].get('detect')),
+        # home location, or None for a location-independent preset — the console and the
+        # CloudTAK panel run a scenario that has one there instead of at a typed/map center
+        'center': doc['center'],
     }

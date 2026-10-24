@@ -147,9 +147,16 @@ class Engine:
     def start_run(self, payload):
         """Validate, build lanes, connect, activate channels, start. Raises ScenarioError
         for anything the operator can fix; RuntimeError for a busy engine or a dead server.
-        A payload without `lanes` runs on every enrolled lane at its recorded channel."""
+        A payload without `lanes` runs on every enrolled lane at its recorded channel.
+        A payload without `center` runs the scenario at its home location (`center` in the
+        document); a scenario with neither is rejected by validate_run_params as before."""
         if isinstance(payload, dict) and 'lanes' not in payload:
             payload = dict(payload, lanes=self.default_lanes())
+        if isinstance(payload, dict) and payload.get('center') is None and isinstance(payload.get('scenario'), str):
+            home = self.load_scenario(payload['scenario'])['center']     # ScenarioError for an unknown name
+            if home is not None:
+                payload = dict(payload, center=dict(home))
+                self.log(f'run: {payload["scenario"]} placed at its home location {home["lat"]:.5f},{home["lon"]:.5f}')
         return self._start(payload, live=False)
 
     def start_live(self, payload):
@@ -160,9 +167,9 @@ class Engine:
         `from: '<scenario name>'` (W3, PLAN v10.1.62) opens a saved scenario — preset or
         upload — for editing: its units, areas and t+0 objects are placed at once, later
         timeline events are left out (a live session has no clock-driven story; the
-        answer says how many). `recenter` (default true) places the layout at the
-        request's `center`; false reopens it at the center it was saved with (a layout
-        without one — every preset — falls back to the request's center, logged)."""
+        answer says how many). `recenter: false` (the default for a scenario with a home
+        location) reopens it where it was made; true places it at the request's `center`
+        (the default for a preset, which has no home location to reopen at)."""
         if not isinstance(payload, dict):
             raise sc.ScenarioError(['live: body must be a JSON object'])
         unknown = sorted(set(payload) - {'center', 'lanes', 'tempo', 'exercise', 'confirm_exercise',
@@ -174,10 +181,10 @@ class Engine:
             src_name = payload['from']
             if not isinstance(src_name, str):
                 raise sc.ScenarioError(['live.from: must be the name of a preset or an upload'])
-            recenter = payload.get('recenter', True)
+            src = self.load_scenario(src_name)          # ScenarioError for a bad/unknown name
+            recenter = payload.get('recenter', src['center'] is None)
             if not isinstance(recenter, bool):
                 raise sc.ScenarioError(['live.recenter: must be true or false'])
-            src = self.load_scenario(src_name)          # ScenarioError for a bad/unknown name
             doc, opened = self._live_doc_from(src)
             if not recenter:
                 if src['center'] is not None:
@@ -316,7 +323,9 @@ class Engine:
                                  name='activate', daemon=True).start()
             return {'started': True, 'live': live, 'scenario': doc['name'], 'entities': len(run.entities),
                     'events': len(run.events), 'lanes': {k: v.channel for k, v in lanes.items()},
-                    'exercise': {k: v.exercise for k, v in lanes.items()}}
+                    'exercise': {k: v.exercise for k, v in lanes.items()},
+                    # where it was placed, so a front end can bring the map to it
+                    'center': {'lat': params['center'][0], 'lon': params['center'][1]}}
 
     def _activate_all(self, run, lanes):
         time.sleep(1.5)
