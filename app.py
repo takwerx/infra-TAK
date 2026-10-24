@@ -82692,6 +82692,10 @@ STACK_BACKUP_PG_CONTAINERS = {
     'cloudtak-postgis-1':     ('docker', 'gis'),
 }
 _STACK_BACKUP_LABEL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$')
+# W12.e fleet constants: keep this many complete backups; refuse to start unless the
+# backup filesystem has 2x the last backup's size free (this floor when there is none yet).
+STACK_BACKUP_KEEP = 3
+STACK_BACKUP_MIN_FREE = 2 * 1024 ** 3
 _STACK_BACKUP_COMPOSE_FILES = ('.env', 'docker-compose.yml', 'docker-compose.yaml', 'compose.yml',
                                'compose.yaml', 'docker-compose.override.yml', 'compose.override.yml')
 
@@ -82702,6 +82706,54 @@ def _sha256_path(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _stack_backup_space_needed():
+    sizes = [int(b.get('size') or 0) for b in (load_settings().get('stack_backups') or []) if b.get('ok')]
+    last = max(sizes[-1:] or [0])
+    return max(STACK_BACKUP_MIN_FREE, 2 * last)
+
+
+def _stack_backup_free_bytes():
+    # Nearest existing ancestor: the backup root may not exist yet, and it lives on
+    # whatever filesystem holds /var/lib (TAK snapshots go to /opt/tak, usually the same).
+    d = STACK_BACKUP_DIR
+    while d != '/' and not os.path.exists(d):
+        d = os.path.dirname(d)
+    try:
+        return shutil.disk_usage(d).free
+    except OSError:
+        return None
+
+
+def _stack_backup_prune(keep_label, plog=None):
+    """Keep the STACK_BACKUP_KEEP newest complete backups. Incomplete ones older than
+    the newest complete one go too — they are superseded. Never removes keep_label."""
+    plog = plog or (lambda m: print(m, flush=True))
+    s = load_settings()
+    idx = sorted(s.get('stack_backups') or [], key=lambda b: b.get('created') or '', reverse=True)
+    complete = [b for b in idx if b.get('ok')]
+    keep = {b['label'] for b in complete[:STACK_BACKUP_KEEP]} | {keep_label}
+    newest_ok = complete[0].get('created') if complete else ''
+    drop = [b for b in idx if b.get('label') not in keep
+            and (b.get('ok') or (newest_ok and (b.get('created') or '') < newest_ok))]
+    gone = set()
+    for b in drop:
+        label = b.get('label') or ''
+        if not _STACK_BACKUP_LABEL_RE.match(label) or '..' in label:
+            continue
+        ok = True
+        for path in (os.path.join(STACK_BACKUP_DIR, label), os.path.join(SNAPSHOT_DIR, label)):
+            r = subprocess.run(_sudo_wrap(['rm', '-rf', path]), capture_output=True, text=True, timeout=300)
+            ok = ok and r.returncode == 0
+        if ok:
+            gone.add(label)
+            plog(f"  stack backup: retention removed {label}")
+    if gone:
+        s = load_settings()
+        s['stack_backups'] = [b for b in (s.get('stack_backups') or []) if b.get('label') not in gone]
+        s['tak_snapshots'] = [b for b in (s.get('tak_snapshots') or []) if b.get('label') not in gone]
+        save_settings(s)
 
 
 def _stack_backup(label=None, plog=None):
@@ -82718,6 +82770,10 @@ def _stack_backup(label=None, plog=None):
     if not _STACK_BACKUP_LABEL_RE.match(label) or '..' in label:
         return False, f'invalid backup label: {label!r}'
     dest = os.path.join(STACK_BACKUP_DIR, label)
+    need, free = _stack_backup_space_needed(), _stack_backup_free_bytes()
+    if free is not None and free < need:
+        return False, (f'not enough free disk for a full-stack backup: {free // 1024 ** 2} MB free, '
+                       f'{need // 1024 ** 2} MB needed (2x the last backup)')
     plog(f"  stack backup [{label}]: creating at {dest}")
     try:
         _makedirs_priv(STACK_BACKUP_DIR, mode=0o700)
@@ -82894,7 +82950,7 @@ def _stack_backup_index_add(manifest):
     save_settings(s)
 
 
-def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None):
+def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None, kind='backup'):
     """Run _stack_backup in a thread. False when one is already running.
     `extra_log(line)` also receives each log line (the OS upgrade log);
     `on_done(ok, manifest_or_error)` runs in the thread when it finishes."""
@@ -82902,7 +82958,7 @@ def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None):
     with _stack_backup_job_lock:
         if _stack_backup_job.get('running'):
             return False
-        _stack_backup_job = {'running': True, 'label': label, 'ok': None, 'error': '', 'log': []}
+        _stack_backup_job = {'running': True, 'kind': kind, 'label': label, 'ok': None, 'error': '', 'log': []}
 
     def plog(m):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
@@ -82915,13 +82971,18 @@ def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None):
                 pass
 
     def _run():
-        ok, res = False, 'stack backup crashed'
+        ok, res = False, f'stack {kind} crashed'
         try:
-            ok, res = _stack_backup(label, plog=plog)
-            if isinstance(res, dict):
+            if kind == 'restore':
+                ok, res = _stack_restore(label, plog=plog)
+            else:
+                ok, res = _stack_backup(label, plog=plog)
+            if kind == 'backup' and isinstance(res, dict):
                 res['source'] = source
                 try:
                     _stack_backup_index_add(res)
+                    if ok:
+                        _stack_backup_prune(label, plog)
                 except Exception as e:
                     plog(f"  stack backup: could not record it in settings: {e}")
         except Exception as e:
@@ -82970,7 +83031,8 @@ def console_stack_backup_run_api():
 @login_required
 def console_stack_backup_status_api():
     j = _stack_backup_job
-    return jsonify({'ok': True, 'running': bool(j.get('running')), 'label': j.get('label') or '',
+    return jsonify({'ok': True, 'running': bool(j.get('running')), 'kind': j.get('kind') or 'backup',
+                    'label': j.get('label') or '',
                     'result': j.get('ok'), 'error': j.get('error') or '', 'log': (j.get('log') or [])[-200:]})
 
 
@@ -83060,6 +83122,244 @@ def console_stack_backup_delete_api(label):
     except Exception:
         pass
     return jsonify({'ok': True})
+
+
+# ── Same-box restore (v10.3.0 W12.d) ────────────────────────────────────────
+# Data and config only — the binaries are the box's own, so a backup taken on 22.04
+# restores onto the same box after its flip to 24.04. Every part is verified before
+# anything is stopped. Node-RED /data is NOT restored yet: that leg waits for a
+# /nodered-preflight on a real box (SACRED rule — union, never shrink).
+STACK_RESTORE_ACK_PREFIX = 'Restore '
+# settings.json keys that describe THIS box now, not the box at backup time.
+_STACK_RESTORE_KEEP_SETTINGS = ('os_type', 'stack_backups', 'tak_snapshots')
+_STACK_RESTORE_MTX_EXT = ('.json', '.yml', '.yaml', '.conf')
+
+
+def _stack_restore_safe_name(n):
+    return bool(n) and '/' not in n and '\x00' not in n and n not in ('.', '..')
+
+
+def _stack_restore_targets(part, member):
+    """Map a tar member of a config part to its one allowed destination, or None.
+    Tar paths are never trusted: each part has a fixed set of shapes."""
+    if part == 'console-config.tar.gz':
+        if member.startswith('config/ssl/'):
+            n = member[len('config/ssl/'):]
+            return os.path.join(CONFIG_DIR, 'ssl', n) if _stack_restore_safe_name(n) else None
+        n = member[len('config/'):] if member.startswith('config/') else ''
+        return os.path.join(CONFIG_DIR, n) if _stack_restore_safe_name(n) else None
+    if part == 'mediamtx-config.tar.gz':
+        if member == 'mediamtx.yml':
+            return '/usr/local/etc/mediamtx.yml'
+        n = member[len('webeditor/'):] if member.startswith('webeditor/') else ''
+        if _stack_restore_safe_name(n) and n.endswith(_STACK_RESTORE_MTX_EXT):
+            return os.path.join('/opt/mediamtx-webeditor', n)
+        return None
+    dirs = {'authentik-compose.tar.gz': os.path.expanduser('~/authentik'),
+            'takportal-compose.tar.gz': _takportal_dir(),
+            'cloudtak-compose.tar.gz': os.path.expanduser('~/CloudTAK'),
+            'nodered-compose.tar.gz': os.path.expanduser('~/node-red')}
+    if part in dirs and member in _STACK_BACKUP_COMPOSE_FILES:
+        return os.path.join(dirs[part], member)
+    return None
+
+
+def _stack_restore_read_part(dest, part):
+    path = os.path.join(dest, part['name'])
+    data = _read_priv_bytes(path)
+    if not part.get('sha256') or hashlib.sha256(data).hexdigest() != part['sha256']:
+        raise RuntimeError(f"{part['name']}: sha256 does not match the manifest")
+    return data
+
+
+def _stack_restore_write(path, data):
+    if path == os.path.join(CONFIG_DIR, 'settings.json'):
+        # Merge: the backup's settings, but this box's current identity keys.
+        cur = load_settings()
+        new = json.loads(data.decode())
+        for k in _STACK_RESTORE_KEEP_SETTINGS:
+            if k in cur:
+                new[k] = cur[k]
+            else:
+                new.pop(k, None)
+        save_settings(new)
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
+        if path.startswith(CONFIG_DIR + '/'):
+            os.chmod(path, 0o600)
+    except PermissionError:
+        _write_priv(path, data)
+
+
+def _stack_restore_app_containers(mods):
+    """(module, [container names]) to stop for the restore — never the DB containers."""
+    out = []
+    if (mods.get('authentik') or {}).get('installed'):
+        out.append(('authentik', ['authentik-server-1', 'authentik-worker-1']))
+    if (mods.get('takportal') or {}).get('installed'):
+        try:
+            names = [c['name'] for c in _takportal_project_containers() if c.get('service') != 'postgres']
+        except Exception:
+            names = []
+        out.append(('takportal', names))
+    if (mods.get('cloudtak') or {}).get('installed'):
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak-', '--format', '{{.Names}}']),
+                           capture_output=True, text=True, timeout=30)
+        out.append(('cloudtak', [n for n in (r.stdout or '').split() if n != 'cloudtak-postgis-1']))
+    return out
+
+
+def _stack_restore(label, plog=None):
+    """Restore a full-stack backup onto this box. (True, summary) or (False, error/summary)."""
+    import io as _io
+    import tarfile as _tarfile
+    plog = plog or (lambda m: print(m, flush=True))
+    if not _stack_backup_label_ok(label):
+        return False, 'invalid label'
+    dest = os.path.join(STACK_BACKUP_DIR, label)
+    try:
+        manifest = json.loads(_read_priv(os.path.join(dest, 'manifest.json')))
+    except Exception as e:
+        return False, f'cannot read the backup manifest: {str(e)[:200]}'
+    if manifest.get('label') != label:
+        return False, 'manifest label does not match the backup'
+    if not manifest.get('ok'):
+        return False, f"this backup is incomplete ({', '.join(manifest.get('failed') or [])}) — refusing to restore it"
+    parts = {p['name']: p for p in manifest.get('parts') or []}
+    plog(f"  restore [{label}]: backup from {manifest.get('created')} on {manifest.get('os')} "
+         f"(infra-TAK {manifest.get('infratak_version')})")
+
+    # 1. Verify everything before anything stops.
+    configs = {}
+    try:
+        for name, p in parts.items():
+            if p['kind'] == 'config':
+                configs[name] = _stack_restore_read_part(dest, p)
+            elif p['kind'] == 'pg_dump':
+                resp = _broker_request({'op': 'stack_pg_restore', 'container': p.get('note'),
+                                        'path': os.path.join(dest, name), 'verify_only': True}, timeout=700) \
+                    if (_broker_should_route() and _broker_available()) else {'ok': True}
+                if not resp.get('ok'):
+                    raise RuntimeError(f"{name}: {resp.get('error') or 'verification failed'}")
+            elif p['kind'] == 'tak-snapshot' and not os.path.isdir(os.path.join(SNAPSHOT_DIR, label)):
+                raise RuntimeError(f'TAK snapshot {SNAPSHOT_DIR}/{label} is missing')
+    except Exception as e:
+        return False, f'verification failed, nothing was changed: {str(e)[:300]}'
+    plog(f"  restore: all {len(parts)} parts verified")
+
+    mods = detect_modules(fresh=True) or {}
+    failed, stopped = [], []
+    try:
+        # 2. Stop the applications (their databases stay up for pg_restore).
+        for mod, names in _stack_restore_app_containers(mods):
+            for n in names:
+                subprocess.run(_sudo_wrap(['docker', 'stop', n]), capture_output=True, timeout=120)
+            stopped.append((mod, names))
+            plog(f"  restore: stopped {mod} ({', '.join(names) or 'none'})")
+
+        # 3. Config files.
+        for name, data in configs.items():
+            n_ok = 0
+            with _tarfile.open(fileobj=_io.BytesIO(data), mode='r:gz') as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    target = _stack_restore_targets(name, m.name)
+                    if not target:
+                        plog(f"  restore: {name}: skipped unexpected entry {m.name!r}")
+                        continue
+                    try:
+                        _stack_restore_write(target, tf.extractfile(m).read())
+                        n_ok += 1
+                    except Exception as e:
+                        failed.append(f'{name}:{m.name}')
+                        plog(f"  restore: {name}: {m.name} FAILED: {str(e)[:200]}")
+            plog(f"  restore: {name}: {n_ok} file(s) restored")
+
+        # 4. Module databases.
+        for name, p in parts.items():
+            if p['kind'] != 'pg_dump':
+                continue
+            container, path = p.get('note'), os.path.join(dest, name)
+            try:
+                if _broker_should_route() and _broker_available():
+                    resp = _broker_request({'op': 'stack_pg_restore', 'container': container,
+                                            'path': path, 'timeout': 3600}, timeout=3700)
+                else:
+                    user, db = STACK_BACKUP_PG_CONTAINERS[container]
+                    with open(path, 'rb') as inp:
+                        r = subprocess.run(['docker', 'exec', '-i', container, 'pg_restore', '-U', user,
+                                            '--clean', '--if-exists', '--no-owner', '-d', db],
+                                           stdin=inp, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3600)
+                    resp = {'ok': True, 'returncode': r.returncode, 'stderr': (r.stderr or b'').decode(errors='replace')[-800:]}
+                if not resp.get('ok'):
+                    raise RuntimeError(resp.get('error') or 'refused')
+                rc = resp.get('returncode')
+                if rc not in (0, 1):
+                    raise RuntimeError(f"pg_restore exit {rc}: {(resp.get('stderr') or '')[-300:]}")
+                plog(f"  restore: {name} -> {container}" + (' (with warnings)' if rc == 1 else ''))
+            except Exception as e:
+                failed.append(name)
+                plog(f"  restore: {name} FAILED: {str(e)[:300]}")
+    finally:
+        # 5. Start back up in deploy order: Authentik → TAK → Portal → CloudTAK → MediaMTX.
+        order = {'authentik': 0, 'takportal': 2, 'cloudtak': 3}
+        started_tak = False
+        for mod, names in sorted(stopped, key=lambda x: order.get(x[0], 9)):
+            if order.get(mod, 9) >= 2 and not started_tak:
+                started_tak = True
+                if 'takserver' in parts:
+                    ok, err = _tak_rollback(label, plog)
+                    if not ok:
+                        failed.append('takserver')
+                        plog(f"  restore: TAK Server FAILED: {str(err)[:300]}")
+            for n in names:
+                subprocess.run(_sudo_wrap(['docker', 'start', n]), capture_output=True, timeout=120)
+            plog(f"  restore: started {mod}")
+        if 'takserver' in parts and not started_tak:
+            ok, err = _tak_rollback(label, plog)
+            if not ok:
+                failed.append('takserver')
+                plog(f"  restore: TAK Server FAILED: {str(err)[:300]}")
+        if 'mediamtx-config.tar.gz' in configs:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+            plog("  restore: restarted mediamtx")
+
+    pending = ['nodered-data.tar'] if 'nodered-data.tar' in parts else []
+    if pending:
+        plog("  restore: Node-RED /data was NOT restored — that step is not built yet "
+             "(its configs are left exactly as they are now)")
+    if failed:
+        plog(f"  restore [{label}]: FINISHED WITH FAILURES: {', '.join(failed)}")
+        return False, {'failed': failed, 'not_restored': pending}
+    plog(f"  restore [{label}]: done")
+    return True, {'failed': [], 'not_restored': pending}
+
+
+@app.route('/api/console/stack-backup/<label>/restore', methods=['POST'])
+@login_required
+def console_stack_backup_restore_api(label):
+    """Console password + typed 'Restore <label>'. Stops modules while it runs."""
+    if not _stack_backup_label_ok(label):
+        return jsonify({'ok': False, 'error': 'invalid label'}), 400
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    if (data.get('acknowledge') or '').strip() != STACK_RESTORE_ACK_PREFIX + label:
+        return jsonify({'ok': False, 'error': f'type exactly: {STACK_RESTORE_ACK_PREFIX}{label}'}), 400
+    if _os_upgrade_job_state().get('running'):
+        return jsonify({'ok': False, 'error': 'the OS upgrade is running'}), 409
+    if not _stack_backup_run_job(label, kind='restore'):
+        return jsonify({'ok': False, 'error': 'a backup or restore is already running'}), 409
+    try:
+        audit('stack-backup:restore', label)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'label': label})
 
 
 def _tak_snapshot_scheduler():

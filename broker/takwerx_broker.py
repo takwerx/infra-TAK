@@ -2217,6 +2217,54 @@ def _do_pg_restore(req):
             'stderr': (proc.stderr or b'').decode(errors='replace')[-500:]}
 
 
+def _check_stack_pg_restore(req):
+    # same gate as stack_pg_dump: pinned container, <root>/<label>/<name>.pgdump only
+    return _check_stack_pg_dump(req)
+
+
+def _do_stack_pg_restore(req):
+    """W12.d: restore a full-stack backup dump into its module's postgres container.
+    Only a dump the broker itself produced (HMAC sidecar) is accepted — the backup
+    tree is on the write allowlist, so the console could otherwise plant an archive
+    whose TOC runs code as the database superuser. `verify_only` checks the HMAC and
+    the archive's TOC without touching the database (the restore preflight)."""
+    import hmac as _hmac
+    path = _check_stack_pg_restore(req)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return {'ok': False, 'code': 'ENOENT', 'error': f'dump not found: {path}'}
+    try:
+        with open(path + '.hmac') as f:
+            want = f.read().strip()
+    except OSError:
+        want = ''
+    if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
+        return {'ok': False, 'code': 'DENIED',
+                'error': 'dump failed authenticity check — not a broker-produced backup'}
+    if req.get('verify_only'):
+        pg_restore = _newest_pg_client('pg_restore')
+        if not pg_restore:
+            return {'ok': True, 'toc_entries': None, 'note': 'HMAC verified; no host pg_restore to read the TOC'}
+        proc = subprocess.run([pg_restore, '--list', path], capture_output=True, timeout=600)
+        toc = [l for l in (proc.stdout or b'').decode(errors='replace').splitlines()
+               if l.strip() and not l.lstrip().startswith(';')]
+        return {'ok': proc.returncode == 0 and bool(toc), 'toc_entries': len(toc),
+                'error': (proc.stderr or b'').decode(errors='replace')[:400]}
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    argv = [docker, 'exec', '-i', req['container'], 'pg_restore', '-U', user,
+            '--clean', '--if-exists', '--no-owner', '-d', db]
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as inp:
+        proc = subprocess.run(argv, stdin=inp, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    # pg_restore exits 1 on non-fatal warnings — passed through for the caller.
+    return {'ok': True, 'returncode': proc.returncode,
+            'stderr': (proc.stderr or b'').decode(errors='replace')[-800:]}
+
+
 # /etc/ssl/openssl.cnf is a ROOT CODE-EXEC surface (it can load engines/providers
 # via .so). The console's ONE legitimate edit is flipping the cert subject encoding
 # for TAK client compat: `string_mask = utf8only` -> `string_mask = nombstr`. So
@@ -3184,6 +3232,8 @@ def _evaluate(req):
             _check_pg_dump(req)
         elif op == 'stack_pg_dump':
             _check_stack_pg_dump(req)
+        elif op == 'stack_pg_restore':
+            _check_stack_pg_restore(req)
         elif op == 'pg_restore':
             _check_pg_restore(req)
         elif op == 'pgminer_scan':
@@ -3281,7 +3331,7 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'stack_pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
+    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
               'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
@@ -3290,8 +3340,8 @@ def _dispatch(req, peer):
             summary = JAVA_CACERTS
         elif op == 'certifi_upgrade':
             summary = CERTIFI_EDITOR_DIR
-        elif op == 'stack_pg_dump':
-            summary = f"{req.get('container')} -> {req.get('path')}"
+        elif op in ('stack_pg_dump', 'stack_pg_restore'):
+            summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -3311,6 +3361,8 @@ def _dispatch(req, peer):
             return _do_pg_dump(req)
         if op == 'stack_pg_dump':
             return _do_stack_pg_dump(req)
+        if op == 'stack_pg_restore':
+            return _do_stack_pg_restore(req)
         if op == 'pg_restore':
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
@@ -4011,6 +4063,9 @@ def cli_selftest():
         ('Policy blocks stack_pg_dump outside the backup tree',
          {'op': 'stack_pg_dump', 'container': 'authentik-postgresql-1',
           'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_restore outside the backup tree',
+         {'op': 'stack_pg_restore', 'container': 'authentik-postgresql-1',
+          'path': '/opt/tak/snapshots/x/cot.pgdump'}),
         ('Policy blocks stack_pg_dump of an unlisted container',
          {'op': 'stack_pg_dump', 'container': 'evil',
           'path': '/var/lib/infratak-backups/x/evil.pgdump'}),
