@@ -128,16 +128,29 @@ images_in_flight() {
 # at 44%). Cap total build cache at CACHE_CAP_GB regardless of disk %. NEVER
 # touches images/containers/volumes. Docker 28+ renamed `--keep-storage` →
 # `--max-used-space`; detect which this daemon supports (both take "20GB").
+#
+# GH #273: `-a` is required. Without it the cap only weighs the cache records
+# BuildKit considers dangling, so a box can sit over the cap with all of it
+# reclaimable and the cap "succeeds" every hour with 0B (reporter: 23.44 GB total,
+# 23.44 GB reclaimable, `size-cap reclaimed 0B (cap 20GB)`). With `-a` the cap
+# prunes the least-recently-used unused cache, of any kind, until the total is
+# under CACHE_CAP_GB, and still keeps the newest 20 GB so the next rebuild stays
+# fast. Cache a running build holds is in use and never pruned either way.
 if docker builder prune --help 2>&1 | grep -q -- '--max-used-space'; then
   CAP_FLAG="--max-used-space=${CACHE_CAP_GB}GB"
 else
   CAP_FLAG="--keep-storage=${CACHE_CAP_GB}GB"
 fi
-RAW_CAP=$(docker builder prune -f $CAP_FLAG 2>>"$LOG")
+# Total build cache, from `docker builder du` ("Total: 21.11GB"). Logged before and
+# after so a cap that frees nothing while the cache is over it shows up as such.
+cache_total() { docker builder du 2>/dev/null | grep -iE '^Total' | grep -oiE '[0-9.]+ ?[KMGTP]?i?B' | tail -1; }
+CACHE_BEFORE=$(cache_total); [ -z "$CACHE_BEFORE" ] && CACHE_BEFORE="0B"
+RAW_CAP=$(docker builder prune -af $CAP_FLAG 2>>"$LOG")
 CAP_RECLAIMED=$(parse_reclaimed "$RAW_CAP"); [ -z "$CAP_RECLAIMED" ] && CAP_RECLAIMED="0B"
-log_line "size-cap: reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, ${CAP_FLAG%%=*}); disk ${disk_pct}%"
-logger -t takguard-buildcache "size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB); disk ${disk_pct}%"
-SUMMARY="size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB)"
+CACHE_AFTER=$(cache_total); [ -z "$CACHE_AFTER" ] && CACHE_AFTER="0B"
+log_line "size-cap: reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, ${CAP_FLAG%%=*}, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
+logger -t takguard-buildcache "size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
+SUMMARY="size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, cache ${CACHE_BEFORE} -> ${CACHE_AFTER})"
 
 # ── Tier 1/2: disk-% backstop ─────────────────────────────────────────────────
 # The size cap holds steady-state; these catch a disk driven full between runs
