@@ -49193,6 +49193,25 @@ def _webodm_pin_images(compose_txt, services=None):
     return compose_txt
 
 
+# Security update for WebODM (ops #206): upstream's webapp image ships the olefile package,
+# which nothing in WebODM uses (`pip show olefile` → Required-by: empty). The webapp and worker
+# entrypoints remove it on every container start, so it stays gone across a recreate or an
+# image bump without building our own image. Fresh deploys write it via the template; existing
+# installs get it on a console restart and on Update (_webodm_strip_olefile).
+WEBODM_OLEFILE_STRIP = 'pip uninstall -y -q olefile >/dev/null 2>&1; '
+
+
+def _webodm_strip_olefile(compose_txt):
+    """Prefix the wo_webapp and wo_worker entrypoints with WEBODM_OLEFILE_STRIP. Idempotent —
+    an already-patched file (or one whose entrypoint isn't the `/bin/bash -c "…"` form we
+    write) comes back unchanged."""
+    for svc in ('wo_webapp', 'wo_worker'):
+        compose_txt = re.sub(
+            rf'(^  {svc}:\n(?:    [^\n]*\n)*?    entrypoint: /bin/bash -c ")(?!{re.escape(WEBODM_OLEFILE_STRIP)})',
+            lambda m: m.group(1) + WEBODM_OLEFILE_STRIP, compose_txt, count=1, flags=re.M)
+    return compose_txt
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
@@ -49213,7 +49232,7 @@ services:
   wo_webapp:
     image: {images[wo_webapp]}
     container_name: webapp
-    entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
+    entrypoint: /bin/bash -c "pip uninstall -y -q olefile >/dev/null 2>&1; service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
@@ -49236,7 +49255,7 @@ services:
   wo_worker:
     image: {images[wo_worker]}
     container_name: wo_worker
-    entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
+    entrypoint: /bin/bash -c "pip uninstall -y -q olefile >/dev/null 2>&1; /webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
@@ -49872,8 +49891,12 @@ def _run_webodm_update():
         compose_txt = _read_priv(compose_path)
         pinned = _webodm_pin_images(compose_txt)
         if pinned != compose_txt:
-            _write_priv(compose_path, pinned)
             plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        stripped = _webodm_strip_olefile(pinned)
+        if stripped != pinned:
+            plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
+        if stripped != compose_txt:
+            _write_priv(compose_path, stripped)
         plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
@@ -95002,6 +95025,10 @@ def _startup_migrations():
                 _wo_before_redis = _wo_patched
                 _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
                 _wo_redis_changed = (_wo_patched != _wo_before_redis)
+                # ops #206: security update — webapp/worker are recreated once, on this restart.
+                _wo_before_ole = _wo_patched
+                _wo_patched = _webodm_strip_olefile(_wo_patched)
+                _wo_ole_changed = (_wo_patched != _wo_before_ole)
                 if _wo_patched != _wo_txt:
                     if _wo_priv:
                         _write_priv(_wo_compose, _wo_patched)
@@ -95013,6 +95040,8 @@ def _startup_migrations():
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     if _wo_redis_changed:
                         print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
+                    if _wo_ole_changed:
+                        print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
                     if _wo_priv:
                         # root's dir: no cwd into /root, so compose runs via the broker
                         _webodm_compose(_wo_dir, 'up -d', timeout=120)
