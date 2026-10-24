@@ -2701,6 +2701,168 @@ def _do_takportal_sudoers(req):
                 pass
 
 
+# ---------------------------------------------------------------------------
+# ops #200 — the Java CA keystore follows the OS trust store (fixed-shape op)
+# ---------------------------------------------------------------------------
+# Ubuntu keeps a second copy of the CA list for Java, /etc/ssl/certs/java/cacerts, and
+# native TAK Server's distro OpenJDK uses it as its default truststore. ca-certificates-
+# java's hook only hears about a root when update-ca-certificates prints a "-<path>" line
+# for it, and it never does when a package update simply DROPS a root: the dangling
+# symlink is swept as an orphan, silently. So every root distrusted since the keystore was
+# built stays trusted by Java. Measured on test8, 2026-10-23 (Ubuntu 22.04, ca-certificates
+# 20260816ubuntu0.22.04.1): Java still trusted 43 roots the OS store had dropped, and was
+# missing 17 the OS had added since.
+#
+# The op takes NO arguments: the broker works out the difference itself and feeds it to
+# Debian's own hook, the same tool, alias names and storepass update-ca-certificates
+# uses, so there is no second keystore writer to drift. Only `debian:` aliases (the ones
+# that hook owns) are touched; anything an operator imported under another alias stays.
+# RHEL needs none of this: update-ca-trust regenerates its Java keystore from the system
+# store, and there /etc/ssl/certs/java/cacerts is a symlink into it.
+JAVA_CACERTS = '/etc/ssl/certs/java/cacerts'
+JAVA_CACERTS_HOOK = '/etc/ca-certificates/update.d/jks-keystore'
+JAVA_CACERTS_DEFAULTS = '/etc/default/cacerts'
+JAVA_CACERTS_BACKUP = '/var/backups/infratak-java-cacerts.bak'
+SYSTEM_CERTS_DIR = '/etc/ssl/certs'
+_SYSTEM_CA_SOURCES = ('/usr/share/ca-certificates/', '/usr/local/share/ca-certificates/')
+# Mozilla's bundle is ~145 roots. Far fewer means /etc/ssl/certs is broken, not that the
+# world distrusted everyone — never "sync" the Java keystore down to that.
+_JAVA_CACERTS_MIN_SYSTEM_ROOTS = 50
+_JAVA_CACERTS_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C.UTF-8'}
+_KEYTOOL_DEBIAN_ALIAS = re.compile(r'^debian:(.+?),\s.*\btrustedCertEntry\b')
+
+
+def _java_cacerts_settings():
+    """(updates_enabled, storepass), read from /etc/default/cacerts the way the hook does:
+    it sources that file and runs only when it sets cacerts_updates=yes."""
+    enabled, storepass = False, 'changeit'
+    try:
+        with open(JAVA_CACERTS_DEFAULTS, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = re.match(r'''^\s*(storepass|cacerts_updates)=(['"]?)(.*?)\2\s*$''', line)
+                if not m:
+                    continue
+                if m.group(1) == 'storepass':
+                    storepass = m.group(3)
+                else:
+                    enabled = m.group(3) == 'yes'
+    except OSError:
+        pass
+    return enabled, storepass
+
+
+def _java_cacerts_supported():
+    """(ok, reason). A box that cannot be synced is skipped, never denied: a DENY would
+    count against the broker's ENFORCE readiness for something that is not a fault."""
+    if os.path.islink(JAVA_CACERTS):
+        return False, f'{JAVA_CACERTS} is a symlink (update-ca-trust keeps it in step)'
+    if not os.path.isfile(JAVA_CACERTS):
+        return False, 'no Java CA keystore on this host'
+    try:
+        st = os.lstat(JAVA_CACERTS_HOOK)
+    except OSError:
+        return False, 'ca-certificates-java is not installed'
+    # We run this file as root, so it must be one only root could have put there.
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+        return False, f'{JAVA_CACERTS_HOOK} is not a root-owned regular file — not running it'
+    if not _sudoers_safe_binaries('keytool'):
+        return False, f'no root-owned keytool in {_SUDOERS_BIN_DIRS}'
+    if not _java_cacerts_settings()[0]:
+        return False, f'Java keystore updates are turned off in {JAVA_CACERTS_DEFAULTS}'
+    return True, ''
+
+
+def _java_cacerts_drift(keytool, storepass):
+    """(stale_aliases, missing_pems, system_root_count), or None if keytool cannot read
+    the keystore. Names are compared case-insensitively: JKS lowercases its aliases."""
+    try:
+        r = subprocess.run([keytool, '-list', '-keystore', JAVA_CACERTS, '-storepass', storepass],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           timeout=120, env=_JAVA_CACERTS_ENV, cwd='/')
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    java = {}
+    for line in (r.stdout or '').splitlines():
+        m = _KEYTOOL_DEBIAN_ALIAS.match(line)
+        if m:
+            java[m.group(1).lower()] = m.group(1)
+    system = {}
+    try:
+        names = os.listdir(SYSTEM_CERTS_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(SYSTEM_CERTS_DIR, name)
+        # update-ca-certificates' own links only; the hash links and the bundle are not roots
+        if not name.endswith('.pem') or not os.path.islink(path):
+            continue
+        if os.path.realpath(path).startswith(_SYSTEM_CA_SOURCES) and os.path.isfile(path):
+            system[name.lower()] = name
+    stale = sorted(java[k] for k in java if k not in system)
+    missing = sorted(system[k] for k in system if k not in java)
+    return stale, missing, len(system)
+
+
+def _check_java_cacerts_sync(req):
+    # Nothing in the request is read, so there is nothing to validate. Whether this box
+    # can be synced is decided in _do_java_cacerts_sync and reported as a skip.
+    return
+
+
+def _do_java_cacerts_sync(req):
+    ok, why = _java_cacerts_supported()
+    if not ok:
+        return {'ok': True, 'skipped': why}
+    keytool = _sudoers_safe_binaries('keytool')[0]
+    storepass = _java_cacerts_settings()[1]
+    before = _java_cacerts_drift(keytool, storepass)
+    if before is None:
+        return {'ok': False, 'error': f'keytool could not read {JAVA_CACERTS}'}
+    stale, missing, n_system = before
+    if n_system < _JAVA_CACERTS_MIN_SYSTEM_ROOTS:
+        return {'ok': False, 'error': f'only {n_system} CA roots in {SYSTEM_CERTS_DIR} — '
+                                      'refusing to sync the Java keystore down to that'}
+    if not stale and not missing:
+        return {'ok': True, 'removed': [], 'added': []}
+    try:
+        os.makedirs(os.path.dirname(JAVA_CACERTS_BACKUP), exist_ok=True)
+        shutil.copy2(JAVA_CACERTS, JAVA_CACERTS_BACKUP)
+    except OSError as e:
+        return {'ok': False, 'error': f'could not back up {JAVA_CACERTS} (nothing changed): {e}'}
+    # The hook's input protocol, as update-ca-certificates writes it: "-<path>" drops alias
+    # debian:<basename> (the file need not exist), "+<path>" imports the file under it.
+    feed = ''.join(f'-{os.path.join(SYSTEM_CERTS_DIR, a)}\n' for a in stale) + \
+        ''.join(f'+{os.path.join(SYSTEM_CERTS_DIR, n)}\n' for n in missing)
+    try:
+        r = subprocess.run([JAVA_CACERTS_HOOK], input=feed, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=300,
+                           env=_JAVA_CACERTS_ENV, cwd='/')
+        hook_rc, hook_out = r.returncode, ((r.stderr or '') + (r.stdout or '')).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        hook_rc, hook_out = -1, str(e)
+    after = _java_cacerts_drift(keytool, storepass)
+    if after is None:
+        # A keystore Java cannot open breaks every outbound TLS call TAK makes, which is far
+        # worse than the stale roots. Put the old one back.
+        try:
+            shutil.copy2(JAVA_CACERTS_BACKUP, JAVA_CACERTS)
+        except OSError as e:
+            return {'ok': False, 'error': f'keystore unreadable after the update and the restore '
+                                          f'from {JAVA_CACERTS_BACKUP} failed: {e}'}
+        return {'ok': False, 'error': 'keystore unreadable after the update — restored the previous '
+                                      f'one (hook rc {hook_rc}: {hook_out[-300:]})'}
+    left_stale = {a.lower() for a in after[0]}
+    left_missing = {n.lower() for n in after[1]}
+    return {'ok': hook_rc == 0,
+            'removed': [a for a in stale if a.lower() not in left_stale],
+            'added': [n for n in missing if n.lower() not in left_missing],
+            'still_stale': after[0], 'still_missing': after[1],
+            'backup': JAVA_CACERTS_BACKUP,
+            **({} if hook_rc == 0 else {'error': f'hook rc {hook_rc}: {hook_out[-300:]}'})}
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -2726,6 +2888,8 @@ def _evaluate(req):
             _check_tak58_upgrade_db(req)
         elif op == 'tak58_setup_db':
             _check_tak58_setup_db(req)
+        elif op == 'java_cacerts_sync':
+            _check_java_cacerts_sync(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -2808,10 +2972,12 @@ def _dispatch(req, peer):
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
-              'tak58_upgrade_db', 'tak58_setup_db'):
+              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
+        elif op == 'java_cacerts_sync':
+            summary = JAVA_CACERTS
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -2839,6 +3005,8 @@ def _dispatch(req, peer):
             return _do_tak58_upgrade_db(req)
         if op == 'tak58_setup_db':
             return _do_tak58_setup_db(req)
+        if op == 'java_cacerts_sync':
+            return _do_java_cacerts_sync(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
