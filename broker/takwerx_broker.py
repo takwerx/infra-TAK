@@ -384,6 +384,8 @@ PATH_CHECKED_BINS = {
 # Privileged path prefixes the console is allowed to read/write (directly via
 # the write/read ops, and as targets of the path-checked coreutils above).
 PATH_ALLOW = (
+    '/var/lib/infratak-backups/',   # v10.3.0 W12 full-stack backups — root-owned 0700,
+                                    # config copies land here; DB dumps via stack_pg_dump
     '/etc/systemd/system/',
     '/etc/fail2ban/',
     '/etc/caddy/',
@@ -1990,15 +1992,27 @@ def _do_pg_dump(req):
             return {'ok': False, 'error': 'runuser/pg_dump not found on trusted PATH'}
         argv = [runuser, '-u', 'postgres', '--', pg_dump,
                 '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'pg_dump')
+
+
+def _dump_to_file(argv, path, timeout, opname):
+    """Run a dump argv with stdout pointed at a root-opened `path`, then chmod 0600
+    and write the HMAC sidecar. Shared by pg_dump and stack_pg_dump."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    timeout = min(int(timeout or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
     # applies, and postgres needs no write access to the snapshot dir.
     # Own session: a timeout kills pg_dump itself, not just runuser — an orphaned
     # pg_dump kept its table locks and snapshot open until this daemon restarted.
     # (With `docker exec` the pg_dump inside the container outlives the client;
     # the lock-wait cap is what bounds that case.)
-    with open(path, 'wb') as out:
+    # O_NOFOLLOW: a symlink planted at the destination must not redirect a root
+    # write (the backup tree is on the write allowlist for config copies).
+    for p_ in (path, path + '.hmac'):
+        if os.path.islink(p_):
+            os.unlink(p_)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as out:
         proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.PIPE,
                                 start_new_session=True)
         try:
@@ -2015,7 +2029,7 @@ def _do_pg_dump(req):
             os.unlink(path)
         except OSError:
             pass
-        return {'ok': False, 'error': 'pg_dump did not finish within %d s' % timeout}
+        return {'ok': False, 'error': '%s did not finish within %d s' % (opname, timeout)}
     if proc.returncode != 0:
         try:
             os.unlink(path)    # never leave a truncated/empty dump behind
@@ -2029,12 +2043,68 @@ def _do_pg_dump(req):
     # sidecar can't be written, restore simply won't trust the dump later.
     try:
         sc = path + '.hmac'
-        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         os.write(fd, _dump_hmac(path).encode())
         os.close(fd)
     except OSError:
         pass
-    return {'ok': True, 'size': os.path.getsize(path)}
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return {'ok': True, 'size': os.path.getsize(path), 'sha256': h.hexdigest()}
+
+
+# ── Full-stack backup DB dumps (infra-TAK v10.3.0 W12.b) ─────────────────────
+# The module databases (Authentik, TAK Portal, CloudTAK) live inside their own
+# postgres containers. The console names the container; the broker supplies the
+# role and database from this fixed table — nothing caller-supplied reaches the
+# argv but the container key. Destination: <STACK_BACKUP_DIR>/<label>/<file>.pgdump
+# only, one level deep, so a dump can never land elsewhere or nest.
+STACK_BACKUP_DIR = '/var/lib/infratak-backups'
+_STACK_PG_CONTAINERS = {
+    'authentik-postgresql-1': ('authentik', 'authentik'),
+    'tak-portal-postgres':    ('takportal', 'takportal'),
+    'cloudtak-postgis-1':     ('docker', 'gis'),
+}
+
+
+def _stack_backup_name_ok(name):
+    return (isinstance(name, str) and 0 < len(name) <= 96
+            and name[0].isalnum() and all(c.isalnum() or c in '-_.' for c in name)
+            and '..' not in name)
+
+
+def _check_stack_pg_dump(req):
+    container = req.get('container')
+    if container not in _STACK_PG_CONTAINERS:
+        raise Denied(f'stack_pg_dump: container not allowed: {container!r}')
+    p = _abs(req.get('path'))
+    rel = p[len(STACK_BACKUP_DIR) + 1:] if p.startswith(STACK_BACKUP_DIR + '/') else ''
+    parts = rel.split('/')
+    if (len(parts) != 2 or not _stack_backup_name_ok(parts[0])
+            or not _stack_backup_name_ok(parts[1]) or not parts[1].endswith('.pgdump')):
+        raise Denied(f'stack_pg_dump: destination must be {STACK_BACKUP_DIR}/<label>/<name>.pgdump: {p}')
+    return p
+
+
+def _do_stack_pg_dump(req):
+    path = _check_stack_pg_dump(req)
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    # The tree is root-only (0700) — created here, never by the console, so no
+    # console-planted symlink can sit at the root or the label dir.
+    for d in (STACK_BACKUP_DIR, os.path.dirname(path)):
+        if os.path.islink(d):
+            return {'ok': False, 'error': f'refusing symlinked backup dir: {d}'}
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    argv = [docker, 'exec', req['container'], 'pg_dump', '-U', user,
+            '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'stack_pg_dump')
 
 
 def _check_pg_restore(req):
@@ -3112,6 +3182,8 @@ def _evaluate(req):
             _path_allowed(req.get('path'), readonly=(op == 'read'))
         elif op == 'pg_dump':
             _check_pg_dump(req)
+        elif op == 'stack_pg_dump':
+            _check_stack_pg_dump(req)
         elif op == 'pg_restore':
             _check_pg_restore(req)
         elif op == 'pgminer_scan':
@@ -3209,7 +3281,7 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
+    if op in ('pg_dump', 'stack_pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
               'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
@@ -3218,6 +3290,8 @@ def _dispatch(req, peer):
             summary = JAVA_CACERTS
         elif op == 'certifi_upgrade':
             summary = CERTIFI_EDITOR_DIR
+        elif op == 'stack_pg_dump':
+            summary = f"{req.get('container')} -> {req.get('path')}"
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -3235,6 +3309,8 @@ def _dispatch(req, peer):
         audit(peer, op, summary, 'ALLOW')
         if op == 'pg_dump':
             return _do_pg_dump(req)
+        if op == 'stack_pg_dump':
+            return _do_stack_pg_dump(req)
         if op == 'pg_restore':
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
@@ -3932,6 +4008,12 @@ def cli_selftest():
          {'op': 'exec', 'argv': ['git', '-C', '/etc', 'rev-parse', 'HEAD']}),
         ('Policy blocks pg_dump outside snapshots',
          {'op': 'pg_dump', 'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_dump outside the backup tree',
+         {'op': 'stack_pg_dump', 'container': 'authentik-postgresql-1',
+          'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_dump of an unlisted container',
+         {'op': 'stack_pg_dump', 'container': 'evil',
+          'path': '/var/lib/infratak-backups/x/evil.pgdump'}),
         ('Policy blocks write to /root/.ssh',
          {'op': 'write', 'path': '/root/.ssh/authorized_keys'}),
         ('Policy blocks non-patch openssl.cnf write',

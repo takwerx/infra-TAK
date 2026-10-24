@@ -160,6 +160,75 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 </div>
+<!-- v10.3.0 W12.c — full-stack backups: Back up now + list / download / delete.
+     Backend: /api/console/stack-backup(s). Same-box restore is W12.d. -->
+<div id="stackbk-card" style="background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px">
+<div style="font-size:13px;font-weight:600;color:var(--cyan)">&#128190; Full-stack backups</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">TAK Server (config, certificates, database), Authentik, TAK Portal and CloudTAK databases, Node-RED flows and configs, MediaMTX config and console settings &mdash; whatever is installed. Saved on this box; download one to keep it off-box. Video recordings and uploads are not included.</div>
+</div>
+<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="stackbk-run-btn" onclick="stackbkRun()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Back up now</button>
+</div></div>
+<div id="stackbk-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:0"></div>
+<pre id="stackbk-log" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:220px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+<div id="stackbk-list" style="margin-top:10px;font-size:11px"></div>
+<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-dim)"><label for="stackbk-pw">Console password (to delete):</label><input id="stackbk-pw" type="password" autocomplete="current-password" style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-primary);font-size:11px;font-family:inherit" placeholder="password"></div>
+</div>
+<script>
+(function(){
+var _poll=null;
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function mb(n){n=+n||0;return n>=1073741824?(n/1073741824).toFixed(1)+' GB':(n/1048576).toFixed(1)+' MB';}
+function setBusy(on){var b=document.getElementById('stackbk-run-btn');if(b){b.disabled=on;b.style.opacity=on?'.5':'1';b.textContent=on?'Backing up…':'Back up now';}}
+async function load(){
+    try{
+        var r=await fetch('/api/console/stack-backups',{credentials:'same-origin',cache:'no-store'});var d=await r.json();
+        var box=document.getElementById('stackbk-list');if(!box)return;
+        var rows=(d.backups||[]).map(function(b){
+            var st=b.ok?'<span style="color:var(--green)">&#10003; complete</span>':'<span style="color:var(--red)">&#10007; incomplete ('+esc((b.failed||[]).join(', '))+')</span>';
+            var l=encodeURIComponent(b.label);
+            return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-top:1px solid rgba(255,255,255,0.05)">'
+              +'<div><span style="color:var(--text-primary)">'+esc(b.label)+'</span> <span style="color:var(--text-dim)">&middot; '+esc(b.created)+' &middot; '+mb(b.size)+' &middot; '+esc(b.source)+'</span><br>'+st+' <span style="color:var(--text-dim)">&middot; '+esc((b.modules||[]).join(', '))+'</span></div>'
+              +'<div style="display:flex;gap:6px"><a href="/api/console/stack-backup/'+l+'/download" style="padding:4px 10px;border:1px solid rgba(59,130,246,0.3);color:var(--text-secondary);border-radius:6px;text-decoration:none">Download</a>'
+              +'<button type="button" data-label="'+esc(b.label)+'" onclick="stackbkDelete(this.dataset.label)" style="padding:4px 10px;background:none;border:1px solid rgba(239,68,68,0.35);color:var(--red);border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer">Delete</button></div></div>';
+        });
+        box.innerHTML=rows.length?rows.join(''):'<div style="color:var(--text-dim)">No full-stack backups on this box yet.</div>';
+        if(d.running){setBusy(true);startPoll();}
+    }catch(e){}
+}
+async function poll(){
+    try{
+        var r=await fetch('/api/console/stack-backup/status',{credentials:'same-origin',cache:'no-store'});var d=await r.json();
+        var lg=document.getElementById('stackbk-log');if(lg){lg.style.display='block';lg.textContent=(d.log||[]).join('\n');lg.scrollTop=lg.scrollHeight;}
+        if(!d.running){clearInterval(_poll);_poll=null;setBusy(false);
+            var e=document.getElementById('stackbk-err');if(e)e.textContent=d.result===false?('Backup incomplete — '+(d.error||'see the log')):'';
+            load();}
+    }catch(e){}
+}
+function startPoll(){if(!_poll)_poll=setInterval(poll,2000);poll();}
+window.stackbkRun=async function(){
+    var e=document.getElementById('stackbk-err');if(e)e.textContent='';
+    setBusy(true);
+    try{var r=await fetch('/api/console/stack-backup/run',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:'{}'});var d=await r.json();
+        if(!r.ok||!d.ok){if(e)e.textContent=d.error||('backup failed to start ('+r.status+')');setBusy(false);return;}
+        startPoll();
+    }catch(x){if(e)e.textContent='backup failed to start: '+x.message;setBusy(false);}
+};
+window.stackbkDelete=async function(label){
+    var e=document.getElementById('stackbk-err'),pi=document.getElementById('stackbk-pw'),pw=pi?pi.value:'';
+    if(!pw){if(e)e.textContent='Enter the console password below to delete a backup';if(pi)pi.focus();return;}
+    if(!confirm('Delete backup '+label+' and its TAK snapshot? This cannot be undone.'))return;
+    if(pi)pi.value='';
+    try{var r=await fetch('/api/console/stack-backup/'+encodeURIComponent(label),{method:'DELETE',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({admin_password:pw})});var d=await r.json();
+        if(!r.ok||!d.ok){if(e)e.textContent=d.error||('delete failed ('+r.status+')');return;}
+        load();
+    }catch(x){if(e)e.textContent='delete failed: '+x.message;}
+};
+load();
+})();
+</script>
 {% if settings.get('os_type') in ('ubuntu-22.04', 'ubuntu-24.04') %}
 <!-- v10.3.0 W4 — console-driven in-place Ubuntu 22.04 -> 24.04 upgrade. The button is
      offered only on a 22.04 box; the progress/result view also renders on 24.04 so the
@@ -385,6 +454,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:4px">What cannot be undone</div>
     <ul id="osup-irreversible" style="font-size:11px;color:var(--text-dim);line-height:1.5;margin:0 0 12px 18px;padding:0"></ul>
     <div id="osup-ack-block" style="display:none">
+      <label id="osup-stackbk-row" style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px;cursor:pointer"><input id="osup-stackbk" type="checkbox" checked style="margin-top:2px"><span><b style="color:var(--text-primary)">Take a full backup first (recommended)</b> &mdash; TAK Server, Authentik, TAK Portal, CloudTAK, Node-RED, MediaMTX and console settings, saved on this box. If the backup fails, the upgrade does not start. It is not a substitute for an off-box snapshot.</span></label>
       <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type <span id="osup-ack-phrase" style="color:var(--yellow)">I have a snapshot</span> to confirm a VPS snapshot or off-box backup exists</label>
       <input id="osup-ack-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;margin-bottom:10px" placeholder="I have a snapshot">
       <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
@@ -1304,7 +1374,7 @@ checkKernelPatch();
 var _osupOsType='{{ settings.get("os_type","") }}';
 var _osupPollTimer=null,_osupGap=0,_osupLastState='',_osupSawGap=false,_osupStartBusy=false;
 var _OSUP_LABELS={os_type:'Operating system',takserver_58:'TAK Server 5.8 or newer (or not installed)',tak_db_local:'TAK database location',disk:'Free disk space',no_job_running:'No other job running',systemd_run:'Detached job runner (systemd-run / broker)',release_upgrader:'Ubuntu release upgrader',os_up_to_date:'All Ubuntu updates installed',no_reboot_pending:'No reboot pending',containers:'Containers (baseline for the after-reboot check)',acknowledge:'Snapshot acknowledgment',split_config:'TAK Server uses this database server',ssh_sudo:'SSH + passwordless sudo on the database server',is_tak_db:'TAK Server\'s PostgreSQL 18 database',baseline:'Baseline (for the after-reboot check)'};
-var _OSUP_STEP_LABELS={'pre-snapshot':'snapshot','pin-pg16':'pin PG','release-upgrade':'release upgrade','repos-noble':'repos','venv-rebuild':'console venv','reassert':'re-assert','restart-console':'console restart','reboot':'reboot','db-dump':'database dump'};
+var _OSUP_STEP_LABELS={'stack-backup':'full backup','pre-snapshot':'snapshot','pin-pg16':'pin PG','release-upgrade':'release upgrade','repos-noble':'repos','venv-rebuild':'console venv','reassert':'re-assert','restart-console':'console restart','reboot':'reboot','db-dump':'database dump'};
 // Which box the shared preflight modal is driving: 'core' (this box) or 'dbserver' (W4.e).
 var _osupTarget='core';
 var _OSUP_ACK={core:'I have a snapshot',dbserver:'I have a snapshot of the database server'};
@@ -1432,6 +1502,7 @@ function osupOpenPreflight(target){
     var ack=document.getElementById('osup-ack-input'),pw=document.getElementById('osup-pw-input');
     if(ack){ack.value=''; ack.placeholder=_OSUP_ACK[_osupTarget];} if(pw)pw.value='';
     var ph=document.getElementById('osup-ack-phrase'); if(ph)ph.textContent=_OSUP_ACK[_osupTarget];
+    var sbr=document.getElementById('osup-stackbk-row'),sb=document.getElementById('osup-stackbk'); if(sbr)sbr.style.display=(_osupTarget==='dbserver')?'none':'flex'; if(sb)sb.checked=true;
     var t=document.getElementById('osup-modal-title');
     if(t)t.innerHTML=(_osupTarget==='dbserver')?'&#11014; Upgrade the database server'+(_dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':'')+' to Ubuntu 24.04 LTS':'&#11014; Upgrade this box to Ubuntu 24.04 LTS';
     _dbsRenderActions(null);
@@ -1479,7 +1550,7 @@ async function osupStart(){
     if(err)err.textContent='';
     _osupStartBusy=true; _osupSetStartEnabled(false);
     try{
-        var r=await fetch(_osupTarget==='dbserver'?'/api/console/dbserver/os-upgrade/start':'/api/console/os-upgrade/start',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({admin_password:pw,acknowledge:ack.trim()})});
+        var r=await fetch(_osupTarget==='dbserver'?'/api/console/dbserver/os-upgrade/start':'/api/console/os-upgrade/start',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({admin_password:pw,acknowledge:ack.trim(),stack_backup:_osupTarget!=='dbserver'&&!!(document.getElementById('osup-stackbk')||{}).checked})});
         var d=await r.json();
         if(r.status===403){ if(err)err.textContent=d.error||'Incorrect console password'; _osupSetStartEnabled(true); return; }
         if(r.status===409&&d.preflight){ _osupRenderPreflight(d.preflight); if(err)err.textContent=d.error||'preflight failed'; return; }
@@ -1488,7 +1559,7 @@ async function osupStart(){
         if(_osupTarget==='dbserver'){ _dbsJobStarted('os-upgrade',d.message); return; }
         _osupSawGap=false; _osupGap=0; _osupLastState='running';
         _osupShow('osup-progress');
-        _osupRenderSteps({state:'running',step:'start',steps:['pre-snapshot','pin-pg16','release-upgrade','repos-noble','venv-rebuild','reassert','restart-console','reboot']});
+        _osupRenderSteps({state:'running',step:d.stack_backup?'stack-backup':'start',steps:['stack-backup','pre-snapshot','pin-pg16','release-upgrade','repos-noble','venv-rebuild','reassert','restart-console','reboot']});
         var lg=document.getElementById('osup-log'); if(lg)lg.textContent='Spawning the detached upgrade job ('+(d.message||'')+')…';
         _osupStartPolling();
     }catch(e){ if(err)err.textContent='start failed: '+e.message; _osupSetStartEnabled(true); }

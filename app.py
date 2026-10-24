@@ -865,6 +865,36 @@ def _makedirs_priv(path, mode=None, exist_ok=True):
         os.chmod(path, int(mode))
 
 
+def _stack_pg_dump_priv(container, dest_path, timeout=3600):
+    """v10.3.0 W12.b: dump a module database (Authentik / TAK Portal / CloudTAK) from
+    its postgres container into the full-stack backup tree. Non-root: the broker's
+    `stack_pg_dump` op, which pins the container, takes the role + database from its
+    own table, and only writes /var/lib/infratak-backups/<label>/<name>.pgdump (with
+    an HMAC sidecar). Root: the same docker exec, run here. Returns (size, sha256);
+    raises BrokerError / RuntimeError on failure."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'stack_pg_dump', 'path': dest_path,
+                                'container': container, 'timeout': timeout},
+                               timeout=timeout + 30)
+        if not resp.get('ok'):
+            raise BrokerError(f"broker stack_pg_dump failed ({container}): {resp.get('error')}")
+        return int(resp.get('size') or 0), resp.get('sha256') or ''
+    user, db = STACK_BACKUP_PG_CONTAINERS[container]
+    os.makedirs(os.path.dirname(dest_path), mode=0o700, exist_ok=True)
+    with open(dest_path, 'wb') as out:
+        r = subprocess.run(['docker', 'exec', container, 'pg_dump', '-U', user,
+                            '--lock-wait-timeout=' + _COT_DUMP_LOCK_WAIT, '-Fc', db],
+                           stdout=out, stderr=subprocess.PIPE, timeout=timeout)
+    if r.returncode != 0:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"pg_dump in {container} failed: {(r.stderr or b'').decode(errors='replace')[:300]}")
+    os.chmod(dest_path, 0o600)
+    return os.path.getsize(dest_path), _sha256_path(dest_path)
+
+
 def _pg_dump_priv(dest_path, db='cot', timeout=600, container=None):
     """v10.0.8 (PLAN §B): local pg_dump written to disk BY THE BROKER — the dump
     never crosses the socket, so the 32MB message cap that forced the non-root
@@ -82649,6 +82679,389 @@ def _tak_setup_snapshot_schedule(plog=None):
         return False
 
 
+# ── Full-stack backup (v10.3.0 W12.a) ───────────────────────────────────────
+# TAK snapshot + every installed module's database and config, into a root-only
+# /var/lib/infratak-backups/<label>/ (0700). Media (recordings, uploads, WebODM)
+# is deliberately excluded. Same-box restore is W12.d; retention is W12.e.
+STACK_BACKUP_DIR = '/var/lib/infratak-backups'
+# container -> (role, database). Mirrors the broker's _STACK_PG_CONTAINERS — the
+# broker ignores anything the console sends but the container name.
+STACK_BACKUP_PG_CONTAINERS = {
+    'authentik-postgresql-1': ('authentik', 'authentik'),
+    'tak-portal-postgres':    ('takportal', 'takportal'),
+    'cloudtak-postgis-1':     ('docker', 'gis'),
+}
+_STACK_BACKUP_LABEL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$')
+_STACK_BACKUP_COMPOSE_FILES = ('.env', 'docker-compose.yml', 'docker-compose.yaml', 'compose.yml',
+                               'compose.yaml', 'docker-compose.override.yml', 'compose.override.yml')
+
+
+def _sha256_path(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stack_backup(label=None, plog=None):
+    """Take a full-stack backup. Returns (True, manifest) or (False, manifest|error).
+
+    A module that is not installed is skipped; a part that fails is recorded in
+    the manifest as failed and the backup as a whole reports False, so the
+    upgrade window (W12.c) can refuse to proceed on a partial backup."""
+    import io as _io
+    import tarfile as _tarfile
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+    label = label or ('stack-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S'))
+    if not _STACK_BACKUP_LABEL_RE.match(label) or '..' in label:
+        return False, f'invalid backup label: {label!r}'
+    dest = os.path.join(STACK_BACKUP_DIR, label)
+    plog(f"  stack backup [{label}]: creating at {dest}")
+    try:
+        _makedirs_priv(STACK_BACKUP_DIR, mode=0o700)
+        _makedirs_priv(dest, mode=0o700)
+    except Exception as e:
+        return False, f'Could not create backup dir: {e}'
+
+    try:
+        mods = detect_modules(fresh=True) or {}
+    except Exception as e:
+        plog(f"  stack backup: module detection failed: {e}")
+        mods = {}
+
+    def _installed(key):
+        return bool((mods.get(key) or {}).get('installed'))
+
+    try:
+        os_pretty = next((l.split('=', 1)[1].strip().strip('"')
+                          for l in (_read_priv('/etc/os-release') or '').splitlines()
+                          if l.startswith('PRETTY_NAME=')), '')
+    except Exception:
+        os_pretty = ''
+    manifest = {
+        'label': label, 'created': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'infratak_version': VERSION, 'os': os_pretty, 'os_type': _distro_family(),
+        'arch': os.uname().machine, 'modules': sorted(k for k in mods if _installed(k)),
+        'parts': [], 'excluded': ['MediaMTX recordings', 'CloudTAK uploads', 'WebODM data'],
+    }
+    failed = []
+
+    def _part(name, kind, ok, size=0, sha256='', note=''):
+        manifest['parts'].append({'name': name, 'kind': kind, 'ok': bool(ok),
+                                  'size': int(size or 0), 'sha256': sha256, 'note': note})
+        if not ok:
+            failed.append(name)
+
+    # 1. TAK Server — the existing snapshot, same label, in /opt/tak/snapshots.
+    if _installed('takserver'):
+        ok, res = _tak_snapshot(label, plog=plog)
+        if ok:
+            _db = bool(res.get('db_dump'))
+            _part('takserver', 'tak-snapshot', _db,
+                  note=os.path.join(SNAPSHOT_DIR, label) + ('' if _db else ' (cot DB dump missing)'))
+        else:
+            _part('takserver', 'tak-snapshot', False, note=str(res)[:300])
+
+    # 2. Module databases — the broker's stack_pg_dump op on non-root (W12.b).
+    _pg = []
+    if _installed('authentik'):
+        _pg.append(('authentik', 'authentik-postgresql-1'))
+    if _installed('takportal'):
+        _pg.append(('takportal', 'tak-portal-postgres'))
+    if _installed('cloudtak') and os.path.isdir(os.path.expanduser('~/CloudTAK')):
+        _pg.append(('cloudtak', 'cloudtak-postgis-1'))
+    for name, container in _pg:
+        part = f'{name}.pgdump'
+        try:
+            sz, digest = _stack_pg_dump_priv(container, os.path.join(dest, part))
+            _part(part, 'pg_dump', sz > 0, sz, digest, container)
+            plog(f"  stack backup: {part} written ({sz // 1024} KB)")
+        except Exception as e:
+            _part(part, 'pg_dump', False, note=str(e)[:300])
+            plog(f"  stack backup: {part} FAILED: {str(e)[:300]}")
+
+    # 3. Config — staged in a console-owned temp dir, hashed there, then copied into
+    #    the root-only tree (the console cannot read it back to hash it).
+    stage = tempfile.mkdtemp(prefix='infratak-stack-')
+
+    def _copy_in(src, part, kind, note=''):
+        digest, sz = _sha256_path(src), os.path.getsize(src)
+        r = subprocess.run(_sudo_wrap(['cp', src, os.path.join(dest, part)]),
+                           capture_output=True, timeout=600)
+        if r.returncode == 0:
+            _chmod_priv(os.path.join(dest, part), 0o600)
+            _part(part, kind, True, sz, digest, note)
+            plog(f"  stack backup: {part} written ({sz // 1024} KB)")
+        else:
+            _part(part, kind, False, note=(r.stderr or b'').decode(errors='replace')[:300])
+            plog(f"  stack backup: {part} FAILED")
+
+    def _files(d, names=None):
+        try:
+            names = names if names is not None else sorted(os.listdir(d))
+        except OSError:
+            return []
+        return [(n, os.path.join(d, n)) for n in names]
+
+    def _tar_in(name, pairs):
+        pairs = [(rel, src) for rel, src in pairs if os.path.isfile(src)]
+        if not pairs:
+            return
+        tar_path = os.path.join(stage, f'{name}.tar.gz')
+        try:
+            with _tarfile.open(tar_path, 'w:gz') as tf:
+                for rel, src in pairs:
+                    try:
+                        with open(src, 'rb') as f:
+                            data = f.read()
+                    except PermissionError:
+                        data = _read_priv_bytes(src)
+                    ti = _tarfile.TarInfo(rel)
+                    ti.size, ti.mode, ti.mtime = len(data), 0o600, int(time.time())
+                    tf.addfile(ti, _io.BytesIO(data))
+            _copy_in(tar_path, f'{name}.tar.gz', 'config')
+        except Exception as e:
+            _part(f'{name}.tar.gz', 'config', False, note=str(e)[:300])
+
+    try:
+        cfg = [(f'config/{n}', src) for n, src in _files(CONFIG_DIR)]
+        cfg += [(f'config/ssl/{n}', src) for n, src in _files(os.path.join(CONFIG_DIR, 'ssl'))]
+        _tar_in('console-config', cfg)
+        for key, d in (('authentik', os.path.expanduser('~/authentik')),
+                       ('takportal', _takportal_dir()),
+                       ('cloudtak', os.path.expanduser('~/CloudTAK')),
+                       ('nodered', os.path.expanduser('~/node-red'))):
+            if _installed(key):
+                _tar_in(f'{key}-compose', _files(d, list(_STACK_BACKUP_COMPOSE_FILES)))
+        if _installed('mediamtx'):
+            mtx = [('mediamtx.yml', '/usr/local/etc/mediamtx.yml')]
+            mtx += [(f'webeditor/{n}', src) for n, src in _files('/opt/mediamtx-webeditor')
+                    if n.endswith(('.json', '.yml', '.yaml', '.conf'))]
+            _tar_in('mediamtx-config', mtx)
+
+        # 4. Node-RED /data — flows, global context, config-backups/latest.json.
+        #    Read-only here; the SACRED union rule governs the restore side (W12.d).
+        if _installed('nodered'):
+            nr_tar = os.path.join(stage, 'nodered-data.tar')
+            try:
+                with open(nr_tar, 'wb') as out:
+                    r = subprocess.run(_sudo_wrap(['docker', 'cp', 'nodered:/data', '-']),
+                                       stdout=out, stderr=subprocess.PIPE, timeout=600)
+                if r.returncode == 0 and os.path.getsize(nr_tar) > 0:
+                    _copy_in(nr_tar, 'nodered-data.tar', 'volume', 'nodered:/data')
+                else:
+                    _part('nodered-data.tar', 'volume', False,
+                          note=(r.stderr or b'').decode(errors='replace')[:300])
+            except Exception as e:
+                _part('nodered-data.tar', 'volume', False, note=str(e)[:300])
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+    manifest['ok'] = not failed
+    manifest['failed'] = failed
+    manifest['size'] = sum(p['size'] for p in manifest['parts'])
+    try:
+        _write_priv(os.path.join(dest, 'manifest.json'), json.dumps(manifest, indent=2), perm=0o600)
+    except Exception as e:
+        return False, f'Could not write manifest: {e}'
+    if failed:
+        plog(f"  stack backup [{label}]: INCOMPLETE — failed: {', '.join(failed)}")
+        return False, manifest
+    plog(f"  stack backup [{label}]: done ({manifest['size'] // (1024 * 1024)} MB, "
+         f"{len(manifest['parts'])} parts)")
+    return True, manifest
+
+
+# ── Full-stack backup job + Console routes (v10.3.0 W12.c) ──────────────────
+# One backup at a time, run in a thread. The index of taken backups lives in
+# settings['stack_backups'] — the backup tree itself is root-only, so the console
+# cannot list it.
+_stack_backup_job = {'running': False, 'label': '', 'ok': None, 'error': '', 'log': []}
+_stack_backup_job_lock = threading.Lock()
+
+
+def _stack_backup_index_add(manifest):
+    s = load_settings()
+    idx = [b for b in (s.get('stack_backups') or []) if b.get('label') != manifest.get('label')]
+    idx.append({'label': manifest.get('label'), 'created': manifest.get('created'),
+                'ok': bool(manifest.get('ok')), 'size': int(manifest.get('size') or 0),
+                'failed': list(manifest.get('failed') or []), 'modules': list(manifest.get('modules') or []),
+                'os': manifest.get('os') or '', 'infratak_version': manifest.get('infratak_version') or '',
+                'parts': len(manifest.get('parts') or []), 'source': manifest.get('source') or 'manual'})
+    s['stack_backups'] = idx
+    save_settings(s)
+
+
+def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None):
+    """Run _stack_backup in a thread. False when one is already running.
+    `extra_log(line)` also receives each log line (the OS upgrade log);
+    `on_done(ok, manifest_or_error)` runs in the thread when it finishes."""
+    global _stack_backup_job
+    with _stack_backup_job_lock:
+        if _stack_backup_job.get('running'):
+            return False
+        _stack_backup_job = {'running': True, 'label': label, 'ok': None, 'error': '', 'log': []}
+
+    def plog(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _stack_backup_job['log'].append(entry)
+        print(entry, flush=True)
+        if extra_log:
+            try:
+                extra_log(entry)
+            except Exception:
+                pass
+
+    def _run():
+        ok, res = False, 'stack backup crashed'
+        try:
+            ok, res = _stack_backup(label, plog=plog)
+            if isinstance(res, dict):
+                res['source'] = source
+                try:
+                    _stack_backup_index_add(res)
+                except Exception as e:
+                    plog(f"  stack backup: could not record it in settings: {e}")
+        except Exception as e:
+            res = f'stack backup crashed: {str(e)[:300]}'
+            plog(res)
+        err = '' if ok else (', '.join(res.get('failed') or []) if isinstance(res, dict) else str(res))
+        _stack_backup_job.update({'running': False, 'ok': bool(ok),
+                                  'error': ('failed: ' + err) if isinstance(res, dict) and not ok else err})
+        if on_done:
+            try:
+                on_done(ok, res)
+            except Exception as e:
+                print(f"[stack-backup] on_done error: {e}", flush=True)
+
+    threading.Thread(target=_run, daemon=True, name='stack-backup').start()
+    return True
+
+
+def _stack_backup_label_ok(label):
+    return isinstance(label, str) and bool(_STACK_BACKUP_LABEL_RE.match(label)) and '..' not in label
+
+
+@app.route('/api/console/stack-backups')
+@login_required
+def console_stack_backups_api():
+    idx = sorted(load_settings().get('stack_backups') or [], key=lambda b: b.get('created') or '', reverse=True)
+    return jsonify({'ok': True, 'backups': idx, 'running': bool(_stack_backup_job.get('running'))})
+
+
+@app.route('/api/console/stack-backup/run', methods=['POST'])
+@login_required
+def console_stack_backup_run_api():
+    if _os_upgrade_job_state().get('running'):
+        return jsonify({'ok': False, 'error': 'the OS upgrade is running'}), 409
+    label = 'stack-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    if not _stack_backup_run_job(label):
+        return jsonify({'ok': False, 'error': 'a backup is already running'}), 409
+    try:
+        audit('stack-backup:run', label)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'label': label})
+
+
+@app.route('/api/console/stack-backup/status')
+@login_required
+def console_stack_backup_status_api():
+    j = _stack_backup_job
+    return jsonify({'ok': True, 'running': bool(j.get('running')), 'label': j.get('label') or '',
+                    'result': j.get('ok'), 'error': j.get('error') or '', 'log': (j.get('log') or [])[-200:]})
+
+
+@app.route('/api/console/stack-backup/<label>/download')
+@login_required
+def console_stack_backup_download_api(label):
+    """Stream <label>.tar.gz: the backup dir, plus the TAK snapshot of the same label
+    as takserver-snapshot/. Root-only trees are staged into a console-owned copy
+    under the backup root first (as the TAK snapshot download does)."""
+    if not _stack_backup_label_ok(label):
+        return jsonify({'error': 'invalid label'}), 400
+    if not any(b.get('label') == label for b in (load_settings().get('stack_backups') or [])):
+        return jsonify({'error': 'backup not found'}), 404
+    src = os.path.join(STACK_BACKUP_DIR, label)
+    tak = os.path.join(SNAPSHOT_DIR, label)
+    # '.dl-' cannot collide with a backup label (labels start alphanumeric), and the
+    # broker's stack_pg_dump refuses any path under it.
+    staging = os.path.join(STACK_BACKUP_DIR, '.dl-' + label)
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+        subprocess.run(_sudo_wrap(['cp', '-rp', src, os.path.join(staging, label)]),
+                       capture_output=True, check=True, timeout=1800)
+        if os.path.isdir(tak):
+            subprocess.run(_sudo_wrap(['cp', '-rp', tak, os.path.join(staging, label, 'takserver-snapshot')]),
+                           capture_output=True, check=True, timeout=1800)
+        subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
+                       capture_output=True, check=True, timeout=300)
+    except Exception as e:
+        try:
+            subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+        except Exception:
+            pass
+        return jsonify({'error': f'could not stage the backup for download: {str(e)[:200]}'}), 500
+
+    def _stream():
+        proc = subprocess.Popen(['tar', '-czf', '-', '-C', staging, label],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            try:
+                subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=120)
+            except Exception:
+                pass
+
+    try:
+        audit('stack-backup:download', label)
+    except Exception:
+        pass
+    from flask import Response
+    return Response(_stream(), headers={'Content-Disposition': f'attachment; filename="{label}.tar.gz"',
+                                        'Content-Type': 'application/gzip'})
+
+
+@app.route('/api/console/stack-backup/<label>', methods=['DELETE'])
+@login_required
+def console_stack_backup_delete_api(label):
+    """Deletes the backup and its same-label TAK snapshot. Console password required."""
+    if not _stack_backup_label_ok(label):
+        return jsonify({'ok': False, 'error': 'invalid label'}), 400
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    if _stack_backup_job.get('running') and _stack_backup_job.get('label') == label:
+        return jsonify({'ok': False, 'error': 'that backup is still being taken'}), 409
+    for path in (os.path.join(STACK_BACKUP_DIR, label), os.path.join(SNAPSHOT_DIR, label)):
+        try:
+            r = subprocess.run(_sudo_wrap(['rm', '-rf', path]), capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                return jsonify({'ok': False, 'error': (r.stderr or 'delete failed').strip()[:200]}), 500
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    s = load_settings()
+    s['stack_backups'] = [b for b in (s.get('stack_backups') or []) if b.get('label') != label]
+    s['tak_snapshots'] = [b for b in (s.get('tak_snapshots') or []) if b.get('label') != label]
+    save_settings(s)
+    try:
+        audit('stack-backup:delete', label)
+    except Exception:
+        pass
+    return jsonify({'ok': True})
+
+
 def _tak_snapshot_scheduler():
     """v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional
     systemd timer — see _tak_setup_snapshot_schedule docstring). Daemon thread,
@@ -88696,7 +89109,9 @@ _OS_UPGRADE_LOGFILE = '/var/log/infratak-os-upgrade.log'
 _OS_UPGRADE_FROM = 'ubuntu-22.04'
 _OS_UPGRADE_TO = 'ubuntu-24.04'
 _OS_UPGRADE_ACK = 'I have a snapshot'
-_OS_UPGRADE_STEPS = ('pre-snapshot', 'pin-pg16', 'release-upgrade', 'repos-noble',
+# 'stack-backup' (W12.c) runs in the console BEFORE the detached job is spawned, and only
+# when the operator left "Take a full backup first" on; the script starts at pre-snapshot.
+_OS_UPGRADE_STEPS = ('stack-backup', 'pre-snapshot', 'pin-pg16', 'release-upgrade', 'repos-noble',
                      'venv-rebuild', 'reassert', 'restart-console', 'reboot')
 _OS_UPGRADE_MIN_ROOT_GB = 10      # do-release-upgrade's own floor is lower; ours covers the
 _OS_UPGRADE_MIN_BOOT_MB = 200     # venv rebuild + Docker image re-pulls
@@ -89389,6 +89804,45 @@ def _os_upgrade_start_job(data):
                            capture_output=True, timeout=5)
         except Exception:
             pass
+    if _stack_backup_job.get('running'):
+        return 409, {'ok': False, 'error': 'a full-stack backup is already running — wait for it to finish'}
+    remote = request.remote_addr if request else '?'
+    if data.get('stack_backup'):
+        # W12.c: the full backup is the job's first step. It fails the job before any
+        # package moves; the detached upgrade is only spawned once it has succeeded.
+        label = 'pre-os-upgrade-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+
+        def _to_log(line):
+            _write_priv(_OS_UPGRADE_LOGFILE, line + '\n', mode='a')
+
+        def _after(ok, res):
+            if not ok:
+                why = ', '.join(res.get('failed') or []) if isinstance(res, dict) else str(res)
+                _to_log(f"[stack-backup] FAILED ({why[:300]}) — the upgrade was not started; nothing was changed")
+                _os_upgrade_write_status('failed:stack-backup')
+                return
+            _to_log(f"[stack-backup] done: {STACK_BACKUP_DIR}/{label} — starting the upgrade")
+            code, payload = _os_upgrade_launch(pf, remote)
+            if code != 200:
+                _to_log(f"[stack-backup] upgrade start failed: {payload.get('error')}")
+
+        try:
+            _makedirs_priv(_OS_UPGRADE_DIR, mode=0o755)
+            _os_upgrade_write_status('running:stack-backup')
+            _to_log(f"[stack-backup] taking a full-stack backup ({label}) before the upgrade")
+        except Exception as e:
+            return 500, {'ok': False, 'error': f'could not prepare the upgrade job: {str(e)[:200]}'}
+        if not _stack_backup_run_job(label, source='os-upgrade', extra_log=_to_log, on_done=_after):
+            _os_upgrade_write_status('failed:stack-backup')
+            return 409, {'ok': False, 'error': 'a full-stack backup is already running'}
+        return 200, {'ok': True, 'message': f'taking a full-stack backup ({label}) first; the upgrade starts when it succeeds',
+                     'stack_backup': label}
+    return _os_upgrade_launch(pf, remote)
+
+
+def _os_upgrade_launch(pf, remote='?'):
+    """Write the baseline + script and spawn the detached unit. (http_status, payload).
+    Split from _os_upgrade_start_job so the W12.c backup thread can call it."""
     settings = load_settings()
     try:
         import pwd as _pwd
@@ -89434,7 +89888,7 @@ def _os_upgrade_start_job(data):
             new_pid = p
             break
         time.sleep(0.1)
-    print(f"[os-upgrade] STARTED by console user={console_user} remote={request.remote_addr if request else '?'} "
+    print(f"[os-upgrade] STARTED by console user={console_user} remote={remote} "
           f"unit={_OS_UPGRADE_UNIT} pid={new_pid or 'pending'} containers={len(pf['baseline'].get('containers') or [])}", flush=True)
     try:
         audit('os-upgrade:start', f"{_OS_UPGRADE_FROM}->{_OS_UPGRADE_TO} pid={new_pid or 'pending'}")
@@ -89468,7 +89922,13 @@ def _os_upgrade_job_state(raw=None, unit=None):
         state = 'rebooting'
     elif raw.startswith('running:'):
         step = raw[len('running:'):]
-        if unit_running or load == '':
+        if step == 'stack-backup':
+            if _stack_backup_job.get('running'):
+                state = 'running'
+            else:
+                # The console restarted mid-backup: the thread is gone and the upgrade was never spawned.
+                state, detail = 'failed', 'the full-stack backup was interrupted (console restart) — the upgrade was not started'
+        elif unit_running or load == '':
             state = 'running'
         else:
             # The unit is gone but no step wrote failed/rebooting: it died mid-step
