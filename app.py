@@ -1136,9 +1136,11 @@ def ensure_session_cookie_domain():
             return jsonify({'error': 'Too many requests. Please slow down.'}), 429
 
     # CSRF baseline for state-changing API calls (same-origin only).
-    # Exempt localhost-only Guard Dog script endpoint (not browser/session driven).
+    # Exempt localhost-only Guard Dog script endpoints (not browser/session driven; each one
+    # refuses anything but a loopback caller itself).
     if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/'):
-        if request.path not in ('/api/guarddog/send-sms', '/api/guarddog/send-alert-email'):
+        if request.path not in ('/api/guarddog/send-sms', '/api/guarddog/send-alert-email',
+                                '/api/guarddog/cloudtak-repair'):   # ops #197
             if not _same_origin_ok():
                 return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
 
@@ -1171,7 +1173,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.27-alpha"
+VERSION = "10.2.28-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -16117,12 +16119,16 @@ _remote_assist_uninstall_status = {'running': False, 'complete': False, 'error':
 
 
 def _remote_assist_restore_tracked_files(ra_dir):
-    """Discard legacy infra-TAK patches to tracked files so git pull succeeds (v2.1.0+ uses .env only)."""
+    """Discard infra-TAK patches to tracked files so git pull succeeds (v2.1.0+ uses .env only).
+    server/package.json carries the build-time npm security pin (ops #190), rewritten before
+    every build."""
     import subprocess as _sp
     if not os.path.isdir(os.path.join(ra_dir, '.git')):
         return
-    _sp.run(['git', '-C', ra_dir, 'checkout', '--', 'docker-compose.yml'],
-            capture_output=True, text=True, timeout=30)
+    # One file per call: git refuses the whole pathspec if any one path is unknown.
+    for _f in ('docker-compose.yml', 'server/package.json'):
+        _sp.run(['git', '-C', ra_dir, 'checkout', '--', _f],
+                capture_output=True, text=True, timeout=30)
 
 
 def _remote_assist_read_version_file(ra_dir):
@@ -16205,6 +16211,95 @@ def _pull_base_images(build_dir, wrap=None, plog=None, timeout=300):
         else:
             _log(f'  ✓ {img} current')
     return failed
+
+
+# ops #190 (GHSA-27r3-jxmh-p828, High): body-parser below 1.20.9 / 2.4.0 lets one request
+# with a compressed body crash the whole Node process. Parsing runs before routing, so it
+# needs no login and no real route. TAK Portal (2.3.0) and Remote Assist (1.20.5) are built
+# ON THE BOX from upstream lockfiles that still pin the old release, so every image build
+# first writes an npm `overrides` entry into the checkout's package.json — the npm side of
+# what modules/tvr.py patch_requirements() does for TVR's Python pins. A checkout discards
+# it (both Update paths reset tracked files) and the next build writes it again.
+# Driven by the LOCKFILE, not by a fixed version: it fires only while the lock resolves a
+# release below the fix, and always as `^fix` on the major the lock already uses (Express 4
+# uses body-parser 1.x, Express 5 uses 2.x). Once upstream bumps the lock it does nothing.
+# https://docs.npmjs.com/cli/v10/configuring-npm/package-json#overrides
+NPM_SECURITY_FLOORS = {
+    'body-parser': ('1.20.9', '2.4.0'),   # GHSA-27r3-jxmh-p828
+}
+
+
+def _npm_security_overrides(pkg, lock, floors=None):
+    """npm `overrides` entries a project needs so its build resolves NPM_SECURITY_FLOORS.
+
+    `pkg` / `lock` are the parsed package.json / package-lock.json. Returns
+    ({name: '^fix'}, [note, ...]). Adds nothing when the lock is already at or above the
+    fix, when upstream already overrides the package (their call), when it is a direct
+    dependency (npm rejects an override that differs from one), or when the lock carries
+    more than one major of it (a single override would force them all onto one)."""
+    floors = NPM_SECURITY_FLOORS if floors is None else floors
+    add, notes = {}, []
+    packages = (lock or {}).get('packages') or {}
+    direct = set()
+    for k in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+        direct.update(((pkg or {}).get(k) or {}).keys())
+    existing = (pkg or {}).get('overrides') or {}
+    for name, fixes in floors.items():
+        versions = sorted({str(v.get('version') or '') for k, v in packages.items()
+                           if k == f'node_modules/{name}' or k.endswith(f'/node_modules/{name}')})
+        found = [(v, _semver_tuple(v)) for v in versions]
+        if not found:
+            continue
+        if any(t is None for _, t in found):
+            notes.append(f'{name}: lockfile version not understood ({", ".join(versions)}) — left alone')
+            continue
+        majors = {t[0] for _, t in found}
+        if len(majors) != 1:
+            notes.append(f'{name}: lockfile has several major versions ({", ".join(versions)}) — left alone')
+            continue
+        fix = next((f for f in fixes if _semver_tuple(f)[0] in majors), None)
+        if fix is None or all(t >= _semver_tuple(fix) for _, t in found):
+            continue
+        if existing.get(name) == f'^{fix}':
+            continue                # ours, left by a checkout that did not reset the file
+        if name in existing:
+            notes.append(f'{name}: upstream already overrides it ({existing[name]!r}) — left alone')
+            continue
+        if name in direct:
+            notes.append(f'{name}: direct dependency at {", ".join(versions)} — cannot override, '
+                         f'needs upstream to move to {fix}')
+            continue
+        add[name] = f'^{fix}'
+        notes.append(f'{name} {", ".join(versions)} → ^{fix}')
+    return add, notes
+
+
+def _apply_npm_security_overrides(project_dir, plog=None):
+    """Write _npm_security_overrides() into project_dir/package.json before an image build.
+    Returns the entries added. Never raises: the build goes on without the bump rather than
+    not at all, and says so (the Caddy edge already strips the trigger — ops #190)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    pkg_path = os.path.join(project_dir, 'package.json')
+    try:
+        with open(pkg_path, encoding='utf-8') as f:
+            pkg = json.load(f)
+        try:
+            with open(os.path.join(project_dir, 'package-lock.json'), encoding='utf-8') as f:
+                lock = json.load(f)
+        except FileNotFoundError:
+            return {}
+        add, notes = _npm_security_overrides(pkg, lock)
+        for n in notes:
+            _log(f'  npm security pin: {n}')
+        if not add:
+            return {}
+        pkg['overrides'] = {**(pkg.get('overrides') or {}), **add}
+        with open(pkg_path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(pkg, indent=2, ensure_ascii=False) + '\n')
+        return add
+    except Exception as e:
+        _log(f'  ⚠ npm security pin not applied ({pkg_path}): {str(e)[:200]} — building upstream\'s lockfile as-is')
+        return {}
 
 
 def _remote_assist_compose_files(ra_dir):
@@ -16673,6 +16768,7 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 5/6: Building & Starting Containers ━━━')
         plog('  ⏳ First build compiles server + web — allow 5–10 min...')
+        _apply_npm_security_overrides(os.path.join(ra_dir, 'server'), plog=plog)  # ops #190
         _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
@@ -16928,6 +17024,7 @@ def _run_remote_assist_update():
 
         plog('')
         plog('━━━ Step 3/5: Rebuilding containers ━━━')
+        _apply_npm_security_overrides(os.path.join(ra_dir, 'server'), plog=plog)  # ops #190
         _pull_base_images(ra_dir, plog=plog)  # ops #135
         r = _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build'),
                     capture_output=True, text=True, timeout=900, cwd=ra_dir)
@@ -17536,7 +17633,7 @@ def guarddog_page():
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': "Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops. Also repairs CloudTAK by itself when it was recreated without the infra-TAK settings (e.g. by a TAK Portal marketplace install), at most 3 times an hour; emails only if that repair does not work."}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. Runs inside the console process, so if this monitor is red, restart the console (Console \u2192 Restart) rather than reinstalling Guard Dog.'}]},
     ])
     # v10.1.0 Leg 7: relay (connectivity anchor) health — only shown once a relay is
@@ -23915,8 +24012,8 @@ def _monitor_health_check(monitor_id):
                 # reading rather than reporting unknown forever on most of the fleet.
                 _kv = _jvm_status_from_guarddog(_pid)
                 _jv = (_kv or {}).get('version', '')
-            if not _jv.strip():
-                return None          # unknown is grey, never a false red
+            if 'version "' not in _jv:
+                return None          # no Java version string = unknown: grey, never a false red
             return ('version "17.' in _jv) or ('version "17"' in _jv)
         if monitor_id == 'intca':
             for name in ('ca.pem', 'ca-do-not-delete.pem', 'intermediate-ca.pem'):
@@ -25054,6 +25151,10 @@ KNOWN_SECURITY_RELEASES = (
     {'component': 'cloudtak', 'fixed_in': '13.112.2',
      'reason': 'Node.js security fixes CVE-2026-111497 and CVE-2026-106069 '
                '(API image rebuilt on Node 26)'},
+    # ops #190: CloudTAK's own GHSA list does not cover a dependency advisory.
+    {'component': 'cloudtak', 'fixed_in': '13.113.0',
+     'reason': 'body-parser security fix GHSA-27r3-jxmh-p828 (an unauthenticated request '
+               'could crash the API)'},
 )
 
 
@@ -33206,6 +33307,26 @@ def _caddy_stream_close_delay_lines(indent):
     return [f"{indent}stream_close_delay {CADDY_STREAM_CLOSE_DELAY}"]
 
 
+# ops #190 (GHSA-27r3-jxmh-p828): the edge half of the body-parser fix (the build half is
+# _apply_npm_security_overrides). A body-parser below 1.20.9 / 2.4.0 crashes the whole Node
+# process on a compressed request body with trailing bytes, before any route or login.
+# TAK Portal, Remote Assist, Node-RED and CloudTAK are Express apps and each has public
+# paths. None of their clients compresses a request body, so these vhosts drop the request's
+# Content-Encoding: the app reads the body as sent and never starts a decoder. This covers a
+# box the moment its Caddyfile regenerates, without waiting for a rebuild of each image.
+# Why strip rather than `respond 415`: in a Caddyfile, `respond` and a header-matched `route`
+# sort AFTER `handle` and after path-matched routes, so TAK Portal's public paths and the
+# Remote Assist device API would be proxied first. `request_header` sorts ahead of all of
+# them. https://caddyserver.com/docs/caddyfile/directives#directive-order
+CADDY_DROP_REQUEST_ENCODING = 'request_header -Content-Encoding'
+
+
+def _caddy_drop_request_encoding_lines(indent='    '):
+    """Site-level line for every vhost that fronts an Express app (ops #190)."""
+    return [f"{indent}# ops #190: no client compresses request bodies; drop the header (GHSA-27r3-jxmh-p828)",
+            f"{indent}{CADDY_DROP_REQUEST_ENCODING}"]
+
+
 def _caddy_rescue_html_oneline(root_url):
     """The callback-rescue page as ONE Caddyfile-safe token, for Caddy < 2.7.
 
@@ -33649,6 +33770,51 @@ def _startup_caddy_read_body_idle_converge():
     print('Startup migration: ✓ Caddyfile now keeps NetBird gRPC streams open '
           '(read_body_idle off) and Caddy %s' % ('reloaded' if _ok else
                                                  'reload FAILED: ' + _detail[:120]), flush=True)
+
+
+# Comment headers generate_caddyfile() writes above each vhost that gets the ops #190 line.
+_CADDY_EXPRESS_VHOST_MARKERS = ('# Node-RED flow editor', '# TAK Portal', '# CloudTAK Web UI',
+                                '# EUD Remote Assist')
+
+
+def _startup_caddy_request_encoding_converge():
+    """ops #190 — put CADDY_DROP_REQUEST_ENCODING into the Express vhosts on boxes that
+    already have them, so the console update itself closes GHSA-27r3-jxmh-p828 at the edge
+    (the image rebuilds only happen on the next Deploy/Update of each module). Same shape as
+    _startup_caddy_read_body_idle_converge(): one read on every box it does not apply to."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: request Content-Encoding converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if CADDY_DROP_REQUEST_ENCODING in generated:
+        return
+    if not any(m in generated for m in _CADDY_EXPRESS_VHOST_MARKERS):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: request Content-Encoding drop queued — written with the '
+              'post-registry Caddyfile regen (ops #190)', flush=True)
+        return
+    try:
+        after = _read_priv(CADDYFILE_PATH)
+        if CADDY_DROP_REQUEST_ENCODING not in after:
+            if any(m in after for m in _CADDY_EXPRESS_VHOST_MARKERS):
+                print('Startup migration: ⚠ request Content-Encoding converge FAILED — the '
+                      'regenerated Caddyfile was rejected and rolled back (ops #190).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Portal / Remote Assist / Node-RED / CloudTAK vhosts now drop '
+          'request Content-Encoding and Caddy %s (ops #190)'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
 def _startup_caddy_selfheal():
@@ -34264,6 +34430,7 @@ def generate_caddyfile(settings=None):
         nodered_up = _get_nodered_upstream(settings)
         lines.append(f"# Node-RED flow editor")
         lines.append(f"{nodered_host} {{")
+        lines += _caddy_drop_request_encoding_lines()
         if ak.get('installed'):
             lines.append(f"    route {{")
             _emit_outpost_callback_rescue(f"{_pub_url(nodered_host, settings)}/")
@@ -34382,6 +34549,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"            roll_keep_for 720h")
             lines.append(f"        }}")
             lines.append(f"    }}")
+        lines += _caddy_drop_request_encoding_lines()
         if ak.get('installed'):
             lines.append(f"    route {{")
             _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
@@ -34417,6 +34585,7 @@ def generate_caddyfile(settings=None):
         ct_up = _get_cloudtak_upstreams(settings)
         lines.append(f"# CloudTAK Web UI (flush for SSE channels / WebSocket; longer timeouts for channel sync)")
         lines.append(f"{ct_map} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['map']} {{")
         lines.append(f"        flush_interval -1")
         # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
@@ -34441,6 +34610,7 @@ def generate_caddyfile(settings=None):
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
         lines.append(f"# CloudTAK Tile Server")
         lines.append(f"{ct_tiles} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['tiles']}")
         lines.append(f"}}")
         lines.append("")
@@ -34454,6 +34624,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# do NOT split /stream/* back out to 18888 (that 404'd every external-HLS video")
         lines.append(f"# in CloudTAK while RTSP leases worked by accident; TN box, 2026-07-10).")
         lines.append(f"{ct_video} {{")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    reverse_proxy {ct_up['video_api']}")
         lines.append(f"}}")
         lines.append("")
@@ -34482,6 +34653,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
             lines.append(f"    bind {ct_bind_ip}")
+            lines += _caddy_drop_request_encoding_lines()
             lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
             lines.append("")
@@ -34828,6 +35000,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# EUD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
         lines.append(f"{ra_host} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    respond @ra_device 404")
         lines.append(f"    reverse_proxy {ra_up} {{")
@@ -34839,6 +35012,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"# EUD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
         lines.append(f"{ra_host}:{REMOTE_ASSIST_DEVICE_PORT} {{")
         lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
+        lines += _caddy_drop_request_encoding_lines()
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    handle @ra_device {{")
         lines.append(f"        reverse_proxy {ra_up} {{")
@@ -38764,6 +38938,7 @@ def takportal_control():
         _gd_maintenance_begin('takportal', 180)  # v10.1.60 W4
         _patch_takportal_compose_network()
         _patch_takportal_compose_ports(portal_dir)
+        _apply_npm_security_overrides(portal_dir)  # ops #190
         subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -38969,6 +39144,8 @@ def _takportal_run_update(portal_dir):
     _patch_takportal_compose_ports(portal_dir)
     for _ep in _takportal_compose_exposed_ports(portal_dir):
         print(f'[takportal] update: WARNING published port not bound to loopback: {_ep}', flush=True)
+    # ops #190: same window as the port patch — after the checkout, before the build.
+    _apply_npm_security_overrides(portal_dir, plog=lambda m: print(f'[takportal] update:{m}', flush=True))
     # v10.1.60 (W1): settings.json and the SSH keys go onto the data volume BEFORE the
     # build, not after. Both live under /usr/src/app/data, which is the project's named
     # volume (tak_portal_data) and survives `compose up --build` — so a `docker cp` into
@@ -39559,6 +39736,7 @@ def run_takportal_deploy():
             plog("  ✓ Published ports bound to 127.0.0.1 in docker-compose.yml (Caddy is the only way in)")
         for _ep in _takportal_compose_exposed_ports(portal_dir):
             plog(f"  ⚠ published port NOT bound to loopback: {_ep}")
+        _apply_npm_security_overrides(portal_dir, plog=plog)  # ops #190
 
         plog("  Building image (this may take a minute)...")
         # Build + create the container WITHOUT starting it. The first boot otherwise
@@ -41748,6 +41926,10 @@ WantedBy=multi-user.target
             plog(f"   SRT:  srt://[server]:8890?streamid=[stream]")
             plog(f"   HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            try:
+                _mediamtx_converge_cloudtak_read(plog)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             mediamtx_deploy_status.update({'running': False, 'complete': True, 'error': False})
         else:
             plog("✗ MediaMTX service not active after deploy — check logs")
@@ -42897,6 +43079,7 @@ def cloudtak_control():
             cmd = "cd ~/CloudTAK && [ -x ./cloudtak.sh ] && ./cloudtak.sh update || (docker compose pull && docker compose up -d)"
         else:
             return jsonify({'error': 'Invalid action'}), 400
+        cmd = "( " + _cloudtak_remote_custom_compose_sh() + " ); " + cmd   # GH #261
         ok, out = _ssh_probe(rcfg, cmd, timeout=900 if action == 'update' else 120)
         if not ok:
             return jsonify({'error': (out or 'Remote action failed')[:220]}), 400
@@ -42905,6 +43088,8 @@ def cloudtak_control():
         running = bool(ok and out and 'Up' in out)
     else:
         cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        if action in ('start', 'stop', 'restart', 'update'):
+            _cloudtak_ensure_custom_compose(cloudtak_dir)   # GH #261: before compose, every time
         if action == 'start':
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=cloudtak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         elif action == 'stop':
@@ -42955,7 +43140,8 @@ def cloudtak_container_logs():
             capture_output=True, text=True, timeout=15)
     else:
         if os.path.exists(compose_yml):
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'logs', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
+            # No `-f`: COMPOSE_FILE in .env adds the operator's services' logs (GH #261).
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'logs', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15, cwd=cloudtak_dir)
         else:
             r = subprocess.run(_sudo_wrap(['docker', 'logs', 'cloudtak-api-1', '--tail', str(lines)]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
@@ -43571,6 +43757,9 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         # build on a slow-disk box legitimately runs past 20 min — the old timeout=1200
         # killed a SUCCEEDING build and rolled back (test12, 2026-07-22: image landed at
         # +14min, compose still finalizing at +20min → spurious "Rebuild failed").
+        # GH #252: a past Update wiped TAK Portal's lint skip for its plugins — put it back.
+        _cloudtak_shield_foreign_plugins(ct_dir, plog)
+        _cloudtak_ensure_custom_compose(ct_dir, plog)   # GH #261: the recreate keeps their services
         # #150: operator pre-build hooks first — a re-cloned tree would otherwise build stock.
         _hok, _hname = _run_cloudtak_prebuild_hooks(ct_dir, 'plugin', plog)
         if not _hok:
@@ -44461,6 +44650,180 @@ def _cloudtak_env_set(env_path, updates=None, remove=()):
         f.write('\n'.join(out) + '\n')
 
 
+# GH #261: the operator's own compose file for CloudTAK (a plugin's service such as the clptak
+# print container, an extra env var on `events`, a network...). It cannot be
+# docker-compose.override.yml: infra-TAK owns that one and regenerates it on every console
+# start, and CloudTAK Update resets docker-compose.yml. So it is a third file, created once and
+# never written again, and every compose run loads it LAST (so it wins) through COMPOSE_FILE in
+# CloudTAK's .env — which is how the bare `docker compose` calls all over this file, cloudtak.sh
+# and an operator's own shell pick it up without each growing a `-f` list. Absolute paths:
+# _broker_compose runs with `--project-directory`, not from inside ~/CloudTAK.
+CLOUDTAK_CUSTOM_COMPOSE = 'docker-compose.custom.yml'
+_CLOUDTAK_CUSTOM_COMPOSE_SEED = """\
+# ~/CloudTAK/docker-compose.custom.yml is YOURS. infra-TAK created it once and never writes it
+# again. Every CloudTAK action in infra-TAK (Deploy, Update, plugin install/rebuild, Start, Stop,
+# Restart, console restart) loads it after CloudTAK's docker-compose.yml and infra-TAK's
+# docker-compose.override.yml, so what you add here is applied last and survives all of them.
+# A plain `docker compose ...` in ~/CloudTAK loads it too (COMPOSE_FILE in .env).
+#
+# Do not edit those two files instead: infra-TAK regenerates docker-compose.override.yml on
+# every console start, and CloudTAK Update resets docker-compose.yml.
+#
+# Add your own services, or settings for CloudTAK's (api, events, tiles, media, postgis, store).
+# CloudTAK's containers reach yours by service name (e.g. http://print:5010).
+#
+# Browser access: infra-TAK's Caddy runs on the host, not in Docker, so it cannot resolve a
+# container name. Publish the port on loopback only, e.g. "127.0.0.1:5010:5010" (never on
+# 0.0.0.0), and route to it from a Caddy include such as
+#   /etc/caddy/sites.d/<CloudTAK map host>/print.caddy:
+#     @print path /print-api /print-api/*
+#     handle @print {
+#         reverse_proxy 127.0.0.1:5010
+#     }
+# then click Reload on the Caddy page.
+#
+# Example: replace the `services: {}` line below with
+#
+# services:
+#   print:
+#     build: ./cloudtak-plugin-print/service
+#     restart: unless-stopped
+#     env_file: .env
+#     environment:
+#       - API_INTERNAL_URL=http://api:5000
+#       - TILES_INTERNAL_URL=http://tiles:5002
+#     ports:
+#       - "127.0.0.1:5010:5010"
+#   events:
+#     environment:
+#       - GDAL_PDF_BANDS=4
+
+services: {}
+"""
+
+
+# TAK Portal's CloudTAK marketplace pins its CSP overlay into the same COMPOSE_FILE (relative
+# name, matched exactly by its own script), so it must survive our rewrite — and a Deploy, which
+# writes .env from scratch, must put it back.
+_CLOUDTAK_TAKPORTAL_CSP_COMPOSE = 'docker-compose.marketplace.yml'
+
+
+def _cloudtak_compose_file_value(cloudtak_dir, current=''):
+    """COMPOSE_FILE for the CloudTAK project: base file, infra-TAK's override (when present),
+    every other file already listed in `current` (kept verbatim — TAK Portal's marketplace adds
+    its own), then the operator's file last. A listed file that no longer exists is dropped:
+    compose refuses to run at all with one missing. ':'-separated (Linux only, like the rest)."""
+    d = os.path.abspath(cloudtak_dir)
+    base = 'docker-compose.yml'
+    if not os.path.exists(os.path.join(d, base)) and os.path.exists(os.path.join(d, 'compose.yaml')):
+        base = 'compose.yaml'
+    ours = [base]
+    if os.path.exists(os.path.join(d, 'docker-compose.override.yml')):
+        ours.append('docker-compose.override.yml')
+    files = [os.path.join(d, f) for f in ours]
+    seen = {os.path.join(d, n) for n in ('docker-compose.yml', 'compose.yaml',
+                                         'docker-compose.override.yml', CLOUDTAK_CUSTOM_COMPOSE)}
+    others = [i.strip() for i in (current or '').strip().strip('"\'').split(':')]
+    if os.path.exists(os.path.join(d, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE)):
+        others.append(_CLOUDTAK_TAKPORTAL_CSP_COMPOSE)
+    for item in others:
+        p = os.path.normpath(os.path.join(d, item)) if item else ''
+        if not p or p in seen or not os.path.exists(p):
+            continue
+        seen.add(p)
+        files.append(item)
+    files.append(os.path.join(d, CLOUDTAK_CUSTOM_COMPOSE))
+    return ':'.join(files)
+
+
+def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
+    """GH #261: create the operator's CloudTAK compose file if it is missing (never touch one
+    that exists — even an empty file or a symlink is theirs), and point COMPOSE_FILE in
+    CloudTAK's .env at base + override + any others listed (TAK Portal's) + it. Run before
+    every compose action and after every .env rewrite; idempotent. Returns True when anything
+    changed. Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        env_path = os.path.join(cloudtak_dir, '.env')
+        if not os.path.isfile(env_path):
+            return False                 # not deployed (or remote): nothing runs compose here
+        changed = False
+        custom = os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE)
+        if not os.path.lexists(custom):
+            with open(custom, 'x') as f:  # 'x': a file that appeared meanwhile is not ours
+                f.write(_CLOUDTAK_CUSTOM_COMPOSE_SEED)
+            _log(f"  Created {custom} for your own CloudTAK services (infra-TAK never edits it)")
+            changed = True
+        cur = _cloudtak_env_read(env_path).get('COMPOSE_FILE') or ''
+        want = _cloudtak_compose_file_value(cloudtak_dir, cur)
+        if cur != want:
+            _cloudtak_env_set(env_path, {'COMPOSE_FILE': want})
+            changed = True
+        return changed
+    except Exception as e:
+        _log(f"  ⚠ Could not set up {CLOUDTAK_CUSTOM_COMPOSE} for CloudTAK: {e}")
+        return False
+
+
+def _cloudtak_remote_custom_compose_sh():
+    """`_cloudtak_ensure_custom_compose()` as POSIX sh for a remote CloudTAK host (run over SSH,
+    any cwd). The .env is rewritten through `cat >` so it keeps its owner and mode."""
+    return (
+        'cd ~/CloudTAK && if [ -f .env ]; then '
+        f'{{ [ -e {CLOUDTAK_CUSTOM_COMPOSE} ] || [ -L {CLOUDTAK_CUSTOM_COMPOSE} ] || '
+        f'printf %s {shlex.quote(_CLOUDTAK_CUSTOM_COMPOSE_SEED)} > {CLOUDTAK_CUSTOM_COMPOSE}; }} && '
+        'b=docker-compose.yml; { [ -f "$b" ] || [ ! -f compose.yaml ]; } || b=compose.yaml; '
+        'f="$PWD/$b"; [ -f docker-compose.override.yml ] && f="$f:$PWD/docker-compose.override.yml"; '
+        # keep every other listed file that still exists (TAK Portal's), verbatim, once
+        "cur=$(grep '^COMPOSE_FILE=' .env | tail -n 1 | cut -d= -f2- | tr -d '\\042\\047'); "
+        f'[ -f {_CLOUDTAK_TAKPORTAL_CSP_COMPOSE} ] && cur="$cur:{_CLOUDTAK_TAKPORTAL_CSP_COMPOSE}"; '
+        'o=$IFS; IFS=:; for i in $cur; do '
+        'case "$i" in ""|docker-compose.yml|compose.yaml|docker-compose.override.yml|'
+        f'{CLOUDTAK_CUSTOM_COMPOSE}|"$PWD/docker-compose.yml"|"$PWD/compose.yaml"|'
+        f'"$PWD/docker-compose.override.yml"|"$PWD/{CLOUDTAK_CUSTOM_COMPOSE}") continue;; esac; '
+        '[ -e "$i" ] || continue; case ":$f:" in *":$i:"*) continue;; esac; f="$f:$i"; '
+        'done; IFS=$o; '
+        f'f="$f:$PWD/{CLOUDTAK_CUSTOM_COMPOSE}"; '
+        "grep -v '^COMPOSE_FILE=' .env > .env.ct261.tmp; echo \"COMPOSE_FILE=$f\" >> .env.ct261.tmp && "
+        'cat .env.ct261.tmp > .env; rm -f .env.ct261.tmp; fi'
+    )
+
+
+def _cloudtak_remote_reclone_sh(release_tag=None):
+    """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
+    deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
+    first and put back after — it is theirs, and seeding a fresh one would silently drop their
+    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run."""
+    keep = '~/.cloudtak-custom-compose.keep'
+    custom = f'~/CloudTAK/{CLOUDTAK_CUSTOM_COMPOSE}'
+    save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
+    restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
+    if release_tag:
+        # Stop a stack that is already there before deleting its tree. The Garage store
+        # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
+        # it came back during the rm -rf, Docker re-created the folder, and Garage
+        # initialized it with the OLD key; the new stack then crash-looped on a key
+        # mismatch (ops #33 box test, redeploy over an existing remote install).
+        return (
+            "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+            "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
+            + save +
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {shlex.quote(release_tag)} "
+            "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
+            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+        )
+    return (
+        "if [ -d ~/CloudTAK/.git ]; then "
+        "cd ~/CloudTAK && git pull --rebase --autostash; "
+        "else "
+        + save +
+        "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK"
+        + restore + "; "
+        "fi; "
+        "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+    )
+
+
 def _cloudtak_compose_run(cloudtak_dir, args, timeout=600):
     """`docker compose <args>` in the CloudTAK project — through the broker on a non-root box
     (it forwards our cwd; TAKWERX_BROKER_TIMEOUT rides to the CLI so long steps are not cut
@@ -44682,6 +45045,143 @@ def _cloudtak_web_dir(ct_dir):
 def _cloudtak_plugins_dir(ct_dir):
     """Where Vite's plugin glob looks in THIS tree."""
     return os.path.join(_cloudtak_web_dir(ct_dir), 'plugins')
+
+
+# GH #252: TAK Portal's CloudTAK Marketplace makes the image build skip lint/typecheck for the
+# plugins it installs by editing TRACKED files (app/package.json, api/eslint.config.js). Our
+# Update / revert `checkout -f` puts those back to stock while the plugin folders (untracked)
+# stay, so every later build lints third-party plugins and dies (a TAK Simulator install failed
+# on 271 ESLint errors, all in marketplace plugins). Before each build we re-apply the same
+# edits whenever the plugins dir holds a plugin we did not install. Same text and markers as
+# TAK Portal's cloudtakMarketplace.align.js, so its next align treats them as its own.
+_CT_MARKETPLACE_TSCONFIG = 'tsconfig.marketplace.json'
+_CT_MARKETPLACE_ROUTES_RE = re.compile(
+    r'[ \t]*/\* cloudtak-marketplace-routes \*/\r?\n[ \t]*\{ ignores: \[[^\]]*\] \},')
+
+
+def _cloudtak_foreign_plugins(ct_dir):
+    """Plugin folders in this tree that are neither ours (CLOUDTAK_PLUGINS) nor upstream's."""
+    base = _cloudtak_plugins_dir(ct_dir)
+    try:
+        names = sorted(n for n in os.listdir(base)
+                       if not n.startswith('.') and os.path.isdir(os.path.join(base, n)))
+    except OSError:
+        return []
+    ours = {p['install_dir'] for p in CLOUDTAK_PLUGINS}
+    names = [n for n in names if n not in ours]
+    if not names:
+        return []
+    rel = os.path.relpath(base, ct_dir)
+    try:
+        r = subprocess.run(['git', '-c', f'safe.directory={ct_dir}', '-C', ct_dir, 'ls-files', '--', rel],
+                           capture_output=True, text=True, timeout=60)
+        tracked = {ln[len(rel) + 1:].split('/', 1)[0] for ln in r.stdout.splitlines()
+                   if ln.startswith(rel + '/')} if r.returncode == 0 else set()
+    except Exception:
+        tracked = set()
+    return [n for n in names if n not in tracked]
+
+
+def _cloudtak_has_ts_nocheck(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return '@ts-nocheck' in f.read(4000)
+    except OSError:
+        return False
+
+
+def _cloudtak_rewrite_in_place(path, text):
+    # In place, not replace: the file keeps its owner and mode (non-root boxes).
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _cloudtak_shield_foreign_plugins(ct_dir, plog):
+    """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
+    raises and never blocks the build: at worst the build fails as it would have anyway."""
+    try:
+        foreign = _cloudtak_foreign_plugins(ct_dir)
+        if not foreign:
+            return
+        changed = []
+        web = _cloudtak_web_dir(ct_dir)
+        pkg = os.path.join(web, 'package.json')
+        if os.path.isfile(pkg):
+            with open(pkg, encoding='utf-8') as f:
+                text = f.read()
+
+            def _lint(m):
+                script = m.group(2)
+                new = re.sub(r'(?:^|\s)\./plugins/?(?=\s|$)', '', script)
+                new = re.sub(r'[ \t]{2,}', ' ', new).strip()
+                return m.group(1) + new + m.group(3) if new and new != script else m.group(0)
+
+            def _check(m):
+                script = m.group(2)
+                if not re.search(r'\bvue-tsc\b', script) or _CT_MARKETPLACE_TSCONFIG in script:
+                    return m.group(0)
+                new = re.sub(r'(?:--project|-p)\s+\S+', ' ', script)
+                new = re.sub(r'[ \t]{2,}', ' ', new).strip()
+                new = re.sub(r'\bvue-tsc\b', 'vue-tsc --project ' + _CT_MARKETPLACE_TSCONFIG, new, count=1)
+                return m.group(1) + new + m.group(3) if new != script else m.group(0)
+
+            new = re.sub(r'("lint"\s*:\s*")((?:\\.|[^"\\])*)(")', _lint, text, count=1)
+            new = re.sub(r'("check"\s*:\s*")((?:\\.|[^"\\])*)(")', _check, new, count=1)
+            if new != text:
+                _cloudtak_rewrite_in_place(pkg, new)
+                changed.append(os.path.relpath(pkg, ct_dir))
+            if _CT_MARKETPLACE_TSCONFIG in new:
+                overlay = os.path.join(web, _CT_MARKETPLACE_TSCONFIG)
+                want = json.dumps({'extends': './tsconfig.json',
+                                   'exclude': ['plugins', 'node_modules', 'dist']}, indent=2) + '\n'
+                try:
+                    with open(overlay, encoding='utf-8') as f:
+                        have = f.read()
+                except OSError:
+                    have = None
+                if have != want:
+                    _cloudtak_rewrite_in_place(overlay, want)
+                    changed.append(os.path.relpath(overlay, ct_dir))
+        # The api's own lint covers plugin server routes, and the marketplace files it marked
+        # @ts-nocheck (those marks are in untracked files, so they survive the checkout).
+        api = os.path.join(ct_dir, 'api')
+        cfg = os.path.join(api, 'eslint.config.js')
+        if os.path.isfile(cfg):
+            extras = set()
+            routes = os.path.join(api, 'stateless', 'routes')
+            if os.path.isdir(routes):
+                for n in os.listdir(routes):
+                    if (re.fullmatch(r'[A-Za-z0-9._-]+\.ts', n) and not n.startswith('plugin-')
+                            and _cloudtak_has_ts_nocheck(os.path.join(routes, n))):
+                        extras.add('stateless/routes/' + n)
+            for sub in ('stateless/lib', 'stateful/lib', 'common', 'test'):
+                for root, dirs, files in os.walk(os.path.join(api, sub)):
+                    dirs[:] = [d for d in dirs if d not in ('node_modules', 'dist')]
+                    for n in files:
+                        p = os.path.join(root, n)
+                        if n.endswith('.ts') and _cloudtak_has_ts_nocheck(p):
+                            extras.add(os.path.relpath(p, api).replace(os.sep, '/'))
+            patterns = ['stateless/routes/plugin-*.ts'] + sorted(extras)
+            block = ('    /* cloudtak-marketplace-routes */\n    { ignores: ['
+                     + ', '.join("'" + p.replace("'", '') + "'" for p in patterns) + '] },')
+            with open(cfg, encoding='utf-8') as f:
+                text = f.read()
+            needle = 'export default tseslint.config('
+            if _CT_MARKETPLACE_ROUTES_RE.search(text):
+                new = _CT_MARKETPLACE_ROUTES_RE.sub(lambda _m: block, text, count=1)
+            elif needle in text:
+                at = text.index(needle) + len(needle)
+                new = text[:at] + '\n' + block + text[at:]
+            else:
+                new = text
+            if new != text:
+                _cloudtak_rewrite_in_place(cfg, new)
+                changed.append(os.path.relpath(cfg, ct_dir))
+        if changed:
+            plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
+                 f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
+    except Exception as e:
+        plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
 
 
 # v10.2.7 — the same Garage step for a CloudTAK that lives on another host. There the SSH user is
@@ -45048,6 +45548,55 @@ def _patch_cloudtak_minio_registry(cloudtak_dir=None):
     return changed
 
 
+# ops #193 (GH #256): CloudTAK builds the RTSP/RTMP/SRT URLs it hands out (the lease
+# "stream" URL ATAK publishes to, and every read URL) from the media container's OWN
+# listen addresses — video-service.ts protocols(): url.port = config.rtspAddress — not
+# from the host port Docker publishes. Upstream maps host ${MEDIA_PORT_*} → container
+# 8554/1935/8890, and infra-TAK sets MEDIA_PORT_* to 18554/11935/18890 so the standalone
+# MediaMTX keeps 8554/1935/8890. So every URL CloudTAK gave out pointed at the standalone
+# MediaMTX (or at nothing): ATAK's broadcast started, was refused, and ended. Make media
+# listen on the host port itself (MediaMTX's MTX_* env overrides) and publish it 1:1, so
+# the advertised URL is the reachable one. SRT is UDP; upstream published it TCP-only.
+_CT_MEDIA_STREAM_PORTS = (
+    # (compose var, upstream container port, infra-TAK host port, MediaMTX key, proto suffix)
+    ('MEDIA_PORT_RTSP', 8554, 18554, 'MTX_RTSPADDRESS', ''),
+    ('MEDIA_PORT_RTMP', 1935, 11935, 'MTX_RTMPADDRESS', ''),
+    ('MEDIA_PORT_SRT', 8890, 18890, 'MTX_SRTADDRESS', '/udp'),
+)
+
+
+def _cloudtak_media_listen_patch(text):
+    """Return CloudTAK compose text with media's RTSP/RTMP/SRT listening on the published
+    host port (see _CT_MEDIA_STREAM_PORTS). All-or-nothing: if any of the three upstream
+    port lines or the media `environment:` list is not where we expect, the text comes back
+    unchanged — a half patch (MediaMTX on 18554 behind an 18554→8554 publish) would break
+    streaming outright, where the unpatched file is only wrong about the URL. Idempotent."""
+    out = text
+    for var, cport, hport, _key, proto in _CT_MEDIA_STREAM_PORTS:
+        new_line = f'"${{{var}:-{hport}}}:${{{var}:-{hport}}}{proto}"'
+        if new_line in out:
+            continue
+        pat = re.compile(r'"\$\{' + var + r':-\d+\}:' + str(cport) + r'(?:/(?:tcp|udp))?"')
+        if len(pat.findall(out)) != 1:
+            return text
+        out = pat.sub(new_line, out)
+    # media's environment list: `  media:` → its `environment:` → first `- ` item (indent).
+    # `\S` pins where each line's indent ends — without it `[ \t]+.*` can split the same
+    # indent many ways and a non-matching file backtracks for minutes.
+    m = re.search(r'(?m)^([ \t]+)media:[ \t]*\n((?:\1[ \t]+\S.*\n|[ \t]*\n)*?)'
+                  r'(\1[ \t]+)environment:[ \t]*\n([ \t]+)- ', out)
+    if not m:
+        return text
+    item_indent = m.group(4)
+    missing = [f'{item_indent}- {key}=:${{{var}:-{hport}}}\n'
+               for var, _c, hport, key, _p in _CT_MEDIA_STREAM_PORTS
+               if f'- {key}=' not in out]
+    if missing:
+        at = m.end() - len(item_indent) - 2   # start of the first `- ` item line
+        out = out[:at] + ''.join(missing) + out[at:]
+    return out
+
+
 def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
 
@@ -45072,7 +45621,8 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
       events 5003     Tier 4 → removed (Docker-internal only)
       media 9997      Tier 3 → 127.0.0.1:9997:9997 (HLS admin)
       media 8888 HLS  Tier 3 → 127.0.0.1:PORT:8888 (via MEDIA_PORT_HLS)
-      media RTSP/RTMP/SRT  Tier 1 → untouched (public streaming)
+      media RTSP/RTMP/SRT  Tier 1 → public, but listen on + publish the host port 1:1
+                       (18554, 11935, 18890/udp) — _cloudtak_media_listen_patch()
       postgis 5433    Tier 4 → removed
       store 9000      Tier 4 → removed
       store 9002      Tier 3 → 127.0.0.1:9002:9002
@@ -45128,6 +45678,10 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
                 r'\g<1>127.0.0.1:\g<2>18888\g<3>',
                 _ct
             )
+
+            # Tier 1: media RTSP/RTMP/SRT listen on the host port and publish 1:1, so the
+            # stream URLs CloudTAK hands out are reachable (ops #193, GH #256).
+            _ct = _cloudtak_media_listen_patch(_ct)
 
             # Tier 4: postgis 5433 — remove the ports block entirely
             _ct = _re.sub(
@@ -45419,30 +45973,73 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
     decisive matched.
 
     Never raises: a hint is a convenience, and must not turn a build failure into a
-    traceback that hides the failure it was meant to explain."""
+    traceback that hides the failure it was meant to explain.
+
+    GH #249: npm 10+ (every CloudTAK image since node:22) prints `npm error`, not
+    `npm ERR!`, so an npm failure matched nothing and the operator got the bare exit code.
+    A step killed for memory also exits 1 through npm, and a lint or vite failure prints no
+    npm line at all — each of those is named here too."""
     try:
         ts_plugin = {}
         ts_other = None
         npm_err = None
+        npm_net = None
         apt_fail = None
         disk_full = False
         rate_limited = False
+        out_of_memory = None
+        lint_fail = None
+        lint_file = None
+        lint_plugins = []
+        vite_fail = None
+        failed_step = None
 
         for ln in lines:
+            # ESLint prints each file's path, then its "12:5  error ..." lines
+            m = re.search(r'\s(/\S+\.(?:ts|js|vue|mjs|cjs))\s*$', ln)
+            if m:
+                lint_file = m.group(1)
+            elif lint_file and re.search(r'\s\d+:\d+\s+error\s', ln):
+                m = re.search(r'/app/plugins/([\w.-]+)/', lint_file)
+                if m and m.group(1) not in lint_plugins:
+                    lint_plugins.append(m.group(1))
             if 'error TS' in ln:
                 m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
                 if m:
                     ts_plugin.setdefault(m.group(2), ln.strip())
                 elif ts_other is None:
                     ts_other = ln.strip()
-            elif npm_err is None and 'npm ERR!' in ln:
-                npm_err = ln.strip()
+            elif re.search(r'npm (?:ERR!|error) ', ln):
+                _said = re.split(r'npm (?:ERR!|error) ', ln, maxsplit=1)[1].strip()
+                if npm_net is None and re.search(
+                        r'\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|'
+                        r'ERR_SOCKET_TIMEOUT|network)\b', _said):
+                    npm_net = ln.strip()
+                if out_of_memory is None and re.search(r'signal SIGKILL|\bENOMEM\b', _said):
+                    out_of_memory = ln.strip()
+                # npm's own bookkeeping lines say nothing about the cause
+                if npm_err is None and _said and not re.match(
+                        r'(?:A complete log|command|path|workspace|location|code 1$|signal)', _said):
+                    npm_err = ln.strip()
+            elif out_of_memory is None and re.search(
+                    r'JavaScript heap out of memory|Reached heap limit|exit code: 137\b|'
+                    r'\bKilled\s*$|\bENOMEM\b', ln):
+                out_of_memory = ln.strip()
             elif apt_fail is None and 'exit code: 100' in ln:
                 apt_fail = ln.strip()
             elif 'no space left on device' in ln:
                 disk_full = True
             elif 'toomanyrequests' in ln or 'pull rate limit' in ln:
                 rate_limited = True
+            # a passing lint prints "✖ 119 problems (0 errors, 119 warnings)" too
+            elif lint_fail is None and re.search(r'✖ \d+ problems? \([1-9]\d* errors?', ln):
+                lint_fail = ln.strip()
+            elif vite_fail is None and 'error during build' in ln:
+                vite_fail = ln.strip()
+            if failed_step is None and 'did not complete successfully' in ln:
+                m = re.search(r'process "(?:/bin/sh -c )?(.+?)" did not complete', ln)
+                if m:
+                    failed_step = m.group(1).strip()
 
         out = []
         if ts_plugin:
@@ -45468,6 +46065,29 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the disk filled up during the build.')
             out.append('  Free space and retry - see the Disk card on the dashboard.')
+        elif out_of_memory:
+            out.append('')
+            out.append('Likely cause: the build ran out of memory (the step was killed).')
+            out.append('  %s' % out_of_memory[:220])
+            out.append('  The CloudTAK build needs about 4 GB free RAM on top of what is running.')
+            out.append('  Add RAM or swap, or retry when the server is quieter.')
+        elif npm_net:
+            out.append('')
+            out.append('Likely cause: npm could not download packages (network).')
+            out.append('  %s' % npm_net[:220])
+            out.append('  Check this server can reach registry.npmjs.org, then retry.')
+        elif lint_fail:
+            out.append('')
+            out.append('Likely cause: the CloudTAK lint check (ESLint) failed.')
+            out.append('  %s' % lint_fail[:220])
+            if lint_plugins:
+                out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
+                           % ', '.join(lint_plugins))
+                out.append('  CloudTAK itself is not the problem - update or remove the plugin(s), then retry.')
+        elif vite_fail:
+            out.append('')
+            out.append('Likely cause: the CloudTAK web app build (vite) failed.')
+            out.append('  %s' % vite_fail[:220])
         elif rate_limited:
             out.append('')
             out.append('Likely cause: Docker Hub pull rate limit.')
@@ -45480,6 +46100,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: an npm step failed inside the build.')
             out.append('  %s' % npm_err[:220])
+        if failed_step:
+            if not out:
+                out.append('')
+                out.append('The build step that failed (its own error is in the output above it):')
+            out.append('  Failed step: %s' % failed_step[:220])
         return out
     except Exception:
         return []
@@ -45542,27 +46167,9 @@ def run_cloudtak_deploy(cfg=None):
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
-                # Stop a stack that is already there before deleting its tree. The Garage store
-                # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
-                # it came back during the rm -rf, Docker re-created the folder, and Garage
-                # initialized it with the OLD key; the new stack then crash-looped on a key
-                # mismatch (ops #33 box test, redeploy over an existing remote install).
-                prep_cmd = (
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
-                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
             else:
                 plog("  ⚠ Could not fetch latest release tag — using main branch")
-                prep_cmd = (
-                    "if [ -d ~/CloudTAK/.git ]; then "
-                    "cd ~/CloudTAK && git pull --rebase --autostash; "
-                    "else "
-                    "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                    "fi; "
-                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-                )
+            prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)
             ok, out = _ssh_probe(remote_cfg, prep_cmd, timeout=600)
             if not ok:
                 plog(f"✗ CloudTAK repo prep failed on remote: {(out or '')[:220]}")
@@ -45607,7 +46214,8 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 mv_cmd = (
                     "mv /tmp/.env ~/CloudTAK/.env && "
-                    "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml"
+                    "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
+                    "( " + _cloudtak_remote_custom_compose_sh() + " )"   # GH #261
                 )
                 ok, out = _ssh_probe(remote_cfg, mv_cmd, timeout=40)
                 if not ok:
@@ -45841,10 +46449,23 @@ def run_cloudtak_deploy(cfg=None):
         compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
+            # GH #261: the operator's compose file is theirs — carry it across the re-clone.
+            _custom_keep = None
+            try:
+                with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'rb') as _ckf:
+                    _custom_keep = _ckf.read()
+            except OSError:
+                pass
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
             _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
+            if _custom_keep is not None and os.path.isdir(cloudtak_dir):
+                try:
+                    with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'wb') as _ckf:
+                        _ckf.write(_custom_keep)
+                except OSError as _cke:
+                    plog(f"  ⚠ Could not put back {CLOUDTAK_CUSTOM_COMPOSE}: {_cke}")
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -45921,6 +46542,9 @@ def run_cloudtak_deploy(cfg=None):
         with open(override_path, 'w') as f:
             f.write(override_yml)
         plog("  docker-compose.override.yml written (api → host.docker.internal for :5001)")
+        # GH #261: the .env above was written from scratch — put COMPOSE_FILE back so the
+        # pull/up below keep the operator's docker-compose.custom.yml services.
+        _cloudtak_ensure_custom_compose(cloudtak_dir, plog)
 
         # v0.9.56: harden base-compose port bindings BEFORE `up -d`. The Step-2 clone pulls
         # upstream CloudTAK, whose base compose republishes every port on 0.0.0.0 — incl. media
@@ -45991,6 +46615,9 @@ def run_cloudtak_deploy(cfg=None):
                     break
         except Exception as e:
             plog(f"    ⚠ Could not check resources: {e}")
+
+        # GH #252: a redeploy over a tree with TAK Portal marketplace plugins must not lint them.
+        _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
 
         # Build with retry logic (up to 2 attempts)
         MAX_BUILD_ATTEMPTS = 2
@@ -46419,6 +47046,10 @@ def run_cloudtak_deploy(cfg=None):
             plog("  Once you see 'ok - http://localhost:5000' the URL above will work.")
         # cfg['deployed']=True already saved in early-Caddy step; keep settings consistent.
         _update_boot_stagger_service()
+        try:
+            _mediamtx_converge_cloudtak_read(plog)
+        except Exception as _ct_rd_e:
+            plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
     except Exception as e:
@@ -46503,6 +47134,7 @@ def run_cloudtak_redeploy(cfg=None):
             cmd = (
                 "mv /tmp/.env ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
+                "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
                 + _g_sh +
                 "cd ~/CloudTAK && docker compose up -d"
             )
@@ -46582,6 +47214,7 @@ def run_cloudtak_redeploy(cfg=None):
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
         with open(override_path, 'w') as f:
             f.write(_cloudtak_build_override_yml(settings))
+        _cloudtak_ensure_custom_compose(cloudtak_dir, plog)   # GH #261
         plog("✓ .env and override written")
         plog("  Restarting containers...")
         dcc = _compose_cmd()
@@ -46640,6 +47273,10 @@ def run_cloudtak_redeploy(cfg=None):
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        try:
+            _mediamtx_converge_cloudtak_read(plog)
+        except Exception as _ct_rd_e:
+            plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         plog("✓ Update config & restart done")
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -46934,6 +47571,7 @@ def _run_cloudtak_prebuild_hooks(cloudtak_dir, phase, plog, tag='', prev_sha='')
 def _cloudtak_revert_hooks(cloudtak_dir, prev_sha, plog):
     """#150: a revert's checkout -f wipes the operator's patch too — put it back, or the next
     plugin rebuild bakes stock source. Never fails the caller."""
+    _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)   # GH #252: same for TAK Portal's lint skip
     _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'revert', plog, prev_sha=prev_sha)
     if not _hok:
         plog(f"  ⚠ Pre-build hook {_hname} failed on the reverted tree — the running "
@@ -47472,6 +48110,10 @@ def run_cloudtak_update():
                     plog("  Re-applied port hardening after checkout (loopback/removed)")
             except Exception as _pe:
                 plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
+            # GH #252: the checkout just reset TAK Portal's lint skip for its plugins.
+            _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
+            # GH #261: build/up below load the operator's docker-compose.custom.yml too.
+            _cloudtak_ensure_custom_compose(cloudtak_dir, plog)
             # #150: the operator's own source patches, after ours and before the build.
             # Nothing is stopped or migrated yet, so a failed hook leaves the box as it was.
             _hok, _hname = _run_cloudtak_prebuild_hooks(cloudtak_dir, 'update', plog,
@@ -47501,6 +48143,7 @@ def run_cloudtak_update():
             _ct_snap = _cloudtak_snapshot_images(None, remote_cfg=remote_cfg)
             # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             # v10.2.7: build, THEN the store step, THEN up -d — see the local branch below.
+            _ssh_probe(remote_cfg, _cloudtak_remote_custom_compose_sh(), timeout=30)   # GH #261
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache"
             ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
             if not ok:
@@ -47716,6 +48359,10 @@ def run_cloudtak_update():
             threading.Thread(target=_post_update_icon_watch, daemon=True,
                              name='cloudtak-update-icon-heal').start()
             plog("  (sprite-regen self-heal armed for the next ~15 min — dfpc-coe/CloudTAK#1623)")
+            try:
+                _mediamtx_converge_cloudtak_read(plog)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -49975,7 +50622,10 @@ def nodered_control():
     if not os.path.exists(compose):
         return jsonify({'error': 'Node-RED not deployed here'}), 400
     if action == 'start':
-        subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
+        # No `-f`: compose discovers its files in nr_dir, so an operator's
+        # docker-compose.override.yml (e.g. an extra published port) is applied.
+        # `-f docker-compose.yml` recreated the container without it (gh #246).
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
     elif action == 'stop':
         subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose, 'stop']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, cwd=nr_dir)
     elif action == 'restart':
@@ -53480,12 +54130,17 @@ volumes:
   node_red_data:
 """)
         plog("✓ docker-compose.yml written (image pinned, hardening flags, scoped certs, host.docker.internal for CoT)")
+        # The rewrite above owns docker-compose.yml only. An operator's
+        # docker-compose.override.yml / compose.override.yaml in nr_dir is never
+        # written or removed here, and the pull + `up -d` below run WITHOUT `-f` so
+        # compose loads it — the same files Update Now's plain `up -d` uses (gh #246:
+        # an extra published UDP port vanished on every Deploy).
         plog("")
         plog("━━━ Step 2/4: Pulling the Node-RED image ━━━")
         plog("  ~200 MB from Docker Hub. On a slow link this is the long part of the")
         plog("  deploy — progress is reported below, so a stalled pull looks different")
         plog("  from a slow one.")
-        if not _docker_compose_pull(compose_yml, nr_dir, plog, timeout=1800, label='Node-RED image'):
+        if not _docker_compose_pull(None, nr_dir, plog, timeout=1800, label='Node-RED image'):
             nodered_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Image present locally")
@@ -53497,7 +54152,7 @@ volumes:
         # where the container may be running perfectly well, and skips every step
         # after it — the exact failure v10.1.50 fixed one step further down.
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, cwd=nr_dir)
             _up_rc, _up_out = r.returncode, (r.stdout or '')
         except subprocess.TimeoutExpired:
             _up_rc, _up_out = None, ''
@@ -53524,7 +54179,7 @@ volumes:
             try:
                 subprocess.run(_sudo_wrap(['docker', 'rm', '-f', 'nodered']),
                                capture_output=True, text=True, timeout=60)
-                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', '-f', compose_yml, 'up', '-d']),
+                r2 = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                     timeout=180, cwd=nr_dir)
                 _up_rc, _up_out = r2.returncode, (r2.stdout or '')
@@ -63239,6 +63894,73 @@ _TAK_API_CHECK_TRIES = 8
 _TAK_API_CHECK_WAIT_S = 300
 _TAK_API_CHECK_RETRY_S = 15
 _TAK_API_CHECK_RETRY_MAX_S = 60
+# ops #158, long-uptime TAK: test8, TAK up 12 h, an update's outpost restart. Within 15 s TAK
+# was looking other users up in LDAP again (admin, mepsteinparsons) but it sent not one search
+# for the check user in 48 logins over 5 min, and only the TAK restart fixed it. A TAK in its
+# normal window after an outpost restart looks different: no lookup for anyone until its API
+# reconnects (54 s on a fresh test8 TAK), then the user's next login is looked up and passes.
+# So once TAK has looked others up for this long, with at least a round of logins in it and no
+# search for the user, waiting out the rest of the 5 min only keeps Data Sync broken.
+# test8 2026-10-23 (TAK debug logs on): the same stuck API, but the check user was also on a
+# real ATAK device. TAK skipped the lookup for nearly every login (aj1cacor: 0 searches in ~130
+# logins), yet the device's own logins still got through now and then (17 searches in 7 min),
+# so "TAK is asking for the user" kept the full 5 min. A working TAK sends one search per
+# login, so the user only counts as looked up when its searches reach half the check's logins.
+_TAK_API_CHECK_STUCK_S = 30
+
+
+def _ldap_outpost_tak_searches(since):
+    """TAK's user lookups the local LDAP outpost logged since epoch `since`, as a list of
+    (epoch, lower-cased user cn). TAK looks a user up with a base search on cn=<user>,…
+    asking for memberOf and ntUserWorkstations; the console's own ldapsearch reads the
+    users OU, so it isn't counted. None when there is no local outpost or its log can't be
+    read (remote Authentik)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', str(int(since)), 'authentik-ldap-1']),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    seen = []
+    for line in (r.stdout or '').splitlines():
+        if 'ntUserWorkstations' not in line:
+            continue
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(j, dict) or j.get('event') != 'Search request' \
+                or 'ntUserWorkstations' not in (j.get('attributes') or []):
+            continue
+        m = re.match(r'cn=([^,]+),', j.get('baseDN') or '', re.I)
+        ts = _epoch_from_rfc3339(j.get('timestamp') or '')
+        if m and ts is not None:
+            seen.append((ts, m.group(1).lower()))
+    return seen
+
+
+def _tak_api_check_stuck(cn, since, logins):
+    """While the HTTPS check keeps getting no groups for `cn`: is TAK even asking LDAP for
+    it? `logins` = epoch of every login since `since`. Returns (path, why); path 'stuck' =
+    TAK looks other users up but `cn` for under half the check's logins, i.e. not for the
+    check's own (see _TAK_API_CHECK_STUCK_S); anything else = keep waiting."""
+    seen = _ldap_outpost_tak_searches(since)
+    if seen is None:
+        return 'blind', "can't read the local LDAP outpost's log to see what TAK asks LDAP"
+    mine = sum(1 for _, u in seen if u == cn.lower())
+    others = [ts for ts, u in seen if u != cn.lower()]
+    first = min(others) if others else None
+    after = [t for t in logins if first is not None and t >= first + 1]   # the log has whole seconds
+    if mine and 2 * mine >= len(after):
+        return 'asking', f"TAK is looking {cn} up in LDAP ({mine} search(es) since the check began)"
+    if not others:
+        return 'quiet', "TAK hasn't looked anyone up in LDAP since the check began (still reconnecting?)"
+    if len(after) < _TAK_API_CHECK_TRIES or after[-1] - first < _TAK_API_CHECK_STUCK_S:
+        return 'others', f"TAK is looking other users up in LDAP again, not yet {cn}"
+    sent = f"sent only {mine} for {cn} (from its own devices?)" if mine else f"sent none for {cn}"
+    return 'stuck', (f"TAK looks other users up in LDAP ({len(others)} search(es)) but {sent} "
+                     f"in {len(after)} login(s) over {int(after[-1] - first)}s")
 
 
 def _tak_user_leaf_cert(cn, workdir):
@@ -63359,7 +64081,7 @@ def _tak_api_user_check_once(cn, ldap_groups):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
+def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
     Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
@@ -63369,7 +64091,8 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
     list) and deletes it again. A fresh cert for every login. A round is up to
     `_TAK_API_CHECK_TRIES` logins in a row while TAK's API says no groups (each one gets
     past one dead pooled LDAP connection, ops #158); failed rounds are retried, backing
-    off, for up to `wait_s`.
+    off, for up to `wait_s`. `early`: from round 2 on, stop waiting as soon as TAK is
+    plainly not asking LDAP for the user while it asks for others (`_tak_api_check_stuck`).
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
     refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
     check with, or the cert or the API couldn't be used)."""
@@ -63396,9 +64119,11 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
     cn, ldap_groups = pick
     t0 = time.time()
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
+    logins, said = [], None
     while True:
         rnd += 1
         for n in range(1, _TAK_API_CHECK_TRIES + 1):
+            logins.append(time.time())
             verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
             if verdict != 'broken':
                 break   # ok, or the API / cert can't be used: logging in again right away won't help
@@ -63408,8 +64133,19 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S):
             return verdict, summary
         if verdict == 'nocert':
             return 'unknown', summary
+        if early and verdict == 'broken' and rnd >= 2:
+            path, why = _tak_api_check_stuck(cn, t0, logins)
+            if path == 'stuck':
+                plog(f"  {tag}: HTTPS check round {rnd}: {why} — not waiting the rest of the {wait_s}s, "
+                     f"TAK Server needs a restart")
+                return verdict, f"{summary}; {why}"
+            if path != said:
+                plog(f"  {tag}: HTTPS check round {rnd}: {why} — keeping the {wait_s}s wait")
+                said = path
         left = wait_s - (time.time() - t0)
         if left <= 0:
+            if early:
+                plog(f"  {tag}: HTTPS check: still no groups for {cn} after the full {wait_s}s wait")
             return verdict, summary
         wait = int(min(delay, left))
         plog(f"  {tag}: HTTPS check round {rnd} ({n} login(s)): {summary} — trying again in {wait}s")
@@ -63589,10 +64325,10 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         if verdict in ('ok', 'healed'):
             # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass)
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=True)
             except Exception as e:
                 api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
-            outcome = 'clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
+            outcome ='clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
             if api_verdict == 'ok':
                 plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
                 _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
@@ -85190,6 +85926,21 @@ def run_takserver_deploy(config):
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
                 _install_le_cert_on_8446_at_deploy(_get_service_domain(settings, 'takserver'), log_step)
 
+        # ops #195: Step 7 generated a NEW CA + admin.p12, so a TAK Portal that was already
+        # installed still holds the OLD CA and client cert. The container deploy has re-synced
+        # them since v10.0.1; this native path never did, so a .deb/.rpm reinstall left the
+        # portal failing every API call (SELF_SIGNED_CERT_IN_CHAIN on 8443) and every 8089
+        # stream handshake ("peer not verified") — dashboard says TAK Server not connected,
+        # no clients, silently, until someone pressed Sync Portal CA. No-ops when TAK Portal
+        # isn't installed. See memory takportal-stale-client-cert-on-redeploy.
+        try:
+            if _takportal_web_running():
+                log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
+                log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+        except Exception as _tpe:
+            log_step(f"  ⚠ TAK Portal cert sync skipped (non-fatal): {str(_tpe)[:120]}")
+
         log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
         log_step(f"  WebGUI (cert):     https://{ip}:8443")
         if webadmin_pass:
@@ -87507,14 +88258,37 @@ def _trusted_java_exe(pid):
 
 def _tak_api_pid():
     """PID of the TAK API JVM, or None. `pgrep` works as any user — only reading
-    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles."""
+    /proc/<pid>/exe is privileged, which is what _trusted_java_exe handles.
+
+    The first PID that is a java process, not just the first one listed. pgrep skips only
+    itself, so tak-jvm-watch.sh running the same pgrep at the same moment shows up too, and
+    after a PID wrap it sorts ahead of the JVM (TryTAK, 2026-10-23). The exe name is read
+    when we may; a non-root console falls back to /proc/<pid>/comm, which any user can read.
+    A PID we cannot classify at all is kept, as before.
+    """
     try:
         r = subprocess.run(['pgrep', '-f', '--', '-Dspring.profiles.active=api'],
                            capture_output=True, text=True, timeout=5)
         pids = (r.stdout or '').split()
-        return pids[0] if pids else None
     except Exception:
         return None
+    for pid in pids:
+        try:
+            name = os.path.basename(os.readlink(f'/proc/{pid}/exe'))
+        except FileNotFoundError:
+            continue                         # exited since pgrep — the other pgrep, usually
+        except OSError:
+            try:
+                with open(f'/proc/{pid}/comm') as f:
+                    name = f.read().strip()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                name = None
+        # A JDK upgraded under a running JVM reads 'java (deleted)'; that is still the JVM.
+        if name is None or name.split(' ')[0] == 'java':
+            return pid
+    return None
 
 
 def _jvm_status_from_guarddog(api_pid):
@@ -89117,6 +89891,104 @@ def _startup_reapply_f2b_trusted_ignoreip():
 _startup_reapply_f2b_trusted_ignoreip()
 
 
+# ops #193 (GH #256): CloudTAK plays an ATAK video feed by having its OWN media container
+# pull the feed's URL. When that URL is the standalone MediaMTX on the same box, the pull
+# arrives from the container's Docker network address, not localhost — and the standalone
+# MediaMTX only lets localhost read without a password, so CloudTAK's play button got a
+# 401. This entry lets exactly that Docker network read (never publish), written above
+# the other users and found again by its marker line so it can follow the subnet.
+_MTX_CLOUDTAK_READ_MARK = ('# infra-TAK: CloudTAK\'s media server (its Docker network) may watch '
+                           'streams without a password (GH #256)')
+
+
+def _mediamtx_cloudtak_read_patch(text, subnets):
+    """Return mediamtx.yml text with our CloudTAK read entry set to `subnets` (removed when
+    `subnets` is empty). Only the entry under our marker line is ever touched — an operator's
+    own users are left alone. No top-level `authInternalUsers:` list → text unchanged."""
+    out = re.sub(r'(?m)^' + re.escape(_MTX_CLOUDTAK_READ_MARK) + r'\n- user: any\n'
+                 r'  ips: \[[^\]\n]*\]\n  permissions:\n  - action: read\n', '', text)
+    if subnets:
+        m = re.search(r'(?m)^authInternalUsers:[ \t]*\n(?=- )', out)
+        if not m:
+            return text
+        ips = ', '.join(f"'{s}'" for s in subnets)
+        out = (out[:m.end()] + f'{_MTX_CLOUDTAK_READ_MARK}\n- user: any\n  ips: [{ips}]\n'
+               '  permissions:\n  - action: read\n' + out[m.end():])
+    return out
+
+
+def _cloudtak_media_subnets():
+    """Subnets of the Docker networks the local CloudTAK media container is attached to.
+    [] when it does not exist, None when Docker could not be asked. Only private ranges no
+    wider than a Docker pool are returned, and never the shared default `bridge` (every
+    non-compose container sits there)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                       '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}',
+                                       'cloudtak-media-1']),
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None                     # no Docker on this box, or it is not answering
+    if r.returncode != 0:
+        return [] if 'no such' in (r.stderr or '').lower() else None
+    subnets = []
+    for net in (r.stdout or '').split():
+        if net in ('bridge', 'host', 'none'):
+            continue
+        n = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                       '{{range .IPAM.Config}}{{.Subnet}} {{end}}', net]),
+                           capture_output=True, text=True, timeout=20)
+        if n.returncode != 0:
+            return None
+        for s in (n.stdout or '').split():
+            try:
+                ipn = ipaddress.ip_network(s, strict=False)
+            except ValueError:
+                continue
+            if ipn.is_private and not ipn.is_loopback and ipn.prefixlen >= (12 if ipn.version == 4 else 48):
+                subnets.append(str(ipn))
+    return sorted(set(subnets))
+
+
+def _mediamtx_converge_cloudtak_read(log=None):
+    """ops #193 (GH #256): keep the standalone MediaMTX's CloudTAK read entry matching the
+    CloudTAK media container's Docker network on this box. Runs at console start and after
+    a local MediaMTX or CloudTAK deploy/update (a `compose down` can hand CloudTAK a new
+    subnet). CloudTAK gone (no container, no ~/CloudTAK compose) → the entry is removed;
+    container missing mid-deploy, or Docker not answering → no change. Restarts MediaMTX
+    only when the file changed and the operator has not stopped it. Returns True if changed."""
+    _log = log or (lambda m: print(m, flush=True))
+    cfg_path = '/usr/local/etc/mediamtx.yml'
+    if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
+        return False
+    subnets = _cloudtak_media_subnets()
+    if subnets is None:
+        return False
+    if not subnets and (os.path.exists(os.path.expanduser('~/CloudTAK/docker-compose.yml'))
+                        or os.path.exists(os.path.expanduser('~/CloudTAK/compose.yaml'))):
+        return False
+    try:
+        with open(cfg_path) as _cf:
+            cur = _cf.read()
+    except OSError:
+        cur = _read_priv(cfg_path)
+    patched = _mediamtx_cloudtak_read_patch(cur, subnets)
+    if patched == cur:
+        return False
+    _write_priv(cfg_path, patched)
+    st = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                        capture_output=True, text=True, timeout=15)
+    if (st.stdout or '').strip() != 'inactive':
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']),
+                       capture_output=True, timeout=60)
+    if subnets:
+        _log(f"  ✓ MediaMTX: CloudTAK's media server ({', '.join(subnets)}) may now watch "
+             "streams without a password (read only)")
+    else:
+        _log("  ✓ MediaMTX: CloudTAK read access removed (CloudTAK is not on this box)")
+    return True
+
+
 def _startup_converge_mediamtx_moq():
     """v10.1.33: disable MoQ in an existing mediamtx.yml — on v1.20.0+ it crash-loops
     mediamtx.service wherever the unit runs as takwerx.
@@ -90048,6 +90920,91 @@ def _ct_wait_compose_idle(timeout=300, log=None):
         time.sleep(3)
 
 
+def _ct_docker_out(args, timeout=20, stdin=None):
+    """`docker <args>` (sudo-wrapped); stdout, or None when it failed."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker'] + list(args)), input=stdin,
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _cloudtak_containers_without_override(ct_dir):
+    """Running containers of the CloudTAK project that compose created WITHOUT
+    docker-compose.override.yml (their config_files label), when the override exists — what
+    TAK Portal's `-f docker-compose.yml -f docker-compose.marketplace.yml` recreate leaves
+    (ops #197): stock media-infra / postgis images and no console CA in the api. [] when
+    clean or when docker can't tell."""
+    if not os.path.exists(os.path.join(ct_dir, 'docker-compose.override.yml')):
+        return []
+    proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
+                              '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
+    if not proj:
+        return []
+    rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
+                             '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}']) or ''
+    bad = []
+    for row in rows.splitlines():
+        name, _, files = row.partition('|')
+        files = [f.strip() for f in files.split(',') if f.strip()]
+        if files and 'docker-compose.override.yml' not in {os.path.basename(f) for f in files}:
+            bad.append(name.strip())
+    return bad
+
+
+def _cloudtak_write_override_file(ct_dir):
+    """Rewrite ~/CloudTAK/docker-compose.override.yml from current settings. True when it
+    changed. The console-start hardening and Guard Dog's auto-repair (ops #197) both write
+    it through here. Never raises."""
+    try:
+        _override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
+        _settings = load_settings()
+        _new_override = _cloudtak_build_override_yml(_settings)
+        _existing = ''
+        if os.path.exists(_override_path):
+            with open(_override_path) as _of:
+                _existing = _of.read()
+        _changed = False
+        if _existing.strip() != _new_override.strip():
+            with open(_override_path, 'w') as _of:
+                _of.write(_new_override)
+            _changed = True
+        if _settings.get('simulator_enabled'):
+            os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
+        return _changed
+    except Exception:
+        return False
+
+
+def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
+    """Force-recreate the whole CloudTAK stack, then re-apply the media patches the recreate
+    wiped. A bare `docker compose` in the stack dir, so COMPOSE_FILE in .env decides the files:
+    base + infra-TAK's override + TAK Portal's marketplace file + the operator's
+    docker-compose.custom.yml (GH #261). The console-start hardening and Guard Dog's
+    auto-repair (ops #197) both recreate through here. `pull` downloads the pinned postgis
+    first, so `up` doesn't spend its 240 s on it. Returns 'ok', 'recreate' (the up failed)
+    or 'heal' (the media heal did not confirm)."""
+    if pull:
+        # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
+        # Download it before the recreate so `up -d` doesn't spend its 240 s budget
+        # on the pull — the stack keeps running meanwhile.
+        _docker_compose_pull(None, ct_dir, log,
+                             timeout=600, label='CloudTAK postgis', services=['postgis'])
+    r = subprocess.run(
+        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+    )
+    if r.returncode != 0:
+        log(f"CloudTAK recreate warning: {(r.stdout or '')[:200]}")
+        return 'recreate'
+    log("CloudTAK recreated with hardened port bindings")
+    # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
+    # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+    if not _cloudtak_media_hls_heal(wait=True):
+        return 'heal'
+    return 'ok'
+
+
 def _startup_harden_cloudtak_ports():
     try:
         _ct_dir = os.path.expanduser('~/CloudTAK')
@@ -90060,24 +91017,12 @@ def _startup_harden_cloudtak_ports():
         _ct_recreate_arm()
         # Refresh the override file (clears stale `ports: !reset` content
         # from v0.9.12 pre-fix installs, keeps extra_hosts/env current).
-        _override_changed = False
-        try:
-            _override_path = os.path.join(_ct_dir, 'docker-compose.override.yml')
-            _settings = load_settings()
-            _new_override = _cloudtak_build_override_yml(_settings)
-            _existing = ''
-            if os.path.exists(_override_path):
-                with open(_override_path) as _of:
-                    _existing = _of.read()
-            if _existing.strip() != _new_override.strip():
-                with open(_override_path, 'w') as _of:
-                    _of.write(_new_override)
-                _override_changed = True
-                print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
-            if _settings.get('simulator_enabled'):
-                os.chmod(_override_path, 0o600)     # v10.1.61 W10: carries the engine token
-        except Exception:
-            pass
+        _override_changed = _cloudtak_write_override_file(_ct_dir)
+        if _override_changed:
+            print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+        # GH #261: before the recreate below, so it keeps the operator's own services.
+        if _cloudtak_ensure_custom_compose(_ct_dir, plog=lambda m: print(f"Startup migration: {m.strip()}", flush=True)):
+            print("Startup migration: CloudTAK compose now loads docker-compose.custom.yml")
         _minio_repointed = _patch_cloudtak_minio_registry(_ct_dir)
         _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
@@ -90106,31 +91051,29 @@ def _startup_harden_cloudtak_ports():
                     print("Startup migration: CloudTAK api is not bound to 127.0.0.1:5000 only — recreating")
             except Exception:
                 pass
+        _no_override = []
+        if not _needs_recreate:
+            # ops #197: a TAK Portal marketplace install recreated part of the stack without
+            # the override. The files on disk are fine, so nothing above notices — and this
+            # restart is what Guard Dog's alarm tells the operator to do.
+            _no_override = _cloudtak_containers_without_override(_ct_dir)
+            if _no_override:
+                _needs_recreate = True
+                print("Startup migration: CloudTAK containers created without infra-TAK's override "
+                      f"({', '.join(_no_override)}) — recreating")
         if not _needs_recreate:
             _ct_recreate_clear()
         else:
             if _pending is not None:
                 _ct_wait_compose_idle(log=lambda m: print(f"Startup migration: {m}", flush=True))
             _ct_recreate_arm(tries=int((_pending or {}).get('tries') or 0) + 1)
-            if _override_changed or _pending is not None:
-                # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
-                # Download it before the recreate so `up -d` doesn't spend its 240 s budget
-                # on the pull — the stack keeps running meanwhile.
-                _docker_compose_pull(None, _ct_dir, lambda m: print(f"Startup migration: {m}", flush=True),
-                                     timeout=600, label='CloudTAK postgis', services=['postgis'])
-            r = subprocess.run(
-                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=_ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
-            )
-            if r.returncode == 0:
-                print("Startup migration: CloudTAK recreated with hardened port bindings")
-                # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
-                # re-apply the self-heal (HLS config + ephemeral-aware reaper).
-                if _cloudtak_media_hls_heal(wait=True):
-                    _ct_recreate_clear()
-                else:
-                    print("Startup migration: CloudTAK media heal did not confirm — recreate stays pending")
-            else:
-                print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
+            _stage = _cloudtak_recreate_and_heal(
+                _ct_dir, lambda m: print(f"Startup migration: {m}", flush=True),
+                pull=_override_changed or _pending is not None or bool(_no_override))
+            if _stage == 'ok':
+                _ct_recreate_clear()
+            elif _stage == 'heal':
+                print("Startup migration: CloudTAK media heal did not confirm — recreate stays pending")
         # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
         # default-deny firewall, EUD publishes into CloudTAK leases were dropped.
         _cloudtak_open_stream_ports()
@@ -90159,6 +91102,260 @@ def _startup_heal_cloudtak_media_hls():
         print(f"Startup self-heal: cloudtak-media error (non-fatal): {_e}")
 
 _startup_heal_cloudtak_media_hls()
+
+
+# ops #197: Guard Dog repairs CloudTAK by itself after a compose run that skipped our override.
+#
+# TAK Portal's marketplace rebuilds CloudTAK with its own command,
+#   docker compose -f docker-compose.yml -f docker-compose.marketplace.yml up -d --force-recreate api
+# and explicit -f flags make compose ignore COMPOSE_FILE in .env, so docker-compose.override.yml
+# is skipped. The recreated containers come back stock: media-infra v9.10.0 instead of
+# MEDIA_INFRA_IMAGE, upstream's frozen postgis, no console CA in the api, no HLS profile (test12
+# ops #194, nuc ops #196). Guard Dog saw the HLS half and emailed; the box stayed wrong until
+# someone restarted the console.
+#
+# Now tak-cloudtak-watch.sh also spots containers whose compose labels show the override was not
+# loaded, and on its second check POSTs here instead of alarming. The console re-checks for
+# itself, waits for anything still running compose (TAK Portal builds, then recreates, then waits
+# for the api), and repairs through the console-start path (_cloudtak_write_override_file +
+# _cloudtak_recreate_and_heal) — never a second copy of it. At most
+# CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR tries an hour; a failure or the limit hit is answered with
+# 'failed' / 'rate_limited' and Guard Dog sends today's "action needed" email. A repair that
+# works sends one short "repaired automatically" note instead.
+CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
+CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
+CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
+_CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json')
+# Any compose step that changes the stack, or an image build (TAK Portal builds --no-cache first).
+_CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
+    r'\bcompose\b.*\s(?:up|build|pull|create|down|stop|start|restart|rm|run)(?:\s|$)'
+    r'|\bdocker\s+(?:buildx\s+)?build(?:\s|$)')
+cloudtak_autorepair_status = {'running': False}   # *_status: _console_busy_reason() sees it
+_cloudtak_autorepair_lock = threading.Lock()
+
+
+def _cloudtak_drift(ct_dir):
+    """What a compose run without infra-TAK's override left behind. Returns
+    {'kind': 'recreate'|'media'|'', 'no_override': [names], 'hls': True|False|None,
+     'media_image': str, 'api_ca': True|False|None}.
+    'recreate': a running CloudTAK container was created without docker-compose.override.yml
+    (its compose config_files label) — image pins, console CA and the HLS profile all need the
+    recreate. 'media': only the HLS profile is gone — the media heal alone fixes that. hls None
+    means the read failed, which is never counted as drift (ops #161)."""
+    out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
+           'hls': None, 'media_image': '', 'api_ca': None}
+    media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
+    if media:
+        chk = _ct_docker_out(['exec', '-i', media, 'sh'], timeout=25, stdin=_CT_MEDIA_CHECK_SH)
+        if chk and chk.strip():
+            out['hls'] = _ct_media_converged(chk)
+        out['media_image'] = (_ct_docker_out(['inspect', media, '--format', '{{.Config.Image}}']) or '').strip()
+    env = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{json .Config.Env}}'])
+    if env:
+        try:
+            out['api_ca'] = any(str(e).startswith('NODE_EXTRA_CA_CERTS=') for e in json.loads(env) or [])
+        except ValueError:
+            pass
+    if out['no_override']:
+        out['kind'] = 'recreate'
+    elif out['hls'] is False:
+        out['kind'] = 'media'
+    return out
+
+
+def _cloudtak_drift_summary(d):
+    """One line for the log / the operator's note."""
+    parts = []
+    if d.get('no_override'):
+        parts.append("created without infra-TAK's compose override: " + ', '.join(d['no_override']))
+    if d.get('hls') is False:
+        parts.append('HLS profile missing')
+    if d.get('media_image'):
+        parts.append(f"media image {d['media_image']}")
+    if d.get('api_ca') is not None:
+        parts.append('console CA ' + ('trusted by the api' if d['api_ca'] else 'missing in the api'))
+    return '; '.join(parts) or 'nothing'
+
+
+def _cloudtak_autorepair_wait_reason(ct_dir):
+    """Why the stack has not settled yet (so a repair now would fight whoever is changing it),
+    or None. TAK Portal's install is build → up --force-recreate api → wait for the api → image
+    prune, all as separate commands, so: any compose/build process on the box, a console job
+    in flight, or an api container that started less than CLOUDTAK_AUTOREPAIR_SETTLE_S ago."""
+    busy = _console_busy_reason()
+    if busy:
+        return f'console busy: {busy}'
+    try:
+        ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
+        run = [l.strip() for l in (ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_BUSY_RE.search(l)]
+    except Exception:
+        run = []
+    if run:
+        return f'a compose/build run is still going ({run[0][:120]})'
+    st = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.Status}} {{.State.StartedAt}}']) or '').split()
+    if len(st) < 2 or st[0] != 'running':
+        return f"cloudtak-api-1 is not running ({st[0] if st else 'not found'})"
+    try:
+        import calendar
+        age = time.time() - calendar.timegm(time.strptime(st[1][:19], '%Y-%m-%dT%H:%M:%S'))
+    except ValueError:
+        age = CLOUDTAK_AUTOREPAIR_SETTLE_S
+    if age < CLOUDTAK_AUTOREPAIR_SETTLE_S:
+        return f'cloudtak-api-1 started {int(max(age, 0))}s ago'
+    return None
+
+
+def _cloudtak_autorepair_record():
+    try:
+        with open(_CLOUDTAK_AUTOREPAIR_RECORD) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cloudtak_autorepair_record_save(d):
+    try:
+        tmp = _CLOUDTAK_AUTOREPAIR_RECORD + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f)
+        os.replace(tmp, _CLOUDTAK_AUTOREPAIR_RECORD)
+    except Exception as e:
+        print(f"[cloudtak-autorepair] record write failed (non-fatal): {e}", flush=True)
+
+
+def _cloudtak_autorepair_request():
+    """Guard Dog saw CloudTAK drift twice in a row. Answer {'state', 'detail'}:
+      ok           — no drift from here (it cleared, or was never ours to fix)
+      repairing    — a repair is running (just started, or still going)
+      waiting      — not settled yet; ask again next check
+      rate_limited — CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR used up: send the alarm
+      failed       — the last repair failed, or cannot run here: send the alarm"""
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    with _cloudtak_autorepair_lock:
+        if cloudtak_autorepair_status.get('running'):
+            return {'state': 'repairing', 'detail': cloudtak_autorepair_status.get('detail') or ''}
+        settings = load_settings()
+        try:
+            if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+                return {'state': 'failed', 'detail': 'CloudTAK runs on a remote host; the console repairs a local stack only'}
+        except Exception:
+            pass
+        if not os.path.isfile(os.path.join(ct_dir, '.env')):
+            return {'state': 'failed', 'detail': f'no CloudTAK install in {ct_dir}'}
+        if os.path.exists(os.path.join(ct_dir, 'COMPROMISE-DETECTED.txt')):
+            return {'state': 'failed', 'detail': 'CloudTAK is held stopped for Remove + Reinstall (compromise banner)'}
+        drift = _cloudtak_drift(ct_dir)
+        if not drift['kind']:
+            return {'state': 'ok', 'detail': _cloudtak_drift_summary(drift)}
+        now = time.time()
+        rec = _cloudtak_autorepair_record()
+        last = rec.get('last') or {}
+        if last.get('result') == 'failed' and now - float(last.get('at') or 0) < CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S:
+            return {'state': 'failed', 'detail': f"automatic repair failed: {last.get('detail') or 'unknown'}"}
+        tries = [t for t in (rec.get('attempts') or []) if isinstance(t, (int, float)) and now - t < 3600]
+        if len(tries) >= CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR:
+            return {'state': 'rate_limited',
+                    'detail': f'{len(tries)} automatic repairs in the last hour, so Guard Dog stopped trying'}
+        wait = _cloudtak_autorepair_wait_reason(ct_dir)
+        if wait:
+            return {'state': 'waiting', 'detail': wait}
+        rec['attempts'] = tries + [now]
+        _cloudtak_autorepair_record_save(rec)
+        detail = _cloudtak_drift_summary(drift)
+        cloudtak_autorepair_status.update({'running': True, 'kind': drift['kind'], 'detail': detail, 'started': now})
+        print(f"[cloudtak-autorepair] Guard Dog drift: {detail} — repairing ({drift['kind']})", flush=True)
+        try:
+            threading.Thread(target=_cloudtak_autorepair_run, args=(ct_dir, drift),
+                             daemon=True, name='cloudtak-autorepair').start()
+        except Exception as e:
+            cloudtak_autorepair_status['running'] = False
+            return {'state': 'failed', 'detail': f'could not start the repair: {e}'}
+        return {'state': 'repairing', 'detail': detail}
+
+
+def _cloudtak_autorepair_run(ct_dir, drift):
+    """The repair itself (background thread). 'recreate': exactly what a console restart does
+    to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
+    operator's custom file stay in it), re-assert the loopback port patch on the base file (the
+    recreate must never publish a port we closed), then the journaled recreate + media heal.
+    'media': the media heal alone. Success is judged by a fresh drift check, not by exit codes."""
+    def _log(m):
+        print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
+    result, why = 'failed', ''
+    try:
+        if drift['kind'] == 'recreate':
+            _p = _ct_recreate_pending()
+            _ct_recreate_arm(tries=int((_p or {}).get('tries') or 0) + 1)   # ops #175: survives a kill
+            if _cloudtak_write_override_file(ct_dir):
+                _log('CloudTAK override rewritten from settings')
+            _cloudtak_ensure_custom_compose(ct_dir, _log)
+            _patch_cloudtak_minio_registry(ct_dir)
+            _patch_cloudtak_compose_ports(ct_dir)
+            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
+            why = {'recreate': 'docker compose up --force-recreate failed',
+                   'heal': 'the HLS profile did not re-apply'}.get(stage, '')
+        else:
+            why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+        after = _cloudtak_drift(ct_dir)
+        if not why and after['kind']:
+            why = f'still drifted after the repair: {_cloudtak_drift_summary(after)}'
+        if not why:
+            result = 'repaired'
+            if drift['kind'] == 'recreate':
+                _ct_recreate_clear()
+            _log(f"repaired — now: {_cloudtak_drift_summary(after)}")
+            _cloudtak_autorepair_notify(drift, after)
+        else:
+            _log(f'⚠ repair failed: {why}')
+    except Exception as e:
+        why = f'error: {e}'
+        _log(f'⚠ repair error: {e}')
+    finally:
+        rec = _cloudtak_autorepair_record()
+        rec['last'] = {'result': result, 'at': time.time(), 'detail': why[:300],
+                       'found': _cloudtak_drift_summary(drift)[:500]}
+        _cloudtak_autorepair_record_save(rec)
+        with _cloudtak_autorepair_lock:
+            cloudtak_autorepair_status.update({'running': False, 'detail': ''})
+
+
+def _cloudtak_autorepair_notify(before, after):
+    """One short 'repaired automatically' note — not the alarm. Same relay, recipient and pause
+    as every Guard Dog alert."""
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            print("[guarddog] CloudTAK repaired note SUPPRESSED (no recipient configured)", flush=True)
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        done = ("rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK Portal's "
+                "compose file and docker-compose.custom.yml kept), then re-applied the HLS profile"
+                if before['kind'] == 'recreate' else 're-applied the HLS profile to cloudtak-media')
+        body = (
+            "CloudTAK lost infra-TAK's settings, most likely because a TAK Portal marketplace plugin\n"
+            "install recreated it without them. Guard Dog repaired it by itself. Nothing to do.\n\n"
+            f"Found: {_cloudtak_drift_summary(before)}\n"
+            f"Done: {done}\n"
+            f"Now: {_cloudtak_drift_summary(after)}\n\n"
+            f"Server: {ident}\n"
+            f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        subj = f"Guard Dog: CloudTAK repaired automatically on {ident}"
+        if _guarddog_send_alert_email_via_relay(to_addr, subj, body):
+            print(f"[guarddog] sent: {subj}", flush=True)
+    except Exception as e:
+        print(f"[guarddog] CloudTAK repaired note not sent: {e}", flush=True)
+
+
+@app.route('/api/guarddog/cloudtak-repair', methods=['POST'])
+def guarddog_cloudtak_repair():
+    """Called by tak-cloudtak-watch.sh (localhost only, ops #197). Takes no input: the console
+    finds the drift itself and only ever re-applies its own CloudTAK settings, rate-limited.
+    A request through Caddy also arrives from loopback but carries X-Forwarded-For — refused."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
+        return jsonify({'error': 'Forbidden'}), 403
+    return jsonify(_cloudtak_autorepair_request())
 
 
 def _fedhub_harden_ui_ports(cfg, settings):
@@ -92422,6 +93619,13 @@ def _startup_migrations():
         except Exception as _mtx_ed_e:
             print(f"Startup migration: mediamtx editor-write converge error (non-fatal): {_mtx_ed_e}", flush=True)
 
+        # ops #193 (GH #256) — let CloudTAK's media container watch the standalone MediaMTX.
+        # Last: it may restart mediamtx, after the converges above have settled it.
+        try:
+            _mediamtx_converge_cloudtak_read(lambda m: print(f"Startup migration:{m}", flush=True))
+        except Exception as _mtx_ct_e:
+            print(f"Startup migration: mediamtx CloudTAK-read converge error (non-fatal): {_mtx_ct_e}", flush=True)
+
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
         # fixes the box for EVERY downstream apt path — Docker, PGDG, Caddy, MongoDB,
@@ -93953,6 +95157,11 @@ def _startup_migrations():
             _startup_caddy_read_body_idle_converge()
         except Exception as _rbi_err:
             print(f"Startup migration: read_body_idle converge error (non-fatal): {_rbi_err}",
+                  flush=True)
+        try:
+            _startup_caddy_request_encoding_converge()
+        except Exception as _rce_err:
+            print(f"Startup migration: request Content-Encoding converge error (non-fatal): {_rce_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
