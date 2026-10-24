@@ -71542,11 +71542,11 @@ def _heal_coreconfig_updateinterval_ms(log=None):
         if not os.path.exists(CORECONFIG_PATH):
             return False
         content = _read_coreconfig(CORECONFIG_PATH)
-    except Exception as _rd_err:
+    except Exception as _re_err:
         # Unreadable CoreConfig is a real condition (640 tak:tak, broker down) but it must
         # never block boot — and it is emphatically not "no migration needed".
         _log(f"CoreConfig updateinterval migration: cannot read CoreConfig.xml "
-             f"({str(_rd_err)[:100]}) — skipped, will retry next boot")
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
         return False
     try:
         _tag_re = re.compile(r'<(?:[A-Za-z][\w-]*:)?ldap\b[^>]*>', re.IGNORECASE)
@@ -71602,9 +71602,9 @@ def _heal_coreconfig_ldap_connection_pool(log=None):
         if not os.path.exists(CORECONFIG_PATH):
             return False
         content = _read_coreconfig(CORECONFIG_PATH)
-    except Exception as _rd_err:
+    except Exception as _re_err:
         _log(f"CoreConfig LDAP connection-pool migration: cannot read CoreConfig.xml "
-             f"({str(_rd_err)[:100]}) — skipped, will retry next boot")
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
         return False
     try:
         _tag_re = re.compile(r'<((?:[A-Za-z][\w-]*:)?ldap\b[^>]*?)(\s*/?>)', re.IGNORECASE)
@@ -95563,8 +95563,8 @@ def _startup_migrations():
                         else:
                             _out = (_r_ldap.stderr or _r_ldap.stdout or '').strip()
                             print(f"Startup migration: LDAP recreate after heal FAILED: {_out[:600]}", flush=True)
-                    except Exception as _rd_err:
-                        print(f"Startup migration: LDAP recreate after heal exception: {_rd_err}", flush=True)
+                    except Exception as _re_err:
+                        print(f"Startup migration: LDAP recreate after heal exception: {_re_err}", flush=True)
         except Exception as _shc_err:
             print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
 
