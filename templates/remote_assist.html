@@ -82,6 +82,13 @@
         <div class="info-item"><div class="info-label">Username</div><div class="info-value"><span id="coturn-user-val" data-val="{{ coturn_username|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-user-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
         <div class="info-item"><div class="info-label">Password</div><div class="info-value"><span id="coturn-pass-val" data-val="{{ coturn_password|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-pass-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
       </div>
+      {% if not netbird_coturn_in_use %}
+      <div style="margin-bottom:16px">
+        <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:var(--text-secondary);cursor:pointer"><input type="checkbox" id="coturn-block-private"{% if coturn_block_private %} checked{% endif %} onchange="doCoturnPeerPolicy(this)"> Block private peers</label>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:4px;margin-left:24px">Stops the relay reaching 10.x and 192.168.x addresses. Turn off only for LAN-only / field-kit setups where devices and the admin share a private network.</div>
+        <div id="coturn-peer-msg" style="margin-top:6px;margin-left:24px;font-size:12px"></div>
+      </div>
+      {% endif %}
       <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall CoTURN</button>
     {% else %}
       {% if can_configure_nb_coturn %}
@@ -219,6 +226,20 @@ function doNBCoturnConfig(){
     if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Configure failed';return;}
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
+}
+function doCoturnPeerPolicy(box){
+  var block=box.checked,msg=document.getElementById('coturn-peer-msg'),body={block_private:block};
+  if(!block){
+    var pw=prompt('Enter infra-TAK admin password to allow private peers:');
+    if(!pw){box.checked=true;return}
+    body.password=pw;
+  }
+  box.disabled=true;msg.style.color='var(--text-dim)';msg.textContent='Restarting CoTURN…';
+  fetch('/api/remote-assist/coturn/peer-policy',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){
+    box.disabled=false;
+    if(!d.success){box.checked=!block;msg.style.color='var(--red)';msg.textContent=d.error||'Change failed';return;}
+    msg.style.color='var(--green)';msg.textContent=block?'Private peers blocked.':'Private peers allowed.';
+  }).catch(function(e){box.disabled=false;box.checked=!block;msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
 function doCoturnUninstall(){
   var pw=prompt('Enter infra-TAK admin password to confirm removal:');

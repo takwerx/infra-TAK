@@ -17123,6 +17123,11 @@ def _run_remote_assist_update():
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
+        try:
+            if _coturn_converge_override(plog=lambda m: plog(f'  {m}')) == 'current':
+                plog(f'✓ CoTURN already on {COTURN_IMAGE}')
+        except Exception as _ct_err:
+            plog(f'  ⚠ CoTURN security update not applied: {str(_ct_err)[:200]}')
 
         plog('')
         plog('━━━ Step 4/5: Verifying running version ━━━')
@@ -17212,6 +17217,7 @@ def remote_assist_page():
         coturn_ip=coturn_ip,
         coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
         coturn_suggested_port=COTURN_DEFAULT_PORT,
+        coturn_block_private=_coturn_block_private_peers(settings),
         can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
         netbird_coturn_in_use=netbird_coturn_in_use,
         netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
@@ -17240,6 +17246,213 @@ COTURN_DEFAULT_PORT = '3479'
 # real escalation. This charset makes injection impossible.
 _COTURN_USER_RE = re.compile(r'^[A-Za-z0-9._@+=-]{1,64}$')
 _COTURN_PASS_RE = re.compile(r'^[A-Za-z0-9._@+=!%^-]{8,128}$')
+_COTURN_REALM_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
+
+# ops #201: the relay's peer ACL. Remote Assist peers are phones and admin browsers, never
+# the box itself, its containers or link-local/CGNAT space. These ranges are refused on
+# every box; 10/8 and 192.168/16 too unless the operator turns off "Block private peers"
+# (LAN-only / field-kit setups where the device and the admin share a private network).
+_COTURN_ALWAYS_DENIED = ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10',
+                         '172.16.0.0/12')
+_COTURN_PRIVATE_DENIED = ('10.0.0.0/8', '192.168.0.0/16')
+
+
+def _coturn_block_private_peers(settings):
+    """'Block private peers' (Remote Assist page). On unless the operator turned it off."""
+    return settings.get('coturn_block_private_peers') is not False
+
+
+def _coturn_peer_range(net):
+    """One coturn peer-ip value. coturn takes `IP` or `IP-IP` only — a CIDR aborts
+    turnserver at startup ("CIDR is not supported"), so never emit one."""
+    net = ipaddress.ip_network(net, strict=False)
+    if net.num_addresses == 1:
+        return str(net.network_address)
+    return f'{net.network_address}-{net.broadcast_address}'
+
+
+def _coturn_box_addresses():
+    """(own IPv4 addresses, container bridge subnets) of this box, sorted.
+
+    Own addresses are refused as peers. Container bridges are refused whole, whatever
+    pool Docker took them from — a compose network can sit in 192.168/16 or 10/8,
+    which the operator may have opened with the opt-out.
+    Best-effort; ([], []) on any failure."""
+    own, subnets = set(), set()
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show'],
+                           capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or '').splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        iface = ipaddress.IPv4Interface(parts[i + 1])
+                    except Exception:
+                        continue
+                    own.add(iface.ip)
+                    if ifname.startswith(_F2B_CONTAINER_IFACE_PREFIXES) and iface.network.is_private:
+                        subnets.add(iface.network)
+    except Exception:
+        pass
+    return [str(a) for a in sorted(own)], [str(n) for n in sorted(subnets)]
+
+
+def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
+    """(denied, allowed) coturn peer-ip values.
+
+    The advertised relay address (--external-ip) is the one own address left open: when
+    BOTH ends of a session fall back to TURN, each relays to the other's relay
+    allocation, i.e. to external-ip:<relay port>. Refusing it breaks those sessions
+    (LTE phone + admin behind a strict NAT). coturn checks allowed-peer-ip before
+    denied-peer-ip, so it wins even when external-ip sits inside a refused range.
+    TCP relay is off (--no-tcp-relay), so what it leaves reachable is UDP only."""
+    denied = list(_COTURN_ALWAYS_DENIED)
+    if block_private:
+        denied += _COTURN_PRIVATE_DENIED
+    denied += list(container_subnets)
+    denied += [a for a in own_ips if a != external_ip]
+    out = []
+    for net in denied:
+        try:
+            v = _coturn_peer_range(net)
+        except Exception:
+            continue
+        if v not in out:
+            out.append(v)
+    allowed = [external_ip] if _valid_core_ip(external_ip) else []
+    return out, allowed
+
+
+def _coturn_override_content(port, ip, username, password, realm, block_private,
+                             own_ips=(), container_subnets=()):
+    """The standalone CoTURN docker-compose.override.yml. One writer: install and the
+    ops #201 converge both build it here, so a box that enabled CoTURN on an old console
+    ends up byte-identical to a fresh install.
+
+    No --no-cli: 4.18 deprecated it (it only logs an ERROR line) — the telnet CLI is off
+    unless --cli is passed, and we never pass it."""
+    denied, allowed = _coturn_peer_acl(ip, block_private, own_ips, container_subnets)
+    acl = ''.join(f'      - --denied-peer-ip={d}\n' for d in denied)
+    acl += ''.join(f'      - --allowed-peer-ip={a}\n' for a in allowed)
+    # Inputs are charset-validated by the callers, so this interpolation cannot break the YAML.
+    return f"""services:
+  coturn:
+    image: {COTURN_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
+      - "50000-50050:50000-50050/udp"
+    command:
+      - -c
+      - ""
+      - --log-file=stdout
+      - --external-ip={ip}
+      - --listening-port={port}
+      - --listening-ip=0.0.0.0
+      - --min-port=50000
+      - --max-port=50050
+      - --user={username}:{password}
+      - --realm={realm}
+      - --no-tcp-relay
+      - --no-multicast-peers
+{acl}"""
+
+
+def _coturn_parse_override(text):
+    """Port / external IP / user / password / realm out of an override we wrote.
+    Each value is returned only if it passes the same check install applies — so it is
+    safe to write back. Missing or failing values come back as ''."""
+    vals = {}
+    for line in (text or '').splitlines():
+        m = re.match(r'^\s*-\s*"?--(listening-port|external-ip|user|realm)=(.*?)"?\s*$', line)
+        if m:
+            vals.setdefault(m.group(1), m.group(2).strip())
+    user, _, password = vals.get('user', '').partition(':')
+    port = vals.get('listening-port', '')
+    return {
+        'port': port if port.isdigit() and 1024 <= int(port) <= 65535 else '',
+        'ip': vals.get('external-ip', '') if _valid_core_ip(vals.get('external-ip', '')) else '',
+        'username': user if _COTURN_USER_RE.match(user) else '',
+        'password': password if _COTURN_PASS_RE.match(password) else '',
+        'realm': vals.get('realm', '') if _COTURN_REALM_RE.match(vals.get('realm', '')) else '',
+    }
+
+
+_coturn_override_lock = threading.Lock()   # converge (start / RA update / setting) vs install
+
+
+def _coturn_converge_override(plog=None, settings=None):
+    with _coturn_override_lock:
+        return _coturn_converge_override_locked(plog, settings)
+
+
+def _coturn_converge_override_locked(plog=None, settings=None):
+    """ops #201: bring an existing standalone CoTURN onto COTURN_IMAGE and the current
+    flags, then recreate only the coturn service.
+
+    The pin and flags used to reach a box only when the operator clicked Install, so
+    console and Remote Assist updates never moved an existing CoTURN forward. Runs on
+    console start and after a Remote Assist update. Port,
+    user and realm are kept from the override itself (settings as fallback).
+
+    Returns 'absent' | 'netbird' | 'current' | 'rewritten' | 'skipped' | 'failed'."""
+    log = plog or (lambda m: print(f'Startup migration: {m}', flush=True))
+    if settings is None:
+        settings = load_settings()
+    if settings.get('netbird_coturn_in_use'):
+        return 'netbird'                  # NetBird's coturn: not our file, not our flags
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    if not os.path.isfile(path):
+        return 'absent'
+    with open(path) as f:
+        old = f.read()
+    cur = _coturn_parse_override(old)
+    sport = str(settings.get('coturn_port') or '')
+    port = cur['port'] or (sport if sport.isdigit() and 1024 <= int(sport) <= 65535 else '')
+    ip = cur['ip'] or (settings.get('coturn_ip') if _valid_core_ip(settings.get('coturn_ip')) else '')
+    user = cur['username'] or (settings.get('coturn_username') or '')
+    password = cur['password'] or (settings.get('coturn_password') or '')
+    realm = cur['realm'] or (settings.get('fqdn') or '').strip()
+    if not _COTURN_REALM_RE.match(realm):
+        realm = 'remote-assist'           # clients take the realm from the server's challenge
+    if not (port and ip and _COTURN_USER_RE.match(user) and _COTURN_PASS_RE.match(password)):
+        log('CoTURN override not recognised (port/IP/user unreadable) — left as is; '
+            'reinstall CoTURN from the Remote Assist page to get the security update')
+        return 'skipped'
+    own_ips, subnets = _coturn_box_addresses()
+    new = _coturn_override_content(port, ip, user, password, realm,
+                                   _coturn_block_private_peers(settings), own_ips, subnets)
+    if new == old:
+        return 'current'
+    with open(path, 'w') as f:
+        f.write(new)
+    r = subprocess.run(_remote_assist_compose_cmd(ra_dir, '-f', path, 'up', '-d', '--no-deps', 'coturn'),
+                       cwd=ra_dir, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        # Put the old file back so the next start tries again (a rewritten file would
+        # read as 'current' and never be retried). compose pulls before it stops the old
+        # container, so a failed pull leaves the old one running.
+        with open(path, 'w') as f:
+            f.write(old)
+        _lines = [l.strip() for l in ((r.stderr or '') + '\n' + (r.stdout or '')).splitlines() if l.strip()]
+        log(f'CoTURN security update failed, will retry on next start: {(_lines[-1] if _lines else "docker compose failed")[:300]}')
+        return 'failed'
+    log(f'CoTURN updated to {COTURN_IMAGE} with the relay peer restrictions '
+        f'(private peers {"blocked" if _coturn_block_private_peers(settings) else "allowed"})')
+    return 'rewritten'
+
+
+def _startup_converge_coturn():
+    try:
+        _coturn_converge_override()
+    except Exception as e:
+        print(f'Startup migration: CoTURN converge error (non-fatal): {e}', flush=True)
 
 
 def _netbird_coturn_status():
@@ -17372,63 +17585,50 @@ def remote_assist_coturn_install():
                 return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird (it provides STUN/TURN). Choose a different port (e.g. 3479) to run CoTURN alongside it.'})
         except Exception:
             pass
-    fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
+    _settings = load_settings()
+    fqdn = (_settings.get('fqdn') or 'remote-assist').strip()
+    if not _COTURN_REALM_RE.match(fqdn):
+        fqdn = 'remote-assist'
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
-    # Inputs are charset-validated above, so this interpolation cannot break the YAML.
-    override_content = f"""services:
-  coturn:
-    image: {COTURN_IMAGE}
-    restart: unless-stopped
-    ports:
-      - "{port}:{port}/tcp"
-      - "{port}:{port}/udp"
-      - "50000-50050:50000-50050/udp"
-    command:
-      - -c
-      - ""
-      - --log-file=stdout
-      - --external-ip={ip}
-      - --listening-port={port}
-      - --listening-ip=0.0.0.0
-      - --min-port=50000
-      - --max-port=50050
-      - --user={username}:{password}
-      - --realm={fqdn}
-"""
-    try:
-        with open(override_path, 'w') as f:
-            f.write(override_content)
-        r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
-                    cwd=ra_dir, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            # docker compose writes pull PROGRESS to stderr, so the head of stderr is
-            # noise — surface the actual failure (last Error/failed line, e.g. a port
-            # conflict), and roll back the half-written override so a retry is clean.
-            _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
-            _lines = [l.strip() for l in _out.splitlines() if l.strip()]
-            _err = next((l for l in reversed(_lines)
-                         if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
-                        (_lines[-1] if _lines else 'docker compose failed'))
-            try:
-                _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
-                        cwd=ra_dir, capture_output=True, timeout=60)
-                os.remove(override_path)
-            except Exception:
-                pass
-            if 'allocated' in _err.lower() or 'in use' in _err.lower():
-                _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
-            return jsonify({'success': False, 'error': _err[:400]})
-        settings = load_settings()
-        settings['coturn_installed'] = True
-        settings['coturn_username'] = username
-        settings['coturn_password'] = password
-        settings['coturn_ip'] = ip
-        settings['coturn_port'] = port
-        settings['netbird_coturn_in_use'] = False
-        save_settings(settings)
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]})
+    _own_ips, _subnets = _coturn_box_addresses()
+    override_content = _coturn_override_content(port, ip, username, password, fqdn,
+                                                _coturn_block_private_peers(_settings),
+                                                _own_ips, _subnets)
+    with _coturn_override_lock:
+        try:
+            with open(override_path, 'w') as f:
+                f.write(override_content)
+            r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
+                        cwd=ra_dir, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                # docker compose writes pull PROGRESS to stderr, so the head of stderr is
+                # noise — surface the actual failure (last Error/failed line, e.g. a port
+                # conflict), and roll back the half-written override so a retry is clean.
+                _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+                _lines = [l.strip() for l in _out.splitlines() if l.strip()]
+                _err = next((l for l in reversed(_lines)
+                             if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
+                            (_lines[-1] if _lines else 'docker compose failed'))
+                try:
+                    _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
+                            cwd=ra_dir, capture_output=True, timeout=60)
+                    os.remove(override_path)
+                except Exception:
+                    pass
+                if 'allocated' in _err.lower() or 'in use' in _err.lower():
+                    _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
+                return jsonify({'success': False, 'error': _err[:400]})
+            settings = load_settings()
+            settings['coturn_installed'] = True
+            settings['coturn_username'] = username
+            settings['coturn_password'] = password
+            settings['coturn_ip'] = ip
+            settings['coturn_port'] = port
+            settings['netbird_coturn_in_use'] = False
+            save_settings(settings)
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:300]})
 
 
 @app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
@@ -17466,6 +17666,40 @@ def remote_assist_coturn_uninstall():
             settings.pop(k, None)
         save_settings(settings)
         return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
+@app.route('/api/remote-assist/coturn/peer-policy', methods=['POST'])
+@login_required
+def remote_assist_coturn_peer_policy():
+    """ops #201 "Block private peers". Turning it OFF loosens the relay, so that
+    direction asks for the admin password, like uninstall."""
+    data = request.get_json(silent=True) or {}
+    block = data.get('block_private')
+    if not isinstance(block, bool):
+        return jsonify({'success': False, 'error': 'block_private must be true or false.'})
+    if not block:
+        _denied = _require_admin_password(data)
+        if _denied:
+            return _denied
+    try:
+        settings = load_settings()
+        prev = settings.get('coturn_block_private_peers')
+        settings['coturn_block_private_peers'] = block
+        save_settings(settings)
+        result = _coturn_converge_override(plog=lambda m: print(f'CoTURN: {m}', flush=True),
+                                           settings=settings)
+        if result in ('failed', 'skipped'):
+            # The running CoTURN did not change, so neither does the setting.
+            settings = load_settings()
+            if prev is None:
+                settings.pop('coturn_block_private_peers', None)
+            else:
+                settings['coturn_block_private_peers'] = prev
+            save_settings(settings)
+            return jsonify({'success': False, 'error': 'CoTURN could not be restarted with the new setting, so nothing changed — see the console log.'})
+        return jsonify({'success': True, 'result': result})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]})
 
@@ -95778,6 +96012,15 @@ def _startup_migrations():
                              name='relay-reassert').start()
         except Exception as _rl_err:
             print(f"Startup migration: relay re-assert start error (non-fatal): {_rl_err}")
+
+        # ops #201: the CoTURN pin and peer restrictions reach a box only through its
+        # override file, which only Install wrote. Converge it on every start. Threaded:
+        # a slow image pull must not hold up startup. No-op once the file is current.
+        try:
+            threading.Thread(target=_startup_converge_coturn, daemon=True,
+                             name='coturn-converge').start()
+        except Exception as _ct_err:
+            print(f"Startup migration: CoTURN converge start error (non-fatal): {_ct_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
