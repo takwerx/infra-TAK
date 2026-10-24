@@ -46,8 +46,12 @@ COMPOSE = """services:
 
 
 def _load(arch, *names):
+    if '_patch_cloudtak_compose_ports' in names:
+        # it also runs the media stream-port patch (ops #193)
+        names += ('_CT_MEDIA_STREAM_PORTS', '_cloudtak_media_listen_patch')
     src = ''.join(ast.get_source_segment(APP, n) + '\n\n' for n in TREE.body
-                  if isinstance(n, ast.FunctionDef) and n.name in names)
+                  if (isinstance(n, ast.FunctionDef) and n.name in names)
+                  or (isinstance(n, ast.Assign) and any(getattr(t, 'id', '') in names for t in n.targets)))
     ns = {'os': os, 're': re, 'shlex': shlex, 'subprocess': subprocess, '_host_arch': lambda: arch,
           '_CLOUDTAK_TILES_DOCKERFILE': os.path.join('tasks', 'pmtiles', 'Dockerfile.compose')}
     exec(compile(src, 'app.py', 'exec'), ns)

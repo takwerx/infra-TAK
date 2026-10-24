@@ -74,9 +74,11 @@ def test_seeded_with_cloudtak_13_112_2():
 ])
 def test_cloudtak_known_release_range(installed, target, flagged):
     got = _known_ns()['_known_security_fixed_by']('cloudtak', installed, target)
+    # only the 13.112.2 entry; later entries (ops #190: 13.113.0) have their own tests
+    got = [g for g in got if g.endswith('(fixed in v13.112.2)')]
     assert bool(got) is flagged
     if flagged:
-        assert got[0].endswith('(fixed in v13.112.2)') and 'CVE-2026-111497' in got[0]
+        assert 'CVE-2026-111497' in got[0]
 
 
 def test_other_component_is_not_flagged():
@@ -126,8 +128,9 @@ def test_cloudtak_below_fix_is_flagged_security_without_a_ghsa():
 
 
 def test_cloudtak_at_or_above_fix_is_a_plain_update():
-    ct = _collect('13.112.2', '13.113.0', [])
-    assert ct['security'] == [] and ct['identity'] == '13.113.0'
+    # past every KNOWN_SECURITY_RELEASES entry (13.113.0 since ops #190)
+    ct = _collect('13.113.0', '13.114.0', [])
+    assert ct['security'] == [] and ct['identity'] == '13.114.0'
 
 
 def test_ghsa_flagging_still_works_and_merges():
@@ -135,11 +138,12 @@ def test_ghsa_flagging_still_works_and_merges():
     assert ct['security'] == ['Fixes ' + GHSA] and ct['identity'] == '13.114.0+security'
     ct = _collect('13.5.0', '13.114.0', [GHSA])
     assert ct['security'][0] == 'Fixes ' + GHSA
-    assert 'CVE-2026-111497' in ct['security'][1] and len(ct['security']) == 2
+    assert 'CVE-2026-111497' in ct['security'][1]
+    assert any('GHSA-27r3-jxmh-p828' in s for s in ct['security'][2:])
 
 
 def test_advisories_unreadable_still_flags_known_release():
-    ct = _collect('13.111.0', '13.112.2', OSError('rate limited'))
+    ct = _collect('13.111.0', '13.112.2', OSError('rate limited'))  # target below 13.113.0
     assert ct['security_unknown'] is True
     assert ct['security'] and ct['identity'] == '13.112.2+security'
 

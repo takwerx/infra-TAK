@@ -252,6 +252,7 @@ def _redeploy_ns(remote_env, env_read_ok=True):
         '_ssh_probe': _ssh_probe, '_scp_to_host': _scp_to_host,
         'generate_caddyfile': lambda s=None: None, '_caddy_reload': lambda: None,
         '_cloudtak_media_hls_heal': lambda **k: None,
+        '_cloudtak_remote_custom_compose_sh': lambda: ':',   # GH #261, tested on its own
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
     }
     exec(compile(src, 'app.py', 'exec'), ns)
@@ -317,7 +318,11 @@ def test_remote_deploy_stops_the_old_stack_before_deleting_its_tree():
     """A running Garage store (restart: always) re-created ~/CloudTAK/.docker-garage during the
     rm -rf and initialized it with the old key, so the new stack crash-looped on a key mismatch."""
     body = re.search(r'^def run_cloudtak_deploy\(.*?(?=^def )', APP, re.S | re.M).group(0)
-    remote = re.sub(r'#.*', '', body[:body.index('# Step 1: Check Docker')])
-    tagged = remote[remote.index('if remote_release_tag:'):remote.index('else:', remote.index('if remote_release_tag:'))]
+    assert 'prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)' in body
+    # GH #261: the repo prep moved into one helper; its tagged branch is the re-clone
+    helper = re.search(r'^def _cloudtak_remote_reclone_sh\(.*?(?=^def )', APP, re.S | re.M).group(0)
+    helper = re.sub(r'#.*', '', helper)
+    tagged = helper[helper.index('if release_tag:'):]
+    tagged = tagged[:tagged.index('\n    return (')]     # up to the untagged (pull) branch
     assert tagged.index('docker compose down --remove-orphans') < tagged.index('rm -rf ~/CloudTAK')
     assert 'down -v' not in tagged          # the postgis volume (and its password) survives a redeploy
