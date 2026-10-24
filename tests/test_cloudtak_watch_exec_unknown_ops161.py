@@ -67,6 +67,9 @@ def box(tmp_path):
         '  ps) echo "Up 3 hours" ;;\n'
         'esac\nexit 0\n' % {'calls': calls, 'rc': tmp_path / 'exec_rc', 'yml': tmp_path / 'media.yml'})
     (stubs / 'docker').chmod(0o755)
+    # ops #197: the second check asks the console to repair first; no console here.
+    (stubs / 'curl').write_text('#!/bin/sh\nexit 7\n')
+    (stubs / 'curl').chmod(0o755)
 
     script = (WATCH.replace('/opt/tak-guarddog/', str(gd) + '/')
                    .replace('/var/lib/takguard', str(state))

@@ -53,9 +53,50 @@ CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
 # update... it fails" — reported again 2026-08-31 with the cause misattributed to an
 # hls.js patch bump. See [[infratak-cloudtak-media-patches]].
 #
-# Detection only, plus a nudge. Re-applying is the console's job — it owns the apply
-# script and the remote/split-box cases; duplicating that sed here would be a second
-# writer of the same file.
+# Detection here, repair in the console (ops #197). Re-applying is the console's job — it
+# owns the apply script, the override and the recreate; duplicating them here would be a
+# second writer of the same files. So on the second check this asks the console to repair
+# (POST /api/guarddog/cloudtak-repair) and only alarms when it can't.
+#
+# ops #197: the second signal. TAK Portal's marketplace recreates CloudTAK with its own
+# `-f docker-compose.yml -f docker-compose.marketplace.yml`, which skips infra-TAK's
+# docker-compose.override.yml (explicit -f flags ignore COMPOSE_FILE). Every container that
+# run made carries compose's config_files label WITHOUT the override: stock media-infra and
+# postgis images, no console CA in the api — and, for media, no HLS profile. A running
+# container of the CloudTAK project without the override in that label is drift.
+_ct_no_override=""
+if [ -f "$CT_DIR/docker-compose.override.yml" ]; then
+  _ct_proj="$(docker inspect cloudtak-api-1 --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
+  if [ -n "$_ct_proj" ]; then
+    while IFS='|' read -r _n _f; do
+      [ -n "$_f" ] || continue
+      case ",$_f," in
+        *,docker-compose.override.yml,*|*/docker-compose.override.yml,*) ;;
+        *) _ct_no_override="$_ct_no_override $_n" ;;
+      esac
+    done <<EOF
+$(docker ps --filter "label=com.docker.compose.project=$_ct_proj" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}' 2>/dev/null)
+EOF
+  fi
+fi
+
+# ops #197: ask the console to repair. Sets _rep_state (ok|repairing|waiting|rate_limited|
+# failed|unreachable) and _rep_detail. HTTPS first (self-signed, -k), HTTP only when HTTPS
+# got no answer at all — same rule as send-alert-email.sh.
+_ct_request_repair() {
+  local _o="" _sch
+  for _sch in https http; do
+    _o="$(curl -s -k -X POST "$_sch://127.0.0.1:${CONSOLE_PORT:-5001}/api/guarddog/cloudtak-repair" \
+      --connect-timeout 5 --max-time 90 2>/dev/null)" && [ -n "$_o" ] && break
+    _o=""
+  done
+  _rep_state=unreachable; _rep_detail="console did not answer on :${CONSOLE_PORT:-5001}"
+  [ -n "$_o" ] || return 0
+  _rep_state="$(printf '%s' "$_o" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d.get("state") or "failed").split()[0])' 2>/dev/null || echo failed)"
+  _rep_detail="$(printf '%s' "$_o" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(str(d.get("detail") or d.get("error") or "").split())[:300])' 2>/dev/null)"
+}
+
+_hls_ok=na
 if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
   # ops #161: read the file ONCE, then grep it here. This used to run
   # `docker exec ... grep -q` per key, so a failed exec looked exactly like a missing
@@ -73,12 +114,18 @@ if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
       printf '%s\n' "$_hls_cfg" | grep -q "$_k" || _hls_ok=0
     done
   fi
+fi
+_ct_found=""
+[ "$_hls_ok" = 0 ] && _ct_found="cloudtak-media HLS profile missing"
+[ -n "$_ct_no_override" ] && _ct_found="${_ct_found:+$_ct_found; }created without infra-TAK's compose override:$_ct_no_override"
+if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
   _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
-  if [ "$_hls_ok" = unknown ]; then
+  if [ -z "$_ct_found" ] && [ "$_hls_ok" = unknown ]; then
     _log "drift | cloudtak-media HLS profile UNKNOWN — could not read /mediamtx.yml (docker exec rc=$_hls_rc); not counted as missing"
-  elif [ "$_hls_ok" -eq 0 ]; then
-    _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
+  elif [ -n "$_ct_found" ]; then
+    [ "$_hls_ok" = 0 ] && _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
+    [ -n "$_ct_no_override" ] && _log "drift | created without infra-TAK's compose override (image pins, console CA):$_ct_no_override"
     # v10.1.57 W12: TWO-STRIKE. Do not alert on first sight.
     #
     # The console recreates CloudTAK itself during post-update security hardening and
@@ -100,20 +147,46 @@ if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
       date +%s > "$_DRIFT_PENDING"
       _log "drift | first detection — deferring alert one interval to let the console's converger finish"
     elif [ ! -f "$_DRIFT_STATE" ]; then
-      SUBJ_D="Guard Dog: CloudTAK video config drift on $SERVER_IDENTIFIER"
-      BODY_D="cloudtak-media is missing infra-TAK's HLS profile (/mediamtx.yml), and it
-did NOT come back on its own.
+      # ops #197: second check — ask the console to repair before alarming. repairing /
+      # waiting / ok hold the alarm back (the console is on it, the stack is still being
+      # changed, or it has already cleared). The alarm goes out when the console says the
+      # repair failed or hit its hourly limit, cannot be reached, or the episode has gone
+      # 30 min without being fixed.
+      _ct_request_repair
+      _ct_age=$(( $(date +%s) - $(cat "$_DRIFT_PENDING" 2>/dev/null || date +%s) ))
+      _ct_alarm=1
+      case "$_rep_state" in
+        repairing|waiting|ok)
+          if [ "$_ct_age" -lt 1800 ]; then
+            _ct_alarm=0
+            _log "drift | auto-repair: $_rep_state — $_rep_detail"
+          else
+            _rep_detail="not fixed after $(( _ct_age / 60 )) min (console: $_rep_state — $_rep_detail)"
+          fi ;;
+      esac
+    fi
+    if [ -f "$_DRIFT_PENDING" ] && [ ! -f "$_DRIFT_STATE" ] && [ "${_ct_alarm:-0}" = 1 ]; then
+      _log "drift | auto-repair did not fix it ($_rep_state: $_rep_detail) — sending the alert"
+      if [ "$_hls_ok" = 0 ]; then
+        SUBJ_D="Guard Dog: CloudTAK video config drift on $SERVER_IDENTIFIER"
+      else
+        SUBJ_D="Guard Dog: CloudTAK settings drift on $SERVER_IDENTIFIER"
+      fi
+      BODY_D="CloudTAK is running without infra-TAK's settings, and Guard Dog could not put
+them back by itself.
 
-infra-TAK writes an HLS profile into this container after every recreate it drives, so
-a brief loss during a console-driven update is normal and self-repairs within seconds —
-that case is deliberately NOT reported. This alert means the profile was still missing
-on a second consecutive check, so something recreated the container outside the console
-(a manual docker compose --build, a restart policy, an OOM recreate) and nothing has
-put it back.
+Found: $_ct_found
+Automatic repair: $_rep_state — $_rep_detail
 
-Impact: stock MediaMTX takes ~7s to produce a playable playlist, which loses to
-CloudTAK's ~7s player retry budget, so CoT video shows a black screen while the stream
-itself is perfectly fine.
+infra-TAK re-applies its CloudTAK settings after every recreate it drives, and Guard Dog
+repairs a recreate it did not drive (a TAK Portal marketplace plugin install, a manual
+docker compose run) by itself. This alert means that repair did not happen or did not
+work.
+
+Impact: without infra-TAK's compose override CloudTAK runs upstream's media and postgis
+images and the api does not trust the console's certificate. Without the HLS profile,
+stock MediaMTX takes ~7s to produce a playable playlist, which loses to CloudTAK's ~7s
+player retry budget, so CoT video shows a black screen while the stream itself is fine.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')
@@ -122,8 +195,9 @@ Check it yourself:
   docker exec cloudtak-media-1 grep -E '^hls' /mediamtx.yml
   (expect hlsVariant: mpegts, hlsSegmentCount: 3, hlsSegmentDuration: 500ms)
 
-To fix: restart the infra-TAK console (systemctl restart takwerx-console) — its
-converger re-applies the profile. A CloudTAK rebuild is NOT required and will not help.
+To fix: restart the infra-TAK console (systemctl restart takwerx-console) — it rewrites
+the override, recreates CloudTAK with it and re-applies the profile. A CloudTAK rebuild
+is NOT required and will not help.
 "
       # v10.1.58 W13: close the once-per-episode gate ONLY on successful delivery.
       #
@@ -144,9 +218,9 @@ converger re-applies the profile. A CloudTAK rebuild is NOT required and will no
     fi
   else
     if [ -f "$_DRIFT_PENDING" ] && [ ! -f "$_DRIFT_STATE" ]; then
-      _log "drift | cloudtak-media HLS profile restored before the alert threshold — self-healed, not reported"
+      _log "drift | CloudTAK settings and HLS profile back before the alert threshold — repaired or self-healed, not reported"
     fi
-    [ -f "$_DRIFT_STATE" ] && _log "drift | cloudtak-media HLS profile restored"
+    [ -f "$_DRIFT_STATE" ] && _log "drift | CloudTAK settings and HLS profile restored"
     rm -f "$_DRIFT_STATE" "$_DRIFT_PENDING"
   fi
 fi
