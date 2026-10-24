@@ -42,6 +42,7 @@ export interface SensorSpec {
     vfov?: number;
     elevation?: number;
     sweep_deg_s?: number;
+    aim?: 'heading' | 'orbit_center';   // orbit_center: an orbiting unit keeps the cone on the orbit's center
     detect?: DetectSpec | null;
 }
 
@@ -156,7 +157,7 @@ export interface ScenarioSummary {
     lanes?: string[];
     silent?: number;               // v2: targets that never report themselves
     sensors_detecting?: number;    // v2: sensors with a detect block
-    center?: LatLon | null;        // v2: where a saved layout was made
+    center?: LatLon | null;        // home location: a saved layout or a site scenario runs there
     valid: boolean;
     errors?: string[];
 }
@@ -230,7 +231,7 @@ export interface LiveParams {
     exercise?: boolean;
     confirm_exercise?: string;
     from?: string;                 // open a saved scenario (preset or upload) for editing (v10.1.62 W3)
-    recenter?: boolean;            // default true: place it at `center`; false: where it was saved
+    recenter?: boolean;            // default: false for a scenario with a home location, true for a preset
 }
 
 export interface RunParams {
@@ -252,6 +253,7 @@ export interface StartResult {
     events: number;
     lanes: Record<string, string>;
     exercise: Record<string, boolean>;
+    center?: LatLon;               // where the run was placed (engines from this release on)
     from?: string;                 // present when the live session was opened on a saved scenario
     dropped_events?: number;       // timeline events (after t+0) a live session leaves out
     delayed_units_placed?: number;

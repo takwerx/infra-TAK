@@ -436,13 +436,25 @@ class Run:
             self._emit_pli(e)
             e.next_emit = self.sim_t + e.spec['interval_s']
 
+    @staticmethod
+    def _sensor_base(e):
+        """The bearing a sensor cone looks along before any sweep: the unit's heading, or —
+        `aim: orbit_center` on a unit circling an orbit — the bearing to the orbit's center.
+        One function for the drawn cone (_emit_pli) and the detection wedge (_detect), so
+        what a viewer sees is what the sensor detects."""
+        sensor, p = e.spec['sensor'], e.spec['path']
+        if sensor.get('aim') == 'orbit_center' and p['kind'] == 'orbit' and e.orbit_entry is None:
+            c = p['center']
+            return geo.heading_deg(c[0] - e.pos[0], c[1] - e.pos[1])
+        return e.heading
+
     def _emit_pli(self, e):
         lat, lon = self._latlon(e.pos)
         sensor = e.spec.get('sensor')
         azimuth = None
-        if sensor and sensor.get('sweep_deg_s'):
+        if sensor and (sensor.get('sweep_deg_s') or sensor.get('aim', 'heading') != 'heading'):
             # radar sweep: the cone rotates at sweep_deg_s on top of the heading (W9)
-            azimuth = (e.heading + self.sim_t * sensor['sweep_deg_s']) % 360.0
+            azimuth = (self._sensor_base(e) + self.sim_t * sensor.get('sweep_deg_s', 0)) % 360.0
         xml = cot.pli_event(e.uid, e.type, self._callsign(e.lane, e.callsign), lat, lon,
                             e.spec['hae_m'], e.speed, e.heading, e.team, e.role, e.spec['stale_s'],
                             sensor=sensor, video=self._video_url(e),
@@ -523,7 +535,7 @@ class Run:
             det = sensor['detect']
             sweep = sensor['sweep_deg_s']
             if sweep > 0:
-                az_now = (s.heading + self.sim_t * sweep) % 360.0     # same azimuth the PLI's cone shows
+                az_now = (self._sensor_base(s) + self.sim_t * sweep) % 360.0     # same azimuth the PLI's cone shows
                 az_prev, s.sweep_prev = s.sweep_prev, az_now
                 if az_prev is None:
                     continue
@@ -532,7 +544,7 @@ class Run:
                 if self.sim_t < s.next_look:
                     continue
                 s.next_look = self.sim_t + s.spec['interval_s']
-                az_prev, delta, half_fov = s.heading, 0.0, sensor['fov'] / 2.0
+                az_prev, delta, half_fov = self._sensor_base(s), 0.0, sensor['fov'] / 2.0
             if targets is None:
                 targets = self._targets()
             range_m = sensor['range_m']
