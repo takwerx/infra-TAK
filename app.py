@@ -89437,6 +89437,58 @@ def _sync_java_cacerts(log_fn=None):
     return r
 
 
+def _upgrade_mediamtx_certifi(log_fn=None):
+    """Upgrade the MediaMTX web editor's certifi when it still trusts a root the OS vendors
+    have distrusted (ops #202): root's pip copy in /usr/local, and the editor user's own if
+    it has one. The deploy does `pip3 install -U certifi`, but Update Now deploys nothing.
+
+    The work lives in the broker (`certifi_upgrade`, broker/takwerx_broker.py); the request
+    carries nothing, and a root console runs that same function in-process. Re-run on every
+    console start, so the next distrusted root is picked up too. A no-op without the editor,
+    with a clean certifi, or with a distro one (RHEL); restarts the editor only after an
+    upgrade. Returns the broker's result dict, or None when the box could not be asked."""
+    _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
+    if not os.path.isdir('/opt/mediamtx-webeditor'):
+        return None
+    if _broker_should_route() and _broker_available():
+        try:
+            r = _broker_request({'op': 'certifi_upgrade'}, timeout=900)
+        except Exception as e:
+            _log(f"MediaMTX certifi check skipped (broker: {str(e)[:160]}) — retries next restart")
+            return None
+    elif os.getuid() == 0:
+        try:
+            m = _broker_module()
+            m._check_certifi_upgrade({})
+            r = m._do_certifi_upgrade({})
+        except Exception as e:
+            _log(f"MediaMTX certifi upgrade failed: {str(e)[:200]}")
+            return None
+    else:
+        return None
+    if r.get('skipped'):
+        return r
+    for u in r.get('upgraded') or []:
+        _log(f"✓ MediaMTX web editor: upgraded {u.get('user')}'s certifi ({u.get('path')}), which "
+             f"still trusted {', '.join(u.get('removed') or [])}")
+    if r.get('upgraded'):
+        # requests 2.32 loads the bundle into an SSL context at import, so the running editor
+        # keeps the old roots until it restarts. The editor only; MediaMTX streams carry on.
+        try:
+            rr = subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'mediamtx-webeditor']),
+                                capture_output=True, text=True, timeout=60)
+            if rr.returncode != 0:
+                _log(f"⚠ mediamtx-webeditor restart failed: {(rr.stderr or rr.stdout or '').strip()[:200]}")
+        except Exception as e:
+            _log(f"⚠ mediamtx-webeditor restart failed: {str(e)[:200]}")
+    if not r.get('ok'):
+        _log(f"⚠ MediaMTX certifi upgrade: {(r.get('error') or 'failed')[:300]} — retries next restart")
+    elif r.get('still_stale'):
+        _log("⚠ MediaMTX certifi still trusts a distrusted root: " + '; '.join(
+            f"{s.get('user')} {s.get('path')}" for s in r['still_stale'])[:300])
+    return r
+
+
 _GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
 
 
@@ -94475,6 +94527,19 @@ def _startup_migrations():
                           flush=True)
         except Exception as _jca_e2:
             print(f"Startup migration: TAK container trust store error (non-fatal): {_jca_e2}", flush=True)
+        # ops #202 — the MediaMTX editor's pip certifi: only a module deploy upgraded it.
+        # A pip download must not hold up boot, and waits out a post-update redeploy's own pip.
+        try:
+            def _mediamtx_certifi_bg():
+                if not _STARTUP_IMPORT_DONE.wait(timeout=1200):
+                    return
+                try:
+                    _upgrade_mediamtx_certifi()
+                except Exception as _cfi_e:
+                    print(f"Startup migration: MediaMTX certifi upgrade error (non-fatal): {_cfi_e}", flush=True)
+            threading.Thread(target=_mediamtx_certifi_bg, daemon=True, name='mediamtx-certifi').start()
+        except Exception as _cfi_e2:
+            print(f"Startup migration: MediaMTX certifi spawn error (non-fatal): {_cfi_e2}", flush=True)
 
         # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
         # _startup_migrations() rather than at import time: it writes a privileged path and
