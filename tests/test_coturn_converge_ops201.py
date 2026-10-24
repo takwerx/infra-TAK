@@ -149,37 +149,50 @@ def test_rewritten_override_has_the_hardening_flags(tmp_path):
                  '100.64.0.0-100.127.255.255', '172.16.0.0-172.31.255.255',
                  '10.0.0.0-10.255.255.255', '192.168.0.0-192.168.255.255'):
         assert want in denied, want
-    # the box's own addresses
-    for own in ('10.0.1.5', '172.17.0.1', '192.168.48.1'):
-        assert own in denied, own
+    # the box's own addresses, incl. the advertised external IP
+    for own in ('10.0.1.5', '172.17.0.1', '192.168.48.1', '203.0.113.50'):
+        assert _covered(own, denied), own
+    assert '203.0.113.50' in denied
     # coturn aborts on a CIDR value — every value is IP or IP-IP
     assert denied and all(RANGE.match(d) for d in denied), denied
-    # the advertised relay address stays reachable for relay-to-relay sessions
-    assert '--allowed-peer-ip=203.0.113.50' in flags
-    assert '203.0.113.50' not in denied
+    # nothing re-opens a refused address
+    assert not any(f.startswith('--allowed-peer-ip') for f in flags)
+    # no entry sits inside another one
+    assert len(denied) == len(set(denied))
+    assert not any(d != e and _covered(d.split('-')[0], [e]) and _covered(d.split('-')[-1], [e])
+                   for d in denied for e in denied)
+
+
+def _in(addr, value):
+    lo, _, hi = value.partition('-')
+    return ipaddress.ip_address(lo) <= ipaddress.ip_address(addr) <= ipaddress.ip_address(hi or lo)
+
+
+def _covered(addr, denied):
+    return any(_in(addr, d) for d in denied)
 
 
 def test_169_254_169_254_and_docker_bridge_gateway_are_denied(tmp_path):
     n, _, _ = _ns(tmp_path, SETTINGS)
     for block in (True, False):
-        denied, allowed = n['_coturn_peer_acl']('203.0.113.50', block, ['172.17.0.1'], ['172.17.0.0/16'])
-        for peer in ('169.254.169.254', '172.17.0.1', '127.0.0.1', '100.100.100.200'):
-            addr = ipaddress.ip_address(peer)
-            assert any(_in(addr, d) for d in denied), (peer, block)
-            assert not any(_in(addr, a) for a in allowed), (peer, block)
-
-
-def _in(addr, value):
-    lo, _, hi = value.partition('-')
-    return ipaddress.ip_address(lo) <= addr <= ipaddress.ip_address(hi or lo)
+        denied = n['_coturn_peer_acl']('203.0.113.50', block, ['172.17.0.1'], ['172.17.0.0/16'])
+        for peer in ('169.254.169.254', '172.17.0.1', '127.0.0.1', '100.100.100.200', '203.0.113.50'):
+            assert _covered(peer, denied), (peer, block)
+        assert not _covered('8.8.8.8', denied)
 
 
 def test_opt_out_drops_only_10_8_and_192_168_16(tmp_path):
     n, _, _ = _ns(tmp_path, SETTINGS)
-    on, _ = n['_coturn_peer_acl']('203.0.113.50', True, ['10.0.1.5'], ['172.17.0.0/16', '192.168.48.0/20'])
-    off, _ = n['_coturn_peer_acl']('203.0.113.50', False, ['10.0.1.5'], ['172.17.0.0/16', '192.168.48.0/20'])
+    own, subnets = ['10.0.1.5', '192.168.48.1'], ['172.17.0.0/16', '192.168.48.0/20']
+    on = n['_coturn_peer_acl']('203.0.113.50', True, own, subnets)
+    off = n['_coturn_peer_acl']('203.0.113.50', False, own, subnets)
     assert set(on) - set(off) == {'10.0.0.0-10.255.255.255', '192.168.0.0-192.168.255.255'}
-    assert set(off) - set(on) == set()
+    probes = ['10.0.0.1', '10.0.1.5', '10.200.3.4', '192.168.1.1', '192.168.48.7', '192.168.48.1',
+              '172.17.0.1', '172.20.5.5', '169.254.169.254', '127.0.0.1', '100.64.0.1', '0.1.2.3',
+              '203.0.113.50', '8.8.8.8', '1.1.1.1']
+    opened = {p for p in probes if _covered(p, on) and not _covered(p, off)}
+    assert opened == {'10.0.0.1', '10.200.3.4', '192.168.1.1'}
+    assert not {p for p in probes if _covered(p, off) and not _covered(p, on)}
     # a Docker network in 192.168/16 and the host's own LAN address stay refused with the opt-out
     assert '192.168.48.0-192.168.63.255' in off and '10.0.1.5' in off
 

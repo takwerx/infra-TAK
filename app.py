@@ -17302,29 +17302,22 @@ def _coturn_box_addresses():
 
 
 def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
-    """(denied, allowed) coturn peer-ip values.
-
-    The advertised relay address (--external-ip) is the one own address left open: when
-    BOTH ends of a session fall back to TURN, each relays to the other's relay
-    allocation, i.e. to external-ip:<relay port>. Refusing it breaks those sessions
-    (LTE phone + admin behind a strict NAT). coturn checks allowed-peer-ip before
-    denied-peer-ip, so it wins even when external-ip sits inside a refused range.
-    TCP relay is off (--no-tcp-relay), so what it leaves reachable is UDP only."""
-    denied = list(_COTURN_ALWAYS_DENIED)
+    """coturn --denied-peer-ip values, widest first; an entry already inside a refused
+    range is left out. The advertised --external-ip is one of the box's own addresses
+    (on a NAT'd cloud box it is on no interface). coturn 4.18 already refuses it as a
+    peer on its own (seen on test8 with no ACL at all), so listing it changes nothing
+    there and keeps the rule simple: the box is never a peer."""
+    nets = [ipaddress.ip_network(n) for n in _COTURN_ALWAYS_DENIED]
     if block_private:
-        denied += _COTURN_PRIVATE_DENIED
-    denied += list(container_subnets)
-    denied += [a for a in own_ips if a != external_ip]
-    out = []
-    for net in denied:
+        nets += [ipaddress.ip_network(n) for n in _COTURN_PRIVATE_DENIED]
+    for n in list(container_subnets) + list(own_ips) + [external_ip]:
         try:
-            v = _coturn_peer_range(net)
+            net = ipaddress.ip_network(n, strict=False)
         except Exception:
             continue
-        if v not in out:
-            out.append(v)
-    allowed = [external_ip] if _valid_core_ip(external_ip) else []
-    return out, allowed
+        if net.version == 4 and not any(net.subnet_of(d) for d in nets):
+            nets.append(net)
+    return [_coturn_peer_range(n) for n in nets]
 
 
 def _coturn_override_content(port, ip, username, password, realm, block_private,
@@ -17335,9 +17328,8 @@ def _coturn_override_content(port, ip, username, password, realm, block_private,
 
     No --no-cli: 4.18 deprecated it (it only logs an ERROR line) — the telnet CLI is off
     unless --cli is passed, and we never pass it."""
-    denied, allowed = _coturn_peer_acl(ip, block_private, own_ips, container_subnets)
-    acl = ''.join(f'      - --denied-peer-ip={d}\n' for d in denied)
-    acl += ''.join(f'      - --allowed-peer-ip={a}\n' for a in allowed)
+    acl = ''.join(f'      - --denied-peer-ip={d}\n'
+                  for d in _coturn_peer_acl(ip, block_private, own_ips, container_subnets))
     # Inputs are charset-validated by the callers, so this interpolation cannot break the YAML.
     return f"""services:
   coturn:
