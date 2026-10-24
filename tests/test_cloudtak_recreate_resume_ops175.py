@@ -59,11 +59,13 @@ def _const(name):
 class Box:
     """One console process: a fake docker/ps and the log it printed."""
 
-    def __init__(self, tmp_path, *, kill_on_up=False, heal_ok=True, busy_polls=0, patched=False):
+    def __init__(self, tmp_path, *, kill_on_up=False, heal_ok=True, busy_polls=0, patched=False,
+                 no_override=()):
         self.home = tmp_path
         self.calls, self.logs = [], []
         self.kill_on_up, self.heal_ok, self.busy_polls = kill_on_up, heal_ok, busy_polls
         self.patched = patched
+        self.no_override = list(no_override)
         self.heals = 0
 
     def run(self, argv, **kw):
@@ -103,12 +105,14 @@ class Box:
             '_cloudtak_media_hls_heal': self.heal,
             '_cloudtak_open_stream_ports': lambda *a, **k: None,
             '_cloudtak_ensure_custom_compose': lambda *a, **k: False,   # GH #261, tested on its own
+            '_cloudtak_containers_without_override': lambda d: self.no_override,   # ops #197
             'CONFIG_DIR': str(self.home / '.config'),
         }
         for c in ('_CLOUDTAK_RECREATE_PENDING', '_CLOUDTAK_RECREATE_MAX_TRIES', '_CLOUDTAK_COMPOSE_UP_RE'):
             exec(_const(c), ns)
         for f in ('_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
-                  '_ct_wait_compose_idle', '_startup_harden_cloudtak_ports'):
+                  '_ct_wait_compose_idle', '_cloudtak_write_override_file',
+                  '_cloudtak_recreate_and_heal', '_startup_harden_cloudtak_ports'):
             exec(compile(_src(f), 'app.py', 'exec'), ns)
         old = os.environ.get('HOME')
         os.environ['HOME'] = str(self.home)
@@ -141,6 +145,17 @@ def test_converged_box_does_nothing_and_leaves_no_marker(home):
     _write_override(home, OVERRIDE)
     b = Box(home).start()
     assert b.ups() == [] and b.heals == 0
+    assert b.pending() is None
+
+
+def test_containers_made_without_the_override_are_recreated(home):
+    # ops #197: TAK Portal's `-f docker-compose.yml -f docker-compose.marketplace.yml` recreate
+    # leaves the files on disk converged, so only the containers' labels show the drift.
+    _write_override(home, OVERRIDE)
+    b = Box(home, no_override=['cloudtak-api-1', 'cloudtak-media-1']).start()
+    assert len(b.ups()) == 1 and b.heals == 1
+    assert ['PULL'] in b.calls                     # the pinned postgis comes back too
+    assert any('created without' in l and 'cloudtak-media-1' in l for l in b.logs)
     assert b.pending() is None
 
 

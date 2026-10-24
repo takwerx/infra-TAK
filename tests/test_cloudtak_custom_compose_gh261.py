@@ -373,8 +373,11 @@ def _before(src, first, then):
 
 def test_console_restart_migration_sets_it_up_before_the_recreate():
     src = _fn('_startup_harden_cloudtak_ports')
-    _before(src, "_new_override = _cloudtak_build_override_yml", '_cloudtak_ensure_custom_compose(')
-    _before(src, '_cloudtak_ensure_custom_compose(', "'up', '-d', '--force-recreate'")
+    _before(src, "_cloudtak_write_override_file(_ct_dir)", '_cloudtak_ensure_custom_compose(')
+    _before(src, '_cloudtak_ensure_custom_compose(', '_cloudtak_recreate_and_heal(')
+    # ops #197: the recreate itself lives in the shared helper (Guard Dog's repair uses it too)
+    assert "'up', '-d', '--force-recreate'" in _fn('_cloudtak_recreate_and_heal')
+    assert '_new_override = _cloudtak_build_override_yml' in _fn('_cloudtak_write_override_file')
 
 
 def test_deploy_restores_it_after_writing_env_and_before_pull_and_up():

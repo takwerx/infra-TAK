@@ -113,6 +113,8 @@ def test_upgrade_runs_after_every_path_that_can_swap_the_image():
 
 
 def test_startup_refresh_prepulls_postgis_before_recreate():
-    body = _func('_startup_harden_cloudtak_ports')
+    # ops #197: the startup recreate goes through the shared helper, asking it to pull first
+    assert 'pull=_override_changed or _pending is not None' in _func('_startup_harden_cloudtak_ports')
+    body = _func('_cloudtak_recreate_and_heal')
     assert "services=['postgis']" in body
     assert body.index("services=['postgis']") < body.index("'up', '-d', '--force-recreate'")
