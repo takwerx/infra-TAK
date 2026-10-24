@@ -66,6 +66,27 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<main class="main">
+{#- ops #199: the link opens the repo's bug_report.yml form. GitHub pre-fills only the
+    form's text fields, by id, so version goes into `version` and the platform into the
+    `what` skeleton (the OS/arch dropdowns can't be pre-filled). Version, OS and arch
+    ONLY: the URL lands on a public site, so no fqdn, IP, email or diagnostics text. -#}
+{%- set _issue_platform = [settings.get('os_name'), settings.get('arch')]|select|join(' · ') %}
+{%- set _issue_what %}What happened:
+
+
+What I expected:
+
+
+Console: v{{ version }}{% if _issue_platform %} · {{ _issue_platform }}{% endif %}
+{% endset %}
+{%- set report_issue_url = 'https://github.com/takwerx/infra-TAK/issues/new?' ~ {'template': 'bug_report.yml', 'version': 'v' ~ version, 'what': _issue_what|string}|urlencode %}
+<div class="help-card" id="report-issue-card">
+<div class="help-card-header" onclick="helpToggle(this)"><h2>Report an issue</h2><span class="help-card-toggle" style="transform:rotate(180deg)">&#9662;</span></div>
+<div class="help-card-body" style="display:block">
+<p>Found a bug? Open an issue on GitHub. The form opens with this console's version filled in; pick your OS, then tell us what happened and how to reproduce it.</p>
+<p style="font-size:12px;color:var(--text-dim)"><b>GitHub issues are public</b>, so check what you write before posting. Run <strong>Diagnostics</strong> below too, but email that report to takwerx@gmail.com with the issue number in the subject; don't attach it to the issue, it contains hostnames and IP addresses.</p>
+<a class="btn btn-primary" id="report-issue-link" href="{{ report_issue_url }}" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;gap:8px;text-decoration:none"><span class="material-symbols-outlined" style="font-size:18px">bug_report</span>Open a GitHub issue</a>
+</div></div>
 <div class="help-card" id="diag-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Diagnostics — send us a report</h2><span class="help-card-toggle" style="transform:rotate(180deg)">&#9662;</span></div>
 <div class="help-card-body" style="display:block">
