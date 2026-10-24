@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.27-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.27-alpha)**
+**Current release: [v10.2.28-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.28-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,25 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.28-alpha — 2026-10-24 — Security: body-parser fix for TAK Portal and Remote Assist; CloudTAK keeps marketplace plugins and your own compose additions, and Guard Dog repairs it after a marketplace install; CloudTAK plays MediaMTX streams; Node-RED keeps extra ports; faster Data Sync recovery after an update
+
+**Headline: TAK Portal and Remote Assist are protected from the body-parser crash (GHSA-27r3-jxmh-p828): Caddy stops passing compressed request bodies to them right away, and their next build uses the patched body-parser. CloudTAK builds work again on servers with TAK Portal marketplace plugins, a failed build names its cause again, `docker-compose.custom.yml` is a supported place for your own CloudTAK services, and Guard Dog repairs CloudTAK by itself after a TAK Portal marketplace install. CloudTAK's media server keeps ATAK broadcasts and plays standalone MediaMTX streams. Plus: Node-RED keeps ports from its override file, TAK clients get their Data Sync groups back about a minute after an update, a native TAK reinstall re-syncs TAK Portal's certificates, and no more false "WRONG JVM" email.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.28-alpha))
+
+**Security: body-parser in TAK Portal and Remote Assist (GHSA-27r3-jxmh-p828).** A compressed request body with trailing bytes could crash the whole TAK Portal or Remote Assist server, without a login. Caddy now drops the `Content-Encoding` header on the TAK Portal, Remote Assist, Node-RED and CloudTAK sites, so the apps never start a decoder; existing servers get this when the console starts. TAK Portal and Remote Assist builds (Deploy, Update) now pin the fixed body-parser until upstream does. CloudTAK 13.113.0 is flagged as a security update.
+
+**CloudTAK.**
+- **Marketplace plugins (GH #252):** after a CloudTAK Update, builds failed on servers with TAK Portal marketplace plugins (such as LiveWX) because their lint skip was wiped. infra-TAK now puts it back before every build.
+- **Build failures name their cause again (GH #249):** a failed build says whether it was memory, network, ESLint (and which plugin), vite or npm, and which Dockerfile step failed.
+- **Your own compose additions (GH #261):** `~/CloudTAK/docker-compose.custom.yml` is yours. infra-TAK creates it once with an example and loads it on every CloudTAK action, Update and Deploy included.
+- **Guard Dog repairs CloudTAK after a TAK Portal marketplace install:** the marketplace recreates CloudTAK without infra-TAK's settings. Guard Dog now notices and asks the console to put them back, and only emails if that repair fails.
+- **Video (GH #256):** CloudTAK's media server listens on the ports it hands to ATAK, so broadcasts to it no longer fail, and CloudTAK can play streams from the standalone MediaMTX.
+
+**Also in this release.**
+- **Node-RED extra ports (GH #246):** Deploy and Start keep what's in `docker-compose.override.yml`, like Update Now already did.
+- **Data Sync groups after an update:** when TAK Server stops looking users up in LDAP after the outpost restarts, it is restarted in about a minute instead of after 5.
+- **Native TAK reinstall:** a .deb/.rpm TAK Server deploy re-syncs TAK Portal's client certificate and CA, so TAK Portal stays connected.
+- **Guard Dog JVM watch:** no more false "TAK Server is running on the WRONG JVM" email.
 
 ### v10.2.27-alpha — 2026-10-22 — Security: PgBouncer 1.26.1 and TAK Video Restreamer packages; Guard Dog no longer restarts Authentik mid-update; TAK clients keep their groups after a Reconfigure; TAK Portal hides admin accounts and follows its new home; Firewall page on Armbian
 
