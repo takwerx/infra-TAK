@@ -91339,8 +91339,9 @@ def _cloudtak_autorepair_notify(before, after):
             f"Now: {_cloudtak_drift_summary(after)}\n\n"
             f"Server: {ident}\n"
             f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        _guarddog_send_alert_email_via_relay(
-            to_addr, f"Guard Dog: CloudTAK repaired automatically on {ident}", body)
+        subj = f"Guard Dog: CloudTAK repaired automatically on {ident}"
+        if _guarddog_send_alert_email_via_relay(to_addr, subj, body):
+            print(f"[guarddog] sent: {subj}", flush=True)
     except Exception as e:
         print(f"[guarddog] CloudTAK repaired note not sent: {e}", flush=True)
 
