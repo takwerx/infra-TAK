@@ -17255,6 +17255,16 @@ _COTURN_REALM_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
 _COTURN_ALWAYS_DENIED = ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10',
                          '172.16.0.0/12')
 _COTURN_PRIVATE_DENIED = ('10.0.0.0/8', '192.168.0.0/16')
+# ops #212: a call where both ends fell back to this TURN server. Each side asks permission
+# for the other's relayed address (<external IP>:500xx), and coturn maps a peer at its
+# external IP to its own relay address before checking it. With no --relay-ip that address
+# is 0.0.0.0 (from --listening-ip), which coturn always refuses, so these calls never
+# worked, v10.2.28 included. Pin the relay address to the container's own address and allow
+# exactly that one: the call goes from one relay port to the other inside the container,
+# and nothing outside the coturn container (the box, its bridges, other containers) is
+# reachable. The image's entrypoint expands $(...) in each argument at start ($$ is
+# compose's escape), so the value follows the container across recreates.
+_COTURN_SELF_ADDR = "$$(hostname -i | cut -d' ' -f1)"
 
 
 def _coturn_block_private_peers(settings):
@@ -17304,9 +17314,10 @@ def _coturn_box_addresses():
 def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
     """coturn --denied-peer-ip values, widest first; an entry already inside a refused
     range is left out. The advertised --external-ip is one of the box's own addresses
-    (on a NAT'd cloud box it is on no interface). coturn 4.18 already refuses it as a
-    peer on its own (seen on test8 with no ACL at all), so listing it changes nothing
-    there and keeps the rule simple: the box is never a peer."""
+    (on a NAT'd cloud box it is on no interface), so it is listed too: the box is never
+    a peer. coturn swaps a peer at the external IP for its own relay address before this
+    list is checked, so that entry never refuses a call between two relays — see
+    _COTURN_SELF_ADDR."""
     nets = [ipaddress.ip_network(n) for n in _COTURN_ALWAYS_DENIED]
     if block_private:
         nets += [ipaddress.ip_network(n) for n in _COTURN_PRIVATE_DENIED]
@@ -17352,6 +17363,8 @@ def _coturn_override_content(port, ip, username, password, realm, block_private,
       - --realm={realm}
       - --no-tcp-relay
       - --no-multicast-peers
+      - "--relay-ip={_COTURN_SELF_ADDR}"
+      - "--allowed-peer-ip={_COTURN_SELF_ADDR}"
 {acl}"""
 
 
