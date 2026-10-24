@@ -64,18 +64,27 @@ CT_DIR="$(gd_find_stack_dir CloudTAK cloudtak-api-1)"
 # run made carries compose's config_files label WITHOUT the override: stock media-infra and
 # postgis images, no console CA in the api — and, for media, no HLS profile. A running
 # container of the CloudTAK project without the override in that label is drift.
+# ops #216: only for the services the override configures (api, events, media, postgis).
+# TAK Portal runs Print and the uDash sidecar from their own docker-compose.plugin-<id>.yml in
+# the same project; they never carry the override, and counting them was drift that no repair
+# could clear (three repairs an hour, then the alarm). Same rule as the console's check.
 _ct_no_override=""
 if [ -f "$CT_DIR/docker-compose.override.yml" ]; then
   _ct_proj="$(docker inspect cloudtak-api-1 --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
+  _ct_ov_svcs="$(awk '/^services:/{s=1;next} s&&/^[^ \t#]/{exit} s&&/^  [A-Za-z0-9][A-Za-z0-9_.-]*:[ \t]*$/{sub(/^  /,"");sub(/:.*/,"");print}' \
+    "$CT_DIR/docker-compose.override.yml" 2>/dev/null | tr '\n' ' ')"
   if [ -n "$_ct_proj" ]; then
-    while IFS='|' read -r _n _f; do
+    while IFS='|' read -r _n _f _s; do
       [ -n "$_f" ] || continue
+      if [ -n "$_ct_ov_svcs" ]; then
+        case " $_ct_ov_svcs " in *" $_s "*) ;; *) continue ;; esac
+      fi
       case ",$_f," in
         *,docker-compose.override.yml,*|*/docker-compose.override.yml,*) ;;
         *) _ct_no_override="$_ct_no_override $_n" ;;
       esac
     done <<EOF
-$(docker ps --filter "label=com.docker.compose.project=$_ct_proj" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}' 2>/dev/null)
+$(docker ps --filter "label=com.docker.compose.project=$_ct_proj" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.service"}}' 2>/dev/null)
 EOF
   fi
 fi

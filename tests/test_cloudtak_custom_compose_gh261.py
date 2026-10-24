@@ -383,8 +383,10 @@ def test_local_reclone_fallback_carries_the_operator_file():
     src = _fn('run_cloudtak_deploy')
     i = src.find('docker-compose.yml missing — re-cloning')
     seg = src[i:i + 1600]
-    _before(seg, 'CLOUDTAK_CUSTOM_COMPOSE), \'rb\')', "rm -rf {cloudtak_dir}")
-    _before(seg, 'git clone --depth 1{_rclone_branch}', "CLOUDTAK_CUSTOM_COMPOSE), 'wb')")
+    # ops #216: through the shared keep-aside, which carries TAK Portal's plugin files too
+    _before(seg, '_keep = _cloudtak_keep_aside(cloudtak_dir)', "rm -rf {cloudtak_dir}")
+    _before(seg, 'git clone --depth 1{_rclone_branch}', '_cloudtak_put_back(_keep, cloudtak_dir, plog)')
+    assert 'CLOUDTAK_CUSTOM_COMPOSE' in _assign('_CLOUDTAK_KEEP_FILES')
 
 
 # ── every compose action sets it up first ────────────────────────────────────
