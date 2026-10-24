@@ -58,10 +58,12 @@ def _const(name):
 
 
 def _load():
-    src = '\n\n'.join([_const('_CT_MARKETPLACE_TSCONFIG'), _const('_CT_MARKETPLACE_ROUTES_RE')]
+    src = '\n\n'.join([_const(c) for c in ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE',
+                                           '_CT_IMPORT_RE', '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')]
                       + [_body(n) for n in ('_cloudtak_web_dir', '_cloudtak_plugins_dir',
                                             '_cloudtak_foreign_plugins', '_cloudtak_has_ts_nocheck',
                                             '_cloudtak_rewrite_in_place',
+                                            '_cloudtak_plugin_missing_deps',
                                             '_cloudtak_shield_foreign_plugins')])
     ns = {'os': os, 're': re, 'json': json, 'subprocess': subprocess,
           'CLOUDTAK_PLUGINS': [{'install_dir': d} for d in

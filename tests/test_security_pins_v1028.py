@@ -58,8 +58,10 @@ def test_coturn_pin_is_past_the_advisories():
 
 
 def test_coturn_flags_avoid_the_ones_418_removed():
-    body = APP[APP.index('override_content = f"""services:\n  coturn:'):]
-    body = body[:body.index('"""', 10)]
+    # ops #201: the override is built in one place for install and the startup converge
+    body = APP[APP.index('def _coturn_override_content('):]
+    body = body[body.index('return f"""services:\n  coturn:'):]
+    body = body[:body.index('"""', 20)]
     for gone in ('--drop-invalid-packets', '--no-dtls', '--no-cli'):
         assert gone not in body
 

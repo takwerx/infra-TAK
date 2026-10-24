@@ -957,7 +957,7 @@ def test_one_package_list_everywhere():
     """deploy, Patch and the remote deploy all install the same list through the constant."""
     assert "pip3 install Flask" not in APP
     assert APP.count('_mediamtx_editor_install_py_deps()') >= 3        # deploy, patch, heal
-    assert "f'pip3 install {_pkgs} --break-system-packages 2>&1'" in APP  # remote deploy
+    assert "f'pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1'" in APP  # remote deploy
     assert '_startup_heal_mediamtx_editor_python()' in _fn('_startup_migrations')
 
 
