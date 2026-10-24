@@ -45474,6 +45474,75 @@ def _cloudtak_rewrite_in_place(path, text):
         f.write(text)
 
 
+# GH #271: a marketplace plugin's own install.sh can add an npm package to the web app's TRACKED
+# package.json (Rubber Sheet adds pdfjs-dist). Our Update / revert `checkout -f` drops it, the
+# plugin folder stays, and vite dies on the unresolved import. TAK Portal's pull wrapper only
+# warns about this. Before each build we put back any package a non-infra-TAK plugin imports AND
+# declares in its own package.json, when the web app no longer has it.
+_CT_IMPORT_RE = re.compile(
+    r'''\bimport\s+(?!type\b)[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]'''
+    r'''|\bimport\s*\(?\s*['"]([^'"]+)['"]'''
+    r'''|\bexport\s+(?!type\b)[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]''')
+_CT_NPM_NAME_RE = re.compile(r'(?:@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*')
+_CT_NPM_SPEC_RE = re.compile(r'[~^]?\d+(?:\.\d+){0,2}(?:[-+][\w.]+)?')
+
+
+def _cloudtak_plugin_missing_deps(web, foreign):
+    """{package: (version, plugin)} that foreign plugins import but the web app cannot resolve."""
+    have = set()
+    try:
+        with open(os.path.join(web, 'package.json'), encoding='utf-8') as f:
+            pkg = json.load(f)
+        for k in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+            have.update((pkg.get(k) or {}).keys())
+    except (OSError, ValueError):
+        return {}
+    try:   # hoisted transitive deps resolve too
+        with open(os.path.join(web, 'package-lock.json'), encoding='utf-8') as f:
+            have.update(p[len('node_modules/'):] for p in (json.load(f).get('packages') or {})
+                        if p.startswith('node_modules/') and '/node_modules/' not in p)
+    except (OSError, ValueError):
+        pass
+    missing = {}
+    for name in foreign:
+        pdir = os.path.join(web, 'plugins', name)
+        try:
+            with open(os.path.join(pdir, 'package.json'), encoding='utf-8') as f:
+                ppkg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        declared = {}
+        for k in ('devDependencies', 'peerDependencies', 'dependencies'):   # last wins
+            declared.update(ppkg.get(k) or {})
+        imported = set()
+        for root, dirs, files in os.walk(pdir):
+            # sidecars with their own package.json are separate npm projects; tests never
+            # reach the vite bundle
+            dirs[:] = [d for d in dirs
+                       if d not in ('node_modules', 'dist', '.git', 'test', 'tests', '__tests__')
+                       and not os.path.isfile(os.path.join(root, d, 'package.json'))]
+            for n in files:
+                if (not n.endswith(('.ts', '.js', '.mjs', '.vue', '.tsx')) or n.endswith('.d.ts')
+                        or re.search(r'\.(?:test|spec)\.\w+$', n)):
+                    continue
+                try:
+                    with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
+                        src = f.read(500000)
+                except OSError:
+                    continue
+                for m in _CT_IMPORT_RE.finditer(src):
+                    spec = (m.group(1) or m.group(2) or m.group(3)).split('?', 1)[0]
+                    parts = spec.split('/')
+                    imported.add('/'.join(parts[:2]) if spec.startswith('@') else parts[0])
+        for dep in sorted(imported):
+            ver = declared.get(dep)
+            if (dep in have or dep in missing or not isinstance(ver, str)
+                    or not _CT_NPM_NAME_RE.fullmatch(dep) or not _CT_NPM_SPEC_RE.fullmatch(ver)):
+                continue
+            missing[dep] = (ver, name)
+    return missing
+
+
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
     """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
     raises and never blocks the build: at worst the build fails as it would have anyway."""
@@ -45487,6 +45556,18 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         if os.path.isfile(pkg):
             with open(pkg, encoding='utf-8') as f:
                 text = f.read()
+            orig = text
+            deps = _cloudtak_plugin_missing_deps(web, foreign)
+            if deps:
+                data = json.loads(text)
+                have = dict(data.get('dependencies') or {})
+                have.update({d: v for d, (v, _p) in deps.items()})
+                data['dependencies'] = dict(sorted(have.items()))
+                m = re.search(r'\n([ \t]+)"', text)
+                text = (json.dumps(data, indent=m.group(1) if m else 4, ensure_ascii=False)
+                        + ('\n' if text.endswith('\n') else ''))
+                plog('  Put back npm package(s) that plugins need, which the checkout had reset: '
+                     + ', '.join(f'{d}@{v} ({p})' for d, (v, p) in deps.items()))
 
             def _lint(m):
                 script = m.group(2)
@@ -45505,7 +45586,7 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 
             new = re.sub(r'("lint"\s*:\s*")((?:\\.|[^"\\])*)(")', _lint, text, count=1)
             new = re.sub(r'("check"\s*:\s*")((?:\\.|[^"\\])*)(")', _check, new, count=1)
-            if new != text:
+            if new != orig:
                 _cloudtak_rewrite_in_place(pkg, new)
                 changed.append(os.path.relpath(pkg, ct_dir))
             if _CT_MARKETPLACE_TSCONFIG in new:
@@ -46384,9 +46465,18 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         lint_file = None
         lint_plugins = []
         vite_fail = None
+        vite_detail = None
+        vite_wait = 0
         failed_step = None
 
         for ln in lines:
+            # GH #271: vite's "error during build:" says nothing; the cause follows a
+            # "Build failed with 1 error:" line and a blank one
+            if vite_fail is not None and vite_detail is None and vite_wait < 6:
+                vite_wait += 1
+                _d = re.sub(r'^#\d+\s+[\d.]+\s*', '', ln.strip())
+                if _d and not re.match(r'Build failed with \d+ errors?:?$', _d):
+                    vite_detail = _d
             # ESLint prints each file's path, then its "12:5  error ..." lines
             m = re.search(r'\s(/\S+\.(?:ts|js|vue|mjs|cjs))\s*$', ln)
             if m:
@@ -46480,6 +46570,12 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the CloudTAK web app build (vite) failed.')
             out.append('  %s' % vite_fail[:220])
+            if vite_detail:
+                out.append('  %s' % vite_detail[:300])
+                m = re.search(r'/(?:app|web)/plugins/([\w.-]+)/', vite_detail)
+                if m:
+                    out.append('  It is in CloudTAK plugin folder %s (app/plugins/). CloudTAK itself is '
+                               'not the problem - update or reinstall that plugin, then retry.' % m.group(1))
         elif rate_limited:
             out.append('')
             out.append('Likely cause: Docker Hub pull rate limit.')
