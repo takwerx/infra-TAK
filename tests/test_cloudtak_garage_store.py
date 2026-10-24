@@ -269,9 +269,12 @@ def test_every_env_writer_runs_the_store_step():
 def test_no_plugin_path_is_hardcoded_to_api_web_any_more():
     code = re.sub(r'#.*', '', APP)
     hits = [m.start() for m in re.finditer(r"'api', 'web', 'plugins'", code)]
-    # only the "look in both roots" list in the update path may still name the old root
-    assert len(hits) == 1
-    assert '_plugin_bases_before' in code[hits[0] - 200:hits[0]]
+    # only the "look in both roots" places may still name the old root: the update path's list,
+    # and (ops #216) the helpers that move or keep every plugin across the two roots
+    assert len(hits) == 3
+    owners = ('_plugin_bases_before', 'def _cloudtak_carry_plugins', '_CLOUDTAK_KEEP_DIRS = (')
+    for h in hits:
+        assert any(o in code[max(0, h - 900):h] for o in owners), code[h - 200:h]
 
 
 def test_migration_can_never_delete_or_downgrade_garage_files():

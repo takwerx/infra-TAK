@@ -176,7 +176,7 @@ class Box:
                 '_cloudtak_env_read', '_cloudtak_env_set', '_cloudtak_compose_file_value',
                 '_cloudtak_ensure_custom_compose', '_ct_media_converged',
                 '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
-                '_ct_docker_out', '_cloudtak_containers_without_override',
+                '_ct_docker_out', '_cloudtak_override_services', '_cloudtak_containers_without_override',
                 '_cloudtak_write_override_file', '_cloudtak_recreate_and_heal',
                 '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_autorepair_wait_reason',
                 '_cloudtak_autorepair_record', '_cloudtak_autorepair_record_save',
