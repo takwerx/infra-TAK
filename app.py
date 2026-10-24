@@ -45279,6 +45279,20 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
 
 
+def _cloudtak_foreign_containers(ps_output, project):
+    """IDs from `docker ps -a --format '{{.ID}} {{.Label "com.docker.compose.project"}}'` that
+    the compose project `project` did not create (other project, or no label at all).
+
+    Deploy's pre-start sweep removes only these (ops #198). Removing the project's own
+    containers dropped postgis's anonymous data volume: `up` then started an empty database."""
+    out = []
+    for line in (ps_output or '').splitlines():
+        parts = line.split()
+        if parts and parts[1:] != [project]:
+            out.append(parts[0])
+    return out
+
+
 def _cloudtak_env_secrets(env_text):
     """(SigningSecret, store secret, POSTGRES_PASSWORD) from an existing CloudTAK .env; '' when absent.
 
@@ -46827,11 +46841,18 @@ def run_cloudtak_deploy(cfg=None):
         # use"). A container left by a prior failed run doesn't carry the labels this
         # compose project expects, so `up` refuses the name instead of recreating it —
         # and the deploy path had NO teardown of its own (only uninstall did). A fresh
-        # deploy owns every cloudtak-* name by definition; volumes are untouched, so
-        # DB data survives.
-        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+        # deploy owns every cloudtak-* name by definition.
+        # ops #198: remove only containers this compose project did NOT create. postgis keeps
+        # its data in an ANONYMOUS volume (upstream's compose names none), and only
+        # `up --force-recreate` carries that over to the new container: after a `docker rm`
+        # compose made a fresh empty one, so a Deploy over an installed CloudTAK came back with
+        # an empty database (the old one orphaned on disk). Our own containers are recreated
+        # by `up` below, the same as the retry loop already leaves them for adoption.
+        _project = os.path.basename(cloudtak_dir).lower()
+        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak', '--format',
+                                          '{{.ID}} {{.Label "com.docker.compose.project"}}']),
                               capture_output=True, text=True, timeout=30)
-        _stale = (_pre.stdout or '').split()
+        _stale = _cloudtak_foreign_containers(_pre.stdout, _project)
         if _stale:
             plog(f"  Removing {len(_stale)} stale cloudtak container(s) from prior runs...")
             subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _stale), capture_output=True, timeout=120)
@@ -46849,7 +46870,6 @@ def run_cloudtak_deploy(cfg=None):
         #     it IS properly project-labeled, the next `up` simply ADOPTS it. So:
         #     retry up to 3 times, each pass removing only foreign holders and leaving
         #     project-labeled ones for adoption. Volumes/DB are never touched.
-        _project = os.path.basename(cloudtak_dir).lower()
         for _attempt in range(3):
             if r.returncode == 0 or 'already in use by container' not in (r.stdout or ''):
                 break

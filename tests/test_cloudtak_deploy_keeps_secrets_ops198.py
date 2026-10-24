@@ -235,6 +235,42 @@ def test_remote_fresh_install_generates_the_secrets():
     assert 'GARAGE_RPC_SECRET' not in env
 
 
+# ── the pre-start sweep keeps the database ───────────────────────────────────
+# Box test for this fix: Deploy kept every secret, and then CloudTAK came back with an EMPTY
+# database. The sweep before `up` ran `docker rm -f` on every cloudtak-* container, postgis
+# included; its data lives in an anonymous volume, which only `up --force-recreate` carries to
+# the new container, so compose made a fresh one. The old data sat orphaned on disk.
+
+def _foreign():
+    src = ast.get_source_segment(APP, next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                                           and n.name == '_cloudtak_foreign_containers'))
+    ns = {}
+    exec(compile(src, 'app.py', 'exec'), ns)
+    return ns['_cloudtak_foreign_containers']
+
+
+def test_sweep_leaves_the_projects_own_containers_for_compose():
+    ps = ('aaa111 cloudtak\n'          # cloudtak-postgis-1, ours: up --force-recreate keeps its volume
+          'bbb222 \n'                  # an unlabeled leftover of a failed run
+          'ccc333 cloudtak-dispatcher\n'
+          'ddd444\n')
+    assert _foreign()(ps, 'cloudtak') == ['bbb222', 'ccc333', 'ddd444']
+    assert _foreign()('', 'cloudtak') == [] and _foreign()(None, 'cloudtak') == []
+
+
+def test_local_deploy_sweeps_only_foreign_containers_before_up():
+    body = ast.get_source_segment(APP, next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                                            and n.name == 'run_cloudtak_deploy'))
+    code = re.sub(r'#.*', '', body)
+    i_ps = code.index("'docker', 'ps', '-a', '--filter', 'name=cloudtak'")
+    i_pick = code.index('_stale = _cloudtak_foreign_containers(_pre.stdout, _project)')
+    i_up = code.index("'up', '-d', '--force-recreate'")
+    assert i_ps < i_pick < i_up
+    assert '{{.Label "com.docker.compose.project"}}' in code[i_ps:i_pick]
+    # the old "every cloudtak-* id" sweep is gone
+    assert "['docker', 'ps', '-aq', '--filter', 'name=cloudtak']" not in code
+
+
 def test_remote_deploy_still_prefers_the_stored_postgis_password():
     _, sent, _ = _remote_deploy(dict(REMOTE, cloudtak_postgres_password='p' * 48), EXISTING_ENV)
     assert _env(sent['/tmp/.env'])['POSTGRES_PASSWORD'] == 'p' * 48
