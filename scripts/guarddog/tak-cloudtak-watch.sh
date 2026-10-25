@@ -89,6 +89,26 @@ EOF
   fi
 fi
 
+# ops #222: TAK Portal starts Print (cloudtak-print) from its own docker-compose.plugin-print.yml,
+# without infra-TAK's docker-compose.infratak-print.yml, so there is no loopback port behind
+# /print-api and its internal URLs don't resolve. Same rule as the console's _cloudtak_print_drift();
+# the repair restarts that one container.
+_ct_print_stale=""
+if [ -f "$CT_DIR/docker-compose.plugin-print.yml" ]; then
+  _ct_pproj="$(docker inspect cloudtak-api-1 --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
+  if [ -n "$_ct_pproj" ]; then
+    while IFS='|' read -r _n _f _s; do
+      [ "$_s" = cloudtak-print ] || continue
+      case ",$_f," in
+        *,docker-compose.infratak-print.yml,*|*/docker-compose.infratak-print.yml,*) ;;
+        *) _ct_print_stale="$_ct_print_stale $_n" ;;
+      esac
+    done <<EOF
+$(docker ps --filter "label=com.docker.compose.project=$_ct_pproj" --filter "label=com.docker.compose.service=cloudtak-print" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.service"}}' 2>/dev/null)
+EOF
+  fi
+fi
+
 # ops #197: ask the console to repair. Sets _rep_state (ok|repairing|waiting|rate_limited|
 # failed|unreachable) and _rep_detail. HTTPS first (self-signed, -k), HTTP only when HTTPS
 # got no answer at all — same rule as send-alert-email.sh.
@@ -127,6 +147,7 @@ fi
 _ct_found=""
 [ "$_hls_ok" = 0 ] && _ct_found="cloudtak-media HLS profile missing"
 [ -n "$_ct_no_override" ] && _ct_found="${_ct_found:+$_ct_found; }created without infra-TAK's compose override:$_ct_no_override"
+[ -n "$_ct_print_stale" ] && _ct_found="${_ct_found:+$_ct_found; }Print started without infra-TAK's /print-api settings:$_ct_print_stale"
 if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
   _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
@@ -135,6 +156,7 @@ if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
   elif [ -n "$_ct_found" ]; then
     [ "$_hls_ok" = 0 ] && _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
     [ -n "$_ct_no_override" ] && _log "drift | created without infra-TAK's compose override (image pins, console CA):$_ct_no_override"
+    [ -n "$_ct_print_stale" ] && _log "drift | Print started without infra-TAK's /print-api settings (no loopback port):$_ct_print_stale"
     # v10.1.57 W12: TWO-STRIKE. Do not alert on first sight.
     #
     # The console recreates CloudTAK itself during post-update security hardening and
