@@ -82503,7 +82503,19 @@ def _tak_rollback(label, plog=None):
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
-    subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=60)  # v10.0.1: container-aware
+    # v10.2.30: the unit's own TimeoutStopSec is 90 s, so the old 60 s cap raised TimeoutExpired
+    # on a slow shutdown. It escaped the rollback thread: the status stayed "running" forever and
+    # TAK Server was left stopped (nuc 2026-10-25). Wait long enough; if it still has not stopped,
+    # bring it back and report — nothing has been restored at this point.
+    try:
+        subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=180)  # v10.0.1: container-aware
+    except subprocess.TimeoutExpired:
+        plog("  rollback: takserver did not stop within 180 s — starting it again, nothing restored")
+        try:
+            subprocess.run(_tak_systemctl('start'), shell=True, capture_output=True, timeout=180)
+        except Exception as _e:
+            plog(f"  rollback: could not start takserver: {str(_e)[:200]}")
+        return False, 'takserver did not stop within 180 s — nothing was restored'
 
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
