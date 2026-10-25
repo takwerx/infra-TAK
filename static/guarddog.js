@@ -78,6 +78,10 @@ lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'
 // that cost a session on 2026-08-10. And don't quote a dead-tuple count the tile
 // beside it is reporting as unknown.
 lines.push('Oldest CoT row '+(f.oldest_age_human||'-')+' · retention '+(f.retention_hours?f.retention_hours+' h':'no CoT policy set (retention-policy.yml)')+' · dead tuples '+(f.stats_stale?'unknown (never analyzed)':(typeof f.dead_tuples==='number'?f.dead_tuples.toLocaleString():'-')));
+// GH #273: data_feed_cot is sized from the catalog — its tuple stats can read 0.
+if(typeof f.feed_cot_bytes==='number')lines.push('data_feed_cot '+(f.feed_cot_human||'-')+(f.feed_cot_orphans?' · has orphaned rows (links to deleted CoT) — the retention guard removes them':' · no orphaned rows'));
+if(f.dup_packages&&f.dup_packages.length){lines.push('');lines.push('Duplicate data packages (same file uploaded more than once). Nothing is deleted automatically; remove extra copies from the TAK Server Web Admin (:8443) if they are not needed:');
+f.dup_packages.forEach(function(p){lines.push('  '+p.name+' · '+p.copies+' copies · '+p.human+' total ('+p.extra_human+' in extra copies)');});}
 if(f.errors&&f.errors.length)lines.push('Could not read: '+f.errors.join(' | '));
 if(out){out.style.color=GD_COT_COLORS[d.verdict]||'var(--text-dim)';out.textContent=lines.join(String.fromCharCode(10));}
 }catch(e){if(btn)btn.disabled=false;if(out){out.style.color='var(--red)';out.textContent='Request failed';}}}
@@ -180,6 +184,32 @@ out.textContent='Purge: '+(d.deleted||0).toLocaleString()+' rows deleted in '+(d
 if(d.running){if(msg){msg.textContent='Purging…';msg.style.color='var(--text-dim)';}gdCotPurgeTimer=setTimeout(gdCotPurgePoll,3000);return;}
 if(msg){msg.textContent=d.error?'Purge failed.':'Purge finished.';msg.style.color=d.error?'var(--red)':'var(--green)';}
 gdRefreshCotSize();}).catch(function(){gdCotPurgeTimer=setTimeout(gdCotPurgePoll,8000);});}
+// GH #273 — the PostgreSQL 15 cluster the 5.8 upgrade leaves behind. The row only
+// appears when one is on disk; Remove only when PostgreSQL 18 is the live database.
+function gdPgOldLoad(){var row=document.getElementById('gd-pgold-row');if(!row)return;
+fetch('/api/guarddog/pg-old-cluster',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+if(!d.found){row.style.display='none';return;}
+row.style.display='flex';
+document.getElementById('gd-pgold-info').textContent=(d.bytes_human||'-')+' at '+(d.path||'-')+' on '+(d.where||'this server')+(d.running?' (running)':' (stopped)');
+document.getElementById('gd-pgold-path').textContent=d.path||'the PostgreSQL 15 data directory';
+document.getElementById('gd-pgold-size').textContent=d.bytes_human||'-';
+var btn=document.getElementById('gd-pgold-btn');if(btn)btn.disabled=!d.removable;
+document.getElementById('gd-pgold-why').textContent=d.removable?'':(d.not_removable_reason||'');
+}).catch(function(){row.style.display='none';});}
+function gdPgOldOpen(){var m=document.getElementById('gd-pgold-modal');if(!m)return;
+document.getElementById('gd-pgold-confirm').value='';document.getElementById('gd-pgold-password').value='';
+var msg=document.getElementById('gd-pgold-msg');if(msg){msg.textContent='';msg.style.color='';}
+var go=document.getElementById('gd-pgold-go');if(go){go.style.display='';go.disabled=false;}
+m.classList.add('open');}
+function gdPgOldClose(){var m=document.getElementById('gd-pgold-modal');if(m)m.classList.remove('open');}
+async function gdPgOldSubmit(){var msg=document.getElementById('gd-pgold-msg');var go=document.getElementById('gd-pgold-go');
+var body={confirm:document.getElementById('gd-pgold-confirm').value.trim(),password:document.getElementById('gd-pgold-password').value};
+if(msg){msg.textContent='Removing… (this can take a minute on a large cluster)';msg.style.color='var(--text-dim)';}if(go)go.disabled=true;
+try{var r=await fetch('/api/guarddog/pg-old-cluster/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});var d=await r.json();
+if(!d.success){if(go)go.disabled=false;if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}return;}
+if(msg){msg.textContent=d.message||'Removed.';msg.style.color='var(--green)';}if(go)go.style.display='none';
+gdPgOldLoad();gdRefreshCotSize();
+}catch(e){if(go)go.disabled=false;if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}}}
 function _gdVacuumSetUI(running,full,secs){var msg=document.getElementById('gd-vacuum-msg');var btnA=document.getElementById('gd-vacuum-analyze-btn');var btnF=document.getElementById('gd-vacuum-full-btn');var btnR=document.getElementById('gd-reindex-btn');[btnA,btnF,btnR].forEach(function(b){if(b){b.disabled=running;b.style.opacity=running?'0.4':'1';b.style.pointerEvents=running?'none':'auto';}});if(running&&msg){var elapsed='';if(secs>0){var m=Math.floor(secs/60);elapsed=m>0?' ('+m+'m '+secs%60+'s)':' ('+secs+'s)';}msg.textContent=(full?'Running VACUUM FULL':'Running VACUUM ANALYZE')+'...'+elapsed;msg.style.color='var(--text-dim)';}}
 async function _gdPollVacuumStatus(){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');try{var r=await fetch('/api/takserver/vacuum/status');var d=await r.json();if(d.running){_gdVacuumSetUI(true,d.full,d.elapsed_secs||0);setTimeout(_gdPollVacuumStatus,5000);}else{if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}}else if(d.result!==null){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.result){out.textContent=d.result;out.style.display='block';}gdRefreshCotSize();}_gdVacuumSetUI(false,false,0);}}catch(e){setTimeout(_gdPollVacuumStatus,10000);}}
 // v10.1.29 W3 — the preflight refusals (400 no_disk / 409 warn_no_bloat) carry the
@@ -204,7 +234,8 @@ function gdRefreshHealth(){fetch('/api/guarddog/health?_='+Date.now(),{credentia
 function gdRefreshMonitorHealth(){var items=document.querySelectorAll('[data-monitor-id]');if(!items.length)return;var ids=[];items.forEach(function(el){var mid=el.getAttribute('data-monitor-id');if(mid)ids.push(mid);});if(!ids.length)return;fetch('/api/guarddog/monitor-health?ids='+ids.join(','),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(h){for(var mid in h){var el=document.getElementById('gd-mh-'+mid);if(!el)continue;var v=h[mid];var unk=(v===null||v===undefined);el.className='guard-monitor-health '+(unk?'pending':(v?'ok':'fail'));el.title=unk?'Unknown \u2014 the check did not complete (box may be under load)':(v?'Healthy':'Unhealthy');}}).catch(function(){});}
 if (document.getElementById('gd-activity-log')) gdLoadActivityLog();
 if (document.getElementById('gd-cot-db-size')){gdRefreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_gdVacuumSetUI(true,d.full,d.elapsed_secs||0);_gdPollVacuumStatus();}}).catch(function(){});
-fetch('/api/guarddog/cotdb/purge/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.running)gdCotPurgePoll();}).catch(function(){});}
+fetch('/api/guarddog/cotdb/purge/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.running)gdCotPurgePoll();}).catch(function(){});
+gdPgOldLoad();}
 if (document.getElementById('gd-fw-rules')) gdFirewallRefresh();
 if (document.querySelector('.guard-service-row')){gdRefreshHealth();gdRefreshMonitorHealth();setInterval(gdRefreshHealth,30000);setInterval(gdRefreshMonitorHealth,30000);}
 if (document.getElementById('gd-sms-provider')) gdSmsProviderChange();

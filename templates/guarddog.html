@@ -364,6 +364,10 @@
         <button type="button" id="gd-cot-purge-btn" onclick="gdCotPurgeOpen()" class="btn btn-ghost" style="color:var(--red);border-color:var(--red);flex-shrink:0">Purge Old CoT</button>
         <span style="font-size:12px;color:var(--text-secondary)"><strong style="color:var(--red)">Destructive.</strong> Deletes CoT position history — by age, or everything. This is the only action that recovers a box whose disk is already full. Password-confirmed.</span>
       </div>
+      <div id="gd-pgold-row" style="display:none;flex-wrap:wrap;align-items:center;gap:12px;border-top:1px solid var(--border);padding-top:12px">
+        <button type="button" id="gd-pgold-btn" onclick="gdPgOldOpen()" class="btn btn-ghost" style="color:var(--red);border-color:var(--red);flex-shrink:0">Remove PostgreSQL 15</button>
+        <span style="font-size:12px;color:var(--text-secondary)"><strong>Old PostgreSQL 15 cluster:</strong> <span id="gd-pgold-info">—</span>. The TAK Server 5.8 upgrade kept it, stopped, as a rollback copy; nothing removes it automatically. <span id="gd-pgold-why" style="color:var(--yellow)"></span></span>
+      </div>
     </div>
     <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
     <div id="gd-vacuum-msg" style="margin-top:8px;font-size:13px"></div>
@@ -389,6 +393,15 @@
     <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-cot-purge-password" placeholder="Confirm password" autocomplete="current-password"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" id="gd-cot-purge-cancel" onclick="gdCotPurgeClose()">Cancel</button><button class="btn" id="gd-cot-purge-go" style="background:var(--red);color:#fff" onclick="gdCotPurgeSubmit()">Purge</button></div>
     <div id="gd-cot-purge-msg" style="margin-top:12px;font-size:12px;white-space:pre-wrap"></div>
+  </div></div>
+
+  <div class="modal-overlay" id="gd-pgold-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:520px;max-width:92vw">
+    <h3 style="font-size:16px;margin-bottom:8px;color:var(--red)">Remove the PostgreSQL 15 cluster</h3>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">This permanently deletes <code id="gd-pgold-path">the PostgreSQL 15 data directory</code> (<span id="gd-pgold-size">—</span>). TAK Server runs on PostgreSQL 18 and does not use it, but it is the only way back to the database as it was before the 5.8 upgrade. There is no undo.</p>
+    <div style="margin-bottom:14px"><label class="form-label">Type <code>15</code> to confirm</label><input class="form-input" type="text" id="gd-pgold-confirm" placeholder="confirmation" autocomplete="off"></div>
+    <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-pgold-password" placeholder="Confirm password" autocomplete="current-password"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" id="gd-pgold-cancel" onclick="gdPgOldClose()">Cancel</button><button class="btn" id="gd-pgold-go" style="background:var(--red);color:#fff" onclick="gdPgOldSubmit()">Remove</button></div>
+    <div id="gd-pgold-msg" style="margin-top:12px;font-size:12px;white-space:pre-wrap"></div>
   </div></div>
   {% endif %}
 

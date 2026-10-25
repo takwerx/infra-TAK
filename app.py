@@ -1173,7 +1173,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.29-alpha"
+VERSION = "10.2.30-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -13765,6 +13765,39 @@ def _get_current_takserver_heap_gb():
     return None
 
 
+TAKSERVER_HEAP_VARS = ('CONFIG_MAX_HEAP', 'API_MAX_HEAP', 'MESSAGING_MAX_HEAP',
+                       'PLUGIN_MANAGER_MAX_HEAP', 'RETENTION_MAX_HEAP')
+_TAKSERVER_HEAP_BLOCK_A = '# >>> infra-TAK managed heap >>>'
+_TAKSERVER_HEAP_BLOCK_B = '# <<< infra-TAK managed heap <<<'
+
+
+def _merge_takserver_heap_defaults(existing, heap_gb, heaps_mb):
+    """Return /etc/default/takserver with infra-TAK's heap vars replaced and everything else kept.
+
+    GH #282: set-heap used to write the whole file, so an operator's own variables were
+    dropped every time the suggested heap was applied. infra-TAK owns only the five
+    *_MAX_HEAP vars: any line setting one of them (with or without `export`) is removed,
+    as are our previous managed block and the two unmarked comment lines older releases
+    wrote, and one managed block is appended at the end so it wins over anything above it.
+    `heaps_mb` maps each name in TAKSERVER_HEAP_VARS to its value in MB.
+    """
+    import re as _re
+    text = _re.sub(rf'{_re.escape(_TAKSERVER_HEAP_BLOCK_A)}.*?{_re.escape(_TAKSERVER_HEAP_BLOCK_B)}\n?',
+                   '', existing or '', flags=_re.DOTALL)
+    owned = _re.compile(r'^\s*(?:export\s+)?(?:%s)=' % '|'.join(TAKSERVER_HEAP_VARS))
+    legacy = ('# infra-TAK total heap:', '# Proportional split across TAK Server processes')
+    kept = [ln for ln in text.splitlines()
+            if not owned.match(ln) and not ln.strip().startswith(legacy)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    block = [_TAKSERVER_HEAP_BLOCK_A,
+             f'# infra-TAK total heap: {heap_gb}g',
+             '# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)']
+    block += [f'export {name}={int(heaps_mb[name])}' for name in TAKSERVER_HEAP_VARS]
+    block.append(_TAKSERVER_HEAP_BLOCK_B)
+    return '\n'.join(kept + ([''] if kept else []) + block) + '\n'
+
+
 @app.route('/api/takserver/heap-info')
 @login_required
 def takserver_heap_info():
@@ -13805,16 +13838,18 @@ def takserver_set_heap():
     plugin_mb = int(total_mb * w_plugin / w_total)
     retain_mb = int(total_mb * w_retain / w_total)
 
-    defaults_content = (
-        f"# infra-TAK total heap: {heap_gb}g\n"
-        f"# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)\n"
-        f"export CONFIG_MAX_HEAP={config_mb}\n"
-        f"export API_MAX_HEAP={api_mb}\n"
-        f"export MESSAGING_MAX_HEAP={msg_mb}\n"
-        f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
-        f"export RETENTION_MAX_HEAP={retain_mb}\n"
-    )
     defaults_file = '/etc/default/takserver'
+    # GH #282: merge into the operator's file instead of replacing it. A file that exists
+    # but cannot be read is a refusal, never a blank slate to overwrite.
+    existing = ''
+    if _exists_priv(defaults_file):
+        try:
+            existing = _read_own_or_priv(defaults_file)
+        except Exception as _rd_err:
+            return jsonify({'success': False, 'error': f'Could not read {defaults_file}, left it unchanged: {str(_rd_err)[:200]}'}), 500
+    defaults_content = _merge_takserver_heap_defaults(existing, heap_gb, {
+        'CONFIG_MAX_HEAP': config_mb, 'API_MAX_HEAP': api_mb, 'MESSAGING_MAX_HEAP': msg_mb,
+        'PLUGIN_MANAGER_MAX_HEAP': plugin_mb, 'RETENTION_MAX_HEAP': retain_mb})
     try:
         # v10.0.5 non-root: /etc/default/takserver + /opt/tak/setenv.sh are root-owned;
         # was bare `sudo tee`/`sudo cat` (bypass broker → EPERM non-root). Route via broker.
@@ -17255,6 +17290,16 @@ _COTURN_REALM_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
 _COTURN_ALWAYS_DENIED = ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10',
                          '172.16.0.0/12')
 _COTURN_PRIVATE_DENIED = ('10.0.0.0/8', '192.168.0.0/16')
+# ops #212: a call where both ends fell back to this TURN server. Each side asks permission
+# for the other's relayed address (<external IP>:500xx), and coturn maps a peer at its
+# external IP to its own relay address before checking it. With no --relay-ip that address
+# is 0.0.0.0 (from --listening-ip), which coturn always refuses, so these calls never
+# worked, v10.2.28 included. Pin the relay address to the container's own address and allow
+# exactly that one: the call goes from one relay port to the other inside the container,
+# and nothing outside the coturn container (the box, its bridges, other containers) is
+# reachable. The image's entrypoint expands $(...) in each argument at start ($$ is
+# compose's escape), so the value follows the container across recreates.
+_COTURN_SELF_ADDR = "$$(hostname -i | cut -d' ' -f1)"
 
 
 def _coturn_block_private_peers(settings):
@@ -17304,9 +17349,10 @@ def _coturn_box_addresses():
 def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
     """coturn --denied-peer-ip values, widest first; an entry already inside a refused
     range is left out. The advertised --external-ip is one of the box's own addresses
-    (on a NAT'd cloud box it is on no interface). coturn 4.18 already refuses it as a
-    peer on its own (seen on test8 with no ACL at all), so listing it changes nothing
-    there and keeps the rule simple: the box is never a peer."""
+    (on a NAT'd cloud box it is on no interface), so it is listed too: the box is never
+    a peer. coturn swaps a peer at the external IP for its own relay address before this
+    list is checked, so that entry never refuses a call between two relays — see
+    _COTURN_SELF_ADDR."""
     nets = [ipaddress.ip_network(n) for n in _COTURN_ALWAYS_DENIED]
     if block_private:
         nets += [ipaddress.ip_network(n) for n in _COTURN_PRIVATE_DENIED]
@@ -17352,6 +17398,8 @@ def _coturn_override_content(port, ip, username, password, realm, block_private,
       - --realm={realm}
       - --no-tcp-relay
       - --no-multicast-peers
+      - "--relay-ip={_COTURN_SELF_ADDR}"
+      - "--allowed-peer-ip={_COTURN_SELF_ADDR}"
 {acl}"""
 
 
@@ -34522,6 +34570,92 @@ def _caddy_registry_loaded():
         print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
 
 
+# ops #222: /print-api on the CloudTAK map site, while infra-TAK has TAK Portal's Print set up on
+# loopback (its overlay exists, _cloudtak_print_converge). It is TAK Portal's own snippet — same
+# name, same matcher — with the one upstream host Caddy can reach. That is deliberate: TAK
+# Portal's "Deploy To Caddy" leaves a `(cloudtak_print)` snippet alone when it is already defined
+# above the CloudTAK site and that site already imports it, and reports the step as applied
+# (applyCaddySnippets / placeNamedSnippet in its cloudtakMarketplace.caddy.js). So it writes
+# nothing, instead of adding its own copy whose upstream, cloudtak-print:5010, is a container
+# name the host can't resolve (a 502), and which Caddy would run first: same-matcher handles keep
+# file order, checked with `caddy adapt`.
+_CADDY_PRINT_SNIPPET = 'cloudtak_print'
+_CADDY_PRINT_IMPORT = f'import {_CADDY_PRINT_SNIPPET}'
+
+
+def _caddy_operator_owns_print(caddyfile_path=None):
+    """True when the operator routes /print-api themselves: an include file (GH #176 — the README
+    example is this very snippet) or the user-blocks part of the Caddyfile names cloudtak_print.
+    Ours would then be a second definition, which Caddy rejects."""
+    for f in _caddy_operator_include_files():
+        try:
+            with open(f, encoding='utf-8', errors='replace') as fh:
+                if _CADDY_PRINT_SNIPPET in fh.read():
+                    return True
+        except OSError:
+            continue
+    try:
+        with open(caddyfile_path or CADDYFILE_PATH, encoding='utf-8', errors='replace') as fh:
+            live = fh.read()
+    except OSError:
+        return False
+    return (CADDYFILE_USER_BLOCKS_MARKER in live
+            and _CADDY_PRINT_SNIPPET in live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[1])
+
+
+def _cloudtak_print_caddy(settings, ct_dir=None):
+    """(top-level snippet lines, lines for inside the CloudTAK map site), or ([], []) — Print not
+    set up, the operator routes it themselves, or CloudTAK is on another host (the overlay
+    publishes on that host's loopback, out of this Caddy's reach)."""
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return [], []
+    except Exception:
+        pass
+    ct_dir = ct_dir or os.path.expanduser('~/CloudTAK')
+    if not os.path.isfile(os.path.join(ct_dir, CLOUDTAK_PRINT_OVERLAY)) or _caddy_operator_owns_print():
+        return [], []
+    snippet = [
+        "# TAK Portal's Print plugin, published on loopback by infra-TAK (ops #222)",
+        f"({_CADDY_PRINT_SNIPPET}) {{",
+        f"    @{_CADDY_PRINT_SNIPPET} path /print-api /print-api/*",
+        f"    handle @{_CADDY_PRINT_SNIPPET} {{",
+        f"        reverse_proxy 127.0.0.1:{CLOUDTAK_PRINT_PORT}",
+        "    }",
+        "}",
+        "",
+    ]
+    return snippet, [f"    {_CADDY_PRINT_IMPORT}"]
+
+
+def _cloudtak_print_caddy_converge(log=None):
+    """Regenerate + reload Caddy when the generated part of the live Caddyfile doesn't route
+    /print-api the way _cloudtak_print_caddy() says: ours missing, ours left over, or TAK Portal's
+    copy (cloudtak-print:5010) in it. Only the generated part is looked at, so a hand-written
+    stanza below the user-blocks marker can't make this loop. Returns True when it regenerated."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = load_settings()
+    if not (settings.get('fqdn') or '').strip():
+        return False
+    try:
+        live = _read_priv(CADDYFILE_PATH)
+    except Exception:
+        return False
+    generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    has = f'reverse_proxy 127.0.0.1:{CLOUDTAK_PRINT_PORT}' in generated and _CADDY_PRINT_IMPORT in generated
+    want = bool(_cloudtak_print_caddy(settings)[0])
+    if has == want and f'{CLOUDTAK_PRINT_SERVICE}:{CLOUDTAK_PRINT_PORT}' not in generated:
+        return False
+    if generate_caddyfile(settings) is None:
+        return False
+    if not _CADDY_REGISTRY_READY.is_set():
+        return True          # deferred: the post-registry catch-up writes and reloads it
+    ok, detail = _caddy_reload_if_changed()
+    _log(f"  Caddy: /print-api {'routed to 127.0.0.1:%d' % CLOUDTAK_PRINT_PORT if want else 'route removed'}"
+         + ('' if ok else f" — reload issue: {str(detail)[:160]}"))
+    return True
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -34541,6 +34675,10 @@ def generate_caddyfile(settings=None):
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
     lines += _caddy_global_options_lines(
         grpc_streams=bool(modules.get('netbird', {}).get('installed')), settings=settings)
+    # ops #222: a snippet has to be defined above the site that imports it.
+    _ct_print_caddy = (_cloudtak_print_caddy(settings) if modules.get('cloudtak', {}).get('installed')
+                       else ([], []))
+    lines += _ct_print_caddy[0]
     # GH #206: Caddy's automatic HTTP->HTTPS redirect deliberately leaves a moved
     # https_port out of the Location (it assumes a router maps public 443 onto it), so
     # http://name:<http_port> would land on whatever else owns 443 — the very thing the
@@ -34919,6 +35057,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"    # clients.claim() in CloudTAK's own service worker; reported upstream.)")
         lines.append(f"    @ct_pwa_entry path /sw.js /registerSW.js /manifest.webmanifest / /index.html")
         lines.append(f"    header @ct_pwa_entry Cache-Control \"no-cache, no-store, must-revalidate\"")
+        lines += _ct_print_caddy[1]   # ops #222: `import cloudtak_print` (defined at the top)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
@@ -45155,6 +45294,172 @@ def _cloudtak_remote_custom_compose_sh():
     )
 
 
+# ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
+# from its own docker-compose.plugin-print.yml in the CloudTAK project, with `expose: 5010` only
+# and internal URLs (http://cloudtak-api:5000, http://cloudtak-tiles:5002) that don't resolve on
+# a stock CloudTAK project (clptak/cloudtak-plugin-print#2). infra-TAK's Caddy runs on the host
+# and can't reach a container name, so the browser's /print-api had nowhere to go (GH #261's 502).
+#
+# infra-TAK's own small overlay publishes it on loopback and points it at api / tiles. It is
+# applied by starting cloudtak-print from base + TAK Portal's file + the overlay (+ the
+# operator's custom file), explicitly, and is deliberately NOT put in COMPOSE_FILE: CloudTAK
+# Update builds every service listed there with --no-cache (Print is a Chromium image, and a
+# failed Print build would fail the CloudTAK update), and TAK Portal's uninstall deletes its
+# file, after which every plain `docker compose` in ~/CloudTAK would refuse to run. So to
+# infra-TAK's own compose runs cloudtak-print stays what it already was: a container of the
+# project they leave alone (none of them passes --remove-orphans, ops #216).
+_CLOUDTAK_PRINT_PLUGIN_COMPOSE = 'docker-compose.plugin-print.yml'   # TAK Portal's; never edited
+CLOUDTAK_PRINT_OVERLAY = 'docker-compose.infratak-print.yml'
+CLOUDTAK_PRINT_SERVICE = 'cloudtak-print'
+CLOUDTAK_PRINT_PORT = 5010
+_CLOUDTAK_PRINT_OVERLAY_YML = f"""\
+# Written by infra-TAK (ops #222) while TAK Portal's Print plugin is installed, and removed when
+# it is not. Do not edit: it is rewritten before Print is started. Your own settings for
+# {CLOUDTAK_PRINT_SERVICE} go in {CLOUDTAK_CUSTOM_COMPOSE}, which is loaded after this file.
+services:
+  {CLOUDTAK_PRINT_SERVICE}:
+    ports:
+      - "127.0.0.1:{CLOUDTAK_PRINT_PORT}:{CLOUDTAK_PRINT_PORT}"
+    environment:
+      - API_INTERNAL_URL=http://api:5000
+      - TILES_INTERNAL_URL=http://tiles:5002
+"""
+
+
+def _cloudtak_print_problem(ct_dir):
+    """Why TAK Portal's Print compose file can't be started as it is: None when there is no such
+    file, '' when it can. Checks what compose itself would refuse: the YAML, the service, and a
+    depends_on naming a service CloudTAK doesn't have — TAK Portal 2.0.18 leaves cloudtak-api /
+    -tiles / -store there (ValleyTacticalSolutions/TAK-Portal#69), and starting that would fail."""
+    import yaml as _yaml
+    path = os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            plug = _yaml.safe_load(f) or {}
+    except Exception as e:
+        return f'{_CLOUDTAK_PRINT_PLUGIN_COMPOSE} could not be read ({str(e)[:120]})'
+    svcs = plug.get('services') if isinstance(plug, dict) else None
+    svc = svcs.get(CLOUDTAK_PRINT_SERVICE) if isinstance(svcs, dict) else None
+    if not isinstance(svc, dict):
+        return f'{_CLOUDTAK_PRINT_PLUGIN_COMPOSE} has no {CLOUDTAK_PRINT_SERVICE} service'
+    base = 'docker-compose.yml'
+    if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+        base = 'compose.yaml'
+    try:
+        with open(os.path.join(ct_dir, base), encoding='utf-8') as f:
+            have = set(((_yaml.safe_load(f) or {}).get('services') or {}).keys())
+    except Exception as e:
+        return f"CloudTAK's {base} could not be read ({str(e)[:120]})"
+    for need in ('api', 'tiles'):
+        if need not in have:
+            return f"CloudTAK's {base} has no {need} service"
+    deps = svc.get('depends_on') or []
+    names = list(deps) if isinstance(deps, (list, dict)) else []
+    missing = sorted(str(n) for n in names if n not in have and n not in svcs)
+    if missing:
+        return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
+                "a newer TAK Portal release fixes this — reinstall Print after updating TAK Portal")
+    return ''
+
+
+def _cloudtak_print_containers(ct_dir):
+    """[(name, [config files])] for the running cloudtak-print containers of the CloudTAK project,
+    or None when CloudTAK isn't running (or docker can't tell)."""
+    proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
+                            '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
+    if not proj:
+        return None
+    rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
+                           '--filter', f'label=com.docker.compose.service={CLOUDTAK_PRINT_SERVICE}',
+                           '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
+                           '|{{.Label "com.docker.compose.service"}}'])
+    if rows is None:
+        return None
+    out = []
+    for row in rows.splitlines():
+        name, _, rest = row.partition('|')
+        files, _, service = rest.partition('|')
+        if name.strip() and service.strip() == CLOUDTAK_PRINT_SERVICE:
+            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()]))
+    return out
+
+
+def _cloudtak_print_drift(ct_dir):
+    """Running cloudtak-print containers that were NOT started with infra-TAK's Print overlay while
+    TAK Portal's Print is installed — what every TAK Portal install / update / rebuild of Print
+    leaves (no loopback port, wrong internal URLs). Guard Dog's tak-cloudtak-watch.sh applies the
+    same rule. [] when clean, not installed, or docker can't tell."""
+    if not os.path.isfile(os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)):
+        return []
+    return [n for n, files in (_cloudtak_print_containers(ct_dir) or [])
+            if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+
+
+def _cloudtak_print_converge(ct_dir, plog=None):
+    """ops #222: make TAK Portal's Print reachable through infra-TAK's Caddy, or tidy up after it
+    is gone. Idempotent; returns 'absent', 'unusable', 'ok' or 'failed'. Never raises.
+
+      * Print installed and startable: write the overlay; if cloudtak-print isn't running from it
+        (TAK Portal started it, or it isn't running) while CloudTAK is up, start it from base +
+        TAK Portal's file + the overlay + the operator's custom file. --no-build: TAK Portal built
+        the image; a start must never turn into a Chromium build.
+      * Not installed, or its file can't be started: remove the overlay.
+
+    Then, when the generated Caddyfile's /print-api route doesn't follow the overlay, regenerate
+    and reload Caddy (_cloudtak_print_caddy)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    result = 'failed'
+    try:
+        overlay = os.path.join(ct_dir, CLOUDTAK_PRINT_OVERLAY)
+        problem = _cloudtak_print_problem(ct_dir)
+        if problem is None or problem:
+            if os.path.lexists(overlay):
+                os.remove(overlay)
+                _log("  Print is no longer installed: removed infra-TAK's Print settings and the /print-api route"
+                     if problem is None else "  Print can't be started: removed infra-TAK's Print settings")
+            if problem:
+                _log(f"  ⚠ TAK Portal's Print plugin can't be started: {problem}")
+            result = 'absent' if problem is None else 'unusable'
+        else:
+            try:
+                with open(overlay, encoding='utf-8') as f:
+                    changed = f.read() != _CLOUDTAK_PRINT_OVERLAY_YML
+            except OSError:
+                changed = True
+            if changed:
+                with open(overlay, 'w', encoding='utf-8') as f:
+                    f.write(_CLOUDTAK_PRINT_OVERLAY_YML)
+            rows = _cloudtak_print_containers(ct_dir)
+            stale = [n for n, files in (rows or [])
+                     if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+            result = 'ok'
+            if rows is not None and (changed or stale or not rows):
+                base = 'docker-compose.yml'
+                if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+                    base = 'compose.yaml'
+                files = [base, _CLOUDTAK_PRINT_PLUGIN_COMPOSE, CLOUDTAK_PRINT_OVERLAY]
+                if os.path.exists(os.path.join(ct_dir, CLOUDTAK_CUSTOM_COMPOSE)):
+                    files.append(CLOUDTAK_CUSTOM_COMPOSE)
+                args = [a for f in files for a in ('-f', f)]
+                rc, out = _cloudtak_compose_run(
+                    ct_dir, args + ['up', '-d', '--no-deps', '--no-build', CLOUDTAK_PRINT_SERVICE], timeout=180)
+                if rc == 0:
+                    _log(f"  Print (cloudtak-print) started on 127.0.0.1:{CLOUDTAK_PRINT_PORT} for /print-api")
+                else:
+                    tail = ' '.join((out or '').strip().splitlines()[-3:])[:300]
+                    _log(f"  ⚠ Could not start Print with infra-TAK's settings: {tail}")
+                    result = 'failed'
+    except Exception as e:
+        _log(f"  ⚠ Print setup error (non-fatal): {str(e)[:200]}")
+    try:
+        _cloudtak_print_caddy_converge(_log)
+    except Exception as e:
+        _log(f"  ⚠ Could not update the /print-api route (non-fatal): {str(e)[:200]}")
+    return result
+
+
 def _cloudtak_remote_reclone_sh(release_tag=None):
     """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
     deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
@@ -47716,6 +48021,7 @@ def run_cloudtak_deploy(cfg=None):
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
 
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -47969,6 +48275,7 @@ def run_cloudtak_redeploy(cfg=None):
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         try:
             _mediamtx_converge_cloudtak_read(plog)
         except Exception as _ct_rd_e:
@@ -49031,6 +49338,8 @@ def run_cloudtak_update():
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
+        if not is_remote:
+            _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -61892,11 +62201,14 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
 _GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
 _GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
 _AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+_AK_UPDATE_INPROC = {'since': 0.0}       # ops #214: this console's own Update, marker or not
 
 
 def _guarddog_authentik_update_begin(what):
     """Tell Guard Dog's Authentik watcher a console update is under way. Best effort:
     without Guard Dog (no state dir) there is no watcher to tell."""
+    # ops #214: the console's own watchdogs are told even without Guard Dog.
+    _AK_UPDATE_INPROC['since'] = time.time()
     if not os.path.isdir(os.path.dirname(_GD_AUTHENTIK_UPDATE_MARKER)):
         return False
     try:
@@ -61908,6 +62220,7 @@ def _guarddog_authentik_update_begin(what):
 
 
 def _guarddog_authentik_update_end():
+    _AK_UPDATE_INPROC['since'] = 0.0
     try:
         subprocess.run(_sudo_wrap(['rm', '-f', _GD_AUTHENTIK_UPDATE_MARKER]),
                        capture_output=True, timeout=15)
@@ -61932,6 +62245,69 @@ def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S
             break
         time.sleep(every_s)
     _guarddog_authentik_update_end()
+
+
+# --- Console watchdogs stand down while Authentik is being changed (ops #214) --
+# Guard Dog's watcher honours the marker above (#167); the console's own watchdogs did
+# not. test12, 2026-10-24 (Authentik 2026.8.5 update): the ldap-sa-watchdog saw the bind
+# fail mid-recreate and ran a service-account heal ("heal INCOMPLETE ... Connection
+# refused"). Harmless that time, but the channels-pool watchdog's `docker restart
+# authentik-server-1` on two unhealthy ticks is exactly the mid-migration restart #167
+# took away from Guard Dog. So each of them asks this first and skips its tick.
+
+def _authentik_compose_lock_busy():
+    """True when someone else holds the compose lock right now. Probes without waiting
+    and without creating the file; holds it for no longer than the probe. Every other
+    party waits for the lock (`flock -w`, the console's retry loop), so the probe can
+    never make one of them skip."""
+    if getattr(_AK_COMPOSE_LOCK_HELD, 'depth', 0) > 0:
+        return False   # this thread holds it: not a reason for its own work to stop
+    import fcntl as _fcntl
+    try:
+        fh = open(_AK_COMPOSE_LOCK_PATH, 'r')
+    except OSError:
+        return False   # no lock file: nobody has taken it since boot
+    try:
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return True
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        return False
+    finally:
+        fh.close()
+
+
+def _guarddog_authentik_update_marker_age():
+    """Age in seconds of a fresh Guard Dog update marker, else None. Same rule as the
+    watcher: older than _GD_AUTHENTIK_UPDATE_MAX_S, unreadable or in the future = ignored
+    (the watcher removes those; the console can't without the broker and needn't)."""
+    try:
+        with open(_GD_AUTHENTIK_UPDATE_MARKER) as f:
+            since = int((f.readline().split() or ['x'])[0])
+    except (OSError, ValueError):
+        return None
+    age = int(time.time()) - since
+    return age if 0 <= age < _GD_AUTHENTIK_UPDATE_MAX_S else None
+
+
+def _authentik_busy_reason():
+    """Why a console watchdog must leave Authentik alone this tick, or '' when it may act."""
+    if _authentik_compose_lock_busy():
+        return 'the Authentik compose lock is held (a recreate is running)'
+    age = _guarddog_authentik_update_marker_age()
+    if age is not None:
+        return f'an Authentik update is in progress (update marker {age}s old)'
+    # The marker is only written where Guard Dog is installed. This console's own Update
+    # is tracked in-process too, until Authentik answers again (i.e. after migrations).
+    since = _AK_UPDATE_INPROC['since']
+    if since:
+        if time.time() - since < _GD_AUTHENTIK_UPDATE_MAX_S and not _local_authentik_http_ok():
+            return f'an Authentik update is in progress ({int(time.time() - since)}s, migrations not finished)'
+        _AK_UPDATE_INPROC['since'] = 0.0
+    if _authentik_deploy_in_progress():
+        return 'an Authentik/TAK deploy is in progress (or just finished)'
+    return ''
 
 
 def _recreate_authentik_server_worker(plog, reason):
@@ -64704,6 +65080,46 @@ def _tak_client_sessions_wait(plog, tag):
         delay, retried = min(delay * 2, _TAK_MARTI_READ_RETRY_MAX_S), True
 
 
+def _tak_log_removed_subscriptions(uids):
+    """Those of these connection uids (tls:N / ssl:N) that TAK's messaging log says it removed
+    since TAK Server last started, although it may still list them (ops #223). TAK numbers
+    connections from 1 again at every start, so only lines after the log's last start line
+    count. None when the log can't be read."""
+    uids = [u for u in dict.fromkeys(uids) if re.fullmatch(r'(?:tls|ssl):\d+', u or '')]
+    if not uids:
+        return set()
+    started = 'Started TAK Server messaging Microservice'
+    path = '/opt/tak/logs/takserver-messaging.log'
+    if _tak_is_container():
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-a', '-E', '-e', started, '-e',
+                                           r'Subscription: (id=)?(%s)( |$)' % '|'.join(uids), path]),
+                               capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        if r.returncode not in (0, 1):   # 1 = no line matched
+            return None
+        lines = (r.stdout or '').splitlines()
+    else:
+        # Read directly, like _diag_tail: TAK's logs are world-readable, and `grep` is not on
+        # the broker's allow-list (a denied call on a non-root box holds enforce mode off).
+        try:
+            with open(path, 'rb') as f:
+                lines = [l.decode('utf-8', 'replace') for l in f
+                         if b'Subscription: ' in l or started.encode() in l]
+        except OSError:
+            return None
+    last = {}
+    for line in lines:
+        if started in line:
+            last.clear()
+            continue
+        m = re.search(r'\b(Added|Removed) Subscription: (?:id=)?((?:tls|ssl):\d+)(?: |$)', line)
+        if m and m.group(2) in uids:
+            last[m.group(2)] = m.group(1)
+    return {u for u, what in last.items() if what == 'Removed'}
+
+
 def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     """Give TAK's live client connections their LDAP groups back after an LDAP outage,
     without restarting TAK Server (ops #126). LDAP must already be verified healthy.
@@ -64723,8 +65139,10 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
        history can't name it (test12, ops #131: the history left that device out). TAK names
        every cert connection whose lookup completes — a user LDAP doesn't know still gets
        its name and __ANON__ — so "no user, no groups" is a lookup that failed.
-       One TAK refuses to drop counts as gone when it has left the list since, or a newer
-       connection from the same client has its groups (ops #172: a ghost TAK still lists).
+       One TAK refuses to drop counts as gone when it has left the list since, TAK's
+       messaging log has it removed, or a newer connection from the same client is listed
+       (ops #172, #223: a ghost TAK still lists). That newer one, if it has no groups either,
+       is judged itself.
     3. Wait for those clients to reconnect (same device uid); repeat once for any that came
        back empty. One that comes back named, with no groups, as a user LDAP gives none is
        fine: that is what it is.
@@ -64850,18 +65268,44 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     # connection had its groups. If the refused one is gone now, or a newer connection from
     # the same client has its groups, TAK's LDAP path works: it is gone, not a reason to
     # restart TAK.
-    replaced = []
+    # ops #223: test8, a client reconnecting every 15 s (1085 connects that day). TAK logged
+    # its tls:334 "Removed" 50 ms after adding it, still listed it 45 min later with no
+    # groups, and dropped each newer connection of that client within 50 ms too, so none was
+    # ever listed with groups and every update or heal restarted TAK, which fixed nothing.
+    # So a refused one is also gone when TAK's messaging log has it removed, or when any
+    # newer connection from the same client is listed. A newer one with no groups either is
+    # then judged itself: still listed, still owed and not removed in the log, it is stuck.
+    replaced, later = [], []
     if undroppable:
         now = _tak_client_sessions(devices)
         if now is not None:
             live = {s['uid'] for s in now}
+            newer = {d['uid']: [s for s in now if _same_client(d, s)] for d in undroppable}
+            listed = [d['uid'] for d in undroppable if d['uid'] in live and not newer[d['uid']]]
+            removed = (_tak_log_removed_subscriptions(listed) or set()) if listed else set()
             replaced = [d for d in undroppable
-                        if d['uid'] not in live or any(s['groups'] and _same_client(d, s) for s in now)]
+                        if d['uid'] not in live or newer[d['uid']] or d['uid'] in removed]
             undroppable = [d for d in undroppable if d not in replaced]
             if replaced:
-                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced by a newer "
-                     "connection from the same client with its groups: " + ', '.join(_label(s) for s in replaced[:15]))
-    stuck = owed + undroppable
+                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced: "
+                     + ', '.join(_label(d) + (' (removed in TAK\'s log)' if d['uid'] in removed else
+                                             ' (a newer connection from the client)' if newer[d['uid']] else '')
+                                 for d in replaced[:15]))
+            judged = {s['uid'] for s in owed}
+            later = list({s['uid']: s for d in replaced for s in newer[d['uid']]
+                          if _owed(s) and s['uid'] not in judged}.values())
+            if later:
+                time.sleep(5)   # TAK may still be assigning its groups
+                again = _tak_client_sessions(devices)
+                if again is not None:
+                    cur = {s['uid']: s for s in again}
+                    later = [cur[s['uid']] for s in later if s['uid'] in cur and _owed(cur[s['uid']])]
+                    gone_too = (_tak_log_removed_subscriptions(s['uid'] for s in later) or set()) if later else set()
+                    later = [s for s in later if s['uid'] not in gone_too]
+                if later:
+                    plog(f"  {tag}: {len(later)} newer connection(s) from those client(s) have no groups either: "
+                         + ', '.join(_label(s) for s in later[:15]))
+    stuck = owed + undroppable + later
     healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
 
     parts = []
@@ -64872,8 +65316,8 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
     if replaced:
-        parts.append(f"{len(replaced)} TAK couldn't drop already gone or replaced by a newer connection "
-                     "with its groups")
+        parts.append(f"{len(replaced)} TAK couldn't drop already gone (removed by TAK, or replaced by a newer "
+                     "connection from the same client)")
     if blind:
         parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
                      "they reconnect by themselves and are looked up again")
@@ -67085,6 +67529,15 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(120)
                 continue
 
+            # ops #214: an updating server is unhealthy and its pool is in flux — restarting
+            # it here lands mid-migration (#167). No samples either: they would skew autotune.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ak-pg-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _consecutive_unhealthy = 0
+                _wt.sleep(120)
+                continue
+
             _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 150)
             # v0.9.36: separate threshold for idle-in-transaction connections.
             _idle_in_tx_threshold = int(
@@ -67854,6 +68307,15 @@ def _authentik_ldap_sa_bind_watchdog_loop():
 
             _env_pass = _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
             if not _env_pass:
+                _wt.sleep(300)
+                continue
+
+            # ops #214: a bind that fails because Authentik is mid-update is not drift.
+            # Skip the whole tick (heal, role check, audit scrape); the next one reassesses.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ldap-sa-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _ok_counter = 0
                 _wt.sleep(300)
                 continue
 
@@ -69360,8 +69822,10 @@ def _authentik_spiral_monitor():
             # container (e.g. postgresql) force-recreated-but-not-started, which makes
             # authentik-server unhealthy and breaks the LDAP SA / webadmin sync on a
             # fresh deploy. See the _with_authentik_deploy_guard block comment.
-            if _authentik_deploy_in_progress():
-                print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
+            # ops #214: an Authentik update / held compose lock counts the same.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[spiral monitor] {_busy} — standing down this cycle "
                       "(avoids concurrent docker compose on the authentik project)", flush=True)
                 continue
 
@@ -75728,6 +76192,13 @@ def takserver_cot_db_size():
 # Table names come from the fixed allowlist below, never from a request.
 _COTDB_TABLES = ('cot_router',)
 
+# ops #227: the cot_router rows retention actually deletes — tak-retention-guard.sh's
+# EXPIRED_WHERE (TAK's own LocalQueryService.deleteCotByTtl predicate) minus the age
+# bound. Mission content (mission_uid) and legacy GeoChat ('b-t-f') are kept on
+# purpose, so an old one of those is never evidence that retention has stalled.
+_COTDB_EXPIRABLE_WHERE = ("cr.cot_type <> 'b-t-f' AND NOT EXISTS "
+                          "(SELECT 1 FROM mission_uid mu WHERE mu.uid = cr.uid)")
+
 # psql prints this when it runs as the postgres OS user from a cwd that user
 # cannot read — e.g. a console installed under /home/<operator>/infra-TAK on a
 # non-root box. Harmless, unrelated to the query, and on 2026-08-10 it was
@@ -76041,6 +76512,54 @@ def _cotdb_facts(tak_cfg=None):
                 if tbl.strip():
                     f['fk_dependents'].append({'table': tbl.strip(), 'constraint': con.strip()})
 
+    # GH #273: data_feed_cot links feeds to cot_router rows with no foreign key, so
+    # retention leaves every link behind and the table only grows (reporter: 71.7M
+    # rows / 4.5 GB, all orphans; pg_stat showed n_live_tup = 0 for it). Its size
+    # comes from the catalog, never from tuple stats, and "has orphans" is one
+    # LIMIT 1 probe down the cot_router_id index — the same anti-join the retention
+    # guard's Step 2b deletes with.
+    f['feed_cot_bytes'] = None
+    f['feed_cot_orphans'] = None
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT CASE WHEN to_regclass('public.data_feed_cot') IS NULL THEN '' ELSE "
+        "pg_total_relation_size('public.data_feed_cot')::text || '|' || "
+        "(SELECT EXISTS (SELECT 1 FROM data_feed_cot d WHERE NOT EXISTS "
+        "(SELECT 1 FROM cot_router c WHERE c.id = d.cot_router_id)))::text END;", timeout=25)
+    if ok and '|' in out:
+        size_s, _, orph = out.strip().splitlines()[-1].partition('|')
+        if size_s.strip().isdigit():
+            f['feed_cot_bytes'] = int(size_s.strip())
+        f['feed_cot_orphans'] = orph.strip() in ('t', 'true')
+    elif not ok and out:
+        f['errors'].append(f'data_feed_cot: {out[:200]}')
+    f['feed_cot_human'] = (_cotdb_fmt_bytes(f['feed_cot_bytes'])
+                           if f['feed_cot_bytes'] is not None else '-')
+
+    # GH #273 (smaller note): the same data package uploaded again and again — the
+    # reporter's `resource` table held 6 identical copies of a 501 MB GeoTIFF. TAK
+    # already stores a hash per row; this only REPORTS repeats. Deleting a package
+    # is TAK's call (its Web Admin), not ours, so nothing here removes anything.
+    f['dup_packages'] = []
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT count(*), COALESCE(sum(pg_column_size(data)), 0)::bigint, "
+        "max(replace(replace(COALESCE(name, filename, ''), '|', ' '), E'\\n', ' ')) "
+        "FROM resource WHERE hash IS NOT NULL AND hash <> '' "
+        "GROUP BY hash HAVING count(*) > 1 "
+        "ORDER BY sum(pg_column_size(data)) DESC NULLS LAST LIMIT 5;", timeout=25)
+    if ok:
+        for line in (out or '').splitlines():
+            parts = line.split('|', 2)
+            if len(parts) == 3 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                copies, total = int(parts[0].strip()), int(parts[1].strip())
+                f['dup_packages'].append({
+                    'name': parts[2].strip()[:120] or '(unnamed)', 'copies': copies,
+                    'bytes': total, 'human': _cotdb_fmt_bytes(total),
+                    'extra_human': _cotdb_fmt_bytes(total - total // copies)})
+
     f['retention_hours'] = _cotdb_retention_hours()
     f['retention_proc_alive'] = _cotdb_retention_proc_alive()
     f['guard_timer_enabled'] = _cotdb_systemctl(['is-enabled', 'takretentionguard.timer']) or 'unknown'
@@ -76068,8 +76587,32 @@ def _cotdb_facts(tak_cfg=None):
                                  if f['largest_table_bytes'] else None)
     f['compact_needed_human'] = (_cotdb_fmt_bytes(f['compact_needed_bytes'])
                                  if f['compact_needed_bytes'] else '-')
-    f['retention_stalled'] = bool(f['retention_hours'] and f['oldest_age_secs']
-                                  and f['oldest_age_secs'] > f['retention_hours'] * 3600 * 2)
+    # ops #227: on a box with missions the oldest row is usually mission content that
+    # retention keeps on purpose, and the card said "Retention is stalled" for
+    # exactly that. Judge it on the oldest row retention WOULD delete. The scan
+    # only covers rows already past the stall line, which on a healthy box are just
+    # the kept ones, so it stays small.
+    stall_secs = int(f['retention_hours']) * 3600 * 2 if f['retention_hours'] else 0
+    f['oldest_expirable_age_secs'] = f['oldest_age_secs']
+    f['old_rows_kept'] = False
+    if stall_secs and f['oldest_age_secs'] and f['oldest_age_secs'] > stall_secs:
+        ok, out = _cotdb_psql(
+            tak_cfg,
+            "SET statement_timeout = '20s'; "
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(cr.servertime)))::bigint, 0) "
+            f"FROM cot_router cr WHERE cr.servertime < now() - interval '{stall_secs} seconds' "
+            f"AND {_COTDB_EXPIRABLE_WHERE};", timeout=30)
+        last = out.strip().splitlines()[-1].strip() if ok and out.strip() else ''
+        if last.isdigit():
+            f['oldest_expirable_age_secs'] = int(last)
+            f['old_rows_kept'] = not int(last)
+        else:
+            # Unknown is not "fine": keep the whole-table answer so a real stall
+            # still raises the alarm, and record why the card could not tell.
+            f['errors'].append(f'retention-eligible age: {(out or "no answer")[:200]}')
+    f['oldest_expirable_age_human'] = _cotdb_fmt_age(f['oldest_expirable_age_secs'])
+    f['retention_stalled'] = bool(stall_secs and f['oldest_expirable_age_secs']
+                                  and f['oldest_expirable_age_secs'] > stall_secs)
     f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
     return f
 
@@ -76111,8 +76654,20 @@ def _cotdb_verdict(facts):
     database of which data_feed_cot is 5.6 GB, verdict retention_stalled,
     recommendation Purge."""
     verdict, headline, detail, recommend = _cotdb_verdict_tree(facts)
+    lt = facts.get('largest_table')
+    if facts.get('feed_cot_orphans'):
+        # GH #273: test8's 5.6 GB data_feed_cot (above) was this — links to CoT rows
+        # retention had already deleted. Purge cannot reach it; the retention guard can.
+        detail += (f" data_feed_cot holds {facts.get('feed_cot_human', '-')} including links to CoT "
+                   "rows that no longer exist. Guard Dog's retention guard deletes those every "
+                   "15 minutes in batches; Run Retention Now starts it immediately. PostgreSQL reuses "
+                   "the freed space once autovacuum has run; Online Compact gives it back to the disk.")
+        recommend = list(recommend or [])
+        if 'retention_run' not in recommend:
+            recommend.insert(0, 'retention_run')
+        if lt == 'data_feed_cot':
+            return verdict, headline, detail, recommend
     if 'purge' in (recommend or []):
-        lt = facts.get('largest_table')
         if lt and lt not in _COTDB_TABLES:
             detail += (f" NOTE: the largest table here is {lt} "
                        f"({facts.get('largest_table_human', '-')}), which Purge Old CoT does "
@@ -76144,7 +76699,8 @@ def _cotdb_verdict_tree(facts):
             causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
         if not causes:
             causes.append('retention is configured but has not been deleting')
-        detail = (f"Retention is set to {rh} h but the oldest CoT row is {facts['oldest_age_human']} old - "
+        detail = (f"Retention is set to {rh} h but the oldest CoT row it should have deleted is "
+                  f"{facts.get('oldest_expirable_age_human') or facts['oldest_age_human']} old - "
                   f"retention is not deleting. Compacting will not help; the space is live data. "
                   f"Cause: {'; '.join(causes)}.")
         return ('retention_stalled', 'Retention is stalled', detail, ['retention_run', 'purge'])
@@ -76209,7 +76765,10 @@ def _cotdb_verdict_tree(facts):
                    else f"{(dead if dead is not None else 0):,} dead tuples")
     detail = (f"{dead_phrase}, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
-              f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
+              f"{facts.get('oldest_age_human', '-')} old"
+              + (" (mission content or GeoChat, which retention keeps on purpose)"
+                 if facts.get('old_rows_kept') else '')
+              + ". Nothing to do.")
     # (No "TTL not set" note here any more — that case returns its own red
     #  no_retention verdict above instead of riding along on a green one.)
     return ('healthy', 'Database looks healthy', detail, [])
@@ -76601,6 +77160,181 @@ def guarddog_cotdb_purge():
 def guarddog_cotdb_purge_status():
     """Poll the batched (mode=age) purge."""
     return jsonify({'success': True, **_cotdb_purge_status})
+
+
+# ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ─────────
+# upgrade-db.sh's pg_upgrade runs in copy mode, so the 15 cluster survives, stopped, as
+# the rollback — and nothing ever removed it (reporter: 15 GB, untouched for 10 days,
+# next to a 14 GB PostgreSQL 18; test6: 3 GB). The card reports it and offers a
+# password-gated Remove once 18 is the live database. Nothing is removed automatically:
+# it is the only way back from a bad migration, so dropping it is the operator's call.
+#
+# Local (native) boxes go through the broker's fixed-shape `pg_old_cluster` op, which
+# re-checks every precondition itself. A two-server Server One runs the same checks in
+# the fixed script below over SSH. No request value reaches either: the action is one
+# of two literals, the majors and paths are constants.
+_PG_OLD_CLUSTER_MAJOR = 15
+_PG_OLD_CLUSTER_SH = r'''set -u
+ACTION="__ACTION__"
+pgdir() {
+  for d in "/var/lib/postgresql/$1/main" "/var/lib/pgsql/$1/data"; do
+    if [ -d "$d" ] && [ ! -L "$d" ] && [ "$(cat "$d/PG_VERSION" 2>/dev/null)" = "$1" ]; then
+      echo "$d"; return 0
+    fi
+  done
+  return 1
+}
+OLD=$(pgdir 15) || OLD=""
+if [ -z "$OLD" ]; then
+  echo "found=0"
+  [ "$ACTION" = "drop" ] && { echo "error=no PostgreSQL 15 cluster found"; exit 1; }
+  exit 0
+fi
+NEW=$(pgdir 18) || NEW=""
+FAM=rhel; case "$OLD" in /var/lib/postgresql/*) FAM=debian ;; esac
+RUN=0; [ -e "$OLD/postmaster.pid" ] && RUN=1
+NEWRUN=0; [ -n "$NEW" ] && [ -e "$NEW/postmaster.pid" ] && NEWRUN=1
+KB=$(du -sk "$OLD" 2>/dev/null | awk '{print $1}')
+BYTES=$(( ${KB:-0} * 1024 ))
+echo "found=1"; echo "family=$FAM"; echo "path=$OLD"; echo "running=$RUN"
+echo "new_path=$NEW"; echo "new_running=$NEWRUN"; echo "bytes=${BYTES:-0}"
+[ "$ACTION" = "drop" ] || exit 0
+[ "$RUN" = "1" ] && { echo "error=the PostgreSQL 15 cluster is running, not removing it"; exit 1; }
+[ "$NEWRUN" = "1" ] || { echo "error=no running PostgreSQL 18 cluster, the 15 cluster may still be the only database"; exit 1; }
+if [ "$FAM" = "debian" ] && command -v pg_dropcluster >/dev/null 2>&1; then
+  pg_dropcluster 15 main >/dev/null 2>&1
+else
+  systemctl disable postgresql-15 >/dev/null 2>&1
+fi
+[ -d "$OLD" ] && [ ! -L "$OLD" ] && rm -rf "$OLD"
+if [ -e "$OLD" ]; then echo "removed=0"; echo "error=$OLD is still present"; exit 1; fi
+echo "removed=1"; echo "freed_bytes=${BYTES:-0}"
+'''
+
+
+def _pg_old_cluster_call(action, tak_cfg):
+    """Ask (action='inspect') or remove (action='drop') the leftover 15 cluster where
+    TAK's database lives. Returns the broker op's dict shape; never raises."""
+    if action not in ('inspect', 'drop'):
+        return {'ok': False, 'error': 'bad action'}
+    mode = (tak_cfg or {}).get('mode') or ''
+    if mode == 'two_server':
+        s1 = tak_cfg.get('server_one') or {}
+        if not (s1.get('host') or '').strip():
+            return {'ok': False, 'error': 'Server One host not configured'}
+        script = _PG_OLD_CLUSTER_SH.replace('__ACTION__', action)
+        ok, out = _ssh_probe(s1, 'cd / && sudo -n bash -c ' + shlex.quote(script),
+                             timeout=1800 if action == 'drop' else 120)
+        res = {'ok': ok, 'where': 'Server One (%s)' % s1.get('host')}
+        for line in (out or '').splitlines():
+            k, sep, v = line.strip().partition('=')
+            if not sep or k not in ('found', 'family', 'path', 'running', 'new_path',
+                                    'new_running', 'bytes', 'removed', 'freed_bytes', 'error'):
+                continue
+            if k in ('found', 'running', 'new_running', 'removed'):
+                res[k] = v.strip() == '1'
+            elif k in ('bytes', 'freed_bytes'):
+                res[k] = int(v) if v.strip().isdigit() else 0
+            else:
+                res[k] = v.strip()
+        if 'found' not in res:
+            res['ok'] = False
+            res.setdefault('error', (out or 'no answer from Server One')[:300])
+        return res
+    if mode == 'external_db' or _tak_is_container():
+        # A managed database has no cluster of ours on disk; container TAK keeps its
+        # PostgreSQL 15 data in a docker volume the 5.8 migration names itself.
+        return {'ok': True, 'found': False, 'not_applicable': True}
+    req = {'op': 'pg_old_cluster', 'action': action}
+    try:
+        if _broker_should_route() and _broker_available():
+            res = _broker_request(req, timeout=1800 if action == 'drop' else 300)
+        elif os.getuid() == 0:
+            m = _broker_module()
+            m._check_pg_old_cluster(req)
+            res = m._do_pg_old_cluster(req)
+        else:
+            return {'ok': False, 'error': 'privilege broker unavailable'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}
+    res['where'] = 'this server'
+    return res
+
+
+def _pg_old_cluster_state(tak_cfg):
+    """inspect + the console's own "is PostgreSQL 18 really the live database" check.
+    `removable` is what gates the card's Remove button."""
+    res = _pg_old_cluster_call('inspect', tak_cfg)
+    if not res.get('found'):
+        return res
+    ok, out = _cotdb_psql(tak_cfg,
+                          "SELECT current_setting('server_version_num')::int / 10000, "
+                          "current_setting('data_directory'), "
+                          "(SELECT count(*) FROM pg_database WHERE datname = 'cot');",
+                          db='postgres', timeout=20)
+    parts = out.strip().split('|') if ok else []
+    live_major = int(parts[0]) if len(parts) == 3 and parts[0].strip().isdigit() else None
+    live_dir = parts[1].strip() if len(parts) == 3 else ''
+    has_cot = len(parts) == 3 and parts[2].strip() not in ('', '0')
+    res['live_major'] = live_major
+    res['bytes_human'] = _cotdb_fmt_bytes(res.get('bytes') or 0)
+    why = None
+    if res.get('running'):
+        why = 'The PostgreSQL %d cluster is still running.' % _PG_OLD_CLUSTER_MAJOR
+    elif live_major is None or not has_cot:
+        why = 'Could not confirm that the live database is healthy, so removal is not offered.'
+    elif live_major <= _PG_OLD_CLUSTER_MAJOR or live_dir == res.get('path'):
+        why = 'PostgreSQL %d is still the live database.' % _PG_OLD_CLUSTER_MAJOR
+    elif not res.get('new_running'):
+        why = 'The PostgreSQL %d cluster is not running.' % live_major
+    res['removable'] = why is None
+    res['not_removable_reason'] = why
+    return res
+
+
+@app.route('/api/guarddog/pg-old-cluster')
+@login_required
+def guarddog_pg_old_cluster():
+    """Read-only: is a stopped PostgreSQL 15 cluster still on disk, and how big is it."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    res = _pg_old_cluster_state(_get_tak_deployment_config(load_settings()))
+    return jsonify({'success': bool(res.get('ok', True)), **res})
+
+
+@app.route('/api/guarddog/pg-old-cluster/remove', methods=['POST'])
+@login_required
+def guarddog_pg_old_cluster_remove():
+    """DESTRUCTIVE: remove the leftover PostgreSQL 15 cluster — the 5.8 migration's
+    rollback copy. Password + typed confirmation, same gate as Purge Old CoT."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    want = str(_PG_OLD_CLUSTER_MAJOR)
+    if (data.get('confirm') or '').strip() != want:
+        return jsonify({'success': False, 'error': "confirm must be exactly '%s'." % want,
+                        'expected_confirm': want}), 400
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    st = _pg_old_cluster_state(tak_cfg)
+    if not st.get('found'):
+        return jsonify({'success': False, 'error': 'No PostgreSQL %s cluster found.' % want}), 400
+    if not st.get('removable'):
+        return jsonify({'success': False, 'error': st.get('not_removable_reason') or 'Not removable.'}), 409
+    audit('guarddog:pg-old-cluster', 'remove PostgreSQL %s cluster %s on %s (%s)'
+          % (want, st.get('path'), st.get('where'), st.get('bytes_human')), force=True)
+    res = _pg_old_cluster_call('drop', tak_cfg)
+    ok = bool(res.get('ok') and res.get('removed'))
+    audit('guarddog:pg-old-cluster', ('removed, freed %s' % st.get('bytes_human')) if ok
+          else ('FAILED: %s' % (res.get('error') or 'unknown')[:200]), force=True)
+    if not ok:
+        return jsonify({'success': False, 'error': res.get('error') or 'Removal failed.'}), 500
+    return jsonify({'success': True, 'freed_human': st.get('bytes_human'),
+                    'message': 'Removed the PostgreSQL %s cluster (%s) on %s and freed %s.'
+                               % (want, st.get('path'), st.get('where'), st.get('bytes_human'))})
 
 
 @app.route('/api/takserver/cert-expiry')
@@ -82455,7 +83189,19 @@ def _tak_rollback(label, plog=None):
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
-    subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=60)  # v10.0.1: container-aware
+    # v10.2.30: the unit's own TimeoutStopSec is 90 s, so the old 60 s cap raised TimeoutExpired
+    # on a slow shutdown. It escaped the rollback thread: the status stayed "running" forever and
+    # TAK Server was left stopped (nuc 2026-10-25). Wait long enough; if it still has not stopped,
+    # bring it back and report — nothing has been restored at this point.
+    try:
+        subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=180)  # v10.0.1: container-aware
+    except subprocess.TimeoutExpired:
+        plog("  rollback: takserver did not stop within 180 s — starting it again, nothing restored")
+        try:
+            subprocess.run(_tak_systemctl('start'), shell=True, capture_output=True, timeout=180)
+        except Exception as _e:
+            plog(f"  rollback: could not start takserver: {str(_e)[:200]}")
+        return False, 'takserver did not stop within 180 s — nothing was restored'
 
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
@@ -92213,6 +92959,10 @@ def _startup_harden_cloudtak_ports():
                 _ct_recreate_clear()
             elif _stage == 'heal':
                 print("Startup migration: CloudTAK media heal did not confirm — recreate stays pending")
+        # ops #222: TAK Portal's Print on loopback with the /print-api route (or both removed
+        # once it is uninstalled). Restarts cloudtak-print only when it isn't running that way.
+        if not os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt')):
+            _cloudtak_print_converge(_ct_dir, lambda m: print(f"Startup migration: {m.strip()}", flush=True))
         # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
         # default-deny firewall, EUD publishes into CloudTAK leases were dropped.
         _cloudtak_open_stream_ports()
@@ -92275,13 +93025,16 @@ _cloudtak_autorepair_lock = threading.Lock()
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'media'|'', 'no_override': [names], 'hls': True|False|None,
-     'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
-    recreate. 'media': only the HLS profile is gone — the media heal alone fixes that. hls None
-    means the read failed, which is never counted as drift (ops #161)."""
+    recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
+    — restarting that one container fixes it. 'media': only the HLS profile is gone — the media
+    heal alone fixes that. hls None means the read failed, which is never counted as drift
+    (ops #161)."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
+           'print': _cloudtak_print_drift(ct_dir),
            'hls': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
@@ -92297,6 +93050,8 @@ def _cloudtak_drift(ct_dir):
             pass
     if out['no_override']:
         out['kind'] = 'recreate'
+    elif out['print']:
+        out['kind'] = 'print'
     elif out['hls'] is False:
         out['kind'] = 'media'
     return out
@@ -92307,6 +93062,8 @@ def _cloudtak_drift_summary(d):
     parts = []
     if d.get('no_override'):
         parts.append("created without infra-TAK's compose override: " + ', '.join(d['no_override']))
+    if d.get('print'):
+        parts.append("Print started without infra-TAK's /print-api settings: " + ', '.join(d['print']))
     if d.get('hls') is False:
         parts.append('HLS profile missing')
     if d.get('media_image'):
@@ -92418,7 +93175,9 @@ def _cloudtak_autorepair_run(ct_dir, drift):
     to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
     operator's custom file stay in it), re-assert the loopback port patch on the base file (the
     recreate must never publish a port we closed), then the journaled recreate + media heal.
-    'media': the media heal alone. Success is judged by a fresh drift check, not by exit codes."""
+    'media': the media heal alone. 'print' (ops #222): Print restarted with infra-TAK's overlay
+    (plus the media heal if that is gone too); every kind ends with that step. Success is judged
+    by a fresh drift check, not by exit codes."""
     def _log(m):
         print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
     result, why = 'failed', ''
@@ -92434,8 +93193,12 @@ def _cloudtak_autorepair_run(ct_dir, drift):
             stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
             why = {'recreate': 'docker compose up --force-recreate failed',
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
-        else:
+        elif drift['kind'] == 'media' or drift.get('hls') is False:
             why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+        # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
+        # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
+        if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
+            why = "Print (cloudtak-print) could not be restarted with infra-TAK's settings"
         after = _cloudtak_drift(ct_dir)
         if not why and after['kind']:
             why = f'still drifted after the repair: {_cloudtak_drift_summary(after)}'
@@ -92469,9 +93232,11 @@ def _cloudtak_autorepair_notify(before, after):
             print("[guarddog] CloudTAK repaired note SUPPRESSED (no recipient configured)", flush=True)
             return
         ident = _guarddog_server_identifier(settings) or socket.gethostname()
-        done = ("rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK Portal's "
-                "compose file and docker-compose.custom.yml kept), then re-applied the HLS profile"
-                if before['kind'] == 'recreate' else 're-applied the HLS profile to cloudtak-media')
+        done = {'recreate': "rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK "
+                            "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
+                            "the HLS profile",
+                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api"
+                }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         body = (
             "CloudTAK lost infra-TAK's settings, most likely because a TAK Portal marketplace plugin\n"
             "install recreated it without them. Guard Dog repaired it by itself. Nothing to do.\n\n"
