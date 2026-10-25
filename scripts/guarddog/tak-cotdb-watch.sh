@@ -180,8 +180,28 @@ PY
     RETENTION_SET=1
   fi
 fi
-OLDEST_SECS=$(cotdb_scalar "SET statement_timeout='20s'; SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(servertime)))::bigint, 0) FROM cot_router;" cot | tr -d '[:space:]')
+# ops #227: psql 15+ prints the SET tag on its own line before the value (seen on
+# PostgreSQL 18), so without `tail -1` this read "SET1358894", failed the numeric
+# check, and the stalled-retention alert below could never fire.
+OLDEST_SECS=$(cotdb_scalar "SET statement_timeout='20s'; SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(servertime)))::bigint, 0) FROM cot_router;" cot | tail -1 | tr -d '[:space:]')
 OLDEST_SECS=$(cotdb_numeric "$OLDEST_SECS")
+
+# ops #227: retention keeps mission content (mission_uid) and legacy GeoChat
+# ('b-t-f') on purpose — tak-retention-guard.sh's EXPIRED_WHERE, TAK's own
+# deleteCotByTtl predicate — so on a box with missions the oldest row is usually
+# one that will never be deleted. "Stalled" is judged on the oldest row retention
+# WOULD delete. The scan only covers rows already past the stall line. If the
+# query fails, the whole-table age stands, so a real stall still alerts.
+STALL_SECS=0
+STALL_AGE_SECS="$OLDEST_SECS"
+if [ "$RETENTION_SET" = "1" ]; then
+  STALL_SECS=$(( RETENTION_HOURS * 3600 * RETENTION_STALE_FACTOR ))
+  if [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$STALL_SECS" ]; then
+    EXPIRABLE_SECS=$(cotdb_scalar "SET statement_timeout='20s'; SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(cr.servertime)))::bigint, 0) FROM cot_router cr WHERE cr.servertime < now() - interval '${STALL_SECS} seconds' AND cr.cot_type <> 'b-t-f' AND NOT EXISTS (SELECT 1 FROM mission_uid mu WHERE mu.uid = cr.uid);" cot | tail -1 | tr -d '[:space:]')
+    EXPIRABLE_SECS=$(cotdb_numeric "$EXPIRABLE_SECS")
+    [ -n "$EXPIRABLE_SECS" ] && STALL_AGE_SECS="$EXPIRABLE_SECS"
+  fi
+fi
 
 if [ "$RETENTION_SET" = "0" ]; then
   # ── Condition B1: no retention policy AT ALL ──────────────────────────────
@@ -211,9 +231,9 @@ deliberately does not write it — the policy is TAK Server's to own.
 Guard Dog's 15-minute retention guard enforces whatever TTL you set there."
     echo "$(date): CoT no-retention-policy alert sent (db $((COT_SIZE / 1024 / 1024))MB)" >> /var/log/takguard/restarts.log
   fi
-elif [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$(( RETENTION_HOURS * 3600 * RETENTION_STALE_FACTOR ))" ]; then
+elif [ -n "$STALL_AGE_SECS" ] && [ "$STALL_AGE_SECS" -gt "$STALL_SECS" ]; then
   rm -f "$NOTTL_ALERT_FILE"
-  OLDEST_DAYS=$(( OLDEST_SECS / 86400 ))
+  OLDEST_DAYS=$(( STALL_AGE_SECS / 86400 ))
   if cot_latch_ready "$RET_ALERT_FILE"; then
     touch "$RET_ALERT_FILE"
     send_cot_alert "TAK Server CoT retention is not deleting on $SERVER_IDENTIFIER" \
@@ -222,7 +242,8 @@ elif [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$(( RETENTION_HOURS * 3600 *
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS_NOW
 Configured retention: ${RETENTION_HOURS} hours
-Oldest CoT row: ${OLDEST_DAYS} days old (alert fires past ${RETENTION_STALE_FACTOR}x the retention window)
+Oldest CoT row retention should have deleted: ${OLDEST_DAYS} days old (alert fires past ${RETENTION_STALE_FACTOR}x the retention window;
+mission content and GeoChat are kept on purpose and do not count)
 
 The database is therefore growing from LIVE rows, not from reclaimable bloat —
 VACUUM and Online Compact will free nothing here. Left alone this fills the disk.

@@ -75931,6 +75931,13 @@ def takserver_cot_db_size():
 # Table names come from the fixed allowlist below, never from a request.
 _COTDB_TABLES = ('cot_router',)
 
+# ops #227: the cot_router rows retention actually deletes — tak-retention-guard.sh's
+# EXPIRED_WHERE (TAK's own LocalQueryService.deleteCotByTtl predicate) minus the age
+# bound. Mission content (mission_uid) and legacy GeoChat ('b-t-f') are kept on
+# purpose, so an old one of those is never evidence that retention has stalled.
+_COTDB_EXPIRABLE_WHERE = ("cr.cot_type <> 'b-t-f' AND NOT EXISTS "
+                          "(SELECT 1 FROM mission_uid mu WHERE mu.uid = cr.uid)")
+
 # psql prints this when it runs as the postgres OS user from a cwd that user
 # cannot read — e.g. a console installed under /home/<operator>/infra-TAK on a
 # non-root box. Harmless, unrelated to the query, and on 2026-08-10 it was
@@ -76319,8 +76326,32 @@ def _cotdb_facts(tak_cfg=None):
                                  if f['largest_table_bytes'] else None)
     f['compact_needed_human'] = (_cotdb_fmt_bytes(f['compact_needed_bytes'])
                                  if f['compact_needed_bytes'] else '-')
-    f['retention_stalled'] = bool(f['retention_hours'] and f['oldest_age_secs']
-                                  and f['oldest_age_secs'] > f['retention_hours'] * 3600 * 2)
+    # ops #227: on a box with missions the oldest row is usually mission content that
+    # retention keeps on purpose, and the card said "Retention is stalled" for
+    # exactly that. Judge it on the oldest row retention WOULD delete. The scan
+    # only covers rows already past the stall line, which on a healthy box are just
+    # the kept ones, so it stays small.
+    stall_secs = int(f['retention_hours']) * 3600 * 2 if f['retention_hours'] else 0
+    f['oldest_expirable_age_secs'] = f['oldest_age_secs']
+    f['old_rows_kept'] = False
+    if stall_secs and f['oldest_age_secs'] and f['oldest_age_secs'] > stall_secs:
+        ok, out = _cotdb_psql(
+            tak_cfg,
+            "SET statement_timeout = '20s'; "
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(cr.servertime)))::bigint, 0) "
+            f"FROM cot_router cr WHERE cr.servertime < now() - interval '{stall_secs} seconds' "
+            f"AND {_COTDB_EXPIRABLE_WHERE};", timeout=30)
+        last = out.strip().splitlines()[-1].strip() if ok and out.strip() else ''
+        if last.isdigit():
+            f['oldest_expirable_age_secs'] = int(last)
+            f['old_rows_kept'] = not int(last)
+        else:
+            # Unknown is not "fine": keep the whole-table answer so a real stall
+            # still raises the alarm, and record why the card could not tell.
+            f['errors'].append(f'retention-eligible age: {(out or "no answer")[:200]}')
+    f['oldest_expirable_age_human'] = _cotdb_fmt_age(f['oldest_expirable_age_secs'])
+    f['retention_stalled'] = bool(stall_secs and f['oldest_expirable_age_secs']
+                                  and f['oldest_expirable_age_secs'] > stall_secs)
     f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
     return f
 
@@ -76407,7 +76438,8 @@ def _cotdb_verdict_tree(facts):
             causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
         if not causes:
             causes.append('retention is configured but has not been deleting')
-        detail = (f"Retention is set to {rh} h but the oldest CoT row is {facts['oldest_age_human']} old - "
+        detail = (f"Retention is set to {rh} h but the oldest CoT row it should have deleted is "
+                  f"{facts.get('oldest_expirable_age_human') or facts['oldest_age_human']} old - "
                   f"retention is not deleting. Compacting will not help; the space is live data. "
                   f"Cause: {'; '.join(causes)}.")
         return ('retention_stalled', 'Retention is stalled', detail, ['retention_run', 'purge'])
@@ -76472,7 +76504,10 @@ def _cotdb_verdict_tree(facts):
                    else f"{(dead if dead is not None else 0):,} dead tuples")
     detail = (f"{dead_phrase}, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
-              f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
+              f"{facts.get('oldest_age_human', '-')} old"
+              + (" (mission content or GeoChat, which retention keeps on purpose)"
+                 if facts.get('old_rows_kept') else '')
+              + ". Nothing to do.")
     # (No "TTL not set" note here any more — that case returns its own red
     #  no_retention verdict above instead of riding along on a green one.)
     return ('healthy', 'Database looks healthy', detail, [])
