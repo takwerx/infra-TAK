@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.29-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.29-alpha)**
+**Current release: [v10.2.30-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.30-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,26 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.30-alpha — 2026-10-25 — CloudTAK Print from TAK Portal works through infra-TAK's Caddy; no TAK Server restart over a flapping client; Guard Dog handles three disk growers; suggested heap keeps your own settings; Remote Assist TURN-to-TURN calls work; Authentik updates no longer race the console's watchdogs
+
+**Headline: TAK Portal's CloudTAK Print plugin now works through infra-TAK's Caddy instead of returning 502. An update or heal no longer restarts TAK Server because one client keeps reconnecting. Guard Dog cleans up orphaned data feed links, offers to remove the PostgreSQL 15 cluster the TAK 5.8 upgrade left behind, and its build cache cap really prunes. Applying the suggested heap keeps your own lines in `/etc/default/takserver`. Remote Assist calls where both ends relay through this server now connect, and the console's own watchdogs stand down while Authentik updates.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.30-alpha))
+
+**CloudTAK.**
+- **Print from the TAK Portal marketplace (GH #286):** `/print-api` returned 502 because Print's container was only reachable inside Docker. infra-TAK now runs it on `127.0.0.1:5010` with the right internal URLs and routes `/print-api` to it through its Caddy. Nothing changes while Print isn't installed, and uninstalling Print removes the route.
+
+**TAK Server.**
+- **No restart over a flapping client:** after an LDAP outage, the end-of-update / Guard Dog LDAP recycle could restart TAK Server over a "ghost" connection from a client that reconnects every few seconds. It now checks TAK's messaging log and counts a connection TAK has already removed as gone.
+- **Suggested heap keeps your settings (GH #282):** applying the suggested heap now changes only the heap lines in `/etc/default/takserver` and keeps everything else you added.
+- **Rollback:** a TAK rollback waits up to 180 s for TAK Server to stop, and if it doesn't, starts it again and reports the failure instead of leaving it stopped.
+
+**Guard Dog.**
+- **Three disk growers (GH #273):** the retention guard deletes orphaned `data_feed_cot` links in batches; the CoT DB card shows the PostgreSQL 15 cluster left by the 5.8 upgrade with a password-gated **Remove PostgreSQL 15** button (never automatic); and the build cache cap is passed in bytes and prunes down to it. Diagnose also lists duplicate data packages.
+- **Diagnose retention:** no longer says "Retention is stalled" when the only old rows are mission content or GeoChat, which retention keeps on purpose. The matching Guard Dog email follows the same rule.
+
+**Also in this release.**
+- **Remote Assist CoTURN:** a call where both ends fall back to TURN on this server no longer fails with 403. The relay still refuses the box's own and internal addresses.
+- **Authentik updates:** the console's LDAP service-account and channels-pool watchdogs stand down while Authentik is updating or being recreated, so they no longer heal or restart it mid-migration.
 
 ### v10.2.29-alpha — 2026-10-24 — Security: Remote Assist CoTURN, WebODM, and the distrusted emSign root out of every trust store; Authentik 2026.8.5; TAK Portal marketplace plugins survive every CloudTAK action; CloudTAK Deploy keeps its secrets and database; faster LDAP updates; Report an issue in Help
 

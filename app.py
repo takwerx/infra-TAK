@@ -1203,7 +1203,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.30-alpha"
+VERSION = "10.2.31-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -34705,6 +34705,92 @@ def _caddy_registry_loaded():
         print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
 
 
+# ops #222: /print-api on the CloudTAK map site, while infra-TAK has TAK Portal's Print set up on
+# loopback (its overlay exists, _cloudtak_print_converge). It is TAK Portal's own snippet — same
+# name, same matcher — with the one upstream host Caddy can reach. That is deliberate: TAK
+# Portal's "Deploy To Caddy" leaves a `(cloudtak_print)` snippet alone when it is already defined
+# above the CloudTAK site and that site already imports it, and reports the step as applied
+# (applyCaddySnippets / placeNamedSnippet in its cloudtakMarketplace.caddy.js). So it writes
+# nothing, instead of adding its own copy whose upstream, cloudtak-print:5010, is a container
+# name the host can't resolve (a 502), and which Caddy would run first: same-matcher handles keep
+# file order, checked with `caddy adapt`.
+_CADDY_PRINT_SNIPPET = 'cloudtak_print'
+_CADDY_PRINT_IMPORT = f'import {_CADDY_PRINT_SNIPPET}'
+
+
+def _caddy_operator_owns_print(caddyfile_path=None):
+    """True when the operator routes /print-api themselves: an include file (GH #176 — the README
+    example is this very snippet) or the user-blocks part of the Caddyfile names cloudtak_print.
+    Ours would then be a second definition, which Caddy rejects."""
+    for f in _caddy_operator_include_files():
+        try:
+            with open(f, encoding='utf-8', errors='replace') as fh:
+                if _CADDY_PRINT_SNIPPET in fh.read():
+                    return True
+        except OSError:
+            continue
+    try:
+        with open(caddyfile_path or CADDYFILE_PATH, encoding='utf-8', errors='replace') as fh:
+            live = fh.read()
+    except OSError:
+        return False
+    return (CADDYFILE_USER_BLOCKS_MARKER in live
+            and _CADDY_PRINT_SNIPPET in live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[1])
+
+
+def _cloudtak_print_caddy(settings, ct_dir=None):
+    """(top-level snippet lines, lines for inside the CloudTAK map site), or ([], []) — Print not
+    set up, the operator routes it themselves, or CloudTAK is on another host (the overlay
+    publishes on that host's loopback, out of this Caddy's reach)."""
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return [], []
+    except Exception:
+        pass
+    ct_dir = ct_dir or os.path.expanduser('~/CloudTAK')
+    if not os.path.isfile(os.path.join(ct_dir, CLOUDTAK_PRINT_OVERLAY)) or _caddy_operator_owns_print():
+        return [], []
+    snippet = [
+        "# TAK Portal's Print plugin, published on loopback by infra-TAK (ops #222)",
+        f"({_CADDY_PRINT_SNIPPET}) {{",
+        f"    @{_CADDY_PRINT_SNIPPET} path /print-api /print-api/*",
+        f"    handle @{_CADDY_PRINT_SNIPPET} {{",
+        f"        reverse_proxy 127.0.0.1:{CLOUDTAK_PRINT_PORT}",
+        "    }",
+        "}",
+        "",
+    ]
+    return snippet, [f"    {_CADDY_PRINT_IMPORT}"]
+
+
+def _cloudtak_print_caddy_converge(log=None):
+    """Regenerate + reload Caddy when the generated part of the live Caddyfile doesn't route
+    /print-api the way _cloudtak_print_caddy() says: ours missing, ours left over, or TAK Portal's
+    copy (cloudtak-print:5010) in it. Only the generated part is looked at, so a hand-written
+    stanza below the user-blocks marker can't make this loop. Returns True when it regenerated."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = load_settings()
+    if not (settings.get('fqdn') or '').strip():
+        return False
+    try:
+        live = _read_priv(CADDYFILE_PATH)
+    except Exception:
+        return False
+    generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    has = f'reverse_proxy 127.0.0.1:{CLOUDTAK_PRINT_PORT}' in generated and _CADDY_PRINT_IMPORT in generated
+    want = bool(_cloudtak_print_caddy(settings)[0])
+    if has == want and f'{CLOUDTAK_PRINT_SERVICE}:{CLOUDTAK_PRINT_PORT}' not in generated:
+        return False
+    if generate_caddyfile(settings) is None:
+        return False
+    if not _CADDY_REGISTRY_READY.is_set():
+        return True          # deferred: the post-registry catch-up writes and reloads it
+    ok, detail = _caddy_reload_if_changed()
+    _log(f"  Caddy: /print-api {'routed to 127.0.0.1:%d' % CLOUDTAK_PRINT_PORT if want else 'route removed'}"
+         + ('' if ok else f" — reload issue: {str(detail)[:160]}"))
+    return True
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -34724,6 +34810,10 @@ def generate_caddyfile(settings=None):
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
     lines += _caddy_global_options_lines(
         grpc_streams=bool(modules.get('netbird', {}).get('installed')), settings=settings)
+    # ops #222: a snippet has to be defined above the site that imports it.
+    _ct_print_caddy = (_cloudtak_print_caddy(settings) if modules.get('cloudtak', {}).get('installed')
+                       else ([], []))
+    lines += _ct_print_caddy[0]
     # GH #206: Caddy's automatic HTTP->HTTPS redirect deliberately leaves a moved
     # https_port out of the Location (it assumes a router maps public 443 onto it), so
     # http://name:<http_port> would land on whatever else owns 443 — the very thing the
@@ -35102,6 +35192,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"    # clients.claim() in CloudTAK's own service worker; reported upstream.)")
         lines.append(f"    @ct_pwa_entry path /sw.js /registerSW.js /manifest.webmanifest / /index.html")
         lines.append(f"    header @ct_pwa_entry Cache-Control \"no-cache, no-store, must-revalidate\"")
+        lines += _ct_print_caddy[1]   # ops #222: `import cloudtak_print` (defined at the top)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
@@ -45330,6 +45421,172 @@ def _cloudtak_remote_custom_compose_sh():
     )
 
 
+# ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
+# from its own docker-compose.plugin-print.yml in the CloudTAK project, with `expose: 5010` only
+# and internal URLs (http://cloudtak-api:5000, http://cloudtak-tiles:5002) that don't resolve on
+# a stock CloudTAK project (clptak/cloudtak-plugin-print#2). infra-TAK's Caddy runs on the host
+# and can't reach a container name, so the browser's /print-api had nowhere to go (GH #261's 502).
+#
+# infra-TAK's own small overlay publishes it on loopback and points it at api / tiles. It is
+# applied by starting cloudtak-print from base + TAK Portal's file + the overlay (+ the
+# operator's custom file), explicitly, and is deliberately NOT put in COMPOSE_FILE: CloudTAK
+# Update builds every service listed there with --no-cache (Print is a Chromium image, and a
+# failed Print build would fail the CloudTAK update), and TAK Portal's uninstall deletes its
+# file, after which every plain `docker compose` in ~/CloudTAK would refuse to run. So to
+# infra-TAK's own compose runs cloudtak-print stays what it already was: a container of the
+# project they leave alone (none of them passes --remove-orphans, ops #216).
+_CLOUDTAK_PRINT_PLUGIN_COMPOSE = 'docker-compose.plugin-print.yml'   # TAK Portal's; never edited
+CLOUDTAK_PRINT_OVERLAY = 'docker-compose.infratak-print.yml'
+CLOUDTAK_PRINT_SERVICE = 'cloudtak-print'
+CLOUDTAK_PRINT_PORT = 5010
+_CLOUDTAK_PRINT_OVERLAY_YML = f"""\
+# Written by infra-TAK (ops #222) while TAK Portal's Print plugin is installed, and removed when
+# it is not. Do not edit: it is rewritten before Print is started. Your own settings for
+# {CLOUDTAK_PRINT_SERVICE} go in {CLOUDTAK_CUSTOM_COMPOSE}, which is loaded after this file.
+services:
+  {CLOUDTAK_PRINT_SERVICE}:
+    ports:
+      - "127.0.0.1:{CLOUDTAK_PRINT_PORT}:{CLOUDTAK_PRINT_PORT}"
+    environment:
+      - API_INTERNAL_URL=http://api:5000
+      - TILES_INTERNAL_URL=http://tiles:5002
+"""
+
+
+def _cloudtak_print_problem(ct_dir):
+    """Why TAK Portal's Print compose file can't be started as it is: None when there is no such
+    file, '' when it can. Checks what compose itself would refuse: the YAML, the service, and a
+    depends_on naming a service CloudTAK doesn't have — TAK Portal 2.0.18 leaves cloudtak-api /
+    -tiles / -store there (ValleyTacticalSolutions/TAK-Portal#69), and starting that would fail."""
+    import yaml as _yaml
+    path = os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            plug = _yaml.safe_load(f) or {}
+    except Exception as e:
+        return f'{_CLOUDTAK_PRINT_PLUGIN_COMPOSE} could not be read ({str(e)[:120]})'
+    svcs = plug.get('services') if isinstance(plug, dict) else None
+    svc = svcs.get(CLOUDTAK_PRINT_SERVICE) if isinstance(svcs, dict) else None
+    if not isinstance(svc, dict):
+        return f'{_CLOUDTAK_PRINT_PLUGIN_COMPOSE} has no {CLOUDTAK_PRINT_SERVICE} service'
+    base = 'docker-compose.yml'
+    if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+        base = 'compose.yaml'
+    try:
+        with open(os.path.join(ct_dir, base), encoding='utf-8') as f:
+            have = set(((_yaml.safe_load(f) or {}).get('services') or {}).keys())
+    except Exception as e:
+        return f"CloudTAK's {base} could not be read ({str(e)[:120]})"
+    for need in ('api', 'tiles'):
+        if need not in have:
+            return f"CloudTAK's {base} has no {need} service"
+    deps = svc.get('depends_on') or []
+    names = list(deps) if isinstance(deps, (list, dict)) else []
+    missing = sorted(str(n) for n in names if n not in have and n not in svcs)
+    if missing:
+        return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
+                "a newer TAK Portal release fixes this — reinstall Print after updating TAK Portal")
+    return ''
+
+
+def _cloudtak_print_containers(ct_dir):
+    """[(name, [config files])] for the running cloudtak-print containers of the CloudTAK project,
+    or None when CloudTAK isn't running (or docker can't tell)."""
+    proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
+                            '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
+    if not proj:
+        return None
+    rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
+                           '--filter', f'label=com.docker.compose.service={CLOUDTAK_PRINT_SERVICE}',
+                           '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
+                           '|{{.Label "com.docker.compose.service"}}'])
+    if rows is None:
+        return None
+    out = []
+    for row in rows.splitlines():
+        name, _, rest = row.partition('|')
+        files, _, service = rest.partition('|')
+        if name.strip() and service.strip() == CLOUDTAK_PRINT_SERVICE:
+            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()]))
+    return out
+
+
+def _cloudtak_print_drift(ct_dir):
+    """Running cloudtak-print containers that were NOT started with infra-TAK's Print overlay while
+    TAK Portal's Print is installed — what every TAK Portal install / update / rebuild of Print
+    leaves (no loopback port, wrong internal URLs). Guard Dog's tak-cloudtak-watch.sh applies the
+    same rule. [] when clean, not installed, or docker can't tell."""
+    if not os.path.isfile(os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)):
+        return []
+    return [n for n, files in (_cloudtak_print_containers(ct_dir) or [])
+            if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+
+
+def _cloudtak_print_converge(ct_dir, plog=None):
+    """ops #222: make TAK Portal's Print reachable through infra-TAK's Caddy, or tidy up after it
+    is gone. Idempotent; returns 'absent', 'unusable', 'ok' or 'failed'. Never raises.
+
+      * Print installed and startable: write the overlay; if cloudtak-print isn't running from it
+        (TAK Portal started it, or it isn't running) while CloudTAK is up, start it from base +
+        TAK Portal's file + the overlay + the operator's custom file. --no-build: TAK Portal built
+        the image; a start must never turn into a Chromium build.
+      * Not installed, or its file can't be started: remove the overlay.
+
+    Then, when the generated Caddyfile's /print-api route doesn't follow the overlay, regenerate
+    and reload Caddy (_cloudtak_print_caddy)."""
+    _log = plog or (lambda m: print(m, flush=True))
+    result = 'failed'
+    try:
+        overlay = os.path.join(ct_dir, CLOUDTAK_PRINT_OVERLAY)
+        problem = _cloudtak_print_problem(ct_dir)
+        if problem is None or problem:
+            if os.path.lexists(overlay):
+                os.remove(overlay)
+                _log("  Print is no longer installed: removed infra-TAK's Print settings and the /print-api route"
+                     if problem is None else "  Print can't be started: removed infra-TAK's Print settings")
+            if problem:
+                _log(f"  ⚠ TAK Portal's Print plugin can't be started: {problem}")
+            result = 'absent' if problem is None else 'unusable'
+        else:
+            try:
+                with open(overlay, encoding='utf-8') as f:
+                    changed = f.read() != _CLOUDTAK_PRINT_OVERLAY_YML
+            except OSError:
+                changed = True
+            if changed:
+                with open(overlay, 'w', encoding='utf-8') as f:
+                    f.write(_CLOUDTAK_PRINT_OVERLAY_YML)
+            rows = _cloudtak_print_containers(ct_dir)
+            stale = [n for n, files in (rows or [])
+                     if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+            result = 'ok'
+            if rows is not None and (changed or stale or not rows):
+                base = 'docker-compose.yml'
+                if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+                    base = 'compose.yaml'
+                files = [base, _CLOUDTAK_PRINT_PLUGIN_COMPOSE, CLOUDTAK_PRINT_OVERLAY]
+                if os.path.exists(os.path.join(ct_dir, CLOUDTAK_CUSTOM_COMPOSE)):
+                    files.append(CLOUDTAK_CUSTOM_COMPOSE)
+                args = [a for f in files for a in ('-f', f)]
+                rc, out = _cloudtak_compose_run(
+                    ct_dir, args + ['up', '-d', '--no-deps', '--no-build', CLOUDTAK_PRINT_SERVICE], timeout=180)
+                if rc == 0:
+                    _log(f"  Print (cloudtak-print) started on 127.0.0.1:{CLOUDTAK_PRINT_PORT} for /print-api")
+                else:
+                    tail = ' '.join((out or '').strip().splitlines()[-3:])[:300]
+                    _log(f"  ⚠ Could not start Print with infra-TAK's settings: {tail}")
+                    result = 'failed'
+    except Exception as e:
+        _log(f"  ⚠ Print setup error (non-fatal): {str(e)[:200]}")
+    try:
+        _cloudtak_print_caddy_converge(_log)
+    except Exception as e:
+        _log(f"  ⚠ Could not update the /print-api route (non-fatal): {str(e)[:200]}")
+    return result
+
+
 def _cloudtak_remote_reclone_sh(release_tag=None):
     """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
     deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
@@ -47891,6 +48148,7 @@ def run_cloudtak_deploy(cfg=None):
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
 
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -48144,6 +48402,7 @@ def run_cloudtak_redeploy(cfg=None):
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, wait=True)
+        _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         try:
             _mediamtx_converge_cloudtak_read(plog)
         except Exception as _ct_rd_e:
@@ -49206,6 +49465,8 @@ def run_cloudtak_update():
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
+        if not is_remote:
+            _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -64946,6 +65207,46 @@ def _tak_client_sessions_wait(plog, tag):
         delay, retried = min(delay * 2, _TAK_MARTI_READ_RETRY_MAX_S), True
 
 
+def _tak_log_removed_subscriptions(uids):
+    """Those of these connection uids (tls:N / ssl:N) that TAK's messaging log says it removed
+    since TAK Server last started, although it may still list them (ops #223). TAK numbers
+    connections from 1 again at every start, so only lines after the log's last start line
+    count. None when the log can't be read."""
+    uids = [u for u in dict.fromkeys(uids) if re.fullmatch(r'(?:tls|ssl):\d+', u or '')]
+    if not uids:
+        return set()
+    started = 'Started TAK Server messaging Microservice'
+    path = '/opt/tak/logs/takserver-messaging.log'
+    if _tak_is_container():
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-a', '-E', '-e', started, '-e',
+                                           r'Subscription: (id=)?(%s)( |$)' % '|'.join(uids), path]),
+                               capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        if r.returncode not in (0, 1):   # 1 = no line matched
+            return None
+        lines = (r.stdout or '').splitlines()
+    else:
+        # Read directly, like _diag_tail: TAK's logs are world-readable, and `grep` is not on
+        # the broker's allow-list (a denied call on a non-root box holds enforce mode off).
+        try:
+            with open(path, 'rb') as f:
+                lines = [l.decode('utf-8', 'replace') for l in f
+                         if b'Subscription: ' in l or started.encode() in l]
+        except OSError:
+            return None
+    last = {}
+    for line in lines:
+        if started in line:
+            last.clear()
+            continue
+        m = re.search(r'\b(Added|Removed) Subscription: (?:id=)?((?:tls|ssl):\d+)(?: |$)', line)
+        if m and m.group(2) in uids:
+            last[m.group(2)] = m.group(1)
+    return {u for u, what in last.items() if what == 'Removed'}
+
+
 def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     """Give TAK's live client connections their LDAP groups back after an LDAP outage,
     without restarting TAK Server (ops #126). LDAP must already be verified healthy.
@@ -64965,8 +65266,10 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
        history can't name it (test12, ops #131: the history left that device out). TAK names
        every cert connection whose lookup completes — a user LDAP doesn't know still gets
        its name and __ANON__ — so "no user, no groups" is a lookup that failed.
-       One TAK refuses to drop counts as gone when it has left the list since, or a newer
-       connection from the same client has its groups (ops #172: a ghost TAK still lists).
+       One TAK refuses to drop counts as gone when it has left the list since, TAK's
+       messaging log has it removed, or a newer connection from the same client is listed
+       (ops #172, #223: a ghost TAK still lists). That newer one, if it has no groups either,
+       is judged itself.
     3. Wait for those clients to reconnect (same device uid); repeat once for any that came
        back empty. One that comes back named, with no groups, as a user LDAP gives none is
        fine: that is what it is.
@@ -65092,18 +65395,44 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     # connection had its groups. If the refused one is gone now, or a newer connection from
     # the same client has its groups, TAK's LDAP path works: it is gone, not a reason to
     # restart TAK.
-    replaced = []
+    # ops #223: test8, a client reconnecting every 15 s (1085 connects that day). TAK logged
+    # its tls:334 "Removed" 50 ms after adding it, still listed it 45 min later with no
+    # groups, and dropped each newer connection of that client within 50 ms too, so none was
+    # ever listed with groups and every update or heal restarted TAK, which fixed nothing.
+    # So a refused one is also gone when TAK's messaging log has it removed, or when any
+    # newer connection from the same client is listed. A newer one with no groups either is
+    # then judged itself: still listed, still owed and not removed in the log, it is stuck.
+    replaced, later = [], []
     if undroppable:
         now = _tak_client_sessions(devices)
         if now is not None:
             live = {s['uid'] for s in now}
+            newer = {d['uid']: [s for s in now if _same_client(d, s)] for d in undroppable}
+            listed = [d['uid'] for d in undroppable if d['uid'] in live and not newer[d['uid']]]
+            removed = (_tak_log_removed_subscriptions(listed) or set()) if listed else set()
             replaced = [d for d in undroppable
-                        if d['uid'] not in live or any(s['groups'] and _same_client(d, s) for s in now)]
+                        if d['uid'] not in live or newer[d['uid']] or d['uid'] in removed]
             undroppable = [d for d in undroppable if d not in replaced]
             if replaced:
-                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced by a newer "
-                     "connection from the same client with its groups: " + ', '.join(_label(s) for s in replaced[:15]))
-    stuck = owed + undroppable
+                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced: "
+                     + ', '.join(_label(d) + (' (removed in TAK\'s log)' if d['uid'] in removed else
+                                             ' (a newer connection from the client)' if newer[d['uid']] else '')
+                                 for d in replaced[:15]))
+            judged = {s['uid'] for s in owed}
+            later = list({s['uid']: s for d in replaced for s in newer[d['uid']]
+                          if _owed(s) and s['uid'] not in judged}.values())
+            if later:
+                time.sleep(5)   # TAK may still be assigning its groups
+                again = _tak_client_sessions(devices)
+                if again is not None:
+                    cur = {s['uid']: s for s in again}
+                    later = [cur[s['uid']] for s in later if s['uid'] in cur and _owed(cur[s['uid']])]
+                    gone_too = (_tak_log_removed_subscriptions(s['uid'] for s in later) or set()) if later else set()
+                    later = [s for s in later if s['uid'] not in gone_too]
+                if later:
+                    plog(f"  {tag}: {len(later)} newer connection(s) from those client(s) have no groups either: "
+                         + ', '.join(_label(s) for s in later[:15]))
+    stuck = owed + undroppable + later
     healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
 
     parts = []
@@ -65114,8 +65443,8 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
     if replaced:
-        parts.append(f"{len(replaced)} TAK couldn't drop already gone or replaced by a newer connection "
-                     "with its groups")
+        parts.append(f"{len(replaced)} TAK couldn't drop already gone (removed by TAK, or replaced by a newer "
+                     "connection from the same client)")
     if blind:
         parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
                      "they reconnect by themselves and are looked up again")
@@ -75990,6 +76319,13 @@ def takserver_cot_db_size():
 # Table names come from the fixed allowlist below, never from a request.
 _COTDB_TABLES = ('cot_router',)
 
+# ops #227: the cot_router rows retention actually deletes — tak-retention-guard.sh's
+# EXPIRED_WHERE (TAK's own LocalQueryService.deleteCotByTtl predicate) minus the age
+# bound. Mission content (mission_uid) and legacy GeoChat ('b-t-f') are kept on
+# purpose, so an old one of those is never evidence that retention has stalled.
+_COTDB_EXPIRABLE_WHERE = ("cr.cot_type <> 'b-t-f' AND NOT EXISTS "
+                          "(SELECT 1 FROM mission_uid mu WHERE mu.uid = cr.uid)")
+
 # psql prints this when it runs as the postgres OS user from a cwd that user
 # cannot read — e.g. a console installed under /home/<operator>/infra-TAK on a
 # non-root box. Harmless, unrelated to the query, and on 2026-08-10 it was
@@ -76378,8 +76714,32 @@ def _cotdb_facts(tak_cfg=None):
                                  if f['largest_table_bytes'] else None)
     f['compact_needed_human'] = (_cotdb_fmt_bytes(f['compact_needed_bytes'])
                                  if f['compact_needed_bytes'] else '-')
-    f['retention_stalled'] = bool(f['retention_hours'] and f['oldest_age_secs']
-                                  and f['oldest_age_secs'] > f['retention_hours'] * 3600 * 2)
+    # ops #227: on a box with missions the oldest row is usually mission content that
+    # retention keeps on purpose, and the card said "Retention is stalled" for
+    # exactly that. Judge it on the oldest row retention WOULD delete. The scan
+    # only covers rows already past the stall line, which on a healthy box are just
+    # the kept ones, so it stays small.
+    stall_secs = int(f['retention_hours']) * 3600 * 2 if f['retention_hours'] else 0
+    f['oldest_expirable_age_secs'] = f['oldest_age_secs']
+    f['old_rows_kept'] = False
+    if stall_secs and f['oldest_age_secs'] and f['oldest_age_secs'] > stall_secs:
+        ok, out = _cotdb_psql(
+            tak_cfg,
+            "SET statement_timeout = '20s'; "
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(cr.servertime)))::bigint, 0) "
+            f"FROM cot_router cr WHERE cr.servertime < now() - interval '{stall_secs} seconds' "
+            f"AND {_COTDB_EXPIRABLE_WHERE};", timeout=30)
+        last = out.strip().splitlines()[-1].strip() if ok and out.strip() else ''
+        if last.isdigit():
+            f['oldest_expirable_age_secs'] = int(last)
+            f['old_rows_kept'] = not int(last)
+        else:
+            # Unknown is not "fine": keep the whole-table answer so a real stall
+            # still raises the alarm, and record why the card could not tell.
+            f['errors'].append(f'retention-eligible age: {(out or "no answer")[:200]}')
+    f['oldest_expirable_age_human'] = _cotdb_fmt_age(f['oldest_expirable_age_secs'])
+    f['retention_stalled'] = bool(stall_secs and f['oldest_expirable_age_secs']
+                                  and f['oldest_expirable_age_secs'] > stall_secs)
     f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
     return f
 
@@ -76466,7 +76826,8 @@ def _cotdb_verdict_tree(facts):
             causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
         if not causes:
             causes.append('retention is configured but has not been deleting')
-        detail = (f"Retention is set to {rh} h but the oldest CoT row is {facts['oldest_age_human']} old - "
+        detail = (f"Retention is set to {rh} h but the oldest CoT row it should have deleted is "
+                  f"{facts.get('oldest_expirable_age_human') or facts['oldest_age_human']} old - "
                   f"retention is not deleting. Compacting will not help; the space is live data. "
                   f"Cause: {'; '.join(causes)}.")
         return ('retention_stalled', 'Retention is stalled', detail, ['retention_run', 'purge'])
@@ -76531,7 +76892,10 @@ def _cotdb_verdict_tree(facts):
                    else f"{(dead if dead is not None else 0):,} dead tuples")
     detail = (f"{dead_phrase}, "
               f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
-              f"{facts.get('oldest_age_human', '-')} old. Nothing to do.")
+              f"{facts.get('oldest_age_human', '-')} old"
+              + (" (mission content or GeoChat, which retention keeps on purpose)"
+                 if facts.get('old_rows_kept') else '')
+              + ". Nothing to do.")
     # (No "TTL not set" note here any more — that case returns its own red
     #  no_retention verdict above instead of riding along on a green one.)
     return ('healthy', 'Database looks healthy', detail, [])
@@ -95728,6 +96092,10 @@ def _startup_harden_cloudtak_ports():
                 _ct_recreate_clear()
             elif _stage == 'heal':
                 print("Startup migration: CloudTAK media heal did not confirm — recreate stays pending")
+        # ops #222: TAK Portal's Print on loopback with the /print-api route (or both removed
+        # once it is uninstalled). Restarts cloudtak-print only when it isn't running that way.
+        if not os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt')):
+            _cloudtak_print_converge(_ct_dir, lambda m: print(f"Startup migration: {m.strip()}", flush=True))
         # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
         # default-deny firewall, EUD publishes into CloudTAK leases were dropped.
         _cloudtak_open_stream_ports()
@@ -95790,13 +96158,16 @@ _cloudtak_autorepair_lock = threading.Lock()
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'media'|'', 'no_override': [names], 'hls': True|False|None,
-     'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
-    recreate. 'media': only the HLS profile is gone — the media heal alone fixes that. hls None
-    means the read failed, which is never counted as drift (ops #161)."""
+    recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
+    — restarting that one container fixes it. 'media': only the HLS profile is gone — the media
+    heal alone fixes that. hls None means the read failed, which is never counted as drift
+    (ops #161)."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
+           'print': _cloudtak_print_drift(ct_dir),
            'hls': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
@@ -95812,6 +96183,8 @@ def _cloudtak_drift(ct_dir):
             pass
     if out['no_override']:
         out['kind'] = 'recreate'
+    elif out['print']:
+        out['kind'] = 'print'
     elif out['hls'] is False:
         out['kind'] = 'media'
     return out
@@ -95822,6 +96195,8 @@ def _cloudtak_drift_summary(d):
     parts = []
     if d.get('no_override'):
         parts.append("created without infra-TAK's compose override: " + ', '.join(d['no_override']))
+    if d.get('print'):
+        parts.append("Print started without infra-TAK's /print-api settings: " + ', '.join(d['print']))
     if d.get('hls') is False:
         parts.append('HLS profile missing')
     if d.get('media_image'):
@@ -95933,7 +96308,9 @@ def _cloudtak_autorepair_run(ct_dir, drift):
     to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
     operator's custom file stay in it), re-assert the loopback port patch on the base file (the
     recreate must never publish a port we closed), then the journaled recreate + media heal.
-    'media': the media heal alone. Success is judged by a fresh drift check, not by exit codes."""
+    'media': the media heal alone. 'print' (ops #222): Print restarted with infra-TAK's overlay
+    (plus the media heal if that is gone too); every kind ends with that step. Success is judged
+    by a fresh drift check, not by exit codes."""
     def _log(m):
         print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
     result, why = 'failed', ''
@@ -95949,8 +96326,12 @@ def _cloudtak_autorepair_run(ct_dir, drift):
             stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
             why = {'recreate': 'docker compose up --force-recreate failed',
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
-        else:
+        elif drift['kind'] == 'media' or drift.get('hls') is False:
             why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+        # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
+        # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
+        if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
+            why = "Print (cloudtak-print) could not be restarted with infra-TAK's settings"
         after = _cloudtak_drift(ct_dir)
         if not why and after['kind']:
             why = f'still drifted after the repair: {_cloudtak_drift_summary(after)}'
@@ -95984,9 +96365,11 @@ def _cloudtak_autorepair_notify(before, after):
             print("[guarddog] CloudTAK repaired note SUPPRESSED (no recipient configured)", flush=True)
             return
         ident = _guarddog_server_identifier(settings) or socket.gethostname()
-        done = ("rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK Portal's "
-                "compose file and docker-compose.custom.yml kept), then re-applied the HLS profile"
-                if before['kind'] == 'recreate' else 're-applied the HLS profile to cloudtak-media')
+        done = {'recreate': "rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK "
+                            "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
+                            "the HLS profile",
+                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api"
+                }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         body = (
             "CloudTAK lost infra-TAK's settings, most likely because a TAK Portal marketplace plugin\n"
             "install recreated it without them. Guard Dog repaired it by itself. Nothing to do.\n\n"

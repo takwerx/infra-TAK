@@ -163,6 +163,9 @@ class Box:
             '_cloudtak_media_hls_heal': self.heal,
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
+            # ops #222: TAK Portal's Print is not installed on this box (its tests load the real ones)
+            '_cloudtak_print_drift': lambda d: [],
+            '_cloudtak_print_converge': lambda d, plog=None: 'absent',
         }
         src = '\n\n'.join(
             [_assign(n) for n in (
