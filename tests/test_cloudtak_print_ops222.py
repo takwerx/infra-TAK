@@ -520,16 +520,14 @@ def test_caddy_takportal_copy_is_what_we_replace(tmp_path):
 
 
 TAKPORTAL_SRC = os.environ.get('TAKPORTAL_SRC', '')
+_needs_takportal = pytest.mark.skipif(
+    not (TAKPORTAL_SRC and shutil.which('node')),
+    reason="set TAKPORTAL_SRC to a TAK Portal checkout to run its own Caddy code")
 
 
-@pytest.mark.skipif(not (TAKPORTAL_SRC and shutil.which('node')),
-                    reason="set TAKPORTAL_SRC to a TAK Portal checkout to run its own Caddy code")
-@pytest.mark.parametrize('with_print', [True, False])
-def test_takportal_deploy_to_caddy_leaves_ours_alone(tmp_path, with_print):
-    """TAK Portal's real applyCaddySnippets on our file: with ours, nothing to do and the step
-    shows as applied; without (Print not set up) it would add its own copy."""
-    cf = tmp_path / 'Caddyfile.gen'
-    cf.write_text(_render(tmp_path, with_print=with_print))
+def _takportal_deploy_to_caddy(path):
+    """TAK Portal's real "Deploy To Caddy" step for Print (applyCaddySnippets with the catalog's
+    snippet) on the Caddyfile at path: {ok, changed, applied (before), text (after)}."""
     js = (
         "const c=require(process.argv[1]+'/services/cloudtakMarketplace.caddy.js');"
         "const fs=require('fs');"
@@ -538,12 +536,22 @@ def test_takportal_deploy_to_caddy_leaves_ours_alone(tmp_path, with_print):
         "const s=p.additionalActions.filter(c.isCaddyAction).map(a=>a.snippet);"
         "const src=fs.readFileSync(process.argv[2],'utf8');"
         "const r=c.applyCaddySnippets(src,s,{host:'map.example.com'});"
-        "console.log(JSON.stringify({ok:r.ok,changed:r.changed,"
+        "console.log(JSON.stringify({ok:r.ok,changed:r.changed,text:r.text,"
         "applied:c.appliedKeys([p],src,{host:'map.example.com'}).length}));")
-    r = subprocess.run(['node', '-e', js, TAKPORTAL_SRC, str(cf)], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(['node', '-e', js, TAKPORTAL_SRC, str(path)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
-    got = json.loads(r.stdout)
-    assert got['ok'] is True
+    return json.loads(r.stdout)
+
+
+@_needs_takportal
+@pytest.mark.parametrize('with_print', [True, False])
+def test_takportal_deploy_to_caddy_leaves_ours_alone(tmp_path, with_print):
+    """TAK Portal's real applyCaddySnippets on our file: with ours, nothing to do and the step
+    shows as applied; without (Print not set up) it would add its own copy."""
+    cf = tmp_path / 'Caddyfile.gen'
+    cf.write_text(_render(tmp_path, with_print=with_print))
+    got = _takportal_deploy_to_caddy(cf)
+    got.pop('text')
     assert got == ({'ok': True, 'changed': False, 'applied': 1} if with_print
                    else {'ok': True, 'changed': True, 'applied': 0})
 
@@ -604,3 +612,60 @@ def test_caddy_converge(tmp_path, home_back, live, overlay, want):
 def test_caddy_converge_before_the_registry_loads_leaves_the_reload_to_it(tmp_path, home_back):
     box = CaddyBox(tmp_path, 'map.example.com {\n}\n' + MARK, ready=False)
     assert box.run() is True and box.calls == ['generate']
+
+
+# ── 4. A box that already has TAK Portal's /print-api route (GH #286) ─────────
+
+def _field_box(tmp_path):
+    """A v10.2.29 Caddyfile after TAK Portal's Deploy To Caddy: its snippet above the CloudTAK
+    site and the import inside it, upstream cloudtak-print:5010 (the 502 in GH #286). Made by
+    TAK Portal's own code when TAKPORTAL_SRC is set, else in the shape that code writes."""
+    d = tmp_path / 'field'
+    d.mkdir()
+    if not (TAKPORTAL_SRC and shutil.which('node')):
+        return _render(d, with_print=False, takportal=True)
+    cf = d / 'Caddyfile.old'
+    cf.write_text(_render(d, with_print=False))
+    got = _takportal_deploy_to_caddy(cf)
+    assert got['ok'] and got['changed']
+    return got['text']
+
+
+def test_field_box_with_takportal_route_gets_ours_after_the_update(tmp_path, home_back):
+    field = _field_box(tmp_path)
+    generated = field.split(MARK)[0]
+    assert 'reverse_proxy cloudtak-print:5010' in generated and 'import cloudtak_print' in generated
+    cf = tmp_path / 'check.caddy'
+    if _caddy_bin():
+        cf.write_text(field)
+        assert _print_upstreams(cf) == ['cloudtak-print:5010']        # the reporter's 502
+    # First console start on the fixed version, Print installed (so the overlay is written):
+    # TAK Portal's copy in the generated part means regenerate.
+    (tmp_path / 'new').mkdir()
+    box = CaddyBox(tmp_path / 'new', field)
+    assert box.run() is True and box.calls == ['generate', 'reload']
+    # What that writes: exactly one cloudtak_print, ours, nothing of TAK Portal's left.
+    fixed = _render(tmp_path / 'new')
+    assert fixed.count('(cloudtak_print)') == 1 and fixed.count('import cloudtak_print') == 1
+    assert 'cloudtak-print:5010' not in fixed
+    if _caddy_bin():
+        cf.write_text(fixed)
+        assert _print_upstreams(cf) == ['127.0.0.1:5010']
+    # Stable: no second regen, and pressing Deploy To Caddy again changes nothing.
+    (tmp_path / 'again').mkdir()
+    assert CaddyBox(tmp_path / 'again', fixed).run() is False
+    if TAKPORTAL_SRC and shutil.which('node'):
+        cf.write_text(fixed)
+        got = _takportal_deploy_to_caddy(cf)
+        assert (got['changed'], got['applied']) == (False, 1)
+
+
+def test_field_box_without_a_startable_print_loses_the_dead_route(tmp_path, home_back):
+    # TAK Portal 2.0.18 left Print's file unstartable (TAK-Portal#69): no overlay, so no route of
+    # ours, but TAK Portal's cloudtak-print:5010 copy still goes (no dangling upstream).
+    field = _field_box(tmp_path)
+    (tmp_path / 'new').mkdir()
+    box = CaddyBox(tmp_path / 'new', field, overlay=False)
+    assert box.run() is True and box.calls == ['generate', 'reload']
+    fixed = _render(tmp_path / 'new', with_print=False)
+    assert 'cloudtak_print' not in fixed and 'print-api' not in fixed
