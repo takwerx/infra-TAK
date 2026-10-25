@@ -83315,8 +83315,7 @@ def console_stack_backup_delete_api(label):
 # ── Same-box restore (v10.3.0 W12.d) ────────────────────────────────────────
 # Data and config only — the binaries are the box's own, so a backup taken on 22.04
 # restores onto the same box after its flip to 24.04. Every part is verified before
-# anything is stopped. Node-RED /data is NOT restored yet: that leg waits for a
-# /nodered-preflight on a real box (SACRED rule — union, never shrink).
+# anything is stopped. Node-RED is merged config-by-config, never replaced (SACRED).
 STACK_RESTORE_ACK_PREFIX = 'Restore '
 # settings.json keys that describe THIS box now, not the box at backup time.
 _STACK_RESTORE_KEEP_SETTINGS = ('os_type', 'stack_backups', 'tak_snapshots')
@@ -83400,6 +83399,142 @@ def _stack_restore_app_containers(mods):
     return out
 
 
+_NODERED_CFG_LISTS = ('arcgis_configs', 'tc_configs', 'pp_configs')
+_NODERED_CFG_OBJECTS = ('tak_settings', 'ipaws_config')
+
+
+def _nodered_ctx_unwrap(d):
+    """The configurator keys from a context dump in any of its shapes: the REST
+    endpoint's {'default': {...}} store envelope, {'msg': <json>} per-value wrapping,
+    JSON-string values, or a plain localfilesystem global.json."""
+    if not isinstance(d, dict):
+        return {}
+    if isinstance(d.get('default'), dict) and set(d) <= {'default', 'memory', 'file'}:
+        d = d['default']
+    out = {}
+    for k in _NODERED_CFG_LISTS + _NODERED_CFG_OBJECTS:
+        v = d.get(k)
+        if isinstance(v, dict) and 'msg' in v and set(v) <= {'msg', 'format'}:
+            v = v['msg']
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                continue
+        if k in _NODERED_CFG_LISTS and isinstance(v, list):
+            out[k] = v
+        elif k in _NODERED_CFG_OBJECTS and isinstance(v, dict):
+            out[k] = v
+    return out
+
+
+def _nodered_cfg_names(lst):
+    return {(c or {}).get('configName') or (c or {}).get('name') or (c or {}).get('id')
+            for c in (lst or []) if isinstance(c, dict)} - {None}
+
+
+def _nodered_ctx_live():
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'nodered', 'curl', '-sf', '--max-time', '20',
+                                   'http://localhost:1880/context/global']),
+                       capture_output=True, text=True, timeout=40)
+    if r.returncode != 0 or not (r.stdout or '').strip():
+        raise RuntimeError(f'cannot read Node-RED context (rc {r.returncode})')
+    return json.loads(r.stdout)
+
+
+def _stack_restore_nodered(dest, label, plog):
+    """SACRED (CLAUDE.md, /nodered-preflight): merge the backup's configurator configs
+    INTO the live set through Node-RED's own /config/deploy-restore — union by
+    configName, never replace /data, never shrink. Flows are not touched (deploy.sh
+    owns them). Raises on any failure, including a result smaller than live."""
+    import io as _io
+    import tarfile as _tarfile
+    # 1. Live first, kept off to the side for the whole operation.
+    live_raw = _nodered_ctx_live()
+    keep = os.path.join(CONFIG_DIR, f'nodered-ctx-before-restore-{label}.json')
+    with open(keep, 'w') as f:
+        json.dump(live_raw, f)
+    os.chmod(keep, 0o600)
+    live = _nodered_ctx_unwrap(live_raw)
+    plog(f"  restore: Node-RED live context saved to {keep} "
+         + ', '.join(f"{k}={len(live.get(k) or [])}" for k in _NODERED_CFG_LISTS))
+
+    # 2. The backup's global.json + latest.json, read from a console-owned staged copy
+    #    (the tar holds all of /data and is too big for a broker read).
+    staging = os.path.join(STACK_BACKUP_DIR, '.dl-nr-' + label)
+    found = {}
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+        subprocess.run(_sudo_wrap(['cp', os.path.join(dest, 'nodered-data.tar'), staging]),
+                       capture_output=True, check=True, timeout=600)
+        subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
+                       capture_output=True, check=True, timeout=60)
+        want = {'data/context/global/global.json': 'global', 'data/config-backups/latest.json': 'latest'}
+        with _tarfile.open(os.path.join(staging, 'nodered-data.tar'), 'r:') as tf:
+            for m in tf:
+                if m.isfile() and m.name.lstrip('./') in want:
+                    try:
+                        found[want[m.name.lstrip('./')]] = json.loads(tf.extractfile(m).read().decode())
+                    except ValueError:
+                        plog(f"  restore: Node-RED backup {m.name} is not valid JSON — ignored")
+    finally:
+        subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=120)
+    if not found:
+        raise RuntimeError('the backup holds neither context/global/global.json nor config-backups/latest.json')
+
+    # 3. Backup side: global.json ∪ latest.json (both honor deletes, so the union
+    #    resurrects nothing). Only non-empty values are sent — deploy-restore replaces
+    #    the two object keys outright, and an empty one would wipe live settings.
+    bk_g, bk_l = _nodered_ctx_unwrap(found.get('global')), _nodered_ctx_unwrap(found.get('latest'))
+    payload = {}
+    for k in _NODERED_CFG_LISTS:
+        merged, seen = [], set()
+        for c in (bk_g.get(k) or []) + (bk_l.get(k) or []):
+            n = (c or {}).get('configName') or (c or {}).get('name') or (c or {}).get('id') if isinstance(c, dict) else None
+            if n is not None and n in seen:
+                continue
+            if n is not None:
+                seen.add(n)
+            merged.append(c)
+        if merged:
+            payload[k] = merged
+    for k in _NODERED_CFG_OBJECTS:
+        v = bk_g.get(k) or bk_l.get(k)
+        if v:
+            payload[k] = v
+    if not payload:
+        plog("  restore: Node-RED backup held no configurator configs — live left as it is")
+        return
+    plog("  restore: Node-RED backup has " + ', '.join(
+        f"{k}={len(payload[k])}" for k in _NODERED_CFG_LISTS if k in payload))
+
+    # 4. Merge through Node-RED's own never-drop-live endpoint.
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', 'nodered', 'curl', '-sf', '--max-time', '30',
+                                   '-X', 'POST', '-H', 'Content-Type: application/json', '--data-binary', '@-',
+                                   'http://localhost:1880/config/deploy-restore']),
+                       input=json.dumps(payload), capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f'/config/deploy-restore failed (rc {r.returncode}): {(r.stderr or r.stdout or "")[:200]}')
+    plog(f"  restore: Node-RED deploy-restore: {(r.stdout or '').strip()[:300]}")
+
+    # 5. Prove it: every config that was live AND every config in the backup is live now.
+    after = _nodered_ctx_unwrap(_nodered_ctx_live())
+    lost = []
+    for k in _NODERED_CFG_LISTS:
+        missing = (_nodered_cfg_names(live.get(k)) | _nodered_cfg_names(payload.get(k))) - _nodered_cfg_names(after.get(k))
+        if missing:
+            lost.append(f"{k}: {', '.join(sorted(map(str, missing)))}")
+    for k in _NODERED_CFG_OBJECTS:
+        if live.get(k) and not after.get(k):
+            lost.append(f'{k}: emptied')
+    if lost:
+        raise RuntimeError('Node-RED configs MISSING after restore — ' + '; '.join(lost)
+                           + f' (pre-restore copy: {keep})')
+    plog("  restore: Node-RED configs now " + ', '.join(
+        f"{k}={len(after.get(k) or [])}" for k in _NODERED_CFG_LISTS) + " — nothing dropped")
+
+
 def _stack_restore(label, plog=None):
     """Restore a full-stack backup onto this box. (True, summary) or (False, error/summary)."""
     import io as _io
@@ -83467,6 +83602,14 @@ def _stack_restore(label, plog=None):
                         plog(f"  restore: {name}: {m.name} FAILED: {str(e)[:200]}")
             plog(f"  restore: {name}: {n_ok} file(s) restored")
 
+        # 3b. Node-RED configurator configs — merged, never replaced (SACRED).
+        if 'nodered-data.tar' in parts and (mods.get('nodered') or {}).get('installed'):
+            try:
+                _stack_restore_nodered(dest, label, plog)
+            except Exception as e:
+                failed.append('nodered-data.tar')
+                plog(f"  restore: Node-RED FAILED: {str(e)[:400]}")
+
         # 4. Module databases.
         for name, p in parts.items():
             if p['kind'] != 'pg_dump':
@@ -83516,10 +83659,7 @@ def _stack_restore(label, plog=None):
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
             plog("  restore: restarted mediamtx")
 
-    pending = ['nodered-data.tar'] if 'nodered-data.tar' in parts else []
-    if pending:
-        plog("  restore: Node-RED /data was NOT restored — that step is not built yet "
-             "(its configs are left exactly as they are now)")
+    pending = []
     if failed:
         plog(f"  restore [{label}]: FINISHED WITH FAILURES: {', '.join(failed)}")
         return False, {'failed': failed, 'not_restored': pending}

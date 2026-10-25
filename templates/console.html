@@ -230,7 +230,7 @@ window.stackbkRestore=async function(label){
     var e=document.getElementById('stackbk-err'),pi=document.getElementById('stackbk-pw'),pw=pi?pi.value:'';
     if(!pw){if(e)e.textContent='Enter the console password below to restore a backup';if(pi)pi.focus();return;}
     var want='Restore '+label;
-    var ack=prompt('Restore '+label+' onto this box?\n\nThis stops Authentik, TAK Portal and CloudTAK, replaces their databases and the console settings with the backup\'s, rolls TAK Server back to the backup, then starts everything again. Changes made since the backup are lost. Node-RED is not restored (not built yet).\n\nType exactly: '+want);
+    var ack=prompt('Restore '+label+' onto this box?\n\nThis stops Authentik, TAK Portal and CloudTAK, replaces their databases and the console settings with the backup\'s, rolls TAK Server back to the backup, then starts everything again. Changes made since the backup are lost. Node-RED configs from the backup are merged in; none of the current ones are removed.\n\nType exactly: '+want);
     if(ack===null)return;
     if(ack.trim()!==want){if(e)e.textContent='Type exactly: '+want;return;}
     if(pi)pi.value='';
