@@ -117,6 +117,7 @@ def _local_deploy(settings):
         _docker_probe=lambda: (0, 'Docker version 27'),
         _ensure_docker_log_limits=lambda plog: None,
         _cloudtak_git_prep=lambda d, plog: None,
+        _cloudtak_carry_plugins=lambda d, plog: [],   # ops #216
         _cloudtak_build_override_yml=_stop)       # the first call after .env is written
     ns['run_cloudtak_deploy']()
     return ns, status
