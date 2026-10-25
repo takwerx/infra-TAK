@@ -13765,6 +13765,39 @@ def _get_current_takserver_heap_gb():
     return None
 
 
+TAKSERVER_HEAP_VARS = ('CONFIG_MAX_HEAP', 'API_MAX_HEAP', 'MESSAGING_MAX_HEAP',
+                       'PLUGIN_MANAGER_MAX_HEAP', 'RETENTION_MAX_HEAP')
+_TAKSERVER_HEAP_BLOCK_A = '# >>> infra-TAK managed heap >>>'
+_TAKSERVER_HEAP_BLOCK_B = '# <<< infra-TAK managed heap <<<'
+
+
+def _merge_takserver_heap_defaults(existing, heap_gb, heaps_mb):
+    """Return /etc/default/takserver with infra-TAK's heap vars replaced and everything else kept.
+
+    GH #282: set-heap used to write the whole file, so an operator's own variables were
+    dropped every time the suggested heap was applied. infra-TAK owns only the five
+    *_MAX_HEAP vars: any line setting one of them (with or without `export`) is removed,
+    as are our previous managed block and the two unmarked comment lines older releases
+    wrote, and one managed block is appended at the end so it wins over anything above it.
+    `heaps_mb` maps each name in TAKSERVER_HEAP_VARS to its value in MB.
+    """
+    import re as _re
+    text = _re.sub(rf'{_re.escape(_TAKSERVER_HEAP_BLOCK_A)}.*?{_re.escape(_TAKSERVER_HEAP_BLOCK_B)}\n?',
+                   '', existing or '', flags=_re.DOTALL)
+    owned = _re.compile(r'^\s*(?:export\s+)?(?:%s)=' % '|'.join(TAKSERVER_HEAP_VARS))
+    legacy = ('# infra-TAK total heap:', '# Proportional split across TAK Server processes')
+    kept = [ln for ln in text.splitlines()
+            if not owned.match(ln) and not ln.strip().startswith(legacy)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    block = [_TAKSERVER_HEAP_BLOCK_A,
+             f'# infra-TAK total heap: {heap_gb}g',
+             '# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)']
+    block += [f'export {name}={int(heaps_mb[name])}' for name in TAKSERVER_HEAP_VARS]
+    block.append(_TAKSERVER_HEAP_BLOCK_B)
+    return '\n'.join(kept + ([''] if kept else []) + block) + '\n'
+
+
 @app.route('/api/takserver/heap-info')
 @login_required
 def takserver_heap_info():
@@ -13805,16 +13838,18 @@ def takserver_set_heap():
     plugin_mb = int(total_mb * w_plugin / w_total)
     retain_mb = int(total_mb * w_retain / w_total)
 
-    defaults_content = (
-        f"# infra-TAK total heap: {heap_gb}g\n"
-        f"# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)\n"
-        f"export CONFIG_MAX_HEAP={config_mb}\n"
-        f"export API_MAX_HEAP={api_mb}\n"
-        f"export MESSAGING_MAX_HEAP={msg_mb}\n"
-        f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
-        f"export RETENTION_MAX_HEAP={retain_mb}\n"
-    )
     defaults_file = '/etc/default/takserver'
+    # GH #282: merge into the operator's file instead of replacing it. A file that exists
+    # but cannot be read is a refusal, never a blank slate to overwrite.
+    existing = ''
+    if _exists_priv(defaults_file):
+        try:
+            existing = _read_own_or_priv(defaults_file)
+        except Exception as _rd_err:
+            return jsonify({'success': False, 'error': f'Could not read {defaults_file}, left it unchanged: {str(_rd_err)[:200]}'}), 500
+    defaults_content = _merge_takserver_heap_defaults(existing, heap_gb, {
+        'CONFIG_MAX_HEAP': config_mb, 'API_MAX_HEAP': api_mb, 'MESSAGING_MAX_HEAP': msg_mb,
+        'PLUGIN_MANAGER_MAX_HEAP': plugin_mb, 'RETENTION_MAX_HEAP': retain_mb})
     try:
         # v10.0.5 non-root: /etc/default/takserver + /opt/tak/setenv.sh are root-owned;
         # was bare `sudo tee`/`sudo cat` (bypass broker → EPERM non-root). Route via broker.
