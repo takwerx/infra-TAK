@@ -82864,7 +82864,7 @@ def _tak_setup_snapshot_schedule(plog=None):
 
 # ── Full-stack backup (v10.3.0 W12.a) ───────────────────────────────────────
 # TAK snapshot + every installed module's database and config, into a root-only
-# /var/lib/infratak-backups/<label>/ (0700). Media (recordings, uploads, WebODM)
+# /var/lib/infratak-backups/<label>/ (0700; the root itself is 0711). Media (recordings, uploads, WebODM)
 # is deliberately excluded. Same-box restore is W12.d; retention is W12.e.
 STACK_BACKUP_DIR = '/var/lib/infratak-backups'
 # container -> (role, database). Mirrors the broker's _STACK_PG_CONTAINERS — the
@@ -82959,7 +82959,9 @@ def _stack_backup(label=None, plog=None):
                        f'{need // 1024 ** 2} MB needed (2x the last backup)')
     plog(f"  stack backup [{label}]: creating at {dest}")
     try:
-        _makedirs_priv(STACK_BACKUP_DIR, mode=0o700)
+        # Root 0711: the console can pass through to its own .dl-* staging dirs
+        # (download, Node-RED restore) but cannot list or enter a backup (0700).
+        _makedirs_priv(STACK_BACKUP_DIR, mode=0o711)
         _makedirs_priv(dest, mode=0o700)
     except Exception as e:
         return False, f'Could not create backup dir: {e}'

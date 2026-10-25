@@ -2099,13 +2099,13 @@ def _do_stack_pg_dump(req):
     docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
     if not docker:
         return {'ok': False, 'error': 'docker not found on trusted PATH'}
-    # The tree is root-only (0700) — created here, never by the console, so no
-    # console-planted symlink can sit at the root or the label dir.
-    for d in (STACK_BACKUP_DIR, os.path.dirname(path)):
+    # Root 0711 (pass-through, no listing: the console reaches only its own .dl-*
+    # staging dirs); each backup dir 0700. Refuse symlinks at either level.
+    for d, mode in ((STACK_BACKUP_DIR, 0o711), (os.path.dirname(path), 0o700)):
         if os.path.islink(d):
             return {'ok': False, 'error': f'refusing symlinked backup dir: {d}'}
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        os.chmod(d, 0o700)
+        os.makedirs(d, mode=mode, exist_ok=True)
+        os.chmod(d, mode)
     argv = [docker, 'exec', req['container'], 'pg_dump', '-U', user,
             '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
     return _dump_to_file(argv, path, req.get('timeout'), 'stack_pg_dump')
