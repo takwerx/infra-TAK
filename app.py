@@ -83126,6 +83126,15 @@ def _stack_backup(label=None, plog=None):
 # settings['stack_backups'] — the backup tree itself is root-only, so the console
 # cannot list it.
 _stack_backup_job = {'running': False, 'label': '', 'ok': None, 'error': '', 'log': []}
+# The post-update deploy's service-recovery sweep `docker compose up -d`s every stopped
+# module — exactly what a restore has just stopped (nuc 2026-10-25: Authentik booted and
+# ran its migration check against a database pg_restore was mid-way through). The two are
+# mutually exclusive: post-update waits out a restore; a restore is refused during one.
+_POST_UPDATE_ACTIVE = {'on': False}
+
+
+def _stack_restore_running():
+    return bool(_stack_backup_job.get('running')) and _stack_backup_job.get('kind') == 'restore'
 _stack_backup_job_lock = threading.Lock()
 
 
@@ -83706,6 +83715,9 @@ def console_stack_backup_restore_api(label):
         return jsonify({'ok': False, 'error': f'type exactly: {STACK_RESTORE_ACK_PREFIX}{label}'}), 400
     if _os_upgrade_job_state().get('running'):
         return jsonify({'ok': False, 'error': 'the OS upgrade is running'}), 409
+    if _POST_UPDATE_ACTIVE['on']:
+        return jsonify({'ok': False, 'error': 'the console is still finishing its post-update deploy '
+                        '(it restarts stopped modules) — try again in a few minutes'}), 409
     if not _stack_backup_run_job(label, kind='restore'):
         return jsonify({'ok': False, 'error': 'a backup or restore is already running'}), 409
     try:
@@ -101747,10 +101759,18 @@ def _post_update_auto_deploy():
 
         def _run_post_update_guarded():
             try:
+                _w = 0
+                while _stack_restore_running() and _w < 3 * 3600:
+                    if _w % 300 == 0:
+                        print("Post-update: waiting — a full-stack restore is running", flush=True)
+                    time.sleep(10)
+                    _w += 10
+                _POST_UPDATE_ACTIVE['on'] = True
                 _run_post_update()
             except Exception as _e:
                 print(f"Post-update: migration thread error: {_e}", flush=True)
             finally:
+                _POST_UPDATE_ACTIVE['on'] = False
                 try:
                     s_done = load_settings()
                     s_done['last_console_version'] = VERSION
