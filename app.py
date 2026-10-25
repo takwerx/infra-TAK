@@ -4643,6 +4643,11 @@ def _gd_alert_bar(settings):
                 'so no email or SMS is being sent. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">'
                 'Review →</a>')
+    elif (has_email or has_sms) and _gd_quiet_state()[0]:
+        # ops #228: held, not paused — it ends by itself and a fault that outlives it is mailed.
+        body = ('⚠ Guard Dog has an active alert — delivery is held while planned work runs '
+                '(T&amp;E, a drill or Update Now). '
+                '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
     elif has_email or has_sms:
         body = ('⚠ Guard Dog has an active alert. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
@@ -25290,6 +25295,186 @@ def _gd_alerts_pause_state(settings=None):
     return True, until
 
 
+# ── ops #228: quiet window — hold alert delivery while planned work runs ──────
+# 2026-10-25: 25 of the 27 emails the dev fleet's Guard Dog sent in 14 hours were our own
+# work — T&E plugin rounds (a TAK Portal marketplace install recreates CloudTAK, so
+# "CloudTAK repaired automatically"), an Update/rollback drill (Guard Dog restarted CloudTAK
+# and TAK Portal mid-rollback, so two "restarted" alarms), dev deploys. A customer's own
+# Update Now trips the same watchers.
+#
+# Three signals open a window. Each carries its own hard expiry, so a run that dies cannot
+# leave a box muted:
+#   - GD_QUIET_MARKER "<start> <end> <reason>", written by /opt/tak-guarddog/gd-quiet.sh
+#     (T&E, drills, box tests). Root-owned in Guard Dog's state dir, like the Authentik
+#     update marker: anyone who can write it can mute Guard Dog. Ignored once past its end,
+#     and ignored outright if it asks for more than GD_QUIET_MAX_S.
+#   - the Update Now single-flight lock (cleared when post-update finishes; 20-min TTL);
+#   - the Authentik update marker (#167; 30-min cap).
+#
+# HELD is not the operator's pause. The pause mutes on purpose; a window must not hide a
+# real fault. So: (1) send-alert-email.sh exits 3 on a held alert, and the watchers that
+# gate their once-per-episode state on delivery keep the episode open and alert after the
+# window if the fault is still there; (2) every held alert is recorded, and when the window
+# closes the console re-runs Guard Dog's checks and, if anything is still failing, sends ONE
+# email naming it and the alerts that were held (_gd_quiet_review_once). A fault the planned
+# work caused and cleared costs nothing; a fault that outlives the window is still reported.
+GD_QUIET_MARKER = '/var/lib/takguard/quiet_window'
+GD_QUIET_MAX_S = 4 * 3600                # gd-quiet.sh MAX_MIN
+_GD_QUIET_UPDATE_LOCK = '/var/lib/takwerx-console/update-now.lock'
+_GD_QUIET_UPDATE_LOCK_TTL_S = 1200       # update_apply() _update_lock_ttl_s
+_GD_QUIET_AK_MARKER = '/var/lib/takguard/authentik_update_in_progress'   # _GD_AUTHENTIK_UPDATE_MARKER
+_GD_QUIET_AK_MAX_S = 1800                # _GD_AUTHENTIK_UPDATE_MAX_S
+GD_QUIET_REVIEW_EVERY_S = 60
+_gd_quiet_lock = threading.Lock()
+
+
+def _gd_quiet_held_path():
+    return os.path.join(CONFIG_DIR, 'guarddog_quiet_held.json')
+
+
+def _gd_quiet_state(now=None):
+    """Effective quiet window: (active: bool, until_epoch: int, reason: str).
+
+    PURE — reads only, like _gd_alerts_pause_state(). Anything unreadable, unparseable,
+    expired or over-long reports NOT quiet: the failure direction is toward noise."""
+    now = time.time() if now is None else now
+    best = [False, 0, '']
+
+    def _consider(until, reason):
+        if until > now and until > best[1]:
+            best[:] = [True, int(until), reason]
+    try:
+        with open(GD_QUIET_MARKER) as f:
+            parts = f.read(512).split(None, 2)
+        start, end = int(parts[0]), int(parts[1])
+        reason = ' '.join((parts[2] if len(parts) > 2 else '').split())[:120] or 'planned work'
+        if start <= now + 60 and 0 < end - start <= GD_QUIET_MAX_S:
+            _consider(end, reason)
+    except Exception:
+        pass
+    for path, ttl, reason in ((_GD_QUIET_UPDATE_LOCK, _GD_QUIET_UPDATE_LOCK_TTL_S, 'Update Now in progress'),
+                              (_GD_QUIET_AK_MARKER, _GD_QUIET_AK_MAX_S, 'Authentik update in progress')):
+        try:
+            _consider(os.path.getmtime(path) + ttl, reason)
+        except Exception:
+            pass
+    return tuple(best)
+
+
+def _gd_quiet_held_load():
+    try:
+        with open(_gd_quiet_held_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gd_quiet_held_save(d):
+    tmp = None
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.gd-quiet-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(d, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _gd_quiet_held_path())
+    except Exception as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        print(f"[guarddog] quiet window: could not record a held alert ({str(e)[:120]})", flush=True)
+
+
+def _gd_quiet_hold(subject, state=None):
+    """Record one alert held by the quiet window, for the close-out review."""
+    _a, until, reason = state or _gd_quiet_state()
+    print(f"[guarddog] alert HELD — quiet window ({reason}) until "
+          f"{datetime.utcfromtimestamp(until).strftime('%H:%M:%SZ') if until else '?'}: {subject}",
+          flush=True)
+    with _gd_quiet_lock:
+        rec = _gd_quiet_held_load()
+        held = rec.get('held') if isinstance(rec.get('held'), list) else []
+        held.append({'at': int(time.time()), 'subject': str(subject or '')[:200], 'reason': reason})
+        rec['held'] = held[-50:]
+        _gd_quiet_held_save(rec)
+
+
+def _gd_quiet_review_once():
+    """Close-out of a quiet window that held alerts. Returns 'open' | 'none' | 'clear' |
+    'sent' | 'not-sent'.
+
+    Re-runs Guard Dog's health checks rather than replaying the held alerts: a replay would
+    re-send exactly the noise the window exists to hold (a restart during a drill is over
+    by now), while a check that is still failing is the fault the window must not hide."""
+    if _gd_quiet_state()[0]:
+        return 'open'
+    with _gd_quiet_lock:
+        held = _gd_quiet_held_load().get('held')
+    if not isinstance(held, list) or not held:
+        return 'none'
+    _guarddog_refresh_page_cache()
+    health = _guarddog_page_cache.get('health') or {}
+    failing = sorted(k for k, v in health.items() if v != 'ok')
+    with _gd_quiet_lock:
+        # Drop only what was read above; a hold recorded since (a new window) stays.
+        rest = _gd_quiet_held_load().get('held')
+        rest = rest[len(held):] if isinstance(rest, list) else []
+        _gd_quiet_held_save({'held': rest} if rest else {})
+    if not failing:
+        print(f"[guarddog] quiet window closed: {len(held)} alert(s) held, every Guard Dog "
+              f"check is OK now — nothing sent", flush=True)
+        return 'clear'
+    settings = load_settings()
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("[guarddog] quiet window close-out SUPPRESSED (no recipient configured)", flush=True)
+        return 'not-sent'
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    reasons = sorted({str(h.get('reason') or '') for h in held if h.get('reason')})
+    lines = [f"Guard Dog held {len(held)} alert(s) during planned work "
+             f"({'; '.join(reasons) or 'quiet window'}). The window is over and these "
+             f"Guard Dog checks are still not OK:", '']
+    lines += [f"  • {k}: {health.get(k)}" for k in failing]
+    lines += ['', 'Alerts held during the window:']
+    for h in held[-20:]:
+        lines.append(f"  {datetime.utcfromtimestamp(int(h.get('at') or 0)).strftime('%Y-%m-%d %H:%M:%SZ')}"
+                     f"  {h.get('subject') or ''}")
+    if len(held) > 20:
+        lines.append(f"  … and {len(held) - 20} earlier")
+    lines += ['', 'Open the Guard Dog page in the console for details.', '',
+              f"Server: {ident}", f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
+    subj = f"Guard Dog: still failing after planned work on {ident}"
+    try:
+        if _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines)):
+            print(f"[guarddog] sent: {subj}", flush=True)
+            return 'sent'
+    except Exception as e:
+        print(f"[guarddog] quiet window close-out not sent: {e}", flush=True)
+    return 'not-sent'
+
+
+def _gd_quiet_review_loop():
+    time.sleep(120)
+    while True:
+        try:
+            _gd_quiet_review_once()
+        except Exception as e:
+            try:
+                print(f"[guarddog] quiet window review failed: {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(GD_QUIET_REVIEW_EVERY_S)
+
+
+try:
+    threading.Thread(target=_gd_quiet_review_loop, daemon=True, name='gd-quiet-review').start()
+except Exception:
+    pass
+
+
 def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
     """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint.
 
@@ -25302,6 +25487,10 @@ def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
         if paused:
             print(f"[guarddog] alert email suppressed — notifications paused"
                   f"{' until ' + until if until else ' (indefinite)'}: {subject}", flush=True)
+            return False
+        quiet = _gd_quiet_state()
+        if quiet[0]:
+            _gd_quiet_hold(subject, quiet)   # ops #228: reviewed when the window closes
             return False
     settings = load_settings()
     relay = settings.get('email_relay', {})
@@ -25686,6 +25875,12 @@ def _update_notify_check_once():
         return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
     if settings.get('guarddog_update_email_enabled') is False:
         return {'pending': [], 'emailed': False, 'skipped': 'update emails disabled'}
+    # ops #228: defer — never mark as mailed — while a quiet window is open. Going through
+    # the held send below would record this version as notified and lose it for good.
+    _q_on, _q_until, _q_why = _gd_quiet_state()
+    if _q_on:
+        return {'pending': [], 'emailed': False, 'skipped': f'quiet window ({_q_why})',
+                'quiet_until': _q_until}
     state = _update_notify_state_load()
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
@@ -25786,14 +25981,20 @@ def _startup_retire_updates_timer():
 def _update_notify_loop():
     time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
     while True:
+        wait = UPDATE_NOTIFY_INTERVAL_S
         try:
-            _update_notify_check_once()
+            r = _update_notify_check_once() or {}
+            if r.get('quiet_until'):
+                # ops #228: deferred by a quiet window — look again once it has settled,
+                # not six hours later.
+                wait = min(UPDATE_NOTIFY_INTERVAL_S,
+                           max(60, int(r['quiet_until'] - time.time()) + UPDATE_NOTIFY_FIRST_DELAY_S))
         except Exception as e:
             try:
                 print(f"[update-notify] sweep failed: {e}", flush=True)
             except Exception:
                 pass
-        time.sleep(UPDATE_NOTIFY_INTERVAL_S)
+        time.sleep(wait)
 
 
 # Start the sweep thread once (daemon; idle-cheap — first sweep 15 min after boot).
@@ -25939,7 +26140,14 @@ def guarddog_send_alert_email():
         return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     body = (data.get('body') or '')[:50000]
     try:
+        # ops #228: say HELD (quiet window), not just suppressed. send-alert-email.sh exits
+        # 3 on it, so a watcher that gates its episode on delivery keeps it open and
+        # alerts after the window if the fault is still there.
+        held = _gd_quiet_state()[0] and not _gd_alerts_pause_state()[0]
         sent = _guarddog_send_alert_email_via_relay(to_addr, subject, body)
+        if held and not sent:
+            return jsonify({'success': True, 'suppressed': True, 'held': True,
+                            'reason': 'quiet window'})
         return jsonify({'success': True, 'suppressed': not sent})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -26131,9 +26339,15 @@ def guarddog_notifications_status():
     # a save had silently dropped an invalid address.
     emails = _safe_alert_emails(settings.get('guarddog_alert_email'))
     sms = settings.get('guarddog_sms') or {}
+    q_on, q_until, q_why = _gd_quiet_state()
     return jsonify({
         'paused': paused,
         'until': until if paused else '',
+        # ops #228: a quiet window holds delivery while planned work runs (ends by itself).
+        'quiet': q_on,
+        'quiet_until': (datetime.utcfromtimestamp(q_until).strftime('%Y-%m-%dT%H:%M:%SZ')
+                        if q_on else ''),
+        'quiet_reason': q_why if q_on else '',
         'indefinite': bool(paused and not until),
         'has_email': bool(emails),
         'has_sms': bool(sms.get('provider')),
@@ -26228,6 +26442,12 @@ def _guarddog_send_sms_now(sms, text, force=False):
             print(f"[guarddog] alert SMS suppressed — notifications paused"
                   f"{' until ' + until if until else ' (indefinite)'}", flush=True)
             return {'suppressed': True}
+        # ops #228: the same alert's email records the hold for the close-out review;
+        # recording it again here would list every alert twice.
+        quiet = _gd_quiet_state()
+        if quiet[0]:
+            print(f"[guarddog] alert SMS HELD — quiet window ({quiet[2]})", flush=True)
+            return {'suppressed': True, 'held': True}
     if sms.get('provider') == 'twilio':
         import base64
         import urllib.error
@@ -26439,6 +26659,8 @@ def run_guarddog_deploy(alert_email):
             # branch emits the identical commands); enables container mode here.
             '_gd-tak-lib.sh',
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
+            # ops #228: opens/closes the quiet window for T&E, drills and box tests.
+            'gd-quiet.sh',
             # v10.1.46 (W1/W2): the boot client gate on 8089 and the session
             # visibility watcher. Both are fleet-wide — the gate no-ops on a box
             # with no firewall backend, the watcher no-ops until TAK is up.
