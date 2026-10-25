@@ -155,8 +155,9 @@ def test_rewritten_override_has_the_hardening_flags(tmp_path):
     assert '203.0.113.50' in denied
     # coturn aborts on a CIDR value — every value is IP or IP-IP
     assert denied and all(RANGE.match(d) for d in denied), denied
-    # nothing re-opens a refused address
-    assert not any(f.startswith('--allowed-peer-ip') for f in flags)
+    # nothing re-opens a refused address except coturn's own relay address (ops #212)
+    assert re.findall(r'--allowed-peer-ip=[^"\n]*', p.read_text()) == [
+        "--allowed-peer-ip=$$(hostname -i | cut -d' ' -f1)"]
     # no entry sits inside another one
     assert len(denied) == len(set(denied))
     assert not any(d != e and _covered(d.split('-')[0], [e]) and _covered(d.split('-')[-1], [e])

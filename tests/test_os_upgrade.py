@@ -48,7 +48,9 @@ def _fn(name):
 
 
 CONSTS = APP[APP.index('_OS_UPGRADE_UNIT = '):APP.index('\n\n\ndef _os_upgrade_unit_state')]
-STEPS = ('pre-snapshot', 'pin-pg16', 'release-upgrade', 'repos-noble',
+# W12.c: 'stack-backup' runs in the console before the detached job is spawned (when the
+# operator leaves "Take a full backup first" on); the script itself starts at pre-snapshot.
+STEPS = ('stack-backup', 'pre-snapshot', 'pin-pg16', 'release-upgrade', 'repos-noble',
          'venv-rebuild', 'reassert', 'restart-console', 'reboot')
 
 
@@ -56,7 +58,8 @@ def _ns(**extra):
     """Namespace with the W4 constants + pure helpers; callers add stubs."""
     import shlex, hashlib, time, os as _os
     ns = {'re': re, 'json': json, 'shlex': shlex, 'hashlib': hashlib, 'shutil': shutil,
-          'time': time, 'os': _os, 'subprocess': subprocess, 'types': types}
+          'time': time, 'os': _os, 'subprocess': subprocess, 'types': types,
+          '_stack_backup_job': {'running': False}}
     ns.update(extra)
     exec(compile(CONSTS, 'app.py:W4-consts', 'exec'), ns)
     for name in ('_os_upgrade_tak_version_tuple', '_os_upgrade_script', '_os_upgrade_job_state'):
@@ -102,7 +105,7 @@ def test_script_parses_in_bash(script):
 
 def test_script_steps_in_plan_order(script):
     steps = re.findall(r'^step (\S+)$', script, re.M)
-    assert tuple(steps) == STEPS
+    assert tuple(steps) == STEPS[1:]   # 'stack-backup' runs in the console, not the script
 
 
 def test_script_names_the_step_before_doing_anything(script):
@@ -514,7 +517,8 @@ def test_start_route_is_password_gated_and_reruns_preflight():
     assert '_require_admin_password(' in body
     assert "data.get('admin_password')" in body
     assert body.index('_require_admin_password(') < body.index('_os_upgrade_start_job(')
-    start = _fn('_os_upgrade_start_job')
+    # W12.c split the spawn into _os_upgrade_launch(), reached only after the preflight
+    start = _fn('_os_upgrade_start_job') + _fn('_os_upgrade_launch')
     # server-side re-run, never the client's copy; refused with 409 + the checks
     assert '_os_upgrade_preflight(for_start=True, data=data)' in start
     assert "return 409, {'ok': False, 'error': 'preflight failed: '" in start
@@ -523,7 +527,7 @@ def test_start_route_is_password_gated_and_reruns_preflight():
 
 
 def test_start_builds_exactly_the_broker_shape():
-    start = _fn('_os_upgrade_start_job')
+    start = _fn('_os_upgrade_launch')
     i = start.index('cmd = [')
     cmd = start[i:start.index(']', i)]
     for tok in ("'systemd-run'", "'--unit=' + _OS_UPGRADE_UNIT.replace('.service', '')",
@@ -534,6 +538,33 @@ def test_start_builds_exactly_the_broker_shape():
         assert tok in cmd, tok
     assert cmd.count('--setenv=') == 3
     assert '_sudo_wrap(cmd)' in start
+
+
+def test_stack_backup_step_states():
+    """W12.c: 'running:stack-backup' has no unit yet — alive while the console's backup
+    thread runs, failed (never a spinner) once that thread is gone."""
+    ns = _ns()
+    no_unit = ('not-found', 'inactive', 'dead', '', 0)
+    ns['_stack_backup_job'] = {'running': True}
+    st = ns['_os_upgrade_job_state']('running:stack-backup', no_unit)
+    assert (st['state'], st['step']) == ('running', 'stack-backup')
+    ns['_stack_backup_job'] = {'running': False}
+    st = ns['_os_upgrade_job_state']('running:stack-backup', no_unit)
+    assert st['state'] == 'failed' and 'interrupted' in st['detail']
+    st = ns['_os_upgrade_job_state']('failed:stack-backup', no_unit)
+    assert (st['state'], st['step']) == ('failed', 'stack-backup')
+
+
+def test_backup_first_fails_the_job_before_any_package_moves():
+    start = _fn('_os_upgrade_start_job')
+    # the backup path returns before the launch; only the backup's on_done launches
+    i = start.index("if data.get('stack_backup'):")
+    assert start.index('_stack_backup_run_job(', i) < start.index('return _os_upgrade_launch(pf, remote)')
+    after = start[start.index('def _after(ok, res):'):start.index('try:', start.index('def _after(ok, res):'))]
+    assert after.index("_os_upgrade_write_status('failed:stack-backup')") < after.index('_os_upgrade_launch(pf, remote)')
+    # never alongside the post-update deploy (aws-arm 2026-10-25) or another backup/restore
+    assert "data.get('stack_backup') and _POST_UPDATE_ACTIVE['on']" in start
+    assert "_stack_backup_job.get('running')" in start
 
 
 def test_startup_migrations_calls_the_verify():
@@ -594,7 +625,7 @@ def test_broker_accepts_exactly_the_shape_the_console_sends(broker):
                                '/bin/bash', '/opt/infratak/scripts/migrate-console-nonroot.sh',
                                '--apply', '--auto-rollback'])
     # the shape app.py builds IS this shape (same tokens, same order)
-    start = _fn('_os_upgrade_start_job')
+    start = _fn('_os_upgrade_launch')
     for tok in OSUP[2:9]:
         assert repr(tok) in start or tok.split('=', 1)[0] in start, tok
 

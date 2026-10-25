@@ -13900,6 +13900,39 @@ def _get_current_takserver_heap_gb():
     return None
 
 
+TAKSERVER_HEAP_VARS = ('CONFIG_MAX_HEAP', 'API_MAX_HEAP', 'MESSAGING_MAX_HEAP',
+                       'PLUGIN_MANAGER_MAX_HEAP', 'RETENTION_MAX_HEAP')
+_TAKSERVER_HEAP_BLOCK_A = '# >>> infra-TAK managed heap >>>'
+_TAKSERVER_HEAP_BLOCK_B = '# <<< infra-TAK managed heap <<<'
+
+
+def _merge_takserver_heap_defaults(existing, heap_gb, heaps_mb):
+    """Return /etc/default/takserver with infra-TAK's heap vars replaced and everything else kept.
+
+    GH #282: set-heap used to write the whole file, so an operator's own variables were
+    dropped every time the suggested heap was applied. infra-TAK owns only the five
+    *_MAX_HEAP vars: any line setting one of them (with or without `export`) is removed,
+    as are our previous managed block and the two unmarked comment lines older releases
+    wrote, and one managed block is appended at the end so it wins over anything above it.
+    `heaps_mb` maps each name in TAKSERVER_HEAP_VARS to its value in MB.
+    """
+    import re as _re
+    text = _re.sub(rf'{_re.escape(_TAKSERVER_HEAP_BLOCK_A)}.*?{_re.escape(_TAKSERVER_HEAP_BLOCK_B)}\n?',
+                   '', existing or '', flags=_re.DOTALL)
+    owned = _re.compile(r'^\s*(?:export\s+)?(?:%s)=' % '|'.join(TAKSERVER_HEAP_VARS))
+    legacy = ('# infra-TAK total heap:', '# Proportional split across TAK Server processes')
+    kept = [ln for ln in text.splitlines()
+            if not owned.match(ln) and not ln.strip().startswith(legacy)]
+    while kept and not kept[-1].strip():
+        kept.pop()
+    block = [_TAKSERVER_HEAP_BLOCK_A,
+             f'# infra-TAK total heap: {heap_gb}g',
+             '# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)']
+    block += [f'export {name}={int(heaps_mb[name])}' for name in TAKSERVER_HEAP_VARS]
+    block.append(_TAKSERVER_HEAP_BLOCK_B)
+    return '\n'.join(kept + ([''] if kept else []) + block) + '\n'
+
+
 @app.route('/api/takserver/heap-info')
 @login_required
 def takserver_heap_info():
@@ -13940,16 +13973,18 @@ def takserver_set_heap():
     plugin_mb = int(total_mb * w_plugin / w_total)
     retain_mb = int(total_mb * w_retain / w_total)
 
-    defaults_content = (
-        f"# infra-TAK total heap: {heap_gb}g\n"
-        f"# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)\n"
-        f"export CONFIG_MAX_HEAP={config_mb}\n"
-        f"export API_MAX_HEAP={api_mb}\n"
-        f"export MESSAGING_MAX_HEAP={msg_mb}\n"
-        f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
-        f"export RETENTION_MAX_HEAP={retain_mb}\n"
-    )
     defaults_file = '/etc/default/takserver'
+    # GH #282: merge into the operator's file instead of replacing it. A file that exists
+    # but cannot be read is a refusal, never a blank slate to overwrite.
+    existing = ''
+    if _exists_priv(defaults_file):
+        try:
+            existing = _read_own_or_priv(defaults_file)
+        except Exception as _rd_err:
+            return jsonify({'success': False, 'error': f'Could not read {defaults_file}, left it unchanged: {str(_rd_err)[:200]}'}), 500
+    defaults_content = _merge_takserver_heap_defaults(existing, heap_gb, {
+        'CONFIG_MAX_HEAP': config_mb, 'API_MAX_HEAP': api_mb, 'MESSAGING_MAX_HEAP': msg_mb,
+        'PLUGIN_MANAGER_MAX_HEAP': plugin_mb, 'RETENTION_MAX_HEAP': retain_mb})
     try:
         # v10.0.5 non-root: /etc/default/takserver + /opt/tak/setenv.sh are root-owned;
         # was bare `sudo tee`/`sudo cat` (bypass broker → EPERM non-root). Route via broker.
@@ -17390,6 +17425,16 @@ _COTURN_REALM_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
 _COTURN_ALWAYS_DENIED = ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10',
                          '172.16.0.0/12')
 _COTURN_PRIVATE_DENIED = ('10.0.0.0/8', '192.168.0.0/16')
+# ops #212: a call where both ends fell back to this TURN server. Each side asks permission
+# for the other's relayed address (<external IP>:500xx), and coturn maps a peer at its
+# external IP to its own relay address before checking it. With no --relay-ip that address
+# is 0.0.0.0 (from --listening-ip), which coturn always refuses, so these calls never
+# worked, v10.2.28 included. Pin the relay address to the container's own address and allow
+# exactly that one: the call goes from one relay port to the other inside the container,
+# and nothing outside the coturn container (the box, its bridges, other containers) is
+# reachable. The image's entrypoint expands $(...) in each argument at start ($$ is
+# compose's escape), so the value follows the container across recreates.
+_COTURN_SELF_ADDR = "$$(hostname -i | cut -d' ' -f1)"
 
 
 def _coturn_block_private_peers(settings):
@@ -17439,9 +17484,10 @@ def _coturn_box_addresses():
 def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
     """coturn --denied-peer-ip values, widest first; an entry already inside a refused
     range is left out. The advertised --external-ip is one of the box's own addresses
-    (on a NAT'd cloud box it is on no interface). coturn 4.18 already refuses it as a
-    peer on its own (seen on test8 with no ACL at all), so listing it changes nothing
-    there and keeps the rule simple: the box is never a peer."""
+    (on a NAT'd cloud box it is on no interface), so it is listed too: the box is never
+    a peer. coturn swaps a peer at the external IP for its own relay address before this
+    list is checked, so that entry never refuses a call between two relays — see
+    _COTURN_SELF_ADDR."""
     nets = [ipaddress.ip_network(n) for n in _COTURN_ALWAYS_DENIED]
     if block_private:
         nets += [ipaddress.ip_network(n) for n in _COTURN_PRIVATE_DENIED]
@@ -17487,6 +17533,8 @@ def _coturn_override_content(port, ip, username, password, realm, block_private,
       - --realm={realm}
       - --no-tcp-relay
       - --no-multicast-peers
+      - "--relay-ip={_COTURN_SELF_ADDR}"
+      - "--allowed-peer-ip={_COTURN_SELF_ADDR}"
 {acl}"""
 
 
@@ -62019,11 +62067,14 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
 _GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
 _GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
 _AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+_AK_UPDATE_INPROC = {'since': 0.0}       # ops #214: this console's own Update, marker or not
 
 
 def _guarddog_authentik_update_begin(what):
     """Tell Guard Dog's Authentik watcher a console update is under way. Best effort:
     without Guard Dog (no state dir) there is no watcher to tell."""
+    # ops #214: the console's own watchdogs are told even without Guard Dog.
+    _AK_UPDATE_INPROC['since'] = time.time()
     if not os.path.isdir(os.path.dirname(_GD_AUTHENTIK_UPDATE_MARKER)):
         return False
     try:
@@ -62035,6 +62086,7 @@ def _guarddog_authentik_update_begin(what):
 
 
 def _guarddog_authentik_update_end():
+    _AK_UPDATE_INPROC['since'] = 0.0
     try:
         subprocess.run(_sudo_wrap(['rm', '-f', _GD_AUTHENTIK_UPDATE_MARKER]),
                        capture_output=True, timeout=15)
@@ -62059,6 +62111,69 @@ def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S
             break
         time.sleep(every_s)
     _guarddog_authentik_update_end()
+
+
+# --- Console watchdogs stand down while Authentik is being changed (ops #214) --
+# Guard Dog's watcher honours the marker above (#167); the console's own watchdogs did
+# not. test12, 2026-10-24 (Authentik 2026.8.5 update): the ldap-sa-watchdog saw the bind
+# fail mid-recreate and ran a service-account heal ("heal INCOMPLETE ... Connection
+# refused"). Harmless that time, but the channels-pool watchdog's `docker restart
+# authentik-server-1` on two unhealthy ticks is exactly the mid-migration restart #167
+# took away from Guard Dog. So each of them asks this first and skips its tick.
+
+def _authentik_compose_lock_busy():
+    """True when someone else holds the compose lock right now. Probes without waiting
+    and without creating the file; holds it for no longer than the probe. Every other
+    party waits for the lock (`flock -w`, the console's retry loop), so the probe can
+    never make one of them skip."""
+    if getattr(_AK_COMPOSE_LOCK_HELD, 'depth', 0) > 0:
+        return False   # this thread holds it: not a reason for its own work to stop
+    import fcntl as _fcntl
+    try:
+        fh = open(_AK_COMPOSE_LOCK_PATH, 'r')
+    except OSError:
+        return False   # no lock file: nobody has taken it since boot
+    try:
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return True
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        return False
+    finally:
+        fh.close()
+
+
+def _guarddog_authentik_update_marker_age():
+    """Age in seconds of a fresh Guard Dog update marker, else None. Same rule as the
+    watcher: older than _GD_AUTHENTIK_UPDATE_MAX_S, unreadable or in the future = ignored
+    (the watcher removes those; the console can't without the broker and needn't)."""
+    try:
+        with open(_GD_AUTHENTIK_UPDATE_MARKER) as f:
+            since = int((f.readline().split() or ['x'])[0])
+    except (OSError, ValueError):
+        return None
+    age = int(time.time()) - since
+    return age if 0 <= age < _GD_AUTHENTIK_UPDATE_MAX_S else None
+
+
+def _authentik_busy_reason():
+    """Why a console watchdog must leave Authentik alone this tick, or '' when it may act."""
+    if _authentik_compose_lock_busy():
+        return 'the Authentik compose lock is held (a recreate is running)'
+    age = _guarddog_authentik_update_marker_age()
+    if age is not None:
+        return f'an Authentik update is in progress (update marker {age}s old)'
+    # The marker is only written where Guard Dog is installed. This console's own Update
+    # is tracked in-process too, until Authentik answers again (i.e. after migrations).
+    since = _AK_UPDATE_INPROC['since']
+    if since:
+        if time.time() - since < _GD_AUTHENTIK_UPDATE_MAX_S and not _local_authentik_http_ok():
+            return f'an Authentik update is in progress ({int(time.time() - since)}s, migrations not finished)'
+        _AK_UPDATE_INPROC['since'] = 0.0
+    if _authentik_deploy_in_progress():
+        return 'an Authentik/TAK deploy is in progress (or just finished)'
+    return ''
 
 
 def _recreate_authentik_server_worker(plog, reason):
@@ -67212,6 +67327,15 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(120)
                 continue
 
+            # ops #214: an updating server is unhealthy and its pool is in flux — restarting
+            # it here lands mid-migration (#167). No samples either: they would skew autotune.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ak-pg-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _consecutive_unhealthy = 0
+                _wt.sleep(120)
+                continue
+
             _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 150)
             # v0.9.36: separate threshold for idle-in-transaction connections.
             _idle_in_tx_threshold = int(
@@ -67981,6 +68105,15 @@ def _authentik_ldap_sa_bind_watchdog_loop():
 
             _env_pass = _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
             if not _env_pass:
+                _wt.sleep(300)
+                continue
+
+            # ops #214: a bind that fails because Authentik is mid-update is not drift.
+            # Skip the whole tick (heal, role check, audit scrape); the next one reassesses.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ldap-sa-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _ok_counter = 0
                 _wt.sleep(300)
                 continue
 
@@ -69487,8 +69620,10 @@ def _authentik_spiral_monitor():
             # container (e.g. postgresql) force-recreated-but-not-started, which makes
             # authentik-server unhealthy and breaks the LDAP SA / webadmin sync on a
             # fresh deploy. See the _with_authentik_deploy_guard block comment.
-            if _authentik_deploy_in_progress():
-                print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
+            # ops #214: an Authentik update / held compose lock counts the same.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[spiral monitor] {_busy} — standing down this cycle "
                       "(avoids concurrent docker compose on the authentik project)", flush=True)
                 continue
 
@@ -76168,6 +76303,54 @@ def _cotdb_facts(tak_cfg=None):
                 if tbl.strip():
                     f['fk_dependents'].append({'table': tbl.strip(), 'constraint': con.strip()})
 
+    # GH #273: data_feed_cot links feeds to cot_router rows with no foreign key, so
+    # retention leaves every link behind and the table only grows (reporter: 71.7M
+    # rows / 4.5 GB, all orphans; pg_stat showed n_live_tup = 0 for it). Its size
+    # comes from the catalog, never from tuple stats, and "has orphans" is one
+    # LIMIT 1 probe down the cot_router_id index — the same anti-join the retention
+    # guard's Step 2b deletes with.
+    f['feed_cot_bytes'] = None
+    f['feed_cot_orphans'] = None
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT CASE WHEN to_regclass('public.data_feed_cot') IS NULL THEN '' ELSE "
+        "pg_total_relation_size('public.data_feed_cot')::text || '|' || "
+        "(SELECT EXISTS (SELECT 1 FROM data_feed_cot d WHERE NOT EXISTS "
+        "(SELECT 1 FROM cot_router c WHERE c.id = d.cot_router_id)))::text END;", timeout=25)
+    if ok and '|' in out:
+        size_s, _, orph = out.strip().splitlines()[-1].partition('|')
+        if size_s.strip().isdigit():
+            f['feed_cot_bytes'] = int(size_s.strip())
+        f['feed_cot_orphans'] = orph.strip() in ('t', 'true')
+    elif not ok and out:
+        f['errors'].append(f'data_feed_cot: {out[:200]}')
+    f['feed_cot_human'] = (_cotdb_fmt_bytes(f['feed_cot_bytes'])
+                           if f['feed_cot_bytes'] is not None else '-')
+
+    # GH #273 (smaller note): the same data package uploaded again and again — the
+    # reporter's `resource` table held 6 identical copies of a 501 MB GeoTIFF. TAK
+    # already stores a hash per row; this only REPORTS repeats. Deleting a package
+    # is TAK's call (its Web Admin), not ours, so nothing here removes anything.
+    f['dup_packages'] = []
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT count(*), COALESCE(sum(pg_column_size(data)), 0)::bigint, "
+        "max(replace(replace(COALESCE(name, filename, ''), '|', ' '), E'\\n', ' ')) "
+        "FROM resource WHERE hash IS NOT NULL AND hash <> '' "
+        "GROUP BY hash HAVING count(*) > 1 "
+        "ORDER BY sum(pg_column_size(data)) DESC NULLS LAST LIMIT 5;", timeout=25)
+    if ok:
+        for line in (out or '').splitlines():
+            parts = line.split('|', 2)
+            if len(parts) == 3 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                copies, total = int(parts[0].strip()), int(parts[1].strip())
+                f['dup_packages'].append({
+                    'name': parts[2].strip()[:120] or '(unnamed)', 'copies': copies,
+                    'bytes': total, 'human': _cotdb_fmt_bytes(total),
+                    'extra_human': _cotdb_fmt_bytes(total - total // copies)})
+
     f['retention_hours'] = _cotdb_retention_hours()
     f['retention_proc_alive'] = _cotdb_retention_proc_alive()
     f['guard_timer_enabled'] = _cotdb_systemctl(['is-enabled', 'takretentionguard.timer']) or 'unknown'
@@ -76238,8 +76421,20 @@ def _cotdb_verdict(facts):
     database of which data_feed_cot is 5.6 GB, verdict retention_stalled,
     recommendation Purge."""
     verdict, headline, detail, recommend = _cotdb_verdict_tree(facts)
+    lt = facts.get('largest_table')
+    if facts.get('feed_cot_orphans'):
+        # GH #273: test8's 5.6 GB data_feed_cot (above) was this — links to CoT rows
+        # retention had already deleted. Purge cannot reach it; the retention guard can.
+        detail += (f" data_feed_cot holds {facts.get('feed_cot_human', '-')} including links to CoT "
+                   "rows that no longer exist. Guard Dog's retention guard deletes those every "
+                   "15 minutes in batches; Run Retention Now starts it immediately. PostgreSQL reuses "
+                   "the freed space once autovacuum has run; Online Compact gives it back to the disk.")
+        recommend = list(recommend or [])
+        if 'retention_run' not in recommend:
+            recommend.insert(0, 'retention_run')
+        if lt == 'data_feed_cot':
+            return verdict, headline, detail, recommend
     if 'purge' in (recommend or []):
-        lt = facts.get('largest_table')
         if lt and lt not in _COTDB_TABLES:
             detail += (f" NOTE: the largest table here is {lt} "
                        f"({facts.get('largest_table_human', '-')}), which Purge Old CoT does "
@@ -76728,6 +76923,181 @@ def guarddog_cotdb_purge():
 def guarddog_cotdb_purge_status():
     """Poll the batched (mode=age) purge."""
     return jsonify({'success': True, **_cotdb_purge_status})
+
+
+# ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ─────────
+# upgrade-db.sh's pg_upgrade runs in copy mode, so the 15 cluster survives, stopped, as
+# the rollback — and nothing ever removed it (reporter: 15 GB, untouched for 10 days,
+# next to a 14 GB PostgreSQL 18; test6: 3 GB). The card reports it and offers a
+# password-gated Remove once 18 is the live database. Nothing is removed automatically:
+# it is the only way back from a bad migration, so dropping it is the operator's call.
+#
+# Local (native) boxes go through the broker's fixed-shape `pg_old_cluster` op, which
+# re-checks every precondition itself. A two-server Server One runs the same checks in
+# the fixed script below over SSH. No request value reaches either: the action is one
+# of two literals, the majors and paths are constants.
+_PG_OLD_CLUSTER_MAJOR = 15
+_PG_OLD_CLUSTER_SH = r'''set -u
+ACTION="__ACTION__"
+pgdir() {
+  for d in "/var/lib/postgresql/$1/main" "/var/lib/pgsql/$1/data"; do
+    if [ -d "$d" ] && [ ! -L "$d" ] && [ "$(cat "$d/PG_VERSION" 2>/dev/null)" = "$1" ]; then
+      echo "$d"; return 0
+    fi
+  done
+  return 1
+}
+OLD=$(pgdir 15) || OLD=""
+if [ -z "$OLD" ]; then
+  echo "found=0"
+  [ "$ACTION" = "drop" ] && { echo "error=no PostgreSQL 15 cluster found"; exit 1; }
+  exit 0
+fi
+NEW=$(pgdir 18) || NEW=""
+FAM=rhel; case "$OLD" in /var/lib/postgresql/*) FAM=debian ;; esac
+RUN=0; [ -e "$OLD/postmaster.pid" ] && RUN=1
+NEWRUN=0; [ -n "$NEW" ] && [ -e "$NEW/postmaster.pid" ] && NEWRUN=1
+KB=$(du -sk "$OLD" 2>/dev/null | awk '{print $1}')
+BYTES=$(( ${KB:-0} * 1024 ))
+echo "found=1"; echo "family=$FAM"; echo "path=$OLD"; echo "running=$RUN"
+echo "new_path=$NEW"; echo "new_running=$NEWRUN"; echo "bytes=${BYTES:-0}"
+[ "$ACTION" = "drop" ] || exit 0
+[ "$RUN" = "1" ] && { echo "error=the PostgreSQL 15 cluster is running, not removing it"; exit 1; }
+[ "$NEWRUN" = "1" ] || { echo "error=no running PostgreSQL 18 cluster, the 15 cluster may still be the only database"; exit 1; }
+if [ "$FAM" = "debian" ] && command -v pg_dropcluster >/dev/null 2>&1; then
+  pg_dropcluster 15 main >/dev/null 2>&1
+else
+  systemctl disable postgresql-15 >/dev/null 2>&1
+fi
+[ -d "$OLD" ] && [ ! -L "$OLD" ] && rm -rf "$OLD"
+if [ -e "$OLD" ]; then echo "removed=0"; echo "error=$OLD is still present"; exit 1; fi
+echo "removed=1"; echo "freed_bytes=${BYTES:-0}"
+'''
+
+
+def _pg_old_cluster_call(action, tak_cfg):
+    """Ask (action='inspect') or remove (action='drop') the leftover 15 cluster where
+    TAK's database lives. Returns the broker op's dict shape; never raises."""
+    if action not in ('inspect', 'drop'):
+        return {'ok': False, 'error': 'bad action'}
+    mode = (tak_cfg or {}).get('mode') or ''
+    if mode == 'two_server':
+        s1 = tak_cfg.get('server_one') or {}
+        if not (s1.get('host') or '').strip():
+            return {'ok': False, 'error': 'Server One host not configured'}
+        script = _PG_OLD_CLUSTER_SH.replace('__ACTION__', action)
+        ok, out = _ssh_probe(s1, 'cd / && sudo -n bash -c ' + shlex.quote(script),
+                             timeout=1800 if action == 'drop' else 120)
+        res = {'ok': ok, 'where': 'Server One (%s)' % s1.get('host')}
+        for line in (out or '').splitlines():
+            k, sep, v = line.strip().partition('=')
+            if not sep or k not in ('found', 'family', 'path', 'running', 'new_path',
+                                    'new_running', 'bytes', 'removed', 'freed_bytes', 'error'):
+                continue
+            if k in ('found', 'running', 'new_running', 'removed'):
+                res[k] = v.strip() == '1'
+            elif k in ('bytes', 'freed_bytes'):
+                res[k] = int(v) if v.strip().isdigit() else 0
+            else:
+                res[k] = v.strip()
+        if 'found' not in res:
+            res['ok'] = False
+            res.setdefault('error', (out or 'no answer from Server One')[:300])
+        return res
+    if mode == 'external_db' or _tak_is_container():
+        # A managed database has no cluster of ours on disk; container TAK keeps its
+        # PostgreSQL 15 data in a docker volume the 5.8 migration names itself.
+        return {'ok': True, 'found': False, 'not_applicable': True}
+    req = {'op': 'pg_old_cluster', 'action': action}
+    try:
+        if _broker_should_route() and _broker_available():
+            res = _broker_request(req, timeout=1800 if action == 'drop' else 300)
+        elif os.getuid() == 0:
+            m = _broker_module()
+            m._check_pg_old_cluster(req)
+            res = m._do_pg_old_cluster(req)
+        else:
+            return {'ok': False, 'error': 'privilege broker unavailable'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}
+    res['where'] = 'this server'
+    return res
+
+
+def _pg_old_cluster_state(tak_cfg):
+    """inspect + the console's own "is PostgreSQL 18 really the live database" check.
+    `removable` is what gates the card's Remove button."""
+    res = _pg_old_cluster_call('inspect', tak_cfg)
+    if not res.get('found'):
+        return res
+    ok, out = _cotdb_psql(tak_cfg,
+                          "SELECT current_setting('server_version_num')::int / 10000, "
+                          "current_setting('data_directory'), "
+                          "(SELECT count(*) FROM pg_database WHERE datname = 'cot');",
+                          db='postgres', timeout=20)
+    parts = out.strip().split('|') if ok else []
+    live_major = int(parts[0]) if len(parts) == 3 and parts[0].strip().isdigit() else None
+    live_dir = parts[1].strip() if len(parts) == 3 else ''
+    has_cot = len(parts) == 3 and parts[2].strip() not in ('', '0')
+    res['live_major'] = live_major
+    res['bytes_human'] = _cotdb_fmt_bytes(res.get('bytes') or 0)
+    why = None
+    if res.get('running'):
+        why = 'The PostgreSQL %d cluster is still running.' % _PG_OLD_CLUSTER_MAJOR
+    elif live_major is None or not has_cot:
+        why = 'Could not confirm that the live database is healthy, so removal is not offered.'
+    elif live_major <= _PG_OLD_CLUSTER_MAJOR or live_dir == res.get('path'):
+        why = 'PostgreSQL %d is still the live database.' % _PG_OLD_CLUSTER_MAJOR
+    elif not res.get('new_running'):
+        why = 'The PostgreSQL %d cluster is not running.' % live_major
+    res['removable'] = why is None
+    res['not_removable_reason'] = why
+    return res
+
+
+@app.route('/api/guarddog/pg-old-cluster')
+@login_required
+def guarddog_pg_old_cluster():
+    """Read-only: is a stopped PostgreSQL 15 cluster still on disk, and how big is it."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    res = _pg_old_cluster_state(_get_tak_deployment_config(load_settings()))
+    return jsonify({'success': bool(res.get('ok', True)), **res})
+
+
+@app.route('/api/guarddog/pg-old-cluster/remove', methods=['POST'])
+@login_required
+def guarddog_pg_old_cluster_remove():
+    """DESTRUCTIVE: remove the leftover PostgreSQL 15 cluster — the 5.8 migration's
+    rollback copy. Password + typed confirmation, same gate as Purge Old CoT."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    want = str(_PG_OLD_CLUSTER_MAJOR)
+    if (data.get('confirm') or '').strip() != want:
+        return jsonify({'success': False, 'error': "confirm must be exactly '%s'." % want,
+                        'expected_confirm': want}), 400
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    st = _pg_old_cluster_state(tak_cfg)
+    if not st.get('found'):
+        return jsonify({'success': False, 'error': 'No PostgreSQL %s cluster found.' % want}), 400
+    if not st.get('removable'):
+        return jsonify({'success': False, 'error': st.get('not_removable_reason') or 'Not removable.'}), 409
+    audit('guarddog:pg-old-cluster', 'remove PostgreSQL %s cluster %s on %s (%s)'
+          % (want, st.get('path'), st.get('where'), st.get('bytes_human')), force=True)
+    res = _pg_old_cluster_call('drop', tak_cfg)
+    ok = bool(res.get('ok') and res.get('removed'))
+    audit('guarddog:pg-old-cluster', ('removed, freed %s' % st.get('bytes_human')) if ok
+          else ('FAILED: %s' % (res.get('error') or 'unknown')[:200]), force=True)
+    if not ok:
+        return jsonify({'success': False, 'error': res.get('error') or 'Removal failed.'}), 500
+    return jsonify({'success': True, 'freed_human': st.get('bytes_human'),
+                    'message': 'Removed the PostgreSQL %s cluster (%s) on %s and freed %s.'
+                               % (want, st.get('path'), st.get('where'), st.get('bytes_human'))})
 
 
 @app.route('/api/takserver/cert-expiry')
@@ -82582,12 +82952,18 @@ def _tak_rollback(label, plog=None):
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
-    # v10.3.0 W12: the unit's own TimeoutStopSec is 90 s, so a 60 s cap raised TimeoutExpired
-    # mid-stop on a slow shutdown (nuc 2026-10-25) and the caller lost the rest of its sequence.
+    # v10.2.30: the unit's own TimeoutStopSec is 90 s, so the old 60 s cap raised TimeoutExpired
+    # on a slow shutdown. It escaped the rollback thread: the status stayed "running" forever and
+    # TAK Server was left stopped (nuc 2026-10-25). Wait long enough; if it still has not stopped,
+    # bring it back and report — nothing has been restored at this point.
     try:
         subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=180)  # v10.0.1: container-aware
     except subprocess.TimeoutExpired:
-        plog("  rollback: takserver did not stop within 180 s")
+        plog("  rollback: takserver did not stop within 180 s — starting it again, nothing restored")
+        try:
+            subprocess.run(_tak_systemctl('start'), shell=True, capture_output=True, timeout=180)
+        except Exception as _e:
+            plog(f"  rollback: could not start takserver: {str(_e)[:200]}")
         return False, 'takserver did not stop within 180 s — nothing was restored'
 
     # 3. Restore CoreConfig.xml

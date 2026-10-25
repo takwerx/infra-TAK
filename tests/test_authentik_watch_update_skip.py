@@ -358,7 +358,8 @@ def test_log_read_is_bounded(box):
 
 _FUNCS = {'_guarddog_authentik_update_begin', '_guarddog_authentik_update_end',
           '_local_authentik_http_ok', '_guarddog_authentik_update_end_when_healthy'}
-_CONSTS = {'_GD_AUTHENTIK_UPDATE_MARKER', '_GD_AUTHENTIK_UPDATE_MAX_S', '_AK_LOCAL_HEALTH_URL'}
+_CONSTS = {'_GD_AUTHENTIK_UPDATE_MARKER', '_GD_AUTHENTIK_UPDATE_MAX_S', '_AK_LOCAL_HEALTH_URL',
+           '_AK_UPDATE_INPROC'}
 
 
 def _load():

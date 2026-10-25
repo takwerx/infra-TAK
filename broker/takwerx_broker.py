@@ -3221,6 +3221,119 @@ def _do_certifi_upgrade(req):
             **({'error': '; '.join(errors)[-600:]} if errors else {})}
 
 
+# ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ──────
+# upgrade-db.sh runs pg_upgrade in COPY mode, so the 15 cluster stays on disk,
+# stopped, as the rollback. Nothing ever removes it: the reporter's sat at 15 GB for
+# weeks next to a 14 GB PostgreSQL 18 cluster. `inspect` reports it (the console user
+# cannot read a postgres 0700 data dir, let alone `du` it); `drop` removes it.
+#   * The request carries an action and NOTHING else — no path, no major, no argv.
+#     Both majors and both layouts are constants here.
+#   * `drop` re-checks everything itself at call time and refuses unless the 15
+#     cluster is stopped AND a PostgreSQL 18 cluster is running. The console's own
+#     gates (password, confirmation, "18 is healthy") are not trusted in its place.
+#   * Never follows a symlink, and PG_VERSION must say 15, so the op cannot be pointed
+#     at anything but a real PostgreSQL 15 data directory.
+_PG_OLD_MAJOR = 15
+_PG_NEW_MAJOR = 18
+_PG_CLUSTER_LAYOUTS = (
+    ('debian', '/var/lib/postgresql/{major}/main'),     # postgresql-common
+    ('rhel', '/var/lib/pgsql/{major}/data'),            # PGDG on EL
+)
+
+
+def _pg_cluster_dir(major):
+    """(family, data_dir) of a real `major` cluster, or (None, None)."""
+    for fam, tmpl in _PG_CLUSTER_LAYOUTS:
+        p = tmpl.format(major=major)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            with open(os.path.join(p, 'PG_VERSION')) as fh:
+                if fh.read().strip() != str(major):
+                    continue
+        except OSError:
+            continue
+        return fam, p
+    return None, None
+
+
+def _pg_cluster_running(path):
+    # postmaster.pid exists while the postmaster runs. A crash can leave a stale one;
+    # that reads as "running" and refuses the drop, which is the safe direction.
+    return os.path.lexists(os.path.join(path, 'postmaster.pid'))
+
+
+def _pg_dir_bytes(path):
+    """Disk use of a directory tree, like `du -sb` (os.walk never follows symlinks)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for n in files:
+            try:
+                total += os.lstat(os.path.join(root, n)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def _check_pg_old_cluster(req):
+    if req.get('action') not in ('inspect', 'drop'):
+        raise Denied(f"pg_old_cluster: action must be 'inspect' or 'drop': {req.get('action')!r}")
+    extra = set(req) - {'op', 'action', 'timeout'}
+    if extra:
+        raise Denied(f'pg_old_cluster: takes no other fields: {sorted(extra)}')
+
+
+def _pg_old_cluster_facts():
+    fam, old = _pg_cluster_dir(_PG_OLD_MAJOR)
+    if not old:
+        return {'ok': True, 'found': False, 'major': _PG_OLD_MAJOR}
+    _nf, new = _pg_cluster_dir(_PG_NEW_MAJOR)
+    return {'ok': True, 'found': True, 'major': _PG_OLD_MAJOR, 'family': fam, 'path': old,
+            'running': _pg_cluster_running(old), 'bytes': _pg_dir_bytes(old),
+            'new_major': _PG_NEW_MAJOR, 'new_path': new,
+            'new_running': bool(new) and _pg_cluster_running(new)}
+
+
+def _do_pg_old_cluster(req):
+    _check_pg_old_cluster(req)
+    f = _pg_old_cluster_facts()
+    if req.get('action') == 'inspect' or not f.get('found'):
+        if req.get('action') == 'drop':
+            return {**f, 'ok': False, 'error': f'no PostgreSQL {_PG_OLD_MAJOR} cluster found'}
+        return f
+    if f['running']:
+        return {**f, 'ok': False, 'error': f'the PostgreSQL {_PG_OLD_MAJOR} cluster is running '
+                                           f'(postmaster.pid in {f["path"]}) — not removing it'}
+    if not f['new_running']:
+        return {**f, 'ok': False, 'error': f'no running PostgreSQL {_PG_NEW_MAJOR} cluster — the '
+                                           f'{_PG_OLD_MAJOR} cluster may still be the only database'}
+    out = ''
+    drop = shutil.which('pg_dropcluster', path=BROKER_TRUSTED_PATH) if f['family'] == 'debian' else None
+    if drop:
+        # The supported removal: data dir AND /etc/postgresql/15/main, cluster unregistered.
+        try:
+            r = subprocess.run([drop, str(_PG_OLD_MAJOR), 'main'], cwd='/', capture_output=True,
+                               text=True, timeout=1800)
+            out = ((r.stdout or '') + (r.stderr or '')).strip()[-2000:]
+        except subprocess.SubprocessError as e:
+            out = str(e)[:300]
+    else:
+        systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH)
+        if systemctl:
+            subprocess.run([systemctl, 'disable', f'postgresql-{_PG_OLD_MAJOR}'],
+                           capture_output=True, timeout=30)
+    if os.path.isdir(f['path']) and not os.path.islink(f['path']):
+        # EL has no pg_dropcluster; on Debian this is the fallback if it failed.
+        shutil.rmtree(f['path'], ignore_errors=True)
+    gone = not os.path.lexists(f['path'])
+    return {**f, 'ok': gone, 'removed': gone, 'freed_bytes': f['bytes'] if gone else 0,
+            'output': out, **({} if gone else {'error': f'{f["path"]} is still present'})}
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -3254,6 +3367,8 @@ def _evaluate(req):
             _check_java_cacerts_sync(req)
         elif op == 'certifi_upgrade':
             _check_certifi_upgrade(req)
+        elif op == 'pg_old_cluster':
+            _check_pg_old_cluster(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -3335,8 +3450,9 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
-              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade'):
+    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
+              'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
+              'pg_old_cluster'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -3346,6 +3462,8 @@ def _dispatch(req, peer):
             summary = CERTIFI_EDITOR_DIR
         elif op in ('stack_pg_dump', 'stack_pg_restore'):
             summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
+        elif op == 'pg_old_cluster':
+            summary = f"action={req.get('action')} major={_PG_OLD_MAJOR}"
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -3381,6 +3499,8 @@ def _dispatch(req, peer):
             return _do_java_cacerts_sync(req)
         if op == 'certifi_upgrade':
             return _do_certifi_upgrade(req)
+        if op == 'pg_old_cluster':
+            return _do_pg_old_cluster(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)

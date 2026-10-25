@@ -44,6 +44,10 @@ BATCH_SLEEP=2
 # Max batched-delete iterations per run (safety cap: 50k × 200 = 10M rows max)
 MAX_BATCHES=200
 
+# Orphaned data_feed_cot batches per run (Step 2b): 50k × 100 = 5M rows. Kept below
+# MAX_BATCHES so both loops together stay well inside the unit's 30-min timeout.
+ORPHAN_MAX_BATCHES=100
+
 # Parse guarddog.conf
 TWO_SERVER_MODE=0
 REMOTE_DB_HOST=""
@@ -202,6 +206,51 @@ ACTIVE_DELETES=$((${ACTIVE_DELETES:-0} + 0))
 if [ "$ACTIVE_DELETES" -gt 0 ]; then
   log_line "RETENTION-GUARD: ${ACTIVE_DELETES} active DELETE(s) running (under ${KILL_THRESHOLD_MIN}min threshold), skipping batched cleanup"
   exit 0
+fi
+
+# ── Step 2b: orphaned data_feed_cot rows (GH #273) ──
+# data_feed_cot links a data feed to a cot_router row (cot_router_id, data_feed_id).
+# It has NO foreign key, and neither TAK's deleteCotByTtl nor the batched delete
+# below touches it, so every cot_router row retention removes leaves its link
+# behind. On the reporter's box it was 71.7M rows / 4.5 GB, every one pointing at a
+# cot_router id that no longer existed; test6 had 45M (2.8 GB), all orphans, while
+# its retention policy ran hourly. A link to a deleted row means nothing, so this
+# runs whatever the retention policy is — it deletes no CoT, only dead links.
+#
+# Only ids below the newest cot_router row older than an hour are considered, so a
+# link written in the same moment as its (not yet visible) cot_router row is never
+# mistaken for an orphan. The anti-join walks data_feed_cot_cot_router_id_idx in
+# order (merge anti join on cot_router_pkey), so each batch is an index range, not
+# a scan of the whole table. NB: this statement contains "cot_router", so Step 1
+# would treat a run of it longer than KILL_THRESHOLD_MIN as stuck — a batch takes
+# seconds, and killing one that did not would be the right call anyway.
+HAS_FEED_COT=$(psql_scalar "SELECT to_regclass('public.data_feed_cot') IS NOT NULL;" | tr -d '[:space:]')
+if [ "$HAS_FEED_COT" = "t" ]; then
+  ORPHAN_SQL="DELETE FROM data_feed_cot WHERE ctid IN (SELECT d.ctid FROM data_feed_cot d WHERE d.cot_router_id < (SELECT max(id) FROM cot_router WHERE servertime < now() - interval '1 hour') AND NOT EXISTS (SELECT 1 FROM cot_router c WHERE c.id = d.cot_router_id) LIMIT ${BATCH_SIZE});"
+  ORPHANS_DELETED=0
+  ORPHAN_BATCHES=0
+  ORPHAN_FAILED=0
+  while [ "$ORPHAN_BATCHES" -lt "$ORPHAN_MAX_BATCHES" ]; do
+    DEL_OUT=$(psql_raw "$ORPHAN_SQL")
+    ROW_COUNT=$(echo "$DEL_OUT" | sed -n 's/^DELETE \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ROW_COUNT" ]; then
+      ORPHAN_FAILED=1
+      break
+    fi
+    ROW_COUNT=$((ROW_COUNT + 0))
+    ORPHANS_DELETED=$((ORPHANS_DELETED + ROW_COUNT))
+    ORPHAN_BATCHES=$((ORPHAN_BATCHES + 1))
+    [ "$ROW_COUNT" -lt "$BATCH_SIZE" ] && break
+    sleep "$BATCH_SLEEP"
+  done
+  if [ "$ORPHAN_FAILED" = "1" ]; then
+    # Not fatal: the cot_router cleanup below is the guard's main job and must still run.
+    log_line "RETENTION-GUARD: ERROR — orphaned data_feed_cot delete failed in batch $((ORPHAN_BATCHES + 1)) after removing ${ORPHANS_DELETED} rows."
+  elif [ "$ORPHANS_DELETED" -gt 0 ]; then
+    MORE=""
+    [ "$ORPHAN_BATCHES" -ge "$ORPHAN_MAX_BATCHES" ] && MORE=" (batch cap reached, more next run)"
+    log_line "RETENTION-GUARD: removed ${ORPHANS_DELETED} orphaned data_feed_cot rows (links to deleted CoT) in ${ORPHAN_BATCHES} batches${MORE}"
+  fi
 fi
 
 # ── Step 3: Determine retention hours from TAK's ACTUAL policy file ──
