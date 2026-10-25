@@ -295,9 +295,12 @@ def test_a_listed_file_that_is_gone_is_dropped(ct, remote):
 # ── remote Deploy deletes and re-clones ~/CloudTAK ───────────────────────────
 
 FAKE_GIT = """#!/bin/sh
-# clone: make the target with a base compose file; anything else: pass
+# clone: make the target with a base compose file; -C DIR rev-parse: a repo only if DIR/.git
+# exists (real git exits 128 outside one); anything else: pass
 for last; do :; done
-case "$1" in clone) [ "$FAIL" = 1 ] && exit 1; mkdir -p "$last" && echo 'services: {}' > "$last/docker-compose.yml" ;; esac
+case "$1" in clone) [ "$FAIL" = 1 ] && exit 1; mkdir -p "$last" && echo 'services: {}' > "$last/docker-compose.yml" ;;
+  fetch) [ "$FAIL" = 1 ] && exit 1 ;;
+  -C) [ "$3" = rev-parse ] && [ ! -d "$2/.git" ] && exit 128 ;; esac
 exit 0
 """
 FAKE_DOCKER = "#!/bin/sh\nexit 0\n"
@@ -348,6 +351,28 @@ def test_remote_reclone_failure_keeps_it_for_the_next_run(ct):
     assert (ct / 'docker-compose.custom.yml').read_text() == OPERATOR
 
 
+def test_remote_deploy_over_a_valid_checkout_updates_in_place(ct):
+    """ops #198: the re-clone deleted .docker-garage (the store's live data) and .env with the
+    tree. A valid checkout is now updated in place, so both survive a remote Deploy."""
+    (ct / '.git').mkdir()
+    (ct / 'docker-compose.yml').write_text('services: {}\n')
+    (ct / 'docker-compose.custom.yml').write_text(OPERATOR)
+    (ct / '.docker-garage' / 'meta').mkdir(parents=True)
+    (ct / '.docker-garage' / 'meta' / 'node_key').write_text('cluster identity')
+    r = _reclone(ct.parent, 'v13.113.0')
+    assert r.returncode == 0, r.stderr
+    assert (ct / '.env').read_text() == ENV
+    assert (ct / '.docker-garage' / 'meta' / 'node_key').read_text() == 'cluster identity'
+    assert (ct / 'docker-compose.custom.yml').read_text() == OPERATOR
+
+
+def test_remote_in_place_update_failure_is_reported(ct):
+    (ct / '.git').mkdir()
+    (ct / 'docker-compose.yml').write_text('services: {}\n')
+    assert _reclone(ct.parent, 'v13.113.0', fail=True).returncode != 0   # the fetch fails
+    assert (ct / '.env').read_text() == ENV       # and nothing was deleted
+
+
 def test_remote_deploy_uses_the_reclone_helper():
     src = _fn('run_cloudtak_deploy')
     assert 'prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)' in src
@@ -358,8 +383,10 @@ def test_local_reclone_fallback_carries_the_operator_file():
     src = _fn('run_cloudtak_deploy')
     i = src.find('docker-compose.yml missing — re-cloning')
     seg = src[i:i + 1600]
-    _before(seg, 'CLOUDTAK_CUSTOM_COMPOSE), \'rb\')', "rm -rf {cloudtak_dir}")
-    _before(seg, 'git clone --depth 1{_rclone_branch}', "CLOUDTAK_CUSTOM_COMPOSE), 'wb')")
+    # ops #216: through the shared keep-aside, which carries TAK Portal's plugin files too
+    _before(seg, '_keep = _cloudtak_keep_aside(cloudtak_dir)', "rm -rf {cloudtak_dir}")
+    _before(seg, 'git clone --depth 1{_rclone_branch}', '_cloudtak_put_back(_keep, cloudtak_dir, plog)')
+    assert 'CLOUDTAK_CUSTOM_COMPOSE' in _assign('_CLOUDTAK_KEEP_FILES')
 
 
 # ── every compose action sets it up first ────────────────────────────────────

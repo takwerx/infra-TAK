@@ -1173,7 +1173,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.2.28-alpha"
+VERSION = "10.2.29-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1214,7 +1214,7 @@ def inject_source_url():
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.8.4"   # v10.2.25: promoted to the 2026.8 line (there is no 2026.6/2026.7 upstream). 8.4 is the first 8.x that parses list env vars (our AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS) correctly (#26081), and it carries the 8.2 security backports plus the LDAP cached-searcher memory-leak fix (8.3). 2026.8 only honours X-Forwarded-* from trusted proxies, so remote-Authentik installs now also trust the console IP (_authentik_trusted_proxy_cidrs). Previous: 2026.5.7 — v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release.
+AUTHENTIK_VETTED_RELEASE = "2026.8.5"   # v10.2.29: same-minor bugfix release, no DB migrations (ops #207). Its certifi 2026.10.19 drops the distrusted eMudhra root (emSign ECC Root CA - G3) that 2026.8.4 still trusted inside the container (ops #202). Validated on test12: console Update 8.4 -> 8.5, LDAP SA bind + outpost restart, SSO on every module, pgbouncer reconnect, no Guard Dog restarts, and a clean rollback to 8.4. Previous: 2026.8.4 — v10.2.25: promoted to the 2026.8 line (there is no 2026.6/2026.7 upstream). 8.4 is the first 8.x that parses list env vars (our AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS) correctly (#26081), and it carries the 8.2 security backports plus the LDAP cached-searcher memory-leak fix (8.3). 2026.8 only honours X-Forwarded-* from trusted proxies, so remote-Authentik installs now also trust the console IP (_authentik_trusted_proxy_cidrs). Previous: 2026.5.7 — v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release.
 
 # Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
 # AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
@@ -1238,7 +1238,7 @@ MEDIAMTX_VETTED_RELEASE = "1.21.1"      # v10.2.8 W7: SECURITY — GHSA-w334-5mp
 # takes it the rest of the way (_ak_upgrade_hop). Each entry is the last vetted patch of a
 # family. Add the outgoing family's last vetted patch here whenever a new family is promoted.
 AUTHENTIK_UPGRADE_STEPS = ("2026.5.7",)
-AUTHENTIK_DEV_RELEASE    = "2026.8.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+AUTHENTIK_DEV_RELEASE    = "2026.8.5"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
@@ -2704,6 +2704,94 @@ def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
         _log(f"  Patched {', '.join(patched)}: `microdnf update --nobest` — Red Hat's newer curl needs an "
              "OpenSSL that TAK's Dockerfile pins out; without this the image build fails on every host.")
     return bool(patched)
+
+
+# ops #200 — CA roots the OS vendors have withdrawn trust from that Temurin's own bundled
+# cacerts still ships. Container TAK trusts that bundled store, not the host's, so an OS
+# update never reaches it. Measured 2026-10-23: Temurin 17.0.19+10 (TAK 5.8's hardened base)
+# and 17.0.20.1+1 (the newest 17) both still carry eMudhra's emSign ECC Root CA - G3. These
+# are Temurin's alias names, exactly as `keytool -list -cacerts` prints them; add the next
+# distrusted root here.
+_JDK_DISTRUSTED_CA_ALIASES = (
+    'cn_emsign_ecc_root_ca__g3,o_emudhra_technologies_limited,ou_emsign_pki,c_in [jdk]',
+)
+_JDK_DISTRUST_MARK = '# infra-TAK: CA trust store update'
+
+
+def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
+    """Drop _JDK_DISTRUSTED_CA_ALIASES from the TAK Server image's JDK truststore. Idempotent.
+
+    Adds one RUN after each FROM in the app Dockerfile, where the base image (eclipse-temurin,
+    root) is still the user, so it lands before TAK's own steps and any USER switch. An alias
+    the JDK does not have is not an error: a newer Temurin that already dropped the root, or
+    a stage that is not a JDK, builds exactly as before. Same contract as the patchers above:
+    a Dockerfile we cannot read or write is built as shipped."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not app_dockerfile:
+        return False
+    df = os.path.join(build_ctx, app_dockerfile)
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    if _JDK_DISTRUST_MARK in src:
+        return False
+    drop = ' ; '.join(f'keytool -delete -cacerts -storepass changeit -alias {shlex.quote(a)} >/dev/null 2>&1'
+                      for a in _JDK_DISTRUSTED_CA_ALIASES)
+    step = f'{_JDK_DISTRUST_MARK}\nRUN {drop} ; true\n'
+    new = re.sub(r'(?im)^(FROM\s[^\n]*\n)', lambda m: m.group(1) + step, src)
+    if new == src:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(new)
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(app_dockerfile)}: CA trust store update "
+         f"({len(_JDK_DISTRUSTED_CA_ALIASES)} root(s) the OS vendors no longer trust).")
+    return True
+
+
+def _tak_container_drop_distrusted_cas(log_fn=None):
+    """Same roots, out of the RUNNING TAK container's JDK, for installs whose image was built
+    before the patch above. Returns the aliases removed (empty when already clean), or None
+    when the container could not be asked. Takes effect from TAK's next restart.
+
+    `docker exec -u 0` with an argv, no shell: the JDK's cacerts is root's, not tak's. The
+    container's writable layer keeps it until the container is recreated, which only happens
+    from a freshly built image — and that one already has the patch."""
+    _log = log_fn or (lambda m: None)
+    removed = []
+    for alias in _JDK_DISTRUSTED_CA_ALIASES:
+        base = ['docker', 'exec', '-u', '0', TAK_CONTAINER, 'keytool']
+        try:
+            r = subprocess.run(_sudo_wrap(base + ['-list', '-cacerts', '-storepass', 'changeit', '-alias', alias]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            _log(f"TAK container trust store check skipped: {str(e)[:160]}")
+            return None
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0:
+            if 'does not exist' in out:
+                continue          # already gone
+            if 'No such container' not in out and 'is not running' not in out:
+                _log(f"TAK container trust store check skipped: {out.strip()[-160:]}")
+            return None           # stopped TAK is asked again on the next console start
+        try:
+            r = subprocess.run(_sudo_wrap(base + ['-delete', '-cacerts', '-storepass', 'changeit', '-alias', alias]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            _log(f"⚠ TAK container trust store: could not remove {alias}: {str(e)[:160]}")
+            continue
+        if r.returncode == 0:
+            removed.append(alias)
+        else:
+            _log(f"⚠ TAK container trust store: could not remove {alias}: "
+                 f"{((r.stdout or '') + (r.stderr or '')).strip()[-160:]}")
+    return removed
 
 
 def _tak_bundle_dockerfiles(ctx):
@@ -17035,6 +17123,11 @@ def _run_remote_assist_update():
         _sp.run(_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--force-recreate', 'nginx'),
                 capture_output=True, text=True, timeout=120, cwd=ra_dir)
         plog('✓ nginx recreated (picks up host nginx.conf + loopback bind)')
+        try:
+            if _coturn_converge_override(plog=lambda m: plog(f'  {m}')) == 'current':
+                plog(f'✓ CoTURN already on {COTURN_IMAGE}')
+        except Exception as _ct_err:
+            plog(f'  ⚠ CoTURN security update not applied: {str(_ct_err)[:200]}')
 
         plog('')
         plog('━━━ Step 4/5: Verifying running version ━━━')
@@ -17124,6 +17217,7 @@ def remote_assist_page():
         coturn_ip=coturn_ip,
         coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
         coturn_suggested_port=COTURN_DEFAULT_PORT,
+        coturn_block_private=_coturn_block_private_peers(settings),
         can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
         netbird_coturn_in_use=netbird_coturn_in_use,
         netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
@@ -17152,6 +17246,205 @@ COTURN_DEFAULT_PORT = '3479'
 # real escalation. This charset makes injection impossible.
 _COTURN_USER_RE = re.compile(r'^[A-Za-z0-9._@+=-]{1,64}$')
 _COTURN_PASS_RE = re.compile(r'^[A-Za-z0-9._@+=!%^-]{8,128}$')
+_COTURN_REALM_RE = re.compile(r'^[A-Za-z0-9.-]{1,253}$')
+
+# ops #201: the relay's peer ACL. Remote Assist peers are phones and admin browsers, never
+# the box itself, its containers or link-local/CGNAT space. These ranges are refused on
+# every box; 10/8 and 192.168/16 too unless the operator turns off "Block private peers"
+# (LAN-only / field-kit setups where the device and the admin share a private network).
+_COTURN_ALWAYS_DENIED = ('0.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '100.64.0.0/10',
+                         '172.16.0.0/12')
+_COTURN_PRIVATE_DENIED = ('10.0.0.0/8', '192.168.0.0/16')
+
+
+def _coturn_block_private_peers(settings):
+    """'Block private peers' (Remote Assist page). On unless the operator turned it off."""
+    return settings.get('coturn_block_private_peers') is not False
+
+
+def _coturn_peer_range(net):
+    """One coturn peer-ip value. coturn takes `IP` or `IP-IP` only — a CIDR aborts
+    turnserver at startup ("CIDR is not supported"), so never emit one."""
+    net = ipaddress.ip_network(net, strict=False)
+    if net.num_addresses == 1:
+        return str(net.network_address)
+    return f'{net.network_address}-{net.broadcast_address}'
+
+
+def _coturn_box_addresses():
+    """(own IPv4 addresses, container bridge subnets) of this box, sorted.
+
+    Own addresses are refused as peers. Container bridges are refused whole, whatever
+    pool Docker took them from — a compose network can sit in 192.168/16 or 10/8,
+    which the operator may have opened with the opt-out.
+    Best-effort; ([], []) on any failure."""
+    own, subnets = set(), set()
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show'],
+                           capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or '').splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        iface = ipaddress.IPv4Interface(parts[i + 1])
+                    except Exception:
+                        continue
+                    own.add(iface.ip)
+                    if ifname.startswith(_F2B_CONTAINER_IFACE_PREFIXES) and iface.network.is_private:
+                        subnets.add(iface.network)
+    except Exception:
+        pass
+    return [str(a) for a in sorted(own)], [str(n) for n in sorted(subnets)]
+
+
+def _coturn_peer_acl(external_ip, block_private, own_ips=(), container_subnets=()):
+    """coturn --denied-peer-ip values, widest first; an entry already inside a refused
+    range is left out. The advertised --external-ip is one of the box's own addresses
+    (on a NAT'd cloud box it is on no interface). coturn 4.18 already refuses it as a
+    peer on its own (seen on test8 with no ACL at all), so listing it changes nothing
+    there and keeps the rule simple: the box is never a peer."""
+    nets = [ipaddress.ip_network(n) for n in _COTURN_ALWAYS_DENIED]
+    if block_private:
+        nets += [ipaddress.ip_network(n) for n in _COTURN_PRIVATE_DENIED]
+    for n in list(container_subnets) + list(own_ips) + [external_ip]:
+        try:
+            net = ipaddress.ip_network(n, strict=False)
+        except Exception:
+            continue
+        if net.version == 4 and not any(net.subnet_of(d) for d in nets):
+            nets.append(net)
+    return [_coturn_peer_range(n) for n in nets]
+
+
+def _coturn_override_content(port, ip, username, password, realm, block_private,
+                             own_ips=(), container_subnets=()):
+    """The standalone CoTURN docker-compose.override.yml. One writer: install and the
+    ops #201 converge both build it here, so a box that enabled CoTURN on an old console
+    ends up byte-identical to a fresh install.
+
+    No --no-cli: 4.18 deprecated it (it only logs an ERROR line) — the telnet CLI is off
+    unless --cli is passed, and we never pass it."""
+    acl = ''.join(f'      - --denied-peer-ip={d}\n'
+                  for d in _coturn_peer_acl(ip, block_private, own_ips, container_subnets))
+    # Inputs are charset-validated by the callers, so this interpolation cannot break the YAML.
+    return f"""services:
+  coturn:
+    image: {COTURN_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
+      - "50000-50050:50000-50050/udp"
+    command:
+      - -c
+      - ""
+      - --log-file=stdout
+      - --external-ip={ip}
+      - --listening-port={port}
+      - --listening-ip=0.0.0.0
+      - --min-port=50000
+      - --max-port=50050
+      - --user={username}:{password}
+      - --realm={realm}
+      - --no-tcp-relay
+      - --no-multicast-peers
+{acl}"""
+
+
+def _coturn_parse_override(text):
+    """Port / external IP / user / password / realm out of an override we wrote.
+    Each value is returned only if it passes the same check install applies — so it is
+    safe to write back. Missing or failing values come back as ''."""
+    vals = {}
+    for line in (text or '').splitlines():
+        m = re.match(r'^\s*-\s*"?--(listening-port|external-ip|user|realm)=(.*?)"?\s*$', line)
+        if m:
+            vals.setdefault(m.group(1), m.group(2).strip())
+    user, _, password = vals.get('user', '').partition(':')
+    port = vals.get('listening-port', '')
+    return {
+        'port': port if port.isdigit() and 1024 <= int(port) <= 65535 else '',
+        'ip': vals.get('external-ip', '') if _valid_core_ip(vals.get('external-ip', '')) else '',
+        'username': user if _COTURN_USER_RE.match(user) else '',
+        'password': password if _COTURN_PASS_RE.match(password) else '',
+        'realm': vals.get('realm', '') if _COTURN_REALM_RE.match(vals.get('realm', '')) else '',
+    }
+
+
+_coturn_override_lock = threading.Lock()   # converge (start / RA update / setting) vs install
+
+
+def _coturn_converge_override(plog=None, settings=None):
+    with _coturn_override_lock:
+        return _coturn_converge_override_locked(plog, settings)
+
+
+def _coturn_converge_override_locked(plog=None, settings=None):
+    """ops #201: bring an existing standalone CoTURN onto COTURN_IMAGE and the current
+    flags, then recreate only the coturn service.
+
+    The pin and flags used to reach a box only when the operator clicked Install, so
+    console and Remote Assist updates never moved an existing CoTURN forward. Runs on
+    console start and after a Remote Assist update. Port,
+    user and realm are kept from the override itself (settings as fallback).
+
+    Returns 'absent' | 'netbird' | 'current' | 'rewritten' | 'skipped' | 'failed'."""
+    log = plog or (lambda m: print(f'Startup migration: {m}', flush=True))
+    if settings is None:
+        settings = load_settings()
+    if settings.get('netbird_coturn_in_use'):
+        return 'netbird'                  # NetBird's coturn: not our file, not our flags
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    if not os.path.isfile(path):
+        return 'absent'
+    with open(path) as f:
+        old = f.read()
+    cur = _coturn_parse_override(old)
+    sport = str(settings.get('coturn_port') or '')
+    port = cur['port'] or (sport if sport.isdigit() and 1024 <= int(sport) <= 65535 else '')
+    ip = cur['ip'] or (settings.get('coturn_ip') if _valid_core_ip(settings.get('coturn_ip')) else '')
+    user = cur['username'] or (settings.get('coturn_username') or '')
+    password = cur['password'] or (settings.get('coturn_password') or '')
+    realm = cur['realm'] or (settings.get('fqdn') or '').strip()
+    if not _COTURN_REALM_RE.match(realm):
+        realm = 'remote-assist'           # clients take the realm from the server's challenge
+    if not (port and ip and _COTURN_USER_RE.match(user) and _COTURN_PASS_RE.match(password)):
+        log('CoTURN override not recognised (port/IP/user unreadable) — left as is; '
+            'reinstall CoTURN from the Remote Assist page to get the security update')
+        return 'skipped'
+    own_ips, subnets = _coturn_box_addresses()
+    new = _coturn_override_content(port, ip, user, password, realm,
+                                   _coturn_block_private_peers(settings), own_ips, subnets)
+    if new == old:
+        return 'current'
+    with open(path, 'w') as f:
+        f.write(new)
+    r = subprocess.run(_remote_assist_compose_cmd(ra_dir, '-f', path, 'up', '-d', '--no-deps', 'coturn'),
+                       cwd=ra_dir, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        # Put the old file back so the next start tries again (a rewritten file would
+        # read as 'current' and never be retried). compose pulls before it stops the old
+        # container, so a failed pull leaves the old one running.
+        with open(path, 'w') as f:
+            f.write(old)
+        _lines = [l.strip() for l in ((r.stderr or '') + '\n' + (r.stdout or '')).splitlines() if l.strip()]
+        log(f'CoTURN security update failed, will retry on next start: {(_lines[-1] if _lines else "docker compose failed")[:300]}')
+        return 'failed'
+    log(f'CoTURN updated to {COTURN_IMAGE} with the relay peer restrictions '
+        f'(private peers {"blocked" if _coturn_block_private_peers(settings) else "allowed"})')
+    return 'rewritten'
+
+
+def _startup_converge_coturn():
+    try:
+        _coturn_converge_override()
+    except Exception as e:
+        print(f'Startup migration: CoTURN converge error (non-fatal): {e}', flush=True)
 
 
 def _netbird_coturn_status():
@@ -17284,63 +17577,50 @@ def remote_assist_coturn_install():
                 return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird (it provides STUN/TURN). Choose a different port (e.g. 3479) to run CoTURN alongside it.'})
         except Exception:
             pass
-    fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
+    _settings = load_settings()
+    fqdn = (_settings.get('fqdn') or 'remote-assist').strip()
+    if not _COTURN_REALM_RE.match(fqdn):
+        fqdn = 'remote-assist'
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
-    # Inputs are charset-validated above, so this interpolation cannot break the YAML.
-    override_content = f"""services:
-  coturn:
-    image: {COTURN_IMAGE}
-    restart: unless-stopped
-    ports:
-      - "{port}:{port}/tcp"
-      - "{port}:{port}/udp"
-      - "50000-50050:50000-50050/udp"
-    command:
-      - -c
-      - ""
-      - --log-file=stdout
-      - --external-ip={ip}
-      - --listening-port={port}
-      - --listening-ip=0.0.0.0
-      - --min-port=50000
-      - --max-port=50050
-      - --user={username}:{password}
-      - --realm={fqdn}
-"""
-    try:
-        with open(override_path, 'w') as f:
-            f.write(override_content)
-        r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
-                    cwd=ra_dir, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            # docker compose writes pull PROGRESS to stderr, so the head of stderr is
-            # noise — surface the actual failure (last Error/failed line, e.g. a port
-            # conflict), and roll back the half-written override so a retry is clean.
-            _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
-            _lines = [l.strip() for l in _out.splitlines() if l.strip()]
-            _err = next((l for l in reversed(_lines)
-                         if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
-                        (_lines[-1] if _lines else 'docker compose failed'))
-            try:
-                _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
-                        cwd=ra_dir, capture_output=True, timeout=60)
-                os.remove(override_path)
-            except Exception:
-                pass
-            if 'allocated' in _err.lower() or 'in use' in _err.lower():
-                _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
-            return jsonify({'success': False, 'error': _err[:400]})
-        settings = load_settings()
-        settings['coturn_installed'] = True
-        settings['coturn_username'] = username
-        settings['coturn_password'] = password
-        settings['coturn_ip'] = ip
-        settings['coturn_port'] = port
-        settings['netbird_coturn_in_use'] = False
-        save_settings(settings)
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]})
+    _own_ips, _subnets = _coturn_box_addresses()
+    override_content = _coturn_override_content(port, ip, username, password, fqdn,
+                                                _coturn_block_private_peers(_settings),
+                                                _own_ips, _subnets)
+    with _coturn_override_lock:
+        try:
+            with open(override_path, 'w') as f:
+                f.write(override_content)
+            r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
+                        cwd=ra_dir, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                # docker compose writes pull PROGRESS to stderr, so the head of stderr is
+                # noise — surface the actual failure (last Error/failed line, e.g. a port
+                # conflict), and roll back the half-written override so a retry is clean.
+                _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+                _lines = [l.strip() for l in _out.splitlines() if l.strip()]
+                _err = next((l for l in reversed(_lines)
+                             if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
+                            (_lines[-1] if _lines else 'docker compose failed'))
+                try:
+                    _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
+                            cwd=ra_dir, capture_output=True, timeout=60)
+                    os.remove(override_path)
+                except Exception:
+                    pass
+                if 'allocated' in _err.lower() or 'in use' in _err.lower():
+                    _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
+                return jsonify({'success': False, 'error': _err[:400]})
+            settings = load_settings()
+            settings['coturn_installed'] = True
+            settings['coturn_username'] = username
+            settings['coturn_password'] = password
+            settings['coturn_ip'] = ip
+            settings['coturn_port'] = port
+            settings['netbird_coturn_in_use'] = False
+            save_settings(settings)
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:300]})
 
 
 @app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
@@ -17378,6 +17658,40 @@ def remote_assist_coturn_uninstall():
             settings.pop(k, None)
         save_settings(settings)
         return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
+@app.route('/api/remote-assist/coturn/peer-policy', methods=['POST'])
+@login_required
+def remote_assist_coturn_peer_policy():
+    """ops #201 "Block private peers". Turning it OFF loosens the relay, so that
+    direction asks for the admin password, like uninstall."""
+    data = request.get_json(silent=True) or {}
+    block = data.get('block_private')
+    if not isinstance(block, bool):
+        return jsonify({'success': False, 'error': 'block_private must be true or false.'})
+    if not block:
+        _denied = _require_admin_password(data)
+        if _denied:
+            return _denied
+    try:
+        settings = load_settings()
+        prev = settings.get('coturn_block_private_peers')
+        settings['coturn_block_private_peers'] = block
+        save_settings(settings)
+        result = _coturn_converge_override(plog=lambda m: print(f'CoTURN: {m}', flush=True),
+                                           settings=settings)
+        if result in ('failed', 'skipped'):
+            # The running CoTURN did not change, so neither does the setting.
+            settings = load_settings()
+            if prev is None:
+                settings.pop('coturn_block_private_peers', None)
+            else:
+                settings['coturn_block_private_peers'] = prev
+            save_settings(settings)
+            return jsonify({'success': False, 'error': 'CoTURN could not be restarted with the new setting, so nothing changed — see the console log.'})
+        return jsonify({'success': True, 'result': result})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]})
 
@@ -40538,9 +40852,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
-    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1', timeout=120)
+    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1', timeout=120)
     if not ok:
-        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
+        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1', timeout=120)
     plog("✓ Python packages installed")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
@@ -41126,12 +41440,14 @@ def run_mediamtx_deploy():
                 return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
 
-        # Install Python packages (try with --break-system-packages for newer pip, else without)
+        # Install Python packages (try with --break-system-packages for newer pip, else without).
+        # ops #202: certifi -U on every deploy — pip pulls it in once with requests and nothing
+        # upgrades it after, so the host python kept roots the OS had since removed.
         plog("  Installing Python packages...")
-        r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
+        r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1',
             shell=True, capture_output=True, text=True, timeout=120)
         if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-            subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
+            subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
         plog("✓ Python packages installed")
 
@@ -41658,10 +41974,10 @@ WantedBy=multi-user.target
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
         if os.path.exists(editor_file):
             r = subprocess.run(
-                'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
+                'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0 and 'no such option' in (r.stderr or r.stdout or ''):
-                r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
+                r = subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1 && pip3 install -U certifi 2>&1',
                     shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog("  ⚠ pip install for web editor deps had issues (check logs); trying to start anyway")
@@ -43999,6 +44315,52 @@ MEDIA_INFRA_MULTIARCH = True
 POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
 POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
+# ops #202: containers that make outbound TLS trust the HOST's CA bundle, not the one baked
+# into their image. An image's bundle is frozen at build time, so when a CA update removes a
+# root, the host drops it and the container keeps trusting it.
+# The host bundle is kept current by the OS updater; mounting it read-only makes the container
+# follow it from its next start. Two mounts of the same file: over the image's standard path,
+# for anything that reads that path directly, and alone in a directory of its own, so
+# SSL_CERT_DIR names a directory with nothing stale in it — Go (MediaMTX, NetBird) and OpenSSL
+# also load every cert in the image's /etc/ssl/certs, which on Debian-based images is a
+# per-root copy of the same frozen set. REQUESTS_CA_BUNDLE covers Python requests/botocore
+# (certifi ignores the OS bundle). Node is the odd one: it trusts its own compiled-in roots
+# whatever the bundle says, and NODE_EXTRA_CA_CERTS only ADDS to them;
+# --use-openssl-ca makes it use SSL_CERT_FILE instead (checked against Node 24 and 26).
+HOST_CA_BUNDLES = {'debian': '/etc/ssl/certs/ca-certificates.crt',
+                   'rhel': '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem'}
+CONTAINER_CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt'
+CONTAINER_CA_DIR = '/etc/ssl/infratak-ca'
+
+
+def _host_ca_bundle():
+    """The host OS CA bundle to share with containers, or None when it is missing or empty —
+    a bind mount of a missing file makes Docker create a directory in its place."""
+    path = HOST_CA_BUNDLES.get(_distro_family())
+    try:
+        if path and os.path.getsize(path) > 0:
+            return path
+    except OSError:
+        pass
+    return None
+
+
+def _container_ca_trust(node=False):
+    """(environment lines, volume lines) for one compose service, at service-key indent, that
+    make it trust the host CA bundle (see HOST_CA_BUNDLES). ('', '') without a host bundle,
+    so the service keeps its image's own and nothing is mounted."""
+    src = _host_ca_bundle()
+    if not src:
+        return '', ''
+    env = (f'      SSL_CERT_FILE: "{CONTAINER_CA_BUNDLE}"\n'
+           f'      SSL_CERT_DIR: "{CONTAINER_CA_DIR}"\n'
+           f'      REQUESTS_CA_BUNDLE: "{CONTAINER_CA_BUNDLE}"\n')
+    if node:
+        env += '      NODE_OPTIONS: "--use-openssl-ca"\n'
+    vols = (f'      - "{src}:{CONTAINER_CA_BUNDLE}:ro"\n'
+            f'      - "{src}:{CONTAINER_CA_DIR}/ca-certificates.crt:ro"\n')
+    return env, vols
+
 
 def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
@@ -44123,6 +44485,10 @@ def _cloudtak_build_override_yml(settings):
     # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
     # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
     postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
+    # ops #202: media (MediaMTX pulling external sources, Node for proxy leases) trusts the
+    # host CA bundle. Local only: the bundle path is this box's, like the console cert above.
+    media_ca_env, media_ca_vols = ('', '') if _ct_is_remote else _container_ca_trust(node=True)
+    media_ca_vol_block = f'    volumes:\n{media_ca_vols}' if media_ca_vols else ''
 
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
@@ -44177,7 +44543,7 @@ services:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
-  postgis:
+{media_ca_env}{media_ca_vol_block}  postgis:
     # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
     # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
     image: {postgis_image}
@@ -44799,18 +45165,30 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
     save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
     restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
     if release_tag:
+        tag = shlex.quote(release_tag)
+        # ops #198: a valid checkout is updated IN PLACE, the same as the local Deploy. The tree
+        # holds the store's live data (.docker-garage, or .docker-store on MinIO) and .env, all
+        # untracked, so `checkout -f` leaves them alone; the re-clone deleted the data with the
+        # tree. The re-clone below is only for a missing or broken checkout.
+        inplace = (
+            "if git -C ~/CloudTAK rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
+            f"cd ~/CloudTAK && git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
+            "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "else ")
         # Stop a stack that is already there before deleting its tree. The Garage store
         # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
         # it came back during the rm -rf, Docker re-created the folder, and Garage
         # initialized it with the OLD key; the new stack then crash-looped on a key
         # mismatch (ops #33 box test, redeploy over an existing remote install).
         return (
+            inplace +
             "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
             "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
             + save +
-            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {shlex.quote(release_tag)} "
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} "
             "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
-            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+            "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "fi"
         )
     return (
         "if [ -d ~/CloudTAK/.git ]; then "
@@ -45096,6 +45474,75 @@ def _cloudtak_rewrite_in_place(path, text):
         f.write(text)
 
 
+# GH #271: a marketplace plugin's own install.sh can add an npm package to the web app's TRACKED
+# package.json (Rubber Sheet adds pdfjs-dist). Our Update / revert `checkout -f` drops it, the
+# plugin folder stays, and vite dies on the unresolved import. TAK Portal's pull wrapper only
+# warns about this. Before each build we put back any package a non-infra-TAK plugin imports AND
+# declares in its own package.json, when the web app no longer has it.
+_CT_IMPORT_RE = re.compile(
+    r'''\bimport\s+(?!type\b)[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]'''
+    r'''|\bimport\s*\(?\s*['"]([^'"]+)['"]'''
+    r'''|\bexport\s+(?!type\b)[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]''')
+_CT_NPM_NAME_RE = re.compile(r'(?:@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*')
+_CT_NPM_SPEC_RE = re.compile(r'[~^]?\d+(?:\.\d+){0,2}(?:[-+][\w.]+)?')
+
+
+def _cloudtak_plugin_missing_deps(web, foreign):
+    """{package: (version, plugin)} that foreign plugins import but the web app cannot resolve."""
+    have = set()
+    try:
+        with open(os.path.join(web, 'package.json'), encoding='utf-8') as f:
+            pkg = json.load(f)
+        for k in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+            have.update((pkg.get(k) or {}).keys())
+    except (OSError, ValueError):
+        return {}
+    try:   # hoisted transitive deps resolve too
+        with open(os.path.join(web, 'package-lock.json'), encoding='utf-8') as f:
+            have.update(p[len('node_modules/'):] for p in (json.load(f).get('packages') or {})
+                        if p.startswith('node_modules/') and '/node_modules/' not in p)
+    except (OSError, ValueError):
+        pass
+    missing = {}
+    for name in foreign:
+        pdir = os.path.join(web, 'plugins', name)
+        try:
+            with open(os.path.join(pdir, 'package.json'), encoding='utf-8') as f:
+                ppkg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        declared = {}
+        for k in ('devDependencies', 'peerDependencies', 'dependencies'):   # last wins
+            declared.update(ppkg.get(k) or {})
+        imported = set()
+        for root, dirs, files in os.walk(pdir):
+            # sidecars with their own package.json are separate npm projects; tests never
+            # reach the vite bundle
+            dirs[:] = [d for d in dirs
+                       if d not in ('node_modules', 'dist', '.git', 'test', 'tests', '__tests__')
+                       and not os.path.isfile(os.path.join(root, d, 'package.json'))]
+            for n in files:
+                if (not n.endswith(('.ts', '.js', '.mjs', '.vue', '.tsx')) or n.endswith('.d.ts')
+                        or re.search(r'\.(?:test|spec)\.\w+$', n)):
+                    continue
+                try:
+                    with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
+                        src = f.read(500000)
+                except OSError:
+                    continue
+                for m in _CT_IMPORT_RE.finditer(src):
+                    spec = (m.group(1) or m.group(2) or m.group(3)).split('?', 1)[0]
+                    parts = spec.split('/')
+                    imported.add('/'.join(parts[:2]) if spec.startswith('@') else parts[0])
+        for dep in sorted(imported):
+            ver = declared.get(dep)
+            if (dep in have or dep in missing or not isinstance(ver, str)
+                    or not _CT_NPM_NAME_RE.fullmatch(dep) or not _CT_NPM_SPEC_RE.fullmatch(ver)):
+                continue
+            missing[dep] = (ver, name)
+    return missing
+
+
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
     """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
     raises and never blocks the build: at worst the build fails as it would have anyway."""
@@ -45109,6 +45556,18 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         if os.path.isfile(pkg):
             with open(pkg, encoding='utf-8') as f:
                 text = f.read()
+            orig = text
+            deps = _cloudtak_plugin_missing_deps(web, foreign)
+            if deps:
+                data = json.loads(text)
+                have = dict(data.get('dependencies') or {})
+                have.update({d: v for d, (v, _p) in deps.items()})
+                data['dependencies'] = dict(sorted(have.items()))
+                m = re.search(r'\n([ \t]+)"', text)
+                text = (json.dumps(data, indent=m.group(1) if m else 4, ensure_ascii=False)
+                        + ('\n' if text.endswith('\n') else ''))
+                plog('  Put back npm package(s) that plugins need, which the checkout had reset: '
+                     + ', '.join(f'{d}@{v} ({p})' for d, (v, p) in deps.items()))
 
             def _lint(m):
                 script = m.group(2)
@@ -45127,7 +45586,7 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 
             new = re.sub(r'("lint"\s*:\s*")((?:\\.|[^"\\])*)(")', _lint, text, count=1)
             new = re.sub(r'("check"\s*:\s*")((?:\\.|[^"\\])*)(")', _check, new, count=1)
-            if new != text:
+            if new != orig:
                 _cloudtak_rewrite_in_place(pkg, new)
                 changed.append(os.path.relpath(pkg, ct_dir))
             if _CT_MARKETPLACE_TSCONFIG in new:
@@ -45182,6 +45641,182 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
     except Exception as e:
         plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
+
+
+# ops #216: the same shield for a CloudTAK on another host. Remote Deploy and Update reset the
+# tracked files there too (`checkout -f`, `checkout -- .`) and then build, so TAK Portal's
+# plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
+# copy in shell, the functions above are sent as they are and run by the remote python3.
+_CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')
+_CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
+                    '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
+                    '_cloudtak_plugin_missing_deps', '_cloudtak_shield_foreign_plugins')
+
+
+def _cloudtak_shield_py():
+    """The shield as a standalone python3 script: `python3 - <CloudTAK dir>`."""
+    import inspect
+    g = globals()
+    parts = ['import json, os, re, subprocess, sys']
+    for n in _CT_SHIELD_CONSTS:
+        v = g[n]
+        parts.append(f'{n} = re.compile({v.pattern!r}, {int(v.flags)})' if isinstance(v, re.Pattern)
+                     else f'{n} = {v!r}')
+    parts.append('CLOUDTAK_PLUGINS = %r' % [{'install_dir': p['install_dir']} for p in CLOUDTAK_PLUGINS])
+    parts += [inspect.getsource(g[n]) for n in _CT_SHIELD_FUNCS]
+    parts.append("_cloudtak_shield_foreign_plugins(sys.argv[1], lambda m: print(m, flush=True))")
+    return '\n\n'.join(parts) + '\n'
+
+
+# Read now, at import: app.py on disk can be newer than this process after Update Now pulls.
+try:
+    _CT_SHIELD_PY = _cloudtak_shield_py()
+except Exception:
+    _CT_SHIELD_PY = ''
+
+
+def _cloudtak_remote_shield_sh():
+    """POSIX sh for the remote host (any cwd): run the shield on ~/CloudTAK. Exits 0 when the
+    host has no python3 — the build then fails as it would have, with the cause in the log."""
+    b64 = _b64.b64encode(_CT_SHIELD_PY.encode('utf-8')).decode('ascii')
+    return ("if command -v python3 >/dev/null 2>&1; then "
+            f"printf %s {b64} | base64 -d | python3 - ~/CloudTAK; "
+            "else echo '  ⚠ python3 not found on the CloudTAK host: TAK Portal plugins are not "
+            "shielded from this build'; fi")
+
+
+def _cloudtak_remote_shield(remote_cfg, plog):
+    """Run `_cloudtak_remote_shield_sh()` over SSH and log what it did. Never raises."""
+    try:
+        if not _CT_SHIELD_PY:
+            return
+        ok, out = _ssh_probe(remote_cfg, _cloudtak_remote_shield_sh(), timeout=120)
+        for line in (out or '').splitlines()[-12:]:
+            if line.strip():
+                plog(line if line.startswith(' ') else f'  {line}')
+        if not ok:
+            plog("  ⚠ Could not set the remote build to skip non-infra-TAK plugins (non-fatal)")
+    except Exception as e:
+        plog(f"  ⚠ Could not set the remote build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
+
+
+def _cloudtak_carry_plugins(ct_dir, plog):
+    """ops #216: move every plugin folder left in the web root this tree no longer builds from
+    (api/web/plugins <-> app/plugins, CloudTAK 13.102.0's move) to the one it does — TAK
+    Portal's as well as ours; only infra-TAK's were moved before, so a marketplace plugin dropped
+    out of the build. Untracked folders only, never over an existing one. Returns the
+    (old, new) moves so a rolled-back Update can put them back."""
+    import shutil as _shutil
+    new = _cloudtak_plugins_dir(ct_dir)
+    moves = []
+    for old in (os.path.join(ct_dir, 'app', 'plugins'), os.path.join(ct_dir, 'api', 'web', 'plugins')):
+        if old == new or not os.path.isdir(old):
+            continue
+        rel = os.path.relpath(old, ct_dir)
+        try:
+            r = subprocess.run(['git', '-c', f'safe.directory={ct_dir}', '-C', ct_dir, 'ls-files', '--', rel],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                continue
+            tracked = {ln[len(rel) + 1:].split('/', 1)[0] for ln in r.stdout.splitlines()
+                       if ln.startswith(rel + '/')}
+            names = sorted(os.listdir(old))
+        except Exception:
+            continue
+        for n in names:
+            src, dst = os.path.join(old, n), os.path.join(new, n)
+            if (n.startswith('.') or n in tracked or os.path.lexists(dst)
+                    or not (os.path.isdir(src) or os.path.islink(src))):
+                continue
+            try:
+                os.makedirs(new, exist_ok=True)
+                _shutil.move(src, dst)
+                moves.append((src, dst))
+                plog(f"  Moved plugin {n} to {os.path.relpath(new, ct_dir)}/ (CloudTAK moved its web app)")
+            except Exception as e:
+                plog(f"  ⚠ Could not move plugin {n} to {os.path.relpath(new, ct_dir)}/: {str(e)[:120]}")
+    return moves
+
+
+# ops #216: what a TAK Portal marketplace install leaves in the CloudTAK tree, outside git. A
+# re-clone (Deploy, when the checkout has no compose file) deletes the tree, so these are moved
+# aside first and put back wherever the fresh clone has nothing of that name.
+_CLOUDTAK_KEEP_FILES = (CLOUDTAK_CUSTOM_COMPOSE, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE, 'cloudtak-marketplace-plugins',
+                  '.plugin-src')
+_CLOUDTAK_KEEP_DIRS = (os.path.join('app', 'plugins'), os.path.join('api', 'web', 'plugins'),
+                 os.path.join('api', 'stateless', 'routes'))
+
+
+def _cloudtak_keep_aside(ct_dir):
+    """Move the untracked plugin state out of `ct_dir` into a sibling folder; returns it (or
+    None when there was nothing). Entries of the plugin and route dirs are moved one by one —
+    the fresh clone brings its own tracked ones back."""
+    import shutil as _shutil
+    import glob as _glob
+    try:
+        keep = tempfile.mkdtemp(prefix='.cloudtak-keep-', dir=os.path.dirname(os.path.abspath(ct_dir)))
+    except Exception:
+        return None
+    moved = 0
+    names = list(_CLOUDTAK_KEEP_FILES) + [os.path.basename(p) for p in
+                                    _glob.glob(os.path.join(ct_dir, 'docker-compose.plugin-*.yml'))]
+    for n in names:
+        src = os.path.join(ct_dir, n)
+        if os.path.lexists(src):
+            try:
+                _shutil.move(src, os.path.join(keep, n))
+                moved += 1
+            except Exception:
+                pass
+    for d in _CLOUDTAK_KEEP_DIRS:
+        try:
+            entries = os.listdir(os.path.join(ct_dir, d))
+        except OSError:
+            continue
+        os.makedirs(os.path.join(keep, d), exist_ok=True)
+        for n in entries:
+            try:
+                _shutil.move(os.path.join(ct_dir, d, n), os.path.join(keep, d, n))
+                moved += 1
+            except Exception:
+                pass
+    if not moved:
+        _shutil.rmtree(keep, ignore_errors=True)
+        return None
+    return keep
+
+
+def _cloudtak_put_back(keep, ct_dir, plog):
+    """Undo `_cloudtak_keep_aside()` into the fresh tree. A path the clone brought wins (upstream's
+    own route files, a plugin it now ships); ours is only put where there is nothing."""
+    import shutil as _shutil
+    if not keep:
+        return
+    put, left = [], []
+    for root, dirs, files in os.walk(keep):
+        rel_root = os.path.relpath(root, keep)
+        for n in list(dirs) + files:
+            rel = os.path.normpath(os.path.join(rel_root, n))
+            if rel in _CLOUDTAK_KEEP_DIRS or any(d.startswith(rel + os.sep) for d in _CLOUDTAK_KEEP_DIRS):
+                continue                    # descend: app/, api/, app/plugins/ ... are containers
+            if n in dirs:
+                dirs.remove(n)              # a kept folder goes back whole
+            dst = os.path.join(ct_dir, rel)
+            if os.path.lexists(dst):
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                _shutil.move(os.path.join(keep, rel), dst)
+                put.append(rel)
+            except Exception:
+                left.append(rel)
+    if put:
+        plog(f"  Kept across the re-clone: {', '.join(sorted(put))}")
+    if left:
+        plog(f"  ⚠ Could not put back {', '.join(sorted(left))} — the old copies are in {keep}")
+    else:
+        _shutil.rmtree(keep, ignore_errors=True)
 
 
 # v10.2.7 — the same Garage step for a CloudTAK that lives on another host. There the SSH user is
@@ -45267,6 +45902,20 @@ def _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog):
              else f"  ⚠ Could not restart the previous CloudTAK: {(out or '').strip()[-300:]}")
     except Exception as e:
         plog(f"  ⚠ Rollback error: {str(e)[:200]}")
+
+
+def _cloudtak_foreign_containers(ps_output, project):
+    """IDs from `docker ps -a --format '{{.ID}} {{.Label "com.docker.compose.project"}}'` that
+    the compose project `project` did not create (other project, or no label at all).
+
+    Deploy's pre-start sweep removes only these (ops #198). Removing the project's own
+    containers dropped postgis's anonymous data volume: `up` then started an empty database."""
+    out = []
+    for line in (ps_output or '').splitlines():
+        parts = line.split()
+        if parts and parts[1:] != [project]:
+            out.append(parts[0])
+    return out
 
 
 def _cloudtak_env_secrets(env_text):
@@ -45992,9 +46641,18 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         lint_file = None
         lint_plugins = []
         vite_fail = None
+        vite_detail = None
+        vite_wait = 0
         failed_step = None
 
         for ln in lines:
+            # GH #271: vite's "error during build:" says nothing; the cause follows a
+            # "Build failed with 1 error:" line and a blank one
+            if vite_fail is not None and vite_detail is None and vite_wait < 6:
+                vite_wait += 1
+                _d = re.sub(r'^#\d+\s+[\d.]+\s*', '', ln.strip())
+                if _d and not re.match(r'Build failed with \d+ errors?:?$', _d):
+                    vite_detail = _d
             # ESLint prints each file's path, then its "12:5  error ..." lines
             m = re.search(r'\s(/\S+\.(?:ts|js|vue|mjs|cjs))\s*$', ln)
             if m:
@@ -46088,6 +46746,12 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the CloudTAK web app build (vite) failed.')
             out.append('  %s' % vite_fail[:220])
+            if vite_detail:
+                out.append('  %s' % vite_detail[:300])
+                m = re.search(r'/(?:app|web)/plugins/([\w.-]+)/', vite_detail)
+                if m:
+                    out.append('  It is in CloudTAK plugin folder %s (app/plugins/). CloudTAK itself is '
+                               'not the problem - update or reinstall that plugin, then retry.' % m.group(1))
         elif rate_limited:
             out.append('')
             out.append('Likely cause: Docker Hub pull rate limit.')
@@ -46162,6 +46826,16 @@ def run_cloudtak_deploy(cfg=None):
             _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
             _cloudtak_remote_media_bufs(remote_cfg, plog)
 
+            # ops #198: read the remote .env BEFORE the repo prep (its re-clone fallback deletes
+            # the tree) so a Deploy over an installed CloudTAK keeps its secrets, same as Update
+            # config. If it cannot be read, stop rather than write new secrets over a working install.
+            _ok_env, _rem_env = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env 2>/dev/null; true', timeout=20)
+            if not _ok_env:
+                plog(f"✗ Could not read the remote CloudTAK .env: {(_rem_env or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            _rem_env = _rem_env or ''
+
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
@@ -46180,23 +46854,28 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 4/6: Writing CloudTAK config on remote ━━━")
             import secrets as _secrets
+            _env_signing, _env_store, _env_pg = _cloudtak_env_secrets(_rem_env)
             # v10.1.3+: Preserve postgres password across redeploys (same as local deploy)
             postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
             if not postgres_pass or len(postgres_pass) < 24:
-                postgres_pass = _secrets.token_hex(24)
+                postgres_pass = _env_pg or _secrets.token_hex(24)
                 settings['cloudtak_postgres_password'] = postgres_pass
                 try:
                     save_settings(settings)
                 except Exception:
                     pass
-            signing_secret = _secrets.token_hex(32)
-            minio_pass = _secrets.token_hex(16)
+            if _env_signing or _env_store:
+                plog("  Preserving existing secrets from the remote .env")
+            signing_secret = _env_signing or _secrets.token_hex(32)
+            minio_pass = _env_store or _secrets.token_hex(16)
             # The clone above already put CloudTAK's compose on the remote box, so a FRESH
             # install of a Garage-based CloudTAK is detected here rather than written wrong.
             env_content = _cloudtak_build_env_content(
                 settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
                 remote_host=remote_host,
                 store_endpoint=_cloudtak_remote_store_endpoint(remote_cfg))
+            # keep every key we do not manage (GARAGE_RPC_SECRET above all), as Update config does
+            env_content = _cloudtak_env_preserve_unknown(env_content, _rem_env)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -46235,6 +46914,10 @@ def run_cloudtak_deploy(cfg=None):
                     plog("✗ Garage store setup failed on the remote host (output above)")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
+
+            # ops #216: a Deploy over a remote CloudTAK keeps TAK Portal's plugins (in-place
+            # checkout) but reset its build edits — put them back before the build.
+            _cloudtak_remote_shield(remote_cfg, plog)
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -46450,22 +47133,16 @@ def run_cloudtak_deploy(cfg=None):
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             # GH #261: the operator's compose file is theirs — carry it across the re-clone.
-            _custom_keep = None
-            try:
-                with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'rb') as _ckf:
-                    _custom_keep = _ckf.read()
-            except OSError:
-                pass
+            # ops #216: and TAK Portal's plugins, route files, overlays and repo copies.
+            _keep = _cloudtak_keep_aside(cloudtak_dir)
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
             _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
-            if _custom_keep is not None and os.path.isdir(cloudtak_dir):
-                try:
-                    with open(os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE), 'wb') as _ckf:
-                        _ckf.write(_custom_keep)
-                except OSError as _cke:
-                    plog(f"  ⚠ Could not put back {CLOUDTAK_CUSTOM_COMPOSE}: {_cke}")
+            if _keep and os.path.isdir(cloudtak_dir):
+                _cloudtak_put_back(_keep, cloudtak_dir, plog)
+            elif _keep:
+                plog(f"  ⚠ Re-clone left no tree — your CloudTAK plugin files are kept in {_keep}")
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -46478,6 +47155,8 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"✗ No compose file found in {cloudtak_dir}")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
+        # ops #216: a Deploy over an installed CloudTAK can cross the api/web -> app/ move too.
+        _cloudtak_carry_plugins(cloudtak_dir, plog)
 
         # Step 3: Generate .env and docker-compose.override.yml
         plog("")
@@ -46492,19 +47171,23 @@ def run_cloudtak_deploy(cfg=None):
         # failed' on every API boot. The .env fallback covers pre-v10.1.3 installs and
         # settings.json loss; _cloudtak_sync_postgis_password() after `up -d` converges
         # any box that already carries a mismatch.
+        # ops #198: Deploy over an installed CloudTAK keeps the secrets its .env already has,
+        # same as Update config. A new store key crash-loops Garage (it keeps the key it was
+        # first started with), a dropped GARAGE_RPC_SECRET gets regenerated and no longer
+        # matches .docker-garage, and a new SigningSecret logs every user out.
+        existing_env_text = ''
+        try:
+            with open(env_path) as _ef:
+                existing_env_text = _ef.read()
+        except Exception:
+            pass
+        _env_signing, _env_store, _env_pg = _cloudtak_env_secrets(existing_env_text)
         postgres_pass = settings.get('cloudtak_postgres_password', '')
         postgres_pass = postgres_pass.strip() if isinstance(postgres_pass, str) else ''
         if postgres_pass:
             plog("  Reusing stored postgis password (settings)")
         else:
-            try:
-                with open(env_path) as _ef:
-                    for _l in _ef:
-                        if _l.strip().startswith('POSTGRES_PASSWORD='):
-                            postgres_pass = _l.strip().split('=', 1)[1].strip()
-                            break
-            except Exception:
-                pass
+            postgres_pass = _env_pg
             if postgres_pass:
                 plog("  Reusing postgis password from existing .env")
             else:
@@ -46517,14 +47200,18 @@ def run_cloudtak_deploy(cfg=None):
             except Exception as e:
                 plog(f"  ⚠ Could not persist postgres password to settings: {e}")
 
-        signing_secret = _secrets.token_hex(32)
-        minio_pass = _secrets.token_hex(16)
+        if _env_signing or _env_store:
+            plog("  Preserving existing secrets from CloudTAK .env")
+        signing_secret = _env_signing or _secrets.token_hex(32)
+        minio_pass = _env_store or _secrets.token_hex(16)
 
         # The clone above is already on disk, so a FRESH install of a Garage-based CloudTAK
         # gets port 3900 instead of MinIO's 9000.
         env_content = _cloudtak_build_env_content(
             settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass,
-            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir))
+            store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
+        # never delete a key CloudTAK grew that we know nothing about (GARAGE_RPC_SECRET above all)
+        env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
         with open(env_path, 'w') as f:
             f.write(env_content)
         try:
@@ -46634,11 +47321,14 @@ def run_cloudtak_deploy(cfg=None):
                 plog(f"━━━ Step 4/7 (Retry {build_attempt}/{MAX_BUILD_ATTEMPTS - 1}): Building Docker Images ━━━")
                 plog(f"  Waiting {RETRY_WAIT}s before retry...")
                 time.sleep(RETRY_WAIT)
-                # Clean up docker state from failed attempt (preserve volumes)
+                # Clean up docker state from failed attempt (preserve volumes). ops #216: no
+                # --remove-orphans — TAK Portal's Print / uDash containers come from their own
+                # docker-compose.plugin-<id>.yml in this project, look orphaned to us, and nothing
+                # here would start them again.
                 plog("  Cleaning up from previous build attempt...")
                 try:
                     subprocess.run(
-                        _sudo_wrap(['docker', 'compose', 'down', '--remove-orphans']),
+                        _sudo_wrap(['docker', 'compose', 'down']),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=120, cwd=cloudtak_dir
                     )
@@ -46794,11 +47484,18 @@ def run_cloudtak_deploy(cfg=None):
         # use"). A container left by a prior failed run doesn't carry the labels this
         # compose project expects, so `up` refuses the name instead of recreating it —
         # and the deploy path had NO teardown of its own (only uninstall did). A fresh
-        # deploy owns every cloudtak-* name by definition; volumes are untouched, so
-        # DB data survives.
-        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+        # deploy owns every cloudtak-* name by definition.
+        # ops #198: remove only containers this compose project did NOT create. postgis keeps
+        # its data in an ANONYMOUS volume (upstream's compose names none), and only
+        # `up --force-recreate` carries that over to the new container: after a `docker rm`
+        # compose made a fresh empty one, so a Deploy over an installed CloudTAK came back with
+        # an empty database (the old one orphaned on disk). Our own containers are recreated
+        # by `up` below, the same as the retry loop already leaves them for adoption.
+        _project = os.path.basename(cloudtak_dir).lower()
+        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak', '--format',
+                                          '{{.ID}} {{.Label "com.docker.compose.project"}}']),
                               capture_output=True, text=True, timeout=30)
-        _stale = (_pre.stdout or '').split()
+        _stale = _cloudtak_foreign_containers(_pre.stdout, _project)
         if _stale:
             plog(f"  Removing {len(_stale)} stale cloudtak container(s) from prior runs...")
             subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _stale), capture_output=True, timeout=120)
@@ -46816,7 +47513,6 @@ def run_cloudtak_deploy(cfg=None):
         #     it IS properly project-labeled, the next `up` simply ADOPTS it. So:
         #     retry up to 3 times, each pass removing only foreign holders and leaving
         #     project-labeled ones for adoption. Volumes/DB are never touched.
-        _project = os.path.basename(cloudtak_dir).lower()
         for _attempt in range(3):
             if r.returncode == 0 or 'already in use by container' not in (r.stdout or ''):
                 break
@@ -48003,6 +48699,8 @@ def run_cloudtak_update():
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #216: every plugin across the api/web -> app/ move, TAK Portal's included.
+            _plugin_moves.extend(_cloudtak_carry_plugins(cloudtak_dir, plog))
             # Restore any catalog plugins that the checkout wiped.
             plugins_base = _cloudtak_plugins_dir(cloudtak_dir)
             os.makedirs(plugins_base, exist_ok=True)
@@ -48096,6 +48794,8 @@ def run_cloudtak_update():
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
             plog("  Re-applied media:9997 loopback hardening after checkout"
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
+            _cloudtak_remote_shield(remote_cfg, plog)
             if os.path.isdir(_cloudtak_hooks_dir()):
                 plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
@@ -48772,6 +49472,25 @@ def _webodm_pin_images(compose_txt, services=None):
     return compose_txt
 
 
+# Security update for WebODM (ops #206): upstream's webapp image ships the olefile package,
+# which nothing in WebODM uses (`pip show olefile` → Required-by: empty). The webapp and worker
+# entrypoints remove it on every container start, so it stays gone across a recreate or an
+# image bump without building our own image. Fresh deploys write it via the template; existing
+# installs get it on a console restart and on Update (_webodm_strip_olefile).
+WEBODM_OLEFILE_STRIP = 'pip uninstall -y -q olefile >/dev/null 2>&1; '
+
+
+def _webodm_strip_olefile(compose_txt):
+    """Prefix the wo_webapp and wo_worker entrypoints with WEBODM_OLEFILE_STRIP. Idempotent —
+    an already-patched file (or one whose entrypoint isn't the `/bin/bash -c "…"` form we
+    write) comes back unchanged."""
+    for svc in ('wo_webapp', 'wo_worker'):
+        compose_txt = re.sub(
+            rf'(^  {svc}:\n(?:    [^\n]*\n)*?    entrypoint: /bin/bash -c ")(?!{re.escape(WEBODM_OLEFILE_STRIP)})',
+            lambda m: m.group(1) + WEBODM_OLEFILE_STRIP, compose_txt, count=1, flags=re.M)
+    return compose_txt
+
+
 WEBODM_DOCKER_COMPOSE = '''version: '2.4'
 volumes:
   wo_dbdata:
@@ -48792,7 +49511,7 @@ services:
   wo_webapp:
     image: {images[wo_webapp]}
     container_name: webapp
-    entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
+    entrypoint: /bin/bash -c "pip uninstall -y -q olefile >/dev/null 2>&1; service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
@@ -48815,7 +49534,7 @@ services:
   wo_worker:
     image: {images[wo_worker]}
     container_name: wo_worker
-    entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
+    entrypoint: /bin/bash -c "pip uninstall -y -q olefile >/dev/null 2>&1; /webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
@@ -49451,8 +50170,12 @@ def _run_webodm_update():
         compose_txt = _read_priv(compose_path)
         pinned = _webodm_pin_images(compose_txt)
         if pinned != compose_txt:
-            _write_priv(compose_path, pinned)
             plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        stripped = _webodm_strip_olefile(pinned)
+        if stripped != pinned:
+            plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
+        if stripped != compose_txt:
+            _write_priv(compose_path, stripped)
         plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
@@ -52649,6 +53372,64 @@ server:
         f.write(config_content)
     with open(compose_path, 'w') as f:
         f.write(compose_content)
+    _netbird_write_ca_override(nb_dir)
+
+
+NETBIRD_CA_OVERRIDE_HEADER = '# TAKWERX: NetBird server trusts the host CA bundle (ops #202). Written by the console.\n'
+
+
+def _netbird_write_ca_override(nb_dir):
+    """ops #202: docker-compose.override.yml beside NetBird's compose, giving netbird-server
+    the host CA bundle (see HOST_CA_BUNDLES) for its outbound TLS (IdP discovery, external
+    login providers). An override rather than a line in docker-compose.yml so an existing
+    install gets it without regenerating its compose; every NetBird compose call runs in
+    nb_dir with the default files, so Compose merges it. True when the file changed."""
+    env, vols = _container_ca_trust()
+    if not env:
+        return False
+    path = os.path.join(nb_dir, 'docker-compose.override.yml')
+    new = (NETBIRD_CA_OVERRIDE_HEADER + 'services:\n  netbird-server:\n'
+           f'    environment:\n{env}    volumes:\n{vols}')
+    try:
+        with open(path) as f:
+            if f.read() == new:
+                return False
+    except FileNotFoundError:
+        pass
+    except Exception:
+        try:
+            if _read_priv(path) == new:
+                return False
+        except Exception:
+            pass
+    try:
+        with open(path, 'w') as f:
+            f.write(new)
+    except Exception:
+        _write_priv(path, new)  # root-era /root/netbird the non-root console can't write
+    return True
+
+
+def _heal_netbird_ca_trust(plog=None):
+    """ops #202: give an existing NetBird server the host CA bundle — write the override and
+    recreate netbird-server only (the dashboard serves static files). A no-op once in place.
+    Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        nb_dir = next((d for d in (os.path.expanduser('~/netbird'), '/root/netbird')
+                       if os.path.isfile(os.path.join(d, 'docker-compose.yml'))), None)
+        if not nb_dir or not _netbird_write_ca_override(nb_dir):
+            return False
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        if r.returncode == 0:
+            _log('  ✓ netbird: server now trusts the host CA bundle (recreated)')
+            return True
+        _log(f"  ⚠ netbird: CA trust recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        return False
+    except Exception as e:
+        _log(f'  netbird: CA trust heal error (non-fatal): {e}')
+        return False
 
 
 def _netbird_read_auth_secret(nb_dir):
@@ -62880,6 +63661,20 @@ def _ensure_authentik_pgbouncer(plog):
     return True
 
 
+def _ak_compose_service_env(svc, key):
+    """`services.<svc>.environment[key]` from parsed compose (dict or list form), unquoted;
+    None when the service sets no such key."""
+    env = svc.get('environment') if isinstance(svc, dict) else None
+    if isinstance(env, dict):
+        v = env.get(key)
+        return None if v is None else str(v).strip().strip('"').strip("'")
+    if isinstance(env, list):
+        for item in env:
+            if isinstance(item, str) and item.startswith(key + '='):
+                return item.split('=', 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 def _ensure_authentik_worker_direct_pg(plog):
     """v10.2.1: connect the Authentik WORKER straight to Postgres; the server stays on PgBouncer.
 
@@ -62940,21 +63735,10 @@ def _ensure_authentik_worker_direct_pg(plog):
     if not isinstance(worker, dict):
         return False
 
-    def _svc_pg_host(svc):
-        env = svc.get('environment') if isinstance(svc, dict) else None
-        if isinstance(env, dict):
-            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
-            return None if v is None else str(v).strip().strip('"').strip("'")
-        if isinstance(env, list):
-            for item in env:
-                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
-                    return item.split('=', 1)[1].strip().strip('"').strip("'")
-        return None
-
-    worker_host = _svc_pg_host(worker)
+    worker_host = _ak_compose_service_env(worker, 'AUTHENTIK_POSTGRESQL__HOST')
     if worker_host == 'postgresql':
         return False
-    if worker_host != 'pgbouncer' or _svc_pg_host(services.get('server')) != 'pgbouncer':
+    if worker_host != 'pgbouncer' or _ak_compose_service_env(services.get('server'), 'AUTHENTIK_POSTGRESQL__HOST') != 'pgbouncer':
         plog(f"  worker direct-pg: worker host {worker_host!r} is not the bundled PgBouncer — left alone")
         return False
 
@@ -63053,6 +63837,234 @@ def _ensure_authentik_worker_direct_pg(plog):
     plog(f"  ✓ worker direct-pg: worker on Postgres directly (health={status or 'unknown'}); "
          f"server unchanged on PgBouncer")
     _record('applied')
+    return True
+
+
+# ops #177: fleet constants (postgresql.direct.<key> = value). The fresh-install .env
+# carries the same lines. CONN_OPTIONS is base64 JSON {"options": "-c idle_session_timeout=0"}:
+# the bundled Postgres reaps sessions idle 300 s (_authentik_fix_pg_idle_timeout), and a
+# LISTEN connection is idle by design. Authentik holds `direct` connections open on purpose
+# (CONN_MAX_AGE=None) — once reaped, the next outpost message hit a dead connection
+# (IdleSessionTimeout), the websocket dropped and the push was lost (nuc 2026-10-23). Only
+# the direct alias is exempt; pooled ORM traffic keeps the 300 s reaper.
+_AK_DIRECT_ENV = (
+    ('host', 'postgresql'),
+    ('conn_options', 'eyJvcHRpb25zIjogIi1jIGlkbGVfc2Vzc2lvbl90aW1lb3V0PTAifQ=='),
+)
+_AK_DIRECT_ENV_LINES = ['AUTHENTIK_POSTGRESQL__DIRECT__%s=%s' % (k.upper(), v) for k, v in _AK_DIRECT_ENV]
+_AK_DIRECT_ENV_COMMENT = [
+    "# ops #177: the server's channel layer LISTENs on Postgres directly (PgBouncer's",
+    "# transaction pooling drops NOTIFY, so outposts got no config pushes). CONN_OPTIONS =",
+    "# base64 {\"options\": \"-c idle_session_timeout=0\"}: these connections stay open on purpose.",
+]
+
+
+def _authentik_server_direct_live():
+    """`postgresql.direct` as the running authentik-server-1 loaded it (`ak dump_config`):
+    a dict ({} when unset), or None when it can't be read. The dump holds secrets: never
+    log it."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-server-1', 'ak', 'dump_config']),
+                           capture_output=True, text=True, timeout=60)
+        out = r.stdout or ''
+        if r.returncode != 0:
+            return None
+    except Exception:
+        return None
+    # The dump is one indented JSON object; skip any one-line JSON log events before it.
+    cfg = None
+    for m in re.finditer(r'^\{', out, re.M):
+        try:
+            obj = json.JSONDecoder().raw_decode(out[m.start():])[0]
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and 'postgresql' in obj:
+            cfg = obj
+            break
+    if cfg is None:
+        return None
+    direct = (cfg.get('postgresql') or {}).get('direct')
+    return direct if isinstance(direct, dict) else {}
+
+
+def _authentik_server_direct_current(live):
+    return isinstance(live, dict) and all(str(live.get(k, '')) == v for k, v in _AK_DIRECT_ENV)
+
+
+def _ensure_authentik_server_direct_listen(plog):
+    """ops #177: give the Authentik SERVER a direct Postgres endpoint for its LISTEN.
+
+    The server hears outpost messages through django_channels_postgres, which LISTENs on
+    its own connection. Behind the transaction-pooling PgBouncer that LISTEN sits on a
+    pooled backend and never hears NOTIFY (pgbouncer.org/features.html: LISTEN "Never" in
+    transaction mode), so no outpost ever got a server push on infra-TAK: a provider change
+    sat unconsumed in the channel messages table and the LDAP outpost only saw it at its
+    5-min refresh (aws-arm 2026-10-23: 270 s). Authentik 2026.8 routes the channel layer
+    through a `direct` DB alias whenever any `postgresql.direct.*` key is set
+    (authentik/root/settings.py CHANNEL_LAYERS, upstream goauthentik/authentik#23013;
+    docs.goauthentik.io/install-config/configuration/). ORM traffic stays on PgBouncer;
+    only the channel layer, LISTEN and advisory locks go direct, exempt from the idle reaper
+    (see _AK_DIRECT_ENV).
+
+    Fleet constants in ~/authentik/.env, read by the server and the worker (not the LDAP
+    outpost). The worker is already on `postgresql` (_ensure_authentik_worker_direct_pg),
+    so the keys change nothing that matters for it and it is not recreated.
+
+    Acts only on the bundled topology: compose has `postgresql` and `pgbouncer` and the
+    server is on pgbouncer. A no-op once .env has the lines and the running server has them.
+    Recreates the SERVER only, verifies the runtime with `ak dump_config`, and puts .env
+    back if the server doesn't come up with it. The recreate is a short LDAP outage under
+    a running TAK Server, so it requests the TAK client heal (ops #126) either way.
+
+    Returns True (applied), False (no-op / not applicable), None (failed, rolled back).
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(env_path) or not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  server direct-listen: PyYAML unavailable — skipped (next boot retries)")
+        return False
+    try:
+        with open(compose_path) as f:
+            data = _yaml.safe_load(f.read())
+        with open(env_path) as f:
+            env_text = f.read()
+    except Exception as e:
+        plog(f"  server direct-listen: ~/authentik unreadable ({str(e)[:80]}) — skipped")
+        return False
+    services = data.get('services') if isinstance(data, dict) else None
+    if not isinstance(services, dict) or 'postgresql' not in services or 'pgbouncer' not in services:
+        return False
+    server = services.get('server')
+    if _ak_compose_service_env(server, 'AUTHENTIK_POSTGRESQL__HOST') != 'pgbouncer':
+        return False
+    env = server.get('environment')
+    svc_keys = env.keys() if isinstance(env, dict) else [str(i).split('=', 1)[0] for i in (env or [])]
+    if any(str(k).startswith('AUTHENTIK_POSTGRESQL__DIRECT__') for k in svc_keys):
+        # compose `environment:` beats env_file, so a .env line could never take effect.
+        plog("  server direct-listen: compose sets AUTHENTIK_POSTGRESQL__DIRECT__* on the server — left alone")
+        return False
+
+    lines = env_text.splitlines()
+    keys = {want.split('=', 1)[0]: want for want in _AK_DIRECT_ENV_LINES}
+
+    def _key(ln):
+        m = re.match(r'^\s*(AUTHENTIK_POSTGRESQL__DIRECT__[A-Z_]+)\s*=', ln)
+        return m.group(1) if m and m.group(1) in keys else None
+
+    have = [ln.strip() for ln in lines if _key(ln)]
+    if have == _AK_DIRECT_ENV_LINES:
+        live = _authentik_server_direct_live()
+        if _authentik_server_direct_current(live):
+            return False
+        if live is None:
+            # A server that isn't running is Guard Dog's / the stack heal's job, not a
+            # reason to recreate it on every boot.
+            plog("  server direct-listen: .env set, but the server's live config can't be read — next boot retries")
+            return False
+
+    # Fleet constants: each key's first line is rewritten in place, repeats dropped,
+    # missing keys appended.
+    new_lines, placed = [], set()
+    for ln in lines:
+        k = _key(ln)
+        if k:
+            if k not in placed:
+                new_lines.append(keys[k])
+                placed.add(k)
+            continue
+        new_lines.append(ln)
+    missing = [want for k, want in keys.items() if k not in placed]
+    if missing:
+        if not any(ln.startswith('# ops #177:') for ln in new_lines):
+            if new_lines and new_lines[-1].strip():
+                new_lines.append('')
+            new_lines += _AK_DIRECT_ENV_COMMENT
+        new_lines += missing
+    new_text = '\n'.join(new_lines) + '\n'
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    env_bak = f"{env_path}.bak.before-server-direct-listen.{ts}"
+
+    def _record(outcome):
+        try:
+            s = load_settings()
+            s['authentik_server_direct_listen'] = {
+                'last_outcome': outcome,
+                'last_attempt_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'version': VERSION,
+                'env_backup': env_bak,
+            }
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _compose_up_server():
+        # Called with the lock below already held; re-taking it on this thread is a no-op.
+        return _ak_compose_subprocess(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server']),
+            'server-direct-listen', plog, cwd=ak_dir, capture_output=True, text=True, timeout=180)
+
+    def _restore_env():
+        with open(env_path, 'w') as f:
+            f.write(env_text)
+
+    plog("  server direct-listen: setting AUTHENTIK_POSTGRESQL__DIRECT__HOST/CONN_OPTIONS and recreating "
+         "the Authentik server (outposts get no config pushes while its LISTEN goes through PgBouncer)")
+    with _authentik_compose_lock('server-direct-listen', plog=plog) as _locked:
+        if not _locked:
+            plog("  server direct-listen: compose lock busy — skipped, next console boot retries")
+            return None
+        try:
+            with open(env_bak, 'w') as f:
+                f.write(env_text)
+            os.chmod(env_bak, 0o600)
+            with open(env_path, 'w') as f:
+                f.write(new_text)
+        except Exception as e:
+            plog(f"  ✗ server direct-listen: .env write failed ({e}) — restoring")
+            try:
+                _restore_env()
+            except Exception:
+                pass
+            _record('write-failed')
+            return None
+        r = _compose_up_server()
+        if r.returncode != 0:
+            plog(f"  ✗ server direct-listen: server recreate failed: {((r.stderr or '') + (r.stdout or ''))[:300]}")
+            _restore_env()
+            _compose_up_server()
+            _record('recreate-failed')
+            _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN, failed + rolled back)')
+            return None
+
+    healthy = _wait_for_authentik_stack_healthy(plog, timeout=240)
+    live = _authentik_server_direct_live()
+    if not healthy or not _authentik_server_direct_current(live):
+        # Never log `live` whole: an operator's direct.password would be in it.
+        seen = 'unreadable' if live is None else ', '.join(
+            f"{k} {'ok' if str(live.get(k, '')) == v else 'NOT set'}" for k, v in _AK_DIRECT_ENV)
+        plog(f"  ✗ server direct-listen: server {'healthy' if healthy else 'NOT healthy'}, "
+             f"live postgresql.direct: {seen} — rolling .env back")
+        with _authentik_compose_lock('server-direct-listen-rollback', plog=plog) as _locked:
+            if _locked:
+                _restore_env()
+                _compose_up_server()
+            else:
+                plog(f"  ✗ server direct-listen: compose lock busy — rollback NOT applied; "
+                     f"restore {env_bak} by hand")
+        _wait_for_authentik_stack_healthy(plog, timeout=240)
+        _record('rolled-back')
+        _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN, rolled back)')
+        return None
+    plog("  ✓ server direct-listen: server healthy, ak dump_config shows postgresql.direct host + "
+         "conn_options — outposts get config pushes again; ORM still on PgBouncer")
+    _record('applied')
+    _tak_ldap_recycle_request('Authentik server recreated (direct LISTEN for outpost pushes)')
     return True
 
 
@@ -68748,7 +69760,7 @@ AUTHENTIK_HOST={_get_authentik_base_url(settings)}
 # Reputation policy, and fail2ban — instead of the Docker bridge gateway (172.18.0.1).
 # 172.16.0.0/12 covers every Docker bridge subnet infra-TAK uses (172.17–172.21).
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
-""" + (f"\n# Cookie domain so session is shared across subdomains (stream., infratak., etc.) — avoids redirect loop\nAUTHENTIK_COOKIE_DOMAIN=.{settings.get('fqdn').split(':')[0]}" if settings.get("fqdn") else "") + """
+""" + '\n'.join(_AK_DIRECT_ENV_COMMENT + _AK_DIRECT_ENV_LINES) + "\n" + (f"\n# Cookie domain so session is shared across subdomains (stream., infratak., etc.) — avoids redirect loop\nAUTHENTIK_COOKIE_DOMAIN=.{settings.get('fqdn').split(':')[0]}" if settings.get("fqdn") else "") + """
 # Email Configuration (uncomment and configure)
 # AUTHENTIK_EMAIL__HOST=smtp.example.com
 # AUTHENTIK_EMAIL__PORT=587
@@ -70182,6 +71194,7 @@ entries:
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             _ensure_authentik_pgbouncer(plog)
             _ensure_authentik_worker_direct_pg(plog)
+            _ensure_authentik_server_direct_listen(plog)
             plog("  ✓ redis + pgbouncer up inline — no restart needed")
         except Exception as _opt_e:
             plog(f"  ⚠ inline redis/pgbouncer optimize skipped (next console restart retries): {str(_opt_e)[:160]}")
@@ -82520,6 +83533,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
@@ -84514,6 +85528,7 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
@@ -88555,6 +89570,108 @@ def _pin_takserver_jvm(plog=None):
     return {'java_home': home, 'changed': changed}
 
 
+def _sync_java_cacerts(log_fn=None):
+    """Bring Ubuntu's Java CA keystore back in step with the OS trust store (ops #200).
+
+    An OS update that distrusts a CA root removes it from /etc/ssl/certs but not from
+    /etc/ssl/certs/java/cacerts, which native TAK Server's OpenJDK trusts for outbound
+    HTTPS. The work, and the reason, live in the broker (`java_cacerts_sync`,
+    broker/takwerx_broker.py): the request carries nothing,
+    and on a root console we run that same function in-process rather than keep a copy.
+
+    Re-run on every console start, so the next distrust is picked up too. It does NOT
+    restart TAK Server: a running JVM keeps the truststore it started with, so the change
+    takes effect on TAK's next restart, the same as the JVM pin above.
+    Returns the broker's result dict, or None when the box could not be asked."""
+    _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
+    if _broker_should_route() and _broker_available():
+        try:
+            r = _broker_request({'op': 'java_cacerts_sync'}, timeout=600)
+        except Exception as e:
+            _log(f"Java trust store sync skipped (broker: {str(e)[:160]}) — retries next restart")
+            return None
+    elif os.getuid() == 0:
+        try:
+            m = _broker_module()
+            m._check_java_cacerts_sync({})
+            r = m._do_java_cacerts_sync({})
+        except Exception as e:
+            _log(f"Java trust store sync failed: {str(e)[:200]}")
+            return None
+    else:
+        return None
+    if r.get('skipped'):
+        return r
+    removed, added = r.get('removed') or [], r.get('added') or []
+    if removed or added:
+        names = ''
+        if removed:
+            names = ' (' + ', '.join(removed[:6]) + (', …' if len(removed) > 6 else '') + ')'
+        tak_note = (' Native TAK Server uses it from its next restart.'
+                    if os.path.isdir('/opt/tak') and not _tak_is_container() else '')
+        _log(f"✓ Java trust store synced to the OS: removed {len(removed)} CA root(s) the OS "
+             f"no longer trusts{names}, added {len(added)} the OS trusts. "
+             f"Backup: {r.get('backup')}.{tak_note}")
+    if not r.get('ok'):
+        _log(f"⚠ Java trust store sync: {(r.get('error') or 'failed')[:300]}")
+    elif r.get('still_stale') or r.get('still_missing'):
+        _log(f"⚠ Java trust store still differs from the OS after the sync: "
+             f"{len(r.get('still_stale') or [])} stale, {len(r.get('still_missing') or [])} missing")
+    return r
+
+
+def _upgrade_mediamtx_certifi(log_fn=None):
+    """Upgrade the MediaMTX web editor's certifi when it still trusts a root the OS vendors
+    have distrusted (ops #202): root's pip copy in /usr/local, and the editor user's own if
+    it has one. The deploy does `pip3 install -U certifi`, but Update Now deploys nothing.
+
+    The work lives in the broker (`certifi_upgrade`, broker/takwerx_broker.py); the request
+    carries nothing, and a root console runs that same function in-process. Re-run on every
+    console start, so the next distrusted root is picked up too. A no-op without the editor,
+    with a clean certifi, or with a distro one (RHEL); restarts the editor only after an
+    upgrade. Returns the broker's result dict, or None when the box could not be asked."""
+    _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
+    if not os.path.isdir('/opt/mediamtx-webeditor'):
+        return None
+    if _broker_should_route() and _broker_available():
+        try:
+            r = _broker_request({'op': 'certifi_upgrade'}, timeout=900)
+        except Exception as e:
+            _log(f"MediaMTX certifi check skipped (broker: {str(e)[:160]}) — retries next restart")
+            return None
+    elif os.getuid() == 0:
+        try:
+            m = _broker_module()
+            m._check_certifi_upgrade({})
+            r = m._do_certifi_upgrade({})
+        except Exception as e:
+            _log(f"MediaMTX certifi upgrade failed: {str(e)[:200]}")
+            return None
+    else:
+        return None
+    if r.get('skipped'):
+        return r
+    for u in r.get('upgraded') or []:
+        _log(f"✓ MediaMTX web editor: upgraded {u.get('user')}'s certifi ({u.get('path')}), which "
+             f"still trusted {', '.join(u.get('removed') or [])}")
+    if r.get('upgraded'):
+        # requests 2.32 loads the bundle into an SSL context at import, so the running editor
+        # keeps the old roots until it restarts. The editor only; MediaMTX streams carry on.
+        try:
+            rr = subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'mediamtx-webeditor']),
+                                capture_output=True, text=True, timeout=60)
+            if rr.returncode != 0:
+                _log(f"⚠ mediamtx-webeditor restart failed: {(rr.stderr or rr.stdout or '').strip()[:200]}")
+        except Exception as e:
+            _log(f"⚠ mediamtx-webeditor restart failed: {str(e)[:200]}")
+    if not r.get('ok'):
+        _log(f"⚠ MediaMTX certifi upgrade: {(r.get('error') or 'failed')[:300]} — retries next restart")
+    elif r.get('still_stale'):
+        _log("⚠ MediaMTX certifi still trusts a distrusted root: " + '; '.join(
+            f"{s.get('user')} {s.get('path')}" for s in r['still_stale'])[:300])
+    return r
+
+
 _GD_BAKED_REMOTE_KEYS = ('DB_HOST', 'DB_PORT', 'SSH_KEY', 'SSH_USER', 'EXTERNAL_DB')
 
 
@@ -90930,12 +92047,29 @@ def _ct_docker_out(args, timeout=20, stdin=None):
     return r.stdout if r.returncode == 0 else None
 
 
+def _cloudtak_override_services(ct_dir):
+    """Service names infra-TAK's docker-compose.override.yml configures (api, events, media,
+    postgis), read from the file itself. Empty set when it can't be read."""
+    try:
+        with open(os.path.join(ct_dir, 'docker-compose.override.yml'), encoding='utf-8') as f:
+            text = f.read()
+    except OSError:
+        return set()
+    m = re.search(r'^services:[ \t]*\n((?:[ \t]+.*\n|[ \t]*\n)*)', text + '\n', re.M)
+    return set(re.findall(r'^  ([A-Za-z0-9][\w.-]*):[ \t]*$', m.group(1), re.M)) if m else set()
+
+
 def _cloudtak_containers_without_override(ct_dir):
     """Running containers of the CloudTAK project that compose created WITHOUT
     docker-compose.override.yml (their config_files label), when the override exists — what
     TAK Portal's `-f docker-compose.yml -f docker-compose.marketplace.yml` recreate leaves
     (ops #197): stock media-infra / postgis images and no console CA in the api. [] when
-    clean or when docker can't tell."""
+    clean or when docker can't tell.
+
+    ops #216: only services the override configures count. TAK Portal starts Print and the uDash
+    sidecar from their own docker-compose.plugin-<id>.yml in the same project; they never carry
+    our override and nothing we recreate would change that, so counting them made every console
+    start recreate CloudTAK and Guard Dog repair it three times an hour, then alarm."""
     if not os.path.exists(os.path.join(ct_dir, 'docker-compose.override.yml')):
         return []
     proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
@@ -90943,11 +92077,16 @@ def _cloudtak_containers_without_override(ct_dir):
     if not proj:
         return []
     rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
-                             '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}']) or ''
+                             '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
+                             '|{{.Label "com.docker.compose.service"}}']) or ''
+    ours = _cloudtak_override_services(ct_dir)
     bad = []
     for row in rows.splitlines():
-        name, _, files = row.partition('|')
+        name, _, rest = row.partition('|')
+        files, _, service = rest.partition('|')
         files = [f.strip() for f in files.split(',') if f.strip()]
+        if ours and service.strip() not in ours:
+            continue
         if files and 'docker-compose.override.yml' not in {os.path.basename(f) for f in files}:
             bad.append(name.strip())
     return bad
@@ -93576,6 +94715,37 @@ def _startup_migrations():
         except Exception as _f2b_e3f:
             print(f"Startup migration: recidive takserver-exempt converge error (non-fatal): {_f2b_e3f}", flush=True)
 
+        # ops #200 — Ubuntu's Java CA keystore never drops a root the OS distrusts. Here and
+        # not at import time: on a non-root box it is a broker op.
+        try:
+            _sync_java_cacerts()
+        except Exception as _jca_e:
+            print(f"Startup migration: Java trust store sync error (non-fatal): {_jca_e}", flush=True)
+        # Container TAK runs on the JDK's bundled cacerts instead, which no OS update touches.
+        try:
+            if _tak_is_container():
+                _jca_rm = _tak_container_drop_distrusted_cas(
+                    lambda m: print(f"Startup migration: {m}", flush=True))
+                if _jca_rm:
+                    print(f"Startup migration: ✓ TAK container trust store: removed {len(_jca_rm)} CA "
+                          "root(s) the OS vendors no longer trust. TAK Server uses it from its next restart.",
+                          flush=True)
+        except Exception as _jca_e2:
+            print(f"Startup migration: TAK container trust store error (non-fatal): {_jca_e2}", flush=True)
+        # ops #202 — the MediaMTX editor's pip certifi: only a module deploy upgraded it.
+        # A pip download must not hold up boot, and waits out a post-update redeploy's own pip.
+        try:
+            def _mediamtx_certifi_bg():
+                if not _STARTUP_IMPORT_DONE.wait(timeout=1200):
+                    return
+                try:
+                    _upgrade_mediamtx_certifi()
+                except Exception as _cfi_e:
+                    print(f"Startup migration: MediaMTX certifi upgrade error (non-fatal): {_cfi_e}", flush=True)
+            threading.Thread(target=_mediamtx_certifi_bg, daemon=True, name='mediamtx-certifi').start()
+        except Exception as _cfi_e2:
+            print(f"Startup migration: MediaMTX certifi spawn error (non-fatal): {_cfi_e2}", flush=True)
+
         # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
         # _startup_migrations() rather than at import time: it writes a privileged path and
         # restarts a service, both of which need the broker mediating (see the note above).
@@ -94221,6 +95391,10 @@ def _startup_migrations():
                 _wo_before_redis = _wo_patched
                 _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
                 _wo_redis_changed = (_wo_patched != _wo_before_redis)
+                # ops #206: security update — webapp/worker are recreated once, on this restart.
+                _wo_before_ole = _wo_patched
+                _wo_patched = _webodm_strip_olefile(_wo_patched)
+                _wo_ole_changed = (_wo_patched != _wo_before_ole)
                 if _wo_patched != _wo_txt:
                     if _wo_priv:
                         _write_priv(_wo_compose, _wo_patched)
@@ -94232,6 +95406,8 @@ def _startup_migrations():
                         print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
                     if _wo_redis_changed:
                         print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
+                    if _wo_ole_changed:
+                        print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
                     if _wo_priv:
                         # root's dir: no cwd into /root, so compose runs via the broker
                         _webodm_compose(_wo_dir, 'up -d', timeout=120)
@@ -94593,6 +95769,14 @@ def _startup_migrations():
         except Exception as ak_wd_err:
             print(f"Startup migration: worker direct-pg error (non-fatal): {ak_wd_err}")
 
+        # ops #177: the server's channel layer LISTEN has the same problem, so no outpost
+        # got a config push (LDAP waited for its 5-min refresh). Authentik 2026.8's
+        # postgresql.direct.* moves that LISTEN off PgBouncer; recreates the server only.
+        try:
+            _ensure_authentik_server_direct_listen(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_sdl_err:
+            print(f"Startup migration: server direct-listen error (non-fatal): {ak_sdl_err}")
+
         # v10.2.21: the install step above only writes the PgBouncer image when it first
         # adds the service, so existing boxes never left v1.25.1-p0. Converge them onto
         # _AUTHENTIK_PGBOUNCER_IMAGE (PgBouncer security fixes); recreates pgbouncer only.
@@ -94840,6 +96024,12 @@ def _startup_migrations():
             )
         except Exception as nb_pin_err:
             print(f"Startup migration: netbird pin-restore error (non-fatal): {nb_pin_err}")
+
+        # ops #202 — NetBird server trusts the host CA bundle, not its image's frozen one.
+        try:
+            _heal_netbird_ca_trust(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as nb_ca_err:
+            print(f"Startup migration: netbird CA trust error (non-fatal): {nb_ca_err}")
 
         # v10.1.4 (WS2): orphaned-store recovery as a background WATCH, not a one-shot —
         # the confirming decrypt signature only appears after a real SSO login attempt
@@ -95209,6 +96399,15 @@ def _startup_migrations():
                              name='relay-reassert').start()
         except Exception as _rl_err:
             print(f"Startup migration: relay re-assert start error (non-fatal): {_rl_err}")
+
+        # ops #201: the CoTURN pin and peer restrictions reach a box only through its
+        # override file, which only Install wrote. Converge it on every start. Threaded:
+        # a slow image pull must not hold up startup. No-op once the file is current.
+        try:
+            threading.Thread(target=_startup_converge_coturn, daemon=True,
+                             name='coturn-converge').start()
+        except Exception as _ct_err:
+            print(f"Startup migration: CoTURN converge start error (non-fatal): {_ct_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
