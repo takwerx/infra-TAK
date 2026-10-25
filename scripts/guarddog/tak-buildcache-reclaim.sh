@@ -40,7 +40,7 @@ LOG="$STATE_DIR/buildcache_reclaim.log"
 log_line() { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') $1" >> "$LOG" 2>/dev/null; }
 
 # Fleet-uniform constants (same on every box — no operator override preserved)
-CACHE_CAP_GB=20            # size cap: keep total BuildKit cache under this, ALWAYS
+CACHE_CAP_GB=20            # size cap: keep unshared BuildKit cache under this, ALWAYS
                            # (disk-size-agnostic — see the size-cap tier below).
 RECLAIM_THRESHOLD_PCT=70   # routine: reclaim cache OLDER than KEEP_WINDOW at/above this
 KEEP_WINDOW="168h"         # keep build cache newer than 7 days (routine band)
@@ -125,32 +125,43 @@ images_in_flight() {
 # The %-of-disk tiers below never fire on a large disk: 70% of a 500G disk is
 # ~350G of runway, so hundreds of GB of BuildKit cache accrue while the disk sits
 # at ~40% and the healer sleeps every night (field: a 502G box reached 177G cache
-# at 44%). Cap total build cache at CACHE_CAP_GB regardless of disk %. NEVER
+# at 44%). Cap unshared build cache at CACHE_CAP_GB regardless of disk %. NEVER
 # touches images/containers/volumes. Docker 28+ renamed `--keep-storage` →
-# `--max-used-space`; detect which this daemon supports (both take "20GB").
+# `--max-used-space`; detect which this daemon supports (both take bytes).
 #
-# GH #273: `-a` is required. Without it the cap only weighs the cache records
-# BuildKit considers dangling, so a box can sit over the cap with all of it
-# reclaimable and the cap "succeeds" every hour with 0B (reporter: 23.44 GB total,
-# 23.44 GB reclaimable, `size-cap reclaimed 0B (cap 20GB)`). With `-a` the cap
-# prunes the least-recently-used unused cache, of any kind, until the total is
-# under CACHE_CAP_GB, and still keeps the newest 20 GB so the next rebuild stays
-# fast. Cache a running build holds is in use and never pruned either way.
+# GH #273: the reporter's cap logged `size-cap reclaimed 0B (cap 20GB)` at 23.44 GB
+# of cache. BuildKit does not weigh the total `docker builder du` prints: the cap
+# counts only UNSHARED cache (du's "Private" line), and the flag parses "20GB" as
+# 20 GiB (21.47 GB). test8 (Docker 29.9.2) sat at 38.25 GB total, 21.14 GB private,
+# and logged 0B every hour. So the cap is passed in bytes, and the log shows the
+# private figure the cap acts on next to the total.
+# No `-a` here: with it BuildKit also deletes shared records and counts them against
+# the cap, so it stops before private is under it (test8 at an 18 GB cap: -a freed
+# 2.4 GB and left private at 19.95 GB; without, 2.97 GB and 16.97 GB). The full tier
+# below still runs `-af` at 80% disk. It keeps the newest 20 GB, so the next rebuild
+# stays fast. Cache a running build holds is in use and never pruned either way.
+CACHE_CAP_BYTES=$((CACHE_CAP_GB * 1000000000))
 if docker builder prune --help 2>&1 | grep -q -- '--max-used-space'; then
-  CAP_FLAG="--max-used-space=${CACHE_CAP_GB}GB"
+  CAP_FLAG="--max-used-space=${CACHE_CAP_BYTES}"
 else
-  CAP_FLAG="--keep-storage=${CACHE_CAP_GB}GB"
+  CAP_FLAG="--keep-storage=${CACHE_CAP_BYTES}"
 fi
-# Total build cache, from `docker builder du` ("Total: 21.11GB"). Logged before and
-# after so a cap that frees nothing while the cache is over it shows up as such.
-cache_total() { docker builder du 2>/dev/null | grep -iE '^Total' | grep -oiE '[0-9.]+ ?[KMGTP]?i?B' | tail -1; }
-CACHE_BEFORE=$(cache_total); [ -z "$CACHE_BEFORE" ] && CACHE_BEFORE="0B"
-RAW_CAP=$(docker builder prune -af $CAP_FLAG 2>>"$LOG")
+# "<total> (private <private>)" from `docker builder du`. Logged before and after, so
+# a cap that frees nothing while private is over it shows up as such.
+cache_size() {
+  local du t p
+  du=$(docker builder du 2>/dev/null)
+  t=$(echo "$du" | grep -iE '^Total' | grep -oiE '[0-9.]+ ?[KMGTP]?i?B' | tail -1)
+  p=$(echo "$du" | grep -iE '^Private' | grep -oiE '[0-9.]+ ?[KMGTP]?i?B' | tail -1)
+  echo "${t:-0B} (private ${p:-?})"
+}
+CACHE_BEFORE=$(cache_size)
+RAW_CAP=$(docker builder prune -f $CAP_FLAG 2>>"$LOG")
 CAP_RECLAIMED=$(parse_reclaimed "$RAW_CAP"); [ -z "$CAP_RECLAIMED" ] && CAP_RECLAIMED="0B"
-CACHE_AFTER=$(cache_total); [ -z "$CACHE_AFTER" ] && CACHE_AFTER="0B"
-log_line "size-cap: reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, ${CAP_FLAG%%=*}, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
-logger -t takguard-buildcache "size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
-SUMMARY="size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB, cache ${CACHE_BEFORE} -> ${CACHE_AFTER})"
+CACHE_AFTER=$(cache_size)
+log_line "size-cap: reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB private, ${CAP_FLAG%%=*}, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
+logger -t takguard-buildcache "size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB private, cache ${CACHE_BEFORE} -> ${CACHE_AFTER}); disk ${disk_pct}%"
+SUMMARY="size-cap reclaimed ${CAP_RECLAIMED} (cap ${CACHE_CAP_GB}GB private, cache ${CACHE_BEFORE} -> ${CACHE_AFTER})"
 
 # ── Tier 1/2: disk-% backstop ─────────────────────────────────────────────────
 # The size cap holds steady-state; these catch a disk driven full between runs

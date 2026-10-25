@@ -43,10 +43,10 @@ case "$*" in
   info*) exit 0 ;;
   "builder prune --help") echo "      --max-used-space bytes" ;;
   "image prune"*) echo "Total reclaimed space: 13GB" ;;
-  "builder prune -af --max-used-space"*) echo "Total:	3.4GB" ;;
+  "builder prune -f --max-used-space"*) echo "Total:	3.4GB" ;;
   "builder prune -af"*) echo "Total:	16.1GB" ;;
   "builder prune"*) echo "Total:	0B" ;;
-  "builder du") echo "Reclaimable:	23.44GB"; printf 'Total:\t\t23.44GB\n' ;;
+  "builder du") printf 'Private:\t21.14GB\nReclaimable:\t35.71GB\nTotal:\t\t38.25GB\n' ;;
 esac
 exit 0
 '''
@@ -113,18 +113,21 @@ def test_below_the_warning_only_old_cache_goes(box):
     box(75)                                                  # first run applies the journald cap
     r = box(75)
     assert 'builder prune -f --filter until=168h' in r['docker']
-    # The size cap (`-af --max-used-space`) runs at every level; the uncapped full
+    # The size cap (`-f --max-used-space`) runs at every level; the uncapped full
     # prune is the bare `builder prune -af`.
     assert not any('image prune' in c or c == 'builder prune -af' for c in r['docker'])
     assert '--vacuum-size' not in r['sys']
 
 
-def test_size_cap_prunes_all_unused_cache_not_just_dangling(box):
-    # GH #273: without -a the cap only weighed dangling cache, so a box sat at 23.44 GB
-    # of reclaimable cache under a 20 GB cap and every run logged "reclaimed 0B".
+def test_size_cap_is_in_bytes_and_logs_the_private_figure_it_acts_on(box):
+    # GH #273: "20GB" on the flag means 20 GiB of UNSHARED cache, so test8 sat at
+    # 38.25 GB total / 21.14 GB private and every run logged "reclaimed 0B (cap 20GB)".
+    # The cap goes in bytes, without -a (with it BuildKit counts shared records against
+    # the cap and stops early), and the log shows private next to the total.
     r = box(40)
-    assert r['docker'][0] == 'builder prune -af --max-used-space=20GB'
-    assert 'size-cap reclaimed 3.4GB (cap 20GB, cache 23.44GB -> 23.44GB)' in r['last']
+    assert r['docker'][0] == 'builder prune -f --max-used-space=20000000000'
+    assert ('size-cap reclaimed 3.4GB (cap 20GB private, '
+            'cache 38.25GB (private 21.14GB) -> 38.25GB (private 21.14GB))') in r['last']
     assert not any('image prune' in c or c == 'builder prune -af' for c in r['docker'])
 
 
