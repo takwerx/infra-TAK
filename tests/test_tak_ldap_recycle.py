@@ -29,6 +29,7 @@ box: docker, systemctl, ldapsearch, TAK's Marti API, the ports and the clock are
 """
 
 import datetime
+import io
 import json
 import os
 import re
@@ -47,6 +48,7 @@ T0 = 1_800_000_000.0          # fake "now" at the start of each test
 BOOT = T0 - 400_000           # the box booted ~4.6 days earlier
 HOUR = 3600
 API = 'https://127.0.0.1:8443/Marti/api'
+MSGLOG = '/opt/tak/logs/takserver-messaging.log'
 UAF = ('<UserAuthenticationFile><User identifier="admin" role="ROLE_ADMIN"/>'
        '<User identifier="cloudtak-svc-bootstrap" role="ROLE_ADMIN"/></UserAuthenticationFile>')
 
@@ -108,7 +110,7 @@ class Box:
         # `ghosts_leave` they are off the list right after the refused delete
         self.ghosts, self.ghosts_leave = set(ghosts), ghosts_leave
         # ops #223: TAK's takserver-messaging.log lines; None = it can't be read
-        self.msglog = []
+        self.msglog, self.log_reads = [], []
         self.tak_start = tak_start
         self.ldap_start = ldap_start
         self.container = container
@@ -286,9 +288,9 @@ class Box:
             out.append(json.dumps({'attributes': ['memberOf'], 'baseDN': 'ou=users,dc=takldap',
                                    'event': 'Search request', 'timestamp': _rfc3339(self.t)[:19] + 'Z'}))
             return ok('\n'.join(out) + '\n')
-        grep = cmd[3:] if cmd[:3] == ['docker', 'exec', 'takserver'] else cmd
-        if grep[:1] == ['grep'] and grep[-1] == '/opt/tak/logs/takserver-messaging.log':
-            assert (cmd is not grep) == self.container
+        grep = cmd[3:]
+        if cmd[:4] == ['docker', 'exec', 'takserver', 'grep'] and grep[-1] == MSGLOG:
+            assert self.container        # a native console reads the log itself (grep isn't brokered)
             if self.msglog is None:
                 return subprocess.CompletedProcess(cmd, 2, stdout='', stderr='grep: Permission denied\n')
             pats = [grep[i + 1] for i, a in enumerate(grep) if a == '-e']
@@ -317,6 +319,15 @@ class Box:
                 return subprocess.CompletedProcess(cmd, 49, stdout='', stderr='ldap_bind: Invalid credentials (49)\n')
             return ok(_ldif(groups))
         raise AssertionError(cmd)
+
+    def open(self, path, mode='r', *a, **kw):
+        if path != MSGLOG:
+            return open(path, mode, *a, **kw)
+        assert mode == 'rb' and not self.container
+        self.log_reads.append(path)
+        if self.msglog is None:
+            raise PermissionError(13, 'Permission denied', path)
+        return io.BytesIO(''.join(l + '\n' for l in self.msglog).encode())
 
     def sleep(self, s):
         self.t += s
@@ -369,6 +380,7 @@ class Box:
                 mkdtemp=lambda prefix='': box.workdirs.append(f'/tmp/{prefix}{len(box.workdirs)}') or box.workdirs[-1]),
             'shutil': types.SimpleNamespace(rmtree=lambda p, ignore_errors=False: box.workdirs.remove(p)),
             '_TAK_API_CHECK_TOOL': 'infratak-check',
+            'open': box.open,
         }
         for c in ('_PGB_SWAP_LDAP_WINDOW_S', '_PGB_SWAP_LDAP_STABLE_S', '_PGB_SWAP_LDAP_EVERY_S',
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
@@ -714,8 +726,12 @@ def test_ops223_ghost_tak_logged_removed_is_not_a_restart(container):
                "(removed in TAK's log)" in l for l in box.log)
     assert not any('still with no groups although LDAP is healthy' in l for l in box.log)
     assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
-    [grep] = [c for c in box.calls if 'grep' in c]
-    assert 'Subscription: (id=)?(tls:334)( |$)' in grep
+    greps = [c for c in box.calls if 'grep' in c]
+    if container:
+        [grep] = greps
+        assert 'Subscription: (id=)?(tls:334)( |$)' in grep and box.log_reads == []
+    else:   # read directly: `grep` is not on the broker's allow-list
+        assert greps == [] and box.log_reads == [MSGLOG]
 
 
 @pytest.mark.parametrize('msglog', [
@@ -761,8 +777,9 @@ def test_ops223_newer_connection_tak_logged_removed_is_a_ghost_too():
     assert not any('no groups either' in l for l in box.log)
 
 
-def test_ops223_messaging_log_lookup_matches_whole_uids_only():
-    box = Box(tak_start=T0 - HOUR)
+@pytest.mark.parametrize('container', [False, True], ids=['native', 'container'])
+def test_ops223_messaging_log_lookup_matches_whole_uids_only(container):
+    box = Box(tak_start=T0 - HOUR, container=container)
     box.msglog = [STARTED, added(334), removed(334), 'Removed Subscription: ssl:7']
     removed_in_log = box.ns()['_tak_log_removed_subscriptions']
     assert removed_in_log(['tls:33', 'tls:3345']) == set()

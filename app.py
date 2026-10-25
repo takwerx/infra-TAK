@@ -64828,18 +64828,28 @@ def _tak_log_removed_subscriptions(uids):
     if not uids:
         return set()
     started = 'Started TAK Server messaging Microservice'
-    cmd = ['grep', '-a', '-E', '-e', started, '-e', r'Subscription: (id=)?(%s)( |$)' % '|'.join(uids),
-           '/opt/tak/logs/takserver-messaging.log']
+    path = '/opt/tak/logs/takserver-messaging.log'
     if _tak_is_container():
-        cmd = ['docker', 'exec', TAK_CONTAINER] + cmd
-    try:
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=30)
-    except Exception:
-        return None
-    if r.returncode not in (0, 1):   # 1 = no line matched
-        return None
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-a', '-E', '-e', started, '-e',
+                                           r'Subscription: (id=)?(%s)( |$)' % '|'.join(uids), path]),
+                               capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        if r.returncode not in (0, 1):   # 1 = no line matched
+            return None
+        lines = (r.stdout or '').splitlines()
+    else:
+        # Read directly, like _diag_tail: TAK's logs are world-readable, and `grep` is not on
+        # the broker's allow-list (a denied call on a non-root box holds enforce mode off).
+        try:
+            with open(path, 'rb') as f:
+                lines = [l.decode('utf-8', 'replace') for l in f
+                         if b'Subscription: ' in l or started.encode() in l]
+        except OSError:
+            return None
     last = {}
-    for line in (r.stdout or '').splitlines():
+    for line in lines:
         if started in line:
             last.clear()
             continue
