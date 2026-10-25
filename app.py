@@ -83126,15 +83126,21 @@ def _stack_backup(label=None, plog=None):
 # settings['stack_backups'] — the backup tree itself is root-only, so the console
 # cannot list it.
 _stack_backup_job = {'running': False, 'label': '', 'ok': None, 'error': '', 'log': []}
-# The post-update deploy's service-recovery sweep `docker compose up -d`s every stopped
-# module — exactly what a restore has just stopped (nuc 2026-10-25: Authentik booted and
-# ran its migration check against a database pg_restore was mid-way through). The two are
-# mutually exclusive: post-update waits out a restore; a restore is refused during one.
+# The post-update deploy restarts and redeploys modules: its recovery sweep `docker compose
+# up -d`s what a restore has just stopped (nuc 2026-10-25: Authentik ran its migration check
+# against a database pg_restore was rebuilding), and its Node-RED redeploy + Authentik tuning
+# broke a backup mid-dump (aws-arm 2026-10-25: nodered restarted under `docker cp /data`, the
+# Authentik pg_dump connection was terminated). Backup/restore and post-update are mutually
+# exclusive: post-update waits out a running job; a job is refused while post-update runs.
 _POST_UPDATE_ACTIVE = {'on': False}
 
 
-def _stack_restore_running():
-    return bool(_stack_backup_job.get('running')) and _stack_backup_job.get('kind') == 'restore'
+def _stack_job_running():
+    return bool(_stack_backup_job.get('running'))
+
+
+_POST_UPDATE_BUSY_MSG = ('the console is still finishing its post-update deploy (it restarts and '
+                         'redeploys modules) — try again in a few minutes')
 _stack_backup_job_lock = threading.Lock()
 
 
@@ -83217,6 +83223,8 @@ def console_stack_backups_api():
 def console_stack_backup_run_api():
     if _os_upgrade_job_state().get('running'):
         return jsonify({'ok': False, 'error': 'the OS upgrade is running'}), 409
+    if _POST_UPDATE_ACTIVE['on']:
+        return jsonify({'ok': False, 'error': _POST_UPDATE_BUSY_MSG}), 409
     label = 'stack-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
     if not _stack_backup_run_job(label):
         return jsonify({'ok': False, 'error': 'a backup is already running'}), 409
@@ -83733,8 +83741,7 @@ def console_stack_backup_restore_api(label):
     if _os_upgrade_job_state().get('running'):
         return jsonify({'ok': False, 'error': 'the OS upgrade is running'}), 409
     if _POST_UPDATE_ACTIVE['on']:
-        return jsonify({'ok': False, 'error': 'the console is still finishing its post-update deploy '
-                        '(it restarts stopped modules) — try again in a few minutes'}), 409
+        return jsonify({'ok': False, 'error': _POST_UPDATE_BUSY_MSG}), 409
     if not _stack_backup_run_job(label, kind='restore'):
         return jsonify({'ok': False, 'error': 'a backup or restore is already running'}), 409
     try:
@@ -90489,6 +90496,8 @@ def _os_upgrade_start_job(data):
     if _stack_backup_job.get('running'):
         return 409, {'ok': False, 'error': 'a full-stack backup is already running — wait for it to finish'}
     remote = request.remote_addr if request else '?'
+    if data.get('stack_backup') and _POST_UPDATE_ACTIVE['on']:
+        return 409, {'ok': False, 'error': _POST_UPDATE_BUSY_MSG}
     if data.get('stack_backup'):
         # W12.c: the full backup is the job's first step. It fails the job before any
         # package moves; the detached upgrade is only spawned once it has succeeded.
@@ -101777,9 +101786,9 @@ def _post_update_auto_deploy():
         def _run_post_update_guarded():
             try:
                 _w = 0
-                while _stack_restore_running() and _w < 3 * 3600:
+                while _stack_job_running() and _w < 3 * 3600:
                     if _w % 300 == 0:
-                        print("Post-update: waiting — a full-stack restore is running", flush=True)
+                        print("Post-update: waiting — a full-stack backup/restore is running", flush=True)
                     time.sleep(10)
                     _w += 10
                 _POST_UPDATE_ACTIVE['on'] = True
