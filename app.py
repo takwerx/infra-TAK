@@ -61940,11 +61940,14 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
 _GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
 _GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
 _AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+_AK_UPDATE_INPROC = {'since': 0.0}       # ops #214: this console's own Update, marker or not
 
 
 def _guarddog_authentik_update_begin(what):
     """Tell Guard Dog's Authentik watcher a console update is under way. Best effort:
     without Guard Dog (no state dir) there is no watcher to tell."""
+    # ops #214: the console's own watchdogs are told even without Guard Dog.
+    _AK_UPDATE_INPROC['since'] = time.time()
     if not os.path.isdir(os.path.dirname(_GD_AUTHENTIK_UPDATE_MARKER)):
         return False
     try:
@@ -61956,6 +61959,7 @@ def _guarddog_authentik_update_begin(what):
 
 
 def _guarddog_authentik_update_end():
+    _AK_UPDATE_INPROC['since'] = 0.0
     try:
         subprocess.run(_sudo_wrap(['rm', '-f', _GD_AUTHENTIK_UPDATE_MARKER]),
                        capture_output=True, timeout=15)
@@ -61980,6 +61984,69 @@ def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S
             break
         time.sleep(every_s)
     _guarddog_authentik_update_end()
+
+
+# --- Console watchdogs stand down while Authentik is being changed (ops #214) --
+# Guard Dog's watcher honours the marker above (#167); the console's own watchdogs did
+# not. test12, 2026-10-24 (Authentik 2026.8.5 update): the ldap-sa-watchdog saw the bind
+# fail mid-recreate and ran a service-account heal ("heal INCOMPLETE ... Connection
+# refused"). Harmless that time, but the channels-pool watchdog's `docker restart
+# authentik-server-1` on two unhealthy ticks is exactly the mid-migration restart #167
+# took away from Guard Dog. So each of them asks this first and skips its tick.
+
+def _authentik_compose_lock_busy():
+    """True when someone else holds the compose lock right now. Probes without waiting
+    and without creating the file; holds it for no longer than the probe. Every other
+    party waits for the lock (`flock -w`, the console's retry loop), so the probe can
+    never make one of them skip."""
+    if getattr(_AK_COMPOSE_LOCK_HELD, 'depth', 0) > 0:
+        return False   # this thread holds it: not a reason for its own work to stop
+    import fcntl as _fcntl
+    try:
+        fh = open(_AK_COMPOSE_LOCK_PATH, 'r')
+    except OSError:
+        return False   # no lock file: nobody has taken it since boot
+    try:
+        try:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return True
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        return False
+    finally:
+        fh.close()
+
+
+def _guarddog_authentik_update_marker_age():
+    """Age in seconds of a fresh Guard Dog update marker, else None. Same rule as the
+    watcher: older than _GD_AUTHENTIK_UPDATE_MAX_S, unreadable or in the future = ignored
+    (the watcher removes those; the console can't without the broker and needn't)."""
+    try:
+        with open(_GD_AUTHENTIK_UPDATE_MARKER) as f:
+            since = int((f.readline().split() or ['x'])[0])
+    except (OSError, ValueError):
+        return None
+    age = int(time.time()) - since
+    return age if 0 <= age < _GD_AUTHENTIK_UPDATE_MAX_S else None
+
+
+def _authentik_busy_reason():
+    """Why a console watchdog must leave Authentik alone this tick, or '' when it may act."""
+    if _authentik_compose_lock_busy():
+        return 'the Authentik compose lock is held (a recreate is running)'
+    age = _guarddog_authentik_update_marker_age()
+    if age is not None:
+        return f'an Authentik update is in progress (update marker {age}s old)'
+    # The marker is only written where Guard Dog is installed. This console's own Update
+    # is tracked in-process too, until Authentik answers again (i.e. after migrations).
+    since = _AK_UPDATE_INPROC['since']
+    if since:
+        if time.time() - since < _GD_AUTHENTIK_UPDATE_MAX_S and not _local_authentik_http_ok():
+            return f'an Authentik update is in progress ({int(time.time() - since)}s, migrations not finished)'
+        _AK_UPDATE_INPROC['since'] = 0.0
+    if _authentik_deploy_in_progress():
+        return 'an Authentik/TAK deploy is in progress (or just finished)'
+    return ''
 
 
 def _recreate_authentik_server_worker(plog, reason):
@@ -67133,6 +67200,15 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(120)
                 continue
 
+            # ops #214: an updating server is unhealthy and its pool is in flux — restarting
+            # it here lands mid-migration (#167). No samples either: they would skew autotune.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ak-pg-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _consecutive_unhealthy = 0
+                _wt.sleep(120)
+                continue
+
             _threshold = int(_settings.get('channels_pool_watchdog_threshold') or 150)
             # v0.9.36: separate threshold for idle-in-transaction connections.
             _idle_in_tx_threshold = int(
@@ -67902,6 +67978,15 @@ def _authentik_ldap_sa_bind_watchdog_loop():
 
             _env_pass = _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
             if not _env_pass:
+                _wt.sleep(300)
+                continue
+
+            # ops #214: a bind that fails because Authentik is mid-update is not drift.
+            # Skip the whole tick (heal, role check, audit scrape); the next one reassesses.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[ldap-sa-watchdog] skip | {_busy} — not checking this tick", flush=True)
+                _ok_counter = 0
                 _wt.sleep(300)
                 continue
 
@@ -69408,8 +69493,10 @@ def _authentik_spiral_monitor():
             # container (e.g. postgresql) force-recreated-but-not-started, which makes
             # authentik-server unhealthy and breaks the LDAP SA / webadmin sync on a
             # fresh deploy. See the _with_authentik_deploy_guard block comment.
-            if _authentik_deploy_in_progress():
-                print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
+            # ops #214: an Authentik update / held compose lock counts the same.
+            _busy = _authentik_busy_reason()
+            if _busy:
+                print(f"[spiral monitor] {_busy} — standing down this cycle "
                       "(avoids concurrent docker compose on the authentik project)", flush=True)
                 continue
 
