@@ -76089,6 +76089,54 @@ def _cotdb_facts(tak_cfg=None):
                 if tbl.strip():
                     f['fk_dependents'].append({'table': tbl.strip(), 'constraint': con.strip()})
 
+    # GH #273: data_feed_cot links feeds to cot_router rows with no foreign key, so
+    # retention leaves every link behind and the table only grows (reporter: 71.7M
+    # rows / 4.5 GB, all orphans; pg_stat showed n_live_tup = 0 for it). Its size
+    # comes from the catalog, never from tuple stats, and "has orphans" is one
+    # LIMIT 1 probe down the cot_router_id index — the same anti-join the retention
+    # guard's Step 2b deletes with.
+    f['feed_cot_bytes'] = None
+    f['feed_cot_orphans'] = None
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT CASE WHEN to_regclass('public.data_feed_cot') IS NULL THEN '' ELSE "
+        "pg_total_relation_size('public.data_feed_cot')::text || '|' || "
+        "(SELECT EXISTS (SELECT 1 FROM data_feed_cot d WHERE NOT EXISTS "
+        "(SELECT 1 FROM cot_router c WHERE c.id = d.cot_router_id)))::text END;", timeout=25)
+    if ok and '|' in out:
+        size_s, _, orph = out.strip().splitlines()[-1].partition('|')
+        if size_s.strip().isdigit():
+            f['feed_cot_bytes'] = int(size_s.strip())
+        f['feed_cot_orphans'] = orph.strip() in ('t', 'true')
+    elif not ok and out:
+        f['errors'].append(f'data_feed_cot: {out[:200]}')
+    f['feed_cot_human'] = (_cotdb_fmt_bytes(f['feed_cot_bytes'])
+                           if f['feed_cot_bytes'] is not None else '-')
+
+    # GH #273 (smaller note): the same data package uploaded again and again — the
+    # reporter's `resource` table held 6 identical copies of a 501 MB GeoTIFF. TAK
+    # already stores a hash per row; this only REPORTS repeats. Deleting a package
+    # is TAK's call (its Web Admin), not ours, so nothing here removes anything.
+    f['dup_packages'] = []
+    ok, out = _cotdb_psql(
+        tak_cfg,
+        "SET statement_timeout = '15s'; "
+        "SELECT count(*), COALESCE(sum(pg_column_size(data)), 0)::bigint, "
+        "max(replace(replace(COALESCE(name, filename, ''), '|', ' '), E'\\n', ' ')) "
+        "FROM resource WHERE hash IS NOT NULL AND hash <> '' "
+        "GROUP BY hash HAVING count(*) > 1 "
+        "ORDER BY sum(pg_column_size(data)) DESC NULLS LAST LIMIT 5;", timeout=25)
+    if ok:
+        for line in (out or '').splitlines():
+            parts = line.split('|', 2)
+            if len(parts) == 3 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+                copies, total = int(parts[0].strip()), int(parts[1].strip())
+                f['dup_packages'].append({
+                    'name': parts[2].strip()[:120] or '(unnamed)', 'copies': copies,
+                    'bytes': total, 'human': _cotdb_fmt_bytes(total),
+                    'extra_human': _cotdb_fmt_bytes(total - total // copies)})
+
     f['retention_hours'] = _cotdb_retention_hours()
     f['retention_proc_alive'] = _cotdb_retention_proc_alive()
     f['guard_timer_enabled'] = _cotdb_systemctl(['is-enabled', 'takretentionguard.timer']) or 'unknown'
@@ -76159,8 +76207,20 @@ def _cotdb_verdict(facts):
     database of which data_feed_cot is 5.6 GB, verdict retention_stalled,
     recommendation Purge."""
     verdict, headline, detail, recommend = _cotdb_verdict_tree(facts)
+    lt = facts.get('largest_table')
+    if facts.get('feed_cot_orphans'):
+        # GH #273: test8's 5.6 GB data_feed_cot (above) was this — links to CoT rows
+        # retention had already deleted. Purge cannot reach it; the retention guard can.
+        detail += (f" data_feed_cot holds {facts.get('feed_cot_human', '-')} including links to CoT "
+                   "rows that no longer exist. Guard Dog's retention guard deletes those every "
+                   "15 minutes in batches; Run Retention Now starts it immediately. PostgreSQL reuses "
+                   "the freed space once autovacuum has run; Online Compact gives it back to the disk.")
+        recommend = list(recommend or [])
+        if 'retention_run' not in recommend:
+            recommend.insert(0, 'retention_run')
+        if lt == 'data_feed_cot':
+            return verdict, headline, detail, recommend
     if 'purge' in (recommend or []):
-        lt = facts.get('largest_table')
         if lt and lt not in _COTDB_TABLES:
             detail += (f" NOTE: the largest table here is {lt} "
                        f"({facts.get('largest_table_human', '-')}), which Purge Old CoT does "
@@ -76649,6 +76709,181 @@ def guarddog_cotdb_purge():
 def guarddog_cotdb_purge_status():
     """Poll the batched (mode=age) purge."""
     return jsonify({'success': True, **_cotdb_purge_status})
+
+
+# ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ─────────
+# upgrade-db.sh's pg_upgrade runs in copy mode, so the 15 cluster survives, stopped, as
+# the rollback — and nothing ever removed it (reporter: 15 GB, untouched for 10 days,
+# next to a 14 GB PostgreSQL 18; test6: 3 GB). The card reports it and offers a
+# password-gated Remove once 18 is the live database. Nothing is removed automatically:
+# it is the only way back from a bad migration, so dropping it is the operator's call.
+#
+# Local (native) boxes go through the broker's fixed-shape `pg_old_cluster` op, which
+# re-checks every precondition itself. A two-server Server One runs the same checks in
+# the fixed script below over SSH. No request value reaches either: the action is one
+# of two literals, the majors and paths are constants.
+_PG_OLD_CLUSTER_MAJOR = 15
+_PG_OLD_CLUSTER_SH = r'''set -u
+ACTION="__ACTION__"
+pgdir() {
+  for d in "/var/lib/postgresql/$1/main" "/var/lib/pgsql/$1/data"; do
+    if [ -d "$d" ] && [ ! -L "$d" ] && [ "$(cat "$d/PG_VERSION" 2>/dev/null)" = "$1" ]; then
+      echo "$d"; return 0
+    fi
+  done
+  return 1
+}
+OLD=$(pgdir 15) || OLD=""
+if [ -z "$OLD" ]; then
+  echo "found=0"
+  [ "$ACTION" = "drop" ] && { echo "error=no PostgreSQL 15 cluster found"; exit 1; }
+  exit 0
+fi
+NEW=$(pgdir 18) || NEW=""
+FAM=rhel; case "$OLD" in /var/lib/postgresql/*) FAM=debian ;; esac
+RUN=0; [ -e "$OLD/postmaster.pid" ] && RUN=1
+NEWRUN=0; [ -n "$NEW" ] && [ -e "$NEW/postmaster.pid" ] && NEWRUN=1
+KB=$(du -sk "$OLD" 2>/dev/null | awk '{print $1}')
+BYTES=$(( ${KB:-0} * 1024 ))
+echo "found=1"; echo "family=$FAM"; echo "path=$OLD"; echo "running=$RUN"
+echo "new_path=$NEW"; echo "new_running=$NEWRUN"; echo "bytes=${BYTES:-0}"
+[ "$ACTION" = "drop" ] || exit 0
+[ "$RUN" = "1" ] && { echo "error=the PostgreSQL 15 cluster is running, not removing it"; exit 1; }
+[ "$NEWRUN" = "1" ] || { echo "error=no running PostgreSQL 18 cluster, the 15 cluster may still be the only database"; exit 1; }
+if [ "$FAM" = "debian" ] && command -v pg_dropcluster >/dev/null 2>&1; then
+  pg_dropcluster 15 main >/dev/null 2>&1
+else
+  systemctl disable postgresql-15 >/dev/null 2>&1
+fi
+[ -d "$OLD" ] && [ ! -L "$OLD" ] && rm -rf "$OLD"
+if [ -e "$OLD" ]; then echo "removed=0"; echo "error=$OLD is still present"; exit 1; fi
+echo "removed=1"; echo "freed_bytes=${BYTES:-0}"
+'''
+
+
+def _pg_old_cluster_call(action, tak_cfg):
+    """Ask (action='inspect') or remove (action='drop') the leftover 15 cluster where
+    TAK's database lives. Returns the broker op's dict shape; never raises."""
+    if action not in ('inspect', 'drop'):
+        return {'ok': False, 'error': 'bad action'}
+    mode = (tak_cfg or {}).get('mode') or ''
+    if mode == 'two_server':
+        s1 = tak_cfg.get('server_one') or {}
+        if not (s1.get('host') or '').strip():
+            return {'ok': False, 'error': 'Server One host not configured'}
+        script = _PG_OLD_CLUSTER_SH.replace('__ACTION__', action)
+        ok, out = _ssh_probe(s1, 'cd / && sudo -n bash -c ' + shlex.quote(script),
+                             timeout=1800 if action == 'drop' else 120)
+        res = {'ok': ok, 'where': 'Server One (%s)' % s1.get('host')}
+        for line in (out or '').splitlines():
+            k, sep, v = line.strip().partition('=')
+            if not sep or k not in ('found', 'family', 'path', 'running', 'new_path',
+                                    'new_running', 'bytes', 'removed', 'freed_bytes', 'error'):
+                continue
+            if k in ('found', 'running', 'new_running', 'removed'):
+                res[k] = v.strip() == '1'
+            elif k in ('bytes', 'freed_bytes'):
+                res[k] = int(v) if v.strip().isdigit() else 0
+            else:
+                res[k] = v.strip()
+        if 'found' not in res:
+            res['ok'] = False
+            res.setdefault('error', (out or 'no answer from Server One')[:300])
+        return res
+    if mode == 'external_db' or _tak_is_container():
+        # A managed database has no cluster of ours on disk; container TAK keeps its
+        # PostgreSQL 15 data in a docker volume the 5.8 migration names itself.
+        return {'ok': True, 'found': False, 'not_applicable': True}
+    req = {'op': 'pg_old_cluster', 'action': action}
+    try:
+        if _broker_should_route() and _broker_available():
+            res = _broker_request(req, timeout=1800 if action == 'drop' else 300)
+        elif os.getuid() == 0:
+            m = _broker_module()
+            m._check_pg_old_cluster(req)
+            res = m._do_pg_old_cluster(req)
+        else:
+            return {'ok': False, 'error': 'privilege broker unavailable'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:300]}
+    res['where'] = 'this server'
+    return res
+
+
+def _pg_old_cluster_state(tak_cfg):
+    """inspect + the console's own "is PostgreSQL 18 really the live database" check.
+    `removable` is what gates the card's Remove button."""
+    res = _pg_old_cluster_call('inspect', tak_cfg)
+    if not res.get('found'):
+        return res
+    ok, out = _cotdb_psql(tak_cfg,
+                          "SELECT current_setting('server_version_num')::int / 10000, "
+                          "current_setting('data_directory'), "
+                          "(SELECT count(*) FROM pg_database WHERE datname = 'cot');",
+                          db='postgres', timeout=20)
+    parts = out.strip().split('|') if ok else []
+    live_major = int(parts[0]) if len(parts) == 3 and parts[0].strip().isdigit() else None
+    live_dir = parts[1].strip() if len(parts) == 3 else ''
+    has_cot = len(parts) == 3 and parts[2].strip() not in ('', '0')
+    res['live_major'] = live_major
+    res['bytes_human'] = _cotdb_fmt_bytes(res.get('bytes') or 0)
+    why = None
+    if res.get('running'):
+        why = 'The PostgreSQL %d cluster is still running.' % _PG_OLD_CLUSTER_MAJOR
+    elif live_major is None or not has_cot:
+        why = 'Could not confirm that the live database is healthy, so removal is not offered.'
+    elif live_major <= _PG_OLD_CLUSTER_MAJOR or live_dir == res.get('path'):
+        why = 'PostgreSQL %d is still the live database.' % _PG_OLD_CLUSTER_MAJOR
+    elif not res.get('new_running'):
+        why = 'The PostgreSQL %d cluster is not running.' % live_major
+    res['removable'] = why is None
+    res['not_removable_reason'] = why
+    return res
+
+
+@app.route('/api/guarddog/pg-old-cluster')
+@login_required
+def guarddog_pg_old_cluster():
+    """Read-only: is a stopped PostgreSQL 15 cluster still on disk, and how big is it."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    res = _pg_old_cluster_state(_get_tak_deployment_config(load_settings()))
+    return jsonify({'success': bool(res.get('ok', True)), **res})
+
+
+@app.route('/api/guarddog/pg-old-cluster/remove', methods=['POST'])
+@login_required
+def guarddog_pg_old_cluster_remove():
+    """DESTRUCTIVE: remove the leftover PostgreSQL 15 cluster — the 5.8 migration's
+    rollback copy. Password + typed confirmation, same gate as Purge Old CoT."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    want = str(_PG_OLD_CLUSTER_MAJOR)
+    if (data.get('confirm') or '').strip() != want:
+        return jsonify({'success': False, 'error': "confirm must be exactly '%s'." % want,
+                        'expected_confirm': want}), 400
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    st = _pg_old_cluster_state(tak_cfg)
+    if not st.get('found'):
+        return jsonify({'success': False, 'error': 'No PostgreSQL %s cluster found.' % want}), 400
+    if not st.get('removable'):
+        return jsonify({'success': False, 'error': st.get('not_removable_reason') or 'Not removable.'}), 409
+    audit('guarddog:pg-old-cluster', 'remove PostgreSQL %s cluster %s on %s (%s)'
+          % (want, st.get('path'), st.get('where'), st.get('bytes_human')), force=True)
+    res = _pg_old_cluster_call('drop', tak_cfg)
+    ok = bool(res.get('ok') and res.get('removed'))
+    audit('guarddog:pg-old-cluster', ('removed, freed %s' % st.get('bytes_human')) if ok
+          else ('FAILED: %s' % (res.get('error') or 'unknown')[:200]), force=True)
+    if not ok:
+        return jsonify({'success': False, 'error': res.get('error') or 'Removal failed.'}), 500
+    return jsonify({'success': True, 'freed_human': st.get('bytes_human'),
+                    'message': 'Removed the PostgreSQL %s cluster (%s) on %s and freed %s.'
+                               % (want, st.get('path'), st.get('where'), st.get('bytes_human'))})
 
 
 @app.route('/api/takserver/cert-expiry')
