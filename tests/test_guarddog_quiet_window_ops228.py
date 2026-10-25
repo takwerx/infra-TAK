@@ -46,7 +46,8 @@ QUIET_SH = (GD / 'gd-quiet.sh').read_text()
 SEND_SH = (GD / 'send-alert-email.sh').read_text()
 
 QUIET_FNS = ('_gd_quiet_held_path', '_gd_quiet_state', '_gd_quiet_held_load',
-             '_gd_quiet_held_save', '_gd_quiet_hold', '_gd_quiet_review_once')
+             '_gd_quiet_held_save', '_gd_quiet_hold', '_gd_quiet_failing',
+             '_gd_quiet_review_once')
 
 
 def _fn(name):
@@ -86,6 +87,7 @@ class Console:
             '_GD_QUIET_UPDATE_LOCK_TTL_S': _const('_GD_QUIET_UPDATE_LOCK_TTL_S'),
             '_GD_QUIET_AK_MARKER': str(self.ak),
             '_GD_QUIET_AK_MAX_S': _const('_GD_QUIET_AK_MAX_S'),
+            'GD_QUIET_SETTLE_S': _const('GD_QUIET_SETTLE_S'),
             '_gd_quiet_lock': threading.Lock(),
             '_guarddog_page_cache': {'health': None},
             '_guarddog_refresh_page_cache': self._refresh,
@@ -199,10 +201,27 @@ def test_held_alerts_that_cleared_are_dropped_quietly(box):
     box._gd_quiet_hold('Guard Dog: CloudTAK repaired automatically on test-box')
     box._gd_quiet_hold('Guard Dog: TAK Portal restarted on test-box')
     box.marker.unlink()                      # T&E: gd-quiet.sh off
-    assert box._gd_quiet_review_once() == 'clear'
+    assert box._gd_quiet_review_once() == 'clear'   # all OK at the close: done at once
     assert box.refreshed == 1 and box.sent == []
     assert box._gd_quiet_held_load() == {}
     assert box._gd_quiet_review_once() == 'none'   # once only
+
+
+SETTLE = _const('GD_QUIET_SETTLE_S')
+
+
+def test_transient_failure_at_the_close_is_not_mailed(box):
+    # nuc, 2026-10-25: the window closed 60 s after a console restart and a check was not
+    # OK yet. Update Now ends like that on every box. Ten minutes later it was fine.
+    box.health['cloudtak'] = 'caution'
+    box._gd_quiet_hold('Guard Dog: CloudTAK restarted on test-box')
+    t0 = time.time()
+    assert box._gd_quiet_review_once(t0) == 'settling'
+    assert box._gd_quiet_review_once(t0 + SETTLE - 5) == 'settling'
+    assert box.refreshed == 1                 # no re-check before the settle is up
+    box.health['cloudtak'] = 'ok'
+    assert box._gd_quiet_review_once(t0 + SETTLE + 1) == 'clear'
+    assert box.sent == [] and box._gd_quiet_held_load() == {}
 
 
 def test_fault_that_outlives_the_window_is_mailed_once(box):
@@ -210,41 +229,75 @@ def test_fault_that_outlives_the_window_is_mailed_once(box):
     box.window(-600, 600, 'Update drill')
     box._gd_quiet_hold('Guard Dog: CloudTAK restarted on test-box')
     box.window(-1200, -1, 'Update drill')    # expired: the run died
-    assert box._gd_quiet_review_once() == 'sent'
+    t0 = time.time()
+    assert box._gd_quiet_review_once(t0) == 'settling'
+    assert box.sent == []
+    assert box._gd_quiet_review_once(t0 + SETTLE + 1) == 'sent'
     assert len(box.sent) == 1
     to, subj, body = box.sent[0]
     assert to == 'ops@example.com'
     assert subj == 'Guard Dog: still failing after planned work on test-box (10.0.0.1)'
     assert '• cloudtak: fail' in body and 'takserver' not in body
     assert 'Guard Dog: CloudTAK restarted on test-box' in body
-    assert 'Update drill' in body
-    assert box._gd_quiet_review_once() == 'none'
+    assert 'Update drill' in body and 'ended 10 min ago' in body
+    assert box._gd_quiet_review_once(t0 + SETTLE + 60) == 'none'
+
+
+def test_a_new_fault_after_the_close_is_not_blamed_on_the_window(box):
+    box.health['cloudtak'] = 'fail'
+    box._gd_quiet_hold('x')
+    t0 = time.time()
+    box._gd_quiet_review_once(t0)
+    box.health['cloudtak'] = 'ok'
+    box.health['takserver'] = 'fail'          # not held: its own watcher reports it
+    assert box._gd_quiet_review_once(t0 + SETTLE + 1) == 'clear'
+    assert box.sent == []
+
+
+def test_reopening_while_settling_restarts_the_settle(box):
+    box.health['cloudtak'] = 'fail'
+    box._gd_quiet_hold('first')
+    t0 = time.time()
+    assert box._gd_quiet_review_once(t0) == 'settling'
+    box.window(-10, 600)                      # next T&E round starts
+    assert box._gd_quiet_review_once() == 'open'
+    assert 'closed_at' not in box._gd_quiet_held_load()
+    box.marker.unlink()
+    assert box._gd_quiet_review_once(t0 + SETTLE + 1) == 'settling'   # a fresh first look
+
+
+def _settled(box):
+    t0 = time.time()
+    first = box._gd_quiet_review_once(t0)
+    return first if first != 'settling' else box._gd_quiet_review_once(t0 + SETTLE + 1)
 
 
 def test_close_out_respects_the_operator_pause(box):
     box.health['cloudtak'] = 'fail'
     box.paused = True
     box._gd_quiet_hold('x')
-    assert box._gd_quiet_review_once() == 'not-sent'
+    assert _settled(box) == 'not-sent'
     assert box.sent == []
 
 
 def test_close_out_without_a_recipient_sends_nothing(tmp_path):
     b = Console(tmp_path, health={'cloudtak': 'fail'}, recipient='')
     b._gd_quiet_hold('x')
-    assert b._gd_quiet_review_once() == 'not-sent' and b.sent == []
+    assert _settled(b) == 'not-sent' and b.sent == []
 
 
 def test_a_hold_recorded_during_the_review_is_kept(box):
     box.health['cloudtak'] = 'fail'
     box._gd_quiet_hold('first')
+    t0 = time.time()
+    box._gd_quiet_review_once(t0)
     real_refresh = box.ns['_guarddog_refresh_page_cache']
 
-    def _refresh_and_new_window():
+    def _refresh_and_new_hold():
         real_refresh()
         box._gd_quiet_hold('second, from the next window')
-    box.ns['_guarddog_refresh_page_cache'] = _refresh_and_new_window
-    box._gd_quiet_review_once()
+    box.ns['_guarddog_refresh_page_cache'] = _refresh_and_new_hold
+    box._gd_quiet_review_once(t0 + SETTLE + 1)
     left = box._gd_quiet_held_load()['held']
     assert [h['subject'] for h in left] == ['second, from the next window']
 

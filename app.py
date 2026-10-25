@@ -25315,9 +25315,10 @@ def _gd_alerts_pause_state(settings=None):
 # real fault. So: (1) send-alert-email.sh exits 3 on a held alert, and the watchers that
 # gate their once-per-episode state on delivery keep the episode open and alert after the
 # window if the fault is still there; (2) every held alert is recorded, and when the window
-# closes the console re-runs Guard Dog's checks and, if anything is still failing, sends ONE
-# email naming it and the alerts that were held (_gd_quiet_review_once). A fault the planned
-# work caused and cleared costs nothing; a fault that outlives the window is still reported.
+# closes the console re-runs Guard Dog's checks, again GD_QUIET_SETTLE_S later, and if a
+# check is still failing sends ONE email naming it and the alerts that were held
+# (_gd_quiet_review_once). A fault the planned work caused and cleared costs nothing; a
+# fault that outlives the window is still reported.
 GD_QUIET_MARKER = '/var/lib/takguard/quiet_window'
 GD_QUIET_MAX_S = 4 * 3600                # gd-quiet.sh MAX_MIN
 _GD_QUIET_UPDATE_LOCK = '/var/lib/takwerx-console/update-now.lock'
@@ -25325,6 +25326,7 @@ _GD_QUIET_UPDATE_LOCK_TTL_S = 1200       # update_apply() _update_lock_ttl_s
 _GD_QUIET_AK_MARKER = '/var/lib/takguard/authentik_update_in_progress'   # _GD_AUTHENTIK_UPDATE_MARKER
 _GD_QUIET_AK_MAX_S = 1800                # _GD_AUTHENTIK_UPDATE_MAX_S
 GD_QUIET_REVIEW_EVERY_S = 60
+GD_QUIET_SETTLE_S = 600                  # close-out: a check must still be failing this long after
 _gd_quiet_lock = threading.Lock()
 
 
@@ -25402,22 +25404,57 @@ def _gd_quiet_hold(subject, state=None):
         _gd_quiet_held_save(rec)
 
 
-def _gd_quiet_review_once():
-    """Close-out of a quiet window that held alerts. Returns 'open' | 'none' | 'clear' |
-    'sent' | 'not-sent'.
+def _gd_quiet_failing():
+    _guarddog_refresh_page_cache()
+    health = _guarddog_page_cache.get('health') or {}
+    return {k: v for k, v in health.items() if v != 'ok'}
+
+
+def _gd_quiet_review_once(now=None):
+    """Close-out of a quiet window that held alerts. Returns 'open' | 'none' | 'settling' |
+    'clear' | 'sent' | 'not-sent'.
 
     Re-runs Guard Dog's health checks rather than replaying the held alerts: a replay would
     re-send exactly the noise the window exists to hold (a restart during a drill is over
-    by now), while a check that is still failing is the fault the window must not hide."""
-    if _gd_quiet_state()[0]:
+    by now), while a check that is still failing is the fault the window must not hide.
+
+    Two looks, GD_QUIET_SETTLE_S apart. Right after the window closes the box is often
+    still settling — nuc, 2026-10-25: a console restart, then the close-out 60 s later
+    found a check not yet OK and mailed. Update Now ends exactly like that on every box.
+    Only a check that is not OK at the close AND still not OK after the settle is reported;
+    a new fault after the close is not held, so its own watcher reports it as usual."""
+    now = time.time() if now is None else now
+    if _gd_quiet_state(now)[0]:
+        with _gd_quiet_lock:
+            rec = _gd_quiet_held_load()
+            if 'closed_at' in rec:           # reopened while settling: settle after this one
+                rec.pop('closed_at', None)
+                rec.pop('failing', None)
+                _gd_quiet_held_save(rec)
         return 'open'
     with _gd_quiet_lock:
-        held = _gd_quiet_held_load().get('held')
+        rec = _gd_quiet_held_load()
+    held = rec.get('held')
     if not isinstance(held, list) or not held:
         return 'none'
-    _guarddog_refresh_page_cache()
-    health = _guarddog_page_cache.get('health') or {}
-    failing = sorted(k for k, v in health.items() if v != 'ok')
+    closed_at = rec.get('closed_at')
+    if not isinstance(closed_at, (int, float)):
+        first = _gd_quiet_failing()
+        if first:
+            with _gd_quiet_lock:
+                cur = _gd_quiet_held_load()
+                cur.update({'closed_at': int(now), 'failing': sorted(first)})
+                _gd_quiet_held_save(cur)
+            print(f"[guarddog] quiet window closed with {len(held)} held alert(s); not OK right "
+                  f"now: {', '.join(f'{k}={v}' for k, v in sorted(first.items()))} — checking "
+                  f"again in {GD_QUIET_SETTLE_S // 60} min", flush=True)
+            return 'settling'
+        failing, health = [], {}
+    elif now - closed_at < GD_QUIET_SETTLE_S:
+        return 'settling'
+    else:
+        health = _gd_quiet_failing()
+        failing = sorted(set(health) & set(rec.get('failing') or []))
     with _gd_quiet_lock:
         # Drop only what was read above; a hold recorded since (a new window) stays.
         rest = _gd_quiet_held_load().get('held')
@@ -25425,7 +25462,7 @@ def _gd_quiet_review_once():
         _gd_quiet_held_save({'held': rest} if rest else {})
     if not failing:
         print(f"[guarddog] quiet window closed: {len(held)} alert(s) held, every Guard Dog "
-              f"check is OK now — nothing sent", flush=True)
+              f"check that was not OK at the close is OK now — nothing sent", flush=True)
         return 'clear'
     settings = load_settings()
     to_addr = (settings.get('guarddog_alert_email') or '').strip()
@@ -25435,8 +25472,9 @@ def _gd_quiet_review_once():
     ident = _guarddog_server_identifier(settings) or socket.gethostname()
     reasons = sorted({str(h.get('reason') or '') for h in held if h.get('reason')})
     lines = [f"Guard Dog held {len(held)} alert(s) during planned work "
-             f"({'; '.join(reasons) or 'quiet window'}). The window is over and these "
-             f"Guard Dog checks are still not OK:", '']
+             f"({'; '.join(reasons) or 'quiet window'}). The window ended "
+             f"{int((now - closed_at) // 60)} min ago and these Guard Dog checks are still "
+             f"not OK:", '']
     lines += [f"  • {k}: {health.get(k)}" for k in failing]
     lines += ['', 'Alerts held during the window:']
     for h in held[-20:]:
@@ -25449,7 +25487,7 @@ def _gd_quiet_review_once():
     subj = f"Guard Dog: still failing after planned work on {ident}"
     try:
         if _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines)):
-            print(f"[guarddog] sent: {subj}", flush=True)
+            print(f"[guarddog] sent: {subj} ({', '.join(failing)})", flush=True)
             return 'sent'
     except Exception as e:
         print(f"[guarddog] quiet window close-out not sent: {e}", flush=True)
