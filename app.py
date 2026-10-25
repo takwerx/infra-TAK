@@ -83088,21 +83088,29 @@ def _stack_backup(label=None, plog=None):
                     if n.endswith(('.json', '.yml', '.yaml', '.conf'))]
             _tar_in('mediamtx-config', mtx)
 
-        # 4. Node-RED /data — flows, global context, config-backups/latest.json.
-        #    Read-only here; the SACRED union rule governs the restore side (W12.d).
+        # 4. Node-RED — global context, config-backups/ (latest.json) and the flows, as
+        #    data/... paths. Archived inside the container: `docker cp nodered:/data` fails
+        #    outright when /data/certs is a nested read-only bind (aws-arm 2026-10-25:
+        #    "openat certs/admin.key: read-only file system"), and the restore needs only
+        #    these. Read-only here; the SACRED union rule governs the restore (W12.d).
         if _installed('nodered'):
             nr_tar = os.path.join(stage, 'nodered-data.tar')
+            _nr_tar_sh = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
+                          'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
+                          '[ $# -gt 0 ] && exec tar -cf - "$@"')
             try:
                 with open(nr_tar, 'wb') as out:
-                    r = subprocess.run(_sudo_wrap(['docker', 'cp', 'nodered:/data', '-']),
+                    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'nodered', 'sh', '-c', _nr_tar_sh]),
                                        stdout=out, stderr=subprocess.PIPE, timeout=600)
                 if r.returncode == 0 and os.path.getsize(nr_tar) > 0:
-                    _copy_in(nr_tar, 'nodered-data.tar', 'volume', 'nodered:/data')
+                    _copy_in(nr_tar, 'nodered-data.tar', 'volume', 'nodered:/data (context, config-backups, flows)')
                 else:
                     _part('nodered-data.tar', 'volume', False,
                           note=(r.stderr or b'').decode(errors='replace')[:300])
+                    plog(f"  stack backup: nodered-data.tar FAILED: {(r.stderr or b'').decode(errors='replace')[:300]}")
             except Exception as e:
                 _part('nodered-data.tar', 'volume', False, note=str(e)[:300])
+                plog(f"  stack backup: nodered-data.tar FAILED: {str(e)[:300]}")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
