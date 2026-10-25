@@ -82582,7 +82582,13 @@ def _tak_rollback(label, plog=None):
 
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
-    subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=60)  # v10.0.1: container-aware
+    # v10.3.0 W12: the unit's own TimeoutStopSec is 90 s, so a 60 s cap raised TimeoutExpired
+    # mid-stop on a slow shutdown (nuc 2026-10-25) and the caller lost the rest of its sequence.
+    try:
+        subprocess.run(_tak_systemctl('stop'), shell=True, capture_output=True, timeout=180)  # v10.0.1: container-aware
+    except subprocess.TimeoutExpired:
+        plog("  rollback: takserver did not stop within 180 s")
+        return False, 'takserver did not stop within 180 s — nothing was restored'
 
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
@@ -83171,7 +83177,7 @@ def _stack_backup_run_job(label, source='manual', extra_log=None, on_done=None, 
                 except Exception as e:
                     plog(f"  stack backup: could not record it in settings: {e}")
         except Exception as e:
-            res = f'stack backup crashed: {str(e)[:300]}'
+            res = f'stack {kind} crashed: {str(e)[:300]}'
             plog(res)
         err = '' if ok else (', '.join(res.get('failed') or []) if isinstance(res, dict) else str(res))
         _stack_backup_job.update({'running': False, 'ok': bool(ok),
@@ -83639,27 +83645,44 @@ def _stack_restore(label, plog=None):
                 plog(f"  restore: {name} FAILED: {str(e)[:300]}")
     finally:
         # 5. Start back up in deploy order: Authentik → TAK → Portal → CloudTAK → MediaMTX.
+        #    Every step is guarded: one failure must never leave the modules after it stopped
+        #    (nuc 2026-10-25 — a TAK stop timeout escaped here and Portal/CloudTAK stayed down).
+        def _tak_back():
+            try:
+                ok, err = _tak_rollback(label, plog)
+            except Exception as e:
+                ok, err = False, str(e)
+            if not ok:
+                failed.append('takserver')
+                plog(f"  restore: TAK Server FAILED: {str(err)[:300]}")
+                try:
+                    subprocess.run(_tak_systemctl('start'), shell=True, capture_output=True, timeout=180)
+                except Exception as e:
+                    plog(f"  restore: could not start takserver: {str(e)[:200]}")
+
         order = {'authentik': 0, 'takportal': 2, 'cloudtak': 3}
         started_tak = False
         for mod, names in sorted(stopped, key=lambda x: order.get(x[0], 9)):
             if order.get(mod, 9) >= 2 and not started_tak:
                 started_tak = True
                 if 'takserver' in parts:
-                    ok, err = _tak_rollback(label, plog)
-                    if not ok:
-                        failed.append('takserver')
-                        plog(f"  restore: TAK Server FAILED: {str(err)[:300]}")
+                    _tak_back()
             for n in names:
-                subprocess.run(_sudo_wrap(['docker', 'start', n]), capture_output=True, timeout=120)
+                try:
+                    subprocess.run(_sudo_wrap(['docker', 'start', n]), capture_output=True, timeout=120)
+                except Exception as e:
+                    failed.append(f'start:{n}')
+                    plog(f"  restore: could not start {n}: {str(e)[:200]}")
             plog(f"  restore: started {mod}")
         if 'takserver' in parts and not started_tak:
-            ok, err = _tak_rollback(label, plog)
-            if not ok:
-                failed.append('takserver')
-                plog(f"  restore: TAK Server FAILED: {str(err)[:300]}")
+            _tak_back()
         if 'mediamtx-config.tar.gz' in configs:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
-            plog("  restore: restarted mediamtx")
+            try:
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+                plog("  restore: restarted mediamtx")
+            except Exception as e:
+                failed.append('mediamtx')
+                plog(f"  restore: could not restart mediamtx: {str(e)[:200]}")
 
     pending = []
     if failed:
