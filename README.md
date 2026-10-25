@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.28-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.28-alpha)**
+**Current release: [v10.2.29-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.29-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,24 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.2.29-alpha — 2026-10-24 — Security: Remote Assist CoTURN, WebODM, and the distrusted emSign root out of every trust store; Authentik 2026.8.5; TAK Portal marketplace plugins survive every CloudTAK action; CloudTAK Deploy keeps its secrets and database; faster LDAP updates; Report an issue in Help
+
+**Headline: Remote Assist's CoTURN moves to 4.18.0 on every server that runs it, with hardened settings and a relay that refuses private addresses. WebODM drops a package it never used that carried a critical flaw. The distrusted emSign ECC Root CA - G3 leaves TAK Server's Java trust store, CloudTAK's media server, the NetBird server and the host's Python. Authentik moves to 2026.8.5. TAK Portal marketplace plugins (Rubber Sheet, Sidebar Configurator, Print, uDash, LiveWX) now survive every CloudTAK Deploy, Update and repair, and a CloudTAK Deploy over an installed CloudTAK keeps its logins, store and database. Plus: the Authentik LDAP outpost gets config pushes again, and Help has a Report an issue card.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.29-alpha))
+
+**Security.**
+- **Remote Assist CoTURN:** servers that turned CoTURN on before v10.2.8 were still running CoTURN 4.14.0. The console now moves them to 4.18.0 when it starts, with hardened settings, and the relay refuses to reach private and internal addresses. A new **Block private peers** setting on the Remote Assist page (on by default) can be turned off to allow your own LAN ranges.
+- **WebODM:** the WebODM web app and worker remove the unused `olefile` package each time they start. Existing servers get this when the console starts.
+- **Distrusted emSign ECC Root CA - G3:** native TAK Server's Java trust store now follows the OS trust store (from TAK Server's next restart), container TAK Server drops it from the JDK, CloudTAK's media server and the NetBird server use the host's CA bundle, and the host Python's `certifi` (MediaMTX web editor) is upgraded on Update Now.
+- **Authentik 2026.8.5:** the Authentik card offers the update. Same-minor bugfix release, no database migrations, and it drops the same root.
+
+**CloudTAK.**
+- **TAK Portal marketplace plugins survive every action (GH #271, #277):** CloudTAK Update puts back the npm packages plugins added (such as Rubber Sheet's `pdfjs-dist`), so the build passes. Print and uDash no longer cause false drift, CloudTAK recreates or Guard Dog alarms. A Deploy retry or re-clone keeps the plugins, a remote CloudTAK host gets the same protection, and a failed Update puts them back.
+- **Deploy over an installed CloudTAK:** keeps its signing secret (nobody is logged out), its store key and store data, and its database.
+
+**Also in this release.**
+- **Authentik LDAP outpost:** gets Authentik's config pushes again, so a provider or outpost change reaches it in seconds instead of at its 5-minute refresh.
+- **Help → Report an issue:** opens a GitHub issue with your console version filled in.
 
 ### v10.2.28-alpha — 2026-10-24 — Security: body-parser fix for TAK Portal and Remote Assist; CloudTAK keeps marketplace plugins and your own compose additions, and Guard Dog repairs it after a marketplace install; CloudTAK plays MediaMTX streams; Node-RED keeps extra ports; faster Data Sync recovery after an update
 
