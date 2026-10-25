@@ -18,6 +18,7 @@ UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 # systemd unit, so the old "${HOME:-...}" default silently pointed at nothing on
 # installs that do not match it and this watchdog exited 0 without ever watching.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+type gd_stack_restore_standdown >/dev/null 2>&1 && gd_stack_restore_standdown tak-nodered-watch && exit 0
 NR_DIR="$(gd_find_stack_dir node-red nodered)"
 [ -z "$NR_DIR" ] && exit 0
 

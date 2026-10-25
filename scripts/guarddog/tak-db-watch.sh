@@ -3,6 +3,7 @@
 # byte-identical (the lib's native branch emits the same systemctl calls);
 # container mode targets the takserver-db container.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+type gd_stack_restore_standdown >/dev/null 2>&1 && gd_stack_restore_standdown tak-db-watch && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/db_alert_sent"

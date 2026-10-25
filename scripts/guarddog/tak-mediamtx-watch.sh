@@ -5,6 +5,10 @@
 # ZERO alerting (test6 2026-08-03: editor crash-looped on a duplicate-endpoint
 # mangle until the operator hit the dead page). A restart won't fix a code-level
 # crash-loop, but the ALERT is the point; the email says where to look.
+# v10.3.0 W12.d: stand down while the console restores a full-stack backup (see
+# gd_stack_restore_standdown in _gd-tak-lib.sh — this script does not source it).
+_sr="$(head -c 32 /var/lib/takguard/stack-restore 2>/dev/null | tr -cd '0-9')"
+[ -n "$_sr" ] && [ "$(date +%s)" -lt "$_sr" ] 2>/dev/null && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"

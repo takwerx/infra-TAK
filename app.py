@@ -83334,6 +83334,21 @@ def console_stack_backup_delete_api(label):
 # restores onto the same box after its flip to 24.04. Every part is verified before
 # anything is stopped. Node-RED is merged config-by-config, never replaced (SACRED).
 STACK_RESTORE_ACK_PREFIX = 'Restore '
+# Guard Dog stand-down (gd_stack_restore_standdown in _gd-tak-lib.sh): an expiry, so a
+# console that dies mid-restore cannot silence the watchers for longer than this.
+_STACK_RESTORE_STANDDOWN = '/var/lib/takguard/stack-restore'
+_STACK_RESTORE_STANDDOWN_S = 2 * 3600
+
+
+def _stack_restore_standdown(on, plog):
+    if not os.path.isdir(os.path.dirname(_STACK_RESTORE_STANDDOWN)):
+        return   # Guard Dog not installed
+    try:
+        _write_priv(_STACK_RESTORE_STANDDOWN,
+                    f'{int(time.time()) + _STACK_RESTORE_STANDDOWN_S if on else 0}\n', perm=0o644)
+        plog("  restore: Guard Dog watchers " + ("standing down" if on else "resumed"))
+    except Exception as e:
+        plog(f"  restore: Guard Dog stand-down {'set' if on else 'clear'} failed (non-fatal): {str(e)[:200]}")
 # settings.json keys that describe THIS box now, not the box at backup time.
 _STACK_RESTORE_KEEP_SETTINGS = ('os_type', 'stack_backups', 'tak_snapshots')
 _STACK_RESTORE_MTX_EXT = ('.json', '.yml', '.yaml', '.conf')
@@ -83592,6 +83607,7 @@ def _stack_restore(label, plog=None):
 
     mods = detect_modules(fresh=True) or {}
     failed, stopped = [], []
+    _stack_restore_standdown(True, plog)
     try:
         # 2. Stop the applications (their databases stay up for pg_restore).
         for mod, names in _stack_restore_app_containers(mods):
@@ -83692,6 +83708,7 @@ def _stack_restore(label, plog=None):
             except Exception as e:
                 failed.append('mediamtx')
                 plog(f"  restore: could not restart mediamtx: {str(e)[:200]}")
+        _stack_restore_standdown(False, plog)
 
     pending = []
     if failed:
