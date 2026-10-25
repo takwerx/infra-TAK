@@ -93075,30 +93075,34 @@ def _cloudtak_drift_summary(d):
 
 def _cloudtak_autorepair_wait_reason(ct_dir):
     """Why the stack has not settled yet (so a repair now would fight whoever is changing it),
-    or None. TAK Portal's install is build → up --force-recreate api → wait for the api → image
-    prune, all as separate commands, so: any compose/build process on the box, a console job
-    in flight, or an api container that started less than CLOUDTAK_AUTOREPAIR_SETTLE_S ago."""
+    as (reason, busy), or (None, False). TAK Portal's install is build → up --force-recreate api
+    → wait for the api → image prune, all as separate commands, so: any compose/build process on
+    the box, a console job in flight, or an api container that started less than
+    CLOUDTAK_AUTOREPAIR_SETTLE_S ago. Those are `busy`: someone is working on the stack, and
+    Guard Dog does not run its 30-min clock while they do (ops #230 — TAK Portal's --no-cache
+    build alone took ~20 min on test6). An api that is not running is not busy: nothing is
+    moving, so that wait counts."""
     busy = _console_busy_reason()
     if busy:
-        return f'console busy: {busy}'
+        return f'console busy: {busy}', True
     try:
         ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
         run = [l.strip() for l in (ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_BUSY_RE.search(l)]
     except Exception:
         run = []
     if run:
-        return f'a compose/build run is still going ({run[0][:120]})'
+        return f'a compose/build run is still going ({run[0][:120]})', True
     st = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.Status}} {{.State.StartedAt}}']) or '').split()
     if len(st) < 2 or st[0] != 'running':
-        return f"cloudtak-api-1 is not running ({st[0] if st else 'not found'})"
+        return f"cloudtak-api-1 is not running ({st[0] if st else 'not found'})", False
     try:
         import calendar
         age = time.time() - calendar.timegm(time.strptime(st[1][:19], '%Y-%m-%dT%H:%M:%S'))
     except ValueError:
         age = CLOUDTAK_AUTOREPAIR_SETTLE_S
     if age < CLOUDTAK_AUTOREPAIR_SETTLE_S:
-        return f'cloudtak-api-1 started {int(max(age, 0))}s ago'
-    return None
+        return f'cloudtak-api-1 started {int(max(age, 0))}s ago', True
+    return None, False
 
 
 def _cloudtak_autorepair_record():
@@ -93124,7 +93128,8 @@ def _cloudtak_autorepair_request():
     """Guard Dog saw CloudTAK drift twice in a row. Answer {'state', 'detail'}:
       ok           — no drift from here (it cleared, or was never ours to fix)
       repairing    — a repair is running (just started, or still going)
-      waiting      — not settled yet; ask again next check
+      waiting      — not settled yet; ask again next check ('busy': someone is still working
+                     on the stack, so Guard Dog does not count this wait — ops #230)
       rate_limited — CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR used up: send the alarm
       failed       — the last repair failed, or cannot run here: send the alarm"""
     ct_dir = os.path.expanduser('~/CloudTAK')
@@ -93153,9 +93158,9 @@ def _cloudtak_autorepair_request():
         if len(tries) >= CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR:
             return {'state': 'rate_limited',
                     'detail': f'{len(tries)} automatic repairs in the last hour, so Guard Dog stopped trying'}
-        wait = _cloudtak_autorepair_wait_reason(ct_dir)
+        wait, busy = _cloudtak_autorepair_wait_reason(ct_dir)
         if wait:
-            return {'state': 'waiting', 'detail': wait}
+            return {'state': 'waiting', 'detail': wait, 'busy': busy}
         rec['attempts'] = tries + [now]
         _cloudtak_autorepair_record_save(rec)
         detail = _cloudtak_drift_summary(drift)
