@@ -64819,6 +64819,46 @@ def _tak_client_sessions_wait(plog, tag):
         delay, retried = min(delay * 2, _TAK_MARTI_READ_RETRY_MAX_S), True
 
 
+def _tak_log_removed_subscriptions(uids):
+    """Those of these connection uids (tls:N / ssl:N) that TAK's messaging log says it removed
+    since TAK Server last started, although it may still list them (ops #223). TAK numbers
+    connections from 1 again at every start, so only lines after the log's last start line
+    count. None when the log can't be read."""
+    uids = [u for u in dict.fromkeys(uids) if re.fullmatch(r'(?:tls|ssl):\d+', u or '')]
+    if not uids:
+        return set()
+    started = 'Started TAK Server messaging Microservice'
+    path = '/opt/tak/logs/takserver-messaging.log'
+    if _tak_is_container():
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'grep', '-a', '-E', '-e', started, '-e',
+                                           r'Subscription: (id=)?(%s)( |$)' % '|'.join(uids), path]),
+                               capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None
+        if r.returncode not in (0, 1):   # 1 = no line matched
+            return None
+        lines = (r.stdout or '').splitlines()
+    else:
+        # Read directly, like _diag_tail: TAK's logs are world-readable, and `grep` is not on
+        # the broker's allow-list (a denied call on a non-root box holds enforce mode off).
+        try:
+            with open(path, 'rb') as f:
+                lines = [l.decode('utf-8', 'replace') for l in f
+                         if b'Subscription: ' in l or started.encode() in l]
+        except OSError:
+            return None
+    last = {}
+    for line in lines:
+        if started in line:
+            last.clear()
+            continue
+        m = re.search(r'\b(Added|Removed) Subscription: (?:id=)?((?:tls|ssl):\d+)(?: |$)', line)
+        if m and m.group(2) in uids:
+            last[m.group(2)] = m.group(1)
+    return {u for u, what in last.items() if what == 'Removed'}
+
+
 def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     """Give TAK's live client connections their LDAP groups back after an LDAP outage,
     without restarting TAK Server (ops #126). LDAP must already be verified healthy.
@@ -64838,8 +64878,10 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
        history can't name it (test12, ops #131: the history left that device out). TAK names
        every cert connection whose lookup completes — a user LDAP doesn't know still gets
        its name and __ANON__ — so "no user, no groups" is a lookup that failed.
-       One TAK refuses to drop counts as gone when it has left the list since, or a newer
-       connection from the same client has its groups (ops #172: a ghost TAK still lists).
+       One TAK refuses to drop counts as gone when it has left the list since, TAK's
+       messaging log has it removed, or a newer connection from the same client is listed
+       (ops #172, #223: a ghost TAK still lists). That newer one, if it has no groups either,
+       is judged itself.
     3. Wait for those clients to reconnect (same device uid); repeat once for any that came
        back empty. One that comes back named, with no groups, as a user LDAP gives none is
        fine: that is what it is.
@@ -64965,18 +65007,44 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
     # connection had its groups. If the refused one is gone now, or a newer connection from
     # the same client has its groups, TAK's LDAP path works: it is gone, not a reason to
     # restart TAK.
-    replaced = []
+    # ops #223: test8, a client reconnecting every 15 s (1085 connects that day). TAK logged
+    # its tls:334 "Removed" 50 ms after adding it, still listed it 45 min later with no
+    # groups, and dropped each newer connection of that client within 50 ms too, so none was
+    # ever listed with groups and every update or heal restarted TAK, which fixed nothing.
+    # So a refused one is also gone when TAK's messaging log has it removed, or when any
+    # newer connection from the same client is listed. A newer one with no groups either is
+    # then judged itself: still listed, still owed and not removed in the log, it is stuck.
+    replaced, later = [], []
     if undroppable:
         now = _tak_client_sessions(devices)
         if now is not None:
             live = {s['uid'] for s in now}
+            newer = {d['uid']: [s for s in now if _same_client(d, s)] for d in undroppable}
+            listed = [d['uid'] for d in undroppable if d['uid'] in live and not newer[d['uid']]]
+            removed = (_tak_log_removed_subscriptions(listed) or set()) if listed else set()
             replaced = [d for d in undroppable
-                        if d['uid'] not in live or any(s['groups'] and _same_client(d, s) for s in now)]
+                        if d['uid'] not in live or newer[d['uid']] or d['uid'] in removed]
             undroppable = [d for d in undroppable if d not in replaced]
             if replaced:
-                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced by a newer "
-                     "connection from the same client with its groups: " + ', '.join(_label(s) for s in replaced[:15]))
-    stuck = owed + undroppable
+                plog(f"  {tag}: {len(replaced)} connection(s) TAK couldn't drop are gone or replaced: "
+                     + ', '.join(_label(d) + (' (removed in TAK\'s log)' if d['uid'] in removed else
+                                             ' (a newer connection from the client)' if newer[d['uid']] else '')
+                                 for d in replaced[:15]))
+            judged = {s['uid'] for s in owed}
+            later = list({s['uid']: s for d in replaced for s in newer[d['uid']]
+                          if _owed(s) and s['uid'] not in judged}.values())
+            if later:
+                time.sleep(5)   # TAK may still be assigning its groups
+                again = _tak_client_sessions(devices)
+                if again is not None:
+                    cur = {s['uid']: s for s in again}
+                    later = [cur[s['uid']] for s in later if s['uid'] in cur and _owed(cur[s['uid']])]
+                    gone_too = (_tak_log_removed_subscriptions(s['uid'] for s in later) or set()) if later else set()
+                    later = [s for s in later if s['uid'] not in gone_too]
+                if later:
+                    plog(f"  {tag}: {len(later)} newer connection(s) from those client(s) have no groups either: "
+                         + ', '.join(_label(s) for s in later[:15]))
+    stuck = owed + undroppable + later
     healed = list({s['uid']: s for s in healed}.values())  # two dropped sessions of one device → one new
 
     parts = []
@@ -64987,8 +65055,8 @@ def _tak_heal_ldap_sessions(plog, tag, ldap_pass):
         parts.append(f"{len(gone)} didn't reconnect within {_TAK_LDAP_HEAL_WAIT_S}s (offline?) — "
                      "they get their groups when they do")
     if replaced:
-        parts.append(f"{len(replaced)} TAK couldn't drop already gone or replaced by a newer connection "
-                     "with its groups")
+        parts.append(f"{len(replaced)} TAK couldn't drop already gone (removed by TAK, or replaced by a newer "
+                     "connection from the same client)")
     if blind:
         parts.append(f"{len(blind)} dropped with no user and no device id (feeds such as Node-RED's) — "
                      "they reconnect by themselves and are looked up again")
