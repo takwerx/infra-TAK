@@ -107,6 +107,8 @@ class Box:
         # ops #172: connections TAK still lists but refuses to drop (HTTP 400); with
         # `ghosts_leave` they are off the list right after the refused delete
         self.ghosts, self.ghosts_leave = set(ghosts), ghosts_leave
+        # ops #223: TAK's takserver-messaging.log lines; None = it can't be read
+        self.msglog = []
         self.tak_start = tak_start
         self.ldap_start = ldap_start
         self.container = container
@@ -284,6 +286,15 @@ class Box:
             out.append(json.dumps({'attributes': ['memberOf'], 'baseDN': 'ou=users,dc=takldap',
                                    'event': 'Search request', 'timestamp': _rfc3339(self.t)[:19] + 'Z'}))
             return ok('\n'.join(out) + '\n')
+        grep = cmd[3:] if cmd[:3] == ['docker', 'exec', 'takserver'] else cmd
+        if grep[:1] == ['grep'] and grep[-1] == '/opt/tak/logs/takserver-messaging.log':
+            assert (cmd is not grep) == self.container
+            if self.msglog is None:
+                return subprocess.CompletedProcess(cmd, 2, stdout='', stderr='grep: Permission denied\n')
+            pats = [grep[i + 1] for i, a in enumerate(grep) if a == '-e']
+            hits = [l for l in self.msglog if any(re.search(p, l) for p in pats)]
+            return subprocess.CompletedProcess(cmd, 0 if hits else 1, stdout=''.join(l + '\n' for l in hits),
+                                               stderr='')
         if cmd in (['systemctl', 'restart', 'takserver'], ['docker', 'restart', 'takserver']):
             self.t += 20
             if self.restart_rc == 0:
@@ -372,7 +383,7 @@ class Box:
                      '_ldap_filter_escape', '_ldap_users_tak_groups', '_ldap_users_tak_group_counts',
                      '_tak_file_users', '_subscription_num',
                      '_tak_device_usernames', '_tak_client_sessions', '_tak_client_sessions_wait',
-                     '_tak_heal_ldap_sessions',
+                     '_tak_log_removed_subscriptions', '_tak_heal_ldap_sessions',
                      '_tak_api_user_check_once', '_tak_api_user_check',
                      '_ldap_outpost_tak_searches', '_tak_api_check_stuck'):
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
@@ -611,14 +622,24 @@ def test_ops172_undroppable_with_no_replacement_still_restarts_tak_once():
 
 @pytest.mark.parametrize('newer', [
     sess(30, 'takdev-emu', client='ANDROID-other-device'),   # same user, another device
-    sess(30, 'takdev-emu', ()),                              # same client, but no groups either
     sess(28, 'takdev-emu'),                                  # older, not a reconnect
-], ids=['other-device', 'no-groups', 'older'])
-def test_ops172_only_a_newer_connection_of_the_same_client_with_groups_replaces_it(newer):
+], ids=['other-device', 'older'])
+def test_ops172_only_a_newer_connection_of_the_same_client_replaces_it(newer):
     box = ghost_box(newer, tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, tak_ldap_ok=False)
     assert box.recycle() is True
     assert len(box.restarts()) == 1
     assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops172_newer_connection_with_no_groups_replaces_the_ghost_but_is_judged_itself():
+    # ops #223: a newer connection from the same client stands in for the ghost even with no
+    # groups; with TAK's own LDAP path broken it keeps coming back empty, so TAK still restarts.
+    box = ghost_box(sess(30, 'takdev-emu', ()), tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR,
+                    tak_ldap_ok=False)
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced" in l for l in box.log)
+    assert any('still with no groups although LDAP is healthy' in l for l in box.log)
 
 
 def test_ops172_unreadable_list_after_a_refused_drop_keeps_the_restart_fallback():
@@ -632,6 +653,122 @@ def test_ops172_unreadable_list_after_a_refused_drop_keeps_the_restart_fallback(
     box.marti = no_reads_after_the_drop
     assert box.recycle() is True
     assert len(box.restarts()) == 1
+
+
+# ── ops #223: the ghost of a flapping client, which TAK's messaging log has removed ──
+
+STARTED = ('2026-10-25-02:31:55.827 [main] INFO tak.server.ServerConfiguration - '
+           'Started TAK Server messaging Microservice.')
+
+
+def added(n, at='03:56:22.487'):
+    return (f'2026-10-25-{at} [epollEventLoopGroup-4-17] INFO c.b.m.s.DistributedSubscriptionManager - '
+            f'Added Subscription: id=tls:{n} source=172.113.144.214')
+
+
+def removed(n, at='03:56:22.536'):
+    return (f'2026-10-25-{at} [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - '
+            f'Removed Subscription: tls:{n}')
+
+
+FLAPPING = [STARTED, added(333), removed(333), added(334), removed(334), added(335), removed(335)]
+
+
+def flapping_box(msglog, **kw):
+    """test8 2026-10-24: achandlerparsons reconnects every 15 s and TAK drops each connection
+    within 50 ms. TAK logged tls:334 removed, still listed it 45 min later with no user and
+    no groups, and refused its delete (HTTP 400); none of the client's newer connections was
+    listed."""
+    kw.setdefault('ghosts', {'tls:334'})
+    kw.setdefault('history', {'ANDROID-achandlerparsons': 'achandlerparsons'})
+    box = healthy_box(tak_start=T0 - 2 * HOUR, ldap_start=T0 - 60, **kw)
+    box.ldap_users['achandlerparsons'] = 2
+    box.subs.append(sess(334, 'achandlerparsons', (), unmapped=True))
+    box.msglog = msglog
+    return box
+
+
+def flap_in(box, *newer, once=False):
+    """After the refused drop, client-list reads also show these newer connections (only the
+    first such read with `once`: gone again within 50 ms)."""
+    marti, shown = box.marti, []
+
+    def reads(url, timeout=12, method='GET', json_body=None):
+        data, err = marti(url, timeout, method, json_body)
+        if method == 'GET' and url == f'{API}/subscriptions/all' and box.drops() and not (once and shown):
+            shown.append(box.t)
+            data = {'data': data['data'] + [dict(s) for s in newer]}
+        return data, err
+    box.marti = reads
+    return shown
+
+
+@pytest.mark.parametrize('container', [False, True], ids=['native', 'container'])
+def test_ops223_ghost_tak_logged_removed_is_not_a_restart(container):
+    box = flapping_box(FLAPPING, container=container)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.drops() == ['tls:334']
+    assert any("couldn't drop ACHANDLERPARSONS (achandlerparsons) (tls:334): http_400" in l for l in box.log)
+    assert any("1 connection(s) TAK couldn't drop are gone or replaced: ACHANDLERPARSONS (achandlerparsons) "
+               "(removed in TAK's log)" in l for l in box.log)
+    assert not any('still with no groups although LDAP is healthy' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients healed, no restart'
+    [grep] = [c for c in box.calls if 'grep' in c]
+    assert 'Subscription: (id=)?(tls:334)( |$)' in grep
+
+
+@pytest.mark.parametrize('msglog', [
+    [STARTED, added(334)],                                                  # added, never removed
+    [added(334, '01:00:00.000'), removed(334, '01:00:00.050'), STARTED, added(334)],   # an older TAK run's tls:334
+    [],                                                                     # nothing about it (log rotated)
+    None,                                                                   # log can't be read
+], ids=['not-removed', 'removed-before-tak-start', 'not-in-log', 'unreadable'])
+def test_ops223_undroppable_connection_tak_has_not_removed_still_restarts_tak_once(msglog):
+    box = flapping_box(msglog)
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert any('still with no groups although LDAP is healthy' in l and 'ACHANDLERPARSONS' in l for l in box.log)
+    assert not any("TAK couldn't drop are gone or replaced" in l for l in box.log)
+
+
+def test_ops223_newer_connection_listed_with_no_groups_for_a_moment_replaces_the_ghost():
+    box = flapping_box([STARTED, added(334)])
+    shown = flap_in(box, sess(336, 'achandlerparsons', (), unmapped=True), once=True)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert len(shown) == 1
+    assert any("are gone or replaced: ACHANDLERPARSONS (achandlerparsons) (a newer connection from the client)" in l
+               for l in box.log)
+    assert not any('no groups either' in l for l in box.log)
+
+
+def test_ops223_newer_connection_that_stays_with_no_groups_is_stuck_and_restarts_tak():
+    box = flapping_box([STARTED, added(334), added(336)])
+    flap_in(box, sess(336, 'achandlerparsons', (), unmapped=True))
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any('1 newer connection(s) from those client(s) have no groups either: ACHANDLERPARSONS' in l
+               for l in box.log)
+    assert any('still with no groups although LDAP is healthy' in l for l in box.log)
+
+
+def test_ops223_newer_connection_tak_logged_removed_is_a_ghost_too():
+    box = flapping_box([STARTED, added(334), added(336), removed(336)])
+    flap_in(box, sess(336, 'achandlerparsons', (), unmapped=True))
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert not any('no groups either' in l for l in box.log)
+
+
+def test_ops223_messaging_log_lookup_matches_whole_uids_only():
+    box = Box(tak_start=T0 - HOUR)
+    box.msglog = [STARTED, added(334), removed(334), 'Removed Subscription: ssl:7']
+    removed_in_log = box.ns()['_tak_log_removed_subscriptions']
+    assert removed_in_log(['tls:33', 'tls:3345']) == set()
+    assert removed_in_log(['tls:334', 'ssl:7', 'tls:1|.*', '', None]) == {'tls:334', 'ssl:7'}
+    assert all('tls:1|' not in a for c in box.calls for a in c)
+    assert removed_in_log([]) == set() and removed_in_log(['tls:x']) == set()
 
 
 # ── ops #139: TAK's HTTPS/API side, which the 8089 connections say nothing about ─────
