@@ -330,7 +330,8 @@ def test_print_only_drift_restarts_print_not_the_stack(prbox):
     assert OVERLAY in prbox.labels['cloudtak-print']
     assert prbox.request()['state'] == 'ok'
     assert len(prbox.compose) == 1                              # no repair loop
-    assert '(cloudtak-print) on 127.0.0.1:5010' in prbox.mails[0][2]
+    assert prbox.mails == []                                    # logged, not emailed (ops #230)
+    assert '(cloudtak-print) on 127.0.0.1:5010' in prbox.guard_log[0][1]
 
 
 def test_takportal_install_recreate_also_gets_print_set_up(prbox):

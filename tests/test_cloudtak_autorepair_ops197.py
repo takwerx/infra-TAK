@@ -84,6 +84,7 @@ class Box:
         (self.ct / 'docker-compose.marketplace.yml').write_text(TAKPORTAL_CSP)
         (self.ct / 'docker-compose.custom.yml').write_text(OPERATOR)
         self.calls, self.logs, self.mails, self.threads = [], [], [], []
+        self.guard_log = []                  # lines appended to restarts.log (ops #230)
         self.procs = ['/usr/bin/python3 broker', 'sleep 30']
         self.api_started = time.time() - 600
         self.up_rc = 0
@@ -161,6 +162,7 @@ class Box:
             '_patch_cloudtak_compose_ports': lambda d: self.calls.append((['PORTS'], d)) or False,
             '_docker_compose_pull': lambda *a, **k: self.calls.append((['PULL'], k.get('services'))) or True,
             '_cloudtak_media_hls_heal': self.heal,
+            '_write_priv': lambda path, content, mode='w', perm=None: self.guard_log.append((path, content, mode)),
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
             # ops #222: TAK Portal's Print is not installed on this box (its tests load the real ones)
@@ -254,16 +256,27 @@ def test_drift_is_repaired_through_the_console_restart_path(box):
     assert box.request()['state'] == 'ok'
 
 
-def test_repair_sends_one_short_repaired_note_not_the_alarm(box):
+def test_repair_is_logged_on_the_guard_dog_page_and_never_emailed(box):
+    # ops #230 (AJ): the "repaired automatically" email went out after every marketplace
+    # install and asked nothing of the operator. It lives in the Activity log now.
     box.request()
     box.finish()
-    assert len(box.mails) == 1
-    to, subj, body = box.mails[0]
-    assert to == 'ops@example.com'
-    assert subj == 'Guard Dog: CloudTAK repaired automatically on test-box (10.0.0.1)'
-    assert 'Nothing to do' in body and STOCK_MEDIA in body and PINNED_MEDIA in body
-    assert 'console CA missing in the api' in body and 'console CA trusted by the api' in body
-    assert 'drift' not in subj.lower()
+    assert box.mails == []
+    assert len(box.guard_log) == 1
+    path, line, mode = box.guard_log[0]
+    assert path == '/var/log/takguard/restarts.log' and mode == 'a'
+    assert line.endswith('\n') and line.count('\n') == 1          # one line in the log
+    assert '| cloudtak-watch | repaired automatically' in line
+    assert STOCK_MEDIA in line and PINNED_MEDIA in line
+    assert 'console CA missing in the api' in line and 'console CA trusted by the api' in line
+    assert any('repaired automatically' in l for l in box.logs)  # and in the console log
+
+
+def test_no_recipient_configured_still_logs_the_repair(box):
+    box.settings = {}
+    box.request()
+    box.finish()
+    assert box.mails == [] and len(box.guard_log) == 1
 
 
 def test_takportal_file_and_operator_file_are_both_kept(box):
@@ -289,7 +302,8 @@ def test_hls_only_drift_gets_the_media_heal_not_a_recreate(box):
     box.finish()
     assert box.ups() == [] and box.hls is True
     assert box.record()['last']['result'] == 'repaired'
-    assert 're-applied the HLS profile to cloudtak-media' in box.mails[0][2]
+    assert box.mails == []
+    assert 're-applied the HLS profile to cloudtak-media' in box.guard_log[0][1]
 
 
 def test_clean_box_is_ok_and_does_nothing(box):
@@ -365,7 +379,7 @@ def test_failed_recreate_falls_back_and_stays_pending_for_a_console_restart(box)
     box.finish()
     rec = box.record()['last']
     assert rec['result'] == 'failed' and 'force-recreate failed' in rec['detail']
-    assert box.mails == []                                 # no "repaired" note
+    assert box.mails == [] and box.guard_log == []         # no "repaired" note
     assert box.pending()                                   # the next console start redoes it
     r = box.request()
     assert r['state'] == 'failed' and 'automatic repair failed' in r['detail']
