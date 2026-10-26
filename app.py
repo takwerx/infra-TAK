@@ -41198,7 +41198,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         f'cd /tmp && rm -f {tarball} checksums.sha256 && '
         f'wget -q -O {tarball} "{url}" && '
         f'wget -q -O checksums.sha256 "{sums_url}" && '
-        f'grep " {tarball}$" checksums.sha256 | sha256sum --check --status && '
+        # Upstream writes binary-mode lines (`<hash> *<file>`): match either separator, or
+        # the grep finds nothing and EVERY remote deploy refuses (shipped v10.1.34 → row 5).
+        f'grep -E "^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$" checksums.sha256 | sha256sum --check --status && '
         f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
         f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
         f'rm -f {tarball} checksums.sha256'

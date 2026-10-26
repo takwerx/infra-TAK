@@ -53,3 +53,25 @@ def test_remote_deploys_join_the_ssh_user_to_docker():
 def test_docker_group_snippet_is_noop_for_root_and_never_prompts():
     sh = APP[APP.index('_REMOTE_DOCKER_GROUP_SH = ('):APP.index('\n)\n', APP.index('_REMOTE_DOCKER_GROUP_SH = ('))]
     assert '[ "$(id -u)" = 0 ] ||' in sh and 'sudo -n usermod -aG docker' in sh
+
+
+# --- remote MediaMTX checksum line matching (shipped broken in v10.1.34, found by row 5) ---
+def test_remote_mediamtx_checksum_grep_matches_upstream_binary_mode_lines(tmp_path):
+    import shutil
+    import subprocess
+    tarball = 'mediamtx_v1.21.1_linux_amd64.tar.gz'
+    src = APP[APP.index('def _run_mediamtx_deploy_remote('):]
+    line = re.search(r"f'(grep -E [^']*checksums\.sha256)", src).group(1)
+    cmd = eval("f'" + line + "'", {'re': re, 'tarball': tarball})
+    # upstream's real format (v1.17 .. v1.21): '<hash> *<file>' — plus the text-mode form
+    (tmp_path / 'checksums.sha256').write_text(
+        'be40' + '0' * 60 + ' *mediamtx_v1.21.1_darwin_amd64.tar.gz\n'
+        '653a' + '0' * 60 + ' *' + tarball + '\n'
+        '1111' + '0' * 60 + ' *' + tarball + '.sig\n')
+    if not shutil.which('bash'):
+        return
+    out = subprocess.run(['bash', '-c', cmd], cwd=tmp_path, capture_output=True, text=True).stdout
+    assert out.splitlines() == ['653a' + '0' * 60 + ' *' + tarball]
+    (tmp_path / 'checksums.sha256').write_text('653a' + '0' * 60 + '  ' + tarball + '\n')
+    out = subprocess.run(['bash', '-c', cmd], cwd=tmp_path, capture_output=True, text=True).stdout
+    assert out.strip().endswith(tarball)
