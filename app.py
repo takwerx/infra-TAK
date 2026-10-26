@@ -1325,6 +1325,14 @@ TAKPORTAL_REF_FALLBACK = "1.4.6"   # used only when the releases API is unreacha
 # _fetch_takportal_latest, which returns None offline precisely so the update badge
 # cannot invent an answer from a constant).
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
+# ops #234: Remote Assist is PINNED to a reviewed upstream commit, like TVR_SHA. Upstream
+# deleted and re-created the repo on 2026-10-25 and now publishes snapshots from a private
+# repo straight onto main, so following main put whatever landed there next on every box at
+# its next Update, unreviewed. Deploy and Update check out exactly this commit and verify it
+# (_remote_assist_checkout_pin); moving it is a reviewed, T&E'd bump like any other pin.
+# 05ca341 = "Release v3.1.4" (published from upstream's private source a017dbb).
+REMOTE_ASSIST_SHA = "05ca3410d8b81f4807c637dd0c68ebfcfc70b8d6"
+REMOTE_ASSIST_PIN_VERSION = "3.1.4"   # upstream's VERSION file at REMOTE_ASSIST_SHA
 REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
@@ -1353,12 +1361,16 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # on 0.80.0, and a 0.74.4 → 0.80.0 upgrade with existing users, PAT, setup keys and peers intact.
 # Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.74.4 / v2.90.4; the pin-
 # restore heal converges boxes back on console boot. 0.74.4 was checked to start clean on a
-# 0.80-migrated store (users, PAT, setup keys, peers intact). Upstream latest is 0.81.x; not
-# under trial yet.
+# 0.80-migrated store (users, PAT, setup keys, peers intact).
+# ops #208: 0.81.4 / v2.95.0 UNDER TRIAL on dev (T&E only, not promoted). 0.81.0 changes the
+# login path (strict base64url JWT decoding, single-use OIDC handoff codes for the proxy) and
+# 0.81.4 distrusts the eMudhra CA keys. No config.yaml schema change; the store only gains
+# columns (peer MAC, cert posture, per-target access); the rollback drill checks 0.80.0 still
+# starts clean on a 0.81-migrated store.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"  # == vetted until a newer pair is under trial
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.81.4"  # UNDER TRIAL (ops #208)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.95.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -4714,6 +4726,11 @@ def _gd_alert_bar(settings):
                 'so no email or SMS is being sent. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">'
                 'Review →</a>')
+    elif (has_email or has_sms) and _gd_quiet_state()[0]:
+        # ops #228: held, not paused — it ends by itself and a fault that outlives it is mailed.
+        body = ('⚠ Guard Dog has an active alert — delivery is held while planned work runs '
+                '(T&amp;E, a drill or Update Now). '
+                '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
     elif has_email or has_sms:
         body = ('⚠ Guard Dog has an active alert. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
@@ -16401,6 +16418,50 @@ def _remote_assist_read_version_file(ra_dir):
         return ''
 
 
+def _remote_assist_checkout_pin(ra_dir, plog):
+    """ops #234: bring the Remote Assist clone to REMOTE_ASSIST_SHA, verify it, return it.
+
+    Fetches the pinned commit by SHA (a shallow clone of main does not hold it once upstream
+    moves on; upstream also rewrote history on 2026-10-25, which broke `pull --ff-only`) and
+    `reset --hard`s to it. A failed fetch is only a warning: an offline box that already has
+    the commit still lands on it, and one that does not fails at the reset. Then HEAD must be
+    the pin and no tracked file may differ from it, or nothing gets built.
+
+    A checkout NEWER than the pin (a box that took upstream main before the pin shipped) is
+    refused rather than downgraded: the portal's database may already be migrated past what
+    the pinned release understands. It moves again when the pin is bumped past it."""
+    import subprocess as _sp
+
+    def git(*args, timeout=120):
+        return _sp.run(['git', '-C', ra_dir, *args], capture_output=True, text=True, timeout=timeout)
+
+    pin = REMOTE_ASSIST_SHA
+    head = (git('rev-parse', 'HEAD', timeout=10).stdout or '').strip()
+    have = _remote_assist_read_version_file(ra_dir)
+    if head != pin and have and (_remote_assist_version_tuple(have)
+                                 > _remote_assist_version_tuple(REMOTE_ASSIST_PIN_VERSION)):
+        raise RuntimeError(f'installed v{have} is newer than the reviewed release '
+                           f'v{REMOTE_ASSIST_PIN_VERSION} ({pin[:7]}) — not downgrading. '
+                           'It moves again when infra-TAK pins a newer reviewed release.')
+    git('remote', 'set-url', 'origin', REMOTE_ASSIST_REPO, timeout=10)
+    f = git('fetch', '-q', '--depth=1', 'origin', pin)
+    if f.returncode != 0:
+        plog(f'  ⚠ git fetch {pin[:7]}: {(f.stderr or f.stdout).strip()[:300]}')
+    r = git('reset', '--hard', pin)
+    plog((r.stdout + r.stderr).strip() or '(no output)')
+    if r.returncode != 0:
+        raise RuntimeError(f'could not check out pinned commit {pin[:7]}: {(r.stderr or "").strip()[:300]}')
+    head = (git('rev-parse', 'HEAD', timeout=10).stdout or '').strip()
+    if head != pin:
+        raise RuntimeError(f'clone is at {head[:7] or "?"}, expected pinned commit {pin[:7]}')
+    st = git('status', '--porcelain', '--untracked-files=no', timeout=30)
+    if st.returncode != 0 or st.stdout.strip():
+        raise RuntimeError(f'checkout does not match pinned commit {pin[:7]}: '
+                           f'{(st.stdout or st.stderr).strip()[:300]}')
+    plog(f'✓ Checked out reviewed commit {pin[:7]} (v{REMOTE_ASSIST_PIN_VERSION})')
+    return head
+
+
 def _remote_assist_deploy_log(msg):
     _remote_assist_deploy_status['log'].append(msg)
 
@@ -16995,21 +17056,21 @@ def _run_remote_assist_deploy(settings):
         plog('')
         plog('━━━ Step 3/6: Cloning Repository ━━━')
         if os.path.isdir(os.path.join(ra_dir, '.git')):
-            plog(f'  Repo already at {ra_dir} — pulling latest...')
+            plog(f'  Repo already at {ra_dir}')
             _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
             if _he:
                 plog(f'  ownership self-heal did not complete: {_he}')
             _remote_assist_restore_tracked_files(ra_dir)
-            r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'], capture_output=True, text=True, timeout=120)
-            plog((r.stdout + r.stderr).strip() or '(no output)')
         else:
             os.makedirs(ra_dir, exist_ok=True)
             plog(f'  Cloning {REMOTE_ASSIST_REPO} → {ra_dir}')
-            r = _sp.run(['git', 'clone', '--depth=1', REMOTE_ASSIST_REPO, ra_dir],
+            # --no-checkout: main's tip is not what we run; the pinned commit is checked out next.
+            r = _sp.run(['git', 'clone', '--depth=1', '--no-checkout', REMOTE_ASSIST_REPO, ra_dir],
                         capture_output=True, text=True, timeout=180)
             if r.returncode != 0:
                 raise RuntimeError(f'git clone failed: {r.stderr[:300]}')
             plog('✓ Repository cloned')
+        _remote_assist_checkout_pin(ra_dir, plog)  # ops #234
 
         sha_r = _sp.run(['git', '-C', ra_dir, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
         commit_sha = sha_r.stdout.strip() or 'unknown'
@@ -17081,22 +17142,6 @@ def _run_remote_assist_deploy(settings):
         _remote_assist_deploy_status.update({'running': False, 'error': True})
 
 
-REMOTE_ASSIST_UPSTREAM_CACHE_TTL = 1800  # 30 min — dashboard polls; /api/remote-assist/version bypasses via fresh=True
-
-_remote_assist_upstream_cache = {'version': None, 'sha': None, 'version_ts': 0, 'sha_ts': 0}
-
-
-def _remote_assist_github_repo_path():
-    """cfd2474/EUD_Remote_Assist_Portal from REMOTE_ASSIST_REPO."""
-    import re as _re
-    m = _re.search(r'github\.com[:/]([^/]+/[^/.]+)', REMOTE_ASSIST_REPO or '')
-    return m.group(1) if m else 'cfd2474/EUD_Remote_Assist_Portal'
-
-
-def _remote_assist_github_headers():
-    return {'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'}
-
-
 def _remote_assist_version_tuple(ver):
     """Parse semver-ish tag (v1.3.3) to comparable tuple."""
     import re as _re
@@ -17110,60 +17155,6 @@ def _remote_assist_version_tuple(ver):
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts)
-
-
-def _fetch_remote_assist_upstream(*, fresh=False):
-    """Upstream VERSION + main SHA via GitHub API (contents + git ref — not raw.githubusercontent.com).
-
-    Two lightweight API calls replace the old raw VERSION fetch plus commits/tags list (which
-    burned unauthenticated rate limit and cached stale semver for 4h). Separate TTLs per field;
-    fresh=True bypasses cache (used by /api/remote-assist/version and page load).
-    Returns stale cache on failure rather than None."""
-    import time as _time
-    import base64 as _b64
-    import urllib.request as _ur
-    repo = _remote_assist_github_repo_path()
-    now = _time.time()
-    c = _remote_assist_upstream_cache
-    out = {'version': c.get('version'), 'sha': c.get('sha')}
-
-    need_version = fresh or not c.get('version') or (now - c.get('version_ts', 0) >= REMOTE_ASSIST_UPSTREAM_CACHE_TTL)
-    need_sha = fresh or not c.get('sha') or (now - c.get('sha_ts', 0) >= REMOTE_ASSIST_UPSTREAM_CACHE_TTL)
-    if not need_version and not need_sha:
-        return out
-
-    if need_version:
-        try:
-            req = _ur.Request(
-                f'https://api.github.com/repos/{repo}/contents/VERSION?ref=main',
-                headers=_remote_assist_github_headers())
-            with _ur.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode())
-            raw = (data.get('content') or '').replace('\n', '')
-            ver = (_b64.b64decode(raw).decode().strip().lstrip('vV') or None) if raw else None
-            if ver:
-                c['version'] = ver
-                c['version_ts'] = now
-                out['version'] = ver
-        except Exception as e:
-            print(f"version-info: remote-assist GitHub VERSION fetch failed (non-fatal): {e}", flush=True)
-
-    if need_sha:
-        try:
-            req = _ur.Request(
-                f'https://api.github.com/repos/{repo}/git/ref/heads/main',
-                headers=_remote_assist_github_headers())
-            with _ur.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode())
-            sha = ((data.get('object') or {}).get('sha') or '').strip() or None
-            if sha:
-                c['sha'] = sha
-                c['sha_ts'] = now
-                out['sha'] = sha
-        except Exception as e:
-            print(f"version-info: remote-assist GitHub main ref fetch failed (non-fatal): {e}", flush=True)
-
-    return out
 
 
 def _get_remote_assist_running_version():
@@ -17183,9 +17174,11 @@ def _get_remote_assist_running_version():
 def _get_remote_assist_version_info(*, fresh=False):
     """Return {version, update_available, latest, latest_tag, running, is_current} for EUD Remote Assist.
 
-    Compares local VERSION to upstream main VERSION via GitHub API (per docs/versioning.md).
-    Falls back to git SHA when VERSION is missing on old checkouts. Pass fresh=True to bypass
-    the 30-minute upstream cache (page load + /api/remote-assist/version polling).
+    ops #234: compares the FULL local SHA against the pin REMOTE_ASSIST_SHA, and `latest` is
+    the pinned release. It used to chase upstream main through the GitHub API, which offered
+    every box whatever upstream published next, unreviewed. A checkout newer than the pin is
+    not offered an update (_remote_assist_checkout_pin refuses that downgrade). There is no
+    network call any more; `fresh` is kept for the callers.
     """
     import subprocess as _sp
     info = {'version': '', 'update_available': False, 'latest': None, 'latest_tag': None,
@@ -17213,24 +17206,15 @@ def _get_remote_assist_version_info(*, fresh=False):
     elif settings.get('remote_assist_commit_sha'):
         info['version'] = settings['remote_assist_commit_sha']
 
-    upstream = _fetch_remote_assist_upstream(fresh=fresh)
-    latest_ver = upstream.get('version')
-    latest_full = upstream.get('sha')
-    if latest_ver:
-        info['latest'] = latest_ver
-        info['latest_tag'] = latest_ver
-        if local_ver and _remote_assist_version_tuple(latest_ver) > _remote_assist_version_tuple(local_ver):
-            info['update_available'] = True
-    if not info['update_available'] and latest_full and local_full and local_full != latest_full:
-        info['update_available'] = True
-        if not info['latest']:
-            info['latest'] = latest_full[:7]
-    if not info['update_available']:
-        if local_ver and latest_ver and _remote_assist_version_tuple(local_ver) >= _remote_assist_version_tuple(latest_ver):
-            if not local_full or not latest_full or local_full == latest_full:
-                info['is_current'] = True
-        elif local_full and latest_full and local_full == latest_full:
-            info['is_current'] = True
+    info['latest'] = info['latest_tag'] = REMOTE_ASSIST_PIN_VERSION
+    pin_t = _remote_assist_version_tuple(REMOTE_ASSIST_PIN_VERSION)
+    newer = bool(local_ver) and _remote_assist_version_tuple(local_ver) > pin_t
+    if local_full:
+        info['is_current'] = local_full == REMOTE_ASSIST_SHA
+        info['update_available'] = not info['is_current'] and not newer
+    elif local_ver:
+        info['update_available'] = _remote_assist_version_tuple(local_ver) < pin_t
+        info['is_current'] = _remote_assist_version_tuple(local_ver) == pin_t
     running = _get_remote_assist_running_version()
     if running:
         info['running'] = running
@@ -17250,22 +17234,13 @@ def _run_remote_assist_update():
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     try:
         settings = load_settings()
-        plog('━━━ Step 1/5: Pulling latest source ━━━')
+        plog('━━━ Step 1/5: Checking out the reviewed release ━━━')
         _h, _he = _module_checkout_ownership_selfheal(ra_dir, plog=plog)
         if _he:
             plog(f'  ownership self-heal did not complete: {_he}')
         _remote_assist_restore_tracked_files(ra_dir)
-        # Ensure remote URL is correct (handles repository rename)
-        _sp.run(['git', '-C', ra_dir, 'remote', 'set-url', 'origin', REMOTE_ASSIST_REPO],
-                capture_output=True, text=True, timeout=10)
-        # Explicitly fetch main to handle shallow clones properly
-        _sp.run(['git', '-C', ra_dir, 'fetch', 'origin', 'main', '--depth', '1'],
-                capture_output=True, text=True, timeout=120)
-        r = _sp.run(['git', '-C', ra_dir, 'reset', '--hard', 'origin/main'],
-                    capture_output=True, text=True, timeout=120)
-        plog((r.stdout + r.stderr).strip() or '(no output)')
-        if r.returncode != 0:
-            raise RuntimeError(f'git pull failed: {r.stderr[:300]}')
+        # ops #234: the pinned commit, not upstream main (sets the remote URL too)
+        _remote_assist_checkout_pin(ra_dir, plog)
         _sp.run(['git', '-C', ra_dir, 'fetch', '--tags', '--depth', '1'],
                 capture_output=True, text=True, timeout=60)
 
@@ -17324,8 +17299,6 @@ def _run_remote_assist_update():
         save_settings(s)
         label = f'v{ra_version}' if ra_version else new_sha
         plog(f'✓ EUD Remote Assist updated to {label}')
-        _remote_assist_upstream_cache.update({'version_ts': 0, 'sha_ts': 0})
-        _fetch_remote_assist_upstream(fresh=True)
         _remote_assist_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as exc:
         plog(f'ERROR: {exc}')
@@ -25428,6 +25401,224 @@ def _gd_alerts_pause_state(settings=None):
     return True, until
 
 
+# ── ops #228: quiet window — hold alert delivery while planned work runs ──────
+# 2026-10-25: 25 of the 27 emails the dev fleet's Guard Dog sent in 14 hours were our own
+# work — T&E plugin rounds (a TAK Portal marketplace install recreates CloudTAK, so
+# "CloudTAK repaired automatically"), an Update/rollback drill (Guard Dog restarted CloudTAK
+# and TAK Portal mid-rollback, so two "restarted" alarms), dev deploys. A customer's own
+# Update Now trips the same watchers.
+#
+# Three signals open a window. Each carries its own hard expiry, so a run that dies cannot
+# leave a box muted:
+#   - GD_QUIET_MARKER "<start> <end> <reason>", written by /opt/tak-guarddog/gd-quiet.sh
+#     (T&E, drills, box tests). Root-owned in Guard Dog's state dir, like the Authentik
+#     update marker: anyone who can write it can mute Guard Dog. Ignored once past its end,
+#     and ignored outright if it asks for more than GD_QUIET_MAX_S.
+#   - the Update Now single-flight lock (cleared when post-update finishes; 20-min TTL);
+#   - the Authentik update marker (#167; 30-min cap).
+#
+# HELD is not the operator's pause. The pause mutes on purpose; a window must not hide a
+# real fault. So: (1) send-alert-email.sh exits 3 on a held alert, and the watchers that
+# gate their once-per-episode state on delivery keep the episode open and alert after the
+# window if the fault is still there; (2) every held alert is recorded, and when the window
+# closes the console re-runs Guard Dog's checks, again GD_QUIET_SETTLE_S later, and if a
+# check is still failing sends ONE email naming it and the alerts that were held
+# (_gd_quiet_review_once). A fault the planned work caused and cleared costs nothing; a
+# fault that outlives the window is still reported.
+GD_QUIET_MARKER = '/var/lib/takguard/quiet_window'
+GD_QUIET_MAX_S = 4 * 3600                # gd-quiet.sh MAX_MIN
+_GD_QUIET_UPDATE_LOCK = '/var/lib/takwerx-console/update-now.lock'
+_GD_QUIET_UPDATE_LOCK_TTL_S = 1200       # update_apply() _update_lock_ttl_s
+_GD_QUIET_AK_MARKER = '/var/lib/takguard/authentik_update_in_progress'   # _GD_AUTHENTIK_UPDATE_MARKER
+_GD_QUIET_AK_MAX_S = 1800                # _GD_AUTHENTIK_UPDATE_MAX_S
+GD_QUIET_REVIEW_EVERY_S = 60
+GD_QUIET_SETTLE_S = 600                  # close-out: a check must still be failing this long after
+_gd_quiet_lock = threading.Lock()
+
+
+def _gd_quiet_held_path():
+    return os.path.join(CONFIG_DIR, 'guarddog_quiet_held.json')
+
+
+def _gd_quiet_state(now=None):
+    """Effective quiet window: (active: bool, until_epoch: int, reason: str).
+
+    PURE — reads only, like _gd_alerts_pause_state(). Anything unreadable, unparseable,
+    expired or over-long reports NOT quiet: the failure direction is toward noise."""
+    now = time.time() if now is None else now
+    best = [False, 0, '']
+
+    def _consider(until, reason):
+        if until > now and until > best[1]:
+            best[:] = [True, int(until), reason]
+    try:
+        with open(GD_QUIET_MARKER) as f:
+            parts = f.read(512).split(None, 2)
+        start, end = int(parts[0]), int(parts[1])
+        reason = ' '.join((parts[2] if len(parts) > 2 else '').split())[:120] or 'planned work'
+        if start <= now + 60 and 0 < end - start <= GD_QUIET_MAX_S:
+            _consider(end, reason)
+    except Exception:
+        pass
+    for path, ttl, reason in ((_GD_QUIET_UPDATE_LOCK, _GD_QUIET_UPDATE_LOCK_TTL_S, 'Update Now in progress'),
+                              (_GD_QUIET_AK_MARKER, _GD_QUIET_AK_MAX_S, 'Authentik update in progress')):
+        try:
+            _consider(os.path.getmtime(path) + ttl, reason)
+        except Exception:
+            pass
+    return tuple(best)
+
+
+def _gd_quiet_held_load():
+    try:
+        with open(_gd_quiet_held_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gd_quiet_held_save(d):
+    tmp = None
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.gd-quiet-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(d, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _gd_quiet_held_path())
+    except Exception as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        print(f"[guarddog] quiet window: could not record a held alert ({str(e)[:120]})", flush=True)
+
+
+def _gd_quiet_hold(subject, state=None):
+    """Record one alert held by the quiet window, for the close-out review."""
+    _a, until, reason = state or _gd_quiet_state()
+    print(f"[guarddog] alert HELD — quiet window ({reason}) until "
+          f"{datetime.utcfromtimestamp(until).strftime('%H:%M:%SZ') if until else '?'}: {subject}",
+          flush=True)
+    with _gd_quiet_lock:
+        rec = _gd_quiet_held_load()
+        held = rec.get('held') if isinstance(rec.get('held'), list) else []
+        held.append({'at': int(time.time()), 'subject': str(subject or '')[:200], 'reason': reason})
+        rec['held'] = held[-50:]
+        _gd_quiet_held_save(rec)
+
+
+def _gd_quiet_failing():
+    _guarddog_refresh_page_cache()
+    health = _guarddog_page_cache.get('health') or {}
+    return {k: v for k, v in health.items() if v != 'ok'}
+
+
+def _gd_quiet_review_once(now=None):
+    """Close-out of a quiet window that held alerts. Returns 'open' | 'none' | 'settling' |
+    'clear' | 'sent' | 'not-sent'.
+
+    Re-runs Guard Dog's health checks rather than replaying the held alerts: a replay would
+    re-send exactly the noise the window exists to hold (a restart during a drill is over
+    by now), while a check that is still failing is the fault the window must not hide.
+
+    Two looks, GD_QUIET_SETTLE_S apart. Right after the window closes the box is often
+    still settling — nuc, 2026-10-25: a console restart, then the close-out 60 s later
+    found a check not yet OK and mailed. Update Now ends exactly like that on every box.
+    Only a check that is not OK at the close AND still not OK after the settle is reported;
+    a new fault after the close is not held, so its own watcher reports it as usual."""
+    now = time.time() if now is None else now
+    if _gd_quiet_state(now)[0]:
+        with _gd_quiet_lock:
+            rec = _gd_quiet_held_load()
+            if 'closed_at' in rec:           # reopened while settling: settle after this one
+                rec.pop('closed_at', None)
+                rec.pop('failing', None)
+                _gd_quiet_held_save(rec)
+        return 'open'
+    with _gd_quiet_lock:
+        rec = _gd_quiet_held_load()
+    held = rec.get('held')
+    if not isinstance(held, list) or not held:
+        return 'none'
+    closed_at = rec.get('closed_at')
+    if not isinstance(closed_at, (int, float)):
+        first = _gd_quiet_failing()
+        if first:
+            with _gd_quiet_lock:
+                cur = _gd_quiet_held_load()
+                cur.update({'closed_at': int(now), 'failing': sorted(first)})
+                _gd_quiet_held_save(cur)
+            print(f"[guarddog] quiet window closed with {len(held)} held alert(s); not OK right "
+                  f"now: {', '.join(f'{k}={v}' for k, v in sorted(first.items()))} — checking "
+                  f"again in {GD_QUIET_SETTLE_S // 60} min", flush=True)
+            return 'settling'
+        failing, health = [], {}
+    elif now - closed_at < GD_QUIET_SETTLE_S:
+        return 'settling'
+    else:
+        health = _gd_quiet_failing()
+        failing = sorted(set(health) & set(rec.get('failing') or []))
+    with _gd_quiet_lock:
+        # Drop only what was read above; a hold recorded since (a new window) stays.
+        rest = _gd_quiet_held_load().get('held')
+        rest = rest[len(held):] if isinstance(rest, list) else []
+        _gd_quiet_held_save({'held': rest} if rest else {})
+    if not failing:
+        print(f"[guarddog] quiet window closed: {len(held)} alert(s) held, every Guard Dog "
+              f"check that was not OK at the close is OK now — nothing sent", flush=True)
+        return 'clear'
+    settings = load_settings()
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("[guarddog] quiet window close-out SUPPRESSED (no recipient configured)", flush=True)
+        return 'not-sent'
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    reasons = sorted({str(h.get('reason') or '') for h in held if h.get('reason')})
+    lines = [f"Guard Dog held {len(held)} alert(s) during planned work "
+             f"({'; '.join(reasons) or 'quiet window'}). The window ended "
+             f"{int((now - closed_at) // 60)} min ago and these Guard Dog checks are still "
+             f"not OK:", '']
+    lines += [f"  • {k}: {health.get(k)}" for k in failing]
+    lines += ['', 'Alerts held during the window:']
+    for h in held[-20:]:
+        lines.append(f"  {datetime.utcfromtimestamp(int(h.get('at') or 0)).strftime('%Y-%m-%d %H:%M:%SZ')}"
+                     f"  {h.get('subject') or ''}")
+    if len(held) > 20:
+        lines.append(f"  … and {len(held) - 20} earlier")
+    lines += ['', 'Open the Guard Dog page in the console for details.', '',
+              f"Server: {ident}", f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"]
+    subj = f"Guard Dog: still failing after planned work on {ident}"
+    try:
+        if _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines)):
+            print(f"[guarddog] sent: {subj} ({', '.join(failing)})", flush=True)
+            return 'sent'
+    except Exception as e:
+        print(f"[guarddog] quiet window close-out not sent: {e}", flush=True)
+    return 'not-sent'
+
+
+def _gd_quiet_review_loop():
+    time.sleep(120)
+    while True:
+        try:
+            _gd_quiet_review_once()
+        except Exception as e:
+            try:
+                print(f"[guarddog] quiet window review failed: {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(GD_QUIET_REVIEW_EVERY_S)
+
+
+try:
+    threading.Thread(target=_gd_quiet_review_loop, daemon=True, name='gd-quiet-review').start()
+except Exception:
+    pass
+
+
 def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
     """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint.
 
@@ -25440,6 +25631,10 @@ def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
         if paused:
             print(f"[guarddog] alert email suppressed — notifications paused"
                   f"{' until ' + until if until else ' (indefinite)'}: {subject}", flush=True)
+            return False
+        quiet = _gd_quiet_state()
+        if quiet[0]:
+            _gd_quiet_hold(subject, quiet)   # ops #228: reviewed when the window closes
             return False
     settings = load_settings()
     relay = settings.get('email_relay', {})
@@ -25824,6 +26019,12 @@ def _update_notify_check_once():
         return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
     if settings.get('guarddog_update_email_enabled') is False:
         return {'pending': [], 'emailed': False, 'skipped': 'update emails disabled'}
+    # ops #228: defer — never mark as mailed — while a quiet window is open. Going through
+    # the held send below would record this version as notified and lose it for good.
+    _q_on, _q_until, _q_why = _gd_quiet_state()
+    if _q_on:
+        return {'pending': [], 'emailed': False, 'skipped': f'quiet window ({_q_why})',
+                'quiet_until': _q_until}
     state = _update_notify_state_load()
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
@@ -25924,14 +26125,20 @@ def _startup_retire_updates_timer():
 def _update_notify_loop():
     time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
     while True:
+        wait = UPDATE_NOTIFY_INTERVAL_S
         try:
-            _update_notify_check_once()
+            r = _update_notify_check_once() or {}
+            if r.get('quiet_until'):
+                # ops #228: deferred by a quiet window — look again once it has settled,
+                # not six hours later.
+                wait = min(UPDATE_NOTIFY_INTERVAL_S,
+                           max(60, int(r['quiet_until'] - time.time()) + UPDATE_NOTIFY_FIRST_DELAY_S))
         except Exception as e:
             try:
                 print(f"[update-notify] sweep failed: {e}", flush=True)
             except Exception:
                 pass
-        time.sleep(UPDATE_NOTIFY_INTERVAL_S)
+        time.sleep(wait)
 
 
 # Start the sweep thread once (daemon; idle-cheap — first sweep 15 min after boot).
@@ -26077,7 +26284,14 @@ def guarddog_send_alert_email():
         return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     body = (data.get('body') or '')[:50000]
     try:
+        # ops #228: say HELD (quiet window), not just suppressed. send-alert-email.sh exits
+        # 3 on it, so a watcher that gates its episode on delivery keeps it open and
+        # alerts after the window if the fault is still there.
+        held = _gd_quiet_state()[0] and not _gd_alerts_pause_state()[0]
         sent = _guarddog_send_alert_email_via_relay(to_addr, subject, body)
+        if held and not sent:
+            return jsonify({'success': True, 'suppressed': True, 'held': True,
+                            'reason': 'quiet window'})
         return jsonify({'success': True, 'suppressed': not sent})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -26269,9 +26483,15 @@ def guarddog_notifications_status():
     # a save had silently dropped an invalid address.
     emails = _safe_alert_emails(settings.get('guarddog_alert_email'))
     sms = settings.get('guarddog_sms') or {}
+    q_on, q_until, q_why = _gd_quiet_state()
     return jsonify({
         'paused': paused,
         'until': until if paused else '',
+        # ops #228: a quiet window holds delivery while planned work runs (ends by itself).
+        'quiet': q_on,
+        'quiet_until': (datetime.utcfromtimestamp(q_until).strftime('%Y-%m-%dT%H:%M:%SZ')
+                        if q_on else ''),
+        'quiet_reason': q_why if q_on else '',
         'indefinite': bool(paused and not until),
         'has_email': bool(emails),
         'has_sms': bool(sms.get('provider')),
@@ -26366,6 +26586,12 @@ def _guarddog_send_sms_now(sms, text, force=False):
             print(f"[guarddog] alert SMS suppressed — notifications paused"
                   f"{' until ' + until if until else ' (indefinite)'}", flush=True)
             return {'suppressed': True}
+        # ops #228: the same alert's email records the hold for the close-out review;
+        # recording it again here would list every alert twice.
+        quiet = _gd_quiet_state()
+        if quiet[0]:
+            print(f"[guarddog] alert SMS HELD — quiet window ({quiet[2]})", flush=True)
+            return {'suppressed': True, 'held': True}
     if sms.get('provider') == 'twilio':
         import base64
         import urllib.error
@@ -26577,6 +26803,8 @@ def run_guarddog_deploy(alert_email):
             # branch emits the identical commands); enables container mode here.
             '_gd-tak-lib.sh',
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
+            # ops #228: opens/closes the quiet window for T&E, drills and box tests.
+            'gd-quiet.sh',
             # v10.1.46 (W1/W2): the boot client gate on 8089 and the session
             # visibility watcher. Both are fleet-wide — the gate no-ops on a box
             # with no firewall backend, the watcher no-ops until TAK is up.
@@ -97257,30 +97485,34 @@ def _cloudtak_drift_summary(d):
 
 def _cloudtak_autorepair_wait_reason(ct_dir):
     """Why the stack has not settled yet (so a repair now would fight whoever is changing it),
-    or None. TAK Portal's install is build → up --force-recreate api → wait for the api → image
-    prune, all as separate commands, so: any compose/build process on the box, a console job
-    in flight, or an api container that started less than CLOUDTAK_AUTOREPAIR_SETTLE_S ago."""
+    as (reason, busy), or (None, False). TAK Portal's install is build → up --force-recreate api
+    → wait for the api → image prune, all as separate commands, so: any compose/build process on
+    the box, a console job in flight, or an api container that started less than
+    CLOUDTAK_AUTOREPAIR_SETTLE_S ago. Those are `busy`: someone is working on the stack, and
+    Guard Dog does not run its 30-min clock while they do (ops #230 — TAK Portal's --no-cache
+    build alone took ~20 min on test6). An api that is not running is not busy: nothing is
+    moving, so that wait counts."""
     busy = _console_busy_reason()
     if busy:
-        return f'console busy: {busy}'
+        return f'console busy: {busy}', True
     try:
         ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
         run = [l.strip() for l in (ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_BUSY_RE.search(l)]
     except Exception:
         run = []
     if run:
-        return f'a compose/build run is still going ({run[0][:120]})'
+        return f'a compose/build run is still going ({run[0][:120]})', True
     st = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.Status}} {{.State.StartedAt}}']) or '').split()
     if len(st) < 2 or st[0] != 'running':
-        return f"cloudtak-api-1 is not running ({st[0] if st else 'not found'})"
+        return f"cloudtak-api-1 is not running ({st[0] if st else 'not found'})", False
     try:
         import calendar
         age = time.time() - calendar.timegm(time.strptime(st[1][:19], '%Y-%m-%dT%H:%M:%S'))
     except ValueError:
         age = CLOUDTAK_AUTOREPAIR_SETTLE_S
     if age < CLOUDTAK_AUTOREPAIR_SETTLE_S:
-        return f'cloudtak-api-1 started {int(max(age, 0))}s ago'
-    return None
+        return f'cloudtak-api-1 started {int(max(age, 0))}s ago', True
+    return None, False
 
 
 def _cloudtak_autorepair_record():
@@ -97306,7 +97538,8 @@ def _cloudtak_autorepair_request():
     """Guard Dog saw CloudTAK drift twice in a row. Answer {'state', 'detail'}:
       ok           — no drift from here (it cleared, or was never ours to fix)
       repairing    — a repair is running (just started, or still going)
-      waiting      — not settled yet; ask again next check
+      waiting      — not settled yet; ask again next check ('busy': someone is still working
+                     on the stack, so Guard Dog does not count this wait — ops #230)
       rate_limited — CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR used up: send the alarm
       failed       — the last repair failed, or cannot run here: send the alarm"""
     ct_dir = os.path.expanduser('~/CloudTAK')
@@ -97335,9 +97568,9 @@ def _cloudtak_autorepair_request():
         if len(tries) >= CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR:
             return {'state': 'rate_limited',
                     'detail': f'{len(tries)} automatic repairs in the last hour, so Guard Dog stopped trying'}
-        wait = _cloudtak_autorepair_wait_reason(ct_dir)
+        wait, busy = _cloudtak_autorepair_wait_reason(ct_dir)
         if wait:
-            return {'state': 'waiting', 'detail': wait}
+            return {'state': 'waiting', 'detail': wait, 'busy': busy}
         rec['attempts'] = tries + [now]
         _cloudtak_autorepair_record_save(rec)
         detail = _cloudtak_drift_summary(drift)

@@ -500,6 +500,7 @@ def _sweep(pending, state, unknown_keys=()):
         'load_settings': lambda: {'guarddog_alert_email': 'ops@example.com', 'fqdn': 'tak.example.com',
                                   'console_port': 5001, 'update_channel': 'main'},
         '_safe_alert_email_list': lambda v: v,
+        '_gd_quiet_state': lambda: (False, 0, ''),   # ops #228: no quiet window
         '_guarddog_server_identifier': lambda s: 'tak-prod-1',
         '_update_notify_state_load': lambda: json.loads(json.dumps(state)),
         '_update_notify_state_save': lambda s: saved.append(s),

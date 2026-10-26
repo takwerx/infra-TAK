@@ -111,8 +111,9 @@ EOF
 fi
 
 # ops #197: ask the console to repair. Sets _rep_state (ok|repairing|waiting|rate_limited|
-# failed|unreachable) and _rep_detail. HTTPS first (self-signed, -k), HTTP only when HTTPS
-# got no answer at all — same rule as send-alert-email.sh.
+# failed|unreachable), _rep_detail, and _rep_busy (1 when the console is waiting because
+# someone is still working on the stack — ops #230). HTTPS first (self-signed, -k), HTTP only
+# when HTTPS got no answer at all — same rule as send-alert-email.sh.
 _ct_request_repair() {
   local _o="" _sch
   for _sch in https http; do
@@ -120,10 +121,11 @@ _ct_request_repair() {
       --connect-timeout 5 --max-time 90 2>/dev/null)" && [ -n "$_o" ] && break
     _o=""
   done
-  _rep_state=unreachable; _rep_detail="console did not answer on :${CONSOLE_PORT:-5001}"
+  _rep_state=unreachable; _rep_detail="console did not answer on :${CONSOLE_PORT:-5001}"; _rep_busy=0
   [ -n "$_o" ] || return 0
   _rep_state="$(printf '%s' "$_o" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d.get("state") or "failed").split()[0])' 2>/dev/null || echo failed)"
   _rep_detail="$(printf '%s' "$_o" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(str(d.get("detail") or d.get("error") or "").split())[:300])' 2>/dev/null)"
+  _rep_busy="$(printf '%s' "$_o" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(1 if d.get("busy") is True else 0)' 2>/dev/null || echo 0)"
 }
 
 _hls_ok=na
@@ -152,6 +154,7 @@ _ct_found=""
 if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
   _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
+  _DRIFT_BUSY="$STATE_DIR/cloudtak_media_drift_busy"
   if [ -z "$_ct_found" ] && [ "$_hls_ok" = unknown ]; then
     _log "drift | cloudtak-media HLS profile UNKNOWN — could not read /mediamtx.yml (docker exec rc=$_hls_rc); not counted as missing"
   elif [ -n "$_ct_found" ]; then
@@ -184,14 +187,43 @@ if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
       # changed, or it has already cleared). The alarm goes out when the console says the
       # repair failed or hit its hourly limit, cannot be reached, or the episode has gone
       # 30 min without being fixed.
+      #
+      # ops #230: those 30 min do not include time the console spent waiting because someone
+      # was still working on the stack (busy: a compose/build run, a console job, an api that
+      # just started). On test6 2026-10-25 TAK Portal's --no-cache api build took ~20 min and a
+      # console plugin job ran after it; the clock ran out on that alone and the alarm said
+      # "could not put them back" while the console was simply waiting its turn — it repaired
+      # it minutes later. A slow box, or several plugin installs in a row, did the same. Busy
+      # time is added up in $_DRIFT_BUSY ("<last check> <busy seconds>"), at most 5 min per
+      # check so a watcher that did not run for a while cannot bank the gap. A stuck job still
+      # alarms: the episode's real age is capped at 2 h whatever the console says.
       _ct_request_repair
-      _ct_age=$(( $(date +%s) - $(cat "$_DRIFT_PENDING" 2>/dev/null || date +%s) ))
+      _ct_now=$(date +%s)
+      _ct_start=$(cat "$_DRIFT_PENDING" 2>/dev/null || echo "$_ct_now")
+      _ct_age=$(( _ct_now - _ct_start ))
+      _ct_last=""; _ct_busy=""
+      [ -f "$_DRIFT_BUSY" ] && read -r _ct_last _ct_busy _ < "$_DRIFT_BUSY"
+      case "$_ct_last" in ''|*[!0-9]*) _ct_last=$_ct_start; _ct_busy=0 ;; esac
+      case "$_ct_busy" in ''|*[!0-9]*) _ct_busy=0 ;; esac
+      [ "$_ct_last" -lt "$_ct_start" ] && { _ct_last=$_ct_start; _ct_busy=0; }
+      _ct_step=$(( _ct_now - _ct_last ))
+      [ "$_ct_step" -lt 0 ] && _ct_step=0
+      [ "$_ct_step" -gt 300 ] && _ct_step=300
+      [ "$_rep_state" = waiting ] && [ "$_rep_busy" = 1 ] && _ct_busy=$(( _ct_busy + _ct_step ))
+      echo "$_ct_now $_ct_busy" > "$_DRIFT_BUSY"
+      _ct_clock=$(( _ct_age - _ct_busy ))
       _ct_alarm=1
       case "$_rep_state" in
         repairing|waiting|ok)
-          if [ "$_ct_age" -lt 1800 ]; then
+          if [ "$_ct_clock" -lt 1800 ] && [ "$_ct_age" -lt 7200 ]; then
             _ct_alarm=0
-            _log "drift | auto-repair: $_rep_state — $_rep_detail"
+            if [ "$_ct_busy" -gt 0 ]; then
+              _log "drift | auto-repair: $_rep_state — $_rep_detail ($(( _ct_clock / 60 )) of 30 min used; $(( _ct_busy / 60 )) min busy not counted)"
+            else
+              _log "drift | auto-repair: $_rep_state — $_rep_detail"
+            fi
+          elif [ "$_ct_clock" -lt 1800 ]; then
+            _rep_detail="not fixed after $(( _ct_age / 60 )) min, $(( _ct_busy / 60 )) of them waiting for other work on CloudTAK to finish (console: $_rep_state — $_rep_detail)"
           else
             _rep_detail="not fixed after $(( _ct_age / 60 )) min (console: $_rep_state — $_rep_detail)"
           fi ;;
@@ -253,7 +285,7 @@ is NOT required and will not help.
       _log "drift | CloudTAK settings and HLS profile back before the alert threshold — repaired or self-healed, not reported"
     fi
     [ -f "$_DRIFT_STATE" ] && _log "drift | CloudTAK settings and HLS profile restored"
-    rm -f "$_DRIFT_STATE" "$_DRIFT_PENDING"
+    rm -f "$_DRIFT_STATE" "$_DRIFT_PENDING" "$_DRIFT_BUSY"
   fi
 fi
 
