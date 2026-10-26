@@ -1639,6 +1639,12 @@ def _do_exec(req):
         env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
+        # DEBIAN_FRONTEND does not answer dpkg's conffile prompt: a package whose config
+        # file is already on disk (the console writes /etc/caddy/Caddyfile before Caddy is
+        # installed) died at "end of file on stdin at conffile prompt" and was left iU.
+        # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
+        # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
+        env.setdefault('DPKG_FORCE', 'confdef,confold')
     proc = subprocess.run(argv, input=input_bytes, capture_output=True,
                           timeout=timeout, cwd=cwd, env=env)
     return {

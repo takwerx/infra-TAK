@@ -3052,7 +3052,10 @@ def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
         env = None
     else:
         cmd = _sudo_wrap(['apt-get', 'install', '-y'] + list(pkgs))
-        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+        # DPKG_FORCE: keep an existing conffile instead of dying at dpkg's prompt (the broker
+        # sets the same for non-root boxes, where this env does not reach apt).
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l',
+                   DPKG_FORCE='confdef,confold')
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except Exception as e:
