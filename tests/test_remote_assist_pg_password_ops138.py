@@ -207,7 +207,7 @@ def _body(start, end):
 
 
 def test_deploy_and_update_never_generate_their_own_password():
-    for start, end in (('def _run_remote_assist_deploy(', 'def _remote_assist_github_repo_path('),
+    for start, end in (('def _run_remote_assist_deploy(', 'def _remote_assist_version_tuple('),
                        ('def _run_remote_assist_update(', "@app.route('/api/remote-assist/version')")):
         body = _body(start, end)
         assert 'token_hex' not in body, start

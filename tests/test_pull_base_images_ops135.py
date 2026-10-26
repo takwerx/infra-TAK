@@ -134,7 +134,7 @@ def _body(start, end):
 
 
 SITES = [
-    ('remote assist deploy', 'def _run_remote_assist_deploy(', 'def _remote_assist_github_repo_path(',
+    ('remote assist deploy', 'def _run_remote_assist_deploy(', 'def _remote_assist_version_tuple(',
      '_pull_base_images(ra_dir, plog=plog)',
      "_remote_assist_compose_cmd(ra_dir, 'up', '-d', '--build')"),
     ('remote assist update', 'def _run_remote_assist_update(', "@app.route('/api/remote-assist/version')",

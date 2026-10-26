@@ -176,9 +176,10 @@ def test_remote_assist_deploy_and_update_pin_before_building():
     pin = "_apply_npm_security_overrides(os.path.join(ra_dir, 'server'), plog=plog)"
     dep = _segment('_run_remote_assist_deploy')
     _before(dep, "'git', 'clone'", pin)
+    _before(dep, '_remote_assist_checkout_pin(ra_dir, plog)', pin)
     _before(dep, pin, "'up', '-d', '--build'")
     upd = _segment('_run_remote_assist_update')
-    _before(upd, "'reset', '--hard', 'origin/main'", pin)
+    _before(upd, '_remote_assist_checkout_pin(ra_dir, plog)', pin)
     _before(upd, pin, "'up', '-d', '--build'")
 
 
