@@ -140,3 +140,10 @@ def test_cli_diff_file(tmp_path, capsys):
     assert pick_tests.main(['--diff-file', str(p), '--format', 'json']) == 0
     out = json.loads(capsys.readouterr().out)
     assert [i['id'] for i in out['required']] == ['tier1', 'box', 'install']
+
+
+def test_editing_the_map_or_the_picker_itself_adds_no_tiers():
+    text = (diff('tools/test-tiers.json', added=['"_pkg_install pgbouncer authentik"'])
+            + diff('tools/pick-tests.py', added=['# systemctl retention']))
+    got, _ = ids(text)
+    assert got == ['tier1', 'box']

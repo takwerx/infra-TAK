@@ -6,7 +6,7 @@
     {"id": "box", "label": "Worker box test"}
   ],
   "default_boxes": ["any free dev box"],
-  "ignore_content_paths": ["tests/**", "docs/**", "**/*.md", "static/**", "templates/**"],
+  "ignore_content_paths": ["tests/**", "docs/**", "**/*.md", "static/**", "templates/**", "tools/test-tiers.json", "tools/pick-tests.py"],
   "rules": [
     {
       "id": "install",
