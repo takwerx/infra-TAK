@@ -30937,6 +30937,27 @@ def _module_deployment_settings_key(module_name):
     return f'{module_name}_deployment'
 
 
+_REMOTE_DOCKER_GROUP_SH = (
+    # A non-root SSH user (an Azure/AWS image's azureuser/ubuntu, with sudo) cannot reach the
+    # Docker socket, and every later remote step runs bare `docker`. Join it to the docker group;
+    # each _ssh_probe is a fresh login, so the next step already has it. Root: nothing to do.
+    '[ "$(id -u)" = 0 ] || id -nG | grep -qw docker || '
+    'sudo -n usermod -aG docker "$(id -un)"'
+)
+
+
+def _remote_docker_group(deploy_cfg, plog=None):
+    """Make the remote SSH user able to run docker (no-op for root and local targets).
+    Found by TEST-MATRIX-v10.3.0 row 5: a remote CloudTAK deploy as azureuser died at its
+    first `docker compose` with "permission denied ... docker.sock"."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return True
+    ok, out = _ssh_probe(deploy_cfg.get('remote', {}), _REMOTE_DOCKER_GROUP_SH, timeout=30)
+    if not ok and plog:
+        plog(f"  ⚠ could not add the SSH user to the docker group (docker steps may fail): {(out or '')[-200:]}")
+    return ok
+
+
 def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
     """Run a command locally or remotely based on deployment config.
 
@@ -47247,7 +47268,8 @@ def run_cloudtak_deploy(cfg=None):
                 "fi; "
                 "(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); "
                 "(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true); "
-                "docker --version"
+                + _REMOTE_DOCKER_GROUP_SH + "; "
+                "sudo -n docker --version 2>/dev/null || docker --version"
             )
             ok, out = _ssh_probe(remote_cfg, docker_cmd, timeout=420)
             if not ok:
@@ -50151,6 +50173,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
             return
     ok, dv = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=10)
     plog(f'  {(dv or "").strip()}')
+    _remote_docker_group(deploy_cfg, plog)
 
     # Create directory structure on remote
     plog('━━━ Creating directories (remote) ━━━')
@@ -55127,6 +55150,7 @@ volumes:
         plog(f"  {(out or '').strip()}")
     else:
         plog(f"  {(out or '').strip()}")
+    _remote_docker_group(deploy_cfg, plog)
     plog("✓ Docker available on remote")
 
     plog("")
@@ -58644,6 +58668,7 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
         plog(f"  {(out or '').strip()}")
     else:
         plog(f"  {(out or '').strip()}")
+    _remote_docker_group(deploy_cfg, plog)
     plog("✓ Docker available on remote")
 
     # Ensure Docker log limits on remote (same as local: 50m × 3 so logs don't fill disk)

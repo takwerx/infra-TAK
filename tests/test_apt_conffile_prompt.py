@@ -42,3 +42,14 @@ def test_broker_keeps_existing_conffiles_for_apt_and_only_apt():
 
 def test_broker_still_denies_dpkg_options_on_the_command_line():
     assert "raise Denied(f'{argv[0]}: -o/--setopt option not allowed')" in BROKER
+
+
+# --- remote SSH user can run docker (same row-5 finding class: a test-box shape no fleet box has) ---
+def test_remote_deploys_join_the_ssh_user_to_docker():
+    assert APP.count('_remote_docker_group(deploy_cfg, plog)') == 3     # webodm, nodered, authentik
+    assert '+ _REMOTE_DOCKER_GROUP_SH + "; "' in APP                    # cloudtak step 2
+
+
+def test_docker_group_snippet_is_noop_for_root_and_never_prompts():
+    sh = APP[APP.index('_REMOTE_DOCKER_GROUP_SH = ('):APP.index('\n)\n', APP.index('_REMOTE_DOCKER_GROUP_SH = ('))]
+    assert '[ "$(id -u)" = 0 ] ||' in sh and 'sudo -n usermod -aG docker' in sh
