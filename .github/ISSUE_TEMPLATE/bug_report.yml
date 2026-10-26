@@ -35,11 +35,41 @@ body:
         - ARM64 / aarch64
     validations:
       required: true
+  - type: dropdown
+    id: install_type
+    attributes:
+      label: Install type
+      options:
+        - Single server (TAK Server and console on one host)
+        - Split two-server (TAK Server and console, or database, on different hosts)
+        - Container TAK Server (Docker)
+        - Remote or external database
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: hosting
+    attributes:
+      label: Where it runs
+      options:
+        - Cloud (AWS, Azure, Oracle, other)
+        - On-prem or home lab
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: takserver
+    attributes:
+      label: TAK Server version
+      description: "Optional. The version of the zip, deb or rpm from tak.gov that you installed."
+      placeholder: "e.g. 5.4-RELEASE-xx"
+    validations:
+      required: false
   - type: textarea
     id: what
     attributes:
       label: What happened
-      description: What you expected, and what you got instead.
+      description: What you did, what you expected, and what you got instead. Name the page or module (TAK Server, Authentik, TAK Portal, CloudTAK, Guard Dog...) if you can.
     validations:
       required: true
   - type: textarea
@@ -63,6 +93,12 @@ body:
         Instead, in the console go to **Help → Diagnostics → Run diagnostics**, then either
         **Email report** to **takwerx@gmail.com**, or **Download report** and email the file there.
         Put this issue's number in the subject. It usually answers our first round of questions.
+  - type: checkboxes
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      options:
+        - label: I have emailed (or will email) the diagnostics report with this issue's number in the subject
   - type: textarea
     id: logs
     attributes:

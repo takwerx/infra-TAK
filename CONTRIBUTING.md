@@ -80,6 +80,7 @@ a moving branch, and note the licence in the pull request.
 
 ## Reporting a security issue
 
-Do not open a public issue. Email the maintainers, and give us a reasonable
-window to ship a fix before disclosure. infra-TAK runs CJIS-class deployments —
+Do not open a public issue. Report it privately with **Report a vulnerability** on
+the repository's Security tab (see [SECURITY.md](SECURITY.md)), and give us a
+reasonable window to ship a fix before disclosure. infra-TAK runs CJIS-class deployments —
 responsible disclosure protects real agencies.
