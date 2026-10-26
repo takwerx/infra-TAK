@@ -4,8 +4,10 @@
 # detects sustained degradation, and sends an email alert.
 #
 # Log: /var/lib/takguard/diskio_history.csv  (timestamp,mb_per_sec)
-# Alert: fires when the last-hour average drops below WARN_MBPS or
-#        falls to less than 30% of the 24-hour rolling average.
+# Alert: fires when 4 KB commit latency (1h avg) exceeds WARN_MS_PER_COMMIT, or
+#        when throughput is below WARN_MBPS / under 30% of the 24-hour average —
+#        over the last hour if latency is degraded or unknown, but for EVERY
+#        reading of the last 3 hours if latency is healthy (ops #229).
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 HISTORY="/var/lib/takguard/diskio_history.csv"
@@ -22,6 +24,15 @@ RETENTION_HOURS=744
 # never operator-typed, never max(cur,target). Healthy ≈ 1–3 ms.
 WARN_MS_PER_COMMIT=10
 LAT_OPS=256
+# ops #229: the 10 MB dsync throughput benchmark dips below WARN_MBPS for an hour
+# whenever the box does its own heavy I/O (a CloudTAK --no-cache build, a console
+# deploy, a startup retention DELETE) while commits stay fast. With commit latency
+# healthy, throughput alone alerts only when EVERY one of the last SUSTAIN_SAMPLES
+# readings (3 h at the 15-min timer) is below the floor, all taken in the last
+# SUSTAIN_MAX_AGE_S — a disk that is actually throttled, not a busy hour. Fleet
+# constants, replayed against a month of test6/test8/test12/nuc history.
+SUSTAIN_SAMPLES=12
+SUSTAIN_MAX_AGE_S=14400
 
 mkdir -p /var/lib/takguard
 
@@ -29,7 +40,8 @@ mkdir -p /var/lib/takguard
 RAW=$(dd if=/dev/zero of=/tmp/.gd_diskio_test bs=1M count=$TEST_SIZE_MB oflag=dsync 2>&1)
 rm -f /tmp/.gd_diskio_test
 
-SPEED=$(echo "$RAW" | grep -oP '[\d.]+ [KMGT]?B/s' | tail -1)
+# GNU dd prints rates under 1 MB/s as "kB/s" (lowercase k) — the class must include it.
+SPEED=$(echo "$RAW" | grep -oP '[\d.]+ [kKMGT]?B/s' | tail -1)
 if [ -z "$SPEED" ]; then
   logger -t takguard-diskio "Benchmark failed — dd returned no speed"
   exit 0
@@ -54,7 +66,10 @@ LAT_KB_S=""
 MS_PER_COMMIT=""
 LRAW=$(dd if=/dev/zero of=/tmp/.gd_diskio_lat bs=4k count=$LAT_OPS oflag=dsync 2>&1)
 rm -f /tmp/.gd_diskio_lat
-LAT_SPEED=$(echo "$LRAW" | grep -oP '[\d.]+ [KMGT]?B/s' | tail -1)
+# ops #229: this used to be [KMGT], so every probe slower than ~3.9 ms/commit (under
+# 1 MB/s, which dd prints as "kB/s") was dropped as "probe failed". The series kept
+# only the fast readings and the WARN_MS_PER_COMMIT gate below could never trip.
+LAT_SPEED=$(echo "$LRAW" | grep -oP '[\d.]+ [kKMGT]?B/s' | tail -1)
 if [ -n "$LAT_SPEED" ]; then
   LAT_KB_S=$(echo "$LAT_SPEED" | awk '{
     val = $1
@@ -136,6 +151,15 @@ if [ -f "$LAT_HISTORY" ]; then
     END { if (n > 0) printf "%.2f", sum/n; else print "" }')
 fi
 
+# Best (highest) of the last SUSTAIN_SAMPLES readings, or empty unless there are
+# that many and all are recent (a box that was off must not mix in stale readings).
+# ISO-8601 UTC sorts as text, as in the trim step above.
+SUSTAIN_CUTOFF=$(date -u -d "@$((NOW_EPOCH - SUSTAIN_MAX_AGE_S))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
+                 date -u -r "$((NOW_EPOCH - SUSTAIN_MAX_AGE_S))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
+MAX_SUSTAIN=$(tail -n +2 "$HISTORY" | tail -n "$SUSTAIN_SAMPLES" | awk -F, -v c="$SUSTAIN_CUTOFF" -v want="$SUSTAIN_SAMPLES" '
+  c != "" && $1 >= c { if (n == 0 || $2 + 0 > m) m = $2 + 0; n++ }
+  END { if (n == want) printf "%.1f", m; else print "" }')
+
 logger -t takguard-diskio "Benchmark: ${MB_S} MB/s | 1h avg: ${AVG_1H} MB/s | 24h avg: ${AVG_24H} MB/s (${SAMPLES_24H} samples)"
 if [ -n "$MS_PER_COMMIT" ]; then
   logger -t takguard-diskio "Latency: ${MS_PER_COMMIT} ms/commit (${LAT_KB_S} kB/s 4k) | 1h avg: ${LAT_AVG_1H:-n/a} ms/commit (ceiling ${WARN_MS_PER_COMMIT} ms)"
@@ -148,25 +172,43 @@ fi
 NEED_ALERT=false
 ALERT_REASON=""
 
-if [ "$(echo "$AVG_1H < $WARN_MBPS" | bc -l 2>/dev/null)" = "1" ]; then
-  NEED_ALERT=true
-  ALERT_REASON="Last-hour average (${AVG_1H} MB/s) is below ${WARN_MBPS} MB/s threshold"
+# Latency-ceiling gate — the signal the throughput gates miss. A chronically-slow
+# disk reads fine sequentially while small-block fsync latency — where Postgres
+# commits live — climbs into the seconds. Fleet constant.
+LAT_BAD=false
+if [ -n "$LAT_AVG_1H" ] && [ "$(echo "$LAT_AVG_1H > $WARN_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
+  LAT_BAD=true
 fi
 
-# Use scale>=2 for the division — scale=0 truncates AVG_1H/AVG_24H to 0 whenever it is <1,
-# which incorrectly yields a 100% "drop" and spams alerts on normal noise (~1% swings).
-if [ "$(echo "$AVG_24H > 0" | bc -l 2>/dev/null)" = "1" ]; then
-  DROP_PCT=$(echo "scale=2; (1 - $AVG_1H / $AVG_24H) * 100" | bc -l 2>/dev/null || echo "0")
-  if [ "$(echo "$DROP_PCT >= 70" | bc -l 2>/dev/null)" = "1" ]; then
+# Throughput gates. With commit latency measured and healthy, a low hour is the box's
+# own I/O, not the disk (ops #229): only the best of the last 3 h counts, so every
+# reading must be low. Latency degraded or not measured: the last-hour average, as before.
+if [ -n "$LAT_AVG_1H" ] && ! $LAT_BAD; then
+  TP_VAL="$MAX_SUSTAIN"
+  TP_DESC="Every reading for the last 3 hours (best ${MAX_SUSTAIN} MB/s)"
+else
+  TP_VAL="$AVG_1H"
+  TP_DESC="Last-hour average (${AVG_1H} MB/s)"
+fi
+
+if [ -n "$TP_VAL" ]; then
+  if [ "$(echo "$TP_VAL < $WARN_MBPS" | bc -l 2>/dev/null)" = "1" ]; then
     NEED_ALERT=true
-    ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}Last-hour average dropped ${DROP_PCT}% from 24h average (${AVG_24H} MB/s → ${AVG_1H} MB/s)"
+    ALERT_REASON="${TP_DESC} is below ${WARN_MBPS} MB/s threshold"
+  fi
+
+  # Use scale>=2 for the division — scale=0 truncates TP_VAL/AVG_24H to 0 whenever it is <1,
+  # which incorrectly yields a 100% "drop" and spams alerts on normal noise (~1% swings).
+  if [ "$(echo "$AVG_24H > 0" | bc -l 2>/dev/null)" = "1" ]; then
+    DROP_PCT=$(echo "scale=2; (1 - $TP_VAL / $AVG_24H) * 100" | bc -l 2>/dev/null || echo "0")
+    if [ "$(echo "$DROP_PCT >= 70" | bc -l 2>/dev/null)" = "1" ]; then
+      NEED_ALERT=true
+      ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}${TP_DESC} is ${DROP_PCT}% below the 24h average (${AVG_24H} MB/s)"
+    fi
   fi
 fi
 
-# Latency-ceiling gate — the signal the throughput gates miss. A chronically-slow
-# disk reads fine sequentially (passing both gates above) while small-block fsync
-# latency — where Postgres commits live — climbs into the seconds. Fleet constant.
-if [ -n "$LAT_AVG_1H" ] && [ "$(echo "$LAT_AVG_1H > $WARN_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
+if $LAT_BAD; then
   NEED_ALERT=true
   ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}Disk commit latency (${LAT_AVG_1H} ms/commit 1h avg) exceeds ${WARN_MS_PER_COMMIT} ms ceiling — small-block fsync stall (Postgres commits affected)"
 fi
@@ -192,6 +234,7 @@ $(echo -e "$ALERT_REASON")
 Throughput (1 MB sequential):
   Current reading:   ${MB_S} MB/s
   Last-hour average: ${AVG_1H} MB/s
+  Last 3 h (best):   ${MAX_SUSTAIN:-n/a} MB/s
   24-hour average:   ${AVG_24H} MB/s
 Commit latency (4 KB sync — where Postgres lives):
   Current reading:   ${MS_PER_COMMIT:-n/a} ms/commit
