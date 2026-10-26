@@ -350,10 +350,17 @@ def test_card_ack_phrase_matches_the_backend():
 
 
 @pytest.mark.parametrize('url', [
-    '/api/console/dbserver/status', '/api/console/dbserver/log', '/api/console/dbserver/os-upgrade/start',
+    '/api/console/dbserver/status', '/api/console/dbserver/log',
     "'/api/console/dbserver/'"])
 def test_card_calls_the_dbserver_routes(url):
     assert url in CONSOLE
+
+
+def test_card_starts_the_upgrade_through_the_target_base():
+    # W4.g: start goes through _osupApi() so dbserver and remotehost share it; the dbserver
+    # base is the literal above, the core keeps its own literal start URL.
+    assert "_osupTarget==='dbserver'?'/api/console/dbserver/'" in CONSOLE
+    assert "fetch(_osupTarget==='core'?'/api/console/os-upgrade/start':_osupApi('os-upgrade/start')" in CONSOLE
 
 
 def test_card_sends_the_password_on_reboot_only_by_post():

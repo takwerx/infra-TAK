@@ -84015,11 +84015,12 @@ def console_stack_backup_download_api(label):
     try:
         subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
         subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+        # A multi-GB bundle copy outlives the broker's 600 s default (ops #160): tell it.
         subprocess.run(_sudo_wrap(['cp', '-rp', src, os.path.join(staging, label)]),
-                       capture_output=True, check=True, timeout=1800)
+                       capture_output=True, check=True, timeout=1800, env=_tak58_long_env())
         if os.path.isdir(tak):
             subprocess.run(_sudo_wrap(['cp', '-rp', tak, os.path.join(staging, label, 'takserver-snapshot')]),
-                           capture_output=True, check=True, timeout=1800)
+                           capture_output=True, check=True, timeout=1800, env=_tak58_long_env())
         subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
                        capture_output=True, check=True, timeout=300)
     except Exception as e:
@@ -92501,6 +92502,902 @@ def console_dbserver_log_api():
     return jsonify({'ok': True, 'present': present, 'log': tail})
 
 
+# =============================================================================
+# v10.3.0 W4.g — every OTHER remote module host, from the core console.
+# PLAN-v10.3.0-W4g-remote-hosts-upgrade.md.
+#
+# Federation Hub, CloudTAK, Authentik, MediaMTX, Node-RED, TAK Portal and WebODM can each be
+# deployed onto another machine (`<module>_deployment.target_mode == 'remote'`). W4.e covers
+# the split install's database server; before W4.g every other remote machine stayed on 22.04
+# with no warning and no button. This gives each one Install updates, Reboot and the
+# 22.04 -> 24.04 upgrade, ONE MACHINE at a time: modules that share a machine (CloudTAK +
+# MediaMTX on one VPS) are one entry, upgraded and verified once.
+#
+# Same mechanism as W4.e and deliberately beside it, not a refactor of it — W4.e is
+# live-proven and its probe/verify are about PostgreSQL and TAK reconnecting. Shared: the
+# transport (_ssh_probe / _scp_to_host with the module's stored SSH config, `sudo -n`), the
+# sha256-checked launch of a transient unit under the remote PID 1, the core job's script
+# fragments (landmine handlers L2-L6, UNCHANGED / PARTLY UPGRADED), the apt script of Install
+# updates, and the status-file state machine. What differs is the proof after the reboot:
+# every container that was running, every service that was active and every TCP port that
+# was listening before the job is back — whatever the modules on that machine are.
+#
+# Never the core itself: _ssh_probe runs a localhost target with a local shell, so a "remote"
+# host that resolves to this box is refused before any probe. Never Server One either: that
+# machine has one upgrade owner, the Database server card.
+_RHOST_MODULES = (
+    ('fedhub', 'Federation Hub', 'fedhub_deployment'),
+    ('cloudtak', 'CloudTAK', 'cloudtak_deployment'),
+    ('authentik', 'Authentik', 'authentik_deployment'),
+    ('mediamtx', 'MediaMTX', 'mediamtx_deployment'),
+    ('nodered', 'Node-RED', 'nodered_deployment'),
+    ('takportal', 'TAK Portal', 'takportal_deployment'),
+    ('webodm', 'WebODM', 'webodm_deployment'),
+)
+_RHOST_ACK = 'I have a snapshot of the remote host'
+_RHOST_DIR = os.path.join(CONFIG_DIR, 'remotehost-jobs')
+_RHOST_JOBS = {
+    'os-upgrade': {'unit': 'infratak-os-upgrade', 'script': '/var/lib/infratak-os-upgrade.sh',
+                   'dir': '/var/lib/infratak-os-upgrade', 'log': '/var/log/infratak-os-upgrade.log',
+                   'title': 'remote host OS upgrade Ubuntu 22.04 -> 24.04'},
+    'updates': {'unit': 'infratak-updates', 'script': '/var/lib/infratak-updates.sh',
+                'dir': '/var/lib/infratak-updates', 'log': '/var/log/infratak-updates.log',
+                'title': 'remote host Install updates'},
+}
+_RHOST_OS_STEPS = ('pre-snapshot', 'pin-pg16', 'release-upgrade', 'repos-noble', 'reassert', 'reboot')
+_RHOST_MIN_ROOT_GB = 10           # Docker image re-pulls after the flip — the core's floor
+# Services the after-reboot check compares when they were active before. Absent units read
+# 'inactive' and so never enter the baseline.
+_RHOST_SERVICES = ('docker', 'containerd', 'federation-hub', 'mongod', 'mediamtx',
+                   'mediamtx-webeditor', 'caddy', 'ssh', 'ufw', 'fail2ban', 'unattended-upgrades')
+_RHOST_POLL_S = 30
+_RHOST_REBOOT_WAIT_S = 1800       # no SSH this long after the reboot -> failed:verify:unreachable
+_RHOST_VERIFY_WAIT_S = 600        # once SSH is back, containers/services/ports get this long
+_RHOST_STANDDOWN_PREFIX = '/var/lib/takguard/remotehost-maintenance.'
+_RHOST_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800}
+_RHOST_IRREVERSIBLE = (
+    'This machine goes from Ubuntu 22.04 to Ubuntu 24.04. do-release-upgrade has no rollback; the only way back is the snapshot of this machine you take BEFORE pressing Start.',
+    'Every package on it is replaced and it reboots at the end. Docker containers and their data volumes are kept; Federation Hub\'s package is held so it is not upgraded with the OS.',
+    'Every module on this machine is unavailable while it upgrades and reboots — expect 15-45 minutes. Nothing on the core is restarted.',
+    'Guard Dog stops restarting the modules on this machine while the job runs. That resumes when the job ends, or after 3 hours at the latest.',
+    'A failure after the package phase starts leaves a half-upgraded machine: the status names the step, and the fix is your snapshot, not a retry.',
+)
+_rhost_lock = threading.Lock()
+_rhost_start_lock = threading.Lock()
+_rhost_watch_active = False
+_rhost_log_cache = {}
+
+# The read-only probe, run on the remote host as root by `python3 -I -c`. Built only from the
+# constants substituted below (_rhost_probe_text). Prints ONE line: INFRATAK-PROBE <json>.
+_RHOST_PROBE_PY = r'''
+import json, os, subprocess
+MODE = '@@MODE@@'
+PENDING_PY = @@PENDING_PY@@
+SERVICES = @@SERVICES@@
+JOBS = @@JOBS@@
+out = {'mode': MODE}
+def run(argv, t=30):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=t)
+        return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+    except Exception as e:
+        return 127, '', str(e)[:200]
+def readf(path, limit=4096):
+    try:
+        with open(path, 'rb') as f:
+            return f.read(limit).decode('utf-8', 'replace')
+    except Exception:
+        return None
+osr = {}
+for line in (readf('/etc/os-release') or '').splitlines():
+    if '=' in line:
+        k, v = line.split('=', 1)
+        osr[k] = v.strip().strip('"')
+out['os_id'] = osr.get('ID', '')
+out['os_version'] = osr.get('VERSION_ID', '')
+out['os_pretty'] = osr.get('PRETTY_NAME', '')
+out['arch'] = os.uname().machine
+out['boot_id'] = (readf('/proc/sys/kernel/random/boot_id') or '').strip()
+out['jobs'] = {}
+for name, j in JOBS.items():
+    rc, o, e = run(['systemctl', 'show', '-p', 'LoadState,ActiveState,SubState,Result,MainPID', j['unit'] + '.service'], 10)
+    out['jobs'][name] = {'status': (readf(j['dir'] + '/status') or '').strip(), 'show': o}
+if MODE == 'full':
+    out['services'] = {s: (run(['systemctl', 'is-active', s], 10)[1] or 'unknown') for s in SERVICES}
+    rc, o, e = run(['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.State}}'], 30)
+    out['containers'] = dict(l.split('\t', 1) for l in o.splitlines() if '\t' in l) if rc == 0 else None
+    rc, o, e = run(['ss', '-ltnH'], 15)
+    ports = set()
+    for l in (o.splitlines() if rc == 0 else []):
+        f = l.split()
+        if len(f) >= 4 and ':' in f[3]:
+            p = f[3].rsplit(':', 1)[1]
+            if p.isdigit():
+                ports.add(int(p))
+    out['ports'] = sorted(ports) if rc == 0 else None
+    def free(path):
+        try:
+            st = os.statvfs(path)
+            return st.f_bavail * st.f_frsize
+        except Exception:
+            return None
+    out['root_free'] = free('/')
+    out['boot_free'] = free('/boot') if os.path.isdir('/boot') else out['root_free']
+    # Busy = another package job. This probe's own ancestors are skipped; names are matched
+    # on comm, never on the command line (the probe's own command line has every word).
+    anc, p = set(), os.getpid()
+    while p > 1 and p not in anc:
+        anc.add(p)
+        try:
+            p = int((readf('/proc/%d/stat' % p) or '').rsplit(')', 1)[1].split()[1])
+        except Exception:
+            break
+    busy = set()
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit() or int(pid) in anc:
+            continue
+        comm = (readf('/proc/%s/comm' % pid) or '').strip()
+        cmd = (readf('/proc/%s/cmdline' % pid) or '').replace('\x00', ' ')
+        if (comm in ('apt', 'apt-get', 'dpkg', 'do-release-upgr')
+                or comm.startswith('apt.systemd.dai')
+                or (comm.startswith('unattended-upgr') and 'unattended-upgrade-shutdown' not in cmd)):
+            busy.add(comm)
+    out['busy'] = sorted(busy)
+    rc, o, e = run(['dpkg-query', '-W', '-f=${Version}', 'ubuntu-release-upgrader-core'], 15)
+    out['upgrader'] = o if rc == 0 else ''
+    out['do_release_upgrade'] = os.path.exists('/usr/bin/do-release-upgrade')
+    prompt = ''
+    for line in (readf('/etc/update-manager/release-upgrades') or '').splitlines():
+        if line.strip().lower().startswith('prompt='):
+            prompt = line.strip().split('=', 1)[1].strip().lower()
+    out['prompt'] = prompt
+    rc, o, e = run(['/usr/bin/python3', '-I', '-c', PENDING_PY], 180)
+    try:
+        out['pending'] = [str(n) for n in json.loads(o.splitlines()[-1])] if rc == 0 else None
+    except Exception:
+        out['pending'] = None
+    out['pending_err'] = '' if out['pending'] is not None else (((e or o).splitlines() or ['exit %d' % rc])[-1])[:200]
+    rb = (readf('/var/run/reboot-required.pkgs', 1 << 16) or '').splitlines()
+    out['reboot_pkgs'] = sorted({l for l in rb if l in ('libc6', 'linux-base') or l.startswith('linux-image-')})
+    out['reboot_required'] = os.path.exists('/var/run/reboot-required')
+print('INFRATAK-PROBE ' + json.dumps(out))
+'''
+
+
+def _rhost_probe_text(mode):
+    if mode not in ('full', 'status'):
+        raise ValueError(f'bad probe mode {mode!r}')
+    jobs = {k: {'unit': v['unit'], 'dir': v['dir']} for k, v in _RHOST_JOBS.items()}
+    return (_RHOST_PROBE_PY.replace("'@@MODE@@'", repr(mode))
+            .replace('@@PENDING_PY@@', repr(_OS_UPGRADE_PENDING_PY))
+            .replace('@@SERVICES@@', repr(list(_RHOST_SERVICES)))
+            .replace('@@JOBS@@', repr(jobs)))
+
+
+def _rhost_key(host):
+    """Stable, path- and URL-safe id for a host string. Also the Guard Dog marker suffix:
+    tak-fedhub-watch.sh derives the same name from its host with the same rule."""
+    return re.sub(r'[^a-z0-9.-]', '_', (host or '').strip().lower())
+
+
+def _rhost_module_cfg(settings, mod, key):
+    if mod == 'fedhub':
+        return _get_fedhub_deployment_config(settings)
+    if mod == 'cloudtak':
+        return _get_cloudtak_deployment_config(settings)
+    return _get_module_deployment_config(settings, key)
+
+
+def _rhost_is_this_box(host, settings):
+    h = (host or '').strip().lower()
+    if h in ('', '127.0.0.1', 'localhost', '::1') or h.startswith('127.'):
+        return True
+    for mine in (settings.get('server_ip'), settings.get('fqdn')):
+        if isinstance(mine, str) and mine.strip() and _dbserver_same_host(h, mine):
+            return True
+    return False
+
+
+def _remote_hosts(settings=None):
+    """Every distinct remote machine a deployed module lives on, grouped by machine.
+    [{key, host, aliases, ssh, modules, labels, excluded}] — `excluded` is '' or why this
+    card will not manage it. Config only: no SSH (name resolution for the grouping)."""
+    settings = settings if settings is not None else load_settings()
+    hosts = []
+    for mod, label, key in _RHOST_MODULES:
+        try:
+            cfg = _rhost_module_cfg(settings, mod, key)
+        except Exception:
+            continue
+        r = cfg.get('remote') if isinstance(cfg.get('remote'), dict) else {}
+        host = (r.get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
+            continue
+        entry = next((h for h in hosts if _dbserver_same_host(host, h['host'])), None)
+        if entry is None:
+            entry = {'key': _rhost_key(host), 'host': host, 'aliases': [], 'ssh': dict(r),
+                     'modules': [], 'labels': [], 'excluded': ''}
+            hosts.append(entry)
+        if host not in entry['aliases']:
+            entry['aliases'].append(host)
+        entry['modules'].append(mod)
+        entry['labels'].append(label)
+    tak = _get_tak_deployment_config(settings)
+    s1_host = ((tak.get('server_one') or {}).get('host') or '').strip() if tak.get('mode') == 'two_server' else ''
+    for e in hosts:
+        user = (e['ssh'].get('ssh_user') or 'root').strip() or 'root'
+        e['ssh']['host'], e['ssh']['ssh_user'] = e['host'], user
+        if _rhost_is_this_box(e['host'], settings):
+            e['excluded'] = 'this is the core box itself — the upgrade above covers it'
+        elif s1_host and _dbserver_same_host(e['host'], s1_host):
+            e['excluded'] = 'this machine is also the database server — upgrade it from the Database server card'
+        else:
+            ok, err = _validate_ssh_target(e['host'], user, e['ssh'].get('ssh_port') or 22)
+            if not ok:
+                e['excluded'] = f'the SSH settings for this machine are not usable: {err}'
+    return hosts
+
+
+def _rhost_target(key, settings=None):
+    """(entry, '') or (None, why). `key` is matched against _remote_hosts() only — a URL
+    value never becomes a hostname."""
+    for e in _remote_hosts(settings):
+        if e['key'] == key:
+            return (None, e['excluded']) if e['excluded'] else (e, '')
+    return None, 'no deployed remote module lives on that machine'
+
+
+def _rhost_probe(entry, mode='full', timeout=None):
+    """(data, kind, error). kind: '' on success, else 'ssh' | 'sudo' | 'probe'."""
+    ssh = entry['ssh']
+    cmd = _dbserver_priv(ssh) + '/usr/bin/python3 -I -c ' + shlex.quote(_rhost_probe_text(mode))
+    ok, out = _ssh_probe(ssh, cmd, timeout=timeout or (240 if mode == 'full' else 40))
+    text = out or ''
+    for line in reversed(text.splitlines()):
+        if line.startswith('INFRATAK-PROBE '):
+            try:
+                return json.loads(line[len('INFRATAK-PROBE '):]), '', ''
+            except Exception as e:
+                return None, 'probe', f'the remote host sent an unreadable answer: {str(e)[:100]}'
+    low = text.lower()
+    if 'a password is required' in low or 'not in the sudoers' in low or 'sudo: ' in low:
+        return None, 'sudo', text.strip().splitlines()[-1][:200] if text.strip() else 'sudo refused'
+    if not ok:
+        return None, 'ssh', (text.strip()[-300:] or 'SSH failed')
+    return None, 'probe', 'the remote host answered without a probe result: ' + text.strip()[-200:]
+
+
+def _rhost_remote_busy(d):
+    busy = list(d.get('busy') or [])
+    for name, j in (d.get('jobs') or {}).items():
+        _l, a, _s, _r, _p = _systemctl_show_tuple(j.get('show'))
+        if a in ('active', 'activating'):
+            busy.append('infratak-' + name)
+    return busy
+
+
+def _os_upgrade_remotehost_script():
+    """The remote host's job (W4.g), built from the SAME fragments as the core job: identical
+    landmine handlers L2-L6 and UNCHANGED / PARTLY UPGRADED reporting. No database step —
+    a module host's data lives in Docker volumes / module dirs, which the flip keeps; the
+    snapshot the operator acknowledged is the rollback. Pure function of constants."""
+    q = shlex.quote
+    j = _RHOST_JOBS['os-upgrade']
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK remote module host OS upgrade (Ubuntu 22.04 -> 24.04). Written by the core\'s\n'
+            '# console, run as root in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a RELEASE_UPGRADER_NO_SCREEN=1\n'
+            f'STATE_DIR={q(j["dir"])}\n'
+            'STATUS="$STATE_DIR/status"\n'
+            'PRE="$STATE_DIR/pre"\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        'echo "[$(TS)] === infra-TAK remote host OS upgrade 22.04 -> 24.04 starting (pid $$) ==="\n',
+        _OS_UPGRADE_SH_OS_CHECK,
+        # Federation Hub's package is held like the core holds takserver: an OS flip must never
+        # resume a half-configured TAK package (v0.9.44).
+        f'TAK_PKGS={q(_KERNEL_PATCH_TAK_PKGS)}\n',
+        _OS_UPGRADE_SH_HOLDS,
+        _OS_UPGRADE_SH_SNAPSHOT_HEAD,
+        (
+            'HAD_DOCKER=0; command -v docker >/dev/null 2>&1 && HAD_DOCKER=1\n'
+            '[ "$HAD_DOCKER" = 1 ] && docker ps -a --format "{{.Names}} {{.State}}" > "$PRE/containers.txt" 2>&1\n'
+            'ss -ltnH > "$PRE/listening.txt" 2>&1 || true\n'
+            'ufw status > "$PRE/ufw-status.txt" 2>&1 || true\n'
+        ),
+        _OS_UPGRADE_SH_SNAPSHOT_TAIL,
+        _OS_UPGRADE_SH_FLIP,
+        (
+            # ---- 5. reassert ----------------------------------------------------------
+            'step reassert\n'
+            'if [ "$HAD_DOCKER" = 1 ]; then\n'
+            '  command -v docker >/dev/null 2>&1 || fail reassert "Docker was installed before the upgrade and is gone now — the machine was NOT rebooted; the container list is in $PRE/containers.txt"\n'
+            'fi\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'echo "[$(TS)] reassert complete; the core checks every container, service and port after the reboot"\n'
+            '\n'
+        ),
+        _OS_UPGRADE_SH_REBOOT,
+    ))
+
+
+def _rhost_record_path(key):
+    return os.path.join(_RHOST_DIR, _rhost_key(key) + '.json')
+
+
+def _rhost_record_read(key):
+    try:
+        with open(_rhost_record_path(key)) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rhost_record_write(rec):
+    os.makedirs(_RHOST_DIR, mode=0o700, exist_ok=True)
+    path = _rhost_record_path(rec['key'])
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _rhost_records():
+    try:
+        names = sorted(n for n in os.listdir(_RHOST_DIR) if n.endswith('.json'))
+    except Exception:
+        return []
+    return [r for r in (_rhost_record_read(n[:-5]) for n in names) if r.get('key')]
+
+
+def _rhost_in_flight(rec):
+    return (rec or {}).get('phase') in ('running', 'rebooting', 'verifying')
+
+
+def _rhost_standdown(rec, secs):
+    """Guard Dog stands down on this machine's modules: the console's own picture through
+    the maintenance window, tak-fedhub-watch.sh through a marker per host name it may use
+    (it SSHes to its own host string and restarts federation-hub after 3 failures). Both
+    expire by themselves, so a console that dies mid-job silences them for at most `secs`."""
+    for m in rec.get('modules') or []:
+        _gd_maintenance_begin(m, secs)
+    until = f'{int(time.time()) + secs}\n' if secs > 120 else '0\n'
+    try:
+        _makedirs_priv('/var/lib/takguard', mode=0o755)
+    except Exception:
+        pass
+    for h in rec.get('aliases') or [rec.get('host')]:
+        _write_priv(_RHOST_STANDDOWN_PREFIX + _rhost_key(h), until, perm=0o644)
+
+
+def _rhost_launch(entry, job, script_text):
+    """Copy the job script to the remote host, install it root-owned 0700, prove the installed
+    bytes are the ones rendered here (sha256), then start the transient unit. (ok, error)."""
+    j = _RHOST_JOBS[job]
+    ssh = entry['ssh']
+    sha = hashlib.sha256(script_text.encode('utf-8')).hexdigest()
+    remote_tmp = f'/tmp/infratak-rhjob.{secrets.token_hex(8)}.sh'
+    fd, local = tempfile.mkstemp(prefix='rhjob-', suffix='.sh', dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(script_text)
+        ok, out = _scp_to_host(ssh, local, remote_tmp, timeout=60)
+    finally:
+        try:
+            os.unlink(local)
+        except Exception:
+            pass
+    if not ok:
+        return False, f'could not copy the job script to {entry["host"]}: {(out or "")[:200]}'
+    launch = (
+        'set -e; '
+        f'install -o root -g root -m 0700 {remote_tmp} {j["script"]}; rm -f {remote_tmp}; '
+        f'[ "$(sha256sum {j["script"]} | cut -d" " -f1)" = {sha} ] || {{ echo HASH_MISMATCH; rm -f {j["script"]}; exit 3; }}; '
+        f'systemctl reset-failed {j["unit"]}.service 2>/dev/null || true; '
+        f'mkdir -p -m 0755 {j["dir"]}; echo running:start > {j["dir"]}/status; '
+        f'systemd-run --unit={j["unit"]} --description="infra-TAK {j["title"]} (detached)" '
+        f'--property=StandardOutput=append:{j["log"]} --property=StandardError=append:{j["log"]} '
+        '--setenv=DEBIAN_FRONTEND=noninteractive --setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin '
+        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1 --no-block '
+        f'/bin/bash {j["script"]}; echo LAUNCHED'
+    )
+    ok, out = _ssh_probe(ssh, _dbserver_priv(ssh) + 'bash -c ' + shlex.quote(launch), timeout=60)
+    if 'HASH_MISMATCH' in (out or ''):
+        return False, 'the script installed on the remote host is not the one the console wrote — nothing was started'
+    if not ok or 'LAUNCHED' not in (out or ''):
+        return False, f'could not start the job on {entry["host"]}: {(out or "")[-240:]}'
+    return True, ''
+
+
+def _rhost_baseline(d):
+    return {
+        'boot_id': d.get('boot_id') or '',
+        'os_version': d.get('os_version') or '',
+        'services': sorted(s for s, v in (d.get('services') or {}).items() if v == 'active'),
+        'containers': sorted(n for n, st in (d.get('containers') or {}).items() if st == 'running'),
+        'ports': list(d.get('ports') or []),
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    }
+
+
+def _rhost_other_jobs(key=None):
+    """Upgrade jobs that keep a W4.g start from going ahead: the core's own, W4.e's, and any
+    other remote host's. One machine at a time."""
+    busy = []
+    try:
+        busy += ['core: ' + b for b in _os_upgrade_running_jobs()]
+    except Exception:
+        pass
+    try:
+        rec = _dbserver_record_read()
+        if _dbserver_in_flight(rec):
+            busy.append(f"database server: {rec.get('job')}")
+    except Exception:
+        pass
+    for r in _rhost_records():
+        if _rhost_in_flight(r) and r.get('key') != key:
+            busy.append(f"{r.get('host')}: {r.get('job')}")
+    return busy
+
+
+def _rhost_preflight(key, for_start=False, data=None, settings=None, probe=None):
+    """Every W4.g check (PLAN-v10.3.0-W4g §4.2). Read-only. `probe` is injectable."""
+    checks = []
+
+    def add(name, ok, detail, notice=False):
+        checks.append({'name': name, 'pass': bool(ok), 'detail': detail, 'notice': bool(notice)})
+
+    res = {'ok': False, 'checks': checks, 'irreversible': list(_RHOST_IRREVERSIBLE), 'baseline': {},
+           'key': key, 'host': '', 'modules': [], 'os_version': '', 'os_name': '', 'arch': '',
+           'pending_count': None, 'reboot_required': False, 'from': _OS_UPGRADE_FROM, 'to': _OS_UPGRADE_TO}
+
+    # 1. A deployed module lives there, and this card may manage it.
+    entry, why = _rhost_target(key, settings)
+    if entry is None:
+        add('target', False, why)
+        return res
+    res['host'], res['modules'] = entry['host'], list(entry['labels'])
+    add('target', True, f"{entry['host']} runs {', '.join(entry['labels'])}")
+
+    # 2. SSH + root on the far side.
+    d, kind, err = probe if probe is not None else _rhost_probe(entry, 'full')
+    if d is None:
+        add('ssh_sudo', False, {
+            'sudo': f'SSH as {entry["ssh"]["ssh_user"]} works, but sudo on {entry["host"]} asks for a password — the console needs passwordless sudo there (or root login): {err}',
+            'ssh': f'cannot reach {entry["host"]} over SSH: {err}',
+        }.get(kind, err))
+        return res
+    user = entry['ssh']['ssh_user']
+    add('ssh_sudo', True, f'SSH as {user}' + (' (root login)' if user == 'root' else ' with passwordless sudo'))
+    res['os_version'], res['os_name'], res['arch'] = d.get('os_version') or '', d.get('os_pretty') or '', d.get('arch') or ''
+
+    # 3. Ubuntu 22.04 on x86-64 — read off the machine, never assumed.
+    if d.get('os_id') == 'ubuntu' and d.get('os_version') == '22.04':
+        add('os_type', True, d.get('os_pretty') or 'Ubuntu 22.04')
+    elif d.get('os_id') == 'ubuntu' and d.get('os_version') == '24.04':
+        add('os_type', False, f"{d.get('os_pretty') or 'Ubuntu 24.04'} — already upgraded, nothing to do")
+    else:
+        add('os_type', False, f"{d.get('os_pretty') or d.get('os_id') or 'unknown OS'} — this upgrade is for Ubuntu 22.04 machines only")
+    arch = d.get('arch') or ''
+    add('arch', arch == 'x86_64', 'x86-64' if arch == 'x86_64' else
+        f'{arch or "unknown"} — the 24.04 upgrade is validated on x86-64 only in this release')
+
+    # 4. Disk.
+    rf, bf = d.get('root_free'), d.get('boot_free')
+    if rf is None or bf is None:
+        add('disk', False, f'could not read free space on {entry["host"]}')
+    else:
+        add('disk', rf >= _RHOST_MIN_ROOT_GB * 1024 ** 3 and bf >= _OS_UPGRADE_MIN_BOOT_MB * 1024 ** 2,
+            f'/ {rf / 1024 ** 3:.1f} GB free (need {_RHOST_MIN_ROOT_GB}), /boot {bf / 1024 ** 2:.0f} MB free (need {_OS_UPGRADE_MIN_BOOT_MB})')
+
+    # 5. Nothing else in flight, there or anywhere this console drives.
+    busy = [f'{entry["host"]}: ' + b for b in _rhost_remote_busy(d)] + _rhost_other_jobs(key)
+    add('no_job_running', not busy, 'no package or upgrade job is running' if not busy
+        else 'wait for these to finish: ' + ', '.join(busy))
+
+    # 6. Ubuntu's release upgrader.
+    if not d.get('upgrader') or not d.get('do_release_upgrade'):
+        add('release_upgrader', False, f'ubuntu-release-upgrader-core is not installed on {entry["host"]} — every Ubuntu server image ships it; this machine\'s package set was trimmed')
+    elif d.get('prompt') == 'never':
+        add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt=never — the job sets Prompt=lts first", notice=True)
+    else:
+        add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt={d.get('prompt') or 'lts (default)'}")
+
+    # 7-8. Ubuntu's own two gates.
+    pend = d.get('pending')
+    res['pending_count'] = None if pend is None else len(pend)
+    if pend is None:
+        add('os_up_to_date', False, f"could not ask apt on {entry['host']} which updates are pending: {d.get('pending_err') or 'no answer'}")
+    elif pend:
+        add('os_up_to_date', False, f'{len(pend)} update(s) pending ({", ".join(pend[:6])}'
+            f'{", …" if len(pend) > 6 else ""}) — Ubuntu\'s upgrader refuses until every update is installed. '
+            'Press Install updates below, then Re-check')
+    else:
+        add('os_up_to_date', True, 'every available update is installed')
+    rb = d.get('reboot_pkgs') or []
+    res['reboot_required'] = bool(d.get('reboot_required'))
+    add('no_reboot_pending', not rb, 'no reboot pending' if not rb else
+        'a reboot is pending after updating ' + ', '.join(rb[:4]) + ' — press Reboot below, then Re-check')
+
+    # 9. Baseline for the after-reboot check.
+    bl = _rhost_baseline(d)
+    res['baseline'] = bl
+    add('baseline', True, f"{len(bl['containers'])} running container(s), {len(bl['ports'])} listening port(s), "
+        f"services: {', '.join(bl['services']) or 'none'}")
+
+    # 10. Typed acknowledgment — start only.
+    if for_start:
+        ack = ((data or {}).get('acknowledge') or '').strip()
+        add('acknowledge', ack == _RHOST_ACK, 'snapshot acknowledged' if ack == _RHOST_ACK
+            else f'type exactly "{_RHOST_ACK}" to confirm a snapshot of {entry["host"]} exists')
+    res['ok'] = all(c['pass'] for c in checks)
+    return res
+
+
+def _rhost_compare(baseline, d, full):
+    """Problems: the after-job state against the baseline."""
+    if d is None:
+        return ['unreachable']
+    problems = []
+    if full and not (d.get('os_id') == 'ubuntu' and d.get('os_version') == '24.04'):
+        problems.append(f"os-release={d.get('os_pretty') or d.get('os_version') or 'unknown'}")
+    svc = d.get('services') or {}
+    down = [s for s in baseline.get('services') or [] if svc.get(s) != 'active']
+    if down:
+        problems.append('services=' + ','.join(down))
+    ct = d.get('containers') or {}
+    gone = [c for c in baseline.get('containers') or [] if ct.get(c) != 'running']
+    if gone:
+        problems.append('containers=' + ','.join(gone))
+    if d.get('ports') is not None:
+        now_ports = set(d.get('ports') or [])
+        closed = [str(p) for p in baseline.get('ports') or [] if p not in now_ports]
+        if closed:
+            problems.append('ports=' + ','.join(closed))
+    return problems
+
+
+def _rhost_verify(entry, rec, probe_fn=None, sleep=time.sleep, now=time.time):
+    """Poll until the machine is back as it was, or _RHOST_VERIFY_WAIT_S passes. Nothing is
+    restarted by the core — a container that did not come back is a finding."""
+    probe_fn = probe_fn or _rhost_probe
+    full = rec.get('job') == 'os-upgrade'
+    deadline = now() + _RHOST_VERIFY_WAIT_S
+    while True:
+        d, _k, _e = probe_fn(entry, 'full')
+        problems = _rhost_compare(rec.get('baseline') or {}, d, full)
+        if d is not None:
+            rec['os_version'] = d.get('os_version') or rec.get('os_version') or ''
+        if not problems or now() >= deadline:
+            return problems
+        sleep(20)
+
+
+def _rhost_finish(rec, phase, step='', detail='', entry=None):
+    rec.update({'phase': phase, 'step': step, 'detail': detail, 'finished': time.time()})
+    _rhost_record_write(rec)
+    try:
+        _rhost_standdown(rec, 120)
+    except Exception as e:
+        print(f'[remotehost] could not clear the Guard Dog stand-down for {rec.get("host")}: {e}', flush=True)
+    job = rec.get('job') or 'job'
+    if entry is not None and job == 'os-upgrade':
+        mark = 'done' if phase == 'done' else ('failed:verify:' + (detail or '?') if step == 'verify' else '')
+        if mark:
+            j = _RHOST_JOBS['os-upgrade']
+            _ssh_probe(entry['ssh'], _dbserver_priv(entry['ssh']) + 'bash -c ' + shlex.quote(f'echo {shlex.quote(mark)} > {j["dir"]}/status'), timeout=20)
+    msg = f"[remotehost] {job} on {rec.get('host')}: {phase}" + (f' at {step}' if step else '') + (f' — {detail}' if detail else '')
+    print(('✓ ' if phase == 'done' else '✗ ') + msg, flush=True)
+    try:
+        audit(f'remotehost-{job}:{phase}', f"host={rec.get('host')} step={step} {detail}".strip())
+    except Exception:
+        pass
+    return rec
+
+
+def _rhost_tick(rec, entry, probe_fn=None, sleep=time.sleep, now=time.time):
+    """One watcher pass for one machine. Pure over its injectables."""
+    probe_fn = probe_fn or _rhost_probe
+    job, t = rec.get('job'), now()
+    d, _kind, err = probe_fn(entry, 'status')
+    if d is None:
+        rec['unreachable_since'] = rec.get('unreachable_since') or t
+        rec['last_error'] = (err or '')[:200]
+        since = rec.get('reboot_at') or rec['unreachable_since']
+        if job == 'reboot' or rec.get('phase') == 'rebooting':
+            if t - since > _RHOST_REBOOT_WAIT_S:
+                return _rhost_finish(rec, 'failed', 'verify', f'unreachable: no SSH for {_RHOST_REBOOT_WAIT_S // 60} min after the reboot', entry)
+        elif t - rec['unreachable_since'] > _RHOST_STANDDOWN_S.get(job, 3600):
+            return _rhost_finish(rec, 'failed', rec.get('step') or 'start', f'unreachable over SSH for {int((t - rec["unreachable_since"]) // 60)} min while the job ran — read its log on the machine', entry)
+        _rhost_record_write(rec)
+        return rec
+    rec['unreachable_since'] = 0
+    rec['last_seen'] = t
+    rebooted = bool(d.get('boot_id')) and d.get('boot_id') != rec.get('boot_id')
+    if job in ('os-upgrade', 'reboot') and rebooted:
+        rec.update({'phase': 'verifying', 'step': 'verify'})
+        _rhost_record_write(rec)
+        problems = _rhost_verify(entry, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+        if problems:
+            return _rhost_finish(rec, 'failed', 'verify', ' '.join(problems), entry)
+        return _rhost_finish(rec, 'done', '', '', entry)
+    if job == 'reboot':
+        if t - (rec.get('started') or t) > _RHOST_REBOOT_WAIT_S:
+            return _rhost_finish(rec, 'failed', 'reboot', 'the machine did not reboot (same boot id)', entry)
+        rec['phase'] = 'rebooting'
+        _rhost_record_write(rec)
+        return rec
+    jd = (d.get('jobs') or {}).get(job) or {}
+    raw = (jd.get('status') or '').strip()
+    unit = _systemctl_show_tuple(jd.get('show'))
+    if job == 'updates':
+        if raw.startswith('done'):
+            rec['reboot_required'] = raw == 'done:reboot-required'
+            rec.update({'phase': 'verifying', 'step': 'verify'})
+            _rhost_record_write(rec)
+            problems = _rhost_verify(entry, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+            if problems:
+                return _rhost_finish(rec, 'failed', 'verify', ' '.join(problems), entry)
+            return _rhost_finish(rec, 'done', '', 'a reboot is required' if rec['reboot_required'] else '', entry)
+        if raw.startswith('failed'):
+            return _rhost_finish(rec, 'failed', 'updates', 'apt reported a failure — the log says why', entry)
+        if raw.startswith('running') and unit[1] not in ('active', 'activating'):
+            return _rhost_finish(rec, 'failed', 'updates', f"the updates job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", entry)
+        rec.update({'phase': 'running', 'step': 'updates'})
+        _rhost_record_write(rec)
+        return rec
+    st = _os_upgrade_job_state(raw=raw, unit=unit)
+    if st['state'] == 'failed':
+        return _rhost_finish(rec, 'failed', st['step'] or 'start', st['detail'], entry)
+    if st['state'] == 'rebooting':
+        rec['reboot_at'] = rec.get('reboot_at') or t
+        rec.update({'phase': 'rebooting', 'step': 'reboot'})
+    else:
+        rec.update({'phase': 'running', 'step': st['step'] or 'start'})
+    _rhost_record_write(rec)
+    return rec
+
+
+def _rhost_watch():
+    global _rhost_watch_active
+    try:
+        while True:
+            live = [r for r in _rhost_records() if _rhost_in_flight(r)]
+            if not live:
+                return
+            for rec in live:
+                entry, why = _rhost_target(rec['key'])
+                if entry is None:
+                    _rhost_finish(rec, 'failed', rec.get('step') or 'start', f'the machine is no longer managed here: {why}')
+                    continue
+                try:
+                    _rhost_tick(rec, entry)
+                except Exception as e:
+                    print(f'[remotehost] watcher pass error on {rec.get("host")} (retrying): {e}', flush=True)
+            time.sleep(_RHOST_POLL_S)
+    finally:
+        with _rhost_lock:
+            _rhost_watch_active = False
+
+
+def _rhost_watch_start():
+    global _rhost_watch_active
+    with _rhost_lock:
+        if _rhost_watch_active:
+            return False
+        _rhost_watch_active = True
+    threading.Thread(target=_rhost_watch, daemon=True, name='remotehost-watch').start()
+    return True
+
+
+def _startup_rhost_watch():
+    """A console that restarts mid-job picks the watch back up and re-opens the console-side
+    Guard Dog window for whatever is left of the job."""
+    live = [r for r in _rhost_records() if _rhost_in_flight(r)]
+    if not live:
+        return False
+    for rec in live:
+        left = int((rec.get('started') or 0) + _RHOST_STANDDOWN_S.get(rec.get('job'), 3600) - time.time())
+        for m in rec.get('modules') or []:
+            if left > 0:
+                _gd_maintenance_begin(m, left)
+    return _rhost_watch_start()
+
+
+def _rhost_begin(job, entry, baseline, launch):
+    """Shared start path: stand Guard Dog down, write the record, launch, start watching.
+    The record is written BEFORE the launch, so a console that dies in between still knows."""
+    rec = {'key': entry['key'], 'host': entry['host'], 'aliases': list(entry['aliases']),
+           'modules': list(entry['modules']), 'labels': list(entry['labels']),
+           'job': job, 'started': time.time(), 'boot_id': baseline.get('boot_id') or '',
+           'os_version': baseline.get('os_version') or '',
+           'phase': 'rebooting' if job == 'reboot' else 'running', 'step': 'start', 'detail': '',
+           'baseline': baseline, 'finished': 0, 'reboot_required': False}
+    try:
+        _rhost_standdown(rec, _RHOST_STANDDOWN_S[job])
+    except Exception as e:
+        return 500, {'ok': False, 'error': f'could not pause Guard Dog for {entry["host"]}: {str(e)[:160]} — nothing was started'}
+    _rhost_record_write(rec)
+    ok, err = launch()
+    if not ok:
+        _rhost_finish(rec, 'failed', 'start', err)
+        return 500, {'ok': False, 'error': err}
+    try:
+        remote = request.remote_addr
+    except Exception:
+        remote = '?'
+    print(f"[remotehost] {job} STARTED on {entry['host']} ({', '.join(entry['labels'])}) by console remote={remote}", flush=True)
+    try:
+        audit(f'remotehost-{job}:start', f"host={entry['host']} modules={','.join(entry['modules'])}")
+    except Exception:
+        pass
+    _rhost_watch_start()
+    return 200, {'ok': True, 'message': f"{job} started on {entry['host']}"}
+
+
+def _rhost_start(key, job, data=None):
+    """(http_status, payload). One start at a time, one machine at a time."""
+    if not _rhost_start_lock.acquire(blocking=False):
+        return 409, {'ok': False, 'error': 'a remote host job is already being started'}
+    try:
+        busy = _rhost_other_jobs(key)
+        if _rhost_in_flight(_rhost_record_read(key)):
+            busy.append('this machine: ' + (_rhost_record_read(key).get('job') or 'job'))
+        if busy:
+            return 409, {'ok': False, 'error': 'wait for these to finish: ' + ', '.join(busy)}
+        return _rhost_start_locked(key, job, data)
+    finally:
+        _rhost_start_lock.release()
+
+
+def _rhost_start_locked(key, job, data):
+    entry, why = _rhost_target(key)
+    if entry is None:
+        return 409, {'ok': False, 'error': why}
+    if job == 'os-upgrade':
+        pf = _rhost_preflight(key, for_start=True, data=data)
+        if not pf['ok']:
+            failed = [c['name'] for c in pf['checks'] if not c['pass']]
+            return 409, {'ok': False, 'error': 'preflight failed: ' + ', '.join(failed), 'preflight': pf}
+        script = _os_upgrade_remotehost_script()
+        return _rhost_begin(job, entry, pf['baseline'], lambda: _rhost_launch(entry, job, script))
+    d, kind, err = _rhost_probe(entry, 'full')
+    if d is None:
+        return 409, {'ok': False, 'error': f'cannot reach {entry["host"]} ({kind}): {err}'}
+    if d.get('os_id') != 'ubuntu':
+        return 409, {'ok': False, 'error': f"{d.get('os_pretty') or 'this OS'} — Install updates / Reboot from here are for Ubuntu machines"}
+    busy = _rhost_remote_busy(d)
+    if busy:
+        return 409, {'ok': False, 'error': f'wait for these to finish on {entry["host"]}: ' + ', '.join(busy)}
+    baseline = _rhost_baseline(d)
+    if job == 'updates':
+        script = _kernel_patch_apt_script(_KERNEL_PATCH_TAK_PKGS, _RHOST_JOBS['updates']['dir'] + '/status')
+        return _rhost_begin(job, entry, baseline, lambda: _rhost_launch(entry, job, script))
+    if job == 'reboot':
+        def _reboot():
+            ok, out = _ssh_probe(entry['ssh'], _dbserver_priv(entry['ssh']) + 'systemctl reboot', timeout=20)
+            low = (out or '').lower()
+            if not ok and ('password' in low or 'not allowed' in low or 'permission denied' in low):
+                return False, f'{entry["host"]} refused the reboot: {(out or "")[-200:]}'
+            return True, ''
+        return _rhost_begin(job, entry, baseline, _reboot)
+    return 400, {'ok': False, 'error': f'unknown job {job!r}'}
+
+
+def _rhost_status(rec):
+    job = rec.get('job') or ''
+    phase = rec.get('phase') or 'idle'
+    return {'job': job, 'state': phase, 'step': rec.get('step') or '', 'detail': rec.get('detail') or '',
+            'started': rec.get('started') or 0, 'finished': rec.get('finished') or 0,
+            'reboot_required': bool(rec.get('reboot_required')), 'running': _rhost_in_flight(rec),
+            'os_version': rec.get('os_version') or '',
+            'steps': list(_RHOST_OS_STEPS) if job == 'os-upgrade' else [],
+            'raw': f"{rec.get('key')}:{job}:{phase}:{int(rec.get('started') or 0)}" if job else ''}
+
+
+def _rhost_list_payload(settings=None):
+    """What the Remote hosts card renders on load — config and the core's own records, no SSH."""
+    hosts = []
+    for e in _remote_hosts(settings):
+        rec = _rhost_record_read(e['key'])
+        hosts.append({'key': e['key'], 'host': e['host'], 'modules': e['labels'],
+                      'excluded': e['excluded'], **_rhost_status(rec)})
+    running = next((h for h in hosts if h['running']), None)
+    return {'ok': True, 'hosts': hosts, 'running_key': running['key'] if running else ''}
+
+
+def _rhost_log_tail(entry, job, limit=12000):
+    j = _RHOST_JOBS.get(job)
+    if j is None:
+        return False, ''
+    ck = (entry['key'], job)
+    hit = _rhost_log_cache.get(ck)
+    if hit and time.time() - hit[0] < 5:
+        return hit[1], hit[2]
+    ok, out = _ssh_probe(entry['ssh'], _dbserver_priv(entry['ssh']) + f'tail -c {int(limit)} {j["log"]}', timeout=20)
+    val = (time.time(), bool(ok), (out or '') if ok else '')
+    _rhost_log_cache[ck] = val
+    return val[1], val[2]
+
+
+@app.route('/api/console/remotehosts')
+@login_required
+def console_remotehosts_api():
+    """Every machine a deployed remote module lives on, with the core's record of its last job."""
+    try:
+        return jsonify(_rhost_list_payload())
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'could not list remote hosts: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/console/remotehosts/<key>/preflight')
+@login_required
+def console_remotehost_preflight_api(key):
+    try:
+        return jsonify(_rhost_preflight(key))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'preflight error: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/console/remotehosts/<key>/os-upgrade/start', methods=['POST'])
+@login_required
+def console_remotehost_os_upgrade_start_api(key):
+    """One-way and destructive: console password AND the typed snapshot acknowledgment AND an
+    all-green preflight re-run right now — the same bar as the core's and W4.e's upgrade."""
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    try:
+        code, payload = _rhost_start(key, 'os-upgrade', data)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/remotehosts/<key>/updates', methods=['POST'])
+@login_required
+def console_remotehost_updates_api(key):
+    """Install updates on the remote host — same gate as the core's and W4.e's Install updates."""
+    try:
+        code, payload = _rhost_start(key, 'updates')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/remotehosts/<key>/reboot', methods=['POST'])
+@login_required
+def console_remotehost_reboot_api(key):
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password({'password': data.get('admin_password') or data.get('password') or ''})
+    if denied:
+        return denied
+    try:
+        code, payload = _rhost_start(key, 'reboot')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'reboot error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/remotehosts/<key>/log')
+@login_required
+def console_remotehost_log_api(key):
+    entry, _why = _rhost_target(key)
+    if entry is None:
+        return jsonify({'ok': True, 'present': False, 'log': ''})
+    job = (request.args.get('job') or _rhost_record_read(key).get('job') or '').strip()
+    if job not in _RHOST_JOBS:
+        return jsonify({'ok': True, 'present': False, 'log': ''})
+    present, tail = _rhost_log_tail(entry, job)
+    return jsonify({'ok': True, 'present': present, 'log': tail})
+
+
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
@@ -100400,6 +101297,13 @@ def _startup_migrations():
                 print("Startup migration: database server job watch resumed", flush=True)
         except Exception as _dw_err:
             print(f"Startup migration: database server watch start error (non-fatal): {_dw_err}")
+
+        # v10.3.0 W4.g: same for a remote module host's job (remotehost-jobs/*.json).
+        try:
+            if _startup_rhost_watch():
+                print("Startup migration: remote host job watch resumed", flush=True)
+        except Exception as _rw_err:
+            print(f"Startup migration: remote host watch start error (non-fatal): {_rw_err}")
 
         # ops #201: the CoTURN pin and peer restrictions reach a box only through its
         # override file, which only Install wrote. Converge it on every start. Threaded:
