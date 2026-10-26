@@ -75,3 +75,13 @@ def test_remote_mediamtx_checksum_grep_matches_upstream_binary_mode_lines(tmp_pa
     (tmp_path / 'checksums.sha256').write_text('653a' + '0' * 60 + '  ' + tarball + '\n')
     out = subprocess.run(['bash', '-c', cmd], cwd=tmp_path, capture_output=True, text=True).stdout
     assert out.strip().endswith(tarball)
+
+
+# --- remote MediaMTX runs as takwerx: it must be able to read its TLS cert/key (row 5) ---
+def test_remote_mediamtx_cert_and_key_are_readable_by_the_service_user_only():
+    perms = APP[APP.index('_MEDIAMTX_REMOTE_CERT_PERMS = ('):APP.index('\n)\n', APP.index('_MEDIAMTX_REMOTE_CERT_PERMS = ('))]
+    assert 'chown root:takwerx' in perms and 'chmod 640' in perms
+    body = APP[APP.index('def _run_mediamtx_deploy_remote('):]
+    body = body[:body.index('\ndef ')]
+    assert body.count('_MEDIAMTX_REMOTE_CERT_PERMS') == 2          # deploy + renewal sync script
+    assert "chmod 600 /etc/mediamtx/certs/stream.key" not in body

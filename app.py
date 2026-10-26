@@ -41130,6 +41130,13 @@ def _mediamtx_grant_config_dir_write(plog=None):
         return False
 
 
+# The remote MediaMTX unit runs as takwerx: it must read the cert AND key; nobody else may.
+_MEDIAMTX_REMOTE_CERT_PERMS = (
+    'chown root:takwerx /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key && '
+    'chmod 640 /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key'
+)
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -41561,7 +41568,9 @@ paths:
             finally:
                 shutil.rmtree(_stage_dir, ignore_errors=True)
             if ok_cert and ok_key:
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && chmod 600 /etc/mediamtx/certs/stream.key', timeout=10)
+                # The unit runs User=takwerx: root:root 0600 made MediaMTX crash-loop on
+                # "open /etc/mediamtx/certs/stream.crt: permission denied" (TEST-MATRIX row 5).
+                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
                 remote_key  = '/etc/mediamtx/certs/stream.key'
                 yml_cmd = (
@@ -41609,7 +41618,7 @@ paths:
                     f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
                     f"\"$KEY\" \"$REMOTE:/etc/mediamtx/certs/stream.key\" 2>/dev/null\n"
                     f"ssh -p $PORT $KEY_FLAG -o BatchMode=yes \"$REMOTE\" "
-                    f"'chmod 600 /etc/mediamtx/certs/stream.key && systemctl restart mediamtx' 2>/dev/null\n"
+                    f"{_sq(_MEDIAMTX_REMOTE_CERT_PERMS + ' && systemctl restart mediamtx')} 2>/dev/null\n"
                 )
                 sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
                 _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
