@@ -38,6 +38,61 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 :root{--bg-deep:var(--bg-primary);--bg-surface:var(--bg-primary);--yellow:#f59e0b}
+/* v10.3.0 W8 — the ONE breakpoint (GH #63). Below 900px the sidebar goes off-canvas and is
+   opened by the .nav-toggle hamburger that render_sidebar() emits; .main takes the whole
+   width and leaves room under the fixed toggle. `body .main`/`body .header` win over the
+   per-page `.main{padding:32px}` that follows in page_css by specificity, not !important.
+   Desktop (>=901px) is untouched. W8b: body becomes a COLUMN here so the top banners
+   (custom banner + notice bars, in-flow below the breakpoint by their own media rules)
+   stack above .main and scroll away; the top bar is sticky so it stays. --chrome-top is
+   the bar's bottom edge, measured by render_sidebar()'s JS when the menu opens. */
+/* v10.3.0 W11 — opt-in responsive utilities for the page passes (W9/W10). Shared, structural,
+   no !important: .grid-2/.grid-3 collapse to one column, .metrics-bar to two, .status-banner
+   and .btn-row wrap, .table-wrap scrolls sideways instead of widening the page. The four pages
+   that already declared an identical .grid-2 keep working and gain the collapse for free. */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.grid-auto{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.mobile-bar{display:none}
+.nav-scrim{display:none}
+@media (max-width: 900px){
+body .grid-2,body .grid-3{grid-template-columns:1fr}
+body .metrics-bar{grid-template-columns:repeat(2,1fr)}
+body .status-banner{flex-wrap:wrap;gap:12px}
+body .stack-sm{display:flex;flex-direction:column;align-items:stretch}
+/* W8c — the phone guard for EVERY page, retrofitted or not (operator on /takportal, dev4:
+   "I can scroll the entire page left"). The templates carry ~3,000 inline styles, so the
+   shared sheet reaches them by attribute: inline flex rows wrap, inline fixed grids go to
+   one column, media/tables/inputs cannot exceed the width, and .main clips anything that
+   still refuses instead of panning. Per-page passes (W9/W10) make things fit nicely;
+   this makes sure nothing is ever wider than the phone. */
+body .main{overflow-x:hidden}
+body .main [style*="display:flex"],body .main [style*="display: flex"]{flex-wrap:wrap}
+body .main [style*="grid-template-columns"]{grid-template-columns:1fr!important} /* the ONE !important here: an inline
+   grid-template-columns can only be beaten by it (flex-wrap above works without, nothing inline declares it) */
+body .main img,body .main video,body .main canvas,body .main svg,body .main iframe{max-width:100%;height:auto}
+body .main table{display:block;overflow-x:auto;max-width:100%}
+body .main .table-wrap table{display:table}
+body .main pre{white-space:pre-wrap;overflow-wrap:anywhere}
+body .main input,body .main select,body .main textarea{max-width:100%}
+body .main .cert-btn,body .main .control-btn,body .main .btn{white-space:normal}
+/* a SOLID top bar, not a floating button: content scrolls cleanly under an opaque strip
+   (operator 2026-10-12: a fixed button over scrolling content "looks like it is hiding
+   something"). Sidebar and scrim start below the bar so the toggle stays reachable. */
+html body{flex-direction:column}  /* html+body: most page_css blocks re-declare body{flex-direction:row} after this sheet */
+.mobile-bar{display:flex;align-items:center;gap:12px;position:sticky;top:0;flex-shrink:0;height:54px;z-index:101;padding:0 10px;background:var(--bg-surface);border-bottom:1px solid var(--border)}
+.mobile-bar-title{font-size:14px;font-weight:700;letter-spacing:.04em;color:var(--text-primary)}
+.mobile-bar-title small{font-size:10px;font-weight:400;color:var(--text-dim);margin-left:8px}
+.nav-toggle{display:flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;border-radius:10px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);font-size:22px;line-height:1;cursor:pointer}
+.sidebar{position:fixed;top:var(--chrome-top,54px);left:0;bottom:0;overflow-y:auto;z-index:100;transform:translateX(-100%);transition:transform .2s ease}
+.sidebar.open{transform:none;box-shadow:0 0 40px rgba(0,0,0,.5)}
+.nav-scrim.open{display:block;position:fixed;top:var(--chrome-top,54px);left:0;right:0;bottom:0;z-index:99;background:rgba(0,0,0,.55)}
+body .main{padding:16px}
+body .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
+.nav-item{min-height:44px}
+}
 </style>
 {% block page_css %}{% endblock %}
 </head><body{% block body_attrs %}{% endblock %}>

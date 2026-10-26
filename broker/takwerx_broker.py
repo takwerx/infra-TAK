@@ -293,9 +293,10 @@ EXEC_ALLOW = {
     # a flipped box). Tightly gated — see _check_git: -C <root-era module dir>
     # only; home-resident repos run git DIRECTLY as the console user, never here.
     'git',
-    # transient-unit launcher — a DIRECT root-exec primitive, so gated to the ONE
-    # fixed kernel-patch shape (see _check_systemd_run). No broader than the
-    # already-allowed `systemctl start <console-written-unit>`.
+    # transient-unit launcher — a DIRECT root-exec primitive, so gated to THREE
+    # fixed shapes (kernel-patch, non-root migrate, OS upgrade — see
+    # _check_systemd_run). No broader than the already-allowed
+    # `systemctl start <console-written-unit>`.
     'systemd-run',
     # v10.1.0 Leg 6 (WiFi Join) — these were MISSING, so the whole WiFi card
     # no-op'd on non-root boxes (scan denied → empty list; add denied at
@@ -383,6 +384,8 @@ PATH_CHECKED_BINS = {
 # Privileged path prefixes the console is allowed to read/write (directly via
 # the write/read ops, and as targets of the path-checked coreutils above).
 PATH_ALLOW = (
+    '/var/lib/infratak-backups/',   # v10.3.0 W12 full-stack backups — root-owned 0700,
+                                    # config copies land here; DB dumps via stack_pg_dump
     '/etc/systemd/system/',
     '/etc/fail2ban/',
     '/etc/caddy/',
@@ -422,6 +425,10 @@ PATH_ALLOW = (
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
+    # v10.3.0 W4: OS-upgrade job state (status file, baseline.json, pre/ snapshot).
+    # Root-owned; the console mkdirs it, writes the baseline + seeds the status,
+    # and reads the status back after each console restart/reboot.
+    '/var/lib/infratak-os-upgrade/',
     '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
@@ -467,6 +474,9 @@ PATH_ALLOW_EXACT = (
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
+    '/var/lib/infratak-os-upgrade.sh',           # v10.3.0 W4: OS-upgrade job script (same
+                                                 # pairing — written by the console, run only
+                                                 # by the third gated systemd-run shape)
     '/etc/default/takserver',                    # TAK Server JVM heap (snapshot/restore + deploy)
     # Relay tunnel config (Connectivity → Connect a Relay). _CONN_WG_IF is the
     # fleet constant 'wg0', so this is one fixed file — NOT the /etc/wireguard/
@@ -555,7 +565,11 @@ def _within_realpath(path, root):
 # (dir/x -> /etc) and have the broker follow it out. These require realpath
 # containment; every other allowlisted prefix is root-owned, so the cheaper
 # lexical match in _abs stays safe.
-_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
+# The full-stack backup root (v10.3.0 W12) is root-owned, but it is on the write
+# allowlist and the console can `ln -s` inside it — so it gets realpath containment
+# too, or a planted link would turn a root cp/write into the backup tree into a
+# write anywhere.
+_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS + ('/var/lib/infratak-backups/',)
 
 
 def _path_allowed(path, readonly=False):
@@ -1358,13 +1372,38 @@ _MIGRATE_ALLOWED_PROPERTIES = {
     'SELinuxContext=system_u:system_r:unconfined_service_t:s0',
 }
 
+# v10.3.0 W4: THIRD fixed systemd-run shape — the console-driven in-place Ubuntu
+# 22.04 -> 24.04 upgrade (app.py _os_upgrade_start_job). Same inherent power as
+# the kernel-patch job (root runs a console-written script), pinned the same way:
+# this unit name, exactly `/bin/bash /var/lib/infratak-os-upgrade.sh`, the two
+# append-log properties, and the kernel-patch --setenv allowlist plus ONE extra
+# pinned by full KEY=VALUE: RELEASE_UPGRADER_NO_SCREEN=1. ubuntu-release-upgrader
+# re-execs itself inside GNU screen unless that variable is set
+# (DistUpgradeMain.py, ubuntu/noble), and a transient unit has no tty for screen.
+# Nothing else widens; a fourth unit or an unpinned --setenv fails
+# /redteam-selfaudit (REGRESSION:broker-systemd-run).
+_OSUP_UNIT_NAME = 'infratak-os-upgrade'
+_OSUP_SCRIPT = '/var/lib/infratak-os-upgrade.sh'
+_OSUP_LOG = '/var/log/infratak-os-upgrade.log'
+_OSUP_ALLOWED_PROPERTIES = {
+    'StandardOutput=append:' + _OSUP_LOG,
+    'StandardError=append:' + _OSUP_LOG,
+}
+_OSUP_ALLOWED_SETENV = _SYSTEMD_RUN_ALLOWED_SETENV | {
+    'RELEASE_UPGRADER_NO_SCREEN=1',
+}
+
 
 def _check_systemd_run(argv):
-    """Allow ONLY the two fixed transient-unit invocations: the kernel-patch job
-    and the non-root migration job. Everything else is denied."""
+    """Allow ONLY the three fixed transient-unit invocations: the kernel-patch job,
+    the non-root migration job and the OS-upgrade job (v10.3.0 W4). Everything
+    else is denied. --setenv values are pinned by FULL `KEY=VALUE` per unit — an
+    env var is enough to turn the fixed `/bin/bash <script>` into arbitrary root
+    exec (BASH_ENV, LD_PRELOAD, PATH), so the key alone is never enough."""
     saw_unit = None
     positionals = []
     props = []
+    setenvs = []
     for a in argv[1:]:
         if positionals:
             # past the launched command — the rest are ITS args (validated as
@@ -1375,9 +1414,9 @@ def _check_systemd_run(argv):
             continue
         if a.startswith('--unit='):
             unit = a.split('=', 1)[1]
-            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME):
+            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME, _OSUP_UNIT_NAME):
                 raise Denied(f'systemd-run: only units {_KPATCH_UNIT_NAME}/'
-                             f'{_MIGRATE_UNIT_NAME} allowed')
+                             f'{_MIGRATE_UNIT_NAME}/{_OSUP_UNIT_NAME} allowed')
             saw_unit = unit
             continue
         if a.startswith('--description='):
@@ -1386,20 +1425,30 @@ def _check_systemd_run(argv):
             props.append(a.split('=', 1)[1])
             continue
         if a.startswith('--setenv='):
-            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_SETENV:
-                raise Denied(f'systemd-run: setenv not allowed: {a}')
+            setenvs.append(a.split('=', 1)[1])   # the FULL KEY=VALUE, checked per unit below
             continue
         if a.startswith('-'):
             raise Denied(f'systemd-run: flag not allowed: {a}')
         positionals.append(a)
     if saw_unit is None:
         raise Denied('systemd-run: missing required --unit=')
+    allowed_setenv = _OSUP_ALLOWED_SETENV if saw_unit == _OSUP_UNIT_NAME else _SYSTEMD_RUN_ALLOWED_SETENV
+    for s in setenvs:
+        if s not in allowed_setenv:
+            raise Denied(f'systemd-run: setenv not allowed: --setenv={s}')
     if saw_unit == _KPATCH_UNIT_NAME:
         for p in props:
             if p not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
                 raise Denied(f'systemd-run: property not allowed: --property={p}')
         if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
             raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
+        return
+    if saw_unit == _OSUP_UNIT_NAME:
+        for p in props:
+            if p not in _OSUP_ALLOWED_PROPERTIES:
+                raise Denied(f'systemd-run: property not allowed: --property={p}')
+        if positionals != ['/bin/bash', _OSUP_SCRIPT]:
+            raise Denied(f'systemd-run: only `/bin/bash {_OSUP_SCRIPT}` allowed')
         return
     # migrate shape: /bin/bash <install>/scripts/migrate-console-nonroot.sh
     # --apply --auto-rollback. The install dir varies per box; the script is
@@ -1590,6 +1639,12 @@ def _do_exec(req):
         env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
+        # DEBIAN_FRONTEND does not answer dpkg's conffile prompt: a package whose config
+        # file is already on disk (the console writes /etc/caddy/Caddyfile before Caddy is
+        # installed) died at "end of file on stdin at conffile prompt" and was left iU.
+        # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
+        # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
+        env.setdefault('DPKG_FORCE', 'confdef,confold')
     proc = subprocess.run(argv, input=input_bytes, capture_output=True,
                           timeout=timeout, cwd=cwd, env=env)
     return {
@@ -1947,15 +2002,27 @@ def _do_pg_dump(req):
             return {'ok': False, 'error': 'runuser/pg_dump not found on trusted PATH'}
         argv = [runuser, '-u', 'postgres', '--', pg_dump,
                 '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'pg_dump')
+
+
+def _dump_to_file(argv, path, timeout, opname):
+    """Run a dump argv with stdout pointed at a root-opened `path`, then chmod 0600
+    and write the HMAC sidecar. Shared by pg_dump and stack_pg_dump."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    timeout = min(int(timeout or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
     # applies, and postgres needs no write access to the snapshot dir.
     # Own session: a timeout kills pg_dump itself, not just runuser — an orphaned
     # pg_dump kept its table locks and snapshot open until this daemon restarted.
     # (With `docker exec` the pg_dump inside the container outlives the client;
     # the lock-wait cap is what bounds that case.)
-    with open(path, 'wb') as out:
+    # O_NOFOLLOW: a symlink planted at the destination must not redirect a root
+    # write (the backup tree is on the write allowlist for config copies).
+    for p_ in (path, path + '.hmac'):
+        if os.path.islink(p_):
+            os.unlink(p_)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as out:
         proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.PIPE,
                                 start_new_session=True)
         try:
@@ -1972,7 +2039,7 @@ def _do_pg_dump(req):
             os.unlink(path)
         except OSError:
             pass
-        return {'ok': False, 'error': 'pg_dump did not finish within %d s' % timeout}
+        return {'ok': False, 'error': '%s did not finish within %d s' % (opname, timeout)}
     if proc.returncode != 0:
         try:
             os.unlink(path)    # never leave a truncated/empty dump behind
@@ -1986,12 +2053,68 @@ def _do_pg_dump(req):
     # sidecar can't be written, restore simply won't trust the dump later.
     try:
         sc = path + '.hmac'
-        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         os.write(fd, _dump_hmac(path).encode())
         os.close(fd)
     except OSError:
         pass
-    return {'ok': True, 'size': os.path.getsize(path)}
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return {'ok': True, 'size': os.path.getsize(path), 'sha256': h.hexdigest()}
+
+
+# ── Full-stack backup DB dumps (infra-TAK v10.3.0 W12.b) ─────────────────────
+# The module databases (Authentik, TAK Portal, CloudTAK) live inside their own
+# postgres containers. The console names the container; the broker supplies the
+# role and database from this fixed table — nothing caller-supplied reaches the
+# argv but the container key. Destination: <STACK_BACKUP_DIR>/<label>/<file>.pgdump
+# only, one level deep, so a dump can never land elsewhere or nest.
+STACK_BACKUP_DIR = '/var/lib/infratak-backups'
+_STACK_PG_CONTAINERS = {
+    'authentik-postgresql-1': ('authentik', 'authentik'),
+    'tak-portal-postgres':    ('takportal', 'takportal'),
+    'cloudtak-postgis-1':     ('docker', 'gis'),
+}
+
+
+def _stack_backup_name_ok(name):
+    return (isinstance(name, str) and 0 < len(name) <= 96
+            and name[0].isalnum() and all(c.isalnum() or c in '-_.' for c in name)
+            and '..' not in name)
+
+
+def _check_stack_pg_dump(req):
+    container = req.get('container')
+    if container not in _STACK_PG_CONTAINERS:
+        raise Denied(f'stack_pg_dump: container not allowed: {container!r}')
+    p = _abs(req.get('path'))
+    rel = p[len(STACK_BACKUP_DIR) + 1:] if p.startswith(STACK_BACKUP_DIR + '/') else ''
+    parts = rel.split('/')
+    if (len(parts) != 2 or not _stack_backup_name_ok(parts[0])
+            or not _stack_backup_name_ok(parts[1]) or not parts[1].endswith('.pgdump')):
+        raise Denied(f'stack_pg_dump: destination must be {STACK_BACKUP_DIR}/<label>/<name>.pgdump: {p}')
+    return p
+
+
+def _do_stack_pg_dump(req):
+    path = _check_stack_pg_dump(req)
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    # Root 0711 (pass-through, no listing: the console reaches only its own .dl-*
+    # staging dirs); each backup dir 0700. Refuse symlinks at either level.
+    for d, mode in ((STACK_BACKUP_DIR, 0o711), (os.path.dirname(path), 0o700)):
+        if os.path.islink(d):
+            return {'ok': False, 'error': f'refusing symlinked backup dir: {d}'}
+        os.makedirs(d, mode=mode, exist_ok=True)
+        os.chmod(d, mode)
+    argv = [docker, 'exec', req['container'], 'pg_dump', '-U', user,
+            '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'stack_pg_dump')
 
 
 def _check_pg_restore(req):
@@ -2102,6 +2225,54 @@ def _do_pg_restore(req):
                               stderr=subprocess.PIPE, timeout=timeout)
     return {'ok': True, 'returncode': proc.returncode,
             'stderr': (proc.stderr or b'').decode(errors='replace')[-500:]}
+
+
+def _check_stack_pg_restore(req):
+    # same gate as stack_pg_dump: pinned container, <root>/<label>/<name>.pgdump only
+    return _check_stack_pg_dump(req)
+
+
+def _do_stack_pg_restore(req):
+    """W12.d: restore a full-stack backup dump into its module's postgres container.
+    Only a dump the broker itself produced (HMAC sidecar) is accepted — the backup
+    tree is on the write allowlist, so the console could otherwise plant an archive
+    whose TOC runs code as the database superuser. `verify_only` checks the HMAC and
+    the archive's TOC without touching the database (the restore preflight)."""
+    import hmac as _hmac
+    path = _check_stack_pg_restore(req)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return {'ok': False, 'code': 'ENOENT', 'error': f'dump not found: {path}'}
+    try:
+        with open(path + '.hmac') as f:
+            want = f.read().strip()
+    except OSError:
+        want = ''
+    if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
+        return {'ok': False, 'code': 'DENIED',
+                'error': 'dump failed authenticity check — not a broker-produced backup'}
+    if req.get('verify_only'):
+        pg_restore = _newest_pg_client('pg_restore')
+        if not pg_restore:
+            return {'ok': True, 'toc_entries': None, 'note': 'HMAC verified; no host pg_restore to read the TOC'}
+        proc = subprocess.run([pg_restore, '--list', path], capture_output=True, timeout=600)
+        toc = [l for l in (proc.stdout or b'').decode(errors='replace').splitlines()
+               if l.strip() and not l.lstrip().startswith(';')]
+        return {'ok': proc.returncode == 0 and bool(toc), 'toc_entries': len(toc),
+                'error': (proc.stderr or b'').decode(errors='replace')[:400]}
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    argv = [docker, 'exec', '-i', req['container'], 'pg_restore', '-U', user,
+            '--clean', '--if-exists', '--no-owner', '-d', db]
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as inp:
+        proc = subprocess.run(argv, stdin=inp, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    # pg_restore exits 1 on non-fatal warnings — passed through for the caller.
+    return {'ok': True, 'returncode': proc.returncode,
+            'stderr': (proc.stderr or b'').decode(errors='replace')[-800:]}
 
 
 # /etc/ssl/openssl.cnf is a ROOT CODE-EXEC surface (it can load engines/providers
@@ -3182,6 +3353,10 @@ def _evaluate(req):
             _path_allowed(req.get('path'), readonly=(op == 'read'))
         elif op == 'pg_dump':
             _check_pg_dump(req)
+        elif op == 'stack_pg_dump':
+            _check_stack_pg_dump(req)
+        elif op == 'stack_pg_restore':
+            _check_stack_pg_restore(req)
         elif op == 'pg_restore':
             _check_pg_restore(req)
         elif op == 'pgminer_scan':
@@ -3281,8 +3456,8 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
-              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
+    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
+              'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
               'pg_old_cluster'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
@@ -3291,6 +3466,8 @@ def _dispatch(req, peer):
             summary = JAVA_CACERTS
         elif op == 'certifi_upgrade':
             summary = CERTIFI_EDITOR_DIR
+        elif op in ('stack_pg_dump', 'stack_pg_restore'):
+            summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
         elif op == 'pg_old_cluster':
             summary = f"action={req.get('action')} major={_PG_OLD_MAJOR}"
         elif op == 'disk_reclaim':
@@ -3310,6 +3487,10 @@ def _dispatch(req, peer):
         audit(peer, op, summary, 'ALLOW')
         if op == 'pg_dump':
             return _do_pg_dump(req)
+        if op == 'stack_pg_dump':
+            return _do_stack_pg_dump(req)
+        if op == 'stack_pg_restore':
+            return _do_stack_pg_restore(req)
         if op == 'pg_restore':
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
@@ -4009,6 +4190,15 @@ def cli_selftest():
          {'op': 'exec', 'argv': ['git', '-C', '/etc', 'rev-parse', 'HEAD']}),
         ('Policy blocks pg_dump outside snapshots',
          {'op': 'pg_dump', 'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_dump outside the backup tree',
+         {'op': 'stack_pg_dump', 'container': 'authentik-postgresql-1',
+          'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_restore outside the backup tree',
+         {'op': 'stack_pg_restore', 'container': 'authentik-postgresql-1',
+          'path': '/opt/tak/snapshots/x/cot.pgdump'}),
+        ('Policy blocks stack_pg_dump of an unlisted container',
+         {'op': 'stack_pg_dump', 'container': 'evil',
+          'path': '/var/lib/infratak-backups/x/evil.pgdump'}),
         ('Policy blocks write to /root/.ssh',
          {'op': 'write', 'path': '/root/.ssh/authorized_keys'}),
         ('Policy blocks non-patch openssl.cnf write',

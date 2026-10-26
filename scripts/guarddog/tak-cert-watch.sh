@@ -5,6 +5,7 @@
 # Native behaviour is byte-identical. (The cert-renewal timer is named
 # takserver-cert-renewal.timer in BOTH modes, so the alert body is correct.)
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+type gd_stack_restore_standdown >/dev/null 2>&1 && gd_stack_restore_standdown tak-cert-watch && exit 0
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cert_alert_sent"

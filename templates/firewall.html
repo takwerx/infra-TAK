@@ -33,6 +33,15 @@
 .exp-tbl td{padding:6px 8px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;color:var(--text-secondary);vertical-align:top}
 .exp-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .exp-ok{background:var(--green)}.exp-warn{background:var(--yellow)}.exp-alert{background:var(--red)}.exp-na{background:var(--text-dim)}
+/* v10.3.0 W10 — same 900px breakpoint as base.html. Five mono columns cannot fit 390px:
+   drop Tier (Bind says the same thing) and go a point smaller so Status wraps in place
+   instead of scrolling out of view; keep ufw's columns aligned and let the box scroll. */
+@media (max-width: 900px){
+.exp-tbl{font-size:11px}
+.exp-tbl th,.exp-tbl td{padding:6px 5px}
+.exp-tbl th:nth-child(3),.exp-tbl td:nth-child(3){display:none}
+.rules-box{white-space:pre}
+}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
@@ -45,7 +54,7 @@
     <summary><span class="fw-summary-left"><span class="material-symbols-outlined">policy</span>Service Exposure</span><span style="display:flex;align-items:center;gap:10px"><span id="exp-badge" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">checking…</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></span></summary>
     <div class="card-body">
       <p style="color:var(--text-dim);font-size:12px;margin-bottom:10px">Live bind + firewall state vs. the declared exposure policy for every installed service. Read-only — drift is re-hardened automatically on update, or fix it with the controls below.</p>
-      <div id="exp-table">Loading exposure audit…</div>
+      <div id="exp-table" class="table-wrap">Loading exposure audit…</div>
       <div id="exp-undeclared"></div>
     </div>
   </details>
@@ -77,7 +86,7 @@
     <summary><span class="fw-summary-left"><span class="material-symbols-outlined">filter_alt</span>Restrict Source IP to Service</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
     <div class="card-body">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <input class="form-input" type="text" id="fw-src" placeholder="Source IP/CIDR (e.g. 203.0.113.10 or 203.0.113.0/24)" style="min-width:300px">
+        <input class="form-input" type="text" id="fw-src" placeholder="Source IP/CIDR (e.g. 203.0.113.10 or 203.0.113.0/24)" style="flex:1 1 240px;min-width:0">
         <select class="form-input" id="fw-action" style="max-width:120px"><option value="allow">allow</option><option value="deny">deny</option></select>
         <input class="form-input" type="number" id="fw-src-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
         <select class="form-input" id="fw-src-proto" style="max-width:100px"><option value="tcp">tcp</option><option value="udp">udp</option></select>

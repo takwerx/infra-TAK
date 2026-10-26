@@ -28,6 +28,17 @@ UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 
 [ -z "$FEDHUB_HOST" ] && exit 0
 
+# v10.3.0 W4.g: the console is upgrading / updating / rebooting this machine — do not count
+# failures or restart federation-hub mid-job. The marker holds an expiry (epoch seconds), so
+# a console that dies mid-job silences this for at most the job's window. Name rule = the
+# console's _rhost_key(): lowercase, anything but [a-z0-9.-] -> '_'.
+RH_KEY="$(printf '%s' "$FEDHUB_HOST" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9.-]/_/g')"
+RH_UNTIL="$(head -c 32 "$STATE_DIR/remotehost-maintenance.$RH_KEY" 2>/dev/null | tr -cd '0-9')"
+if [ -n "$RH_UNTIL" ] && [ "$(date +%s)" -lt "$RH_UNTIL" ] 2>/dev/null; then
+  echo 0 > "$FAIL_FILE"
+  exit 0
+fi
+
 SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 ${SSH_USER}@${FEDHUB_HOST}"
 
 HEALTHY=true
