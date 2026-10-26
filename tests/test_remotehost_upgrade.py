@@ -92,7 +92,7 @@ def _ns(settings=None, records=None, other_core_jobs=None, dbserver_rec=None):
     exec(compile(RH_CONSTS, 'app.py:W4g-consts', 'exec'), ns)
     exec(compile(PROBE, 'app.py:W4g-probe', 'exec'), ns)
     for name in ('_systemctl_show_tuple', '_dbserver_same_host', '_dbserver_priv', '_os_upgrade_job_state',
-                 '_rhost_probe_text', '_rhost_key', '_rhost_module_cfg', '_rhost_is_this_box', '_remote_hosts',
+                 '_rhost_probe_text', '_rhost_key', '_rhost_local_boot_id', '_rhost_module_cfg', '_rhost_is_this_box', '_remote_hosts',
                  '_rhost_target', '_rhost_remote_busy', '_rhost_baseline', '_rhost_other_jobs',
                  '_rhost_in_flight', '_rhost_preflight', '_rhost_compare', '_rhost_verify', '_rhost_tick',
                  '_rhost_status', '_rhost_list_payload', '_os_upgrade_remotehost_script'):
@@ -163,6 +163,20 @@ def test_the_database_server_has_one_upgrade_owner():
 def test_unusable_ssh_settings_are_refused():
     h = _ns(_settings(nodered=_remote('bad host;x')))['_remote_hosts']()[0]
     assert 'not usable' in h['excluded']
+
+
+def test_a_remote_host_reporting_this_boxs_boot_id_is_refused():
+    # the core's LAN IP / a DNS name for it gets past the config check; the boot id does not lie
+    ns = _ns()
+    ns['_rhost_local_boot_id'] = lambda: 'boot-1'
+    res = ns['_rhost_preflight'](_rhkey(A), probe=_probe(boot_id='boot-1'))
+    assert not res['ok'] and 'this core box itself' in res['checks'][-1]['detail']
+    assert 'ssh_sudo' not in _checks(res)
+
+
+@pytest.mark.parametrize('host', ['0.0.0.0', '127.0.1.1'])
+def test_wildcard_and_loopback_aliases_are_the_core(host):
+    assert 'core box itself' in _ns(_settings(authentik=_remote(host)))['_remote_hosts']()[0]['excluded']
 
 
 def test_url_key_never_becomes_a_hostname():

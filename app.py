@@ -92690,12 +92690,20 @@ def _rhost_module_cfg(settings, mod, key):
 
 def _rhost_is_this_box(host, settings):
     h = (host or '').strip().lower()
-    if h in ('', '127.0.0.1', 'localhost', '::1') or h.startswith('127.'):
+    if h in ('', '127.0.0.1', 'localhost', '::1', '0.0.0.0', '::') or h.startswith('127.'):
         return True
     for mine in (settings.get('server_ip'), settings.get('fqdn')):
         if isinstance(mine, str) and mine.strip() and _dbserver_same_host(h, mine):
             return True
     return False
+
+
+def _rhost_local_boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except Exception:
+        return ''
 
 
 def _remote_hosts(settings=None):
@@ -92971,6 +92979,13 @@ def _rhost_preflight(key, for_start=False, data=None, settings=None, probe=None)
             'sudo': f'SSH as {entry["ssh"]["ssh_user"]} works, but sudo on {entry["host"]} asks for a password — the console needs passwordless sudo there (or root login): {err}',
             'ssh': f'cannot reach {entry["host"]} over SSH: {err}',
         }.get(kind, err))
+        return res
+    # A name or private address the config check could not tie to this box (the core's LAN IP,
+    # a DNS name for it) still lands here; the boot id cannot lie. Refuse before anything else.
+    mine = _rhost_local_boot_id()
+    if mine and d.get('boot_id') == mine:
+        add('target', False, f"{entry['host']} is this core box itself (same boot id) — fix that module's remote host setting; the upgrade above covers this box")
+        res['ok'] = False
         return res
     user = entry['ssh']['ssh_user']
     add('ssh_sudo', True, f'SSH as {user}' + (' (root login)' if user == 'root' else ' with passwordless sudo'))
@@ -93269,6 +93284,9 @@ def _rhost_start_locked(key, job, data):
     d, kind, err = _rhost_probe(entry, 'full')
     if d is None:
         return 409, {'ok': False, 'error': f'cannot reach {entry["host"]} ({kind}): {err}'}
+    mine = _rhost_local_boot_id()
+    if mine and d.get('boot_id') == mine:
+        return 409, {'ok': False, 'error': f"{entry['host']} is this core box itself (same boot id) — nothing was started"}
     if d.get('os_id') != 'ubuntu':
         return 409, {'ok': False, 'error': f"{d.get('os_pretty') or 'this OS'} — Install updates / Reboot from here are for Ubuntu machines"}
     busy = _rhost_remote_busy(d)
