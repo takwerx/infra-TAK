@@ -414,3 +414,105 @@ def test_card_calls_the_routes_through_the_key():
     assert "'/api/console/remotehosts/'+encodeURIComponent(_rhKey)+'/'" in CONSOLE
     assert "fetch('/api/console/remotehosts'," in CONSOLE
     assert "osupOpenPreflight('remotehost',h.key,h.host)" in CONSOLE
+
+
+# ---------------------------------------------------------------------------
+# W4.g.2 — Federation Hub's MongoDB 8.x -> 7.0 before the flip (row 5, host B)
+# ---------------------------------------------------------------------------
+MONGO7 = APP[APP.index('_OS_UPGRADE_SH_MONGO7 = ('):APP.index('_OS_UPGRADE_SH_SNAPSHOT_HEAD = (')]
+
+
+def _mongo7_text():
+    ns = {}
+    exec(compile(MONGO7, 'app.py:mongo7', 'exec'), ns)
+    return ns['_OS_UPGRADE_SH_MONGO7']
+
+
+def test_mongo7_runs_before_the_snapshot_in_the_core_and_remote_jobs_only():
+    ns = _ns()
+    rs = ns['_os_upgrade_remotehost_script']()
+    m = _mongo7_text()
+    assert m in rs and rs.index(m) < rs.index(ns['_OS_UPGRADE_SH_SNAPSHOT_HEAD']) and rs.index(ns['_OS_UPGRADE_SH_HOLDS']) < rs.index(m)
+    core = _fn('_os_upgrade_script')
+    assert '_OS_UPGRADE_SH_HOLDS,\n        _OS_UPGRADE_SH_MONGO7,\n        _OS_UPGRADE_SH_SNAPSHOT_HEAD,' in core
+    assert '_OS_UPGRADE_SH_MONGO7' not in _fn('_os_upgrade_dbserver_script')     # W4.e untouched
+
+
+def _run_mongo7(tmp_path, mongo_ver, mfdt):
+    """Run the real fragment under bash with every system command stubbed into a log."""
+    bin_ = tmp_path / 'bin'
+    bin_.mkdir()
+    log = tmp_path / 'calls.log'
+    for cmd in ('systemctl', 'apt-get', 'curl', 'gpg', 'install', 'date', 'mv'):
+        (bin_ / cmd).write_text(f'#!/bin/bash\necho "{cmd} $*" >> {log}\n[ "{cmd}" = date ] && echo 20261026120000\nexit 0\n')
+    (bin_ / 'dpkg-query').write_text(f'#!/bin/bash\necho -n "{mongo_ver}"\n[ -n "{mongo_ver}" ]\n')
+    (bin_ / 'mongosh').write_text('#!/bin/bash\necho 1\n')
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    fhb = tmp_path / 'broker.yml'
+    fhb.write_text(f'v2Enabled: true\nmissionFederationDisruptionEnabled: {"true" if mfdt else "false"}\n')
+    frag = _mongo7_text().replace('/opt/tak/federation-hub/configs/federation-hub-broker.yml', str(fhb)) \
+                         .replace('/etc/apt/sources.list.d/', str(tmp_path) + '/') \
+                         .replace('[ -d /var/lib/mongodb ]', '[ -d /nonexistent-but-mv-is-stubbed ] || true; [ 1 = 1 ]')
+    script = (f'STATUS={tmp_path}/status\nTS() {{ echo T; }}\nwait_for_apt() {{ return 0; }}\n' + frag + 'echo AFTER\n')
+    r = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                       env={'PATH': f'{bin_}:/usr/bin:/bin'})
+    calls = log.read_text() if log.exists() else ''
+    status = (tmp_path / 'status').read_text().strip() if (tmp_path / 'status').exists() else ''
+    return r, calls, status
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+def test_mongo7_is_a_noop_without_mongodb_8(tmp_path):
+    for v in ('', '7.0.45', '4.4.29'):
+        sub = tmp_path / (v or 'none')
+        sub.mkdir()
+        r, calls, status = _run_mongo7(sub, v, mfdt=False)
+        assert 'AFTER' in r.stdout and calls == '' and status == ''
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+def test_mongo7_refuses_when_mfdt_holds_data_and_touches_nothing(tmp_path):
+    r, calls, status = _run_mongo7(tmp_path, '8.0.34', mfdt=True)
+    assert r.returncode == 1 and 'AFTER' not in r.stdout
+    assert status == 'failed:mongo-7' and 'MFDT' in r.stdout and 'keep this host on 22.04' in r.stdout
+    assert calls == ''                                   # not even systemctl stop
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+def test_mongo7_swaps_8_to_7_keeping_the_old_data(tmp_path):
+    r, calls, status = _run_mongo7(tmp_path, '8.0.34', mfdt=False)
+    assert r.returncode == 0 and 'AFTER' in r.stdout, r.stdout + r.stderr
+    order = [l.split()[0] + ' ' + (l.split()[1] if len(l.split()) > 1 else '') for l in calls.splitlines()]
+    assert order.index('systemctl stop') < order.index('mv /var/lib/mongodb') < order.index('apt-get remove') \
+        < order.index('apt-get install') < order.index('systemctl start')
+    assert 'mv /var/lib/mongodb /var/lib/mongodb.pre-7.0-20261026120000' in calls      # kept, never rm
+    assert 'rm -rf' not in _mongo7_text() and 'purge' not in _mongo7_text()
+    assert 'jammy/mongodb-org/7.0' in (tmp_path / 'mongodb-org-7.0.list').read_text()
+    assert status == 'running:mongo-7'
+
+
+def test_repos_noble_keeps_the_mongodb_7_list_on_jammy_and_tolerates_its_refresh():
+    flip = _ns()['_OS_UPGRADE_SH_FLIP']
+    assert 'mongodb-org-7.0.list) cp -a "$f"' in flip and 'continue ;; esac' in flip
+    assert 'repo[.]mongodb[.]org' in flip
+
+
+def test_new_fedhub_deploys_install_mongodb_7_from_jammy():
+    assert "MONGO_VER=7.0; distro_codename=jammy; " in APP
+    assert 'MONGO_VER=8.0' not in APP
+
+
+@pytest.mark.parametrize('mongo,mfdt,want', [('8.0.34', False, (True, True)), ('8.0.34', True, (False, False)),
+                                            ('7.0.45', False, None), ('', False, None)])
+def test_remote_preflight_fedhub_mongo(mongo, mfdt, want):
+    c = _checks(_ns()['_rhost_preflight'](_rhkey(B), probe=_probe(mongo=mongo, mfdt=mfdt))).get('fedhub_mongo')
+    if want is None:
+        assert c is None
+    else:
+        assert (c['pass'], c['notice']) == want
+
+
+def test_probe_reads_mongo_version_and_mfdt():
+    t = _ns()['_rhost_probe_text']('full')
+    assert "'mongodb-org-server'" in t and 'missionFederationDisruptionEnabled' in t

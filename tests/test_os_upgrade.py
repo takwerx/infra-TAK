@@ -213,7 +213,8 @@ class Box:
                  tak_installed=True, container=False, db_host='127.0.0.1', clusters=(('18', 'main', '5432', 'online'),),
                  root_free_gb=40, boot_free_mb=400, busy=(), systemd_run=True, broker=(True, 'root console'),
                  upgrader_ver='1:22.04.20', prompt='lts', containers=('authentik-server', 'tak-portal'),
-                 problems=(), docker_err='', pending=(), pending_err='', reboot_pkgs=()):
+                 problems=(), docker_err='', pending=(), pending_err='', reboot_pkgs=(),
+                 mongo=('', False)):
         calls = self.calls = []
         exists = {'/opt/tak/CoreConfig.xml': tak_installed, '/usr/bin/systemd-run': systemd_run,
                   '/bin/systemd-run': False, '/usr/bin/do-release-upgrade': bool(upgrader_ver),
@@ -255,6 +256,7 @@ class Box:
             _os_upgrade_pending_updates=lambda: ((None, pending_err) if pending_err else (list(pending), '')),
             _os_upgrade_reboot_blockers=lambda: list(reboot_pkgs),
             _os_upgrade_service_baseline=lambda: {'takserver': 'active', 'docker': 'active'},
+            _fedhub_mongo_state=lambda: tuple(mongo),
         )
         exec(compile(_fn('_os_upgrade_preflight'), 'app.py:_os_upgrade_preflight', 'exec'), self.ns)
 
@@ -1017,3 +1019,11 @@ def test_card_states_the_58_requirement_before_the_click():
     i = html.index('id="osup-idle"')
     card = html[i:html.index('id="osup-progress"', i)]
     assert 'Requires TAK Server 5.8 or newer' in card and 'TAK Server page first' in card
+
+
+# W4.g.2: a dedicated Federation Hub box upgrades through the core job — same MongoDB gate.
+@pytest.mark.parametrize('mongo,want', [(('8.0.34', True), False), (('8.0.34', False), True), (('7.0.45', False), None)])
+def test_core_preflight_fedhub_mongo(mongo, want):
+    res = Box(mongo=mongo).run()
+    c = {x['name']: x for x in res['checks']}.get('fedhub_mongo')
+    assert (c is None) if want is None else (c['pass'] is want)

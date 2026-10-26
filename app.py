@@ -27680,15 +27680,17 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
 
-        # --- MongoDB (required by Federation Hub) ---
+        # --- MongoDB (optional for Federation Hub — MFDT only; installed so it can be enabled) ---
         plog('━━━ Install & start MongoDB ━━━')
         mongo_cmds = (
             'if ! command -v mongod >/dev/null 2>&1; then '
             '  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gnupg >/dev/null 2>&1; '
             '  distro_codename=$(awk -F= "/^VERSION_CODENAME=/{ print tolower(\\$2) }" /etc/*-release | tr -d \'\\"\'); '
             '  if grep -q avx /proc/cpuinfo; then '
-            '    MONGO_VER=8.0; '
-            '    echo "CPU supports AVX — installing MongoDB 8.0"; '
+            # W4.g.2: 7.0, as the Fed Hub 5.8 guide documents — 8.0 refuses to start on the
+            # >= 6.19 kernels 24.04 clouds run (SERVER-121912). 7.0 is published for jammy only.
+            '    MONGO_VER=7.0; distro_codename=jammy; '
+            '    echo "CPU supports AVX — installing MongoDB 7.0 (Federation Hub 5.8 guide)"; '
             '  else '
             '    MONGO_VER=4.4; '
             '    echo "WARNING: CPU does not support AVX — falling back to MongoDB 4.4 (LXC or older CPU)"; '
@@ -90059,7 +90061,7 @@ def _kernel_patch_apt_script(tak_pkgs=_KERNEL_PATCH_TAK_PKGS, status_file=''):
         # apt keeps the dead repo's LAST index, so full-upgrade still tries to download its
         # newer packages (measured on test8: caddy 2.11.7 -> 402 again, nothing installed).
         # Hence --fix-missing on this path only, plus the distro-skip check after it.
-        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
+        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
         'FIXMISSING=""\n'
         'UPDLOG="$(mktemp)"\n'
         'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
@@ -90660,6 +90662,46 @@ _OS_UPGRADE_SH_HOLDS = (
     '\n'
 )
 
+# ---- mongo-7 (W4.g.2) — only on a Federation Hub host carrying MongoDB 8.x ----------------
+# On 24.04 the cloud kernels are >= 6.19, where MongoDB 8.0 refuses to start (SERVER-121912).
+# The Fed Hub 5.8 guide documents MongoDB 7.0 (jammy repo, also on Ubuntu 24) and calls it
+# optional — used only by MFDT, which defaults off and infra-TAK never enables. MongoDB
+# Community cannot be binary-downgraded, so 8.x -> 7.0 is a fresh, empty data dir; the old
+# one is KEPT beside it. Refused (failed:mongo-7) when MFDT is enabled. Runs before
+# pre-snapshot, so the package list it records — and UNCHANGED/PARTLY UPGRADED after it —
+# describe the box after the swap. Its own failure text: it never claims "unchanged".
+_OS_UPGRADE_SH_MONGO7 = (
+    'MONGO_NOW="$(dpkg-query -W -f=\'${Version}\' mongodb-org-server 2>/dev/null)"\n'
+    'case "$MONGO_NOW" in 8.*)\n'
+    '  echo "running:mongo-7" > "$STATUS"; echo "[$(TS)] === step mongo-7 ==="\n'
+    '  mfail() { echo "failed:mongo-7" > "$STATUS"; echo "[$(TS)] FATAL: step mongo-7 failed — $1"; exit 1; }\n'
+    '  FHB=/opt/tak/federation-hub/configs/federation-hub-broker.yml\n'
+    '  if grep -qiE "^[[:space:]]*missionFederationDisruptionEnabled:[[:space:]]*true" "$FHB" 2>/dev/null; then\n'
+    '    mfail "MongoDB $MONGO_NOW holds Federation Hub MFDT data (missionFederationDisruptionEnabled: true); MongoDB cannot be downgraded and 8.x does not start on the 24.04 kernel. Nothing was changed — keep this host on 22.04"\n'
+    '  fi\n'
+    '  echo "[$(TS)] MongoDB $MONGO_NOW -> 7.0 (Federation Hub 5.8 guide; MFDT is off, so the data dir is not in use)"\n'
+    '  wait_for_apt || mfail "apt/dpkg still busy after 30 min — nothing was changed"\n'
+    '  systemctl stop mongod 2>/dev/null\n'
+    '  MOLD="/var/lib/mongodb.pre-7.0-$(date -u +%Y%m%d%H%M%S)"\n'
+    '  if [ -d /var/lib/mongodb ]; then mv /var/lib/mongodb "$MOLD" || mfail "could not move /var/lib/mongodb aside — MongoDB is stopped, nothing else was changed"; echo "[$(TS)] old data dir kept: $MOLD"; fi\n'
+    '  apt-get remove -y mongodb-org mongodb-org-server mongodb-org-mongos mongodb-org-shell mongodb-org-tools mongodb-org-database mongodb-org-database-tools-extra || mfail "could not remove MongoDB $MONGO_NOW (old data: $MOLD)"\n'
+    '  rm -f /etc/apt/sources.list.d/mongodb-org-8.*.list\n'
+    '  curl -fsSL https://pgp.mongodb.com/server-7.0.asc | gpg --dearmor --yes -o /usr/share/keyrings/mongodb-server-7.0.gpg || mfail "could not fetch the MongoDB 7.0 signing key (old data: $MOLD)"\n'
+    '  echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list\n'
+    '  apt-get -o Acquire::Retries=3 update || mfail "apt-get update failed with the MongoDB 7.0 repository (old data: $MOLD)"\n'
+    '  apt-get install -y mongodb-org || mfail "could not install MongoDB 7.0 (old data: $MOLD)"\n'
+    '  install -d -o mongodb -g mongodb -m 0755 /var/lib/mongodb\n'
+    '  systemctl enable mongod >/dev/null 2>&1; systemctl start mongod || mfail "MongoDB 7.0 did not start (old data: $MOLD)"\n'
+    '  for i in $(seq 1 30); do mongosh --quiet --eval "db.runCommand({ping:1}).ok" 2>/dev/null | grep -qx 1 && break; sleep 2; done\n'
+    '  mongosh --quiet --eval "db.runCommand({ping:1}).ok" 2>/dev/null | grep -qx 1 || mfail "MongoDB 7.0 is not answering (old data: $MOLD)"\n'
+    '  if [ -x /opt/tak/federation-hub/scripts/db/configure.sh ]; then /opt/tak/federation-hub/scripts/db/configure.sh || mfail "the Federation Hub configure.sh failed against MongoDB 7.0"; fi\n'
+    '  systemctl restart federation-hub 2>/dev/null\n'
+    '  echo "[$(TS)] MongoDB $(dpkg-query -W -f=\'${Version}\' mongodb-org-server) active; Federation Hub restarted"\n'
+    '  ;;\n'
+    'esac\n'
+    '\n'
+)
+
 _OS_UPGRADE_SH_SNAPSHOT_HEAD = (
     # ---- 1. pre-snapshot ------------------------------------------------------
     'step pre-snapshot\n'
@@ -90731,11 +90773,14 @@ _OS_UPGRADE_SH_FLIP = (
     'for f in "$PRE/sources.list.d/"*.list; do\n'
     '  [ -e "$f" ] || continue\n'
     '  b="$(basename "$f")"\n'
+    # W4.g.2: MongoDB publishes 7.0 for jammy only (the Fed Hub guide uses jammy on 24.04
+    # too) — re-enable that list as it was, never point it at a noble 7.0 that 404s.
+    '  case "$b" in mongodb-org-7.0.list) cp -a "$f" "/etc/apt/sources.list.d/$b"; echo "[$(TS)] re-enabled $b (kept on jammy: no noble build of MongoDB 7.0)"; continue ;; esac\n'
     '  sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"\n'
     '  echo "[$(TS)] re-enabled $b (jammy -> noble)"\n'
     'done\n'
     'rm -f /etc/apt/sources.list.d/*.distUpgrade 2>/dev/null\n'
-    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org)/"\n'
+    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
     'UPDLOG="$(mktemp)"\n'
     'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
     'rc=${PIPESTATUS[0]}\n'
@@ -91013,6 +91058,25 @@ def _os_upgrade_service_baseline(listdir=None, run=None, islink=None):
     return out
 
 
+def _fedhub_mongo_state():
+    """(mongodb-org-server version or '', MFDT enabled?) on THIS box — W4.g.2. dpkg-query and
+    a read of the broker yml; both read-only. A missing package or file reads ('', False)."""
+    try:
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Version}', 'mongodb-org-server'],
+                           capture_output=True, text=True, timeout=15)
+        ver = (r.stdout or '').strip() if r.returncode == 0 else ''
+    except Exception:
+        ver = ''
+    try:
+        yml = _read_priv('/opt/tak/federation-hub/configs/federation-hub-broker.yml') or ''
+    except Exception:
+        yml = ''
+    mfdt = any(l.split(':', 1)[0].strip() == 'missionFederationDisruptionEnabled'
+               and l.split(':', 1)[1].strip().lower().startswith('true')
+               for l in yml.splitlines() if ':' in l)
+    return ver, mfdt
+
+
 def _os_upgrade_preflight(for_start=False, data=None):
     """Every check in PLAN-v10.3.0 §4 W4. Returns {ok, checks:[{name,pass,detail,notice}],
     irreversible:[...], baseline:{...}, os_type, os_name}. Read-only: nothing here changes
@@ -91126,6 +91190,18 @@ def _os_upgrade_preflight(for_start=False, data=None):
     else:
         add('release_upgrader', True, f"ubuntu-release-upgrader-core {upg_ver}; Prompt={prompt or 'lts (default)'}")
 
+    # 7a. W4.g.2 — a dedicated Federation Hub box upgrades through this job too: MongoDB 8.x
+    #     does not start on the 24.04 kernel (_OS_UPGRADE_SH_MONGO7 moves it to 7.0 first).
+    mongo_v, mfdt = _fedhub_mongo_state()
+    if mongo_v.startswith('8.'):
+        if mfdt:
+            add('fedhub_mongo', False, f'MongoDB {mongo_v} holds Federation Hub MFDT data (missionFederationDisruptionEnabled: true). '
+                'MongoDB 8.x does not start on the 24.04 kernel and cannot be downgraded — keep this box on 22.04 '
+                '(Federation Hub supports it) until MongoDB ships an 8.x that runs there')
+        else:
+            add('fedhub_mongo', True, f'MongoDB {mongo_v} → 7.0 first (the Federation Hub 5.8 guide\'s version; 8.x does not start '
+                'on the 24.04 kernel). MFDT is off, so its data dir is not in use; it is kept as /var/lib/mongodb.pre-7.0-<time>', notice=True)
+
     # 7b. Ubuntu's own two gates, asked the way do-release-upgrade asks them — a green preflight
     #     the upgrader then refuses is a lie (aws-jammy W5 run 1, 2026-10-13).
     pend, perr = _os_upgrade_pending_updates()
@@ -91208,6 +91284,7 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
             'TAK_PKGS="takserver takserver-fed-hub"\n'
         ),
         _OS_UPGRADE_SH_HOLDS,
+        _OS_UPGRADE_SH_MONGO7,
         _OS_UPGRADE_SH_SNAPSHOT_HEAD,
         (
             'rm -rf "$PRE/venv"\n'
@@ -92699,6 +92776,12 @@ if MODE == 'full':
     rb = (readf('/var/run/reboot-required.pkgs', 1 << 16) or '').splitlines()
     out['reboot_pkgs'] = sorted({l for l in rb if l in ('libc6', 'linux-base') or l.startswith('linux-image-')})
     out['reboot_required'] = os.path.exists('/var/run/reboot-required')
+    rc, o, e = run(['dpkg-query', '-W', '-f=${Version}', 'mongodb-org-server'], 15)
+    out['mongo'] = o if rc == 0 else ''
+    fhb = readf('/opt/tak/federation-hub/configs/federation-hub-broker.yml', 1 << 16) or ''
+    out['mfdt'] = any(l.split(':', 1)[0].strip() == 'missionFederationDisruptionEnabled'
+                      and l.split(':', 1)[1].strip().lower().startswith('true')
+                      for l in fhb.splitlines() if ':' in l)
 print('INFRATAK-PROBE ' + json.dumps(out))
 '''
 
@@ -92848,6 +92931,7 @@ def _os_upgrade_remotehost_script():
         # resume a half-configured TAK package (v0.9.44).
         f'TAK_PKGS={q(_KERNEL_PATCH_TAK_PKGS)}\n',
         _OS_UPGRADE_SH_HOLDS,
+        _OS_UPGRADE_SH_MONGO7,
         _OS_UPGRADE_SH_SNAPSHOT_HEAD,
         (
             'HAD_DOCKER=0; command -v docker >/dev/null 2>&1 && HAD_DOCKER=1\n'
@@ -93061,6 +93145,17 @@ def _rhost_preflight(key, for_start=False, data=None, settings=None, probe=None)
         add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt=never — the job sets Prompt=lts first", notice=True)
     else:
         add('release_upgrader', True, f"ubuntu-release-upgrader-core {d['upgrader']}; Prompt={d.get('prompt') or 'lts (default)'}")
+
+    # 6b. W4.g.2 — Federation Hub's MongoDB: 8.x does not start on the 24.04 kernel.
+    mv = d.get('mongo') or ''
+    if mv.startswith('8.'):
+        if d.get('mfdt'):
+            add('fedhub_mongo', False, f'MongoDB {mv} holds Federation Hub MFDT data (missionFederationDisruptionEnabled: true). '
+                'MongoDB 8.x does not start on the 24.04 kernel and cannot be downgraded — keep this host on 22.04 '
+                '(Federation Hub supports it) until MongoDB ships an 8.x that runs there')
+        else:
+            add('fedhub_mongo', True, f'MongoDB {mv} → 7.0 first (the Federation Hub 5.8 guide\'s version; 8.x does not start '
+                'on the 24.04 kernel). MFDT is off, so its data dir is not in use; it is kept as /var/lib/mongodb.pre-7.0-<time>', notice=True)
 
     # 7-8. Ubuntu's own two gates.
     pend = d.get('pending')
