@@ -1,0 +1,33 @@
+name: Feature request
+description: "Suggest something infra-TAK should do"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This repository is public.** Describe the job you need done in general terms and leave out hostnames, addresses and
+        anything operationally sensitive.
+  - type: textarea
+    id: problem
+    attributes:
+      label: "What are you trying to do?"
+      description: |
+        The situation or task, and what is hard or impossible today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: "What would you like it to do?"
+      description: |
+        How you imagine it working. A rough sketch is fine.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "What do you do today instead?"
+      description: |
+        Workarounds, other tools.
+    validations:
+      required: false
