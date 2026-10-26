@@ -67,6 +67,14 @@ case "$RESP" in
             logger -t guarddog-alert -- \
                 "NOT SENT (console returned HTTP ${CODE} with an EMPTY BODY on :${CONSOLE_PORT} -- alert endpoint is misrouted, this is a bug): ${SUBJ}" 2>/dev/null
         fi ;;
+    # ops #228: held by a quiet window (T&E, a drill, Update Now). NOT delivered, so exit 3:
+    # a watcher that gates its episode on delivery keeps it open and alerts after the
+    # window if the fault is still there. Must sit above the suppressed match — a held
+    # reply carries "suppressed": true as well.
+    *'"held": true'*|*'"held":true'*)
+        logger -t guarddog-alert -- \
+            "HELD by Guard Dog quiet window (planned work in progress): ${SUBJ}" 2>/dev/null
+        _RC=3 ;;
     *'"suppressed": true'*|*'"suppressed":true'*)
         logger -t guarddog-alert -- \
             "SUPPRESSED by console (no recipient configured, or relay declined): ${SUBJ}" 2>/dev/null ;;
@@ -79,7 +87,7 @@ esac
 
 # v10.1.58 W13: report DELIVERY STATUS to the caller.
 #   0 = delivered, or deliberately suppressed (no recipient configured)
-#   3 = NOT sent (console unreachable, misrouted, or an error)
+#   3 = NOT sent (console unreachable, misrouted, an error, or held by a quiet window)
 #
 # Until now this always exited 0, so a watcher had no way to know its alert had
 # been dropped. Watchers gate themselves with an "alert once per episode" state

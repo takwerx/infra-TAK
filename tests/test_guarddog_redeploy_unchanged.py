@@ -92,7 +92,7 @@ def h(tmp_path):
 
     # Every script the deploy list names, with a placeholder so rendering matters.
     names = [n.strip(" '\"") for n in
-             __import__('re').findall(r"'((?:_gd-|send-|tak-)[\w.-]+\.(?:sh|py))'",
+             __import__('re').findall(r"'((?:_gd-|gd-|send-|tak-)[\w.-]+\.(?:sh|py))'",
                                       SRC[:SRC.index('# Optional: monitors')])]
     for n in set(names):
         (scripts / n).write_text(f'#!/bin/bash\n# {n}\nV=CONSOLE_VERSION_PLACEHOLDER\n')
