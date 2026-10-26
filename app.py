@@ -1331,12 +1331,16 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # on 0.80.0, and a 0.74.4 → 0.80.0 upgrade with existing users, PAT, setup keys and peers intact.
 # Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.74.4 / v2.90.4; the pin-
 # restore heal converges boxes back on console boot. 0.74.4 was checked to start clean on a
-# 0.80-migrated store (users, PAT, setup keys, peers intact). Upstream latest is 0.81.x; not
-# under trial yet.
+# 0.80-migrated store (users, PAT, setup keys, peers intact).
+# ops #208: 0.81.4 / v2.95.0 UNDER TRIAL on dev (T&E only, not promoted). 0.81.0 changes the
+# login path (strict base64url JWT decoding, single-use OIDC handoff codes for the proxy) and
+# 0.81.4 distrusts the eMudhra CA keys. No config.yaml schema change; the store only gains
+# columns (peer MAC, cert posture, per-target access); the rollback drill checks 0.80.0 still
+# starts clean on a 0.81-migrated store.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.80.0"  # == vetted until a newer pair is under trial
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.94.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.81.4"  # UNDER TRIAL (ops #208)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.95.0"
 
 
 def _get_netbird_target_images(settings=None):
