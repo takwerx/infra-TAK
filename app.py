@@ -10469,13 +10469,36 @@ def console_power_api():
     data = request.get_json(silent=True) or {}
     action = (data.get('action') or '').strip()
     password = data.get('password') or ''
+    target = (data.get('target') or 'this_host').strip()
     if action not in ('poweroff', 'reboot'):
         return jsonify({'success': False, 'error': 'action must be "poweroff" or "reboot".'}), 400
+    if target not in ('this_host', 'tak_db', 'fedhub'):
+        return jsonify({'success': False, 'error': 'unknown target.'}), 400
+    # A remote host can only be rebooted, never powered off: there is no way to power
+    # it back on from here, and the console would have lost the box with no recovery.
+    if target != 'this_host' and action != 'reboot':
+        return jsonify({'success': False, 'error': 'A remote host can only be rebooted from the console.'}), 400
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'success': False, 'error': 'Incorrect console password.', 'need_password': True}), 403
-    _detached_power_action(action, delay=2)
-    return jsonify({'success': True, 'action': action})
+    if target == 'this_host':
+        _detached_power_action(action, delay=2)
+        return jsonify({'success': True, 'action': action, 'target': target})
+    settings = load_settings()
+    if target == 'tak_db':
+        cfg = _get_tak_deployment_config(settings)
+        remote = cfg.get('server_one', {}) if cfg.get('mode') == 'two_server' else {}
+    else:
+        fh = _get_fedhub_deployment_config(settings)
+        remote = fh.get('remote', {}) if fh.get('deployed') and fh.get('target_mode') == 'remote' else {}
+    if not (remote.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'That host is not configured.'}), 400
+    # Detach on the far side so ssh returns cleanly before the box goes down.
+    ok, out = _ssh_probe(remote, "nohup sh -c 'sleep 2; sudo systemctl reboot' >/dev/null 2>&1 &", timeout=15)
+    if not ok:
+        return jsonify({'success': False, 'error': (out or 'ssh failed')[:300]}), 500
+    print(f"[audit] remote reboot requested target={target} host={remote.get('host')}", flush=True)
+    return jsonify({'success': True, 'action': action, 'target': target})
 
 
 _CONSOLE_UNIT = '/etc/systemd/system/takwerx-console.service'
