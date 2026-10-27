@@ -39550,7 +39550,14 @@ def _takportal_install_sudoers(log_fn=None):
             log_fn(f"  ✗ TAK Portal sudo grant NOT installed: {r}")
         return False, str(r)
     if log_fn:
-        log_fn("  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal)")
+        _r = r if isinstance(r, dict) else {}
+        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'legacy'})")
+        if _r.get('variant') == 'legacy':
+            log_fn(f"  ⚠ legacy (root-equivalent) grant kept: {_r.get('variant_reason')}")
+        if _r.get('removed_leftover'):
+            log_fn("  ✓ removed leftover /etc/sudoers.d/tak-portal-marketplace (NOPASSWD: ALL from TAK Portal <2.0.19)")
+        if _r.get('variant') == 'hardened' and not _r.get('helper_granted'):
+            log_fn(f"  ⚠ CloudTAK marketplace helper not granted: {_r.get('helper_reason') or 'not installed'}")
     return True, 'installed'
 
 
@@ -40329,8 +40336,15 @@ def takportal_ssh_status():
     if ok and isinstance(grant, dict):
         if not grant.get('supported'):
             row('Sudo grant', 'na', grant.get('reason') or 'not supported here')
+        elif grant.get('present') and grant.get('matches') and grant.get('variant') == 'legacy':
+            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (legacy, root-equivalent)',
+                (grant.get('variant_reason') or 'TAK Portal is older than 2.0.19') +
+                '. Update TAK Portal, then run Repair.')
         elif grant.get('present') and grant.get('matches'):
-            row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current)')
+            _h = (grant.get('helper') or {})
+            row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
+                '' if _h.get('granted') else
+                'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
                 'Run Repair to rewrite it.')

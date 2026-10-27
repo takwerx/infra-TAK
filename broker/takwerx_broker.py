@@ -2683,6 +2683,31 @@ TAKPORTAL_SUDOERS_PATH = '/etc/sudoers.d/tak-portal'
 TAKPORTAL_REPAIR_SCRIPT = '/opt/tak/utils/tak-portal-repair-certs.sh'
 TAKPORTAL_CORECONFIG = '/opt/tak/CoreConfig.xml'
 TAKPORTAL_TAK_USER = 'tak'
+
+# The HARDENED grant (TAK Portal 2.0.19+): least privilege for the portal's SSH user.
+#   * no rule for the portal repair script (nothing under a directory the `tak`
+#     user owns is ever run as root);
+#   * CoreConfig `cat`/`tee` still match the exact commands the portal sends
+#     (`sudo -n cat|tee /opt/tak/CoreConfig.xml`), but they resolve — through a
+#     per-user secure_path — to ROOT-OWNED wrappers that drop to `tak` before
+#     touching the file;
+#   * the marketplace helper is installed from a PINNED sha256 and granted by
+#     exact path.
+# Boxes whose TAK Portal is older than 2.0.19 keep the legacy text (their
+# marketplace needs it) until the portal is updated.
+TAKPORTAL_LIBEXEC = '/usr/local/libexec/infratak'
+TAKPORTAL_WRAP_DIR = TAKPORTAL_LIBEXEC + '/portal-bin'
+TAKPORTAL_WRAPPED = ('cat', 'tee')
+TAKPORTAL_HELPER = '/usr/local/libexec/tak-portal/marketplace-helper'
+TAKPORTAL_LEFTOVER_SUDOERS = '/etc/sudoers.d/tak-portal-marketplace'
+TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
+# sha256 of host-helpers/marketplace-helper in TAK Portal releases 2.0.19-2.0.21
+# (ValleyTacticalSolutions/TAK-Portal). The helper is granted as root, so we only
+# ever install bytes we have reviewed; a portal that ships a different helper gets
+# it granted after the new hash is added here (with a /module-scan), never before.
+TAKPORTAL_HELPER_SHA256 = frozenset({
+    'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
+})
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
 # born-non-root box the directory is 0750 root:root anyway. Without it the UI
@@ -2733,8 +2758,13 @@ def _sudoers_safe_binaries(name):
     return out
 
 
-def _takportal_sudoers_text(user=BROKER_USER):
+def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
     """The ONE definition of the grant.
+
+    variant 'legacy'   — the v10.1.53 text, for a TAK Portal older than 2.0.19.
+    variant 'hardened' — ops #217: no script rules, CoreConfig cat/tee through
+                         root-owned wrappers that drop to `tak`, and (helper=True)
+                         the pinned marketplace helper.
 
     app.py imports THIS function for the root-console path rather than keeping its
     own copy, so the two can never drift — a drifted sudoers template is a
@@ -2745,6 +2775,10 @@ def _takportal_sudoers_text(user=BROKER_USER):
     binaries)."""
     if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
+    if variant == 'hardened':
+        return _takportal_hardened_text(user, helper)
+    if variant != 'legacy':
+        raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
     lines = [
         '# Managed by infra-TAK (v10.1.53). Do not edit by hand.',
         '#',
@@ -2773,6 +2807,228 @@ def _takportal_sudoers_text(user=BROKER_USER):
     # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
     lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
     return '\n'.join(lines) + '\n'
+
+
+def _takportal_hardened_text(user, helper):
+    """The hardened grant (ops #217). See the comment above TAKPORTAL_LIBEXEC."""
+    lines = [
+        '# Managed by infra-TAK (ops #217). Do not edit by hand.',
+        '#',
+        '# TAK Portal 2.0.19+. Nothing here runs a file that the `tak` user can',
+        '# write as root: no rule for the portal repair script, and the CoreConfig',
+        '# cat/tee below resolve (secure_path) to root-owned wrappers in',
+        f'# {TAKPORTAL_WRAP_DIR} that drop to `tak` first, so root never',
+        '# reads or writes through a path the `tak` user controls.',
+        f'Defaults:{user} !requiretty',
+        f'Defaults:{user} secure_path="{TAKPORTAL_WRAP_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+    ]
+    systemctl = _sudoers_safe_binaries('systemctl')
+    if not systemctl:
+        raise Denied(f'takportal_sudoers: cannot resolve a root-owned systemctl in {_SUDOERS_BIN_DIRS}')
+    for name in TAKPORTAL_WRAPPED:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_WRAP_DIR}/{name} {TAKPORTAL_CORECONFIG}')
+    for p in systemctl:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
+    # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
+    lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
+    if helper:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_HELPER}')
+    return '\n'.join(lines) + '\n'
+
+
+def _takportal_wrapper_text(name):
+    """Body of the root-owned wrapper for `cat` / `tee` (see TAKPORTAL_LIBEXEC)."""
+    real = (_sudoers_safe_binaries(name) or [None])[0]
+    setpriv = (_sudoers_safe_binaries('setpriv') or [None])[0]
+    if not real or not setpriv:
+        raise Denied(f'takportal_sudoers: cannot resolve a root-owned {name}/setpriv '
+                     f'in {_SUDOERS_BIN_DIRS}')
+    return (
+        '#!/bin/sh\n'
+        '# Managed by infra-TAK (ops #217). Do not edit by hand.\n'
+        "# TAK Portal's `sudo -n " + name + " " + TAKPORTAL_CORECONFIG + "` lands here: sudo searches\n"
+        '# this directory first for the portal user (secure_path in\n'
+        '# /etc/sudoers.d/tak-portal). Run as root with exactly that one argument,\n'
+        f'# the real {name} runs AS `{TAKPORTAL_TAK_USER}`, so root never reads or writes through\n'
+        '# a path that user controls. Anything else runs unchanged\n'
+        '# (commands sudo starts as `tak` inherit the same PATH).\n'
+        f'if [ "$(id -u)" = 0 ] && [ "$#" -eq 1 ] && [ "$1" = \'{TAKPORTAL_CORECONFIG}\' ]; then\n'
+        f'  exec {setpriv} --reuid={TAKPORTAL_TAK_USER} --regid={TAKPORTAL_TAK_USER} --init-groups {real} -- "$1"\n'
+        'fi\n'
+        f'exec {real} "$@"\n'
+    )
+
+
+def _root_dir_chain_ok(path):
+    """True when every component of `path` is a real directory (no symlink),
+    owned by root and not writable by group/other."""
+    cur = '/'
+    parts = [c for c in path.split('/') if c]
+    for c in [''] + parts:
+        cur = os.path.join(cur, c) if c else '/'
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+    return True
+
+
+def _ensure_root_dir(path):
+    """Create `path` (0755 root:root) when missing; Denied if any component that
+    exists is not a root-owned, non-writable, non-symlink directory."""
+    cur = '/'
+    for c in [c for c in path.split('/') if c]:
+        cur = os.path.join(cur, c)
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            os.mkdir(cur, 0o755)
+            os.chown(cur, 0, 0)
+            os.chmod(cur, 0o755)
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            raise Denied(f'takportal_sudoers: {cur} is not a root-owned, non-writable '
+                         'directory — refusing to place a root-run file under it')
+
+
+def _write_root_file(path, data, mode):
+    """Atomically install `data` at `path` as root:root `mode` (same-dir rename)."""
+    _ensure_root_dir(os.path.dirname(path))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.infratak-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _root_file_ok(path, want_sha256=None, want_bytes=None):
+    """A regular, root-owned file nobody else can write, in a root-only
+    directory chain, whose content matches (bytes, or one of a set of sha256)."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+        if not _root_dir_chain_ok(os.path.dirname(path)):
+            return False
+        with open(path, 'rb') as f:
+            data = f.read(1 << 20)
+    except OSError:
+        return False
+    if want_bytes is not None:
+        return data == want_bytes
+    return hashlib.sha256(data).hexdigest() in (want_sha256 or ())
+
+
+def _takportal_wrappers_ok():
+    try:
+        return all(_root_file_ok(f'{TAKPORTAL_WRAP_DIR}/{n}', want_bytes=_takportal_wrapper_text(n).encode())
+                   for n in TAKPORTAL_WRAPPED)
+    except Denied:
+        return False
+
+
+def _takportal_install_wrappers():
+    for n in TAKPORTAL_WRAPPED:
+        _write_root_file(f'{TAKPORTAL_WRAP_DIR}/{n}', _takportal_wrapper_text(n).encode(), 0o755)
+    if not _takportal_wrappers_ok():
+        raise Denied('takportal_sudoers: wrapper install did not verify (not root-owned/unwritable) '
+                     '— refusing to grant')
+
+
+def _read_small_nofollow(path, limit=1 << 20):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('not a regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as f:
+            return f.read(limit + 1)[:limit]
+    finally:
+        os.close(fd)
+
+
+def _takportal_version_tuple(ver):
+    m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)', str(ver or '').strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _takportal_decide(user=BROKER_USER):
+    """Which grant this box gets, from the TAK Portal checkout in the console
+    user's home. Read as root from a directory that user controls, so: no git
+    (config hooks run code), O_NOFOLLOW, size-capped, and the helper bytes are
+    only ever USED if they hash to a pinned value.
+
+    The checkout is operator-writable, so this selects between two grants, it is
+    not an authority: a box where the portal is old stays on the legacy text by
+    design (AJ, ops #16), and the status row says so."""
+    out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
+           'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found'}
+    try:
+        portal = os.path.join(pwd.getpwnam(user).pw_dir, 'TAK-Portal')
+    except KeyError:
+        return out
+    if os.path.islink(portal) or not os.path.isdir(portal):
+        return out
+    ver = ''
+    try:
+        ver = str((json.loads(_read_small_nofollow(os.path.join(portal, 'package.json')).decode('utf-8', 'replace'))
+                   or {}).get('version') or '')
+    except (OSError, ValueError, AttributeError):
+        pass
+    out['portal_version'] = ver
+    try:
+        data = _read_small_nofollow(os.path.join(portal, 'host-helpers', 'marketplace-helper'), 262144)
+    except OSError:
+        data = None
+    if data is not None:
+        if hashlib.sha256(data).hexdigest() in TAKPORTAL_HELPER_SHA256:
+            out['helper_bytes'] = data
+            out['helper_reason'] = ''
+        else:
+            out['helper_reason'] = ('this TAK Portal ships a marketplace helper infra-TAK has not '
+                                    'reviewed (sha256 not pinned)')
+    else:
+        out['helper_reason'] = 'no host-helpers/marketplace-helper in the TAK Portal checkout'
+    tup = _takportal_version_tuple(ver)
+    # The helper file only exists from 2.0.19, so it also proves "new enough"
+    # when package.json lags (upstream has shipped a release without bumping it).
+    if data is None and tup is not None and tup < TAKPORTAL_HARDENED_MIN_VERSION:
+        out['variant'] = 'legacy'
+        out['reason'] = (f'TAK Portal {ver} is older than '
+                         f'{".".join(map(str, TAKPORTAL_HARDENED_MIN_VERSION))} — its marketplace '
+                         'still needs the legacy grant; update TAK Portal to tighten it')
+    else:
+        out['reason'] = f'TAK Portal {ver or "version unknown"}'
+    return out
+
+
+def _takportal_helper_ok():
+    return _root_file_ok(TAKPORTAL_HELPER, want_sha256=TAKPORTAL_HELPER_SHA256)
+
+
+def _takportal_remove_leftover():
+    """Drop TAK Portal <2.0.19's `NOPASSWD: ALL` marketplace drop-in. True when
+    a file was removed."""
+    try:
+        st = os.lstat(TAKPORTAL_LEFTOVER_SUDOERS)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    os.unlink(TAKPORTAL_LEFTOVER_SUDOERS)
+    return True
 
 
 def _takportal_sudoers_supported():
@@ -2810,7 +3066,12 @@ def _check_takportal_sudoers(req):
     ok, why = _takportal_sudoers_supported()
     if not ok:
         raise Denied(f'takportal_sudoers: {why}')
-    _takportal_sudoers_text()          # raises Denied if the text cannot be built
+    # raises Denied if the text (or, hardened, a wrapper) cannot be built
+    variant = _takportal_decide()['variant']
+    _takportal_sudoers_text(variant=variant)
+    if variant == 'hardened':
+        for n in TAKPORTAL_WRAPPED:
+            _takportal_wrapper_text(n)
 
 
 def _do_takportal_sudoers(req):
@@ -2820,6 +3081,13 @@ def _do_takportal_sudoers(req):
         present = os.path.exists(TAKPORTAL_SUDOERS_PATH)
         matches = False
         mode = ''
+        decision = _takportal_decide()
+        variant = decision['variant']
+        helper_ok = _takportal_helper_ok()
+        hardened = (variant == 'hardened')
+        wrappers_ok = _takportal_wrappers_ok() if hardened else True
+        # An install would still have to put the helper in place.
+        helper_pending = hardened and decision['helper_bytes'] is not None and not helper_ok
         if present:
             try:
                 with open(TAKPORTAL_SUDOERS_PATH) as f:
@@ -2827,12 +3095,30 @@ def _do_takportal_sudoers(req):
                 st = os.stat(TAKPORTAL_SUDOERS_PATH)
                 mode = oct(st.st_mode & 0o777)
                 if ok:
-                    matches = (current == _takportal_sudoers_text())
-            except OSError:
+                    matches = (current == _takportal_sudoers_text(
+                        variant=variant, helper=(hardened and helper_ok))
+                        and wrappers_ok and not helper_pending)
+            except (OSError, Denied):
                 pass
         return {'ok': True, 'present': present, 'matches': matches, 'mode': mode,
-                'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH}
+                'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH,
+                'variant': variant, 'variant_reason': decision['reason'],
+                'wrappers_ok': wrappers_ok,
+                'helper': {'granted': bool(hardened and helper_ok),
+                           'installed': helper_ok, 'reason': decision['helper_reason']},
+                'leftover_marketplace_sudoers': os.path.lexists(TAKPORTAL_LEFTOVER_SUDOERS)}
     if action == 'remove':
+        # The wrappers and the helper exist only for this grant; they go with it.
+        for n in TAKPORTAL_WRAPPED:
+            try:
+                os.unlink(f'{TAKPORTAL_WRAP_DIR}/{n}')
+            except OSError:
+                pass
+        if _takportal_helper_ok():
+            try:
+                os.unlink(TAKPORTAL_HELPER)
+            except OSError:
+                pass
         try:
             os.unlink(TAKPORTAL_SUDOERS_PATH)
             return {'ok': True, 'removed': True, 'path': TAKPORTAL_SUDOERS_PATH}
@@ -2842,7 +3128,21 @@ def _do_takportal_sudoers(req):
         except OSError as e:
             return {'ok': False, 'error': f'could not remove {TAKPORTAL_SUDOERS_PATH}: {e}'}
 
-    content = _takportal_sudoers_text()
+    decision = _takportal_decide()
+    variant = decision['variant']
+    helper_granted = False
+    if variant == 'hardened':
+        # Root-owned, tak-unwritable files FIRST; the grant only goes in once
+        # they verify, so a half-installed hardened grant can never exist.
+        try:
+            _takportal_install_wrappers()
+            if decision['helper_bytes'] is not None:
+                if not _takportal_helper_ok():
+                    _write_root_file(TAKPORTAL_HELPER, decision['helper_bytes'], 0o755)
+            helper_granted = _takportal_helper_ok()
+        except (OSError, Denied) as e:
+            return {'ok': False, 'error': f'hardened TAK Portal grant not installed: {e}'}
+    content = _takportal_sudoers_text(variant=variant, helper=helper_granted)
     # Stage in /etc so os.replace() is an atomic same-filesystem rename, and so a
     # half-written file is never visible inside sudoers.d (sudo reads every file
     # in that directory on every invocation).
@@ -2864,7 +3164,19 @@ def _do_takportal_sudoers(req):
                              + ((chk.stderr or chk.stdout or '').strip()[:300])}
         os.replace(tmp, TAKPORTAL_SUDOERS_PATH)
         tmp = None
-        return {'ok': True, 'path': TAKPORTAL_SUDOERS_PATH, 'content': content}
+        removed = False
+        if variant == 'hardened':
+            # TAK Portal <2.0.19 wrote a NOPASSWD: ALL drop-in here; the
+            # hardened grant must not sit beside it.
+            try:
+                removed = _takportal_remove_leftover()
+            except OSError as e:
+                return {'ok': False, 'error': f'grant installed but could not remove '
+                                              f'{TAKPORTAL_LEFTOVER_SUDOERS}: {e}'}
+        return {'ok': True, 'path': TAKPORTAL_SUDOERS_PATH, 'content': content,
+                'variant': variant, 'variant_reason': decision['reason'],
+                'helper_granted': helper_granted, 'helper_reason': decision['helper_reason'],
+                'removed_leftover': removed}
     finally:
         if tmp:
             try:
