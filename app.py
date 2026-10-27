@@ -23502,6 +23502,9 @@ def _f2b_rewrite_all_jails():
         c = _f2b_read_recidive_config()
         _f2b_write_recidive_config(c['maxretry'], c['findtime'])
         done.append('recidive')
+    if os.path.exists(_F2B_MANUAL_JAIL_PATH):
+        _f2b_manual_ensure_jail()
+        done.append(_F2B_MANUAL_JAIL)
     return done
 
 
@@ -23602,7 +23605,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         # 2026-10-21: the same for takserver bans, now TAK-ports-only. Its commonest
         # repeat offender is an operator's own phone with an old certificate, which
         # re-trips every hour; escalating that cost the admin the console for 7 days.
-        "ignoreregex = \\[(?:mediamtx-rtsp|takserver)\\] Ban\n"
+        "ignoreregex = \\[(?:mediamtx-rtsp|takserver|infratak-manual)\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -23796,6 +23799,408 @@ def fail2ban_recidive_unban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# --- Manual bans (infra-TAK #313) -------------------------------------------------------
+# An operator-kept list of addresses and ranges to block, with a note, and either for good
+# or for a set number of days. The list lives in settings ('fail2ban_manual_bans') and is
+# the source of truth; a dedicated fail2ban jail ('infratak-manual', bantime -1, no log to
+# match) does the blocking, so it uses the same firewall action as every other jail on
+# Ubuntu and Rocky. Expiry is ours, not fail2ban's: one jail cannot hold a different ban
+# time per address, so _f2b_manual_reconcile() lifts a ban the minute it runs out.
+#
+# This is the one place the console lets an operator block every port for good, so it is
+# built so nobody can lock themselves out by accident: an entry that contains the caller's
+# own address, the box's own addresses, its local/VPN/container networks or anything on the
+# trusted list is refused, and a trusted address added later wins over an older entry.
+_F2B_MANUAL_JAIL = 'infratak-manual'
+_F2B_MANUAL_JAIL_PATH = '/etc/fail2ban/jail.d/infratak-manual.conf'
+_F2B_MANUAL_FILTER_PATH = '/etc/fail2ban/filter.d/infratak-manual.conf'
+_F2B_MANUAL_MAX_ENTRIES = 500
+_F2B_MANUAL_MAX_NOTE = 200
+_F2B_MANUAL_MAX_DAYS = 3650
+_F2B_MANUAL_MIN_PREFIX = 8              # refuse anything wider than a /8
+_F2B_MANUAL_LOCK = threading.RLock()
+_F2B_MANUAL_FILTER = (
+    "[Definition]\n"
+    "# infra-TAK Manual bans. Addresses are added with `fail2ban-client set infratak-manual\n"
+    "# banip`, never found in a log, so this pattern is built to match nothing.\n"
+    "failregex = ^infratak-manual-bans-never-matches-a-log-line <HOST>$\n"
+    "ignoreregex =\n"
+)
+
+
+def _f2b_manual_jail_text():
+    return (
+        "[infratak-manual]\n"
+        "enabled  = true\n"
+        "filter   = infratak-manual\n"
+        "logpath  = /var/log/fail2ban.log\n"
+        "maxretry = 1\n"
+        "findtime = 60\n"
+        "bantime  = -1\n"
+        f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+        f"action   = {_f2b_banaction()}\n"
+    )
+
+
+def _f2b_manual_net(text):
+    """Parse an address or range into a network (a single host stays a host). Raises
+    ValueError with a sentence an operator can act on."""
+    s = str(text or '').strip()
+    if not s or len(s) > 64 or not re.fullmatch(r'[0-9A-Fa-f:.]+(?:/\d{1,3})?', s):
+        raise ValueError('Enter an IP address or a range like 203.0.113.0/24.')
+    try:
+        net = ipaddress.ip_network(s, strict=True)
+    except ValueError as e:
+        if 'host bits' in str(e):
+            try:
+                suggest = str(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                suggest = ''
+            raise ValueError('That range has extra bits set' + (f' — did you mean {suggest}?' if suggest else '.'))
+        raise ValueError('Enter an IP address or a range like 203.0.113.0/24.')
+    if net.version != 4:
+        # fail2ban's ufw action cannot add an IPv6 rule while IPv4 rules exist ("Invalid
+        # position '1'", tested on Ubuntu 24.04 / ufw 0.36), and iptables-allports on Rocky
+        # is IPv4 only. Say so rather than list a ban the firewall is not enforcing.
+        raise ValueError('IPv6 addresses can\'t be banned here yet: the firewall rule infra-TAK '
+                         'uses only blocks IPv4.')
+    if net.prefixlen < _F2B_MANUAL_MIN_PREFIX:
+        raise ValueError('That range is too wide to ban by hand '
+                         f'(smallest allowed is /{_F2B_MANUAL_MIN_PREFIX}).')
+    return net
+
+
+def _f2b_manual_label(net):
+    """How an entry is written and shown: a bare address for one host, CIDR for a range."""
+    return str(net.network_address) if net.num_addresses == 1 else str(net)
+
+
+def _f2b_manual_overlap(net, others):
+    """The first of `others` (address or CIDR strings) that shares any address with `net`."""
+    for o in others:
+        try:
+            other = ipaddress.ip_network(str(o).strip(), strict=False)
+        except ValueError:
+            continue
+        if other.version == net.version and net.overlaps(other):
+            return str(o).strip()
+    return None
+
+
+def _f2b_manual_protected_reason(net, client_ip=''):
+    """Why this entry must not be banned, or None. Used when adding AND at every
+    reconcile, so a trusted address added later still wins over an older entry."""
+    if client_ip:
+        hit = _f2b_manual_overlap(net, [client_ip])
+        if hit:
+            return (f'That includes your own address ({client_ip}). Banning it would block you '
+                    'from this console.')
+    hit = _f2b_manual_overlap(net, _f2b_trusted_ignoreip().split())
+    if hit:
+        return (f'That includes {hit}, which is on this box\'s never-ban list (this server, its '
+                'local networks, or a trusted network you added), so banning it could cut the '
+                'box off. If it is a trusted network you added, remove it from Trusted '
+                'Upstream Networks first.')
+    return None
+
+
+def _f2b_manual_load():
+    raw = load_settings().get('fail2ban_manual_bans')
+    out = []
+    for e in (raw if isinstance(raw, list) else []):
+        if not isinstance(e, dict):
+            continue
+        try:
+            net = _f2b_manual_net(e.get('target'))
+        except ValueError:
+            continue
+        exp = e.get('expires')
+        out.append({
+            'id': str(e.get('id') or secrets.token_hex(6)),
+            'target': _f2b_manual_label(net),
+            'note': str(e.get('note') or '')[:_F2B_MANUAL_MAX_NOTE],
+            'created': int(e.get('created') or 0),
+            'expires': int(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None,
+        })
+    return out
+
+
+def _f2b_manual_save(entries):
+    s = load_settings()
+    s['fail2ban_manual_bans'] = entries
+    save_settings(s)
+
+
+def _f2b_manual_active(entries, now=None):
+    now = time.time() if now is None else now
+    return [e for e in entries if e['expires'] is None or e['expires'] > now]
+
+
+def _f2b_manual_banned():
+    """Targets the jail is blocking right now, as {network: text fail2ban uses for it}.
+    None when it cannot be read (jail not loaded, daemon down)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', _F2B_MANUAL_JAIL]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for tok in _f2b_parse_status(r.stdout)['banned_ips']:
+        try:
+            out[ipaddress.ip_network(tok, strict=False)] = tok
+        except ValueError:
+            continue
+    return out
+
+
+def _f2b_manual_enforced(banned):
+    """The part of `banned` the firewall is really enforcing. fail2ban keeps its own list, so a
+    rule removed by hand (or one ufw refused) leaves an address listed as banned and connecting
+    freely. Where the firewall can be read (ufw) check it; elsewhere trust fail2ban."""
+    if not banned:
+        return banned
+    blocked = _f2b_ufw_blocked_ips()
+    if blocked is None:
+        return banned
+    return {net: text for net, text in banned.items()
+            if text in blocked or _f2b_manual_label(net) in blocked}
+
+
+def _f2b_manual_ensure_jail():
+    """Write the jail and filter when missing or out of date (the never-ban list is baked
+    in) and make fail2ban load them. Returns an error string, or '' on success."""
+    try:
+        want = _f2b_manual_jail_text()
+        try:
+            have = _read_priv(_F2B_MANUAL_JAIL_PATH)
+        except Exception:
+            have = ''
+        try:
+            have_filter = _read_priv(_F2B_MANUAL_FILTER_PATH)
+        except Exception:
+            have_filter = ''
+        changed = False
+        if have_filter != _F2B_MANUAL_FILTER:
+            _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+            _write_priv(_F2B_MANUAL_FILTER_PATH, _F2B_MANUAL_FILTER)
+            changed = True
+        if have != want:
+            _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+            _write_priv(_F2B_MANUAL_JAIL_PATH, want)
+            changed = True
+        # Repeat Offender Protection reads every jail's "Ban" lines. Without this exemption it
+        # would ban a manual entry a second time for 7 days, and lift the firewall rule both
+        # bans share when that one runs out - ending a permanent manual ban early.
+        if _f2b_recidive_enabled():
+            _rec = _f2b_read_text('/etc/fail2ban/jail.d/infratak-recidive.conf')
+            if _rec is not None and _F2B_MANUAL_JAIL not in _rec:
+                _rc = _f2b_read_recidive_config()
+                _f2b_write_recidive_config(_rc['maxretry'], _rc['findtime'])
+                changed = True
+        if changed or _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+            subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']),
+                           capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, timeout=30)
+        if _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+            return 'fail2ban did not load the manual-bans jail'
+    except Exception as e:
+        return str(e)[:200]
+    return ''
+
+
+def _f2b_manual_reconcile():
+    """Make the jail match the list: ban what is missing, lift what is gone, expired or
+    now protected. Safe to run any time and from several workers. Returns
+    {'errors': [...], 'banned': {network: text} or None}."""
+    with _F2B_MANUAL_LOCK:
+        errors = []
+        if not _f2b_is_available():
+            return {'errors': ['fail2ban not installed'], 'banned': None}
+        entries = _f2b_manual_load()
+        desired = {}
+        for e in _f2b_manual_active(entries):
+            net = _f2b_manual_net(e['target'])
+            if _f2b_manual_protected_reason(net):
+                continue
+            desired[net] = e['target']
+        if not desired and not os.path.exists(_F2B_MANUAL_JAIL_PATH):
+            return {'errors': [], 'banned': {}}
+        err = _f2b_manual_ensure_jail()
+        if err:
+            return {'errors': [err], 'banned': None}
+        banned = _f2b_manual_banned()
+        if banned is None:
+            return {'errors': ['could not read the manual-bans jail'], 'banned': None}
+        enforced = _f2b_manual_enforced(banned)
+        for net, text in desired.items():
+            if net in banned and net in enforced:
+                continue
+            if net in banned:
+                # listed by fail2ban but missing from the firewall: clear it so it is re-added
+                subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'unbanip', text]),
+                               capture_output=True, text=True, timeout=15)
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'banip', text]),
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                errors.append(f'{text}: {(r.stderr or r.stdout).strip()[:120] or "ban failed"}')
+        for net, text in list(banned.items()):
+            if net in desired:
+                continue
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'unbanip', text]),
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                errors.append(f'{text}: {(r.stderr or r.stdout).strip()[:120] or "unban failed"}')
+        return {'errors': errors, 'banned': _f2b_manual_enforced(_f2b_manual_banned())}
+
+
+def _f2b_manual_view(e, banned, client_ip='', now=None):
+    now = time.time() if now is None else now
+    net = _f2b_manual_net(e['target'])
+    if e['expires'] is not None and e['expires'] <= now:
+        state = 'expired'
+    elif _f2b_manual_protected_reason(net, client_ip):
+        state = 'protected'
+    elif banned is not None and net in banned:
+        state = 'banned'
+    else:
+        state = 'pending'
+    return dict(e, state=state, permanent=e['expires'] is None)
+
+
+def _f2b_manual_days(raw):
+    """Expiry time (epoch seconds) for a number of days from now; None (permanent) for
+    null/0/''. Raises ValueError."""
+    if raw is None or raw == '' or raw == 0 or raw == '0':
+        return None
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError('Days must be a whole number.')
+    if days < 1 or days > _F2B_MANUAL_MAX_DAYS:
+        raise ValueError(f'Days must be between 1 and {_F2B_MANUAL_MAX_DAYS}, or choose permanent.')
+    return int(time.time()) + days * 86400
+
+
+def _f2b_manual_clean_note(raw):
+    note = re.sub(r'[\x00-\x20\x7f]+', ' ', str(raw or '')).strip()
+    if len(note) > _F2B_MANUAL_MAX_NOTE:
+        raise ValueError(f'Keep the note under {_F2B_MANUAL_MAX_NOTE} characters.')
+    return note
+
+
+@app.route('/api/fail2ban/manual-bans', methods=['GET', 'POST'])
+@login_required
+def fail2ban_manual_bans_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    client_ip = _f2b_console_client_ip()
+    if request.method == 'GET':
+        banned = _f2b_manual_enforced(_f2b_manual_banned())
+        return jsonify({'ok': True, 'client_ip': client_ip,
+                        'bans': [_f2b_manual_view(e, banned, client_ip) for e in _f2b_manual_load()]})
+    data = request.get_json(silent=True) or {}
+    try:
+        net = _f2b_manual_net(data.get('target'))
+        note = _f2b_manual_clean_note(data.get('note'))
+        expires = _f2b_manual_days(data.get('days'))
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    why = _f2b_manual_protected_reason(net, client_ip)
+    if why:
+        return jsonify({'ok': False, 'error': why}), 400
+    with _F2B_MANUAL_LOCK:
+        entries = _f2b_manual_load()
+        if len(entries) >= _F2B_MANUAL_MAX_ENTRIES:
+            return jsonify({'ok': False, 'error': f'The list is full ({_F2B_MANUAL_MAX_ENTRIES}). Remove some first.'}), 400
+        if any(e['target'] == _f2b_manual_label(net) for e in entries):
+            return jsonify({'ok': False, 'error': f'{_f2b_manual_label(net)} is already on the list. Edit it instead.'}), 400
+        entry = {'id': secrets.token_hex(6), 'target': _f2b_manual_label(net), 'note': note,
+                 'created': int(time.time()), 'expires': expires}
+        _f2b_manual_save(entries + [entry])
+        res = _f2b_manual_reconcile()
+        banned = res['banned']
+        if banned is None or net not in banned:
+            _f2b_manual_save(entries)          # not enforced: do not keep a ban that is not real
+            _f2b_manual_reconcile()
+            return jsonify({'ok': False, 'error': 'fail2ban could not apply the ban: '
+                            + ('; '.join(res['errors']) or 'unknown error')}), 500
+    print(f"fail2ban: manual ban added {entry['target']} "
+          f"({'permanent' if expires is None else 'until ' + str(expires)})", flush=True)
+    audit('fail2ban:manual-ban add', f"{entry['target']} {'permanent' if expires is None else 'expires ' + str(expires)}")
+    return jsonify({'ok': True, 'ban': _f2b_manual_view(entry, banned, client_ip)})
+
+
+@app.route('/api/fail2ban/manual-bans/<ban_id>', methods=['PUT', 'DELETE'])
+@login_required
+def fail2ban_manual_ban_item_api(ban_id):
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    client_ip = _f2b_console_client_ip()
+    with _F2B_MANUAL_LOCK:
+        entries = _f2b_manual_load()
+        cur = next((e for e in entries if e['id'] == ban_id), None)
+        if cur is None:
+            return jsonify({'ok': False, 'error': 'That ban is no longer on the list.'}), 404
+        if request.method == 'DELETE':
+            _f2b_manual_save([e for e in entries if e['id'] != ban_id])
+            res = _f2b_manual_reconcile()
+            print(f"fail2ban: manual ban removed {cur['target']}", flush=True)
+            audit('fail2ban:manual-ban remove', cur['target'])
+            return jsonify({'ok': not res['errors'], 'errors': res['errors']})
+        data = request.get_json(silent=True) or {}
+        new = dict(cur)
+        try:
+            if 'target' in data:
+                net = _f2b_manual_net(data.get('target'))
+                new['target'] = _f2b_manual_label(net)
+                if new['target'] != cur['target']:
+                    if any(e['target'] == new['target'] for e in entries):
+                        raise ValueError(f"{new['target']} is already on the list.")
+                    why = _f2b_manual_protected_reason(net, client_ip)
+                    if why:
+                        raise ValueError(why)
+            if 'note' in data:
+                new['note'] = _f2b_manual_clean_note(data.get('note'))
+            if 'days' in data:
+                new['expires'] = _f2b_manual_days(data.get('days'))
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+        _f2b_manual_save([new if e['id'] == ban_id else e for e in entries])
+        res = _f2b_manual_reconcile()
+        banned = res['banned']
+        new_net = _f2b_manual_net(new['target'])
+        live = bool(_f2b_manual_active([new])) and not _f2b_manual_protected_reason(new_net)
+        if live and (banned is None or new_net not in banned):
+            _f2b_manual_save(entries)
+            _f2b_manual_reconcile()
+            return jsonify({'ok': False, 'error': 'fail2ban could not apply the change: '
+                            + ('; '.join(res['errors']) or 'unknown error')}), 500
+    audit('fail2ban:manual-ban edit', f"{cur['target']} -> {new['target']}")
+    return jsonify({'ok': True, 'ban': _f2b_manual_view(new, banned, client_ip)})
+
+
+def _f2b_manual_loop():
+    """Lift expired bans and re-apply any that fail2ban lost, once a minute."""
+    time.sleep(45)
+    while True:
+        try:
+            if _f2b_is_available() and (_f2b_manual_load() or os.path.exists(_F2B_MANUAL_JAIL_PATH)):
+                res = _f2b_manual_reconcile()
+                if res['errors']:
+                    print('fail2ban: manual bans: ' + '; '.join(res['errors']), flush=True)
+        except Exception as e:
+            print(f'fail2ban: manual bans loop: {e}', flush=True)
+        time.sleep(60)
+
+try:
+    threading.Thread(target=_f2b_manual_loop, daemon=True, name='f2b-manual-bans').start()
+except Exception:
+    pass
+
+
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
@@ -23933,6 +24338,8 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/jail.d/infratak-takserver.conf',
             '/etc/fail2ban/filter.d/authentik.conf',
             '/etc/fail2ban/filter.d/takserver.conf',
+            _F2B_MANUAL_JAIL_PATH,
+            _F2B_MANUAL_FILTER_PATH,
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
