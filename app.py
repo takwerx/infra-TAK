@@ -45756,10 +45756,12 @@ def _cloudtak_remote_custom_compose_sh():
 # ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
 # from its own docker-compose.plugin-print.yml in the CloudTAK project, with `expose: 5010` only
 # and internal URLs (http://cloudtak-api:5000, http://cloudtak-tiles:5002) that don't resolve on
-# a stock CloudTAK project (clptak/cloudtak-plugin-print#2). infra-TAK's Caddy runs on the host
-# and can't reach a container name, so the browser's /print-api had nowhere to go (GH #261's 502).
+# a stock CloudTAK project (clptak/cloudtak-plugin-print#2; upstream PRs #3/#4 fixed the URLs).
+# infra-TAK's Caddy runs on the host and can't reach a container name, so the browser's
+# /print-api had nowhere to go (GH #261's 502).
 #
-# infra-TAK's own small overlay publishes it on loopback and points it at api / tiles. It is
+# infra-TAK's own small overlay publishes it on loopback (ops #235: the URLs are the plugin's own
+# defaults now, so the overlay no longer sets them). It is
 # applied by starting cloudtak-print from base + TAK Portal's file + the overlay (+ the
 # operator's custom file), explicitly, and is deliberately NOT put in COMPOSE_FILE: CloudTAK
 # Update builds every service listed there with --no-cache (Print is a Chromium image, and a
@@ -45779,10 +45781,43 @@ services:
   {CLOUDTAK_PRINT_SERVICE}:
     ports:
       - "127.0.0.1:{CLOUDTAK_PRINT_PORT}:{CLOUDTAK_PRINT_PORT}"
-    environment:
-      - API_INTERNAL_URL=http://api:5000
-      - TILES_INTERNAL_URL=http://tiles:5002
 """
+
+
+# ops #235: the Print plugin (clptak/cloudtak-plugin-print PRs #3/#4) now names its dependencies
+# `${PRINT_API_SERVICE:-api}` / `${PRINT_TILES_SERVICE:-tiles}` / `${PRINT_STORE_SERVICE:-store}`
+# and its internal URLs `${PRINT_API_INTERNAL_URL:-http://api:5000}`, so the stock names are the
+# defaults and the stack's .env can override them. Compose fills those in from ~/CloudTAK/.env
+# when it runs; the check below has to do the same before it compares names with CloudTAK's.
+_CLOUDTAK_COMPOSE_VAR_RE = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-+?])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))')
+
+
+def _cloudtak_compose_interpolate(text, env):
+    """`text` the way Compose reads it: $$ is a literal $, $VAR / ${VAR} take the value from `env`
+    (empty when unset), ${VAR:-d} / ${VAR-d} fall back to d, ${VAR:+r} / ${VAR+r} give r when set.
+    None when a `${VAR:?}` requirement is unmet — Compose would stop there."""
+    bad = []
+
+    def sub(m):
+        if m.group(0) == '$$':
+            return '$'
+        name = m.group(1) or m.group(4)
+        op, arg = m.group(2), m.group(3) or ''
+        val = env.get(name)
+        val = val.strip().strip('"\'') if val is not None else None
+        empty = val is None or (op is not None and op.startswith(':') and val == '')
+        if op in ('-', ':-'):
+            return arg if empty else val
+        if op in ('+', ':+'):
+            return '' if empty else arg
+        if op in ('?', ':?'):
+            if empty:
+                bad.append(name)
+            return val or ''
+        return val or ''
+
+    out = _CLOUDTAK_COMPOSE_VAR_RE.sub(sub, str(text))
+    return None if bad else out
 
 
 def _cloudtak_print_problem(ct_dir):
@@ -45811,13 +45846,37 @@ def _cloudtak_print_problem(ct_dir):
             have = set(((_yaml.safe_load(f) or {}).get('services') or {}).keys())
     except Exception as e:
         return f"CloudTAK's {base} could not be read ({str(e)[:120]})"
-    for need in ('api', 'tiles'):
-        if need not in have:
-            return f"CloudTAK's {base} has no {need} service"
+    env = _cloudtak_env_read(os.path.join(ct_dir, '.env'))
+    # Print reaches CloudTAK's API and tiles by these URLs (the plugin's defaults are the stock
+    # http://api:5000 / http://tiles:5002, overridable from .env); a file that doesn't set them
+    # gets those defaults, so the stock services have to be there.
+    envs = svc.get('environment') or []
+    if isinstance(envs, list):
+        envs = dict(str(e).split('=', 1) for e in envs if '=' in str(e))
+    envs = envs if isinstance(envs, dict) else {}
+    for key, need in (('API_INTERNAL_URL', 'api'), ('TILES_INTERNAL_URL', 'tiles')):
+        url = _cloudtak_compose_interpolate(envs.get(key) or '', env) if envs.get(key) else ''
+        m = re.match(r'[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?\[?([^:/?#\]]+)', url)
+        host = (m.group(1) if m else url) if url else need
+        if host not in have and host not in svcs:
+            return (f"CloudTAK's {base} has no {host} service ({key}); "
+                    "fix it in CloudTAK's .env, or update TAK Portal and reinstall Print" if url else
+                    f"CloudTAK's {base} has no {host} service")
     deps = svc.get('depends_on') or []
-    names = list(deps) if isinstance(deps, (list, dict)) else []
-    missing = sorted(str(n) for n in names if n not in have and n not in svcs)
+    names = []
+    for n in (list(deps) if isinstance(deps, (list, dict)) else []):
+        got = _cloudtak_compose_interpolate(n, env)
+        if got is None:
+            return (f"its depends_on entry {n} needs a value that CloudTAK's .env doesn't set; "
+                    "set it there or reinstall Print")
+        names.append((got, '$' in str(n)))
+    missing = sorted(n for n, _ in names if n not in have and n not in svcs)
     if missing:
+        # the plugin's ${PRINT_*_SERVICE:-default} entries, as CloudTAK's .env resolved them
+        if any(v and n in missing for n, v in names):
+            return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
+                    "PRINT_API_SERVICE / PRINT_TILES_SERVICE / PRINT_STORE_SERVICE in CloudTAK's "
+                    ".env must name CloudTAK's own services")
         return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
                 "a newer TAK Portal release fixes this — reinstall Print after updating TAK Portal")
     return ''
