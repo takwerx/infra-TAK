@@ -1582,12 +1582,15 @@ function _osupRenderPreflight(d){
     var what=(_osupTarget==='dbserver')?'This database server':(_osupTarget==='remotehost'?'This machine':'This box');
     if(intro)intro.textContent=d.ok?'Every check passed. Read the list below, take your snapshot, then type the acknowledgment and your console password.':what+' is not ready — fix the red items and press Re-check. Nothing has been changed.';
     _osupSetStartEnabled(!!d.ok);
-    if(_osupTarget!=='core')_dbsRenderActions(d);
+    _dbsRenderActions(d);
 }
 async function osupLoadPreflight(){
     var intro=document.getElementById('osup-modal-intro'),err=document.getElementById('osup-modal-err');
     if(intro)intro.textContent=(_osupTarget==='dbserver')?'Checking the database server over SSH (up to a minute)…':(_osupTarget==='remotehost'?'Checking '+(_rhHost||'the remote host')+' over SSH (up to a minute)…':'Checking the box…');
     _osupSetStartEnabled(false);
+    var box=document.getElementById('osup-checks'); if(box)box.innerHTML='<div style="color:var(--text-dim)">Running every check again&hellip;</div>';
+    if(err)err.textContent='';
+    _dbsRenderActions(null);
     try{
         var r=await fetch(_osupApi('preflight'),{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
@@ -1718,17 +1721,21 @@ function _dbsRenderActions(pf){
     var ub=document.getElementById('dbs-updates-btn'),rb=document.getElementById('dbs-reboot-btn'),pwb=document.getElementById('dbs-reboot-pw-block'),msg=document.getElementById('dbs-actions-msg');
     if(pwb)pwb.style.display='none';
     var pw=document.getElementById('dbs-reboot-pw'); if(pw)pw.value='';
-    if(!pf||_osupTarget==='core'){ box.style.display='none'; return; }
-    var where=_osupTarget==='remotehost'?(_rhHost||'the remote host'):'the database server';
-    if(rb)rb.textContent=_osupTarget==='remotehost'?'Reboot '+where:'Reboot database server';
+    if(!pf){ box.style.display='none'; return; }
+    var core=_osupTarget==='core';
+    var where=_osupTarget==='remotehost'?(_rhHost||'the remote host'):(core?'this box':'the database server');
+    if(rb)rb.textContent=core?'Reboot this box':(_osupTarget==='remotehost'?'Reboot '+where:'Reboot database server');
     var by={}; (pf.checks||[]).forEach(function(c){by[c.name]=c;});
-    var sshOk=by.ssh_sudo&&by.ssh_sudo.pass, busy=by.no_job_running&&!by.no_job_running.pass;
+    var sshOk=core||(by.ssh_sudo&&by.ssh_sudo.pass), busy=by.no_job_running&&!by.no_job_running.pass;
     var needUpd=!!(by.os_up_to_date&&!by.os_up_to_date.pass&&pf.pending_count);
     var needRb=!!((by.no_reboot_pending&&!by.no_reboot_pending.pass)||pf.reboot_required);
     if(!sshOk||busy||(!needUpd&&!needRb)){ box.style.display='none'; return; }
     if(ub)ub.style.display=needUpd?'inline-block':'none';
     if(rb)rb.style.display=(needRb&&!needUpd)?'inline-block':'none';   // updates first; they may add a reboot
-    if(msg)msg.textContent=_osupTarget==='remotehost'
+    if(msg)msg.textContent=core
+        ?(needUpd?(pf.pending_count||'Some')+' update(s) are pending on this box. Install updates runs the same job as the yellow "Operating system updates available" banner (TAK Server is held). When it finishes, open Check & upgrade again.'
+                 :'This box needs a reboot before Ubuntu\'s upgrader will run. Every connected EUD drops for the minute or two it is down.')
+        :_osupTarget==='remotehost'
         ?(needUpd?pf.pending_count+' update(s) are pending on '+where+'. Install updates runs apt full-upgrade there (Federation Hub\'s package is held). Its modules may restart briefly. Then Re-check.'
                  :where+' needs a reboot before Ubuntu\'s upgrader will run. Its modules are unavailable for the minute or two it is down.')
         :(needUpd
@@ -1751,6 +1758,12 @@ async function _dbsPost(path,body){
 }
 async function dbsInstallUpdates(){
     if(_dbsBusy)return;
+    if(_osupTarget==='core'){   // this box: the banner's job, which shows its own progress
+        osupCloseModal();
+        var kb=document.getElementById('kernel-patch-banner'); if(kb){ kb.style.display='block'; kb.scrollIntoView({behavior:'smooth',block:'start'}); }
+        if(!_osUpdLast)await checkKernelPatch();
+        startKernelPatch(); return;
+    }
     var rhost=_osupTarget==='remotehost';
     if(!confirm(rhost?'Install every pending update on '+(_rhHost||'the remote host')+'?\n\nIts modules may restart briefly during the run. Federation Hub\'s package is held and is not upgraded.'
         :'Install every pending update on the database server'+(_dbsTargetHost?' ('+_dbsTargetHost+')':'')+'?\n\nTAK Server stays up, but it cannot save or read data if PostgreSQL restarts during the run. TAK\'s database package is held and is not upgraded.'))return;
@@ -1761,6 +1774,7 @@ async function dbsInstallUpdates(){
 }
 async function dbsReboot(){
     if(_dbsBusy)return;
+    if(_osupTarget==='core'){ osupCloseModal(); rebootForKernelPatch(); return; }
     var pwb=document.getElementById('dbs-reboot-pw-block'),pw=document.getElementById('dbs-reboot-pw');
     if(pwb&&pwb.style.display==='none'){ pwb.style.display='block'; if(pw)pw.focus(); return; }   // first click asks for the password
     var err=document.getElementById('osup-modal-err');
@@ -2106,10 +2120,12 @@ checkUpdate();
 (function(){var b=document.getElementById('srv-update-banner');if(b)b.style.display='none';})();
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    var pw=window.prompt('Enter the console admin password to confirm the rollback:');
+    if(!pw)return;
     var bar=document.getElementById('console-rollback-bar');
     if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
     try{
-        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        var r=await fetch('/api/console/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});var d=await r.json();
         if(d.ok){
             if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
             setTimeout(function(){window.location.reload()},10000);

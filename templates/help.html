@@ -228,10 +228,12 @@ async function doApplySshPort(){
 }
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    var pw=window.prompt('Enter the console admin password to confirm the rollback:');
+    if(!pw)return;
     var btn=document.querySelector('[onclick="doConsoleRollback()"]');
     if(btn){btn.disabled=true;btn.textContent='Rolling back…';}
     try{
-        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        var r=await fetch('/api/console/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});var d=await r.json();
         if(d.ok){
             if(btn)btn.textContent='✓ '+d.message;
             setTimeout(function(){window.location.reload();},10000);

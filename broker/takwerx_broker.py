@@ -3444,7 +3444,7 @@ def _dispatch(req, peer):
         audit(peer, 'ping', '', 'ALLOW')
         return {'ok': True, 'pong': True, 'enforce': ENFORCE,
                 'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
-                'readiness': _enforce_readiness(),
+                'readiness': _enforce_readiness(fresh=False),
                 'src_sha': RUNNING_SRC_SHA, 'src_path': SELF_PATH}
     if op == 'enforce_enable':
         # Operator opts the box in to enforcement (ratchet — enable only). Audited.
@@ -3629,19 +3629,64 @@ def _audit_clean_window(now=None):
     return True, '', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since))
 
 
-def _enforce_readiness():
+# v10.3.0: the audit window is up to 11 x 20 MB of JSON lines. Scanning it on every
+# `ping` took 50 s on a box with weeks of history (test6, 216 MB), so every caller
+# with a timeout -- the OS-upgrade preflight (45 s), the broker card (5 s) -- failed,
+# and concurrent pings each re-read the whole log. The answer changes on the scale
+# of hours (the window is 72 h), so `ping` serves a cached result and refreshes it
+# in the background; only the enforce decision paths wait for a fresh scan.
+_READINESS_TTL = 600
+_READINESS_LOCK = threading.Lock()
+_READINESS_CACHE = {'at': 0.0, 'val': None, 'busy': False}
+
+
+def _audit_clean_window_safe():
+    try:
+        return _audit_clean_window()
+    except Exception as e:
+        return False, f'gate evaluation error: {e}', None
+
+
+def _readiness_refresh():
+    try:
+        val = _audit_clean_window_safe()
+        with _READINESS_LOCK:
+            _READINESS_CACHE.update(at=time.time(), val=val)
+    finally:
+        with _READINESS_LOCK:
+            _READINESS_CACHE['busy'] = False
+
+
+def _audit_clean_window_cached():
+    """Never blocks on the scan: returns the last result (refreshing it in the
+    background once older than _READINESS_TTL), or a 'still checking' answer
+    before the first scan has finished."""
+    with _READINESS_LOCK:
+        val, age, busy = _READINESS_CACHE['val'], time.time() - _READINESS_CACHE['at'], _READINESS_CACHE['busy']
+        if (val is None or age > _READINESS_TTL) and not busy:
+            _READINESS_CACHE['busy'] = True
+            threading.Thread(target=_readiness_refresh, daemon=True).start()
+    if val is None:
+        return False, 'checking the audit history', None
+    return val
+
+
+def _enforce_readiness(fresh=True):
     """Report the box's enforce readiness for the console card WITHOUT changing
     mode. Returns a dict: opted_in, clean, ready, reason, clean_since. Never
     raises. `ready` = opted_in is not required — a box is 'ready' (eligible) once
-    its audit window is clean, whether or not the operator has opted in yet."""
+    its audit window is clean, whether or not the operator has opted in yet.
+    fresh=False (ping) answers from the background cache instead of scanning."""
     try:
         opted_in = os.path.exists(ENFORCE_OPTIN_FILE)
     except OSError:
         opted_in = False
-    try:
-        clean, why, since = _audit_clean_window()
-    except Exception as e:
-        clean, why, since = False, f'gate evaluation error: {e}', None
+    if fresh:
+        clean, why, since = _audit_clean_window_safe()
+        with _READINESS_LOCK:
+            _READINESS_CACHE.update(at=time.time(), val=(clean, why, since))
+    else:
+        clean, why, since = _audit_clean_window_cached()
     return {'opted_in': opted_in, 'clean': clean, 'ready': clean,
             'reason': why, 'clean_since': since,
             'clean_secs_required': ENFORCE_CLEAN_SECS}
@@ -4025,6 +4070,7 @@ def serve():
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
                                'summary': 'recycle threshold overridden to %ds '
                                           '(TAKWERX_BROKER_RECYCLE_SECS test hook)' % _after}))
+    _audit_clean_window_cached()   # warm the readiness cache so the first ping is fast
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
