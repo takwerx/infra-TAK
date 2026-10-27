@@ -14,13 +14,12 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""ops #217 — the TAK Portal sudo grant is no longer root-equivalent.
+"""TAK Portal sudo grant, hardened variant (TAK Portal 2.0.19+).
 
-Legacy grant (TAK Portal < 2.0.19): root `tee` AND root `bash` of a script in
-/opt/tak/utils (a tak-owned directory), `(tak) ALL`, and root `cat`/`tee` of
-/opt/tak/CoreConfig.xml (tak can symlink it anywhere). Anyone holding the portal's
-SSH key was root. The hardened grant (TAK Portal 2.0.19+) has none of those, and
-the legacy text is kept byte-for-byte for older portals.
+The hardened grant has no rule for a script in a tak-owned directory, runs the
+CoreConfig cat/tee as `tak` through root-owned wrappers, and grants only a
+hash-pinned marketplace helper. The legacy text is kept byte-for-byte for older
+portals.
 """
 
 import hashlib
@@ -95,7 +94,7 @@ def test_helper_rule_only_when_helper_is_in_place(b):
 
 
 def test_wrapper_and_helper_live_where_tak_cannot_write(b):
-    # Neither /opt/tak (tak-owned) nor anything under the console user's home.
+    # Root-owned locations only: not /opt/tak, not the console user's home.
     for p in (b.TAKPORTAL_WRAP_DIR, b.TAKPORTAL_HELPER):
         assert p.startswith('/usr/local/libexec/')
 

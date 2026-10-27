@@ -2513,17 +2513,9 @@ TAKPORTAL_REPAIR_SCRIPT = '/opt/tak/utils/tak-portal-repair-certs.sh'
 TAKPORTAL_CORECONFIG = '/opt/tak/CoreConfig.xml'
 TAKPORTAL_TAK_USER = 'tak'
 
-# ops #217 — the HARDENED grant (TAK Portal 2.0.19+).
-#
-# The legacy grant above lets the portal's SSH user rewrite AND run a root-run
-# script that lives in /opt/tak/utils, a directory the `tak` user owns, and the
-# same user holds `(tak) NOPASSWD: ALL`; it also runs `cat`/`tee` of
-# /opt/tak/CoreConfig.xml as ROOT, which tak can turn into any-file read/write by
-# swapping CoreConfig.xml for a symlink. Anyone holding the portal's SSH key was
-# therefore root. TAK Portal 2.0.19 (TAK-Portal#68) stopped needing the script
-# rules and moved its marketplace onto one fixed-verb, root-owned helper, so:
-#   * no `tee`/`bash` of the repair script at all (nothing under a tak-owned
-#     directory is ever run as root);
+# The HARDENED grant (TAK Portal 2.0.19+): least privilege for the portal's SSH user.
+#   * no rule for the portal repair script (nothing under a directory the `tak`
+#     user owns is ever run as root);
 #   * CoreConfig `cat`/`tee` still match the exact commands the portal sends
 #     (`sudo -n cat|tee /opt/tak/CoreConfig.xml`), but they resolve — through a
 #     per-user secure_path — to ROOT-OWNED wrappers that drop to `tak` before
@@ -2654,8 +2646,8 @@ def _takportal_hardened_text(user, helper):
         '# TAK Portal 2.0.19+. Nothing here runs a file that the `tak` user can',
         '# write as root: no rule for the portal repair script, and the CoreConfig',
         '# cat/tee below resolve (secure_path) to root-owned wrappers in',
-        f'# {TAKPORTAL_WRAP_DIR} that drop to `tak` first, so a symlinked',
-        '# CoreConfig.xml cannot become a root read or write.',
+        f'# {TAKPORTAL_WRAP_DIR} that drop to `tak` first, so root never',
+        '# reads or writes through a path the `tak` user controls.',
         f'Defaults:{user} !requiretty',
         f'Defaults:{user} secure_path="{TAKPORTAL_WRAP_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
     ]
@@ -2686,8 +2678,8 @@ def _takportal_wrapper_text(name):
         "# TAK Portal's `sudo -n " + name + " " + TAKPORTAL_CORECONFIG + "` lands here: sudo searches\n"
         '# this directory first for the portal user (secure_path in\n'
         '# /etc/sudoers.d/tak-portal). Run as root with exactly that one argument,\n'
-        f'# the real {name} runs AS `{TAKPORTAL_TAK_USER}`, so CoreConfig.xml swapped for a symlink\n'
-        '# is never read or written with root rights. Anything else runs unchanged\n'
+        f'# the real {name} runs AS `{TAKPORTAL_TAK_USER}`, so root never reads or writes through\n'
+        '# a path that user controls. Anything else runs unchanged\n'
         '# (commands sudo starts as `tak` inherit the same PATH).\n'
         f'if [ "$(id -u)" = 0 ] && [ "$#" -eq 1 ] && [ "$1" = \'{TAKPORTAL_CORECONFIG}\' ]; then\n'
         f'  exec {setpriv} --reuid={TAKPORTAL_TAK_USER} --regid={TAKPORTAL_TAK_USER} --init-groups {real} -- "$1"\n'
