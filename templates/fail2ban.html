@@ -181,6 +181,48 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </div><!-- /recidive-enabled-section -->
 </div><!-- /Repeat Offender Protection card -->
 
+<!-- Manual bans -->
+<div class="card" id="f2b-manual-card" style="margin-bottom:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🚫 Manual Bans</span>
+<span class="badge badge-yellow" id="f2b-manual-count" style="font-size:10px;padding:2px 8px">0</span>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px;line-height:1.6">
+Block an address or a whole range yourself, for good or for a set number of days. A banned address is blocked on <strong>every port</strong>, including <code>:5001</code>, this console. The box's own addresses, its local networks, your own address and anything on the trusted list can't be added.
+</div>
+<div style="display:grid;grid-template-columns:minmax(160px,1.2fr) minmax(160px,2fr) minmax(140px,1fr);gap:10px;margin-top:14px">
+<div>
+<label class="form-label">IP address or range</label>
+<input class="form-input" id="f2b-manual-target" type="text" maxlength="64" placeholder="203.0.113.7 or 203.0.113.0/24" style="font-family:monospace" autocomplete="off">
+</div>
+<div>
+<label class="form-label">Note (optional)</label>
+<input class="form-input" id="f2b-manual-note" type="text" maxlength="200" placeholder="e.g. scanner seen Oct 27" autocomplete="off">
+</div>
+<div>
+<label class="form-label">Ban for</label>
+<select class="form-input" id="f2b-manual-days" onchange="f2bManualDaysChanged()">
+<option value="0">Permanent</option>
+<option value="1">1 day</option>
+<option value="7">7 days</option>
+<option value="30">30 days</option>
+<option value="90">90 days</option>
+<option value="365">1 year</option>
+<option value="custom">Other…</option>
+</select>
+<input class="form-input" id="f2b-manual-days-custom" type="number" min="1" max="3650" placeholder="days" style="display:none;margin-top:6px">
+</div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+<button class="btn btn-primary" id="f2b-manual-save" onclick="f2bManualSave()">Add ban</button>
+<button class="btn" id="f2b-manual-cancel" onclick="f2bManualReset()" style="display:none">Cancel edit</button>
+<span id="f2b-manual-msg" style="font-size:12px"></span>
+</div>
+<div id="f2b-manual-list" style="margin-top:16px"></div>
+</div>
+
 <!-- Authentik Jail card -->
 <div class="card" style="margin-bottom:20px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -1886,6 +1928,108 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadRecidiveStatus();
   setInterval(loadRecidiveStatus,30000);
+})();
+
+// Manual bans
+(function(){
+  var bans=[], editingId=null;
+  function el(id){return document.getElementById(id);}
+  function mk(tag, text, css){var e=document.createElement(tag); if(text!=null)e.textContent=text; if(css)e.style.cssText=css; return e;}
+  function msg(text, ok){var m=el('f2b-manual-msg'); if(!m)return; m.textContent=text||''; m.style.color=ok?'var(--green)':'var(--red)';}
+  function untilText(b){
+    if(b.permanent)return 'Permanent';
+    var d=new Date(b.expires*1000), left=b.expires*1000-Date.now();
+    if(left<=0)return 'Expired '+d.toLocaleDateString();
+    var days=Math.ceil(left/86400000);
+    return 'Until '+d.toLocaleDateString()+' ('+days+(days===1?' day':' days')+' left)';
+  }
+  var STATE={
+    banned:['Blocked','var(--red)','rgba(239,68,68,0.1)','rgba(239,68,68,0.3)'],
+    pending:['Not applied yet','var(--yellow)','rgba(234,179,8,0.1)','rgba(234,179,8,0.3)'],
+    protected:['Skipped: now trusted','var(--text-dim)','rgba(148,163,184,0.1)','var(--border)'],
+    expired:['Expired','var(--text-dim)','rgba(148,163,184,0.1)','var(--border)']
+  };
+  function render(){
+    var box=el('f2b-manual-list'); if(!box)return;
+    var cnt=el('f2b-manual-count');
+    var live=bans.filter(function(b){return b.state==='banned'||b.state==='pending';}).length;
+    if(cnt)cnt.textContent=live;
+    box.textContent='';
+    if(!bans.length){box.appendChild(mk('div','No manual bans yet.','color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0'));return;}
+    var t=mk('table',null,'width:100%;border-collapse:collapse');
+    var hr=mk('tr',null,'font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em');
+    ['Address / range','Note','Ban length','Status',''].forEach(function(h,i){hr.appendChild(mk('th',h,'padding:4px 8px;text-align:'+(i===4?'right':'left')));});
+    var th=mk('thead'); th.appendChild(hr); t.appendChild(th);
+    var tb=mk('tbody');
+    bans.forEach(function(b){
+      var tr=mk('tr',null,'border-bottom:1px solid var(--border)'+(b.state==='expired'?';opacity:.6':''));
+      tr.appendChild(mk('td',b.target,'padding:6px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary);white-space:nowrap'));
+      tr.appendChild(mk('td',b.note||'','padding:6px 8px;font-size:12px;color:var(--text-secondary);word-break:break-word'));
+      tr.appendChild(mk('td',untilText(b),'padding:6px 8px;font-size:12px;color:var(--text-dim);white-space:nowrap'));
+      var st=STATE[b.state]||STATE.pending, td=mk('td',null,'padding:6px 8px');
+      td.appendChild(mk('span',st[0],'font-size:10px;color:'+st[1]+';background:'+st[2]+';padding:1px 5px;border-radius:3px;border:1px solid '+st[3]));
+      tr.appendChild(td);
+      var act=mk('td',null,'padding:6px 8px;text-align:right;white-space:nowrap');
+      var eb=mk('button','Edit'); eb.className='btn-danger-sm'; eb.style.cssText='margin-right:6px;color:var(--text-primary);background:rgba(148,163,184,0.1);border-color:var(--border)'; eb.onclick=function(){edit(b.id);};
+      var rb=mk('button','Remove'); rb.className='btn-danger-sm'; rb.onclick=function(){remove(b.id);};
+      act.appendChild(eb); act.appendChild(rb); tr.appendChild(act);
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); box.appendChild(t);
+  }
+  function load(){
+    fetch('/api/fail2ban/manual-bans').then(function(r){return r.json();}).then(function(d){
+      if(d.ok){bans=d.bans||[]; render();}
+    }).catch(function(){});
+  }
+  function daysValue(){
+    var sel=el('f2b-manual-days').value;
+    if(sel==='custom')return parseInt(el('f2b-manual-days-custom').value,10)||0;
+    return parseInt(sel,10)||0;
+  }
+  window.f2bManualDaysChanged=function(){
+    el('f2b-manual-days-custom').style.display=el('f2b-manual-days').value==='custom'?'':'none';
+  };
+  window.f2bManualReset=function(){
+    editingId=null;
+    el('f2b-manual-target').value=''; el('f2b-manual-note').value='';
+    el('f2b-manual-days').value='0'; el('f2b-manual-days-custom').value=''; f2bManualDaysChanged();
+    el('f2b-manual-save').textContent='Add ban'; el('f2b-manual-cancel').style.display='none';
+  };
+  function edit(id){
+    var b=bans.filter(function(x){return x.id===id;})[0]; if(!b)return;
+    editingId=id; msg('');
+    el('f2b-manual-target').value=b.target; el('f2b-manual-note').value=b.note||'';
+    // An edit sets the ban length again, counted from now.
+    el('f2b-manual-days').value=b.permanent?'0':'custom';
+    el('f2b-manual-days-custom').value=b.permanent?'':Math.max(1,Math.ceil((b.expires*1000-Date.now())/86400000));
+    f2bManualDaysChanged();
+    el('f2b-manual-save').textContent='Save changes'; el('f2b-manual-cancel').style.display='';
+    el('f2b-manual-target').focus();
+  }
+  window.f2bManualSave=function(){
+    var body={target:el('f2b-manual-target').value.trim(), note:el('f2b-manual-note').value.trim(), days:daysValue()};
+    if(!body.target){msg('Enter an IP address or range.');return;}
+    var btn=el('f2b-manual-save'); btn.disabled=true; msg('');
+    var url='/api/fail2ban/manual-bans'+(editingId?'/'+encodeURIComponent(editingId):'');
+    fetch(url,{method:editingId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        btn.disabled=false;
+        if(d.ok){showToast(editingId?'Ban updated.':body.target+' banned.','success'); f2bManualReset(); load();}
+        else msg(d.error||'Could not save the ban.');
+      }).catch(function(){btn.disabled=false; msg('Network error.');});
+  };
+  function remove(id){
+    var b=bans.filter(function(x){return x.id===id;})[0]; if(!b)return;
+    if(!confirm('Remove the ban on '+b.target+'?\n\nIt will be able to reach this box again right away.'))return;
+    fetch('/api/fail2ban/manual-bans/'+encodeURIComponent(id),{method:'DELETE'})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(b.target+' unbanned.','success'); if(editingId===id)f2bManualReset(); load();}
+        else showToast((d.errors&&d.errors[0])||d.error||'Could not remove the ban','error');
+      }).catch(function(){showToast('Network error','error');});
+  }
+  load();
+  setInterval(load,30000);
 })();
 
 async function fail2banUninstall(){
