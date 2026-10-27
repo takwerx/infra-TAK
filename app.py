@@ -10754,10 +10754,15 @@ def console_migrate_nonroot_status_api():
 def console_rollback_api():
     """Roll back the console to the version saved before the last Update Now."""
     data = request.get_json(silent=True) or {}
-    password = data.get('password', '')
-    auth = load_settings().get('auth', {})
-    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return jsonify({'ok': False, 'error': 'Incorrect password'}), 403
+    # The console password lives in auth.json (load_auth), never in settings.json —
+    # this route used to read settings['auth'], which no box has, so it answered
+    # "Incorrect password" to every request, right password or not (ops #248). The
+    # shared gate fails closed: missing/unusable hash or wrong password is a 403.
+    _denied = _require_admin_password(data)
+    if _denied:
+        _resp, _status = _denied
+        _err = (_resp.get_json(silent=True) or {}).get('error') or 'Incorrect password'
+        return jsonify({'ok': False, 'error': _err, 'need_password': True}), _status
     console_dir = os.path.dirname(os.path.abspath(__file__))
     s = load_settings()
     rb = s.get('console_rollback') or {}

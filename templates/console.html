@@ -2079,10 +2079,12 @@ checkUpdate();
 (function(){var b=document.getElementById('srv-update-banner');if(b)b.style.display='none';})();
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    var pw=window.prompt('Enter the console admin password to confirm the rollback:');
+    if(!pw)return;
     var bar=document.getElementById('console-rollback-bar');
     if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
     try{
-        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        var r=await fetch('/api/console/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});var d=await r.json();
         if(d.ok){
             if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
             setTimeout(function(){window.location.reload()},10000);
