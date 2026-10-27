@@ -58,15 +58,16 @@ _ASSIGNS = {t.id: n for n in TREE.body if isinstance(n, ast.Assign)
 PLUGIN = 'docker-compose.plugin-print.yml'
 OVERLAY = 'docker-compose.infratak-print.yml'
 CONSTS = ('CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_PRINT_PLUGIN_COMPOSE', 'CLOUDTAK_PRINT_OVERLAY',
-          'CLOUDTAK_PRINT_SERVICE', 'CLOUDTAK_PRINT_PORT', '_CLOUDTAK_PRINT_OVERLAY_YML')
-FUNCS = ('_cloudtak_print_problem', '_cloudtak_print_containers', '_cloudtak_print_drift',
-         '_cloudtak_print_converge')
+          'CLOUDTAK_PRINT_SERVICE', 'CLOUDTAK_PRINT_PORT', '_CLOUDTAK_PRINT_OVERLAY_YML',
+          '_CT_ENV_LINE_RE', '_CLOUDTAK_COMPOSE_VAR_RE')
+FUNCS = ('_cloudtak_env_read', '_cloudtak_compose_interpolate', '_cloudtak_print_problem',
+         '_cloudtak_print_containers', '_cloudtak_print_drift', '_cloudtak_print_converge')
 
 # CloudTAK v13.113.0's docker-compose.yml, trimmed to what matters here.
 BASE = ('services:\n  api:\n    image: cloudtak-api\n  tiles:\n    image: cloudtak-tiles\n'
         '  store:\n    image: garage\n  events:\n    image: cloudtak-events\n')
-# What TAK Portal (main / Beta) writes: Print's compose.service.yml with depends_on rewritten
-# to CloudTAK's service names — and the internal URLs left as they were.
+# What TAK Portal 2.0.19+ writes: Print's compose.service.yml with depends_on and the internal
+# URLs rewritten to CloudTAK's service names.
 PLUGIN_OK = """\
 # Managed by TAK Portal CloudTAK marketplace. Do not edit by hand.
 services:
@@ -85,12 +86,14 @@ services:
       shm_size: '1gb'
       env_file: .env
       environment:
-        - API_INTERNAL_URL=http://cloudtak-api:5000
-        - TILES_INTERNAL_URL=http://cloudtak-tiles:5002
+        - API_INTERNAL_URL=http://api:5000
+        - TILES_INTERNAL_URL=http://tiles:5002
         - PRINT_CONCURRENCY=${PRINT_CONCURRENCY:-1}
 """
 # TAK Portal 2.0.18: the depends_on rewrite never ran (TAK-Portal#69).
 PLUGIN_2018 = PLUGIN_OK.replace('- api\n', '- cloudtak-api\n').replace('- store\n', '- cloudtak-store\n')
+# A file from before TAK Portal 2.0.19: the depends_on rewrite ran but the URLs were left alone.
+PLUGIN_OLD_URLS = PLUGIN_OK.replace('http://api:5000', 'http://cloudtak-api:5000')
 
 
 def _src(name):
@@ -155,12 +158,123 @@ class Stack:
 
 # ── 1. Compose: the overlay, and only a startable file ───────────────────────
 
-def test_overlay_publishes_on_loopback_only_and_points_at_api_and_tiles():
+def test_overlay_publishes_on_loopback_only_and_nothing_else():
+    # ops #235: the plugin's own defaults are the stock api / tiles URLs now (clptak/cloudtak-
+    # plugin-print PRs #3/#4), so the overlay no longer sets API_INTERNAL_URL / TILES_INTERNAL_URL.
     ns = _load((), CONSTS)
     svc = yaml.safe_load(ns['_CLOUDTAK_PRINT_OVERLAY_YML'])['services']['cloudtak-print']
     assert svc['ports'] == ['127.0.0.1:5010:5010']
-    assert svc['environment'] == ['API_INTERNAL_URL=http://api:5000', 'TILES_INTERNAL_URL=http://tiles:5002']
-    assert set(svc) == {'ports', 'environment'}      # adds to TAK Portal's service, replaces nothing else
+    assert set(svc) == {'ports'}                     # adds to TAK Portal's service, replaces nothing else
+
+
+# What the plugin's compose.service.yml carries since clptak/cloudtak-plugin-print#4 (TAK Portal
+# leaves the ${...} lines alone): Compose fills them in from CloudTAK's .env.
+PLUGIN_VARS = PLUGIN_OK.replace(
+    '- api\n        - tiles\n        - store\n',
+    '- ${PRINT_API_SERVICE:-api}\n        - ${PRINT_TILES_SERVICE:-tiles}\n        - ${PRINT_STORE_SERVICE:-store}\n'
+).replace('http://api:5000', '${PRINT_API_INTERNAL_URL:-http://api:5000}'
+          ).replace('http://tiles:5002', '${PRINT_TILES_INTERNAL_URL:-http://tiles:5002}')
+
+
+def test_plugin_vars_fixture_has_the_upstream_lines():
+    assert '${PRINT_API_SERVICE:-api}' in PLUGIN_VARS and '- api\n' not in PLUGIN_VARS
+
+
+@pytest.mark.parametrize('env, want', [
+    ('', ''),                                                    # defaults: stock names
+    ('PRINT_API_SERVICE=\n', ''),                                # empty counts as unset for :-
+    ('PRINT_API_SERVICE=api\nPRINT_STORE_SERVICE="store"\n', ''),
+    ('# PRINT_API_SERVICE=cloudtak-api\n', ''),                  # a comment sets nothing
+])
+def test_stock_stack_without_print_vars_in_env_is_startable(tmp_path, env, want):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    (st.ct / '.env').write_text(env)
+    assert st.ns()['_cloudtak_print_problem'](str(st.ct)) == want
+
+
+def test_stock_stack_with_no_env_file_is_startable(tmp_path):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    assert not (st.ct / '.env').exists()
+    assert st.ns()['_cloudtak_print_problem'](str(st.ct)) == ''
+
+
+def test_env_override_naming_a_service_the_stack_lacks_is_unstartable(tmp_path):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    (st.ct / '.env').write_text('PRINT_API_SERVICE=cloudtak-api\n')
+    got = st.ns()['_cloudtak_print_problem'](str(st.ct))
+    assert 'cloudtak-api' in got and 'depends_on' in got, got
+    assert 'PRINT_API_SERVICE' in got and 'reinstall' not in got, got   # the .env is what to fix
+
+
+def test_renamed_stack_that_sets_the_print_vars_is_startable(tmp_path):
+    # The stack names its services cloudtak-api / -tiles / -store and says so in .env (what
+    # clptak/cloudtak-plugin-print#4 is for); before ops #235 the overlay forced api / tiles.
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    st.ct.joinpath('docker-compose.yml').write_text(
+        BASE.replace('  api:', '  cloudtak-api:').replace('  tiles:', '  cloudtak-tiles:').replace('  store:', '  cloudtak-store:'))
+    assert "has no api service" in st.ns()['_cloudtak_print_problem'](str(st.ct))     # defaults don't fit
+    (st.ct / '.env').write_text('PRINT_API_SERVICE=cloudtak-api\nPRINT_TILES_SERVICE=cloudtak-tiles\n'
+                                'PRINT_STORE_SERVICE=cloudtak-store\n'
+                                'PRINT_API_INTERNAL_URL=http://cloudtak-api:5000\n'
+                                'PRINT_TILES_INTERNAL_URL=http://cloudtak-tiles:5002\n')
+    assert st.ns()['_cloudtak_print_problem'](str(st.ct)) == ''
+
+
+def test_url_that_names_no_cloudtak_service_is_unstartable(tmp_path):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    (st.ct / '.env').write_text('PRINT_TILES_INTERNAL_URL=http://cloudtak-tiles:5002\n')
+    got = st.ns()['_cloudtak_print_problem'](str(st.ct))
+    assert got.startswith("CloudTAK's docker-compose.yml has no cloudtak-tiles service (TILES_INTERNAL_URL)"), got
+
+
+def test_file_without_url_settings_needs_the_stock_services(tmp_path):
+    plugin = '\n'.join(l for l in PLUGIN_OK.splitlines() if 'INTERNAL_URL' not in l) + '\n'
+    st = Stack(tmp_path, plugin=plugin)
+    assert st.ns()['_cloudtak_print_problem'](str(st.ct)) == ''
+    st.ct.joinpath('docker-compose.yml').write_text(BASE.replace('  tiles:', '  other:'))
+    assert "has no tiles service" in st.ns()['_cloudtak_print_problem'](str(st.ct))
+
+
+def test_required_var_that_is_missing_is_unstartable(tmp_path):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS.replace('${PRINT_API_SERVICE:-api}', '${PRINT_API_SERVICE:?set it}'))
+    got = st.ns()['_cloudtak_print_problem'](str(st.ct))
+    assert "doesn't set" in got and 'PRINT_API_SERVICE' in got, got
+
+
+@pytest.mark.parametrize('text, env, want', [
+    ('${A:-x}', {}, 'x'), ('${A:-x}', {'A': ''}, 'x'), ('${A-x}', {'A': ''}, ''),
+    ('${A-x}', {}, 'x'), ('${A:-x}', {'A': 'y'}, 'y'), ('${A}', {'A': "'y'"}, 'y'),
+    ('$A', {'A': 'y'}, 'y'), ('$$A', {'A': 'y'}, '$A'), ('${A:+r}', {'A': 'y'}, 'r'),
+    ('${A:+r}', {}, ''), ('plain', {}, 'plain'), ('${A:?no}', {}, None), ('${A:?no}', {'A': 'y'}, 'y'),
+])
+def test_compose_interpolation_matches_composes_rules(text, env, want):
+    assert _load(FUNCS, CONSTS)['_cloudtak_compose_interpolate'](text, env) == want
+
+
+def test_print_with_vars_is_converged_without_touching_the_stack_env(tmp_path):
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    (st.ct / '.env').write_text('FOO=bar\n')
+    st.takportal_started()
+    assert st.converge() == 'ok'
+    assert (st.ct / '.env').read_text() == 'FOO=bar\n'            # we never write PRINT_*_SERVICE
+    assert len(st.compose) == 1
+
+
+def test_print_api_route_is_generated_once_converge_succeeds_with_the_var_file(tmp_path):
+    # GH #295: with the plugin's ${PRINT_API_SERVICE:-api} lines the check used to call Print
+    # unstartable, so no overlay was written and /print-api was never routed (200 text/html).
+    st = Stack(tmp_path, plugin=PLUGIN_VARS)
+    st.takportal_started()
+    assert st.converge() == 'ok'
+    assert (st.ct / OVERLAY).is_file() and st.caddy == [True]
+    ns = _load(('_caddy_operator_owns_print', '_cloudtak_print_caddy'), CONSTS + CADDY_CONSTS,
+               CADDYFILE_PATH=str(tmp_path / 'Caddyfile'),
+               _caddy_operator_include_files=lambda: [],
+               _get_cloudtak_deployment_config=lambda s: {'target_mode': 'local'})
+    snippet, site = ns['_cloudtak_print_caddy']({}, str(st.ct))
+    assert '    @cloudtak_print path /print-api /print-api/*' in snippet
+    assert '        reverse_proxy 127.0.0.1:5010' in snippet
+    assert site == ['    import cloudtak_print']
 
 
 @pytest.mark.parametrize('plugin, want', [
@@ -229,6 +343,15 @@ def test_a_failed_start_is_reported(tmp_path):
     st.takportal_started()
     assert st.converge() == 'failed'
     assert any('port is already allocated' in l for l in st.logs)
+
+
+def test_file_with_urls_to_services_cloudtak_lacks_is_never_started(tmp_path):
+    # Print would start and then fail every export, so say so instead; the overlay no longer
+    # sets these URLs for it (ops #235).
+    st = Stack(tmp_path, plugin=PLUGIN_OLD_URLS, rows=[])
+    assert st.converge() == 'unusable'
+    assert st.compose == [] and not (st.ct / OVERLAY).exists()
+    assert any('cloudtak-api' in l and 'API_INTERNAL_URL' in l and 'reinstall' in l for l in st.logs), st.logs
 
 
 def test_takportal_2018_file_is_never_started(tmp_path):
