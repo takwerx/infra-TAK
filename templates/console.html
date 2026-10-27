@@ -322,6 +322,7 @@ load();
 <div style="flex:1;min-width:260px"><div id="dbs-result-head" style="font-size:13px;font-weight:600;color:var(--green)"></div>
 <div id="dbs-result-body" style="font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="dbs-result-next" onclick="dbsDismiss().then(function(){osupOpenPreflight('dbserver');})" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
 <button type="button" onclick="dbsToggleResultLog()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show log</button>
 <button type="button" onclick="dbsDismiss()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Close</button>
 </div></div>
@@ -1652,6 +1653,8 @@ function _dbsRenderResult(d){
     var head=document.getElementById('dbs-result-head'),body=document.getElementById('dbs-result-body');
     if(!head||!body)return;
     var notes=(d.notices||[]).length?' Notes: '+(d.notices||[]).join(' · '):'';
+    // after updates or a reboot the next thing is the upgrade itself: offer it here, not behind Close
+    var nx=document.getElementById('dbs-result-next'); if(nx)nx.style.display=(d.state==='done'&&d.job!=='os-upgrade')?'inline-block':'none';
     if(d.state==='done'){
         head.style.color='var(--green)';
         if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
