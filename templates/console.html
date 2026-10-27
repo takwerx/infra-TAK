@@ -331,7 +331,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 {% endif %}
 </div>
-{% if host.id != 'this_host' %}<button type="button" onclick="event.stopPropagation();promptPower('reboot','{{ host.id }}')" title="Reboot this remote host (asks for your console password)" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot</button>{% endif %}
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
@@ -1930,10 +1929,8 @@ async function confirmDevChannel(){
     }catch(e){if(err)err.textContent='Error: '+e.message;}
 }
 var _powerAction='';
-var _powerTarget='this_host';
-function promptPower(action,target){
+function promptPower(action){
     _powerAction=action;
-    _powerTarget=target||'this_host';
     var m=document.getElementById('power-pw-modal');
     var inp=document.getElementById('power-pw-input');
     var err=document.getElementById('power-pw-err');
@@ -1947,8 +1944,8 @@ function promptPower(action,target){
       if(msg)msg.textContent='The box shuts down completely — you will need physical access to power it back on. Enter your console password to confirm.';
       if(btn){btn.textContent='Power Off';btn.style.background='var(--red)';btn.style.color='#fff';}
     }else{
-      if(ttl)ttl.textContent=_powerTarget==='this_host'?'⚠ Reboot this box':'⚠ Reboot the remote host';
-      if(msg)msg.textContent=_powerTarget==='this_host'?'The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.':'The remote host restarts and is unreachable for a minute or two. TAK Server and anything using its database will drop until it is back. Enter your console password to confirm.';
+      if(ttl)ttl.textContent='⚠ Reboot this box';
+      if(msg)msg.textContent='The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.';
       // v10.1.47 W5: a reboot is the heaviest tool available and it is the one
       // operators reach for. In the 2026-08-21 incident a reboot was used to fix
       // a service-level problem (a user could not set a password) and that reboot
@@ -1980,10 +1977,10 @@ async function confirmPower(){
     if(!pw){if(err){err.style.color='var(--red)';err.textContent='Password required';}return;}
     if(err){err.style.color='var(--red)';err.textContent='';}
     try{
-        var r=await fetchRetry('/api/console/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:_powerAction,password:pw,target:_powerTarget}),credentials:'same-origin'});
+        var r=await fetchRetry('/api/console/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:_powerAction,password:pw}),credentials:'same-origin'});
         var d=await r.json();
         if(d.success){
-            if(msg)msg.textContent=(_powerAction==='poweroff'?'Powering off now — this console will go offline in a moment.':(_powerTarget==='this_host'?'Rebooting now — the console will return in about a minute.':'Reboot sent — the host will be back in a minute or two.'));
+            if(msg)msg.textContent=(_powerAction==='poweroff'?'Powering off now — this console will go offline in a moment.':'Rebooting now — the console will return in about a minute.');
             if(err){err.style.color='var(--green)';err.textContent='Command sent.';}
             var btn=document.getElementById('power-pw-confirm');if(btn)btn.disabled=true;
         }else{if(err){err.style.color='var(--red)';err.textContent=d.error||'Incorrect password';}}
