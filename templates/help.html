@@ -68,7 +68,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {#- ops #199: the link opens the repo's bug_report.yml form. GitHub pre-fills only the
     form's text fields, by id, so version goes into `version` and the platform into the
     `what` skeleton (the OS/arch dropdowns can't be pre-filled). Version, OS and arch
-    ONLY: the URL lands on a public site, so no fqdn, IP, email or diagnostics text. -#}
+    ONLY: the URL lands on a public site, so no fqdn, IP, email or diagnostics text.
+    ops #245: report_version names the rc a beta box runs and marks the beta channel. -#}
+{%- set _issue_version = report_version or ('v' ~ version) %}
 {%- set _issue_platform = [settings.get('os_name'), settings.get('arch')]|select|join(' · ') %}
 {%- set _issue_what %}What happened:
 
@@ -76,9 +78,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 What I expected:
 
 
-Console: v{{ version }}{% if _issue_platform %} · {{ _issue_platform }}{% endif %}
+Console: {{ _issue_version }}{% if _issue_platform %} · {{ _issue_platform }}{% endif %}
 {% endset %}
-{%- set report_issue_url = 'https://github.com/takwerx/infra-TAK/issues/new?' ~ {'template': 'bug_report.yml', 'version': 'v' ~ version, 'what': _issue_what|string}|urlencode %}
+{%- set report_issue_url = 'https://github.com/takwerx/infra-TAK/issues/new?' ~ {'template': 'bug_report.yml', 'version': _issue_version, 'what': _issue_what|string}|urlencode %}
 <div class="help-card" id="report-issue-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Report an issue</h2><span class="help-card-toggle" style="transform:rotate(180deg)">&#9662;</span></div>
 <div class="help-card-body" style="display:block">

@@ -8609,7 +8609,11 @@ def help_page():
     settings = load_settings()
     current_ssh_port = _get_current_ssh_port()
     _relay = settings.get('email_relay') or {}
+    # ops #245: an issue from a beta box says so, and names the rc it runs.
+    _, _run_tag = _console_running_release(_console_head_tags(), VERSION)
+    report_version = (_run_tag or f'v{VERSION}') + (' (beta channel)' if _update_beta_on(settings) else '')
     return render_template('help.html', settings=settings, version=VERSION, current_ssh_port=current_ssh_port,
+                           report_version=report_version,
                            diag_support_email=DIAG_SUPPORT_EMAIL,
                            diag_email_ready=bool(_relay.get('relay_host') and _relay.get('smtp_user')))
 
@@ -8779,7 +8783,9 @@ def _diag_section_box(settings):
     out = []
     git = lambda *a: _diag_cmd(['git', '-C', BASE_DIR] + list(a), priv=False)
     out.append(f"console: v{VERSION}  git={git('rev-parse', '--short', 'HEAD')}  "
-               f"branch={git('branch', '--show-current')}  update_channel={settings.get('update_channel') or 'main'}")
+               f"branch={git('branch', '--show-current')}  update_channel={settings.get('update_channel') or 'main'}  "
+               f"beta={'on' if settings.get('update_beta') else 'off'}  "
+               f"tag={(git('tag', '--points-at', 'HEAD') or '-').replace(chr(10), ',')}")
     out.append(f"fqdn={settings.get('fqdn') or '-'}  server_ip={settings.get('server_ip') or '-'}  "
                f"ssl_mode={settings.get('ssl_mode') or '-'}  os_type={settings.get('os_type') or '-'}")
     import getpass
@@ -9716,6 +9722,103 @@ def support_diagnostics_email():
     return jsonify({'success': True, 'message': f'Sent to {to}'})
 
 
+# ops #245: beta update channel. A console with update_beta on (and the main channel)
+# also takes release-candidate pre-releases: /ship tags the release commit on dev as
+# vX.Y.Z-alpha-rcN and publishes it as a GitHub pre-release about a day before the
+# stable tag. The "-rcN" suffix is deliberate: every older console reads versions out
+# of tag names with int() and drops a tag it cannot parse, so an rc is invisible to
+# them ("-beta1" would read as X.Y.Z1 and be offered to every box).
+_RELEASE_TAG_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-alpha|-beta)?(?:-rc(\d+))?$')
+_beta_check_cache = {'checked': 0, 'data': None}
+
+
+def _update_beta_on(settings):
+    """Beta only rides the main channel; dev already gets everything first."""
+    return (bool(settings.get('update_beta'))
+            and (settings.get('update_channel') or 'main').strip().lower() == 'main')
+
+
+def _release_key(tag):
+    """(major, minor, patch, stable, rc) for a release tag, or None. A stable release
+    outranks every rc of its own version: v10.2.31-alpha > v10.2.31-alpha-rc2."""
+    m = _RELEASE_TAG_RE.match((tag or '').strip())
+    if not m:
+        return None
+    rc = m.group(4)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if rc else 1, int(rc or 0))
+
+
+def _console_head_tags():
+    """Tags on the commit this console runs (Update Now fetches the tag it checks out)."""
+    try:
+        r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
+             'tag', '--points-at', 'HEAD'],
+            capture_output=True, text=True, timeout=5)
+        return [t.strip() for t in (r.stdout or '').splitlines() if t.strip()]
+    except Exception:
+        return []
+
+
+def _console_running_release(head_tags, version):
+    """(key, tag) for what this console runs. On a release tag of its own VERSION that
+    tag decides (so rc1 and rc2 differ); off any tag (a dev build) it sits below every
+    rc of its version, so the beta channel moves it onto a real release."""
+    vk = _release_key(version)
+    if vk is None:
+        return None, None
+    best = None
+    for t in head_tags or []:
+        k = _release_key(t)
+        if k and k[:3] == vk[:3] and (best is None or k > best[0]):
+            best = (k, t)
+    return best if best else (vk[:3] + (0, 0), None)
+
+
+def _beta_pick(releases, head_tags, version):
+    """The beta channel's update decision from the GitHub release list. Only published
+    rc pre-releases and stable non-pre-releases count; drafts and anything else are
+    ignored. Returns {'tag', 'key', 'prerelease', 'release', 'available', 'running_tag',
+    'running_key'}, or None when the list has no usable release."""
+    cur_key, cur_tag = _console_running_release(head_tags, version)
+    best, max_rc = None, {}
+    for rel in releases if isinstance(releases, list) else []:
+        tag = (rel.get('tag_name') or '').strip()
+        k = _release_key(tag)
+        if rel.get('draft') or k is None or bool(rel.get('prerelease')) != (k[3] == 0):
+            continue
+        if k[3] == 0:
+            max_rc[k[:3]] = max(max_rc.get(k[:3], 0), k[4])
+        if best is None or k > best[0]:
+            best = (k, tag, rel)
+    if best is None or cur_key is None:
+        return None
+    k, tag, rel = best
+    available = k > cur_key
+    # Promotion: the stable tag of the version this box already runs as its newest rc
+    # is the same code (/ship promotes the last rc unchanged), so it is up to date.
+    # A pulled or older rc is not: max_rc then differs and the update is offered.
+    if available and k[3] == 1 and cur_key[:3] == k[:3] and cur_key[3] == 0 \
+            and cur_key[4] > 0 and max_rc.get(k[:3]) == cur_key[4]:
+        available = False
+    return {'tag': tag, 'key': k, 'prerelease': k[3] == 0, 'release': rel,
+            'available': available, 'running_tag': cur_tag, 'running_key': cur_key}
+
+
+def _beta_update_target():
+    """_beta_pick() against the live GitHub release list. Raises when GitHub can't be read."""
+    import urllib.request
+    req = urllib.request.Request(
+        f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50',
+        headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        rels = json.loads(resp.read().decode())
+    picked = _beta_pick(rels, _console_head_tags(), VERSION)
+    if picked is not None:
+        picked['releases'] = rels
+    return picked
+
+
 def _update_check_response(data):
     """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
     from flask import make_response
@@ -9794,7 +9897,25 @@ def set_update_channel():
     s['update_channel'] = channel
     save_settings(s)
     update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
+    _beta_check_cache.update({'checked': 0, 'data': None})
     return jsonify({'ok': True, 'channel': channel})
+
+
+@app.route('/api/update/beta', methods=['POST'])
+@login_required
+def set_update_beta():
+    """ops #245: opt this console in or out of beta releases (rc pre-releases about a
+    day before stable). No password either way: unlike dev it only changes WHEN a
+    vetted release arrives, and turning it off is the way back out."""
+    enabled = (request.get_json(silent=True) or {}).get('enabled')
+    if not isinstance(enabled, bool):
+        return jsonify({'ok': False, 'error': 'enabled must be true or false'}), 400
+    s = load_settings()
+    s['update_beta'] = enabled
+    save_settings(s)
+    _beta_check_cache.update({'checked': 0, 'data': None})
+    print(f"[update] beta channel turned {'on' if enabled else 'off'}", flush=True)
+    return jsonify({'ok': True, 'beta': enabled})
 
 
 @app.route('/api/update/check')
@@ -9855,8 +9976,37 @@ def update_check():
                 'error': str(e)[:200], 'body': '', 'update_available': False,
                 'check_failed': True})
 
-    # Main channel: existing tag-based check.
     force = request.args.get('refresh') == '1'
+
+    # ops #245: beta channel — newest of the latest stable release and the newest rc
+    # pre-release. Own cache: update_cache['latest'] stays the stable release, which
+    # the server-side banner and the Guard Dog card parse as plain X.Y.Z.
+    if _update_beta_on(_settings):
+        if not force and _beta_check_cache['data'] and (now - _beta_check_cache['checked']) < 600:
+            return _update_check_response(_beta_check_cache['data'])
+        try:
+            bt = _beta_update_target()
+        except Exception as e:
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main',
+                'beta': True, 'error': str(e)[:200], 'body': '', 'update_available': False,
+                'check_failed': True})
+        if not bt:
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main',
+                'beta': True, 'error': 'No releases found', 'body': '', 'update_available': False,
+                'check_failed': True})
+        body = ''
+        if bt['available']:
+            body = (bt['release'].get('body') or '').strip()[:12000]
+            if bt['release'].get('html_url'):
+                body += f"\n\n---\nOn GitHub: {bt['release']['html_url']}"
+        data = {'current': (bt['running_tag'] or VERSION).lstrip('v'), 'latest': bt['tag'].lstrip('v'),
+                'notes': ('Beta pre-release' if bt['prerelease'] else f"Version {bt['tag']}"),
+                'body': body, 'channel': 'main', 'beta': True, 'prerelease': bt['prerelease'],
+                'update_available': bt['available']}
+        _beta_check_cache.update({'checked': now, 'data': data})
+        return _update_check_response(data)
+
+    # Main channel: existing tag-based check.
     if not force and update_cache['latest'] and (now - update_cache['checked']) < 600:
         try:
             cached_newer = _parse_version_tuple(update_cache['latest']) > _parse_version_tuple(VERSION)
@@ -10043,6 +10193,21 @@ def update_apply():
                       '> Database maintenance (CoT) > Diagnose.'),
         }), 400
 
+    # ops #245: a beta box updates to exactly the release the check offered. Resolved
+    # here, before the lock and the rollback snapshot, and it never falls back to the
+    # newest stable tag: on a box running an rc that tag is OLDER, so the fallback
+    # would be a silent downgrade.
+    _beta_tag = None
+    if _update_beta_on(load_settings()):
+        try:
+            _bt = _beta_update_target()
+        except Exception as e:
+            return jsonify({'success': False,
+                            'error': f'Could not read the release list from GitHub: {str(e)[:160]}. Try again in a minute.'})
+        if not _bt or not _bt['available']:
+            return jsonify({'success': False, 'error': 'Already up to date on the beta channel.'})
+        _beta_tag = _bt['tag']
+
     # v0.9.24 Item 1: Update Now single-flight lock.
     # Field incident on test8 (2026-05-16): operator double-clicked "Update Now"
     # from two browser tabs. Both POSTs to /api/update/apply ran concurrently
@@ -10201,7 +10366,7 @@ def update_apply():
             # local tag if it moved). Bulk `git fetch --tags` fails on many field installs: local
             # v0.3.8-alpha etc. can differ from origin ("would clobber existing tag") even when the
             # operator only wants the newest release.
-            tag_name = _fetch_latest_tag_name()
+            tag_name = _beta_tag or _fetch_latest_tag_name()
             target_ref = None
             if tag_name:
                 refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
@@ -10212,6 +10377,9 @@ def update_apply():
                 if verify_tag.returncode == 0:
                     target_ref = f'refs/tags/{tag_name}'
 
+            if _beta_tag and not target_ref:
+                return _fail_release_lock({'success': False,
+                    'error': f'Fetched {_beta_tag} but git cannot find it. Try again in a minute.'})
             # Fallback: track origin/main if tag lookup fails.
             if not target_ref:
                 fetch_main = _git(
@@ -10252,6 +10420,7 @@ def update_apply():
             return _fail_release_lock(payload)
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
+        _beta_check_cache.update({'checked': 0, 'data': None})
         _ensure_gunicorn_upgrade(console_dir)
         _detached_console_restart()
         return jsonify({
@@ -25788,6 +25957,24 @@ def _console_pending_update(settings):
             return {'label': 'infra-TAK console', 'installed': f'v{VERSION} @ {local or "?"}',
                     'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7]}
         return None
+    if settings.get('update_beta') and channel == 'main':
+        # ops #245: the beta channel's target (an rc pre-release or the stable release).
+        bt = _beta_update_target()
+        if not bt or not bt['available']:
+            return None
+        item = {'label': 'infra-TAK console', 'installed': bt['running_tag'] or f'v{VERSION}',
+                'target': bt['tag'] + (' (beta)' if bt['prerelease'] else ''), 'identity': bt['tag'],
+                'how': 'Console page → Update Now.'}
+        sec = []
+        for rel in bt.get('releases') or []:
+            k = _release_key(rel.get('tag_name'))
+            if rel.get('draft') or k is None or not (bt['running_key'] < k <= bt['key']):
+                continue
+            what = _release_security_summary(rel.get('body'))
+            if what:
+                sec.append((k, f"{rel['tag_name'].strip()} is a security release: {what}"))
+        item['security'] = [s for _, s in sorted(sec)]
+        return item
     req = urllib.request.Request(
         f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -26125,8 +26312,9 @@ def _update_notify_check_once():
             lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
+        _ch = (settings.get('update_channel') or 'main').strip().lower()
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
-                  f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
+                  f"Update channel: {_ch}{' (beta releases on)' if _ch == 'main' and settings.get('update_beta') else ''}",
                   '', 'You get one email per new pending version — not a reminder per sweep.']
         if sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
