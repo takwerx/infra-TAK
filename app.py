@@ -10754,10 +10754,15 @@ def console_migrate_nonroot_status_api():
 def console_rollback_api():
     """Roll back the console to the version saved before the last Update Now."""
     data = request.get_json(silent=True) or {}
-    password = data.get('password', '')
-    auth = load_settings().get('auth', {})
-    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
-        return jsonify({'ok': False, 'error': 'Incorrect password'}), 403
+    # The console password lives in auth.json (load_auth), never in settings.json —
+    # this route used to read settings['auth'], which no box has, so it answered
+    # "Incorrect password" to every request, right password or not (ops #248). The
+    # shared gate fails closed: missing/unusable hash or wrong password is a 403.
+    _denied = _require_admin_password(data)
+    if _denied:
+        _resp, _status = _denied
+        _err = (_resp.get_json(silent=True) or {}).get('error') or 'Incorrect password'
+        return jsonify({'ok': False, 'error': _err, 'need_password': True}), _status
     console_dir = os.path.dirname(os.path.abspath(__file__))
     s = load_settings()
     rb = s.get('console_rollback') or {}
@@ -97422,7 +97427,7 @@ _startup_heal_cloudtak_media_hls()
 # _cloudtak_recreate_and_heal) — never a second copy of it. At most
 # CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR tries an hour; a failure or the limit hit is answered with
 # 'failed' / 'rate_limited' and Guard Dog sends today's "action needed" email. A repair that
-# works sends one short "repaired automatically" note instead.
+# works is logged on the Guard Dog page's Activity log, not emailed (ops #230).
 CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
@@ -97640,33 +97645,24 @@ def _cloudtak_autorepair_run(ct_dir, drift):
 
 
 def _cloudtak_autorepair_notify(before, after):
-    """One short 'repaired automatically' note — not the alarm. Same relay, recipient and pause
-    as every Guard Dog alert."""
+    """Record a successful auto-repair on the Guard Dog page's Activity log (restarts.log) and in
+    the console log. NOT an email (ops #230, AJ's call): the repair asks nothing of the operator,
+    and a marketplace install triggers one every time. Failures still alarm through the watcher."""
     try:
-        settings = load_settings()
-        to_addr = (settings.get('guarddog_alert_email') or '').strip()
-        if not to_addr:
-            print("[guarddog] CloudTAK repaired note SUPPRESSED (no recipient configured)", flush=True)
-            return
-        ident = _guarddog_server_identifier(settings) or socket.gethostname()
         done = {'recreate': "rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK "
                             "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
                             "the HLS profile",
                 'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api"
                 }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
-        body = (
-            "CloudTAK lost infra-TAK's settings, most likely because a TAK Portal marketplace plugin\n"
-            "install recreated it without them. Guard Dog repaired it by itself. Nothing to do.\n\n"
-            f"Found: {_cloudtak_drift_summary(before)}\n"
-            f"Done: {done}\n"
-            f"Now: {_cloudtak_drift_summary(after)}\n\n"
-            f"Server: {ident}\n"
-            f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        subj = f"Guard Dog: CloudTAK repaired automatically on {ident}"
-        if _guarddog_send_alert_email_via_relay(to_addr, subj, body):
-            print(f"[guarddog] sent: {subj}", flush=True)
+        line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | repaired automatically, "
+                f"nothing to do (likely a TAK Portal marketplace install) | "
+                f"Found: {_cloudtak_drift_summary(before)} | Done: {done} | "
+                f"Now: {_cloudtak_drift_summary(after)}")
+        line = ' '.join(line.split())
+        print(f"[cloudtak-autorepair] {line}", flush=True)
+        _write_priv('/var/log/takguard/restarts.log', line + '\n', mode='a')
     except Exception as e:
-        print(f"[guarddog] CloudTAK repaired note not sent: {e}", flush=True)
+        print(f"[cloudtak-autorepair] repaired note not logged: {e}", flush=True)
 
 
 @app.route('/api/guarddog/cloudtak-repair', methods=['POST'])
