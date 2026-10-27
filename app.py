@@ -39738,7 +39738,14 @@ def _takportal_install_sudoers(log_fn=None):
             log_fn(f"  ✗ TAK Portal sudo grant NOT installed: {r}")
         return False, str(r)
     if log_fn:
-        log_fn("  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal)")
+        _r = r if isinstance(r, dict) else {}
+        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'legacy'})")
+        if _r.get('variant') == 'legacy':
+            log_fn(f"  ⚠ legacy (root-equivalent) grant kept: {_r.get('variant_reason')}")
+        if _r.get('removed_leftover'):
+            log_fn("  ✓ removed leftover /etc/sudoers.d/tak-portal-marketplace (NOPASSWD: ALL from TAK Portal <2.0.19)")
+        if _r.get('variant') == 'hardened' and not _r.get('helper_granted'):
+            log_fn(f"  ⚠ CloudTAK marketplace helper not granted: {_r.get('helper_reason') or 'not installed'}")
     return True, 'installed'
 
 
@@ -40517,8 +40524,15 @@ def takportal_ssh_status():
     if ok and isinstance(grant, dict):
         if not grant.get('supported'):
             row('Sudo grant', 'na', grant.get('reason') or 'not supported here')
+        elif grant.get('present') and grant.get('matches') and grant.get('variant') == 'legacy':
+            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (legacy, root-equivalent)',
+                (grant.get('variant_reason') or 'TAK Portal is older than 2.0.19') +
+                '. Update TAK Portal, then run Repair.')
         elif grant.get('present') and grant.get('matches'):
-            row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current)')
+            _h = (grant.get('helper') or {})
+            row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
+                '' if _h.get('granted') else
+                'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
                 'Run Repair to rewrite it.')
@@ -45944,10 +45958,12 @@ def _cloudtak_remote_custom_compose_sh():
 # ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
 # from its own docker-compose.plugin-print.yml in the CloudTAK project, with `expose: 5010` only
 # and internal URLs (http://cloudtak-api:5000, http://cloudtak-tiles:5002) that don't resolve on
-# a stock CloudTAK project (clptak/cloudtak-plugin-print#2). infra-TAK's Caddy runs on the host
-# and can't reach a container name, so the browser's /print-api had nowhere to go (GH #261's 502).
+# a stock CloudTAK project (clptak/cloudtak-plugin-print#2; upstream PRs #3/#4 fixed the URLs).
+# infra-TAK's Caddy runs on the host and can't reach a container name, so the browser's
+# /print-api had nowhere to go (GH #261's 502).
 #
-# infra-TAK's own small overlay publishes it on loopback and points it at api / tiles. It is
+# infra-TAK's own small overlay publishes it on loopback (ops #235: the URLs are the plugin's own
+# defaults now, so the overlay no longer sets them). It is
 # applied by starting cloudtak-print from base + TAK Portal's file + the overlay (+ the
 # operator's custom file), explicitly, and is deliberately NOT put in COMPOSE_FILE: CloudTAK
 # Update builds every service listed there with --no-cache (Print is a Chromium image, and a
@@ -45967,10 +45983,43 @@ services:
   {CLOUDTAK_PRINT_SERVICE}:
     ports:
       - "127.0.0.1:{CLOUDTAK_PRINT_PORT}:{CLOUDTAK_PRINT_PORT}"
-    environment:
-      - API_INTERNAL_URL=http://api:5000
-      - TILES_INTERNAL_URL=http://tiles:5002
 """
+
+
+# ops #235: the Print plugin (clptak/cloudtak-plugin-print PRs #3/#4) now names its dependencies
+# `${PRINT_API_SERVICE:-api}` / `${PRINT_TILES_SERVICE:-tiles}` / `${PRINT_STORE_SERVICE:-store}`
+# and its internal URLs `${PRINT_API_INTERNAL_URL:-http://api:5000}`, so the stock names are the
+# defaults and the stack's .env can override them. Compose fills those in from ~/CloudTAK/.env
+# when it runs; the check below has to do the same before it compares names with CloudTAK's.
+_CLOUDTAK_COMPOSE_VAR_RE = re.compile(r'\$(?:\$|\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-+?])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))')
+
+
+def _cloudtak_compose_interpolate(text, env):
+    """`text` the way Compose reads it: $$ is a literal $, $VAR / ${VAR} take the value from `env`
+    (empty when unset), ${VAR:-d} / ${VAR-d} fall back to d, ${VAR:+r} / ${VAR+r} give r when set.
+    None when a `${VAR:?}` requirement is unmet — Compose would stop there."""
+    bad = []
+
+    def sub(m):
+        if m.group(0) == '$$':
+            return '$'
+        name = m.group(1) or m.group(4)
+        op, arg = m.group(2), m.group(3) or ''
+        val = env.get(name)
+        val = val.strip().strip('"\'') if val is not None else None
+        empty = val is None or (op is not None and op.startswith(':') and val == '')
+        if op in ('-', ':-'):
+            return arg if empty else val
+        if op in ('+', ':+'):
+            return '' if empty else arg
+        if op in ('?', ':?'):
+            if empty:
+                bad.append(name)
+            return val or ''
+        return val or ''
+
+    out = _CLOUDTAK_COMPOSE_VAR_RE.sub(sub, str(text))
+    return None if bad else out
 
 
 def _cloudtak_print_problem(ct_dir):
@@ -45999,13 +46048,37 @@ def _cloudtak_print_problem(ct_dir):
             have = set(((_yaml.safe_load(f) or {}).get('services') or {}).keys())
     except Exception as e:
         return f"CloudTAK's {base} could not be read ({str(e)[:120]})"
-    for need in ('api', 'tiles'):
-        if need not in have:
-            return f"CloudTAK's {base} has no {need} service"
+    env = _cloudtak_env_read(os.path.join(ct_dir, '.env'))
+    # Print reaches CloudTAK's API and tiles by these URLs (the plugin's defaults are the stock
+    # http://api:5000 / http://tiles:5002, overridable from .env); a file that doesn't set them
+    # gets those defaults, so the stock services have to be there.
+    envs = svc.get('environment') or []
+    if isinstance(envs, list):
+        envs = dict(str(e).split('=', 1) for e in envs if '=' in str(e))
+    envs = envs if isinstance(envs, dict) else {}
+    for key, need in (('API_INTERNAL_URL', 'api'), ('TILES_INTERNAL_URL', 'tiles')):
+        url = _cloudtak_compose_interpolate(envs.get(key) or '', env) if envs.get(key) else ''
+        m = re.match(r'[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?\[?([^:/?#\]]+)', url)
+        host = (m.group(1) if m else url) if url else need
+        if host not in have and host not in svcs:
+            return (f"CloudTAK's {base} has no {host} service ({key}); "
+                    "fix it in CloudTAK's .env, or update TAK Portal and reinstall Print" if url else
+                    f"CloudTAK's {base} has no {host} service")
     deps = svc.get('depends_on') or []
-    names = list(deps) if isinstance(deps, (list, dict)) else []
-    missing = sorted(str(n) for n in names if n not in have and n not in svcs)
+    names = []
+    for n in (list(deps) if isinstance(deps, (list, dict)) else []):
+        got = _cloudtak_compose_interpolate(n, env)
+        if got is None:
+            return (f"its depends_on entry {n} needs a value that CloudTAK's .env doesn't set; "
+                    "set it there or reinstall Print")
+        names.append((got, '$' in str(n)))
+    missing = sorted(n for n, _ in names if n not in have and n not in svcs)
     if missing:
+        # the plugin's ${PRINT_*_SERVICE:-default} entries, as CloudTAK's .env resolved them
+        if any(v and n in missing for n, v in names):
+            return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
+                    "PRINT_API_SERVICE / PRINT_TILES_SERVICE / PRINT_STORE_SERVICE in CloudTAK's "
+                    ".env must name CloudTAK's own services")
         return (f"its depends_on names services CloudTAK doesn't have ({', '.join(missing)}); "
                 "a newer TAK Portal release fixes this — reinstall Print after updating TAK Portal")
     return ''
