@@ -9831,6 +9831,29 @@ def set_update_channel():
     return jsonify({'ok': True, 'channel': channel})
 
 
+def _git_ls_remote(*patterns):
+    """{ref: sha} from `git ls-remote` on the public repo, or None on failure.
+
+    Used when the GitHub REST API refuses us. The API is 60 calls/hour per IP
+    unauthenticated and the console, Guard Dog's watcher and the version lookups all
+    spend from that one bucket, so "Check for new release" failed on any box that had
+    been clicked a few times. git's smart-HTTP endpoint is not part of that quota.
+    """
+    try:
+        r = subprocess.run(['git', 'ls-remote', f'https://github.com/{GITHUB_REPO}.git'] + list(patterns),
+                           capture_output=True, text=True, timeout=10,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+        if r.returncode != 0:
+            return None
+        out = {}
+        for line in r.stdout.splitlines():
+            sha, _, ref = line.partition('\t')
+            if sha and ref:
+                out[ref.strip()] = sha.strip()
+        return out
+    except Exception:
+        return None
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -9880,6 +9903,22 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': latest_label, 'notes': notes,
                 'body': body, 'channel': 'dev', 'update_available': _is_ahead})
         except Exception as e:
+            _refs = _git_ls_remote('refs/heads/dev')
+            _full = (_refs or {}).get('refs/heads/dev', '')
+            if _full:
+                try:
+                    _lsha = subprocess.run(
+                        ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
+                         'rev-parse', '--short', 'HEAD'],
+                        capture_output=True, text=True, timeout=5).stdout.strip()
+                except Exception:
+                    _lsha = ''
+                _ahead = not _full.startswith(_lsha or 'XXXXXXXX')
+                _label = f'dev@{_full[:7]}'
+                _body = f'Latest commit on dev: {_full[:7]}\n\nClick "Pull dev" to update to this commit.'
+                update_cache.update({'latest': _label, 'checked': now, 'notes': 'dev branch', 'body': _body})
+                return _update_check_response({'current': VERSION, 'latest': _label, 'notes': 'dev branch',
+                    'body': _body, 'channel': 'dev', 'update_available': _ahead})
             # v10.1.40: check_failed distinguishes "I could not find out" from "there is
             # nothing new". Without it the UI's `else` branch printed "Up to date" over a
             # GitHub rate-limit (unauthenticated = 60/hour/IP, and the Guard Dog updates
@@ -9953,6 +9992,30 @@ def update_check():
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
             'channel': 'main', 'update_available': is_newer})
     except Exception as e:
+        # API refused (rate limit, DNS, timeout): read the tag list over git instead. The
+        # main-branch ancestry filter above needs the API, so this trusts the tag list —
+        # tags are only cut at ship, on main, so a dev-only tag is not expected.
+        _refs = _git_ls_remote('refs/tags/*')
+        _vers = []
+        for _ref in (_refs or {}):
+            _n = _ref.rsplit('/', 1)[-1]
+            if _n.endswith('^{}'):
+                continue
+            try:
+                _vers.append((_parse_version_tuple(_n.lstrip('v')), _n))
+            except (ValueError, IndexError):
+                continue
+        if _vers:
+            _vers.sort(key=lambda x: x[0], reverse=True)
+            _lt = _vers[0][1].lstrip('v')
+            try:
+                _newer = _parse_version_tuple(_lt) > _parse_version_tuple(VERSION) and _lt.strip() != VERSION.strip()
+            except (ValueError, IndexError):
+                _newer = False
+            _notes = f'Version {_vers[0][1]}'
+            update_cache.update({'latest': _lt, 'checked': now, 'notes': _notes, 'body': ''})
+            return _update_check_response({'current': VERSION, 'latest': _lt, 'notes': _notes, 'body': '',
+                'channel': 'main', 'update_available': _newer})
         return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False, 'check_failed': True})
 
 def _fetch_latest_tag_name():
