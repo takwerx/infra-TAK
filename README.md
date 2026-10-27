@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.2.30-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.2.30-alpha)**
+**Current release: [v10.3.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.0-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,33 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.0-alpha — 2026-10-27 — Ubuntu 24.04: install it, or upgrade a running box from the console; full-stack backup; the console works on a phone
+
+**Headline: infra-TAK now installs on Ubuntu 24.04 LTS, and a running 22.04 box upgrades to 24.04 from the Console page — checks first, backup first, no SSH session. Two-server installs upgrade the database server from the same page, and remote module hosts (Federation Hub, CloudTAK, Authentik, MediaMTX, Node-RED, TAK Portal, WebODM) upgrade one machine at a time. A new Full-stack backups card saves TAK Server, Authentik, TAK Portal, CloudTAK, Node-RED, MediaMTX and console settings in one click, and the console is usable on a phone.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.0-alpha))
+
+**Ubuntu 24.04.**
+- **Fresh installs** on 24.04 are supported (single box, Docker TAK, two-server, managed databases).
+- **In-place upgrade 22.04 → 24.04** from the Console page: a preflight lists every check, installs pending updates from the same window, takes a full-stack backup first, then runs the upgrade and reboot and verifies every service and container came back. Requires TAK Server 5.8.
+- **Two-server installs:** upgrade the main box first, then the database server from its own card; TAK Server stays connected throughout.
+- **Remote module hosts** upgrade from the core, one machine at a time. Federation Hub's MongoDB moves to 7.0 (the version the Federation Hub 5.8 guide documents; MongoDB 8.0 does not start on the 24.04 kernel). Hosts with Federation Hub MFDT enabled stay on 22.04.
+- ARM64 boxes stay on 22.04 for now.
+
+**Full-stack backup (GH #18).** Back up now, list, download, delete and same-box restore, with retention. On by default before an OS upgrade.
+
+**Phone-friendly console (GH #63).** Off-canvas sidebar with a top bar, banners that wrap, and the Console, TAK Server, Firewall, Marketplace and other pages fit a phone screen.
+
+**Fixes.**
+- apt installs keep an existing config file instead of stopping at dpkg's prompt.
+- Remote MediaMTX deploys work again (checksum match) and can read their TLS cert and key; remote deploys as a non-root SSH user join the docker group.
+- CloudTAK Print reads the plugin's `${VAR:-default}` settings like Compose does (GH #295).
+- The broker's readiness check no longer re-reads its whole audit log on every call.
+- Docker builds and pulls through the broker get up to an hour.
+- Console rollback checks the real password store and asks for it in the page.
+- Guard Dog: "CloudTAK repaired automatically" goes to the Activity log instead of email; the disk I/O alert needs sustained low throughput when commit latency is healthy.
+- Remote Assist follows upstream's newest verified release.
+- TAK Portal: image builds get 15 minutes and say why they failed; built-in admin accounts are hidden from the user list; its sudo grant is narrower.
+- TAK `.deb` signature verification works on a non-root console, and a package that fails it is refused.
 
 ### v10.2.30-alpha — 2026-10-25 — CloudTAK Print from TAK Portal works through infra-TAK's Caddy; no TAK Server restart over a flapping client; Guard Dog handles three disk growers; suggested heap keeps your own settings; Remote Assist TURN-to-TURN calls work; Authentik updates no longer race the console's watchdogs
 
