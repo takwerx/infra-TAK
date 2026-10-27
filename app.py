@@ -23835,8 +23835,9 @@ def _f2b_manual_protected_reason(net, client_ip=''):
     hit = _f2b_manual_overlap(net, _f2b_trusted_ignoreip().split())
     if hit:
         return (f'That includes {hit}, which is on this box\'s never-ban list (this server, its '
-                'local networks, or a trusted network you added). Remove it from Trusted '
-                'Upstream Networks first if you really want it banned.')
+                'local networks, or a trusted network you added), so banning it could cut the '
+                'box off. If it is a trusted network you added, remove it from Trusted '
+                'Upstream Networks first.')
     return None
 
 
