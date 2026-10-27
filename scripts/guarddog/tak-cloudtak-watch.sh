@@ -92,20 +92,25 @@ fi
 
 # ops #222: TAK Portal starts Print (cloudtak-print) from its own docker-compose.plugin-print.yml,
 # without infra-TAK's docker-compose.infratak-print.yml, so there is no loopback port behind
-# /print-api and its internal URLs don't resolve. Same rule as the console's _cloudtak_print_drift();
-# the repair restarts that one container.
+# /print-api and its internal URLs don't resolve. Same rule as the console's _cloudtak_print_drift():
+# fine when started with the overlay OR when it already publishes 127.0.0.1:5010 (ops #279: the
+# Print file TAK Portal installs now does, so the overlay never shows in its labels); the repair
+# restarts that one container.
 _ct_print_stale=""
 if [ -f "$CT_DIR/docker-compose.plugin-print.yml" ]; then
   _ct_pproj="$(docker inspect cloudtak-api-1 --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
   if [ -n "$_ct_pproj" ]; then
-    while IFS='|' read -r _n _f _s; do
+    while IFS='|' read -r _n _f _s _p; do
       [ "$_s" = cloudtak-print ] || continue
       case ",$_f," in
         *,docker-compose.infratak-print.yml,*|*/docker-compose.infratak-print.yml,*) ;;
-        *) _ct_print_stale="$_ct_print_stale $_n" ;;
+        *) case "$_p" in
+             *127.0.0.1:5010-\>5010/tcp*) ;;
+             *) _ct_print_stale="$_ct_print_stale $_n" ;;
+           esac ;;
       esac
     done <<EOF
-$(docker ps --filter "label=com.docker.compose.project=$_ct_pproj" --filter "label=com.docker.compose.service=cloudtak-print" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.service"}}' 2>/dev/null)
+$(docker ps --filter "label=com.docker.compose.project=$_ct_pproj" --filter "label=com.docker.compose.service=cloudtak-print" --format '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.service"}}|{{.Ports}}' 2>/dev/null)
 EOF
   fi
 fi
