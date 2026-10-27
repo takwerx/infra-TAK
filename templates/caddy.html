@@ -79,8 +79,8 @@
 {% elif caddy.installed and caddy.running %}
 <div class="section-title">Domain Configuration</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
-<div style="display:flex;gap:12px;align-items:end">
-<div style="flex:1"><label class="input-label">Base Domain (subdomains auto-configured)</label>
+<div class="btn-row" style="gap:12px;align-items:end">
+<div style="flex:1 1 220px;min-width:0"><label class="input-label">Base Domain (subdomains auto-configured)</label>
 <input type="text" id="domain-input" class="input-field" value="{{ settings.get('fqdn', '') }}" placeholder="yourdomain.com"></div>
 <button onclick="updateDomain()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Update & Reload</button>
 </div>

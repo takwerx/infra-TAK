@@ -565,6 +565,13 @@ function gdLoadPauseState(){
           (d.indefinite?'They stay paused until you resume them.'
                        :('Resuming automatically in '+(left||'under a minute')+'.'));
         st.style.color='var(--text-dim)';
+      }else if(d.quiet){
+        /* ops #228: planned work (T&E, a drill, Update Now) holds delivery; it ends by itself. */
+        var qleft=gdFmtRemaining(d.quiet_until);
+        st.innerHTML='<strong style="color:var(--yellow)">Alerts are HELD for planned work</strong> ('+
+          gdEsc(d.quiet_reason||'quiet window')+'), ending in '+(qleft||'under a minute')+
+          '. Anything still failing after that is emailed.';
+        st.style.color='var(--text-dim)';
       }else{
         st.textContent='Alerts are being delivered normally.';
         st.style.color='var(--green)';

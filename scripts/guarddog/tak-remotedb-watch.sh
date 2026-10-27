@@ -57,6 +57,11 @@
 #     also ask DB_HOST:DB_PORT, and, if this SSH user cannot sudo to postgres, the local
 #     socket as itself, as before. Same livelier-answer rule.
 
+# v10.3.0 W4.e: while the console is upgrading / updating / rebooting the database server,
+# a stopped PostgreSQL is the job working, not an outage — never restart it mid-dpkg.
+source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
+type gd_dbserver_standdown >/dev/null 2>&1 && gd_dbserver_standdown tak-remotedb-watch && exit 0
+
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
 DB_PORT="DB_PORT_PLACEHOLDER"

@@ -293,9 +293,10 @@ EXEC_ALLOW = {
     # a flipped box). Tightly gated — see _check_git: -C <root-era module dir>
     # only; home-resident repos run git DIRECTLY as the console user, never here.
     'git',
-    # transient-unit launcher — a DIRECT root-exec primitive, so gated to the ONE
-    # fixed kernel-patch shape (see _check_systemd_run). No broader than the
-    # already-allowed `systemctl start <console-written-unit>`.
+    # transient-unit launcher — a DIRECT root-exec primitive, so gated to THREE
+    # fixed shapes (kernel-patch, non-root migrate, OS upgrade — see
+    # _check_systemd_run). No broader than the already-allowed
+    # `systemctl start <console-written-unit>`.
     'systemd-run',
     # v10.1.0 Leg 6 (WiFi Join) — these were MISSING, so the whole WiFi card
     # no-op'd on non-root boxes (scan denied → empty list; add denied at
@@ -383,6 +384,8 @@ PATH_CHECKED_BINS = {
 # Privileged path prefixes the console is allowed to read/write (directly via
 # the write/read ops, and as targets of the path-checked coreutils above).
 PATH_ALLOW = (
+    '/var/lib/infratak-backups/',   # v10.3.0 W12 full-stack backups — root-owned 0700,
+                                    # config copies land here; DB dumps via stack_pg_dump
     '/etc/systemd/system/',
     '/etc/fail2ban/',
     '/etc/caddy/',
@@ -422,6 +425,10 @@ PATH_ALLOW = (
     '/usr/local/etc/',
     '/var/lib/cesium-tiles/',   # RHEL cesium tiles dir (chmod 755 by the console)
     '/var/lib/takguard/',       # Guard Dog state dir (mkdir/chmod by the console)
+    # v10.3.0 W4: OS-upgrade job state (status file, baseline.json, pre/ snapshot).
+    # Root-owned; the console mkdirs it, writes the baseline + seeds the status,
+    # and reads the status back after each console restart/reboot.
+    '/var/lib/infratak-os-upgrade/',
     '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
@@ -467,6 +474,9 @@ PATH_ALLOW_EXACT = (
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
+    '/var/lib/infratak-os-upgrade.sh',           # v10.3.0 W4: OS-upgrade job script (same
+                                                 # pairing — written by the console, run only
+                                                 # by the third gated systemd-run shape)
     '/etc/default/takserver',                    # TAK Server JVM heap (snapshot/restore + deploy)
     # Relay tunnel config (Connectivity → Connect a Relay). _CONN_WG_IF is the
     # fleet constant 'wg0', so this is one fixed file — NOT the /etc/wireguard/
@@ -555,7 +565,11 @@ def _within_realpath(path, root):
 # (dir/x -> /etc) and have the broker follow it out. These require realpath
 # containment; every other allowlisted prefix is root-owned, so the cheaper
 # lexical match in _abs stays safe.
-_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
+# The full-stack backup root (v10.3.0 W12) is root-owned, but it is on the write
+# allowlist and the console can `ln -s` inside it — so it gets realpath containment
+# too, or a planted link would turn a root cp/write into the backup tree into a
+# write anywhere.
+_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS + ('/var/lib/infratak-backups/',)
 
 
 def _path_allowed(path, readonly=False):
@@ -1358,13 +1372,38 @@ _MIGRATE_ALLOWED_PROPERTIES = {
     'SELinuxContext=system_u:system_r:unconfined_service_t:s0',
 }
 
+# v10.3.0 W4: THIRD fixed systemd-run shape — the console-driven in-place Ubuntu
+# 22.04 -> 24.04 upgrade (app.py _os_upgrade_start_job). Same inherent power as
+# the kernel-patch job (root runs a console-written script), pinned the same way:
+# this unit name, exactly `/bin/bash /var/lib/infratak-os-upgrade.sh`, the two
+# append-log properties, and the kernel-patch --setenv allowlist plus ONE extra
+# pinned by full KEY=VALUE: RELEASE_UPGRADER_NO_SCREEN=1. ubuntu-release-upgrader
+# re-execs itself inside GNU screen unless that variable is set
+# (DistUpgradeMain.py, ubuntu/noble), and a transient unit has no tty for screen.
+# Nothing else widens; a fourth unit or an unpinned --setenv fails
+# /redteam-selfaudit (REGRESSION:broker-systemd-run).
+_OSUP_UNIT_NAME = 'infratak-os-upgrade'
+_OSUP_SCRIPT = '/var/lib/infratak-os-upgrade.sh'
+_OSUP_LOG = '/var/log/infratak-os-upgrade.log'
+_OSUP_ALLOWED_PROPERTIES = {
+    'StandardOutput=append:' + _OSUP_LOG,
+    'StandardError=append:' + _OSUP_LOG,
+}
+_OSUP_ALLOWED_SETENV = _SYSTEMD_RUN_ALLOWED_SETENV | {
+    'RELEASE_UPGRADER_NO_SCREEN=1',
+}
+
 
 def _check_systemd_run(argv):
-    """Allow ONLY the two fixed transient-unit invocations: the kernel-patch job
-    and the non-root migration job. Everything else is denied."""
+    """Allow ONLY the three fixed transient-unit invocations: the kernel-patch job,
+    the non-root migration job and the OS-upgrade job (v10.3.0 W4). Everything
+    else is denied. --setenv values are pinned by FULL `KEY=VALUE` per unit — an
+    env var is enough to turn the fixed `/bin/bash <script>` into arbitrary root
+    exec (BASH_ENV, LD_PRELOAD, PATH), so the key alone is never enough."""
     saw_unit = None
     positionals = []
     props = []
+    setenvs = []
     for a in argv[1:]:
         if positionals:
             # past the launched command — the rest are ITS args (validated as
@@ -1375,9 +1414,9 @@ def _check_systemd_run(argv):
             continue
         if a.startswith('--unit='):
             unit = a.split('=', 1)[1]
-            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME):
+            if unit not in (_KPATCH_UNIT_NAME, _MIGRATE_UNIT_NAME, _OSUP_UNIT_NAME):
                 raise Denied(f'systemd-run: only units {_KPATCH_UNIT_NAME}/'
-                             f'{_MIGRATE_UNIT_NAME} allowed')
+                             f'{_MIGRATE_UNIT_NAME}/{_OSUP_UNIT_NAME} allowed')
             saw_unit = unit
             continue
         if a.startswith('--description='):
@@ -1386,20 +1425,30 @@ def _check_systemd_run(argv):
             props.append(a.split('=', 1)[1])
             continue
         if a.startswith('--setenv='):
-            if a.split('=', 1)[1] not in _SYSTEMD_RUN_ALLOWED_SETENV:
-                raise Denied(f'systemd-run: setenv not allowed: {a}')
+            setenvs.append(a.split('=', 1)[1])   # the FULL KEY=VALUE, checked per unit below
             continue
         if a.startswith('-'):
             raise Denied(f'systemd-run: flag not allowed: {a}')
         positionals.append(a)
     if saw_unit is None:
         raise Denied('systemd-run: missing required --unit=')
+    allowed_setenv = _OSUP_ALLOWED_SETENV if saw_unit == _OSUP_UNIT_NAME else _SYSTEMD_RUN_ALLOWED_SETENV
+    for s in setenvs:
+        if s not in allowed_setenv:
+            raise Denied(f'systemd-run: setenv not allowed: --setenv={s}')
     if saw_unit == _KPATCH_UNIT_NAME:
         for p in props:
             if p not in _SYSTEMD_RUN_ALLOWED_PROPERTIES:
                 raise Denied(f'systemd-run: property not allowed: --property={p}')
         if positionals != ['/bin/bash', _KPATCH_SCRIPT]:
             raise Denied(f'systemd-run: only `/bin/bash {_KPATCH_SCRIPT}` allowed')
+        return
+    if saw_unit == _OSUP_UNIT_NAME:
+        for p in props:
+            if p not in _OSUP_ALLOWED_PROPERTIES:
+                raise Denied(f'systemd-run: property not allowed: --property={p}')
+        if positionals != ['/bin/bash', _OSUP_SCRIPT]:
+            raise Denied(f'systemd-run: only `/bin/bash {_OSUP_SCRIPT}` allowed')
         return
     # migrate shape: /bin/bash <install>/scripts/migrate-console-nonroot.sh
     # --apply --auto-rollback. The install dir varies per box; the script is
@@ -1590,6 +1639,12 @@ def _do_exec(req):
         env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
+        # DEBIAN_FRONTEND does not answer dpkg's conffile prompt: a package whose config
+        # file is already on disk (the console writes /etc/caddy/Caddyfile before Caddy is
+        # installed) died at "end of file on stdin at conffile prompt" and was left iU.
+        # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
+        # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
+        env.setdefault('DPKG_FORCE', 'confdef,confold')
     proc = subprocess.run(argv, input=input_bytes, capture_output=True,
                           timeout=timeout, cwd=cwd, env=env)
     return {
@@ -1947,15 +2002,27 @@ def _do_pg_dump(req):
             return {'ok': False, 'error': 'runuser/pg_dump not found on trusted PATH'}
         argv = [runuser, '-u', 'postgres', '--', pg_dump,
                 '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'pg_dump')
+
+
+def _dump_to_file(argv, path, timeout, opname):
+    """Run a dump argv with stdout pointed at a root-opened `path`, then chmod 0600
+    and write the HMAC sidecar. Shared by pg_dump and stack_pg_dump."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    timeout = min(int(timeout or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
     # applies, and postgres needs no write access to the snapshot dir.
     # Own session: a timeout kills pg_dump itself, not just runuser — an orphaned
     # pg_dump kept its table locks and snapshot open until this daemon restarted.
     # (With `docker exec` the pg_dump inside the container outlives the client;
     # the lock-wait cap is what bounds that case.)
-    with open(path, 'wb') as out:
+    # O_NOFOLLOW: a symlink planted at the destination must not redirect a root
+    # write (the backup tree is on the write allowlist for config copies).
+    for p_ in (path, path + '.hmac'):
+        if os.path.islink(p_):
+            os.unlink(p_)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as out:
         proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.PIPE,
                                 start_new_session=True)
         try:
@@ -1972,7 +2039,7 @@ def _do_pg_dump(req):
             os.unlink(path)
         except OSError:
             pass
-        return {'ok': False, 'error': 'pg_dump did not finish within %d s' % timeout}
+        return {'ok': False, 'error': '%s did not finish within %d s' % (opname, timeout)}
     if proc.returncode != 0:
         try:
             os.unlink(path)    # never leave a truncated/empty dump behind
@@ -1986,12 +2053,68 @@ def _do_pg_dump(req):
     # sidecar can't be written, restore simply won't trust the dump later.
     try:
         sc = path + '.hmac'
-        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         os.write(fd, _dump_hmac(path).encode())
         os.close(fd)
     except OSError:
         pass
-    return {'ok': True, 'size': os.path.getsize(path)}
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return {'ok': True, 'size': os.path.getsize(path), 'sha256': h.hexdigest()}
+
+
+# ── Full-stack backup DB dumps (infra-TAK v10.3.0 W12.b) ─────────────────────
+# The module databases (Authentik, TAK Portal, CloudTAK) live inside their own
+# postgres containers. The console names the container; the broker supplies the
+# role and database from this fixed table — nothing caller-supplied reaches the
+# argv but the container key. Destination: <STACK_BACKUP_DIR>/<label>/<file>.pgdump
+# only, one level deep, so a dump can never land elsewhere or nest.
+STACK_BACKUP_DIR = '/var/lib/infratak-backups'
+_STACK_PG_CONTAINERS = {
+    'authentik-postgresql-1': ('authentik', 'authentik'),
+    'tak-portal-postgres':    ('takportal', 'takportal'),
+    'cloudtak-postgis-1':     ('docker', 'gis'),
+}
+
+
+def _stack_backup_name_ok(name):
+    return (isinstance(name, str) and 0 < len(name) <= 96
+            and name[0].isalnum() and all(c.isalnum() or c in '-_.' for c in name)
+            and '..' not in name)
+
+
+def _check_stack_pg_dump(req):
+    container = req.get('container')
+    if container not in _STACK_PG_CONTAINERS:
+        raise Denied(f'stack_pg_dump: container not allowed: {container!r}')
+    p = _abs(req.get('path'))
+    rel = p[len(STACK_BACKUP_DIR) + 1:] if p.startswith(STACK_BACKUP_DIR + '/') else ''
+    parts = rel.split('/')
+    if (len(parts) != 2 or not _stack_backup_name_ok(parts[0])
+            or not _stack_backup_name_ok(parts[1]) or not parts[1].endswith('.pgdump')):
+        raise Denied(f'stack_pg_dump: destination must be {STACK_BACKUP_DIR}/<label>/<name>.pgdump: {p}')
+    return p
+
+
+def _do_stack_pg_dump(req):
+    path = _check_stack_pg_dump(req)
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    # Root 0711 (pass-through, no listing: the console reaches only its own .dl-*
+    # staging dirs); each backup dir 0700. Refuse symlinks at either level.
+    for d, mode in ((STACK_BACKUP_DIR, 0o711), (os.path.dirname(path), 0o700)):
+        if os.path.islink(d):
+            return {'ok': False, 'error': f'refusing symlinked backup dir: {d}'}
+        os.makedirs(d, mode=mode, exist_ok=True)
+        os.chmod(d, mode)
+    argv = [docker, 'exec', req['container'], 'pg_dump', '-U', user,
+            '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
+    return _dump_to_file(argv, path, req.get('timeout'), 'stack_pg_dump')
 
 
 def _check_pg_restore(req):
@@ -2102,6 +2225,54 @@ def _do_pg_restore(req):
                               stderr=subprocess.PIPE, timeout=timeout)
     return {'ok': True, 'returncode': proc.returncode,
             'stderr': (proc.stderr or b'').decode(errors='replace')[-500:]}
+
+
+def _check_stack_pg_restore(req):
+    # same gate as stack_pg_dump: pinned container, <root>/<label>/<name>.pgdump only
+    return _check_stack_pg_dump(req)
+
+
+def _do_stack_pg_restore(req):
+    """W12.d: restore a full-stack backup dump into its module's postgres container.
+    Only a dump the broker itself produced (HMAC sidecar) is accepted — the backup
+    tree is on the write allowlist, so the console could otherwise plant an archive
+    whose TOC runs code as the database superuser. `verify_only` checks the HMAC and
+    the archive's TOC without touching the database (the restore preflight)."""
+    import hmac as _hmac
+    path = _check_stack_pg_restore(req)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return {'ok': False, 'code': 'ENOENT', 'error': f'dump not found: {path}'}
+    try:
+        with open(path + '.hmac') as f:
+            want = f.read().strip()
+    except OSError:
+        want = ''
+    if not want or not _hmac.compare_digest(want, _dump_hmac(path)):
+        return {'ok': False, 'code': 'DENIED',
+                'error': 'dump failed authenticity check — not a broker-produced backup'}
+    if req.get('verify_only'):
+        pg_restore = _newest_pg_client('pg_restore')
+        if not pg_restore:
+            return {'ok': True, 'toc_entries': None, 'note': 'HMAC verified; no host pg_restore to read the TOC'}
+        proc = subprocess.run([pg_restore, '--list', path], capture_output=True, timeout=600)
+        toc = [l for l in (proc.stdout or b'').decode(errors='replace').splitlines()
+               if l.strip() and not l.lstrip().startswith(';')]
+        return {'ok': proc.returncode == 0 and bool(toc), 'toc_entries': len(toc),
+                'error': (proc.stderr or b'').decode(errors='replace')[:400]}
+    user, db = _STACK_PG_CONTAINERS[req['container']]
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    argv = [docker, 'exec', '-i', req['container'], 'pg_restore', '-U', user,
+            '--clean', '--if-exists', '--no-owner', '-d', db]
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as inp:
+        proc = subprocess.run(argv, stdin=inp, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    # pg_restore exits 1 on non-fatal warnings — passed through for the caller.
+    return {'ok': True, 'returncode': proc.returncode,
+            'stderr': (proc.stderr or b'').decode(errors='replace')[-800:]}
 
 
 # /etc/ssl/openssl.cnf is a ROOT CODE-EXEC surface (it can load engines/providers
@@ -2512,6 +2683,31 @@ TAKPORTAL_SUDOERS_PATH = '/etc/sudoers.d/tak-portal'
 TAKPORTAL_REPAIR_SCRIPT = '/opt/tak/utils/tak-portal-repair-certs.sh'
 TAKPORTAL_CORECONFIG = '/opt/tak/CoreConfig.xml'
 TAKPORTAL_TAK_USER = 'tak'
+
+# The HARDENED grant (TAK Portal 2.0.19+): least privilege for the portal's SSH user.
+#   * no rule for the portal repair script (nothing under a directory the `tak`
+#     user owns is ever run as root);
+#   * CoreConfig `cat`/`tee` still match the exact commands the portal sends
+#     (`sudo -n cat|tee /opt/tak/CoreConfig.xml`), but they resolve — through a
+#     per-user secure_path — to ROOT-OWNED wrappers that drop to `tak` before
+#     touching the file;
+#   * the marketplace helper is installed from a PINNED sha256 and granted by
+#     exact path.
+# Boxes whose TAK Portal is older than 2.0.19 keep the legacy text (their
+# marketplace needs it) until the portal is updated.
+TAKPORTAL_LIBEXEC = '/usr/local/libexec/infratak'
+TAKPORTAL_WRAP_DIR = TAKPORTAL_LIBEXEC + '/portal-bin'
+TAKPORTAL_WRAPPED = ('cat', 'tee')
+TAKPORTAL_HELPER = '/usr/local/libexec/tak-portal/marketplace-helper'
+TAKPORTAL_LEFTOVER_SUDOERS = '/etc/sudoers.d/tak-portal-marketplace'
+TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
+# sha256 of host-helpers/marketplace-helper in TAK Portal releases 2.0.19-2.0.21
+# (ValleyTacticalSolutions/TAK-Portal). The helper is granted as root, so we only
+# ever install bytes we have reviewed; a portal that ships a different helper gets
+# it granted after the new hash is added here (with a /module-scan), never before.
+TAKPORTAL_HELPER_SHA256 = frozenset({
+    'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
+})
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
 # born-non-root box the directory is 0750 root:root anyway. Without it the UI
@@ -2562,8 +2758,13 @@ def _sudoers_safe_binaries(name):
     return out
 
 
-def _takportal_sudoers_text(user=BROKER_USER):
+def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
     """The ONE definition of the grant.
+
+    variant 'legacy'   — the v10.1.53 text, for a TAK Portal older than 2.0.19.
+    variant 'hardened' — ops #217: no script rules, CoreConfig cat/tee through
+                         root-owned wrappers that drop to `tak`, and (helper=True)
+                         the pinned marketplace helper.
 
     app.py imports THIS function for the root-console path rather than keeping its
     own copy, so the two can never drift — a drifted sudoers template is a
@@ -2574,6 +2775,10 @@ def _takportal_sudoers_text(user=BROKER_USER):
     binaries)."""
     if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
+    if variant == 'hardened':
+        return _takportal_hardened_text(user, helper)
+    if variant != 'legacy':
+        raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
     lines = [
         '# Managed by infra-TAK (v10.1.53). Do not edit by hand.',
         '#',
@@ -2602,6 +2807,228 @@ def _takportal_sudoers_text(user=BROKER_USER):
     # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
     lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
     return '\n'.join(lines) + '\n'
+
+
+def _takportal_hardened_text(user, helper):
+    """The hardened grant (ops #217). See the comment above TAKPORTAL_LIBEXEC."""
+    lines = [
+        '# Managed by infra-TAK (ops #217). Do not edit by hand.',
+        '#',
+        '# TAK Portal 2.0.19+. Nothing here runs a file that the `tak` user can',
+        '# write as root: no rule for the portal repair script, and the CoreConfig',
+        '# cat/tee below resolve (secure_path) to root-owned wrappers in',
+        f'# {TAKPORTAL_WRAP_DIR} that drop to `tak` first, so root never',
+        '# reads or writes through a path the `tak` user controls.',
+        f'Defaults:{user} !requiretty',
+        f'Defaults:{user} secure_path="{TAKPORTAL_WRAP_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+    ]
+    systemctl = _sudoers_safe_binaries('systemctl')
+    if not systemctl:
+        raise Denied(f'takportal_sudoers: cannot resolve a root-owned systemctl in {_SUDOERS_BIN_DIRS}')
+    for name in TAKPORTAL_WRAPPED:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_WRAP_DIR}/{name} {TAKPORTAL_CORECONFIG}')
+    for p in systemctl:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
+    # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
+    lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
+    if helper:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_HELPER}')
+    return '\n'.join(lines) + '\n'
+
+
+def _takportal_wrapper_text(name):
+    """Body of the root-owned wrapper for `cat` / `tee` (see TAKPORTAL_LIBEXEC)."""
+    real = (_sudoers_safe_binaries(name) or [None])[0]
+    setpriv = (_sudoers_safe_binaries('setpriv') or [None])[0]
+    if not real or not setpriv:
+        raise Denied(f'takportal_sudoers: cannot resolve a root-owned {name}/setpriv '
+                     f'in {_SUDOERS_BIN_DIRS}')
+    return (
+        '#!/bin/sh\n'
+        '# Managed by infra-TAK (ops #217). Do not edit by hand.\n'
+        "# TAK Portal's `sudo -n " + name + " " + TAKPORTAL_CORECONFIG + "` lands here: sudo searches\n"
+        '# this directory first for the portal user (secure_path in\n'
+        '# /etc/sudoers.d/tak-portal). Run as root with exactly that one argument,\n'
+        f'# the real {name} runs AS `{TAKPORTAL_TAK_USER}`, so root never reads or writes through\n'
+        '# a path that user controls. Anything else runs unchanged\n'
+        '# (commands sudo starts as `tak` inherit the same PATH).\n'
+        f'if [ "$(id -u)" = 0 ] && [ "$#" -eq 1 ] && [ "$1" = \'{TAKPORTAL_CORECONFIG}\' ]; then\n'
+        f'  exec {setpriv} --reuid={TAKPORTAL_TAK_USER} --regid={TAKPORTAL_TAK_USER} --init-groups {real} -- "$1"\n'
+        'fi\n'
+        f'exec {real} "$@"\n'
+    )
+
+
+def _root_dir_chain_ok(path):
+    """True when every component of `path` is a real directory (no symlink),
+    owned by root and not writable by group/other."""
+    cur = '/'
+    parts = [c for c in path.split('/') if c]
+    for c in [''] + parts:
+        cur = os.path.join(cur, c) if c else '/'
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+    return True
+
+
+def _ensure_root_dir(path):
+    """Create `path` (0755 root:root) when missing; Denied if any component that
+    exists is not a root-owned, non-writable, non-symlink directory."""
+    cur = '/'
+    for c in [c for c in path.split('/') if c]:
+        cur = os.path.join(cur, c)
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            os.mkdir(cur, 0o755)
+            os.chown(cur, 0, 0)
+            os.chmod(cur, 0o755)
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            raise Denied(f'takportal_sudoers: {cur} is not a root-owned, non-writable '
+                         'directory — refusing to place a root-run file under it')
+
+
+def _write_root_file(path, data, mode):
+    """Atomically install `data` at `path` as root:root `mode` (same-dir rename)."""
+    _ensure_root_dir(os.path.dirname(path))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.infratak-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _root_file_ok(path, want_sha256=None, want_bytes=None):
+    """A regular, root-owned file nobody else can write, in a root-only
+    directory chain, whose content matches (bytes, or one of a set of sha256)."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+        if not _root_dir_chain_ok(os.path.dirname(path)):
+            return False
+        with open(path, 'rb') as f:
+            data = f.read(1 << 20)
+    except OSError:
+        return False
+    if want_bytes is not None:
+        return data == want_bytes
+    return hashlib.sha256(data).hexdigest() in (want_sha256 or ())
+
+
+def _takportal_wrappers_ok():
+    try:
+        return all(_root_file_ok(f'{TAKPORTAL_WRAP_DIR}/{n}', want_bytes=_takportal_wrapper_text(n).encode())
+                   for n in TAKPORTAL_WRAPPED)
+    except Denied:
+        return False
+
+
+def _takportal_install_wrappers():
+    for n in TAKPORTAL_WRAPPED:
+        _write_root_file(f'{TAKPORTAL_WRAP_DIR}/{n}', _takportal_wrapper_text(n).encode(), 0o755)
+    if not _takportal_wrappers_ok():
+        raise Denied('takportal_sudoers: wrapper install did not verify (not root-owned/unwritable) '
+                     '— refusing to grant')
+
+
+def _read_small_nofollow(path, limit=1 << 20):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('not a regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as f:
+            return f.read(limit + 1)[:limit]
+    finally:
+        os.close(fd)
+
+
+def _takportal_version_tuple(ver):
+    m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)', str(ver or '').strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _takportal_decide(user=BROKER_USER):
+    """Which grant this box gets, from the TAK Portal checkout in the console
+    user's home. Read as root from a directory that user controls, so: no git
+    (config hooks run code), O_NOFOLLOW, size-capped, and the helper bytes are
+    only ever USED if they hash to a pinned value.
+
+    The checkout is operator-writable, so this selects between two grants, it is
+    not an authority: a box where the portal is old stays on the legacy text by
+    design (AJ, ops #16), and the status row says so."""
+    out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
+           'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found'}
+    try:
+        portal = os.path.join(pwd.getpwnam(user).pw_dir, 'TAK-Portal')
+    except KeyError:
+        return out
+    if os.path.islink(portal) or not os.path.isdir(portal):
+        return out
+    ver = ''
+    try:
+        ver = str((json.loads(_read_small_nofollow(os.path.join(portal, 'package.json')).decode('utf-8', 'replace'))
+                   or {}).get('version') or '')
+    except (OSError, ValueError, AttributeError):
+        pass
+    out['portal_version'] = ver
+    try:
+        data = _read_small_nofollow(os.path.join(portal, 'host-helpers', 'marketplace-helper'), 262144)
+    except OSError:
+        data = None
+    if data is not None:
+        if hashlib.sha256(data).hexdigest() in TAKPORTAL_HELPER_SHA256:
+            out['helper_bytes'] = data
+            out['helper_reason'] = ''
+        else:
+            out['helper_reason'] = ('this TAK Portal ships a marketplace helper infra-TAK has not '
+                                    'reviewed (sha256 not pinned)')
+    else:
+        out['helper_reason'] = 'no host-helpers/marketplace-helper in the TAK Portal checkout'
+    tup = _takportal_version_tuple(ver)
+    # The helper file only exists from 2.0.19, so it also proves "new enough"
+    # when package.json lags (upstream has shipped a release without bumping it).
+    if data is None and tup is not None and tup < TAKPORTAL_HARDENED_MIN_VERSION:
+        out['variant'] = 'legacy'
+        out['reason'] = (f'TAK Portal {ver} is older than '
+                         f'{".".join(map(str, TAKPORTAL_HARDENED_MIN_VERSION))} — its marketplace '
+                         'still needs the legacy grant; update TAK Portal to tighten it')
+    else:
+        out['reason'] = f'TAK Portal {ver or "version unknown"}'
+    return out
+
+
+def _takportal_helper_ok():
+    return _root_file_ok(TAKPORTAL_HELPER, want_sha256=TAKPORTAL_HELPER_SHA256)
+
+
+def _takportal_remove_leftover():
+    """Drop TAK Portal <2.0.19's `NOPASSWD: ALL` marketplace drop-in. True when
+    a file was removed."""
+    try:
+        st = os.lstat(TAKPORTAL_LEFTOVER_SUDOERS)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    os.unlink(TAKPORTAL_LEFTOVER_SUDOERS)
+    return True
 
 
 def _takportal_sudoers_supported():
@@ -2639,7 +3066,12 @@ def _check_takportal_sudoers(req):
     ok, why = _takportal_sudoers_supported()
     if not ok:
         raise Denied(f'takportal_sudoers: {why}')
-    _takportal_sudoers_text()          # raises Denied if the text cannot be built
+    # raises Denied if the text (or, hardened, a wrapper) cannot be built
+    variant = _takportal_decide()['variant']
+    _takportal_sudoers_text(variant=variant)
+    if variant == 'hardened':
+        for n in TAKPORTAL_WRAPPED:
+            _takportal_wrapper_text(n)
 
 
 def _do_takportal_sudoers(req):
@@ -2649,6 +3081,13 @@ def _do_takportal_sudoers(req):
         present = os.path.exists(TAKPORTAL_SUDOERS_PATH)
         matches = False
         mode = ''
+        decision = _takportal_decide()
+        variant = decision['variant']
+        helper_ok = _takportal_helper_ok()
+        hardened = (variant == 'hardened')
+        wrappers_ok = _takportal_wrappers_ok() if hardened else True
+        # An install would still have to put the helper in place.
+        helper_pending = hardened and decision['helper_bytes'] is not None and not helper_ok
         if present:
             try:
                 with open(TAKPORTAL_SUDOERS_PATH) as f:
@@ -2656,12 +3095,30 @@ def _do_takportal_sudoers(req):
                 st = os.stat(TAKPORTAL_SUDOERS_PATH)
                 mode = oct(st.st_mode & 0o777)
                 if ok:
-                    matches = (current == _takportal_sudoers_text())
-            except OSError:
+                    matches = (current == _takportal_sudoers_text(
+                        variant=variant, helper=(hardened and helper_ok))
+                        and wrappers_ok and not helper_pending)
+            except (OSError, Denied):
                 pass
         return {'ok': True, 'present': present, 'matches': matches, 'mode': mode,
-                'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH}
+                'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH,
+                'variant': variant, 'variant_reason': decision['reason'],
+                'wrappers_ok': wrappers_ok,
+                'helper': {'granted': bool(hardened and helper_ok),
+                           'installed': helper_ok, 'reason': decision['helper_reason']},
+                'leftover_marketplace_sudoers': os.path.lexists(TAKPORTAL_LEFTOVER_SUDOERS)}
     if action == 'remove':
+        # The wrappers and the helper exist only for this grant; they go with it.
+        for n in TAKPORTAL_WRAPPED:
+            try:
+                os.unlink(f'{TAKPORTAL_WRAP_DIR}/{n}')
+            except OSError:
+                pass
+        if _takportal_helper_ok():
+            try:
+                os.unlink(TAKPORTAL_HELPER)
+            except OSError:
+                pass
         try:
             os.unlink(TAKPORTAL_SUDOERS_PATH)
             return {'ok': True, 'removed': True, 'path': TAKPORTAL_SUDOERS_PATH}
@@ -2671,7 +3128,21 @@ def _do_takportal_sudoers(req):
         except OSError as e:
             return {'ok': False, 'error': f'could not remove {TAKPORTAL_SUDOERS_PATH}: {e}'}
 
-    content = _takportal_sudoers_text()
+    decision = _takportal_decide()
+    variant = decision['variant']
+    helper_granted = False
+    if variant == 'hardened':
+        # Root-owned, tak-unwritable files FIRST; the grant only goes in once
+        # they verify, so a half-installed hardened grant can never exist.
+        try:
+            _takportal_install_wrappers()
+            if decision['helper_bytes'] is not None:
+                if not _takportal_helper_ok():
+                    _write_root_file(TAKPORTAL_HELPER, decision['helper_bytes'], 0o755)
+            helper_granted = _takportal_helper_ok()
+        except (OSError, Denied) as e:
+            return {'ok': False, 'error': f'hardened TAK Portal grant not installed: {e}'}
+    content = _takportal_sudoers_text(variant=variant, helper=helper_granted)
     # Stage in /etc so os.replace() is an atomic same-filesystem rename, and so a
     # half-written file is never visible inside sudoers.d (sudo reads every file
     # in that directory on every invocation).
@@ -2693,7 +3164,19 @@ def _do_takportal_sudoers(req):
                              + ((chk.stderr or chk.stdout or '').strip()[:300])}
         os.replace(tmp, TAKPORTAL_SUDOERS_PATH)
         tmp = None
-        return {'ok': True, 'path': TAKPORTAL_SUDOERS_PATH, 'content': content}
+        removed = False
+        if variant == 'hardened':
+            # TAK Portal <2.0.19 wrote a NOPASSWD: ALL drop-in here; the
+            # hardened grant must not sit beside it.
+            try:
+                removed = _takportal_remove_leftover()
+            except OSError as e:
+                return {'ok': False, 'error': f'grant installed but could not remove '
+                                              f'{TAKPORTAL_LEFTOVER_SUDOERS}: {e}'}
+        return {'ok': True, 'path': TAKPORTAL_SUDOERS_PATH, 'content': content,
+                'variant': variant, 'variant_reason': decision['reason'],
+                'helper_granted': helper_granted, 'helper_reason': decision['helper_reason'],
+                'removed_leftover': removed}
     finally:
         if tmp:
             try:
@@ -3182,6 +3665,10 @@ def _evaluate(req):
             _path_allowed(req.get('path'), readonly=(op == 'read'))
         elif op == 'pg_dump':
             _check_pg_dump(req)
+        elif op == 'stack_pg_dump':
+            _check_stack_pg_dump(req)
+        elif op == 'stack_pg_restore':
+            _check_stack_pg_restore(req)
         elif op == 'pg_restore':
             _check_pg_restore(req)
         elif op == 'pgminer_scan':
@@ -3269,7 +3756,7 @@ def _dispatch(req, peer):
         audit(peer, 'ping', '', 'ALLOW')
         return {'ok': True, 'pong': True, 'enforce': ENFORCE,
                 'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
-                'readiness': _enforce_readiness(),
+                'readiness': _enforce_readiness(fresh=False),
                 'src_sha': RUNNING_SRC_SHA, 'src_path': SELF_PATH}
     if op == 'enforce_enable':
         # Operator opts the box in to enforcement (ratchet — enable only). Audited.
@@ -3281,8 +3768,8 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'pg_restore', 'pgminer_scan', 'disk_reclaim', 'takportal_sudoers',
-              'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
+    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
+              'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
               'pg_old_cluster'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
@@ -3291,6 +3778,8 @@ def _dispatch(req, peer):
             summary = JAVA_CACERTS
         elif op == 'certifi_upgrade':
             summary = CERTIFI_EDITOR_DIR
+        elif op in ('stack_pg_dump', 'stack_pg_restore'):
+            summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
         elif op == 'pg_old_cluster':
             summary = f"action={req.get('action')} major={_PG_OLD_MAJOR}"
         elif op == 'disk_reclaim':
@@ -3310,6 +3799,10 @@ def _dispatch(req, peer):
         audit(peer, op, summary, 'ALLOW')
         if op == 'pg_dump':
             return _do_pg_dump(req)
+        if op == 'stack_pg_dump':
+            return _do_stack_pg_dump(req)
+        if op == 'stack_pg_restore':
+            return _do_stack_pg_restore(req)
         if op == 'pg_restore':
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
@@ -3448,19 +3941,64 @@ def _audit_clean_window(now=None):
     return True, '', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since))
 
 
-def _enforce_readiness():
+# v10.3.0: the audit window is up to 11 x 20 MB of JSON lines. Scanning it on every
+# `ping` took 50 s on a box with weeks of history (test6, 216 MB), so every caller
+# with a timeout -- the OS-upgrade preflight (45 s), the broker card (5 s) -- failed,
+# and concurrent pings each re-read the whole log. The answer changes on the scale
+# of hours (the window is 72 h), so `ping` serves a cached result and refreshes it
+# in the background; only the enforce decision paths wait for a fresh scan.
+_READINESS_TTL = 600
+_READINESS_LOCK = threading.Lock()
+_READINESS_CACHE = {'at': 0.0, 'val': None, 'busy': False}
+
+
+def _audit_clean_window_safe():
+    try:
+        return _audit_clean_window()
+    except Exception as e:
+        return False, f'gate evaluation error: {e}', None
+
+
+def _readiness_refresh():
+    try:
+        val = _audit_clean_window_safe()
+        with _READINESS_LOCK:
+            _READINESS_CACHE.update(at=time.time(), val=val)
+    finally:
+        with _READINESS_LOCK:
+            _READINESS_CACHE['busy'] = False
+
+
+def _audit_clean_window_cached():
+    """Never blocks on the scan: returns the last result (refreshing it in the
+    background once older than _READINESS_TTL), or a 'still checking' answer
+    before the first scan has finished."""
+    with _READINESS_LOCK:
+        val, age, busy = _READINESS_CACHE['val'], time.time() - _READINESS_CACHE['at'], _READINESS_CACHE['busy']
+        if (val is None or age > _READINESS_TTL) and not busy:
+            _READINESS_CACHE['busy'] = True
+            threading.Thread(target=_readiness_refresh, daemon=True).start()
+    if val is None:
+        return False, 'checking the audit history', None
+    return val
+
+
+def _enforce_readiness(fresh=True):
     """Report the box's enforce readiness for the console card WITHOUT changing
     mode. Returns a dict: opted_in, clean, ready, reason, clean_since. Never
     raises. `ready` = opted_in is not required — a box is 'ready' (eligible) once
-    its audit window is clean, whether or not the operator has opted in yet."""
+    its audit window is clean, whether or not the operator has opted in yet.
+    fresh=False (ping) answers from the background cache instead of scanning."""
     try:
         opted_in = os.path.exists(ENFORCE_OPTIN_FILE)
     except OSError:
         opted_in = False
-    try:
-        clean, why, since = _audit_clean_window()
-    except Exception as e:
-        clean, why, since = False, f'gate evaluation error: {e}', None
+    if fresh:
+        clean, why, since = _audit_clean_window_safe()
+        with _READINESS_LOCK:
+            _READINESS_CACHE.update(at=time.time(), val=(clean, why, since))
+    else:
+        clean, why, since = _audit_clean_window_cached()
     return {'opted_in': opted_in, 'clean': clean, 'ready': clean,
             'reason': why, 'clean_since': since,
             'clean_secs_required': ENFORCE_CLEAN_SECS}
@@ -3844,6 +4382,7 @@ def serve():
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
                                'summary': 'recycle threshold overridden to %ds '
                                           '(TAKWERX_BROKER_RECYCLE_SECS test hook)' % _after}))
+    _audit_clean_window_cached()   # warm the readiness cache so the first ping is fast
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -3868,6 +4407,43 @@ def serve():
 # ---------------------------------------------------------------------------
 # Client  (used by the CLI proxy + selftest; app.py has its own in-process copy)
 # ---------------------------------------------------------------------------
+# ops #262: a first Print install from TAK Portal's marketplace (`docker compose ... up -d
+# --build cloudtak-print`, 2 GB Chromium image) was killed at exactly the 600 s default on a
+# busy box and the job showed failed although the image finished building. That call comes
+# from TAK Portal through the docker shim, so no caller sets TAKWERX_BROKER_TIMEOUT for it.
+# When the env is unset, an image-build or image-pull command gets BUILD_TIMEOUT instead.
+# Everything else keeps the default; an explicit TAKWERX_BROKER_TIMEOUT always wins.
+BUILD_TIMEOUT = 3600
+_DOCKER_VALUE_FLAGS = frozenset((
+    '-c', '--context', '-H', '--host', '-l', '--log-level', '--config',          # docker
+    '-f', '--file', '-p', '--project-name', '--profile', '--env-file',           # compose
+    '--project-directory', '--progress', '--ansi', '--parallel'))
+
+
+def default_timeout(argv):
+    """BUILD_TIMEOUT for `docker build|pull`, `docker buildx build` and `docker compose
+    build|up|pull|create`; 0 (no opinion, the daemon's own default) for anything else."""
+    if not argv or os.path.basename(argv[0]) != 'docker':
+        return 0
+    words, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+        elif a.startswith('-'):
+            skip = a in _DOCKER_VALUE_FLAGS
+        else:
+            words.append(a)
+            if len(words) == 2:
+                break
+    if words[:1] in (['build'], ['pull']):
+        return BUILD_TIMEOUT
+    if words[:2] == ['buildx', 'build']:
+        return BUILD_TIMEOUT
+    if words[:1] == ['compose'] and words[1:2] and words[1] in ('build', 'up', 'pull', 'create'):
+        return BUILD_TIMEOUT
+    return 0
+
+
 def client_send(req, timeout=DEFAULT_TIMEOUT):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -3919,6 +4495,8 @@ def cli_exec(args):
         _env_t = 0
     if _env_t > 0:
         req['timeout'] = min(_env_t, MAX_TIMEOUT)
+    elif default_timeout(args):
+        req['timeout'] = default_timeout(args)
     try:
         resp = client_send(req, timeout=(req.get('timeout') or DEFAULT_TIMEOUT) + 60)
     except (OSError, socket.timeout, ValueError) as e:
@@ -4009,6 +4587,15 @@ def cli_selftest():
          {'op': 'exec', 'argv': ['git', '-C', '/etc', 'rev-parse', 'HEAD']}),
         ('Policy blocks pg_dump outside snapshots',
          {'op': 'pg_dump', 'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_dump outside the backup tree',
+         {'op': 'stack_pg_dump', 'container': 'authentik-postgresql-1',
+          'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_pg_restore outside the backup tree',
+         {'op': 'stack_pg_restore', 'container': 'authentik-postgresql-1',
+          'path': '/opt/tak/snapshots/x/cot.pgdump'}),
+        ('Policy blocks stack_pg_dump of an unlisted container',
+         {'op': 'stack_pg_dump', 'container': 'evil',
+          'path': '/var/lib/infratak-backups/x/evil.pgdump'}),
         ('Policy blocks write to /root/.ssh',
          {'op': 'write', 'path': '/root/.ssh/authorized_keys'}),
         ('Policy blocks non-patch openssl.cnf write',

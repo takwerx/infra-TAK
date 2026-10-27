@@ -440,6 +440,48 @@ gd_find_stack_dir() {
   return 1
 }
 
+# v10.3.0 W4.e — the console is working on a split install's database server (OS upgrade,
+# Install updates, reboot). While /var/lib/takguard/dbserver-maintenance holds an epoch in
+# the future, a stopped PostgreSQL is that job working, not an outage: the DB watchers stand
+# down (return 0) instead of restarting PostgreSQL in the middle of dpkg. Absent, unreadable,
+# expired or garbage -> return 1 and the caller runs normally, so a console that died
+# mid-job silences Guard Dog for at most the expiry it wrote (3 h for the upgrade).
+# Logs once per script per window, not once per run.
+# v10.3.0 W12.d — the console is restoring a full-stack backup on THIS box: Authentik,
+# Portal, CloudTAK and TAK Server are stopped on purpose and their databases are being
+# rebuilt. A watcher that restarts one of them mid-restore races pg_restore. The console
+# writes an expiry (epoch) to the file and '0' when done; an expired or missing file
+# means run normally, so a console that dies mid-restore cannot silence Guard Dog for good.
+gd_stack_restore_standdown() {
+  local f=/var/lib/takguard/stack-restore name="${1:-guarddog}" until now seen
+  [ -f "$f" ] || return 1
+  until="$(head -c 32 "$f" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$until" ] || return 1
+  now="$(date +%s)"
+  [ "$now" -lt "$until" ] 2>/dev/null || return 1
+  seen="/var/lib/takguard/stack-restore.${name//[^a-z0-9-]/}.logged"
+  if [ "$(cat "$seen" 2>/dev/null)" != "$until" ]; then
+    echo "$(date): ${name}: stand-down — the console is restoring a full-stack backup (until $(date -d "@$until" 2>/dev/null || echo "$until"))" >> /var/log/takguard/restarts.log
+    echo "$until" > "$seen" 2>/dev/null
+  fi
+  return 0
+}
+
+gd_dbserver_standdown() {
+  local f=/var/lib/takguard/dbserver-maintenance name="${1:-guarddog}" until now seen
+  [ -f "$f" ] || return 1
+  until="$(head -c 32 "$f" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$until" ] || return 1
+  now="$(date +%s)"
+  [ "$now" -lt "$until" ] 2>/dev/null || return 1
+  seen="/var/lib/takguard/dbserver-maintenance.${name//[^a-z-]/}.logged"
+  if [ "$(cat "$seen" 2>/dev/null)" != "$until" ]; then
+    echo "$(date): ${name}: stand-down — the console is working on the database server (until $(date -d "@$until" 2>/dev/null || echo "$until"))" >> /var/log/takguard/restarts.log
+    echo "$until" > "$seen" 2>/dev/null
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # ops #180: the Authentik compose lock, for the boot scripts.
 #

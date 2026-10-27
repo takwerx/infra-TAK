@@ -1,0 +1,96 @@
+{
+  "_readme": "Path -> test tier map read by tools/pick-tests.py. To extend: add a glob to a rule's 'paths', a regex to 'content' (matched case-insensitively against changed lines), or a regex to 'context' (matched against the function/class a changed hunk sits in). Add a new object to 'rules' for a new tier. Tiers: see ops PIPELINE.md / FLEET.md 'Test cadence'.",
+  "version": 1,
+  "always": [
+    {"id": "tier1", "label": "Tier 1 PR checks (#236)"},
+    {"id": "box", "label": "Worker box test"}
+  ],
+  "default_boxes": ["any free dev box"],
+  "ignore_content_paths": ["tests/**", "docs/**", "**/*.md", "static/**", "templates/**", "tools/test-tiers.json", "tools/pick-tests.py"],
+  "rules": [
+    {
+      "id": "install",
+      "label": "Tier 3 fresh install (#239) before merge",
+      "why": "install path changed",
+      "boxes": ["nuc", "aws-arm"],
+      "paths": [
+        "start.sh",
+        "fix-console-after-pull.sh",
+        "requirements.txt",
+        "selinux/**",
+        "**/*.service",
+        "scripts/ufw-firewalld-shim/**",
+        "scripts/migrate-console-nonroot.sh",
+        "scripts/tak-console-restart.sh",
+        "scripts/set-docker-log-limits.sh",
+        "scripts/bootstrap-*.sh",
+        "scripts/connectivity-anchor-bootstrap.sh",
+        "nodered/deploy.sh"
+      ],
+      "content": [
+        "\\b_pkg_(install|remove|mgr|lock_wait)\\b",
+        "\\b_fw_(allow|allow_from|remove|deny|backend|ensure_installed|install_shim|port_source_scoped)\\b",
+        "\\b_distro_family\\b",
+        "\\bsystemctl\\b",
+        "\\.service\\b",
+        "\\bdocker (compose )?(pull|up)\\b",
+        "\\b(apt-get|apt|dnf|yum)\\b +(-\\S+ +)*(install|remove|update)\\b",
+        "\\b(wget|curl)\\b.*(https?://|-o|-O)",
+        "\\bghcr\\.io/|\\bdocker\\.io/|^\\s*image:"
+      ],
+      "context": [
+        "\\bdef (_?run_)?\\w*deploy\\w*\\(",
+        "\\bdef \\w*install\\w*\\("
+      ]
+    },
+    {
+      "id": "database",
+      "label": "Tier 5 cloud database tests (#243): RDS + Azure PostgreSQL",
+      "why": "database / remote-DB / split-server code changed",
+      "boxes": ["test8"],
+      "paths": [
+        "scripts/guarddog/tak-db-*",
+        "scripts/guarddog/tak-remotedb-*",
+        "scripts/guarddog/tak-retention-guard.sh",
+        "scripts/guarddog/tak-auto-vacuum.sh",
+        "scripts/guarddog/tak-cotdb-watch.sh",
+        "docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md"
+      ],
+      "content": [
+        "pgbouncer",
+        "\\btwo_server\\b|two-server",
+        "\\bremote_?db\\b|remote-db",
+        "\\b(retention|vacuum|repack)\\b",
+        "\\brds\\b|amazonaws\\.com.*(rds|postgres)",
+        "azure.*postgres|postgres.*azure|\\.postgres\\.database\\.azure\\.com",
+        "\\bpsql\\b|\\bpg_(dump|restore|hba|isready)\\b|\\bpostgres(ql)?\\b"
+      ],
+      "context": [
+        "\\bdef \\w*(two_server|remote_?db|pgbouncer|retention|vacuum)\\w*\\("
+      ]
+    },
+    {
+      "id": "soak",
+      "label": "Soak of at least 60 min (T&E invariant 4)",
+      "why": "touches Authentik / Postgres / retention / cert renewal",
+      "boxes": [],
+      "paths": [
+        "scripts/guarddog/tak-db-*",
+        "scripts/guarddog/tak-retention-guard.sh",
+        "scripts/guarddog/tak-auto-vacuum.sh",
+        "scripts/guarddog/tak-cert-watch.sh",
+        "scripts/guarddog/tak-authentik-watch.sh"
+      ],
+      "content": [
+        "authentik",
+        "pgbouncer",
+        "\\bpostgres(ql)?\\b|\\bpsql\\b",
+        "\\b(retention|vacuum)\\b",
+        "certbot|\\brenew(al|ed|ing)?\\b|letsencrypt|\\bacme\\b"
+      ],
+      "context": [
+        "\\bdef \\w*(authentik|pgbouncer|retention|vacuum|renew|cert_renew)\\w*\\("
+      ]
+    }
+  ]
+}

@@ -91,6 +91,7 @@ def _ns(settings, **stubs):
         '_get_service_domain': lambda s, k: '',
         '_get_cloudtak_target_release_tag': lambda use_cache=True: 'v13.113.0',
         '_cloudtak_release_cache': {'tag': None, 'ts': 0},
+        '_REMOTE_DOCKER_GROUP_SH': 'true',   # row 5: remote step 2 joins the SSH user to docker
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
     }
     ns.update(stubs)

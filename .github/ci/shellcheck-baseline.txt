@@ -1,0 +1,4 @@
+scripts/guarddog/tak-8089-watch.sh SC2157
+scripts/guarddog/tak-oom-watch.sh SC2157
+scripts/guarddog/tak-setup-ap.sh SC2045
+start.sh SC1087
