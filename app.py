@@ -91273,16 +91273,60 @@ _OS_UPGRADE_SH_FLIP = (
     '\n'
 )
 
+# ops #284 (field, 2026-10-27): the TAK 5.8 migration's upgrade-db.sh keeps the old 15
+# cluster, stopped, as its rollback copy (GH #273 — the Guard Dog card offers Remove), and
+# pg_upgradecluster moves it off 5432. The preflight already let that box through, then this
+# check demanded "exactly one cluster" AFTER the flip and stopped a box that was on 24.04
+# with nothing wrong. The rule now matches _os_upgrade_pg_layout(): exactly one cluster
+# online, and it is PG_EXPECT on 5432; anything else must be an older major, stopped, and
+# not configured on 5432 (a second cluster on 5432 races TAK's for the port at boot).
+# A failure here is after the flip, so it says what the job did NOT do and how to finish.
 _OS_UPGRADE_SH_PG_CHECK = (
     'if [ -n "$PG_EXPECT" ]; then\n'
-    '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot"; fi\n'
+    '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot. $PG_NEXT"; fi\n'
     '  CL="$(pg_lsclusters --no-header 2>/dev/null)"\n'
     '  echo "[$(TS)] pg_lsclusters: ${CL:-none}"\n'
-    '  N="$(printf "%s\\n" "$CL" | grep -c .)"\n'
-    '  [ "$N" -eq 1 ] || fail reassert "expected exactly one PostgreSQL cluster, found $N: $CL"\n'
-    '  printf "%s\\n" "$CL" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online" || fail reassert "expected PostgreSQL ${PG_EXPECT} on 5432 online, found: $CL"\n'
+    '  LIVE="$(printf "%s\\n" "$CL" | awk \'$4 == "online"\')"\n'
+    '  if [ "$(printf "%s\\n" "$LIVE" | grep -c .)" -ne 1 ] || ! printf "%s\\n" "$LIVE" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online"; then\n'
+    '    fail reassert "TAK Server\'s database must be the only running PostgreSQL cluster: ${PG_EXPECT} on port 5432. Running now: ${LIVE:-none}. Make that true first (sudo pg_lsclusters shows them; sudo pg_ctlcluster <version> <name> start|stop). $PG_NEXT"\n'
+    '  fi\n'
+    '  BAD="$(printf "%s\\n" "$CL" | awk -v want="$PG_EXPECT" \'NF && $4 != "online" && ($4 !~ /^down/ || $3 == "5432" || $1 !~ /^[0-9]+$/ || $1 + 0 >= want + 0)\')"\n'
+    '  if [ -n "$BAD" ]; then\n'
+    '    fail reassert "a stopped PostgreSQL cluster other than an older leftover is configured here: $BAD. Only an older, stopped cluster on another port is safe to keep beside TAK Server\'s ${PG_EXPECT} on 5432. $PG_NEXT"\n'
+    '  fi\n'
+    '  OLDCL="$(printf "%s\\n" "$CL" | awk \'$4 ~ /^down/ { printf "%s%s/%s on %s", (n++ ? ", " : ""), $1, $2, $3 }\')"\n'
+    '  [ -n "$OLDCL" ] && echo "[$(TS)] kept as it is: stopped PostgreSQL $OLDCL (the copy the TAK Server 5.8 migration keeps as its rollback; TAK Server uses ${PG_EXPECT} on 5432). Remove it from Guard Dog when you no longer need it."\n'
     'fi\n'
 )
+
+
+def _os_upgrade_pg_layout(clusters, expect='18'):
+    """(ok, detail) for the local PostgreSQL clusters [(version, name, port, status), ...],
+    the same rule as _OS_UPGRADE_SH_PG_CHECK so the preflight refuses BEFORE the flip what
+    the reassert step would refuse after it. Accepted: exactly one cluster online, `expect`
+    on 5432; every other cluster an older major, stopped, configured on another port (the
+    5.8 migration's rollback copy, ops #284)."""
+    def _t(cs):
+        return ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in cs) or 'none'
+    live = [c for c in clusters if c[3] == 'online']
+    rest = [c for c in clusters if c[3] != 'online']
+    if len(live) != 1 or live[0][0] != expect or live[0][2] != '5432':
+        stop = [c for c in live if not (c[0] == expect and c[2] == '5432')]
+        how = (' — stop ' + ' and '.join(f'{c[0]}/{c[1]} (sudo pg_ctlcluster {c[0]} {c[1]} stop, and set '
+                                         f'/etc/postgresql/{c[0]}/{c[1]}/start.conf to manual)' for c in stop)
+               if stop and any(c[0] == expect and c[2] == '5432' for c in live) else '')
+        return False, (f'TAK Server\'s database must be the only running PostgreSQL cluster '
+                       f'({expect} on 5432); running: {_t(live)}{how}')
+    bad = [c for c in rest if not c[3].startswith('down') or c[2] == '5432'
+           or not c[0].isdigit() or int(c[0]) >= int(expect)]
+    if bad:
+        return False, (f'PostgreSQL {_t(live)}, but {_t(bad)} is also configured — only an older, '
+                       f'stopped cluster on another port is safe to keep beside it')
+    detail = f'PostgreSQL {_t(live)}'
+    if rest:
+        detail += (f'; the stopped {_t(rest)} (the copy the 5.8 migration keeps) is left as it is — '
+                   f'remove it from Guard Dog when you no longer need it')
+    return True, detail
 
 _OS_UPGRADE_SH_REBOOT = (
     # ---- 8. reboot ------------------------------------------------------------
@@ -91602,8 +91646,11 @@ def _os_upgrade_preflight(for_start=False, data=None):
                     ok = False
                     detail += ' — PostgreSQL cluster is ' + ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in clusters) + ', not 18 (the 5.8 migration did not finish)'
                 else:
-                    pg_expect = '18'
-                    detail += '; PostgreSQL ' + ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in clusters)
+                    # ops #284: the reassert step's rule, asked while nothing has changed yet.
+                    ok, pg_detail = _os_upgrade_pg_layout(clusters, '18')
+                    detail += ' — ' + pg_detail if not ok else '; ' + pg_detail
+                    if ok:
+                        pg_expect = '18'
             add('takserver_58', ok, detail)
 
     # 3. Local DB — a split-box remote DB server has no console and is not touched.
@@ -91794,6 +91841,11 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
             '  sed -i "s/^string_mask = utf8only/string_mask = nombstr/" /etc/ssl/openssl.cnf && echo "[$(TS)] re-applied string_mask = nombstr"\n'
             'fi\n'
             'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-pip python3-venv openssl sshpass git wget curl ca-certificates || fail reassert "base dependencies could not be installed"\n'
+            # ops #284: what a reassert failure leaves undone, as the exact commands for this box.
+            'PG_NEXT="Ubuntu 24.04 is installed and the console\'s Python was rebuilt, but the console was NOT restarted and the box was NOT rebooted. Once that is fixed, finish by hand: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg"\n'
+            'systemctl list-unit-files docker.service 2>/dev/null | grep -q docker.service && PG_NEXT="$PG_NEXT; sudo systemctl enable docker"\n'
+            'systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker && PG_NEXT="$PG_NEXT; sudo systemctl restart takwerx-broker"\n'
+            'PG_NEXT="$PG_NEXT; sudo systemctl restart takwerx-console; echo rebooting | sudo tee $STATUS; sudo reboot — after the reboot the console checks that everything came back"\n'
         ),
         _OS_UPGRADE_SH_PG_CHECK,
         (
@@ -92476,6 +92528,7 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
         (
             # ---- 6. reassert ----------------------------------------------------------
             'step reassert\n'
+            'PG_NEXT="Ubuntu 24.04 is installed on this database server, but it was NOT rebooted and the TLS check that follows did not run. Once that is fixed, compare SHOW ssl, the infra-TAK-dbtls lines in postgresql.conf and the hostssl rules with the copies in $PRE/pg, then: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg; sudo reboot"\n'
         ),
         _OS_UPGRADE_SH_PG_CHECK,
         (
@@ -92488,7 +92541,7 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
             '[ "$(grep -c "infra-TAK-dbtls" "$CONF")" = "$(cat "$PRE/pg/dbtls-count" 2>/dev/null)" ] || fail reassert "the infra-TAK TLS lines in postgresql.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
             'grep -E "^[[:space:]]*hostssl" "$HBA" | cmp -s - "$PRE/pg/hostssl" || fail reassert "the hostssl rules in pg_hba.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
             'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
-            'echo "[$(TS)] reassert complete: one PostgreSQL ${PG_EXPECT} cluster on 5432; TLS settings and hostssl rules as before"\n'
+            'echo "[$(TS)] reassert complete: PostgreSQL ${PG_EXPECT} on 5432 is the only running cluster; TLS settings and hostssl rules as before"\n'
             '\n'
         ),
         _OS_UPGRADE_SH_REBOOT,
@@ -92647,9 +92700,12 @@ def _dbserver_preflight(for_start=False, data=None, settings=None, probe=None):
     cl = d.get('clusters') or []
     tak_n, tak_ssl = d.get('tak_sessions'), d.get('tak_sessions_ssl')
     cl_text = ', '.join('/'.join(c) for c in cl) or 'none'
-    if len(cl) != 1 or cl[0][:1] != ['18'] or cl[0][2:4] != ['5432', 'online']:
-        hint = ' — run the TAK Server 5.8 update first (it moves the database to PostgreSQL 18)' if any(c[:1] == ['15'] for c in cl) else ''
-        add('is_tak_db', False, f'expected exactly one PostgreSQL 18 cluster on 5432, online; found {cl_text}{hint}')
+    # ops #284: the reassert step's rule — the 5.8 migration's stopped 15 copy may stay.
+    pg_ok, pg_detail = _os_upgrade_pg_layout([tuple(c[:4]) for c in cl if len(c) >= 4], '18')
+    if not pg_ok:
+        hint = (' — run the TAK Server 5.8 update first (it moves the database to PostgreSQL 18)'
+                if not any(c[:1] == ['18'] for c in cl) and any(c[:1] == ['15'] for c in cl) else '')
+        add('is_tak_db', False, f'{pg_detail}; found {cl_text}{hint}')
     elif not d.get('cot'):
         add('is_tak_db', False, 'PostgreSQL 18 is running but there is no cot database — this is not TAK Server\'s database')
     elif not tak_n:
