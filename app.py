@@ -895,6 +895,40 @@ def _stack_pg_dump_priv(container, dest_path, timeout=3600):
     return os.path.getsize(dest_path), _sha256_path(dest_path)
 
 
+# Node-RED /data archive for the full-stack backup: global context, config-backups/ and the
+# flows, as data/... paths. The broker holds its own copy of this script (it takes nothing
+# from the caller); keep the two in step.
+_STACK_NODERED_TAR_SH = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
+                         'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
+                         '[ $# -gt 0 ] && exec tar -cf - "$@"')
+
+
+def _stack_nodered_tar_priv(dest_path, timeout=600):
+    """Archive the Node-RED container's /data into the full-stack backup tree. Non-root: the
+    broker's `stack_nodered_tar` op writes the tar to disk itself — streamed through the exec
+    proxy it came back as ONE base64 reply, and a busy Node-RED (a 26.7 MB tar on test12) went
+    past the broker's 32 MiB MAX_MSG, so the backup ended INCOMPLETE. Root: the same docker
+    exec, run here. Returns (size, sha256); raises BrokerError / RuntimeError on failure."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'stack_nodered_tar', 'path': dest_path, 'timeout': timeout},
+                               timeout=timeout + 30)
+        if not resp.get('ok'):
+            raise BrokerError(f"broker stack_nodered_tar failed: {resp.get('error')}")
+        return int(resp.get('size') or 0), resp.get('sha256') or ''
+    os.makedirs(os.path.dirname(dest_path), mode=0o700, exist_ok=True)
+    with open(dest_path, 'wb') as out:
+        r = subprocess.run(['docker', 'exec', 'nodered', 'sh', '-c', _STACK_NODERED_TAR_SH],
+                           stdout=out, stderr=subprocess.PIPE, timeout=timeout)
+    if r.returncode != 0 or os.path.getsize(dest_path) == 0:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"tar in nodered failed: {(r.stderr or b'').decode(errors='replace')[:300]}")
+    os.chmod(dest_path, 0o600)
+    return os.path.getsize(dest_path), _sha256_path(dest_path)
+
+
 def _pg_dump_priv(dest_path, db='cot', timeout=600, container=None):
     """v10.0.8 (PLAN §B): local pg_dump written to disk BY THE BROKER — the dump
     never crosses the socket, so the 32MB message cap that forced the non-root
@@ -84431,20 +84465,10 @@ def _stack_backup(label=None, plog=None):
         #    "openat certs/admin.key: read-only file system"), and the restore needs only
         #    these. Read-only here; the SACRED union rule governs the restore (W12.d).
         if _installed('nodered'):
-            nr_tar = os.path.join(stage, 'nodered-data.tar')
-            _nr_tar_sh = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
-                          'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
-                          '[ $# -gt 0 ] && exec tar -cf - "$@"')
             try:
-                with open(nr_tar, 'wb') as out:
-                    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'nodered', 'sh', '-c', _nr_tar_sh]),
-                                       stdout=out, stderr=subprocess.PIPE, timeout=600)
-                if r.returncode == 0 and os.path.getsize(nr_tar) > 0:
-                    _copy_in(nr_tar, 'nodered-data.tar', 'volume', 'nodered:/data (context, config-backups, flows)')
-                else:
-                    _part('nodered-data.tar', 'volume', False,
-                          note=(r.stderr or b'').decode(errors='replace')[:300])
-                    plog(f"  stack backup: nodered-data.tar FAILED: {(r.stderr or b'').decode(errors='replace')[:300]}")
+                sz, digest = _stack_nodered_tar_priv(os.path.join(dest, 'nodered-data.tar'))
+                _part('nodered-data.tar', 'volume', True, sz, digest, 'nodered:/data (context, config-backups, flows)')
+                plog(f"  stack backup: nodered-data.tar written ({sz // 1024} KB)")
             except Exception as e:
                 _part('nodered-data.tar', 'volume', False, note=str(e)[:300])
                 plog(f"  stack backup: nodered-data.tar FAILED: {str(e)[:300]}")
