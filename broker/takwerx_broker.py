@@ -4407,6 +4407,43 @@ def serve():
 # ---------------------------------------------------------------------------
 # Client  (used by the CLI proxy + selftest; app.py has its own in-process copy)
 # ---------------------------------------------------------------------------
+# ops #262: a first Print install from TAK Portal's marketplace (`docker compose ... up -d
+# --build cloudtak-print`, 2 GB Chromium image) was killed at exactly the 600 s default on a
+# busy box and the job showed failed although the image finished building. That call comes
+# from TAK Portal through the docker shim, so no caller sets TAKWERX_BROKER_TIMEOUT for it.
+# When the env is unset, an image-build or image-pull command gets BUILD_TIMEOUT instead.
+# Everything else keeps the default; an explicit TAKWERX_BROKER_TIMEOUT always wins.
+BUILD_TIMEOUT = 3600
+_DOCKER_VALUE_FLAGS = frozenset((
+    '-c', '--context', '-H', '--host', '-l', '--log-level', '--config',          # docker
+    '-f', '--file', '-p', '--project-name', '--profile', '--env-file',           # compose
+    '--project-directory', '--progress', '--ansi', '--parallel'))
+
+
+def default_timeout(argv):
+    """BUILD_TIMEOUT for `docker build|pull`, `docker buildx build` and `docker compose
+    build|up|pull|create`; 0 (no opinion, the daemon's own default) for anything else."""
+    if not argv or os.path.basename(argv[0]) != 'docker':
+        return 0
+    words, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+        elif a.startswith('-'):
+            skip = a in _DOCKER_VALUE_FLAGS
+        else:
+            words.append(a)
+            if len(words) == 2:
+                break
+    if words[:1] in (['build'], ['pull']):
+        return BUILD_TIMEOUT
+    if words[:2] == ['buildx', 'build']:
+        return BUILD_TIMEOUT
+    if words[:1] == ['compose'] and words[1:2] and words[1] in ('build', 'up', 'pull', 'create'):
+        return BUILD_TIMEOUT
+    return 0
+
+
 def client_send(req, timeout=DEFAULT_TIMEOUT):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -4458,6 +4495,8 @@ def cli_exec(args):
         _env_t = 0
     if _env_t > 0:
         req['timeout'] = min(_env_t, MAX_TIMEOUT)
+    elif default_timeout(args):
+        req['timeout'] = default_timeout(args)
     try:
         resp = client_send(req, timeout=(req.get('timeout') or DEFAULT_TIMEOUT) + 60)
     except (OSError, socket.timeout, ValueError) as e:
