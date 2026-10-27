@@ -4,7 +4,7 @@ name: PR checks
 # A red check blocks the merge. Run the same things locally with:
 #   python3 -I .github/ci/compile_check.py
 #   bash .github/ci/shellcheck_gate.sh
-#   python3 -m pytest -q -n auto tests   (needs pytest-xdist; see .github/ci/requirements-test.txt)
+#   python3 -m pytest -q -n auto --basetemp ~/pytest-tmp tests   (basetemp must not be under /tmp; needs pytest-xdist, see .github/ci/requirements-test.txt)
 on:
   pull_request:
     branches: [dev, main]
@@ -87,7 +87,9 @@ jobs:
             requirements.txt
             .github/ci/requirements-test.txt
       - run: pip install -r requirements.txt -r .github/ci/requirements-test.txt
-      - run: python -m pytest -q -n 2 --timeout 300 --durations=10 -p no:cacheprovider tests
+      # --basetemp keeps pytest's temp dirs out of /tmp: some Guard Dog tests rewrite '/tmp/' in the
+      # script under test to their own tmp_path, which mangles a tmp_path that is itself under /tmp.
+      - run: python -m pytest -q -n 2 --timeout 300 --durations=10 -p no:cacheprovider --basetemp "$RUNNER_TEMP/pytest" tests
 
   # 3. The private security/smoke scanners (redteam-selfaudit scan.py, pre-merge-check
   #    smoke.py and check-template-js.py). They live in the gitignored .claude/skills/
