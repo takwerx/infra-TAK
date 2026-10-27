@@ -91476,6 +91476,8 @@ def _os_upgrade_preflight(for_start=False, data=None):
     }
     return {'ok': all(c['pass'] for c in checks), 'checks': checks,
             'irreversible': list(_OS_UPGRADE_IRREVERSIBLE), 'baseline': baseline,
+            # the modal's Install updates / Reboot actions key off these (same as dbserver/rhost)
+            'pending_count': None if pend is None else len(pend), 'reboot_required': bool(rb),
             'os_type': os_type, 'os_name': os_name, 'from': _OS_UPGRADE_FROM, 'to': _OS_UPGRADE_TO}
 
 
