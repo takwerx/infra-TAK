@@ -330,7 +330,13 @@ def test_standdown_while_marker_is_live_and_logs_once(standdown):
     assert log.count('stand-down') == 1 and 'tak-db-repack' in log
 
 
-@pytest.mark.parametrize('marker', [None, str(int(time.time()) - 1), 'garbage', ''])
+# The ids are fixed: a time-based id differs between pytest-xdist workers and aborts the run.
+@pytest.mark.parametrize('marker', [
+    pytest.param(None, id='none'),
+    pytest.param(str(int(time.time()) - 1), id='expired-1s-ago'),
+    pytest.param('garbage', id='garbage'),
+    pytest.param('', id='empty'),
+])
 def test_standdown_never_outlives_its_expiry(standdown, marker):
     assert standdown(marker) == 1
 
