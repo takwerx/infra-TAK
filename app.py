@@ -23754,7 +23754,7 @@ _F2B_MANUAL_FILTER_PATH = '/etc/fail2ban/filter.d/infratak-manual.conf'
 _F2B_MANUAL_MAX_ENTRIES = 500
 _F2B_MANUAL_MAX_NOTE = 200
 _F2B_MANUAL_MAX_DAYS = 3650
-_F2B_MANUAL_MIN_PREFIX = {4: 8, 6: 32}   # refuse anything wider than a /8 (v4) or /32 (v6)
+_F2B_MANUAL_MIN_PREFIX = 8              # refuse anything wider than a /8
 _F2B_MANUAL_LOCK = threading.RLock()
 _F2B_MANUAL_FILTER = (
     "[Definition]\n"
@@ -23795,9 +23795,15 @@ def _f2b_manual_net(text):
                 suggest = ''
             raise ValueError('That range has extra bits set' + (f' — did you mean {suggest}?' if suggest else '.'))
         raise ValueError('Enter an IP address or a range like 203.0.113.0/24.')
-    if net.prefixlen < _F2B_MANUAL_MIN_PREFIX[net.version]:
+    if net.version != 4:
+        # fail2ban's ufw action cannot add an IPv6 rule while IPv4 rules exist ("Invalid
+        # position '1'", tested on Ubuntu 24.04 / ufw 0.36), and iptables-allports on Rocky
+        # is IPv4 only. Say so rather than list a ban the firewall is not enforcing.
+        raise ValueError('IPv6 addresses can\'t be banned here yet: the firewall rule infra-TAK '
+                         'uses only blocks IPv4.')
+    if net.prefixlen < _F2B_MANUAL_MIN_PREFIX:
         raise ValueError('That range is too wide to ban by hand '
-                         f'(smallest allowed is /{_F2B_MANUAL_MIN_PREFIX[net.version]}).')
+                         f'(smallest allowed is /{_F2B_MANUAL_MIN_PREFIX}).')
     return net
 
 
@@ -23885,6 +23891,19 @@ def _f2b_manual_banned():
     return out
 
 
+def _f2b_manual_enforced(banned):
+    """The part of `banned` the firewall is really enforcing. fail2ban keeps its own list, so a
+    rule removed by hand (or one ufw refused) leaves an address listed as banned and connecting
+    freely. Where the firewall can be read (ufw) check it; elsewhere trust fail2ban."""
+    if not banned:
+        return banned
+    blocked = _f2b_ufw_blocked_ips()
+    if blocked is None:
+        return banned
+    return {net: text for net, text in banned.items()
+            if text in blocked or _f2b_manual_label(net) in blocked}
+
+
 def _f2b_manual_ensure_jail():
     """Write the jail and filter when missing or out of date (the never-ban list is baked
     in) and make fail2ban load them. Returns an error string, or '' on success."""
@@ -23951,9 +23970,14 @@ def _f2b_manual_reconcile():
         banned = _f2b_manual_banned()
         if banned is None:
             return {'errors': ['could not read the manual-bans jail'], 'banned': None}
+        enforced = _f2b_manual_enforced(banned)
         for net, text in desired.items():
-            if net in banned:
+            if net in banned and net in enforced:
                 continue
+            if net in banned:
+                # listed by fail2ban but missing from the firewall: clear it so it is re-added
+                subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'unbanip', text]),
+                               capture_output=True, text=True, timeout=15)
             r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'banip', text]),
                                capture_output=True, text=True, timeout=15)
             if r.returncode != 0:
@@ -23965,7 +23989,7 @@ def _f2b_manual_reconcile():
                                capture_output=True, text=True, timeout=15)
             if r.returncode != 0:
                 errors.append(f'{text}: {(r.stderr or r.stdout).strip()[:120] or "unban failed"}')
-        return {'errors': errors, 'banned': _f2b_manual_banned()}
+        return {'errors': errors, 'banned': _f2b_manual_enforced(_f2b_manual_banned())}
 
 
 def _f2b_manual_view(e, banned, client_ip='', now=None):
@@ -24010,7 +24034,7 @@ def fail2ban_manual_bans_api():
         return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
     client_ip = _f2b_console_client_ip()
     if request.method == 'GET':
-        banned = _f2b_manual_banned()
+        banned = _f2b_manual_enforced(_f2b_manual_banned())
         return jsonify({'ok': True, 'client_ip': client_ip,
                         'bans': [_f2b_manual_view(e, banned, client_ip) for e in _f2b_manual_load()]})
     data = request.get_json(silent=True) or {}

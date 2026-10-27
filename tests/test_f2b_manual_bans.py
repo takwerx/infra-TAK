@@ -40,7 +40,7 @@ TEMPLATE = (REPO / 'templates' / 'fail2ban.html').read_text(encoding='utf-8')
 
 FUNCS = ('_f2b_manual_jail_text', '_f2b_manual_net', '_f2b_manual_label', '_f2b_manual_overlap',
          '_f2b_manual_protected_reason', '_f2b_manual_load', '_f2b_manual_save',
-         '_f2b_manual_active', '_f2b_manual_banned', '_f2b_manual_reconcile',
+         '_f2b_manual_active', '_f2b_manual_banned', '_f2b_manual_enforced', '_f2b_manual_reconcile',
          '_f2b_manual_view', '_f2b_manual_days', '_f2b_manual_clean_note')
 CONSTS = ('_F2B_MANUAL_JAIL', '_F2B_MANUAL_JAIL_PATH', '_F2B_MANUAL_FILTER_PATH',
           '_F2B_MANUAL_MAX_NOTE', '_F2B_MANUAL_MAX_DAYS', '_F2B_MANUAL_MIN_PREFIX',
@@ -75,6 +75,7 @@ class Box:
         self.calls = []
         self.files = {}
         self.jail_loaded = jail_loaded
+        self.ufw_rules = None      # None = firewall can't be read (Rocky); a set = ufw's REJECT sources
         self.jail_file = True      # the jail file is written the first time a ban lands
         fake_os = types.SimpleNamespace(path=types.SimpleNamespace(exists=lambda p: self.jail_file))
         ns = {'re': re, 'os': fake_os, 'time': time, 'secrets': secrets, 'ipaddress': ipaddress,
@@ -92,6 +93,7 @@ class Box:
             _f2b_loaded_jails=lambda: ['sshd', 'infratak-manual'] if self.jail_loaded else ['sshd'],
             _f2b_parse_status=self._parse,
             _f2b_manual_ensure_jail=lambda: '',
+            _f2b_ufw_blocked_ips=lambda: self.ufw_rules,
         )
         self.ns = ns
 
@@ -127,8 +129,6 @@ class Box:
     (' 203.0.113.7 ', '203.0.113.7'),
     ('203.0.113.0/24', '203.0.113.0/24'),
     ('203.0.113.7/32', '203.0.113.7'),
-    ('2001:db8::/32', '2001:db8::/32'),
-    ('2001:db8::1', '2001:db8::1'),
 ])
 def test_accepts_addresses_and_ranges(text, label):
     b = Box()
@@ -139,6 +139,7 @@ def test_accepts_addresses_and_ranges(text, label):
     '', '   ', 'hello', '203.0.113', '203.0.113.256', '1.2.3.4; reboot', '1.2.3.4 5.6.7.8',
     '$(id)', '../etc', '203.0.113.0/33', '203.0.113.0/-1', '203.0.113.0/', 'a' * 100,
     '0.0.0.0/0', '10.0.0.0/7', '::/0', '2001:db8::/16',
+    '2001:db8::/32', '2001:db8::1', '::1',        # IPv6 is not enforced by the firewall action
 ])
 def test_refuses_junk_and_ranges_too_wide(text):
     b = Box()
@@ -164,15 +165,21 @@ def test_refuses_your_own_address_and_any_range_containing_it():
 def test_refuses_the_boxs_own_and_trusted_networks_and_anything_inside_or_around_them():
     b = Box()
     net = b.ns['_f2b_manual_net']
-    for t in ('127.0.0.1', '10.0.0.0/24', '10.0.0.77', '10.0.0.0/16', '192.0.2.50', '192.0.2.0/24', '::1'):
+    for t in ('127.0.0.1', '10.0.0.0/24', '10.0.0.77', '10.0.0.0/16', '192.0.2.50', '192.0.2.0/24'):
         assert b.ns['_f2b_manual_protected_reason'](net(t)), t
 
 
 def test_other_addresses_are_allowed():
     b = Box()
     net = b.ns['_f2b_manual_net']
-    for t in ('203.0.113.7', '203.0.113.0/24', '10.0.1.0/24', '2001:db8::/32'):
+    for t in ('203.0.113.7', '203.0.113.0/24', '10.0.1.0/24'):
         assert b.ns['_f2b_manual_protected_reason'](net(t), '198.51.100.20') is None, t
+
+
+def test_ipv6_refusal_says_why():
+    b = Box()
+    with pytest.raises(ValueError, match='IPv6'):
+        b.ns['_f2b_manual_net']('2001:db8::/32')
 
 
 def test_ipv4_entry_is_not_compared_with_an_ipv6_trusted_entry():
@@ -384,3 +391,29 @@ def test_card_talks_to_the_manual_ban_routes():
     js = _manual_js()
     assert "'/api/fail2ban/manual-bans'" in js
     assert "method:editingId?'PUT':'POST'" in js and "method:'DELETE'" in js
+
+
+# ── 8. fail2ban lists it but the firewall doesn't block it ───────────────────────────
+
+def test_a_ban_the_firewall_is_not_enforcing_is_not_shown_as_blocked_and_is_repaired():
+    b = Box()
+    b.add('203.0.113.7')
+    b.add('203.0.113.0/28')
+    b.banned.update({'203.0.113.7': True, '203.0.113.0/28': True})
+    b.ufw_rules = {'203.0.113.0/28'}              # the rule for .7 was removed by hand
+    enforced = b.ns['_f2b_manual_enforced'](b.ns['_f2b_manual_banned']())
+    assert {t for t in enforced.values()} == {'203.0.113.0/28'}
+    states = {e['target']: b.ns['_f2b_manual_view'](e, enforced)['state'] for e in b.ns['_f2b_manual_load']()}
+    assert states == {'203.0.113.7': 'pending', '203.0.113.0/28': 'banned'}
+    b.calls.clear()
+    b.ns['_f2b_manual_reconcile']()
+    assert ['fail2ban-client', 'set', 'infratak-manual', 'unbanip', '203.0.113.7'] in b.calls
+    assert ['fail2ban-client', 'set', 'infratak-manual', 'banip', '203.0.113.7'] in b.calls
+    assert not [c for c in b.calls if c[-1] == '203.0.113.0/28' and 'banip' in c]
+
+
+def test_where_the_firewall_cannot_be_read_fail2bans_list_is_trusted():
+    b = Box()
+    b.banned['203.0.113.7'] = True
+    b.ufw_rules = None
+    assert len(b.ns['_f2b_manual_enforced'](b.ns['_f2b_manual_banned']())) == 1
