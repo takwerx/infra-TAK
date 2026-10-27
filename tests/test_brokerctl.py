@@ -137,7 +137,7 @@ def _module_assigns(path):
             for t in node.targets if isinstance(t, ast.Name)}
 
 
-@pytest.mark.parametrize('name', ['SOCKET_PATH', 'MAX_MSG', 'DEFAULT_TIMEOUT', 'MAX_TIMEOUT'])
+@pytest.mark.parametrize('name', ['SOCKET_PATH', 'MAX_MSG', 'DEFAULT_TIMEOUT', 'MAX_TIMEOUT', 'BUILD_TIMEOUT'])
 def test_duplicated_constants_match_the_daemon(name):
     old, new = _module_assigns(OLD)[name], _module_assigns(NEW)[name]
     if name == 'SOCKET_PATH':
@@ -225,6 +225,49 @@ def test_timeout_env_rides_the_request_clamped(broker_factory, val, expect):
     _, reqs = assert_same(both(broker_factory, ok_reply(), ['exec', '--', 'true'],
                                env_extra={'TAKWERX_BROKER_TIMEOUT': val}))
     assert reqs[0].get('timeout') == expect
+
+
+# ops #262: image builds/pulls get a longer default when no caller set TAKWERX_BROKER_TIMEOUT
+# (TAK Portal's marketplace Print install died at the 600 s default on a busy box).
+PRINT_UP = ['docker', 'compose', '--progress=plain', '-f', 'docker-compose.yml', '-f',
+            '/home/takwerx/CloudTAK/docker-compose.plugin-print.yml',
+            'up', '-d', '--build', 'cloudtak-print']
+
+
+@pytest.mark.parametrize('argv', [
+    PRINT_UP,
+    ['docker', 'compose', '--progress', 'plain', '-p', 'cloudtak', 'build', '--no-cache'],
+    ['docker', 'compose', 'pull'],
+    ['docker', 'compose', 'create', 'x'],
+    ['docker', '--context', 'default', 'compose', 'up', '-d'],
+    ['docker', 'build', '-t', 'x', '.'],
+    ['docker', 'pull', 'img:tag'],
+    ['docker', 'buildx', 'build', '.'],
+], ids=lambda a: ' '.join(a[1:4]))
+def test_image_build_and_pull_get_the_long_default(broker_factory, argv):
+    _, reqs = assert_same(both(broker_factory, ok_reply(), ['exec', '--'] + argv))
+    assert reqs[0].get('timeout') == 3600
+
+
+@pytest.mark.parametrize('argv', [
+    ['docker', 'ps'],
+    ['docker', 'compose', 'ps'],
+    ['docker', 'compose', 'exec', 'x', 'up'],
+    ['docker', 'compose', '-f', 'build', 'ps'],      # `build` is the -f VALUE here
+    ['docker', 'exec', 'c', 'build'],
+    ['docker', 'cp', 'c:/x', '/tmp/x'],
+    ['systemctl', 'restart', 'caddy'],
+    ['apt-get', 'install', 'build'],
+], ids=lambda a: ' '.join(a[:3]))
+def test_other_commands_keep_the_daemon_default(broker_factory, argv):
+    _, reqs = assert_same(both(broker_factory, ok_reply(), ['exec', '--'] + argv))
+    assert 'timeout' not in reqs[0]
+
+
+def test_explicit_env_timeout_beats_the_build_default(broker_factory):
+    _, reqs = assert_same(both(broker_factory, ok_reply(), ['exec', '--'] + PRINT_UP,
+                               env_extra={'TAKWERX_BROKER_TIMEOUT': '900'}))
+    assert reqs[0].get('timeout') == 900
 
 
 def test_argv_without_double_dash_and_missing_command(broker_factory):
