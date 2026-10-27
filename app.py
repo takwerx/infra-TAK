@@ -1325,14 +1325,17 @@ TAKPORTAL_REF_FALLBACK = "1.4.6"   # used only when the releases API is unreacha
 # _fetch_takportal_latest, which returns None offline precisely so the update badge
 # cannot invent an answer from a constant).
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
-# ops #234: Remote Assist is PINNED to a reviewed upstream commit, like TVR_SHA. Upstream
-# deleted and re-created the repo on 2026-10-25 and now publishes snapshots from a private
-# repo straight onto main, so following main put whatever landed there next on every box at
-# its next Update, unreviewed. Deploy and Update check out exactly this commit and verify it
-# (_remote_assist_checkout_pin); moving it is a reviewed, T&E'd bump like any other pin.
-# 05ca341 = "Release v3.1.4" (published from upstream's private source a017dbb).
+# ops #234 / #265: Remote Assist follows upstream's newest PUBLISHED RELEASE, like TAK Portal
+# (_remote_assist_latest_release), never the tip of main. Upstream deleted and re-created the
+# repo on 2026-10-25 and publishes snapshots from a private repo straight onto main, so main is
+# unreviewed; a release is a deliberate act. A release is only used when its tag really contains
+# that version (the tag's VERSION file must match: on 2026-10-26 the eud_3.3.0/eud_3.4.0 tags
+# pointed at the v3.1.4 commit), and the deploy log + settings record the tag and commit.
+# 05ca341 = "Release v3.1.4" is the FLOOR: what an offline box (or one whose newest release tag
+# is broken) installs. It is expected to go stale between bumps and is never an update target.
 REMOTE_ASSIST_SHA = "05ca3410d8b81f4807c637dd0c68ebfcfc70b8d6"
 REMOTE_ASSIST_PIN_VERSION = "3.1.4"   # upstream's VERSION file at REMOTE_ASSIST_SHA
+REMOTE_ASSIST_API_REPO = "cfd2474/EUD_Remote_Assist_Portal"
 REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
@@ -16418,48 +16421,108 @@ def _remote_assist_read_version_file(ra_dir):
         return ''
 
 
-def _remote_assist_checkout_pin(ra_dir, plog):
-    """ops #234: bring the Remote Assist clone to REMOTE_ASSIST_SHA, verify it, return it.
+_REMOTE_ASSIST_TAG_RE = re.compile(r'^(?:eud_|v)?(\d+\.\d+\.\d+)$')
+_remote_assist_upstream_cache = {'ts': 0, 'release': None}
 
-    Fetches the pinned commit by SHA (a shallow clone of main does not hold it once upstream
-    moves on; upstream also rewrote history on 2026-10-25, which broke `pull --ff-only`) and
-    `reset --hard`s to it. A failed fetch is only a warning: an offline box that already has
-    the commit still lands on it, and one that does not fails at the reset. Then HEAD must be
-    the pin and no tracked file may differ from it, or nothing gets built.
 
-    A checkout NEWER than the pin (a box that took upstream main before the pin shipped) is
-    refused rather than downgraded: the portal's database may already be migrated past what
-    the pinned release understands. It moves again when the pin is bumped past it."""
+def _remote_assist_latest_release(fresh=False):
+    """ops #265: upstream's newest published Remote Assist release as {'tag', 'version'}, or None.
+
+    None when GitHub is unreachable, the tag is not a plain version, or the release does not
+    hold up: the tag's own VERSION file must equal the version in its name. Upstream's
+    eud_3.3.0 / eud_3.4.0 tags pointed at the v3.1.4 commit on 2026-10-26, so taking the
+    release name on trust would have installed 3.1.4 under a 3.4.0 label and offered an Update
+    that never lands. Never raises, never returns the floor: a pin is not an observation
+    (same rule as _fetch_takportal_latest). The tag reaches `git fetch`, so it is validated
+    against a strict shape first. The last attempt is cached so a box that cannot reach GitHub
+    backs off for a full TTL instead of eating the timeout on every page render."""
+    import time as _time
+    import urllib.request as _ur
+    c = _remote_assist_upstream_cache
+    now = _time.time()
+    if not fresh and c['ts'] and (now - c['ts'] < TAKPORTAL_UPSTREAM_CACHE_TTL):
+        return c['release']
+    c['ts'] = now
+    c['release'] = None
+    try:
+        req = _ur.Request(f'https://api.github.com/repos/{REMOTE_ASSIST_API_REPO}/releases/latest',
+                          headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=6) as resp:
+            tag = str((json.loads(resp.read().decode()) or {}).get('tag_name') or '').strip()
+        m = _REMOTE_ASSIST_TAG_RE.match(tag)
+        if not m:
+            print(f"remote-assist: latest release tag {tag[:40]!r} is not a plain version — ignored", flush=True)
+            return None
+        req = _ur.Request(f'https://raw.githubusercontent.com/{REMOTE_ASSIST_API_REPO}/refs/tags/{tag}/VERSION',
+                          headers={'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=6) as resp:
+            have = resp.read(64).decode().strip().lstrip('vV')
+        if have != m.group(1):
+            print(f"remote-assist: release {tag} holds v{have or '?'}, not v{m.group(1)} — ignored", flush=True)
+            return None
+        c['release'] = {'tag': tag, 'version': m.group(1)}
+    except Exception as e:
+        print(f"remote-assist: GitHub releases lookup failed (non-fatal): {e}", flush=True)
+    return c['release']
+
+
+def _remote_assist_checkout_release(ra_dir, plog):
+    """ops #234 / #265: bring the Remote Assist clone to upstream's newest verified release
+    (_remote_assist_latest_release), or to the floor REMOTE_ASSIST_SHA when there is none.
+    Verify it and return (head, version).
+
+    Fetches by tag / SHA (a shallow clone of main holds neither once upstream moves on; upstream
+    also rewrote history on 2026-10-25, which broke `pull --ff-only`) and `reset --hard`s to it.
+    A failed fetch is only a warning: an offline box that already has the commit still lands on
+    it, and one that does not fails at the reset. Then HEAD must be the target, its VERSION file
+    must say the target version, and no tracked file may differ from it, or nothing gets built.
+
+    A checkout NEWER than the target (a box that took upstream main, or whose release was later
+    withdrawn) is refused rather than downgraded: the portal's database may already be migrated
+    past what the older release understands. It moves again when a newer release is published."""
     import subprocess as _sp
 
     def git(*args, timeout=120):
         return _sp.run(['git', '-C', ra_dir, *args], capture_output=True, text=True, timeout=timeout)
 
-    pin = REMOTE_ASSIST_SHA
+    rel = _remote_assist_latest_release(fresh=True)
+    if rel:
+        ref, version, label = f"refs/tags/{rel['tag']}", rel['version'], f"release v{rel['version']} ({rel['tag']})"
+        fetch = ['fetch', '-q', '--depth=1', 'origin', f"+{ref}:{ref}"]
+        target = ref + '^{commit}'
+    else:
+        ref, version, label = REMOTE_ASSIST_SHA, REMOTE_ASSIST_PIN_VERSION, f'floor release v{REMOTE_ASSIST_PIN_VERSION}'
+        fetch = ['fetch', '-q', '--depth=1', 'origin', REMOTE_ASSIST_SHA]
+        target = REMOTE_ASSIST_SHA
+        plog('  No verified upstream release reachable — using the reviewed floor')
     head = (git('rev-parse', 'HEAD', timeout=10).stdout or '').strip()
     have = _remote_assist_read_version_file(ra_dir)
-    if head != pin and have and (_remote_assist_version_tuple(have)
-                                 > _remote_assist_version_tuple(REMOTE_ASSIST_PIN_VERSION)):
-        raise RuntimeError(f'installed v{have} is newer than the reviewed release '
-                           f'v{REMOTE_ASSIST_PIN_VERSION} ({pin[:7]}) — not downgrading. '
-                           'It moves again when infra-TAK pins a newer reviewed release.')
+    if have and (_remote_assist_version_tuple(have) > _remote_assist_version_tuple(version)):
+        raise RuntimeError(f'installed v{have} is newer than the {label} — not '
+                           'downgrading. It moves again when upstream publishes a newer release.')
     git('remote', 'set-url', 'origin', REMOTE_ASSIST_REPO, timeout=10)
-    f = git('fetch', '-q', '--depth=1', 'origin', pin)
+    f = git(*fetch)
     if f.returncode != 0:
-        plog(f'  ⚠ git fetch {pin[:7]}: {(f.stderr or f.stdout).strip()[:300]}')
-    r = git('reset', '--hard', pin)
+        plog(f'  ⚠ git fetch {ref[:40]}: {(f.stderr or f.stdout).strip()[:300]}')
+    want = (git('rev-parse', '--verify', '-q', target, timeout=10).stdout or '').strip()
+    if not want:
+        raise RuntimeError(f'could not find the {label} after fetch')
+    r = git('reset', '--hard', want)
     plog((r.stdout + r.stderr).strip() or '(no output)')
     if r.returncode != 0:
-        raise RuntimeError(f'could not check out pinned commit {pin[:7]}: {(r.stderr or "").strip()[:300]}')
+        raise RuntimeError(f'could not check out the {label} {want[:7]}: {(r.stderr or "").strip()[:300]}')
     head = (git('rev-parse', 'HEAD', timeout=10).stdout or '').strip()
-    if head != pin:
-        raise RuntimeError(f'clone is at {head[:7] or "?"}, expected pinned commit {pin[:7]}')
+    if head != want:
+        raise RuntimeError(f'clone is at {head[:7] or "?"}, expected the {label} {want[:7]}')
+    got = _remote_assist_read_version_file(ra_dir)
+    if got != version:
+        raise RuntimeError(f'the {label} holds v{got or "?"}, expected v{version}')
     st = git('status', '--porcelain', '--untracked-files=no', timeout=30)
     if st.returncode != 0 or st.stdout.strip():
-        raise RuntimeError(f'checkout does not match pinned commit {pin[:7]}: '
+        raise RuntimeError(f'checkout does not match the {label} {want[:7]}: '
                            f'{(st.stdout or st.stderr).strip()[:300]}')
-    plog(f'✓ Checked out reviewed commit {pin[:7]} (v{REMOTE_ASSIST_PIN_VERSION})')
-    return head
+    plog(f'✓ Checked out {label}, commit {want[:7]}')
+    return head, version
 
 
 def _remote_assist_deploy_log(msg):
@@ -17070,7 +17133,7 @@ def _run_remote_assist_deploy(settings):
             if r.returncode != 0:
                 raise RuntimeError(f'git clone failed: {r.stderr[:300]}')
             plog('✓ Repository cloned')
-        _remote_assist_checkout_pin(ra_dir, plog)  # ops #234
+        _remote_assist_checkout_release(ra_dir, plog)  # ops #234 / #265
 
         sha_r = _sp.run(['git', '-C', ra_dir, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
         commit_sha = sha_r.stdout.strip() or 'unknown'
@@ -17174,11 +17237,11 @@ def _get_remote_assist_running_version():
 def _get_remote_assist_version_info(*, fresh=False):
     """Return {version, update_available, latest, latest_tag, running, is_current} for EUD Remote Assist.
 
-    ops #234: compares the FULL local SHA against the pin REMOTE_ASSIST_SHA, and `latest` is
-    the pinned release. It used to chase upstream main through the GitHub API, which offered
-    every box whatever upstream published next, unreviewed. A checkout newer than the pin is
-    not offered an update (_remote_assist_checkout_pin refuses that downgrade). There is no
-    network call any more; `fresh` is kept for the callers.
+    ops #265: `latest` is upstream's newest verified release (_remote_assist_latest_release,
+    cached; `fresh` bypasses the cache). When GitHub is unreachable or the release does not hold
+    up, it is the reviewed floor, and a box at or above the floor is never offered an update:
+    a floor is not an observation. A checkout newer than the target is not offered one either
+    (_remote_assist_checkout_release refuses that downgrade).
     """
     import subprocess as _sp
     info = {'version': '', 'update_available': False, 'latest': None, 'latest_tag': None,
@@ -17206,15 +17269,14 @@ def _get_remote_assist_version_info(*, fresh=False):
     elif settings.get('remote_assist_commit_sha'):
         info['version'] = settings['remote_assist_commit_sha']
 
-    info['latest'] = info['latest_tag'] = REMOTE_ASSIST_PIN_VERSION
-    pin_t = _remote_assist_version_tuple(REMOTE_ASSIST_PIN_VERSION)
-    newer = bool(local_ver) and _remote_assist_version_tuple(local_ver) > pin_t
-    if local_full:
-        info['is_current'] = local_full == REMOTE_ASSIST_SHA
-        info['update_available'] = not info['is_current'] and not newer
-    elif local_ver:
-        info['update_available'] = _remote_assist_version_tuple(local_ver) < pin_t
-        info['is_current'] = _remote_assist_version_tuple(local_ver) == pin_t
+    rel = _remote_assist_latest_release(fresh=fresh)
+    target = rel['version'] if rel else REMOTE_ASSIST_PIN_VERSION
+    info['latest'] = target
+    info['latest_tag'] = rel['tag'] if rel else None
+    if local_ver:
+        cmp_t = _remote_assist_version_tuple(local_ver)
+        info['update_available'] = cmp_t < _remote_assist_version_tuple(target)
+        info['is_current'] = cmp_t == _remote_assist_version_tuple(target)
     running = _get_remote_assist_running_version()
     if running:
         info['running'] = running
@@ -17239,8 +17301,8 @@ def _run_remote_assist_update():
         if _he:
             plog(f'  ownership self-heal did not complete: {_he}')
         _remote_assist_restore_tracked_files(ra_dir)
-        # ops #234: the pinned commit, not upstream main (sets the remote URL too)
-        _remote_assist_checkout_pin(ra_dir, plog)
+        # ops #265: upstream's newest verified release, never main (sets the remote URL too)
+        _remote_assist_checkout_release(ra_dir, plog)
         _sp.run(['git', '-C', ra_dir, 'fetch', '--tags', '--depth', '1'],
                 capture_output=True, text=True, timeout=60)
 
@@ -17344,7 +17406,7 @@ def remote_assist_page():
         _remote_assist_deploy_status.update({'complete': False, 'error': False})
     ra_host = _get_service_domain(settings, 'remote_assist')
     ra_url = f'https://{_pub_hostport(ra_host)}' if ra_host else ''
-    ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
+    ra_vinfo = _get_remote_assist_version_info() if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
     coturn_ip = settings.get('coturn_ip', '')
     coturn_port = str(settings.get('coturn_port') or COTURN_DEFAULT_PORT)
