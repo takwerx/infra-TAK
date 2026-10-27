@@ -1073,7 +1073,7 @@ def test_no_user_to_check_with_is_said_and_does_not_restart():
     box.request('PgBouncer image swap', need_groups=False)
     assert box.recycle() is False
     assert box.restarts() == [] and box.leaf_certs == []
-    assert any('HTTPS/API side NOT checked: no non-admin LDAP user with TAK groups' in l for l in box.log)
+    assert any('HTTPS/API side NOT checked: no non-admin LDAP user with read/write TAK groups' in l for l in box.log)
     assert not any('no TAK Server restart needed' in l for l in box.log)
     assert box.settings['tak_ldap_recycle']['last_outcome'] == 'clients fine, no restart (HTTPS not checked)'
 
@@ -1118,6 +1118,65 @@ def test_group_tak_already_reports_is_used_so_a_fresh_portal_add_cannot_restart_
     assert box.recycle() is False
     assert box.restarts() == []
     assert 'group=OPS' in [u for _, m, u in box.user_api if m == 'PUT'][0]
+
+
+def _feed_groups(box, **by_user):
+    """LDAP: these users' tak_ memberOf are exactly the given group names."""
+    real = box.run
+
+    def run(cmd, **kw):
+        r = real(cmd, **kw)
+        if cmd[0] == 'ldapsearch' and r.stdout:
+            out, cur = [], None
+            for line in r.stdout.splitlines():
+                m = re.match(r'dn: cn=([^,]+),', line)
+                if m:
+                    cur = m.group(1)
+                    out.append(line)
+                    out += [f'memberOf: cn=tak_{g},ou=groups,dc=takldap' for g in by_user.get(cur, ())]
+                elif cur in by_user and line.lower().startswith('memberof:'):
+                    continue
+                else:
+                    out.append(line)
+            r.stdout = '\n'.join(out) + '\n'
+        return r
+    box.run = run
+
+
+def test_ops278_write_only_feed_user_is_not_picked_for_the_https_check():
+    # test8 2026-10-27: the first live user alphabetically was a Node-RED feed in only
+    # tak_AIRTEST_WRITE. TAK lists no write-only group on groups/all, so the check read
+    # "no groups" and restarted TAK on every update and Authentik restart.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    box.subs.append(sess(20, 'AAA-feed'))
+    box.ldap_users['AAA-feed'] = 1
+    _feed_groups(box, **{'AAA-feed': ['AIRTEST_WRITE']})
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert box.leaf_certs == ['ADSB_PS']
+    assert any('HTTPS as ADSB_PS' in l for l in box.log)
+
+
+def test_ops278_read_only_users_are_not_picked_either_and_mixed_users_use_their_rw_group():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    box.subs.append(sess(20, 'AAA-feed'))
+    box.subs.append(sess(21, 'AAB-mixed'))
+    box.ldap_users.update({'AAA-feed': 1, 'AAB-mixed': 1})
+    _feed_groups(box, **{'AAA-feed': ['AIRTEST_READ'], 'AAB-mixed': ['ZZZ_WRITE', 'OPS']})
+    assert box.recycle() is False
+    assert box.leaf_certs == ['AAB-mixed']
+    assert 'group=OPS' in [u for _, m, u in box.user_api if m == 'PUT'][0]
+
+
+def test_ops278_only_write_only_users_means_nothing_to_check_with_and_no_restart():
+    box = Box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR,
+              subs=[sess(1, 'admin', ('A',)), sess(2, 'feed')], ldap_users={'feed': 1},
+              ldap=lambda b: (0, 0))
+    _feed_groups(box, feed=['AIRTEST_WRITE'])
+    box.request('PgBouncer image swap', need_groups=False)
+    assert box.recycle() is False
+    assert box.restarts() == [] and box.leaf_certs == []
+    assert any('HTTPS/API side NOT checked: no non-admin LDAP user with read/write TAK groups' in l for l in box.log)
 
 
 def test_test_mission_left_by_a_failed_user_delete_is_deleted_as_admin():

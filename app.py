@@ -66264,8 +66264,9 @@ def _tak_api_user_check_once(cn, ldap_groups):
 def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
-    Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
-    one, else the first in LDAP; never a file user or a ROLE_ADMIN member) and, as a
+    Picks a real non-admin LDAP user with a read/write TAK group (one connected right now if
+    there is one, else the first in LDAP; never a file user, a ROLE_ADMIN member, or a user
+    whose groups are all *_READ / *_WRITE: TAK lists no write-only group, ops #278) and, as a
     throwaway cert for that user, reads its groups (groups/all), lists missions, creates a
     mission in one of its groups (tool `infratak-check`, which ATAK's Data Sync doesn't
     list) and deletes it again. A fresh cert for every login. A round is up to
@@ -66280,8 +66281,12 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
 
     def _pick(groups):
         for cn in sorted(groups or {}, key=str.lower):
-            g = [x for x in groups[cn] if x not in ('__ANON__', '')]
-            if (g and 'ROLE_ADMIN' not in g and cn.lower() not in file_users
+            all_g = [x for x in groups[cn] if x not in ('__ANON__', '')]
+            # Only groups the user can read AND write: TAK lists a *_WRITE (feed-in only)
+            # group on no groups/all, and the mission create needs write access, so a
+            # write-only Node-RED feed user would always read as "no groups" (ops #278).
+            g = [x for x in all_g if not re.search(r'_(?:read|write)$', x, re.I)]
+            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users
                     and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
                 return cn, g
         return None
@@ -66295,7 +66300,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
             return 'unknown', "can't read the users' groups from LDAP"
         pick = _pick(groups)
     if not pick:
-        return 'unknown', "no non-admin LDAP user with TAK groups to check with"
+        return 'unknown', "no non-admin LDAP user with read/write TAK groups to check with"
     cn, ldap_groups = pick
     t0 = time.time()
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
