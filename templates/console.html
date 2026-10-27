@@ -266,6 +266,7 @@ load();
 <div style="font-size:13px;font-weight:600;color:var(--cyan)">&#11014; Upgrade to Ubuntu 24.04 LTS</div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">This box runs Ubuntu 22.04, whose standard support ends in April 2027. The console can upgrade it in place: it checks the box first, shows you exactly what cannot be undone, then runs the whole upgrade &mdash; repositories, the console's Python environment, PostgreSQL, the reboot &mdash; with no SSH session. Take a VPS snapshot or an off-box backup first: there is no rollback.</div>
 <div style="font-size:11px;color:var(--yellow);margin-top:6px;line-height:1.5">Requires TAK Server 5.8 or newer. A box still on 5.7 runs the 5.8 update from the TAK Server page first, then comes back here.</div>
+<div id="osup-split-note" style="display:none;font-size:11px;color:var(--cyan);margin-top:6px;line-height:1.5">Two-server install: upgrade this box first, then the database server (its card is below).</div>
 </div>
 <div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
 <button type="button" onclick="osupOpenPreflight()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
@@ -301,6 +302,7 @@ load();
 <div style="flex:1;min-width:260px">
 <div id="dbs-idle-head" style="font-size:13px;font-weight:600;color:var(--cyan)">&#128451; Database server</div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">TAK Server's database runs on a separate box. The console can install its updates, reboot it, and upgrade it from Ubuntu 22.04 to 24.04 over the SSH connection it already uses &mdash; no SSH session from you. TAK Server stays up throughout, but nothing is saved to or read from the database while it restarts. Snapshot the database server before upgrading: there is no rollback.</div>
+<div style="font-size:11px;color:var(--cyan);margin-top:6px;line-height:1.5">Order: upgrade the main box first (the &ldquo;Upgrade to Ubuntu 24.04 LTS&rdquo; card above), then this database server.</div>
 <div id="dbs-idle-err" style="display:none;font-size:11px;color:var(--yellow);margin-top:6px;line-height:1.5"></div>
 </div>
 <div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
@@ -1633,6 +1635,7 @@ function _dbsShow(which){
     var card=document.getElementById('dbserver-card'); if(!card)return;
     ['dbs-idle','dbs-progress','dbs-result'].forEach(function(id){var el=document.getElementById(id);if(el)el.style.display=(id===which)?'block':'none';});
     card.style.display=which?'block':'none';
+    var sn=document.getElementById('osup-split-note'); if(sn)sn.style.display=which?'block':'none';
 }
 function _dbsHostLabel(){ return _dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':''; }
 function _dbsRenderProgress(d){
@@ -1733,7 +1736,7 @@ function _dbsRenderActions(pf){
     if(ub)ub.style.display=needUpd?'inline-block':'none';
     if(rb)rb.style.display=(needRb&&!needUpd)?'inline-block':'none';   // updates first; they may add a reboot
     if(msg)msg.textContent=core
-        ?(needUpd?(pf.pending_count||'Some')+' update(s) are pending on this box. Install updates runs the same job as the yellow "Operating system updates available" banner (TAK Server is held). When it finishes, open Check & upgrade again.'
+        ?(needUpd?(pf.pending_count||'Some')+' update(s) are pending on this box. Install updates runs the same job as the "operating system updates available" banner at the top of this page (TAK Server is held). When it finishes, open Check & upgrade again.'
                  :'This box needs a reboot before Ubuntu\'s upgrader will run. Every connected EUD drops for the minute or two it is down.')
         :_osupTarget==='remotehost'
         ?(needUpd?pf.pending_count+' update(s) are pending on '+where+'. Install updates runs apt full-upgrade there (Federation Hub\'s package is held). Its modules may restart briefly. Then Re-check.'
