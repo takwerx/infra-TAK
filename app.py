@@ -45931,8 +45931,9 @@ def _cloudtak_print_problem(ct_dir):
 
 
 def _cloudtak_print_containers(ct_dir):
-    """[(name, [config files])] for the running cloudtak-print containers of the CloudTAK project,
-    or None when CloudTAK isn't running (or docker can't tell)."""
+    """[(name, [config files], ports)] for the running cloudtak-print containers of the CloudTAK
+    project (`ports` is docker's own published-ports text), or None when CloudTAK isn't running
+    (or docker can't tell)."""
     proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
                             '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
     if not proj:
@@ -45940,27 +45941,38 @@ def _cloudtak_print_containers(ct_dir):
     rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
                            '--filter', f'label=com.docker.compose.service={CLOUDTAK_PRINT_SERVICE}',
                            '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
-                           '|{{.Label "com.docker.compose.service"}}'])
+                           '|{{.Label "com.docker.compose.service"}}|{{.Ports}}'])
     if rows is None:
         return None
     out = []
     for row in rows.splitlines():
         name, _, rest = row.partition('|')
-        files, _, service = rest.partition('|')
+        files, _, rest = rest.partition('|')
+        service, _, ports = rest.partition('|')
         if name.strip() and service.strip() == CLOUDTAK_PRINT_SERVICE:
-            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()]))
+            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()], ports.strip()))
     return out
 
 
+def _cloudtak_print_set_up(files, ports):
+    """Is this cloudtak-print container reachable for /print-api: either started with infra-TAK's
+    overlay, or already publishing 127.0.0.1:5010 (ops #279: the Print file TAK Portal installs
+    now publishes it itself, so Compose gives the overlay's start the same container and never
+    adds the overlay to its labels). The loopback port is the only thing the overlay does."""
+    return (CLOUDTAK_PRINT_OVERLAY in {os.path.basename(f) for f in files}
+            or f'127.0.0.1:{CLOUDTAK_PRINT_PORT}->{CLOUDTAK_PRINT_PORT}/tcp' in (ports or ''))
+
+
 def _cloudtak_print_drift(ct_dir):
-    """Running cloudtak-print containers that were NOT started with infra-TAK's Print overlay while
-    TAK Portal's Print is installed — what every TAK Portal install / update / rebuild of Print
-    leaves (no loopback port, wrong internal URLs). Guard Dog's tak-cloudtak-watch.sh applies the
-    same rule. [] when clean, not installed, or docker can't tell."""
+    """Running cloudtak-print containers that aren't set up for /print-api (no overlay and no
+    loopback port, see _cloudtak_print_set_up) while TAK Portal's Print is installed — what a
+    TAK Portal install / update / rebuild of an older Print file leaves. Guard Dog's
+    tak-cloudtak-watch.sh applies the same rule. [] when clean, not installed, or docker can't
+    tell."""
     if not os.path.isfile(os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)):
         return []
-    return [n for n, files in (_cloudtak_print_containers(ct_dir) or [])
-            if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+    return [n for n, files, ports in (_cloudtak_print_containers(ct_dir) or [])
+            if not _cloudtak_print_set_up(files, ports)]
 
 
 def _cloudtak_print_converge(ct_dir, plog=None):
@@ -45998,10 +46010,14 @@ def _cloudtak_print_converge(ct_dir, plog=None):
                 with open(overlay, 'w', encoding='utf-8') as f:
                     f.write(_CLOUDTAK_PRINT_OVERLAY_YML)
             rows = _cloudtak_print_containers(ct_dir)
-            stale = [n for n, files in (rows or [])
-                     if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+            stale = [n for n, files, ports in (rows or [])
+                     if not _cloudtak_print_set_up(files, ports)]
+            # a changed overlay only matters to a container that was started with it (ops #279:
+            # one that publishes the port by itself never reads it)
+            used = any(CLOUDTAK_PRINT_OVERLAY in {os.path.basename(f) for f in files}
+                       for _n, files, _p in (rows or []))
             result = 'ok'
-            if rows is not None and (changed or stale or not rows):
+            if rows is not None and ((changed and used) or stale or not rows):
                 base = 'docker-compose.yml'
                 if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
                     base = 'compose.yaml'
