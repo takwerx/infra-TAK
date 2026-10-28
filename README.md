@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.1-alpha)**
+**Current release: [v10.3.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.2-alpha — 2026-10-28 — Security: old Node.js in TAK Portal, CloudTAK, Node-RED or Remote Assist is flagged and emailed; CloudTAK plugins survive rebuilds
+
+**Headline: a Node.js bug that is being actively exploited (CVE-2026-111497) lives inside the TAK Portal, CloudTAK, Node-RED and Remote Assist images, so a module could be on its latest release and still run a vulnerable Node. The console now checks the Node version each of them really runs, sends a security email and shows a red flag on the card until you press Update, and Update now rebuilds on the newest Node.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.2-alpha))
+
+**Node.js security.**
+- Old Node.js in TAK Portal, CloudTAK, Node-RED or Remote Assist triggers one "Security update pending" email and a red "Node.js out of date — press Update" flag on the module's card.
+- CloudTAK Deploy and Update now pull the newest base image before building, so Update really moves CloudTAK onto the fixed Node. Node-RED Update moves to an image with the fixed Node.
+
+**CloudTAK plugins.**
+- Plugins installed by infra-TAK (and TAK Portal Marketplace plugins) stay in the CloudTAK build when a newer CloudTAK excludes its plugins folder from the image.
+- After a plugin install or a CloudTAK Update, the console checks that each plugin's menu entry is really in the rebuilt app, and warns in the install log if one is missing.
+
+**TAK Portal.**
+- Marketplace "Deploy To Caddy" no longer fails with "Caddy rejected the updated file" when the console doesn't run as root.
+- TAK Portal 2.0.23+ ships a newer marketplace helper. infra-TAK keeps the reviewed one for now, and the TAK Portal card says so. Deploy To Caddy does not need the newer one.
 
 ### v10.3.1-alpha — 2026-10-28 — Ubuntu 24.04 upgrade no longer stops at "reassert"; Manual bans on the Fail2ban page
 
