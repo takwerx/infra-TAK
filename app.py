@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.1-alpha"
+VERSION = "10.3.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -26451,6 +26451,159 @@ def _apply_security_identity(item):
     return item
 
 
+# ops #296: the Node.js inside a module's image is baked in at build time, so a module on
+# its latest release can still run a Node from before a Node security release. This table
+# is the ONE place that says which Node is fixed; the red flag on the console cards and the
+# security email both read it. When Node ships its next security release, add an entry (one
+# per advisory, newest last) with the fixed version of each major line still supported —
+# a major that is not listed claims nothing — and bump NODERED_IMAGE. Boxes below the new
+# versions then get the flag, and one more email (the email identity is the set of releases
+# a module is still below). `reason` is shown to the operator as-is.
+# https://nodejs.org/en/blog/vulnerability
+NODE_SECURITY_RELEASES = (
+    {'id': 'CVE-2026-111497', 'released': '2026-10-21',
+     'fixed': {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'},
+     'reason': 'a Brotli decoder memory-corruption bug that can lead to remote code execution, '
+               'being actively attacked'},
+)
+
+# Node-based modules whose containers are checked: module key (as in /api/modules/version) →
+# label, the container names / compose (project, services) that run Node, and where the
+# operator presses Update. The CloudTAK media helper is left out on purpose: it is an
+# upstream image that infra-TAK's Update cannot rebuild, so flagging it could never clear.
+NODE_MODULE_CONTAINERS = {
+    'takportal': {'label': 'TAK Portal', 'names': ('tak-portal', 'tak-portal-worker'),
+                  'projects': ('tak-portal',), 'services': ('tak-portal', 'tak-portal-worker')},
+    'cloudtak': {'label': 'CloudTAK', 'names': (), 'projects': ('cloudtak',),
+                 'services': ('api', 'events', 'tiles', 'retention', 'cloudtak-print')},
+    'nodered': {'label': 'Node-RED', 'names': ('nodered',), 'projects': (), 'services': ()},
+    'remote_assist': {'label': 'Remote Assist', 'names': (), 'projects': ('eud-remote-assist',),
+                      'services': ('server',)},
+}
+
+
+def _node_version_tuple(v):
+    m = re.match(r'^\s*v?(\d+)\.(\d+)\.(\d+)\s*$', v or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _node_releases_missing(version):
+    """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
+    that does not parse, or a major no entry lists, is not claimed."""
+    ver = _node_version_tuple(version)
+    if ver is None:
+        return []
+    out = []
+    for rel in NODE_SECURITY_RELEASES:
+        fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
+        if fixed is not None and ver < fixed:
+            out.append(rel)
+    return out
+
+
+def _node_container_versions():
+    """{module_key: {container: 'v22.23.4' | None}} for the running containers of the
+    modules in NODE_MODULE_CONTAINERS; None when a container has no `node` or does not
+    answer (unknown claims nothing). Raises when docker cannot be listed. Local
+    containers only — a module deployed to another host is not visible."""
+    r = subprocess.run(
+        _sudo_wrap(['docker', 'ps', '--format',
+                    '{{.Names}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}']),
+        capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or 'docker ps failed').strip()[:200])
+    out = {}
+    deadline = time.time() + 60
+    for line in r.stdout.splitlines():
+        name, _, rest = line.partition('|')
+        project, _, service = rest.partition('|')
+        for key, m in NODE_MODULE_CONTAINERS.items():
+            if name in m['names'] or (project in m['projects'] and service in m['services']):
+                if time.time() > deadline:
+                    break
+                try:
+                    p = subprocess.run(_sudo_wrap(['docker', 'exec', name, 'node', '--version']),
+                                       capture_output=True, text=True, timeout=10)
+                    ver = p.stdout.strip() if p.returncode == 0 and _node_version_tuple(p.stdout) else None
+                except Exception:
+                    ver = None
+                out.setdefault(key, {})[name] = ver
+    return out
+
+
+def _node_security_gaps(versions=None):
+    """{module_key: {'label', 'outdated': {container: version}, 'releases': [entries]}} for
+    the modules whose Node is below a NODE_SECURITY_RELEASES fix. `versions` is the
+    _node_container_versions() shape; it is read from docker when not given."""
+    versions = _node_container_versions() if versions is None else versions
+    gaps = {}
+    for key, per_container in versions.items():
+        outdated, rels = {}, {}
+        for cname, ver in per_container.items():
+            missing = _node_releases_missing(ver)
+            if missing:
+                outdated[cname] = ver
+                rels.update({r['id']: r for r in missing})
+        if outdated:
+            gaps[key] = {'label': NODE_MODULE_CONTAINERS[key]['label'], 'outdated': outdated,
+                         'releases': [rels[i] for i in sorted(rels)]}
+    return gaps
+
+
+def _node_security_items(versions=None):
+    """Update-email items (ops #296): one per Node-based module whose container Node is
+    below a security fix. The identity is the set of releases it is still below, so it
+    mails once and again when the next Node security release ships. Raises when docker
+    cannot be read — the caller carries its dedup state over a blip."""
+    items = []
+    for key, g in sorted(_node_security_gaps(versions).items()):
+        label, rels = g['label'], g['releases']
+        ids = [r['id'] for r in rels]
+        worst = min(g['outdated'].values(), key=lambda v: _node_version_tuple(v))
+        reason = '; '.join(f"{r['id']}: {r['reason']}" for r in rels)
+        items.append({
+            'key': f'node:{key}', 'label': f'{label} Node.js',
+            'installed': f'Node.js {worst}', 'target': 'a Node.js with the security fix',
+            'summary': f'Node.js inside {label} is out of date',
+            'identity': 'node-' + '+'.join(ids),
+            'security': [f"{label} is running Node.js {worst}. Newer Node.js fixes {reason}."],
+            'how': f'Open {label} in infra-TAK and press Update.'})
+    return items
+
+
+# The console cards read the same table, from a cache: the probe is a docker exec per
+# container and /api/modules/version is polled every 30 s per open browser.
+NODE_SECURITY_CACHE_S = 600
+_node_card_cache = {'at': 0.0, 'gaps': {}, 'busy': False}
+
+
+def _node_card_gaps():
+    """Cached _node_security_gaps() for the cards. Never blocks the poll: a stale cache is
+    served while a daemon thread refreshes it; a failed probe keeps the last answer."""
+    c = _node_card_cache
+    if time.time() - c['at'] >= NODE_SECURITY_CACHE_S and not c['busy']:
+        c['busy'] = True
+
+        def _refresh():
+            try:
+                c['gaps'] = _node_security_gaps()
+            except Exception as e:
+                print(f"[node-security] card check failed: {e}", flush=True)
+            finally:
+                c['at'] = time.time()
+                c['busy'] = False
+        threading.Thread(target=_refresh, daemon=True, name='node-security').start()
+    return c['gaps']
+
+
+def _node_card_flag(gap):
+    """Plain sentence for the red card flag."""
+    worst = min(gap['outdated'].values(), key=lambda v: _node_version_tuple(v))
+    ids = ', '.join(r['id'] for r in gap['releases'])
+    return (f"Security update: Node.js on this module is out of date ({worst}, {ids}). "
+            f"Press Update.")
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -26566,6 +26719,15 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
     except Exception as e:
         unknown.update({'os-security', 'kernel-security'})
         print(f"[update-notify] OS security check failed: {e}", flush=True)
+    try:
+        nv = _node_container_versions()
+        # a container that did not answer is unknown, not fixed: keep its dedup state
+        unknown.update('node:' + k for k, per in nv.items() if None in per.values())
+        pending.extend(_node_security_items(nv))
+    except Exception as e:
+        # ops #296: containers we could not read are not "fixed" — carry their dedup state.
+        unknown.update('node:' + k for k in NODE_MODULE_CONTAINERS)
+        print(f"[update-notify] Node.js security check failed: {e}", flush=True)
     try:
         for p in _detect_cloudtak_plugins():
             if p.get('installed') and p.get('update_available') and not p.get('local'):
@@ -38912,6 +39074,13 @@ def get_all_module_versions():
             except (ValueError, IndexError):
                 pass
         result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
+    # ops #296: red "Node.js is out of date" flag — same table as the security email.
+    try:
+        for key, gap in _node_card_gaps().items():
+            if modules.get(key, {}).get('installed') and key in result:
+                result[key] = {**result[key], 'node_security': _node_card_flag(gap)}  # copy: helpers may cache
+    except Exception as e:
+        print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
     return result
 
 
@@ -40137,6 +40306,61 @@ TAKPORTAL_CONTAINER_TAK_NOTE = (
     "https://github.com/ValleyTacticalSolutions/TAK-Portal/issues/61")
 
 
+TAKPORTAL_CADDY_SHIM_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        'scripts', 'takportal-caddy-validate-shim.sh')
+TAKPORTAL_CADDY_SHIM_MARKER = 'infratak-caddy-validate-shim'
+
+
+def _takportal_install_caddy_validate_shim(log_fn=None):
+    """ops #298: put scripts/takportal-caddy-validate-shim.sh at ~/.local/bin/caddy.
+
+    TAK Portal's Marketplace "Deploy To Caddy" runs `caddy validate` over SSH as the console
+    user. On a non-root box that user cannot open Caddy's access log (0644 caddy:caddy) or read
+    /var/lib/caddy, so validate exits 1 with "permission denied" and the Portal says "Caddy
+    rejected the updated file" about a good file. The shim treats a validate whose ONLY errors
+    are permission-denied as inconclusive (the same carve-out _caddy_validate_config() has);
+    any other error keeps Caddy's own exit code. Nothing privileged: it is a file in the console
+    user's own home, ahead of /usr/bin on its login PATH. A root console needs nothing.
+
+    Never replaces a ~/.local/bin/caddy that is not ours. Idempotent. Returns one of
+    'installed' | 'current' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        if os.geteuid() == 0:
+            return 'skipped'
+        dest_dir = os.path.expanduser('~/.local/bin')
+        dest = os.path.join(dest_dir, 'caddy')
+        path = os.pathsep.join(d for d in os.environ.get('PATH', '').split(os.pathsep)
+                               if d and os.path.abspath(d) != os.path.abspath(dest_dir))
+        if not shutil.which('caddy', path=path):
+            return 'skipped'              # no host Caddy (Docker or none): nothing to validate
+        with open(TAKPORTAL_CADDY_SHIM_SRC, 'r', encoding='utf-8') as f:
+            want = f.read()
+        if os.path.lexists(dest):
+            with open(dest, 'r', encoding='utf-8', errors='replace') as f:
+                have = f.read()
+            if TAKPORTAL_CADDY_SHIM_MARKER not in have:
+                _say(f"  \u26a0 {dest} exists and is not infra-TAK's; leaving it alone "
+                     "(Marketplace Deploy To Caddy may fail validating as this user)")
+                return 'skipped'
+            if have == want and os.access(dest, os.X_OK) and not os.path.islink(dest):
+                return 'current'
+        os.makedirs(dest_dir, exist_ok=True)
+        tmp = dest + '.tmp-infratak'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(want)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+        _say(f"  \u2713 Caddy validate helper installed ({dest}): Marketplace Deploy To Caddy "
+             "no longer fails on Caddy files this user cannot open")
+        return 'installed'
+    except Exception as e:
+        _say(f"  \u26a0 Caddy validate helper not installed (non-fatal): {e}")
+        return 'error'
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -40226,6 +40450,9 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # ops #298: Marketplace Deploy To Caddy validates as this user.
+        _takportal_install_caddy_validate_shim(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -40849,6 +41076,15 @@ def takportal_ssh_status():
             row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
                 '' if _h.get('granted') else
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
+            # TAK Portal 2.0.23+ ships a newer helper. It runs as root, so infra-TAK keeps
+            # the old pinned one until the new bytes are reviewed. Box test (ops #295, 2.0.24):
+            # Deploy/Redeploy To Caddy does not need it here. The portal falls back to
+            # copying through the broker's cp shim, so say that, not "will fail".
+            if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
+                row('Marketplace helper', 'na', 'newer version not reviewed yet',
+                    'This TAK Portal ships a newer marketplace helper that infra-TAK has not reviewed, '
+                    'so infra-TAK keeps the older one. The Marketplace "Deploy To Caddy" button does not '
+                    'need the newer helper on an infra-TAK box. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
                 'Run Repair to rewrite it.')
@@ -45268,7 +45504,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                  'restart the console (startup heal re-patches it) or redeploy CloudTAK.')
 
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
-        plog(f'✓ Plugin {action_label} successfully.')
+        # ops #301: look in the web app that is now being served before calling it a success.
+        _in_app = (_cloudtak_verify_plugins_in_app(ct_dir, plog, only=[plugin['install_dir']])
+                   if action in ('install', 'update') else None)
+        if _in_app is False:
+            plog(f'⚠ Plugin {action_label}, but its menu entry did not make it into the rebuilt CloudTAK (see above).')
+            cloudtak_plugin_status['warning'] = 'menu entry not found in the built web app'
+        else:
+            plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
             plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
             plog('    If still on the old version: DevTools (F12) → Application → Clear site data, then reload.')
@@ -46900,9 +47143,183 @@ def _cloudtak_plugin_missing_deps(web, foreign):
     return missing
 
 
+# ops #299: CloudTAK main added `app/plugins/*` to .dockerignore (only *.ts and README stay), so
+# upstream's own plugin installer (WEB_PLUGINS) is the only way a plugin reaches the image. We
+# install by COPYING folders into app/plugins/, so on the first release that carries the line every
+# plugin we or TAK Portal installed would be left out of the build context: the build succeeds and
+# the menu item never appears. BuildKit reads `<Dockerfile>.dockerignore` before `.dockerignore`, so
+# an untracked Dockerfile.dockerignore (a copy of .dockerignore plus `!app/plugins/<dir>` per
+# installed folder) puts them back without touching a tracked file.
+_CT_DOCKERIGNORE_MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
+_CT_PLUGIN_DIR_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_keep_plugins_in_build(ct_dir, plog):
+    """ops #299: make the api image build keep the plugin folders in this tree. Writes (or removes)
+    CloudTAK's untracked Dockerfile.dockerignore; never touches one we did not write. Never raises."""
+    try:
+        rel = os.path.relpath(_cloudtak_plugins_dir(ct_dir), ct_dir).replace(os.sep, '/')
+        base = os.path.join(ct_dir, '.dockerignore')
+        out = os.path.join(ct_dir, 'Dockerfile.dockerignore')
+        mine = False
+        if os.path.exists(out):
+            with open(out, encoding='utf-8', errors='replace') as f:
+                mine = f.readline().rstrip('\r\n') == _CT_DOCKERIGNORE_MARK
+            if not mine:
+                return                      # the operator's own file: theirs to keep
+        text = ''
+        if os.path.isfile(base):
+            with open(base, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        excluded = {rel, rel + '/', rel + '/*', rel + '/**'}
+        names = []
+        if any(ln.strip() in excluded for ln in text.splitlines()):
+            plugins = os.path.join(ct_dir, rel)
+            try:
+                names = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
+                               and os.path.isdir(os.path.join(plugins, n)))
+            except OSError:
+                names = []
+        if not names:
+            if mine:
+                os.remove(out)
+                plog('  Removed Dockerfile.dockerignore (CloudTAK no longer leaves plugins out of the build)')
+            return
+        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '']
+        for n in names:
+            lines += [f'!{rel}/{n}', f'{rel}/{n}/**/node_modules/']
+        want = '\n'.join(lines) + '\n'
+        have = None
+        if mine:
+            with open(out, encoding='utf-8') as f:
+                have = f.read()
+        if have != want:
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(want)
+            plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
+                 f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
+    except Exception as e:
+        plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
+
+
+# ops #301: "installed" is not "in the app". CloudTAK 13.102.0 moved its web folder; a plugin installer
+# that kept copying into the old one reported success and the plugin never reached the build (ops
+# #297, found by hand). After a rebuild we look in the web app the api container is SERVING for the
+# menu entry each plugin registers (its own `menu.add({key, label})`). A miss is a warning in the
+# install log, never a rollback: the check reads plugin source with regexes and can be wrong, the
+# build itself worked. The nightly in .github/workflows/cloudtak-plugins-nightly.yml does the same
+# on a stock CloudTAK build.
+_CT_MENU_ADD_RE = re.compile(r'\bmenu\s*\.\s*add\s*\(\s*(?=\{)')
+_CT_JS_STR = r"""(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)")"""
+_CT_JS_CONST_RE = re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*(?::\s*string\s*)?=\s*' + _CT_JS_STR)
+_CT_APP_DIST = '/home/etl/app/dist'
+# $1 = menu key, $2 = label, $3 = the web app folder. The bundler writes strings with backticks
+# (rolldown) or double quotes (esbuild), so all three quote styles are tried; the label has to be a
+# `label:` value and the key has to be a string in the same file. Prints FOUND, MISSING or NODIST.
+_CT_IN_APP_SH = ('if [ -d "$3" ]; then '
+                 'r=$(find "$3" -name "*.js" | xargs -r grep -lF -e "label:\\"$2\\"" -e "label:\'$2\'" -e "label:\\`$2\\`" '
+                 '| xargs -r grep -lF -e "\\"$1\\"" -e "\'$1\'" -e "\\`$1\\`" | head -n 1); '
+                 'if [ -n "$r" ]; then echo FOUND; else echo MISSING; fi; else echo NODIST; fi')
+_CT_JS_PLAIN_RE = re.compile(r'[^\x00-\x1f\\\'"`$]{1,199}')
+
+
+def _cloudtak_plugin_menu_entries(plugin_dir):
+    """[(key, label)] a plugin registers with `menu.add({key: ..., label: ...})`, read from its source.
+    Only plain string literals and `const NAME = '...'` are understood; anything else is skipped."""
+    out = []
+    for root, dirs, files in os.walk(plugin_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ('node_modules', 'dist', '.git', 'test', 'tests', '__tests__'))
+        for n in sorted(files):
+            if not n.endswith(('.ts', '.js', '.mjs', '.vue')) or n.endswith('.d.ts'):
+                continue
+            try:
+                with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
+                    text = f.read(500000)
+            except OSError:
+                continue
+            consts = {m.group(1): m.group(2) if m.group(2) is not None else m.group(3)
+                      for m in _CT_JS_CONST_RE.finditer(text)}
+            for m in _CT_MENU_ADD_RE.finditer(text):
+                i = m.end()
+                depth, quote, j = 0, None, i
+                while j < len(text):
+                    c = text[j]
+                    if quote:
+                        if c == '\\':
+                            j += 1
+                        elif c == quote:
+                            quote = None
+                    elif c in '\'"`':
+                        quote = c
+                    elif c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                body = text[i:j + 1]
+                vals = {}
+                for prop in ('key', 'label'):
+                    pm = re.search(r'(?:^|[\s,{])' + prop + r'\s*:\s*(?:' + _CT_JS_STR + r'|([A-Za-z_]\w*)\b)', body)
+                    if not pm:
+                        continue
+                    vals[prop] = (pm.group(1) if pm.group(1) is not None else pm.group(2)
+                                  if pm.group(2) is not None else consts.get(pm.group(3)))
+                k, lab = vals.get('key'), vals.get('label')
+                if (k and lab and _CT_JS_PLAIN_RE.fullmatch(k) and _CT_JS_PLAIN_RE.fullmatch(lab)
+                        and k.isascii() and lab.isascii() and (k, lab) not in out):
+                    out.append((k, lab))
+    return out
+
+
+def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
+    """Look for each plugin's menu entry in the web app the local api container serves.
+    Returns False when one is missing (and says which), True when all were found, None when it
+    could not look (container not running, no web app in it, no plugin with a menu entry).
+    `only`: install_dir names to check; default is every folder in the plugins dir. Never raises."""
+    try:
+        base = _cloudtak_plugins_dir(ct_dir)
+        names = sorted(n for n in os.listdir(base)
+                       if _CT_PLUGIN_DIR_RE.fullmatch(n) and os.path.isdir(os.path.join(base, n))) \
+            if os.path.isdir(base) else []
+        if only is not None:
+            names = [n for n in names if n in only]
+        found, missing = [], []
+        for n in names[:30]:
+            for key, label in _cloudtak_plugin_menu_entries(os.path.join(base, n)):
+                rc, out = _cloudtak_compose_at(
+                    ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_', key, label, _CT_APP_DIST],
+                    timeout=120)
+                # docker compose adds its own warning lines (stdout+stderr are joined): only our verdict words count
+                verdict = [ln.strip() for ln in (out or '').splitlines()
+                           if ln.strip() in ('FOUND', 'MISSING', 'NODIST')][-1:] or ['']
+                if rc == 0 and verdict[0] == 'FOUND':
+                    found.append((n, label))
+                elif rc == 0 and verdict[0] == 'MISSING':
+                    missing.append((n, label))
+                else:
+                    plog(f"  Could not look inside the CloudTAK api container to check the plugin menu entries "
+                         f"({(out or '').strip()[:120] or 'no output'})")
+                    return None
+        for n, label in found:
+            plog(f"  ✓ {n}: menu entry '{label}' is in the built web app")
+        for n, label in missing:
+            plog(f"  ⚠ {n}: menu entry '{label}' is NOT in the built web app. The plugin files were copied but "
+                 f"did not make it into the build, so the menu item will not show. Likely cause: CloudTAK "
+                 f"changed where it builds plugins from (this happened in 13.102.0). Please report it with this log.")
+        if not found and not missing:
+            return None
+        return not missing
+    except Exception as e:
+        plog(f"  ⚠ Could not check the plugin menu entries (non-fatal): {str(e)[:160]}")
+        return None
+
+
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
     """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
     raises and never blocks the build: at worst the build fails as it would have anyway."""
+    _cloudtak_keep_plugins_in_build(ct_dir, plog)   # ops #299: ours and TAK Portal's alike
     try:
         foreign = _cloudtak_foreign_plugins(ct_dir)
         if not foreign:
@@ -47005,10 +47422,11 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 # plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
 # copy in shell, the functions above are sent as they are and run by the remote python3.
 _CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
 _CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                     '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                    '_cloudtak_plugin_missing_deps', '_cloudtak_shield_foreign_plugins')
+                    '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
+                    '_cloudtak_shield_foreign_plugins')
 
 
 def _cloudtak_shield_py():
@@ -48664,6 +49082,10 @@ def run_cloudtak_deploy(cfg=None):
         # GH #252: a redeploy over a tree with TAK Portal marketplace plugins must not lint them.
         _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
 
+        # ops #296: --no-cache does not re-fetch the FROM image, so a rebuild kept the Node it
+        # was first built on. Pull the base images first (a failed pull only warns).
+        _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
+
         # Build with retry logic (up to 2 attempts)
         MAX_BUILD_ATTEMPTS = 2
         BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
@@ -50280,6 +50702,8 @@ def run_cloudtak_update():
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
+            # ops #296: same as ops #135 — build on the newest Node, not the one first built on.
+            _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
             plog("  Streaming build output...")
             # v10.1.4 WS8: on non-root boxes `docker` here is the broker shim, which
             # buffers and dies at the broker's 600s default — the streaming Popen alone
@@ -50393,6 +50817,7 @@ def run_cloudtak_update():
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
+            _cloudtak_verify_plugins_in_app(cloudtak_dir, plog)   # ops #301: plugins survived the new CloudTAK?
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -102084,6 +102509,16 @@ def _startup_migrations():
             )
         except Exception as tp_tok_err:
             print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
+
+        # ops #298 — boxes that already run TAK Portal get the Caddy validate helper on the
+        # next console start, not only on a Portal update or a Repair click. Idempotent.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_install_caddy_validate_shim(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_shim_err:
+            print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
 
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
