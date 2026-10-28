@@ -61,7 +61,6 @@ jobs:
           - { name: 'Dispatcher install.sh (main), latest release', ct: release, scenario: dispatcher, dref: main }
           - { name: 'Dispatcher install.sh (main), CloudTAK main',  ct: main,    scenario: dispatcher, dref: main }
           - { name: 'Dispatcher install.sh (dev), CloudTAK main',   ct: main,    scenario: dispatcher, dref: dev }
-          - { name: 'TEMP evidence: Dispatcher fix branch (PR 4)', ct: main, scenario: dispatcher, dref: claude/issue-297 }
           # takwerx/cloudtak-dispatcher-plugin 15c1694 = the last commit before the 13.102 fix (ops #297):
           # its install.sh still copies into api/web/plugins. The check has to flag it.
           - { name: 'canary: old Dispatcher install.sh must be caught', ct: release, scenario: dispatcher, dref: 15c16943fcd1b2fd3ce8c2725522f7784d622c4b, expect_red: true }
