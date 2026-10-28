@@ -46909,9 +46909,69 @@ def _cloudtak_plugin_missing_deps(web, foreign):
     return missing
 
 
+# ops #299: CloudTAK main added `app/plugins/*` to .dockerignore (only *.ts and README stay), so
+# upstream's own plugin installer (WEB_PLUGINS) is the only way a plugin reaches the image. We
+# install by COPYING folders into app/plugins/, so on the first release that carries the line every
+# plugin we or TAK Portal installed would be left out of the build context: the build succeeds and
+# the menu item never appears. BuildKit reads `<Dockerfile>.dockerignore` before `.dockerignore`, so
+# an untracked Dockerfile.dockerignore (a copy of .dockerignore plus `!app/plugins/<dir>` per
+# installed folder) puts them back without touching a tracked file.
+_CT_DOCKERIGNORE_MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
+_CT_PLUGIN_DIR_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_keep_plugins_in_build(ct_dir, plog):
+    """ops #299: make the api image build keep the plugin folders in this tree. Writes (or removes)
+    CloudTAK's untracked Dockerfile.dockerignore; never touches one we did not write. Never raises."""
+    try:
+        rel = os.path.relpath(_cloudtak_plugins_dir(ct_dir), ct_dir).replace(os.sep, '/')
+        base = os.path.join(ct_dir, '.dockerignore')
+        out = os.path.join(ct_dir, 'Dockerfile.dockerignore')
+        mine = False
+        if os.path.exists(out):
+            with open(out, encoding='utf-8', errors='replace') as f:
+                mine = f.readline().rstrip('\r\n') == _CT_DOCKERIGNORE_MARK
+            if not mine:
+                return                      # the operator's own file: theirs to keep
+        text = ''
+        if os.path.isfile(base):
+            with open(base, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        excluded = {rel, rel + '/', rel + '/*', rel + '/**'}
+        names = []
+        if any(ln.strip() in excluded for ln in text.splitlines()):
+            plugins = os.path.join(ct_dir, rel)
+            try:
+                names = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
+                               and os.path.isdir(os.path.join(plugins, n)))
+            except OSError:
+                names = []
+        if not names:
+            if mine:
+                os.remove(out)
+                plog('  Removed Dockerfile.dockerignore (CloudTAK no longer leaves plugins out of the build)')
+            return
+        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '']
+        for n in names:
+            lines += [f'!{rel}/{n}', f'{rel}/{n}/**/node_modules/']
+        want = '\n'.join(lines) + '\n'
+        have = None
+        if mine:
+            with open(out, encoding='utf-8') as f:
+                have = f.read()
+        if have != want:
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(want)
+            plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
+                 f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
+    except Exception as e:
+        plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
+
+
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
     """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
     raises and never blocks the build: at worst the build fails as it would have anyway."""
+    _cloudtak_keep_plugins_in_build(ct_dir, plog)   # ops #299: ours and TAK Portal's alike
     try:
         foreign = _cloudtak_foreign_plugins(ct_dir)
         if not foreign:
@@ -47014,10 +47074,11 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 # plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
 # copy in shell, the functions above are sent as they are and run by the remote python3.
 _CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
 _CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                     '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                    '_cloudtak_plugin_missing_deps', '_cloudtak_shield_foreign_plugins')
+                    '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
+                    '_cloudtak_shield_foreign_plugins')
 
 
 def _cloudtak_shield_py():
