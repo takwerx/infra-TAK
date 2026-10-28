@@ -230,7 +230,7 @@ _SHIELD = ['_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plug
 _SHIELD_CONSTS = ['_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
                   '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE',
                   '_CT_SHIELD_CONSTS', '_CT_SHIELD_FUNCS']
-OURS = [{'install_dir': d, 'key': d} for d in ('ping', 'search-containment', 'tak-dispatcher', 'taksim')]
+OURS = [{'install_dir': d, 'key': d} for d in ('taksim',)]
 
 
 def _remote_ns():

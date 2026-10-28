@@ -123,8 +123,8 @@ def test_sidecar_projects_and_tests_are_not_scanned(tmp_path):
 
 
 def test_our_own_plugins_are_not_scanned(tmp_path):
-    ct = _tree(tmp_path, ('tak-dispatcher',))
-    d = ct / 'app' / 'plugins' / 'tak-dispatcher'
+    ct = _tree(tmp_path, ('taksim',))
+    d = ct / 'app' / 'plugins' / 'taksim'
     (d / 'package.json').write_text(json.dumps({'dependencies': {'leftpad': '1.0.0'}}))
     (d / 'index.ts').write_text("import l from 'leftpad';\n")
     assert _run(_load(), ct) == []

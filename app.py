@@ -43657,63 +43657,12 @@ _cloudtak_deploy_lock = threading.Lock()
 #   Set repo instead (or in addition) once the plugin has its own public repo.
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# ops #299: Cell Ping / RTT, Search Containment and CloudTAK Dispatcher moved to TAK Portal's
+# marketplace and are no longer hosted here. A box that already has one keeps it: the folder is
+# an untracked plugin dir like any marketplace plugin, so the foreign-plugin handling (carry
+# across a CloudTAK update, lint shield, npm deps, keep-in-build) covers it. Only the
+# Simulator panel stays until TAK Portal lists it.
 CLOUDTAK_PLUGINS = [
-    {
-        'key': 'ping',
-        'name': 'Cell Ping / RTT',
-        'description': (
-            'Plot cellphone tower coverage as CoT features. '
-            'Cell Ping produces a u-d-c-c uncertainty circle; '
-            'RTT produces a u-rb-a arc (±70° wedge). '
-            'Posts directly to an active DataSync mission.'
-        ),
-        'repo': 'https://github.com/clptak/cloudtak-plugin-cellphone',
-        'install_dir': 'ping',
-        'requires': 'CloudTAK 13.2+',
-        'author': 'clptak',
-        'license': 'MIT',
-    },
-    {
-        'key': 'search-containment',
-        'name': 'Search Containment',
-        'description': (
-            'ATAK Chokepoint-style containment for SAR: pick a mission shape, line, '
-            'or manual point, offset a containment ring by a distance, and generate '
-            'numbered markers wherever the trail network (snapping tileset) crosses '
-            'the ring — posted into the active DataSync mission. Requires a '
-            'snapping-enabled vector basemap (e.g. snapping.pmtiles).'
-        ),
-        'repo': 'https://github.com/clptak/cloudtak-plugin-search-containment',
-        'install_dir': 'search-containment',
-        'requires': 'CloudTAK 13.45+',
-        'author': 'clptak',
-        # No LICENSE file in the repo yet (author's ping plugin is MIT) — asked to add one.
-        'license': 'Unlicensed',
-    },
-    {
-        'key': 'tak-dispatcher',
-        'name': 'CloudTAK Dispatcher',
-        'description': (
-            'Standalone dispatcher plugin for CloudTAK — create incidents on the map, '
-            'notify responders via mission thread and direct message. Works without the '
-            'TAK-CAD server plugin; auto-upgrades to full TAK-CAD mode when detected.'
-        ),
-        # Deployed from its own public repo (like ping). The web plugin and the CloudTAK
-        # API routes live in separate subdirs: the installer clones the repo to a cache dir,
-        # copies plugin/ into web/plugins/ and server/*.ts into api/routes/. The server files
-        # must NOT land under web/plugins or CloudTAK's web build (vue-tsc) would type-check
-        # them (they import server-only api libs). plugin-takcad.ts is the optional TAK-CAD
-        # proxy; plugin-dispatcher.ts is the standalone Events/Incidents store.
-        'repo': 'https://github.com/takwerx/cloudtak-dispatcher-plugin',
-        'plugin_subpath': 'plugin',
-        'server_subpath': 'server',
-        'install_dir': 'tak-dispatcher',
-        # v10.1.4: server routes migrated to the 13.45 hub/api split contract
-        # (api/stateless/routes/, ConfigStateless) — the installer refuses pre-split trees.
-        'requires': 'CloudTAK 13.45+',
-        'author': 'takwerx',
-        'license': 'Proprietary',
-    },
     {
         'key': 'taksim',
         'name': 'TAK Simulator',
