@@ -40306,6 +40306,61 @@ TAKPORTAL_CONTAINER_TAK_NOTE = (
     "https://github.com/ValleyTacticalSolutions/TAK-Portal/issues/61")
 
 
+TAKPORTAL_CADDY_SHIM_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        'scripts', 'takportal-caddy-validate-shim.sh')
+TAKPORTAL_CADDY_SHIM_MARKER = 'infratak-caddy-validate-shim'
+
+
+def _takportal_install_caddy_validate_shim(log_fn=None):
+    """ops #298: put scripts/takportal-caddy-validate-shim.sh at ~/.local/bin/caddy.
+
+    TAK Portal's Marketplace "Deploy To Caddy" runs `caddy validate` over SSH as the console
+    user. On a non-root box that user cannot open Caddy's access log (0644 caddy:caddy) or read
+    /var/lib/caddy, so validate exits 1 with "permission denied" and the Portal says "Caddy
+    rejected the updated file" about a good file. The shim treats a validate whose ONLY errors
+    are permission-denied as inconclusive (the same carve-out _caddy_validate_config() has);
+    any other error keeps Caddy's own exit code. Nothing privileged: it is a file in the console
+    user's own home, ahead of /usr/bin on its login PATH. A root console needs nothing.
+
+    Never replaces a ~/.local/bin/caddy that is not ours. Idempotent. Returns one of
+    'installed' | 'current' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        if os.geteuid() == 0:
+            return 'skipped'
+        dest_dir = os.path.expanduser('~/.local/bin')
+        dest = os.path.join(dest_dir, 'caddy')
+        path = os.pathsep.join(d for d in os.environ.get('PATH', '').split(os.pathsep)
+                               if d and os.path.abspath(d) != os.path.abspath(dest_dir))
+        if not shutil.which('caddy', path=path):
+            return 'skipped'              # no host Caddy (Docker or none): nothing to validate
+        with open(TAKPORTAL_CADDY_SHIM_SRC, 'r', encoding='utf-8') as f:
+            want = f.read()
+        if os.path.lexists(dest):
+            with open(dest, 'r', encoding='utf-8', errors='replace') as f:
+                have = f.read()
+            if TAKPORTAL_CADDY_SHIM_MARKER not in have:
+                _say(f"  \u26a0 {dest} exists and is not infra-TAK's; leaving it alone "
+                     "(Marketplace Deploy To Caddy may fail validating as this user)")
+                return 'skipped'
+            if have == want and os.access(dest, os.X_OK) and not os.path.islink(dest):
+                return 'current'
+        os.makedirs(dest_dir, exist_ok=True)
+        tmp = dest + '.tmp-infratak'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(want)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+        _say(f"  \u2713 Caddy validate helper installed ({dest}): Marketplace Deploy To Caddy "
+             "no longer fails on Caddy files this user cannot open")
+        return 'installed'
+    except Exception as e:
+        _say(f"  \u26a0 Caddy validate helper not installed (non-fatal): {e}")
+        return 'error'
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -40395,6 +40450,9 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # ops #298: Marketplace Deploy To Caddy validates as this user.
+        _takportal_install_caddy_validate_shim(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -102268,6 +102326,16 @@ def _startup_migrations():
             )
         except Exception as tp_tok_err:
             print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
+
+        # ops #298 — boxes that already run TAK Portal get the Caddy validate helper on the
+        # next console start, not only on a Portal update or a Repair click. Idempotent.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_install_caddy_validate_shim(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_shim_err:
+            print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
 
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
