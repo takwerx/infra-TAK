@@ -1425,6 +1425,8 @@ MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9
                               # fix + embedded hls.js are on installer dev awaiting tag) — an
                               # unpinned ref is a supply-chain gap our own /module-scan rule bans.
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
+# The local editor unit's pre-start line that runs the script below (dash: best-effort).
+_MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
 """Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
@@ -1440,7 +1442,10 @@ def main():
     OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
     MARKER  = '# --- infra-TAK LDAP overlay ---'
 
-    if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
+    # The port/bind/API patches below do not depend on the overlay: without them an
+    # upstream self-update brings the editor back on 0.0.0.0:5000 and stream.<domain>
+    # (Caddy -> 127.0.0.1:5080) answers 502 (GH #330). Only the import needs the file.
+    if not os.path.exists(EDITOR):
         return
 
     with open(EDITOR, 'r') as f:
@@ -1472,7 +1477,7 @@ def main():
         changed = True
 
     # 3. LDAP overlay import injection
-    if MARKER not in src:
+    if MARKER not in src and os.path.exists(OVERLAY):
         inject = (
             "\n" + MARKER + "\n"
             "import os as _os\n"
@@ -41950,6 +41955,17 @@ def mediamtx_recovery():
         _tp_unit = '/etc/systemd/system/mediamtx-webeditor.service'
         _tp_line = (f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
                     f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}')
+        # GH #330: a local unit deployed before Authentik never ran ensure_overlay.py, so the
+        # next editor self-update undid this patch (port 5000 -> 502). The restart below
+        # daemon-reloads it in.
+        if not (deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()):
+            try:
+                _ut = _read_priv(_tp_unit) or ''
+                _ut_new = _mediamtx_editor_unit_with_prestart(_ut)
+                if _ut_new != _ut:
+                    _write_priv(_tp_unit, _ut_new)
+            except Exception:
+                pass
         cmd = (
             'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
@@ -43290,18 +43306,17 @@ WantedBy=multi-user.target
             )
 
         # Write self-healing overlay script — runs before every service start
-        # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated
-        if ldap_available:
-            heal_path = f'{webeditor_dir}/ensure_overlay.py'
-            with open(heal_path, 'w') as hf:
-                hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
-            os.chmod(heal_path, 0o755)
-            plog("✓ Self-healing overlay script installed (runs on every service start)")
+        # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated.
+        # With or without Authentik (GH #330): the port/bind patches are what keep a
+        # self-updated editor on 127.0.0.1:5080, where Caddy sends stream.<domain>.
+        heal_path = f'{webeditor_dir}/ensure_overlay.py'
+        with open(heal_path, 'w') as hf:
+            hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+        os.chmod(heal_path, 0o755)
+        plog("✓ Self-healing overlay script installed (runs on every service start)")
 
-        exec_start_pre = ''
-        if ldap_available:
-            # Dash prefix: pre-step failure must not block the editor from starting
-            exec_start_pre = f'ExecStartPre=-/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
+        # Dash prefix: pre-step failure must not block the editor from starting
+        exec_start_pre = f'{_MEDIAMTX_EDITOR_PRESTART}\n'
 
         editor_file = f'{webeditor_dir}/mediamtx_config_editor.py'
         if os.path.exists(editor_file):
@@ -100912,6 +100927,53 @@ def _startup_heal_mediamtx_editor_python():
     return True
 
 
+def _mediamtx_editor_unit_with_prestart(txt):
+    """The editor unit text with _MEDIAMTX_EDITOR_PRESTART just before ExecStart=, or `txt`
+    unchanged when it already runs ensure_overlay.py or has no ExecStart= to anchor on."""
+    if not txt or 'ensure_overlay.py' in txt:
+        return txt
+    out, done = [], False
+    for ln in txt.split('\n'):
+        if not done and ln.startswith('ExecStart='):
+            out.append(_MEDIAMTX_EDITOR_PRESTART)
+            done = True
+        out.append(ln)
+    return '\n'.join(out) if done else txt
+
+
+def _startup_heal_mediamtx_editor_prestart():
+    """GH #330: give a local editor unit the ensure_overlay.py pre-start it is missing.
+
+    The deploy only wrote that line when Authentik was installed first, so on a box that
+    got MediaMTX before Authentik nothing re-applies the port/bind patches after the
+    editor's own Update (Versions tab) or Rollback. Upstream's file binds 0.0.0.0:5000,
+    Caddy proxies stream.<domain> to 127.0.0.1:5080, and the operator gets a 502 with no
+    way back into the editor. Adds the line (and the script, when absent; a stale one is
+    refreshed by the container-ports heal), and restarts the editor only when its source
+    is unpatched right now. Returns True when it changed the unit."""
+    if not (os.path.exists(_MEDIAMTX_EDITOR_UNIT) and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        return False
+    unit_txt = _read_priv(_MEDIAMTX_EDITOR_UNIT) or ''
+    new_unit = _mediamtx_editor_unit_with_prestart(unit_txt)
+    if new_unit == unit_txt:
+        return False
+    ov = '/opt/mediamtx-webeditor/ensure_overlay.py'
+    if not os.path.exists(ov):
+        _write_priv(ov, MEDIAMTX_ENSURE_OVERLAY_SCRIPT, perm=0o755)
+    _write_priv(_MEDIAMTX_EDITOR_UNIT, new_unit)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+    src = _read_priv(_MEDIAMTX_EDITOR_SRC) or ''
+    if 'port=5000' in src:
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                       capture_output=True, timeout=60)
+        print("Startup migration: MediaMTX web editor was on upstream's port 5000 after its own "
+              "update (stream.<domain> gave 502) — added the pre-start patch and restarted it", flush=True)
+    else:
+        print("Startup migration: MediaMTX web editor unit now re-applies its port patch on every "
+              "start, so its own updates keep stream.<domain> working", flush=True)
+    return True
+
+
 # Docker TAK: PostgreSQL's lock files outlive the container's PostgreSQL. TAK's db entrypoint
 # (configureInDocker.sh) is PID 1 and does not pass a stop signal on, so every `docker stop` /
 # reboot / dockerd restart SIGKILLs PostgreSQL and it never removes its locks. There are THREE,
@@ -102902,6 +102964,13 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_python()
         except Exception as _mxp_err:
             print(f"Startup migration: MediaMTX editor Python heal error (non-fatal): {_mxp_err}", flush=True)
+
+        # GH #330: an editor deployed before Authentik had no pre-start patch, so its own
+        # Update put it back on port 5000 and stream.<domain> answered 502.
+        try:
+            _startup_heal_mediamtx_editor_prestart()
+        except Exception as _mxs_err:
+            print(f"Startup migration: MediaMTX editor pre-start heal error (non-fatal): {_mxs_err}", flush=True)
 
         # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
         # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
