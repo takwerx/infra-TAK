@@ -8966,6 +8966,17 @@ def _diag_section_authentik(settings):
     env = _diag_cmd(['docker', 'inspect', 'authentik-ldap-1', '--format', '{{range .Config.Env}}{{println .}}{{end}}'])
     host = next((l for l in env.splitlines() if l.startswith('AUTHENTIK_HOST=')), 'AUTHENTIK_HOST=(not found)')
     out.append(f"ldap outpost {host}   (internal http://authentik-server… = routing-spiral risk; https://<fqdn> = normal)")
+    if 'http://authentik-server' in host:
+        # ops #306: say why the console has not moved the outpost to https://<fqdn> yet.
+        def move_check():
+            ak_host = _get_authentik_host(settings)
+            ok, problem, _sha = _ldap_outpost_fqdn_precheck(ak_host) if ak_host else (False, 'no Authentik hostname set', '')
+            out.append(f"  move to https://{ak_host}: " + ('possible (DNS and Caddy certificate check passes)' if ok
+                                                              else f'blocked — {problem}'))
+        try:
+            move_check()
+        except Exception as e:
+            out.append(f"  (move check failed: {type(e).__name__}: {str(e)[:160]})")
     # One statement: psql -c prints only the LAST result of a multi-statement string.
     sql = ("SELECT 'idle_in_tx='||count(*) FROM pg_stat_activity WHERE state='idle in transaction' "
            "UNION ALL SELECT 'tasks_'||state||'='||count(*) FROM authentik_tasks_task GROUP BY state")
@@ -9130,6 +9141,13 @@ def _diag_section_takserver(settings):
         out.append(f"cot database sessions: not shown — the database is not on this box ({_mode})")
     else:
         out.extend(_cot_stall_report())
+        # ops #306: whether a "failed 5.8 migration" left the database unusable is one number.
+        try:
+            _sv = _tak58_schema_version()
+            out.append(f"cot schema_version: {_sv if _sv is not None else 'unreadable'}"
+                       f"   (TAK Server 5.8 needs >= {_TAK58_MIN_SCHEMA_VERSION})")
+        except Exception as e:
+            out.append(f"cot schema_version: ({type(e).__name__}: {str(e)[:120]})")
     out.extend(_diag_tak_update_history())
     return out
 
@@ -61685,16 +61703,50 @@ def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
     _ips, problem = _dns_resolve_ipv4(fqdn)
     if problem == 'missing':
         return False, f"{fqdn} has no DNS A record", ''
-    try:
-        ctx = ssl.create_default_context()
+    def _handshake(ctx):
         with socket.create_connection(('127.0.0.1', _caddy_https_port()), timeout=timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
-                der = tls.getpeercert(binary_form=True) or b''
+                return tls.getpeercert(binary_form=True) or b''
+    try:
+        der = _handshake(ssl.create_default_context())
     except ssl.SSLCertVerificationError as e:
-        return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+        # ops #306: an operator's own certificate (ssl_mode 'custom', e.g. a Cloudflare Origin
+        # cert) is not in this box's trust store, so the check above fails for it. The outpost
+        # runs with AUTHENTIK_INSECURE=true and never verifies the chain, so an untrusted chain
+        # is fine for it, while keeping it on internal routing leaves every LDAP bind failing
+        # with "exceeded stage recursion depth" on Authentik 2026.x. Only a trust-chain failure
+        # on a custom-cert box with an insecure-mode outpost is waived, and the handshake still
+        # has to complete: a name Caddy has no certificate for is still refused.
+        if (getattr(e, 'verify_code', None) not in _LDAP_UNTRUSTED_CHAIN_CODES
+                or (load_settings().get('ssl_mode') or '') != 'custom'
+                or not _ldap_outpost_skips_tls_verify()):
+            return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+        try:
+            unverified = ssl.create_default_context()
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            der = _handshake(unverified)
+        except (ssl.SSLError, OSError) as e2:
+            return False, f"Caddy has no working certificate for {fqdn} ({e2})", ''
     except (ssl.SSLError, OSError) as e:
         return False, f"Caddy has no working certificate for {fqdn} ({e})", ''
     return True, '', hashlib.sha256(der).hexdigest()
+
+
+# OpenSSL verify codes for "the chain does not end in a CA this box trusts": self-signed leaf,
+# self-signed cert in the chain, issuer not found, leaf signature not verifiable. Not expiry,
+# not a name mismatch.
+_LDAP_UNTRUSTED_CHAIN_CODES = (18, 19, 20, 21)
+
+
+def _ldap_outpost_skips_tls_verify():
+    """True when ~/authentik/docker-compose.yml runs the LDAP outpost with AUTHENTIK_INSECURE
+    true (the infra-TAK template always does), i.e. it does not check Caddy's certificate."""
+    try:
+        with open(os.path.join(os.path.expanduser('~/authentik'), 'docker-compose.yml')) as f:
+            return bool(re.search(r'AUTHENTIK_INSECURE:\s*["\']?true["\']?\s*$', f.read(), re.M | re.I))
+    except OSError:
+        return False
 
 
 def _ldap_fqdn_move_backoff(fqdn, cert_sha256, now=None):
