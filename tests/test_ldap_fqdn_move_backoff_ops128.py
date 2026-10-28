@@ -156,7 +156,7 @@ def load(tmp_path, monkeypatch):
         fake_time = types.SimpleNamespace(time=lambda: box.now, strftime=time.strftime,
                                           localtime=time.localtime)
         ns = {
-            'os': __import__('os'), 'hashlib': __import__('hashlib'), 'time': fake_time,
+            'os': __import__('os'), 're': __import__('re'), 'hashlib': __import__('hashlib'), 'time': fake_time,
             'subprocess': types.SimpleNamespace(run=box.run, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT,
                                                 TimeoutExpired=subprocess.TimeoutExpired),
             'ssl': types.SimpleNamespace(create_default_context=lambda: _Ctx(box),
@@ -178,7 +178,8 @@ def load(tmp_path, monkeypatch):
         # ops #178: the compose calls go through the locked runner; no lock in this sandbox.
         ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
         ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
-        for name in ('_LDAP_FQDN_MOVE_BACKOFF_S', '_LDAP_FQDN_MOVE_BACKOFF_MAX_S', '_ldap_outpost_fqdn_precheck',
+        for name in ('_LDAP_FQDN_MOVE_BACKOFF_S', '_LDAP_FQDN_MOVE_BACKOFF_MAX_S', '_LDAP_UNTRUSTED_CHAIN_CODES',
+                     '_ldap_outpost_skips_tls_verify', '_ldap_outpost_fqdn_precheck',
                      '_ldap_fqdn_move_backoff', '_ldap_fqdn_move_failed', '_rewrite_ldap_compose_to_fqdn',
                      '_record_spiral_repair_attempt', '_apply_authentik_ldap_routing_repair',
                      '_ensure_authentik_ldap_outpost_on_fqdn', '_spiral_monitor_tak_recycle'):
