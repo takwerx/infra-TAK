@@ -254,7 +254,10 @@ def cmd_install_catalog(a):
                 shutil.copy2(f, routes / f.name)
         print(f"installed {p['name']} ({p['key']}) from {sha or 'this repo'} into {web.relative_to(ct)}/plugins/{p['install_dir']}")
         expect.append(plugin_expectation(p, src, sha))
-    run_shield(ct, [p for p in plugins if p.get('in_catalog')])
+    if a.no_shield:
+        print("NOT running infra-TAK's pre-build step (--no-shield): this is the canary for a CloudTAK that leaves plugin folders out of the build")
+    else:
+        run_shield(ct, [p for p in plugins if p.get('in_catalog')])
     write_expect(work, expect)
 
 
@@ -314,6 +317,38 @@ def run_shield(ct, catalog):
     ns['_cloudtak_shield_foreign_plugins'](str(ct), lambda m: print(m, flush=True))
 
 
+# ── infra-TAK's own in-container look, run against the image we just built ───────
+
+def load_app_consts(names, app_py=REPO_ROOT / 'app.py'):
+    tree = ast.parse(Path(app_py).read_text(encoding='utf-8'))
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id in names:
+            out[node.targets[0].id] = ast.literal_eval(node.value)
+    missing = [n for n in names if n not in out]
+    if missing:
+        raise SystemExit('ERROR: app.py no longer defines ' + ', '.join(missing))
+    return out
+
+
+def cmd_verify_in_image(a):
+    """Run the exact shell snippet the console runs inside the api container after a rebuild
+    (_CT_IN_APP_SH in app.py) in the image we built, once per menu entry. The two checks must agree."""
+    c = load_app_consts(('_CT_IN_APP_SH', '_CT_APP_DIST'))
+    expect = json.loads(Path(a.expect).read_text(encoding='utf-8'))
+    bad = 0
+    for p in expect['plugins']:
+        for e in p.get('menu', []):
+            r = subprocess.run(['docker', 'run', '--rm', '--entrypoint', 'sh', a.image, '-c', c['_CT_IN_APP_SH'], '_',
+                                json.dumps(e['key']), 'label:' + json.dumps(e['label']), c['_CT_APP_DIST']],
+                               text=True, capture_output=True)
+            verdict = (r.stdout.strip().splitlines() or [''])[-1]
+            print(f"{verdict or 'ERROR':8} {p['name']}: '{e['label']}'" + (f"  ({r.stderr.strip()[:200]})" if r.returncode else ''))
+            bad += verdict != 'FOUND'
+    return 1 if bad else 0
+
+
 # ── command line ─────────────────────────────────────────────────────────────────
 
 def cmd_verify(a):
@@ -333,7 +368,13 @@ def main(argv=None):
         s.add_argument('--work', required=True, help='scratch folder (clones go here; expect.json is written here)')
         if name == 'install-dispatcher':
             s.add_argument('--ref', default='', help='Dispatcher repo branch, tag or sha (default: its default branch)')
+        else:
+            s.add_argument('--no-shield', action='store_true', help="skip infra-TAK's pre-build step (canary only)")
         s.set_defaults(fn=fn)
+    s = sub.add_parser('verify-in-image')
+    s.add_argument('--expect', required=True)
+    s.add_argument('--image', required=True)
+    s.set_defaults(fn=cmd_verify_in_image)
     s = sub.add_parser('verify')
     s.add_argument('--expect', required=True)
     s.add_argument('--dist', required=True, help="the built web app (CloudTAK's app/dist)")

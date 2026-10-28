@@ -45504,7 +45504,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                  'restart the console (startup heal re-patches it) or redeploy CloudTAK.')
 
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
-        plog(f'✓ Plugin {action_label} successfully.')
+        # ops #301: look in the web app that is now being served before calling it a success.
+        _in_app = (_cloudtak_verify_plugins_in_app(ct_dir, plog, only=[plugin['install_dir']])
+                   if action in ('install', 'update') else None)
+        if _in_app is False:
+            plog(f'⚠ Plugin {action_label}, but its menu entry did not make it into the rebuilt CloudTAK (see above).')
+            cloudtak_plugin_status['warning'] = 'menu entry not found in the built web app'
+        else:
+            plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
             plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
             plog('    If still on the old version: DevTools (F12) → Application → Clear site data, then reload.')
@@ -47193,6 +47200,113 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                  f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
     except Exception as e:
         plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
+
+
+# ops #301: "installed" is not "in the app". CloudTAK 13.102.0 moved its web folder; a plugin installer
+# that kept copying into the old one reported success and the plugin never reached the build (ops
+# #297, found by hand). After a rebuild we look in the web app the api container is SERVING for the
+# menu entry each plugin registers (its own `menu.add({key, label})`). A miss is a warning in the
+# install log, never a rollback: the check reads plugin source with regexes and can be wrong, the
+# build itself worked. The nightly in .github/workflows/cloudtak-plugins-nightly.yml does the same
+# on a stock CloudTAK build.
+_CT_MENU_ADD_RE = re.compile(r'\bmenu\s*\.\s*add\s*\(\s*(?=\{)')
+_CT_JS_STR = r"""(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)")"""
+_CT_JS_CONST_RE = re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*(?::\s*string\s*)?=\s*' + _CT_JS_STR)
+_CT_APP_DIST = '/home/etl/app/dist'
+_CT_IN_APP_SH = ('if [ -d "$3" ]; then '
+                 'r=$(find "$3" -name "*.js" | xargs -r grep -lF -e "$1" | xargs -r grep -lF -e "$2" | head -n 1); '
+                 'if [ -n "$r" ]; then echo FOUND; else echo MISSING; fi; else echo NODIST; fi')
+
+
+def _cloudtak_plugin_menu_entries(plugin_dir):
+    """[(key, label)] a plugin registers with `menu.add({key: ..., label: ...})`, read from its source.
+    Only plain string literals and `const NAME = '...'` are understood; anything else is skipped."""
+    out = []
+    for root, dirs, files in os.walk(plugin_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ('node_modules', 'dist', '.git', 'test', 'tests', '__tests__'))
+        for n in sorted(files):
+            if not n.endswith(('.ts', '.js', '.mjs', '.vue')) or n.endswith('.d.ts'):
+                continue
+            try:
+                with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
+                    text = f.read(500000)
+            except OSError:
+                continue
+            consts = {m.group(1): m.group(2) if m.group(2) is not None else m.group(3)
+                      for m in _CT_JS_CONST_RE.finditer(text)}
+            for m in _CT_MENU_ADD_RE.finditer(text):
+                i = m.end()
+                depth, quote, j = 0, None, i
+                while j < len(text):
+                    c = text[j]
+                    if quote:
+                        if c == '\\':
+                            j += 1
+                        elif c == quote:
+                            quote = None
+                    elif c in '\'"`':
+                        quote = c
+                    elif c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                body = text[i:j + 1]
+                vals = {}
+                for prop in ('key', 'label'):
+                    pm = re.search(r'(?:^|[\s,{])' + prop + r'\s*:\s*(?:' + _CT_JS_STR + r'|([A-Za-z_]\w*)\b)', body)
+                    if not pm:
+                        continue
+                    vals[prop] = (pm.group(1) if pm.group(1) is not None else pm.group(2)
+                                  if pm.group(2) is not None else consts.get(pm.group(3)))
+                k, lab = vals.get('key'), vals.get('label')
+                if (k and lab and len(k) < 200 and len(lab) < 200 and (k, lab) not in out
+                        and not re.search(r'[\x00-\x1f\\]', k + lab)):
+                    out.append((k, lab))
+    return out
+
+
+def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
+    """Look for each plugin's menu entry in the web app the local api container serves.
+    Returns False when one is missing (and says which), True when all were found, None when it
+    could not look (container not running, no web app in it, no plugin with a menu entry).
+    `only`: install_dir names to check; default is every folder in the plugins dir. Never raises."""
+    try:
+        base = _cloudtak_plugins_dir(ct_dir)
+        names = sorted(n for n in os.listdir(base)
+                       if _CT_PLUGIN_DIR_RE.fullmatch(n) and os.path.isdir(os.path.join(base, n))) \
+            if os.path.isdir(base) else []
+        if only is not None:
+            names = [n for n in names if n in only]
+        found, missing = [], []
+        for n in names[:30]:
+            for key, label in _cloudtak_plugin_menu_entries(os.path.join(base, n)):
+                rc, out = _cloudtak_compose_at(
+                    ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_',
+                             json.dumps(key), 'label:' + json.dumps(label), _CT_APP_DIST], timeout=120)
+                verdict = (out or '').strip().splitlines()[-1:] or ['']
+                if rc == 0 and verdict[0] == 'FOUND':
+                    found.append((n, label))
+                elif rc == 0 and verdict[0] == 'MISSING':
+                    missing.append((n, label))
+                else:
+                    plog(f"  Could not look inside the CloudTAK api container to check the plugin menu entries "
+                         f"({(out or '').strip()[:120] or 'no output'})")
+                    return None
+        for n, label in found:
+            plog(f"  ✓ {n}: menu entry '{label}' is in the built web app")
+        for n, label in missing:
+            plog(f"  ⚠ {n}: menu entry '{label}' is NOT in the built web app. The plugin files were copied but "
+                 f"did not make it into the build, so the menu item will not show. Likely cause: CloudTAK "
+                 f"changed where it builds plugins from (this happened in 13.102.0). Please report it with this log.")
+        if not found and not missing:
+            return None
+        return not missing
+    except Exception as e:
+        plog(f"  ⚠ Could not check the plugin menu entries (non-fatal): {str(e)[:160]}")
+        return None
 
 
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
@@ -50696,6 +50810,7 @@ def run_cloudtak_update():
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
+            _cloudtak_verify_plugins_in_app(cloudtak_dir, plog)   # ops #301: plugins survived the new CloudTAK?
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")

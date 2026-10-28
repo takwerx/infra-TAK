@@ -65,6 +65,9 @@ jobs:
           # takwerx/cloudtak-dispatcher-plugin 15c1694 = the last commit before the 13.102 fix (ops #297):
           # its install.sh still copies into api/web/plugins. The check has to flag it.
           - { name: 'canary: old Dispatcher install.sh must be caught', ct: release, scenario: dispatcher, dref: 15c16943fcd1b2fd3ce8c2725522f7784d622c4b, expect_red: true }
+          # CloudTAK main ignores app/plugins/* in .dockerignore (ops #299). infra-TAK's pre-build step
+          # undoes that; without it the build has to come out without the plugins, and the check has to see it.
+          - { name: 'canary: CloudTAK main without infra-TAK build step must be caught', ct: main, scenario: catalog, no_shield: true, expect_red: true }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -107,11 +110,12 @@ jobs:
         env:
           SCENARIO: ${{ matrix.scenario }}
           DREF: ${{ matrix.dref }}
+          NO_SHIELD: ${{ matrix.no_shield && '--no-shield' || '' }}
         run: |
           set -euo pipefail
           tool=.github/ci/cloudtak_plugins/bundle_check.py
           if [ "$SCENARIO" = catalog ]; then
-            python3 -I "$tool" install-catalog --ct "$RUNNER_TEMP/CloudTAK" --work "$RUNNER_TEMP/work"
+            python3 -I "$tool" install-catalog --ct "$RUNNER_TEMP/CloudTAK" --work "$RUNNER_TEMP/work" $NO_SHIELD
           else
             python3 -I "$tool" install-dispatcher --ct "$RUNNER_TEMP/CloudTAK" --work "$RUNNER_TEMP/work" --ref "$DREF"
           fi
@@ -139,14 +143,25 @@ jobs:
           python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify --expect "$RUNNER_TEMP/work/expect.json" --dist "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/verify.txt"
           { echo; echo '```'; cat "$RUNNER_TEMP/verify.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Canary - the old installer must be caught
+      - name: Look inside the image the way the infra-TAK console does
+        if: ${{ !matrix.expect_red }}
+        run: |
+          set -o pipefail
+          python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify-in-image --expect "$RUNNER_TEMP/work/expect.json" --image cloudtak-nightly | tee "$RUNNER_TEMP/in-image.txt"
+          { echo; echo "Console's own look inside the image:"; echo '```'; cat "$RUNNER_TEMP/in-image.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Canary - the check must catch it
         if: ${{ matrix.expect_red }}
         run: |
+          if [ "${{ matrix.no_shield }}" = true ] && ! grep -q 'app/plugins' "$RUNNER_TEMP/CloudTAK/.dockerignore"; then
+            echo "::notice::This CloudTAK no longer leaves app/plugins out of the build context, so there is nothing for this canary to catch."
+            exit 0
+          fi
           python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify --expect "$RUNNER_TEMP/work/expect.json" --dist "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/verify.txt" || true
           { echo; echo '```'; cat "$RUNNER_TEMP/verify.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           if grep -q '^FAIL' "$RUNNER_TEMP/verify.txt"; then
-            echo "Good: the check caught the Dispatcher installer from before the fix."
+            echo "Good: the check caught it."
           else
-            echo "::error::The check did NOT notice that the old Dispatcher installer leaves the plugin out of the build. It is blind to the bug it exists for."
+            echo "::error::The check did NOT notice that this install leaves the plugin out of the build. It is blind to the bug it exists for."
             exit 1
           fi
