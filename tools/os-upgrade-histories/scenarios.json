@@ -1,0 +1,388 @@
+{
+  "_readme": "The box-history matrix for one-way, in-place upgrades (ops #285). Each scenario is a box HISTORY: the real released steps a customer box went through, replayed on a lane Azure VM, snapshotted, then upgraded with the candidate. Never hand-craft the end state: every step in 'history' is recorded on the box by 'box.sh note-step' and 'histories.py judge --stage start' refuses a snapshot whose provenance does not list them in order. Read tools/os-upgrade-histories/README.md.",
+  "version": 1,
+  "defaults": {
+    "azure": {
+      "resource_group": "rg-tak-hist",
+      "region": "westus2",
+      "owner": "claude-lane",
+      "image": "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
+      "size_core": "Standard_D4s_v4",
+      "size_db": "Standard_D2s_v4",
+      "os_disk_gb": 128,
+      "auto_shutdown_utc": "0600",
+      "snapshot_expires_days": 45,
+      "run_expires_days": 2
+    },
+    "log_fail_pattern": "(?i)\\bfail(ed|ure)?\\b",
+    "log_allow": [],
+    "os_from": "22.04",
+    "os_to": "24.04"
+  },
+  "steps": {
+    "image": "stock Ubuntu 22.04 server image from Azure (nothing else installed)",
+    "infratak-install": "install a RELEASED infra-TAK tag with start.sh, exactly as the README says (arg: ref)",
+    "console-update": "console 'Update Now' to a RELEASED tag, the way a customer updates (arg: ref)",
+    "takserver-deploy": "deploy TAK Server through the console from the tak.gov package (arg: version, 5.7 or 5.8)",
+    "takserver-58-migrate": "the console's guided TAK Server 5.8 update on a 5.7 box: PostgreSQL 15 -> 18, the old 15 kept stopped on 5434",
+    "start-old-cluster": "start the stopped PostgreSQL 15 cluster again (pg_ctlcluster 15 main start), the way an operator might (arg: cluster)",
+    "module-deploy": "deploy a module through the console (arg: module = authentik | broker | docker-modules | docker-tak)",
+    "two-server-deploy": "console two-server install: core + database server on a second VM (arg: version)",
+    "os-upgrade-released": "run the console's OS upgrade with a RELEASED tag's code, and expect it to stop (args: ref, expect_status)"
+  },
+  "scenarios": [
+    {
+      "id": "h1-fresh-single",
+      "title": "Fresh install on 22.04, single PostgreSQL 18",
+      "why": "What we tested before ops #284. Still the baseline: if this breaks, everything breaks.",
+      "boxes": [
+        "core"
+      ],
+      "variants": {
+        "a-bare": {
+          "label": "TAK Server only: no Authentik, no Docker, no broker",
+          "extra_steps": []
+        },
+        "b-authentik": {
+          "label": "TAK Server + Authentik",
+          "extra_steps": [
+            {
+              "step": "module-deploy",
+              "module": "authentik"
+            }
+          ],
+          "expect": {
+            "containers_match": [
+              "authentik"
+            ]
+          }
+        },
+        "c-docker-tak": {
+          "label": "Docker (hardened) TAK Server",
+          "replace_step": {
+            "takserver-deploy": {
+              "step": "module-deploy",
+              "module": "docker-tak"
+            }
+          },
+          "expect": {
+            "clusters": [],
+            "containers_match": [
+              "takserver"
+            ],
+            "tak_in_container": true
+          }
+        },
+        "d-full": {
+          "label": "Everything: Authentik + broker + Docker modules",
+          "extra_steps": [
+            {
+              "step": "module-deploy",
+              "module": "authentik"
+            },
+            {
+              "step": "module-deploy",
+              "module": "broker"
+            },
+            {
+              "step": "module-deploy",
+              "module": "docker-modules"
+            }
+          ],
+          "expect": {
+            "containers_match": [
+              "authentik"
+            ]
+          }
+        }
+      },
+      "history": [
+        {
+          "step": "image"
+        },
+        {
+          "step": "infratak-install",
+          "ref": "v10.2.30-alpha"
+        },
+        {
+          "step": "takserver-deploy",
+          "version": "5.8"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": ""
+      },
+      "run": "os-upgrade",
+      "expect": {
+        "result": "done",
+        "clusters": [
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "services_active": [
+          "takwerx-console"
+        ],
+        "containers_match": []
+      }
+    },
+    {
+      "id": "h2-57-to-58-then-os",
+      "title": "Installed on TAK 5.7 / PostgreSQL 15, then the console's 5.8 update, then the OS upgrade",
+      "why": "The case we missed (ops #284): PostgreSQL 15 is kept stopped on 5434 next to PostgreSQL 18 on 5432.",
+      "boxes": [
+        "core"
+      ],
+      "history": [
+        {
+          "step": "image"
+        },
+        {
+          "step": "infratak-install",
+          "ref": "v10.1.85-alpha"
+        },
+        {
+          "step": "takserver-deploy",
+          "version": "5.7"
+        },
+        {
+          "step": "console-update",
+          "ref": "v10.2.30-alpha"
+        },
+        {
+          "step": "takserver-58-migrate",
+          "version": "5.8"
+        },
+        {
+          "step": "module-deploy",
+          "module": "authentik"
+        },
+        {
+          "step": "module-deploy",
+          "module": "broker"
+        },
+        {
+          "step": "module-deploy",
+          "module": "docker-modules"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5434",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": ""
+      },
+      "run": "os-upgrade",
+      "expect": {
+        "result": "done",
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5434",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "services_active": [
+          "takwerx-console"
+        ],
+        "containers_match": [
+          "authentik"
+        ],
+        "log_must_match": [
+          "kept as it is: stopped PostgreSQL 15/main on 5434"
+        ]
+      }
+    },
+    {
+      "id": "h3-old-pg-left-online",
+      "title": "Same as h2, but PostgreSQL 15 was left running",
+      "why": "Unsafe on purpose. The console must refuse before changing anything and say what to do.",
+      "boxes": [
+        "core"
+      ],
+      "derive_from": "h2-57-to-58-then-os",
+      "history": [
+        {
+          "step": "start-old-cluster",
+          "cluster": "15/main"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5434",
+            "online"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": ""
+      },
+      "run": "os-upgrade",
+      "expect": {
+        "result": "refused",
+        "refused_check": "takserver_58",
+        "next_step_must_match": [
+          "pg_ctlcluster 15 main stop"
+        ],
+        "unchanged": true
+      }
+    },
+    {
+      "id": "h4-stuck-reassert",
+      "title": "Box stuck at failed:reassert on v10.3.0, then Update Now to the candidate",
+      "why": "Real customers are in this state today. The candidate must finish the upgrade by itself (ops #318), no SSH.",
+      "boxes": [
+        "core"
+      ],
+      "derive_from": "h2-57-to-58-then-os",
+      "history": [
+        {
+          "step": "os-upgrade-released",
+          "ref": "v10.3.0-alpha",
+          "expect_status": "failed:reassert"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5434",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": "failed:reassert",
+        "os_release": "24.04"
+      },
+      "run": "update-now-then-wait",
+      "expect": {
+        "result": "done",
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5434",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "services_active": [
+          "takwerx-console"
+        ],
+        "containers_match": [
+          "authentik"
+        ],
+        "log_must_match": [
+          "reassert complete"
+        ],
+        "no_automatic_reboot": true
+      }
+    },
+    {
+      "id": "h5-two-server",
+      "title": "Two-server layout (core + remote database) through the OS upgrade",
+      "why": "test8-style box: the database lives on a second host. Core first, then the database server from the core console.",
+      "boxes": [
+        "core",
+        "db"
+      ],
+      "history": [
+        {
+          "step": "image"
+        },
+        {
+          "step": "infratak-install",
+          "ref": "v10.2.30-alpha"
+        },
+        {
+          "step": "two-server-deploy",
+          "version": "5.8"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "clusters_db": [
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": ""
+      },
+      "run": "os-upgrade",
+      "expect": {
+        "result": "done",
+        "clusters": [],
+        "clusters_db": [
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "services_active": [
+          "takwerx-console"
+        ],
+        "containers_match": [],
+        "also_upgrade_db_box": true
+      }
+    }
+  ]
+}
