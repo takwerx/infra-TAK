@@ -303,6 +303,23 @@ def test_infratak_warns_when_the_menu_entry_is_not_in_the_app(tmp_path):
     assert any('NOT in the built web app' in m for m in log)
 
 
+_COMPOSE_WARN = 'time="2026-10-28T12:00:00-07:00" level=warning msg="The \\"CLOUDTAK_Hub_URL\\" variable is not set. Defaulting to a blank string."\n'
+
+
+@pytest.mark.parametrize('verdict, expected', [('FOUND', True), ('MISSING', False)])
+def test_a_compose_warning_around_the_verdict_does_not_blind_the_check(tmp_path, verdict, expected):
+    """docker compose prints a warning on every call and the output joins stdout+stderr."""
+    ct, log = _ct_with_plugin(tmp_path), []
+    for out in (verdict + '\n' + _COMPOSE_WARN, _COMPOSE_WARN + verdict + '\n', _COMPOSE_WARN + verdict + '\n' + _COMPOSE_WARN):
+        assert _app_ns(lambda *a, **k: (0, out))['_cloudtak_verify_plugins_in_app'](str(ct), log.append) is expected
+    assert not any('Could not look inside' in m for m in log)
+
+
+def test_only_a_compose_warning_is_still_could_not_look(tmp_path):
+    ct = _ct_with_plugin(tmp_path)
+    assert _app_ns(lambda *a, **k: (0, _COMPOSE_WARN))['_cloudtak_verify_plugins_in_app'](str(ct), lambda m: None) is None
+
+
 def test_infratak_does_not_claim_anything_when_it_cannot_look(tmp_path):
     ct, log = _ct_with_plugin(tmp_path), []
     for rc, out in ((1, 'service "api" is not running'), (0, 'NODIST\n')):
