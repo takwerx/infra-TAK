@@ -165,6 +165,15 @@ def find_menu_entry(chunks, entry):
     return None
 
 
+def snippet(chunks, name, entry, width=70):
+    """The text around `label:"..."` in the chunk, to show what the built app really has."""
+    for f in _forms(entry['label']):
+        m = re.search(r'\blabel\s*:\s*["\'`]' + re.escape(f) + r'["\'`]', chunks[name])
+        if m:
+            return chunks[name][max(0, m.start() - width):m.end() + width].replace('\n', ' ')
+    return ''
+
+
 def verify_bundle(expect, dist):
     """(report lines, number of problems). One line per plugin."""
     chunks = read_chunks(dist)
@@ -181,6 +190,7 @@ def verify_bundle(expect, dist):
             chunk = find_menu_entry(chunks, e)
             if chunk:
                 lines.append(f"ok    {label}: menu entry '{e['label']}' (key {e['key']}) is in {chunk}")
+                lines.append(f"        ...{snippet(chunks, chunk, e)}...")
             else:
                 lines.append(f"FAIL  {label}: menu entry '{e['label']}' (key {e['key']}) is NOT in the built app "
                              f"({len(chunks)} JS files searched). The plugin was installed but did not make it into the build.")
@@ -332,6 +342,12 @@ def load_app_consts(names, app_py=REPO_ROOT / 'app.py'):
     return out
 
 
+DIAG_SH = ('echo "js files: $(find "$3" -name "*.js" | wc -l)"; '
+           'echo "with key $1: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$1" | wc -l)"; '
+           'echo "with $2: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$2" | wc -l)"; '
+           'echo "shell: $(readlink -f /bin/sh)"')
+
+
 def cmd_verify_in_image(a):
     """Run the exact shell snippet the console runs inside the api container after a rebuild
     (_CT_IN_APP_SH in app.py) in the image we built, once per menu entry. The two checks must agree."""
@@ -345,7 +361,12 @@ def cmd_verify_in_image(a):
                                text=True, capture_output=True)
             verdict = (r.stdout.strip().splitlines() or [''])[-1]
             print(f"{verdict or 'ERROR':8} {p['name']}: '{e['label']}'" + (f"  ({r.stderr.strip()[:200]})" if r.returncode else ''))
-            bad += verdict != 'FOUND'
+            if verdict != 'FOUND':
+                bad += 1
+                diag = subprocess.run(['docker', 'run', '--rm', '--entrypoint', 'sh', a.image, '-c', DIAG_SH, '_',
+                                       json.dumps(e['key']), 'label:' + json.dumps(e['label']), c['_CT_APP_DIST']],
+                                      text=True, capture_output=True)
+                print('   ' + (diag.stdout + diag.stderr).strip().replace('\n', '\n   '))
     return 1 if bad else 0
 
 
@@ -355,7 +376,8 @@ def cmd_verify(a):
     expect = json.loads(Path(a.expect).read_text(encoding='utf-8'))
     lines, problems = verify_bundle(expect, a.dist)
     print('\n'.join(lines))
-    print(f"\n{len(lines) - problems} of {len(lines)} checks passed" if lines else 'nothing to check')
+    total = sum(1 for ln in lines if not ln.startswith(' '))
+    print(f"\n{total - problems} of {total} checks passed" if lines else 'nothing to check')
     return 1 if problems else 0
 
 
