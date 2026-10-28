@@ -255,7 +255,7 @@ def _app_ns(compose_at):
     want_funcs = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_plugin_menu_entries',
                   '_cloudtak_verify_plugins_in_app')
     want_consts = ('_CT_MENU_ADD_RE', '_CT_JS_STR', '_CT_JS_CONST_RE', '_CT_APP_DIST', '_CT_IN_APP_SH',
-                   '_CT_PLUGIN_DIR_RE')
+                   '_CT_PLUGIN_DIR_RE', '_CT_JS_PLAIN_RE')
     parts = []
     for node in tree.body:
         name = (node.name if isinstance(node, ast.FunctionDef)
@@ -291,7 +291,7 @@ def test_infratak_says_nothing_is_wrong_when_the_menu_entry_is_in_the_app(tmp_pa
         return 0, 'FOUND\n'
     assert _app_ns(fake)['_cloudtak_verify_plugins_in_app'](str(ct), log.append) is True
     assert calls[0][:5] == ['exec', '-T', 'api', 'sh', '-c']
-    assert calls[0][-3:] == ['"plugin-ping"', 'label:"Cell Ping / RTT"', '/home/etl/app/dist']
+    assert calls[0][-3:] == ['plugin-ping', 'Cell Ping / RTT', '/home/etl/app/dist']
     assert any('✓ ping' in m for m in log)
 
 
@@ -320,9 +320,33 @@ def test_infratak_only_checks_the_plugin_it_just_installed(tmp_path):
         seen.append(args[-2])
         return 0, 'FOUND\n'
     _app_ns(fake)['_cloudtak_verify_plugins_in_app'](str(ct), lambda m: None, only=['other'])
-    assert seen == ['label:"Other"']
+    assert seen == ['Other']
 
 
 def test_the_check_runs_after_a_plugin_rebuild_and_after_a_cloudtak_update():
     assert "_cloudtak_verify_plugins_in_app(ct_dir, plog, only=[plugin['install_dir']])" in APP_SRC
     assert '_cloudtak_verify_plugins_in_app(cloudtak_dir, plog)' in APP_SRC
+
+
+@pytest.mark.parametrize('bundle', [
+    'const G=`plugin-ping`;a.menu.add({key:G,label:`Cell Ping / RTT`,route:N});',      # rolldown: backticks
+    'const G="plugin-ping";a.menu.add({key:G,label:"Cell Ping / RTT",route:N});',      # esbuild: double quotes
+    "a.menu.add({key:'plugin-ping',label:'Cell Ping / RTT'});",
+])
+def test_the_shell_look_inside_the_image_reads_every_quote_style(tmp_path, bundle):
+    """The snippet the console runs inside the api container, on a stand-in for /home/etl/app/dist.
+    The nightly runs the same snippet in the real image (the first version only knew double quotes
+    and the real CloudTAK build writes backticks)."""
+    import subprocess
+    sh = bc.load_app_consts(('_CT_IN_APP_SH',))['_CT_IN_APP_SH']
+    dist = tmp_path / 'dist'
+    (dist / 'assets').mkdir(parents=True)
+    (dist / 'assets' / 'main-1.js').write_text(bundle)
+    (dist / 'assets' / 'other.js').write_text('x({key:"o",label:"Other"})')
+
+    def look(key, label):
+        return subprocess.run(['sh', '-c', sh, '_', key, label, str(dist)], capture_output=True, text=True).stdout.strip()
+    assert look('plugin-ping', 'Cell Ping / RTT') == 'FOUND'
+    assert look('plugin-ping', 'Other') == 'MISSING'                  # key and label in different files
+    assert look('nope', 'Cell Ping / RTT') == 'MISSING'
+    assert subprocess.run(['sh', '-c', sh, '_', 'a', 'b', str(tmp_path / 'none')], capture_output=True, text=True).stdout.strip() == 'NODIST'

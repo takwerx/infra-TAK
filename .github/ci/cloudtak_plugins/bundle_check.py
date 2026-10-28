@@ -343,9 +343,8 @@ def load_app_consts(names, app_py=REPO_ROOT / 'app.py'):
 
 
 DIAG_SH = ('echo "js files: $(find "$3" -name "*.js" | wc -l)"; '
-           'echo "with key $1: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$1" | wc -l)"; '
-           'echo "with $2: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$2" | wc -l)"; '
-           'echo "shell: $(readlink -f /bin/sh)"')
+           'echo "files containing the key $1: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$1" | wc -l)"; '
+           'echo "files containing the label $2: $(find "$3" -name "*.js" | xargs -r grep -lF -e "$2" | wc -l)"')
 
 
 def cmd_verify_in_image(a):
@@ -357,14 +356,14 @@ def cmd_verify_in_image(a):
     for p in expect['plugins']:
         for e in p.get('menu', []):
             r = subprocess.run(['docker', 'run', '--rm', '--entrypoint', 'sh', a.image, '-c', c['_CT_IN_APP_SH'], '_',
-                                json.dumps(e['key']), 'label:' + json.dumps(e['label']), c['_CT_APP_DIST']],
+                                e['key'], e['label'], c['_CT_APP_DIST']],
                                text=True, capture_output=True)
             verdict = (r.stdout.strip().splitlines() or [''])[-1]
             print(f"{verdict or 'ERROR':8} {p['name']}: '{e['label']}'" + (f"  ({r.stderr.strip()[:200]})" if r.returncode else ''))
             if verdict != 'FOUND':
                 bad += 1
                 diag = subprocess.run(['docker', 'run', '--rm', '--entrypoint', 'sh', a.image, '-c', DIAG_SH, '_',
-                                       json.dumps(e['key']), 'label:' + json.dumps(e['label']), c['_CT_APP_DIST']],
+                                       e['key'], e['label'], c['_CT_APP_DIST']],
                                       text=True, capture_output=True)
                 print('   ' + (diag.stdout + diag.stderr).strip().replace('\n', '\n   '))
     return 1 if bad else 0

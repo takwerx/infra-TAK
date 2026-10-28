@@ -47213,9 +47213,14 @@ _CT_MENU_ADD_RE = re.compile(r'\bmenu\s*\.\s*add\s*\(\s*(?=\{)')
 _CT_JS_STR = r"""(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)")"""
 _CT_JS_CONST_RE = re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*(?::\s*string\s*)?=\s*' + _CT_JS_STR)
 _CT_APP_DIST = '/home/etl/app/dist'
+# $1 = menu key, $2 = label, $3 = the web app folder. The bundler writes strings with backticks
+# (rolldown) or double quotes (esbuild), so all three quote styles are tried; the label has to be a
+# `label:` value and the key has to be a string in the same file. Prints FOUND, MISSING or NODIST.
 _CT_IN_APP_SH = ('if [ -d "$3" ]; then '
-                 'r=$(find "$3" -name "*.js" | xargs -r grep -lF -e "$1" | xargs -r grep -lF -e "$2" | head -n 1); '
+                 'r=$(find "$3" -name "*.js" | xargs -r grep -lF -e "label:\\"$2\\"" -e "label:\'$2\'" -e "label:\\`$2\\`" '
+                 '| xargs -r grep -lF -e "\\"$1\\"" -e "\'$1\'" -e "\\`$1\\`" | head -n 1); '
                  'if [ -n "$r" ]; then echo FOUND; else echo MISSING; fi; else echo NODIST; fi')
+_CT_JS_PLAIN_RE = re.compile(r'[^\x00-\x1f\\\'"`$]{1,199}')
 
 
 def _cloudtak_plugin_menu_entries(plugin_dir):
@@ -47262,8 +47267,8 @@ def _cloudtak_plugin_menu_entries(plugin_dir):
                     vals[prop] = (pm.group(1) if pm.group(1) is not None else pm.group(2)
                                   if pm.group(2) is not None else consts.get(pm.group(3)))
                 k, lab = vals.get('key'), vals.get('label')
-                if (k and lab and len(k) < 200 and len(lab) < 200 and (k, lab) not in out
-                        and not re.search(r'[\x00-\x1f\\]', k + lab)):
+                if (k and lab and _CT_JS_PLAIN_RE.fullmatch(k) and _CT_JS_PLAIN_RE.fullmatch(lab)
+                        and k.isascii() and lab.isascii() and (k, lab) not in out):
                     out.append((k, lab))
     return out
 
@@ -47284,8 +47289,8 @@ def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
         for n in names[:30]:
             for key, label in _cloudtak_plugin_menu_entries(os.path.join(base, n)):
                 rc, out = _cloudtak_compose_at(
-                    ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_',
-                             json.dumps(key), 'label:' + json.dumps(label), _CT_APP_DIST], timeout=120)
+                    ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_', key, label, _CT_APP_DIST],
+                    timeout=120)
                 verdict = (out or '').strip().splitlines()[-1:] or ['']
                 if rc == 0 and verdict[0] == 'FOUND':
                     found.append((n, label))
