@@ -67,20 +67,33 @@ def test_free_token_far_future_expiry_is_covered():
     assert _covered()(_status(expires='9999-12-31T00:00:00+00:00')) is True
 
 
-@pytest.mark.parametrize('raw', [
-    _status(attached=False),
-    _status(esm='disabled'),
-    _status(esm='n/a'),
-    _status(expires='past'),
-    _status(expires=None),
-    _status(expires='not a date'),
-    _status(expires='2099-01-01T00:00:00'),                    # no timezone: can't judge it
-    _status(services=[]),
-    _status(services=[{'name': 'esm-apps', 'status': 'enabled'}]),   # esm-infra is the security feed
-    _status(services=[{'name': 'esm-infra', 'status': 'enabled'}, {'name': 'esm-infra', 'status': 'enabled'}]),
-    '', 'not json', '[]', 'null', '{"attached": "true"}',
-])
-def test_any_doubt_is_not_covered(raw):
+# Built inside the test from fixed kwargs/raw strings: the parameters carry no timestamps, so
+# every pytest-xdist worker collects identical test ids.
+DOUBT_CASES = {
+    'not_attached': {'attached': False},
+    'esm_disabled': {'esm': 'disabled'},
+    'esm_na': {'esm': 'n/a'},
+    'expired': {'expires': 'past'},
+    'no_expires': {'expires': None},
+    'bad_date': {'expires': 'not a date'},
+    'no_timezone': {'expires': '2099-01-01T00:00:00'},                    # can't judge it
+    'no_services': {'services': []},
+    'esm_apps_only': {'services': [{'name': 'esm-apps', 'status': 'enabled'}]},   # esm-infra is the security feed
+    'duplicate_esm_infra': {'services': [{'name': 'esm-infra', 'status': 'enabled'},
+                                         {'name': 'esm-infra', 'status': 'enabled'}]},
+}
+RAW_DOUBT_CASES = {
+    'empty': '', 'not_json': 'not json', 'list': '[]', 'null': 'null', 'attached_string': '{"attached": "true"}',
+}
+
+
+@pytest.mark.parametrize('kwargs', list(DOUBT_CASES.values()), ids=list(DOUBT_CASES))
+def test_any_doubt_is_not_covered(kwargs):
+    assert _covered()(_status(**kwargs)) is False
+
+
+@pytest.mark.parametrize('raw', list(RAW_DOUBT_CASES.values()), ids=list(RAW_DOUBT_CASES))
+def test_unreadable_status_is_not_covered(raw):
     assert _covered()(raw) is False
 
 
