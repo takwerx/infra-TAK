@@ -26451,6 +26451,159 @@ def _apply_security_identity(item):
     return item
 
 
+# ops #296: the Node.js inside a module's image is baked in at build time, so a module on
+# its latest release can still run a Node from before a Node security release. This table
+# is the ONE place that says which Node is fixed; the red flag on the console cards and the
+# security email both read it. When Node ships its next security release, add an entry (one
+# per advisory, newest last) with the fixed version of each major line still supported —
+# a major that is not listed claims nothing — and bump NODERED_IMAGE. Boxes below the new
+# versions then get the flag, and one more email (the email identity is the set of releases
+# a module is still below). `reason` is shown to the operator as-is.
+# https://nodejs.org/en/blog/vulnerability
+NODE_SECURITY_RELEASES = (
+    {'id': 'CVE-2026-111497', 'released': '2026-10-21',
+     'fixed': {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'},
+     'reason': 'a Brotli decoder memory-corruption bug that can lead to remote code execution, '
+               'being actively attacked'},
+)
+
+# Node-based modules whose containers are checked: module key (as in /api/modules/version) →
+# label, the container names / compose (project, services) that run Node, and where the
+# operator presses Update. The CloudTAK media helper is left out on purpose: it is an
+# upstream image that infra-TAK's Update cannot rebuild, so flagging it could never clear.
+NODE_MODULE_CONTAINERS = {
+    'takportal': {'label': 'TAK Portal', 'names': ('tak-portal', 'tak-portal-worker'),
+                  'projects': ('tak-portal',), 'services': ('tak-portal', 'tak-portal-worker')},
+    'cloudtak': {'label': 'CloudTAK', 'names': (), 'projects': ('cloudtak',),
+                 'services': ('api', 'events', 'tiles', 'retention', 'cloudtak-print')},
+    'nodered': {'label': 'Node-RED', 'names': ('nodered',), 'projects': (), 'services': ()},
+    'remote_assist': {'label': 'Remote Assist', 'names': (), 'projects': ('eud-remote-assist',),
+                      'services': ('server',)},
+}
+
+
+def _node_version_tuple(v):
+    m = re.match(r'^\s*v?(\d+)\.(\d+)\.(\d+)\s*$', v or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _node_releases_missing(version):
+    """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
+    that does not parse, or a major no entry lists, is not claimed."""
+    ver = _node_version_tuple(version)
+    if ver is None:
+        return []
+    out = []
+    for rel in NODE_SECURITY_RELEASES:
+        fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
+        if fixed is not None and ver < fixed:
+            out.append(rel)
+    return out
+
+
+def _node_container_versions():
+    """{module_key: {container: 'v22.23.4' | None}} for the running containers of the
+    modules in NODE_MODULE_CONTAINERS; None when a container has no `node` or does not
+    answer (unknown claims nothing). Raises when docker cannot be listed. Local
+    containers only — a module deployed to another host is not visible."""
+    r = subprocess.run(
+        _sudo_wrap(['docker', 'ps', '--format',
+                    '{{.Names}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}']),
+        capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or 'docker ps failed').strip()[:200])
+    out = {}
+    deadline = time.time() + 60
+    for line in r.stdout.splitlines():
+        name, _, rest = line.partition('|')
+        project, _, service = rest.partition('|')
+        for key, m in NODE_MODULE_CONTAINERS.items():
+            if name in m['names'] or (project in m['projects'] and service in m['services']):
+                if time.time() > deadline:
+                    break
+                try:
+                    p = subprocess.run(_sudo_wrap(['docker', 'exec', name, 'node', '--version']),
+                                       capture_output=True, text=True, timeout=10)
+                    ver = p.stdout.strip() if p.returncode == 0 and _node_version_tuple(p.stdout) else None
+                except Exception:
+                    ver = None
+                out.setdefault(key, {})[name] = ver
+    return out
+
+
+def _node_security_gaps(versions=None):
+    """{module_key: {'label', 'outdated': {container: version}, 'releases': [entries]}} for
+    the modules whose Node is below a NODE_SECURITY_RELEASES fix. `versions` is the
+    _node_container_versions() shape; it is read from docker when not given."""
+    versions = _node_container_versions() if versions is None else versions
+    gaps = {}
+    for key, per_container in versions.items():
+        outdated, rels = {}, {}
+        for cname, ver in per_container.items():
+            missing = _node_releases_missing(ver)
+            if missing:
+                outdated[cname] = ver
+                rels.update({r['id']: r for r in missing})
+        if outdated:
+            gaps[key] = {'label': NODE_MODULE_CONTAINERS[key]['label'], 'outdated': outdated,
+                         'releases': [rels[i] for i in sorted(rels)]}
+    return gaps
+
+
+def _node_security_items(versions=None):
+    """Update-email items (ops #296): one per Node-based module whose container Node is
+    below a security fix. The identity is the set of releases it is still below, so it
+    mails once and again when the next Node security release ships. Raises when docker
+    cannot be read — the caller carries its dedup state over a blip."""
+    items = []
+    for key, g in sorted(_node_security_gaps(versions).items()):
+        label, rels = g['label'], g['releases']
+        ids = [r['id'] for r in rels]
+        worst = min(g['outdated'].values(), key=lambda v: _node_version_tuple(v))
+        reason = '; '.join(f"{r['id']}: {r['reason']}" for r in rels)
+        items.append({
+            'key': f'node:{key}', 'label': f'{label} Node.js',
+            'installed': f'Node.js {worst}', 'target': 'a Node.js with the security fix',
+            'summary': f'Node.js inside {label} is out of date',
+            'identity': 'node-' + '+'.join(ids),
+            'security': [f"Node.js inside {label} is out of date ({worst}). It fixes {reason}."],
+            'how': f'Open {label} in infra-TAK and press Update.'})
+    return items
+
+
+# The console cards read the same table, from a cache: the probe is a docker exec per
+# container and /api/modules/version is polled every 30 s per open browser.
+NODE_SECURITY_CACHE_S = 600
+_node_card_cache = {'at': 0.0, 'gaps': {}, 'busy': False}
+
+
+def _node_card_gaps():
+    """Cached _node_security_gaps() for the cards. Never blocks the poll: a stale cache is
+    served while a daemon thread refreshes it; a failed probe keeps the last answer."""
+    c = _node_card_cache
+    if time.time() - c['at'] >= NODE_SECURITY_CACHE_S and not c['busy']:
+        c['busy'] = True
+
+        def _refresh():
+            try:
+                c['gaps'] = _node_security_gaps()
+            except Exception as e:
+                print(f"[node-security] card check failed: {e}", flush=True)
+            finally:
+                c['at'] = time.time()
+                c['busy'] = False
+        threading.Thread(target=_refresh, daemon=True, name='node-security').start()
+    return c['gaps']
+
+
+def _node_card_flag(gap):
+    """Plain sentence for the red card flag."""
+    worst = min(gap['outdated'].values(), key=lambda v: _node_version_tuple(v))
+    ids = ', '.join(r['id'] for r in gap['releases'])
+    return (f"Security update: Node.js on this module is out of date ({worst}, {ids}). "
+            f"Press Update.")
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -26566,6 +26719,15 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
     except Exception as e:
         unknown.update({'os-security', 'kernel-security'})
         print(f"[update-notify] OS security check failed: {e}", flush=True)
+    try:
+        nv = _node_container_versions()
+        # a container that did not answer is unknown, not fixed: keep its dedup state
+        unknown.update('node:' + k for k, per in nv.items() if None in per.values())
+        pending.extend(_node_security_items(nv))
+    except Exception as e:
+        # ops #296: containers we could not read are not "fixed" — carry their dedup state.
+        unknown.update('node:' + k for k in NODE_MODULE_CONTAINERS)
+        print(f"[update-notify] Node.js security check failed: {e}", flush=True)
     try:
         for p in _detect_cloudtak_plugins():
             if p.get('installed') and p.get('update_available') and not p.get('local'):
@@ -38912,6 +39074,13 @@ def get_all_module_versions():
             except (ValueError, IndexError):
                 pass
         result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
+    # ops #296: red "Node.js is out of date" flag — same table as the security email.
+    try:
+        for key, gap in _node_card_gaps().items():
+            if modules.get(key, {}).get('installed') and key in result:
+                result[key] = {**result[key], 'node_security': _node_card_flag(gap)}  # copy: helpers may cache
+    except Exception as e:
+        print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
     return result
 
 
@@ -48664,6 +48833,10 @@ def run_cloudtak_deploy(cfg=None):
         # GH #252: a redeploy over a tree with TAK Portal marketplace plugins must not lint them.
         _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
 
+        # ops #296: --no-cache does not re-fetch the FROM image, so a rebuild kept the Node it
+        # was first built on. Pull the base images first (a failed pull only warns).
+        _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
+
         # Build with retry logic (up to 2 attempts)
         MAX_BUILD_ATTEMPTS = 2
         BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
@@ -50280,6 +50453,8 @@ def run_cloudtak_update():
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
+            # ops #296: same as ops #135 — build on the newest Node, not the one first built on.
+            _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
             plog("  Streaming build output...")
             # v10.1.4 WS8: on non-root boxes `docker` here is the broker shim, which
             # buffers and dies at the broker's 600s default — the streaming Popen alone

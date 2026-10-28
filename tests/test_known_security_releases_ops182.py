@@ -107,6 +107,9 @@ def _collect(installed, latest, ghsa):
             'version': installed, 'latest': latest, 'update_available': True},
         '_gh_advisories_fixed_by': advisories,
         '_os_security_items': lambda seen, unknown: [],
+        '_node_container_versions': lambda: {},   # ops #296: no Node containers here
+        '_node_security_items': lambda versions: [],
+        'NODE_MODULE_CONTAINERS': {},
         '_detect_cloudtak_plugins': lambda: [],
     })
     _exec(n, '_apply_security_identity', '_collect_pending_updates')
