@@ -47291,7 +47291,9 @@ def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
                 rc, out = _cloudtak_compose_at(
                     ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_', key, label, _CT_APP_DIST],
                     timeout=120)
-                verdict = (out or '').strip().splitlines()[-1:] or ['']
+                # docker compose adds its own warning lines (stdout+stderr are joined): only our verdict words count
+                verdict = [ln.strip() for ln in (out or '').splitlines()
+                           if ln.strip() in ('FOUND', 'MISSING', 'NODIST')][-1:] or ['']
                 if rc == 0 and verdict[0] == 'FOUND':
                     found.append((n, label))
                 elif rc == 0 and verdict[0] == 'MISSING':
