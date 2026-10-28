@@ -168,6 +168,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
      console restart and the reboot gap). -->
 <div id="os-upgrade-card" style="display:none;background:linear-gradient(135deg,rgba(59,130,246,0.08),rgba(14,116,144,0.06));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="osup-idle" style="display:none">
+<!-- GH #320: Ubuntu Pro security updates already cover this 22.04 box, so the idle card is one line. The button is the same one. -->
+<div id="osup-idle-pro" style="display:none;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px;font-size:12px;color:var(--text-dim);line-height:1.5"><span style="color:var(--cyan);font-weight:600">&#11014; Ubuntu 24.04 LTS</span> &mdash; this box is on 22.04 and covered by Ubuntu Pro security updates, so there is no rush to upgrade.</div>
+<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" onclick="osupOpenPreflight()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--cyan);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
+</div></div>
+<div id="osup-idle-full" style="display:block">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
 <div style="flex:1;min-width:260px">
 <div style="font-size:13px;font-weight:600;color:var(--cyan)">&#11014; Upgrade to Ubuntu 24.04 LTS</div>
@@ -178,6 +185,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
 <button type="button" onclick="osupOpenPreflight()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
 </div></div>
+</div>
 </div>
 <div id="osup-progress" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
@@ -1432,8 +1440,16 @@ async function _osupPollOnce(){
         }
     }
 }
+// GH #320: pro_covered (server-side, positive evidence only) collapses the idle card to one line.
+function _osupIdleMode(d){
+    var pro=!!(d&&d.pro_covered);
+    var a=document.getElementById('osup-idle-pro'),b=document.getElementById('osup-idle-full');
+    if(a)a.style.display=pro?'flex':'none';
+    if(b)b.style.display=pro?'none':'block';
+}
 function _osupApply(d){
     if(!d||!d.ok)return;
+    _osupIdleMode(d);
     var dismissed=null; try{dismissed=localStorage.getItem('os-upgrade-dismissed');}catch(e){}
     if(d.state==='running'||d.state==='rebooting'||d.state==='verifying'){
         _osupLastState=d.state; _osupShow('osup-progress'); _osupRenderSteps(d); _osupStartPolling(); return;
