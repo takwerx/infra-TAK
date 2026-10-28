@@ -1,0 +1,152 @@
+name: CloudTAK plugins nightly
+
+# ops #301. Build the newest CloudTAK release AND CloudTAK main with every plugin takwerx ships
+# installed, then open the BUILT web app and look for each plugin's menu entry.
+#
+# Why: CloudTAK 13.102.0 moved its web app from api/web/ to app/. The Dispatcher's install.sh kept
+# copying into the old folder, said "installed", and the plugin never reached the build. Nobody
+# looked at the finished app until a user did (ops #297). A change on CloudTAK's side can do the same
+# again at any time, so this runs every night, not only when we change something.
+#
+# What runs (each is a real `docker build` of CloudTAK, the same one infra-TAK does):
+#   all plugins     every plugin in .github/ci/cloudtak_plugins/manifest.json, installed the way
+#                   infra-TAK installs them, with infra-TAK's own pre-build step from app.py
+#   Dispatcher      the Dispatcher repo's own install.sh, for people running CloudTAK without infra-TAK
+#   canary          the Dispatcher's install.sh from BEFORE the fix. This one must come out RED in
+#                   the check; the job is green only when the check catches it. If the check ever
+#                   goes blind, the canary turns the run red.
+# Each plugin's expected menu entry is read from the plugin's own source (see bundle_check.py).
+#
+# Public repo, GitHub-hosted runners, no secrets, read-only token: no cost. Not a self-hosted job:
+# it runs other people's plugin code through npm.
+
+on:
+  schedule:
+    - cron: '23 10 * * *'   # 3:23 AM PT (2:23 AM in winter)
+  workflow_dispatch:
+    inputs:
+      ct_ref:
+        description: 'CloudTAK tag, branch or sha to build instead of "latest release" and "main" (optional)'
+        required: false
+        default: ''
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - '.github/workflows/cloudtak-plugins-nightly.yml'
+      - '.github/ci/cloudtak_plugins/**'
+
+concurrency:
+  group: cloudtak-plugins-nightly-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CLOUDTAK_REPO: https://github.com/dfpc-coe/CloudTAK
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'all plugins, latest CloudTAK release', ct: release, scenario: catalog }
+          - { name: 'all plugins, CloudTAK main',           ct: main,    scenario: catalog }
+          # The Dispatcher's own install.sh, as people without infra-TAK run it. dref is the branch of
+          # takwerx/cloudtak-dispatcher-plugin: main is what users get today, dev is what ships next.
+          - { name: 'Dispatcher install.sh (main), latest release', ct: release, scenario: dispatcher, dref: main }
+          - { name: 'Dispatcher install.sh (main), CloudTAK main',  ct: main,    scenario: dispatcher, dref: main }
+          - { name: 'Dispatcher install.sh (dev), CloudTAK main',   ct: main,    scenario: dispatcher, dref: dev }
+          - { name: 'TEMP evidence: Dispatcher fix branch (PR 4)', ct: main, scenario: dispatcher, dref: claude/issue-297 }
+          # takwerx/cloudtak-dispatcher-plugin 15c1694 = the last commit before the 13.102 fix (ops #297):
+          # its install.sh still copies into api/web/plugins. The check has to flag it.
+          - { name: 'canary: old Dispatcher install.sh must be caught', ct: release, scenario: dispatcher, dref: 15c16943fcd1b2fd3ce8c2725522f7784d622c4b, expect_red: true }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Pick the CloudTAK version
+        id: ct
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CT_KIND: ${{ matrix.ct }}
+          CT_OVERRIDE: ${{ github.event.inputs.ct_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CT_OVERRIDE" ]; then
+            ref="$CT_OVERRIDE"
+          elif [ "$CT_KIND" = release ]; then
+            ref="$(gh api repos/dfpc-coe/CloudTAK/releases/latest --jq .tag_name)"
+          else
+            ref=main
+          fi
+          [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::odd CloudTAK ref: $ref"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/work"
+          git init -q "$RUNNER_TEMP/CloudTAK"
+          git -C "$RUNNER_TEMP/CloudTAK" remote add origin "$CLOUDTAK_REPO"
+          git -C "$RUNNER_TEMP/CloudTAK" fetch -q --depth 1 origin "$ref"
+          git -C "$RUNNER_TEMP/CloudTAK" checkout -q FETCH_HEAD
+          sha="$(git -C "$RUNNER_TEMP/CloudTAK" rev-parse --short=9 HEAD)"
+          ver="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$RUNNER_TEMP/CloudTAK/package.json")"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.name }}"
+            echo "CloudTAK \`$ref\` = $ver ($sha)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the plugins into CloudTAK
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          DREF: ${{ matrix.dref }}
+        run: |
+          set -euo pipefail
+          tool=.github/ci/cloudtak_plugins/bundle_check.py
+          if [ "$SCENARIO" = catalog ]; then
+            python3 -I "$tool" install-catalog --ct "$RUNNER_TEMP/CloudTAK" --work "$RUNNER_TEMP/work"
+          else
+            python3 -I "$tool" install-dispatcher --ct "$RUNNER_TEMP/CloudTAK" --work "$RUNNER_TEMP/work" --ref "$DREF"
+          fi
+
+      - name: Make room on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h / | tail -1
+
+      - name: Build CloudTAK (docker build, as infra-TAK does)
+        run: docker build -t cloudtak-nightly "$RUNNER_TEMP/CloudTAK"
+
+      - name: Copy the built web app out of the image
+        run: |
+          set -euo pipefail
+          cid="$(docker create cloudtak-nightly)"
+          docker cp "$cid:/home/etl/app/dist" "$RUNNER_TEMP/dist"
+          docker rm "$cid" > /dev/null
+          echo "web app: $(find "$RUNNER_TEMP/dist" -name '*.js' | wc -l) JS files"
+
+      - name: Check each plugin's menu entry is in the built app
+        if: ${{ !matrix.expect_red }}
+        run: |
+          set -o pipefail
+          python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify --expect "$RUNNER_TEMP/work/expect.json" --dist "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/verify.txt"
+          { echo; echo '```'; cat "$RUNNER_TEMP/verify.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Canary - the old installer must be caught
+        if: ${{ matrix.expect_red }}
+        run: |
+          python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify --expect "$RUNNER_TEMP/work/expect.json" --dist "$RUNNER_TEMP/dist" | tee "$RUNNER_TEMP/verify.txt" || true
+          { echo; echo '```'; cat "$RUNNER_TEMP/verify.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q '^FAIL' "$RUNNER_TEMP/verify.txt"; then
+            echo "Good: the check caught the Dispatcher installer from before the fix."
+          else
+            echo "::error::The check did NOT notice that the old Dispatcher installer leaves the plugin out of the build. It is blind to the bug it exists for."
+            exit 1
+          fi
