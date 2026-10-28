@@ -61,7 +61,7 @@ CONSTS = ('CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_PRINT_PLUGIN_COMPOSE', 'CLOUDTAK
           'CLOUDTAK_PRINT_SERVICE', 'CLOUDTAK_PRINT_PORT', '_CLOUDTAK_PRINT_OVERLAY_YML',
           '_CT_ENV_LINE_RE', '_CLOUDTAK_COMPOSE_VAR_RE')
 FUNCS = ('_cloudtak_env_read', '_cloudtak_compose_interpolate', '_cloudtak_print_problem',
-         '_cloudtak_print_containers', '_cloudtak_print_drift', '_cloudtak_print_converge')
+         '_cloudtak_print_containers', '_cloudtak_print_set_up', '_cloudtak_print_drift', '_cloudtak_print_converge')
 
 # CloudTAK v13.113.0's docker-compose.yml, trimmed to what matters here.
 BASE = ('services:\n  api:\n    image: cloudtak-api\n  tiles:\n    image: cloudtak-tiles\n'
@@ -132,7 +132,8 @@ class Stack:
             return '' if self.rows is None else 'cloudtak\n'
         if args[0] == 'ps':
             assert 'label=com.docker.compose.service=cloudtak-print' in args
-            return ''.join(f'{n}|{",".join(f)}|cloudtak-print\n' for n, f in self.rows or [])
+            return ''.join(f'{n}|{",".join(f)}|cloudtak-print|{(r[2:] or [""])[0]}\n'
+                           for r in self.rows or [] for n, f in [r[:2]])
         raise AssertionError(args)
 
     def compose_run(self, ct_dir, args, timeout=600):
@@ -151,9 +152,11 @@ class Stack:
     def converge(self):
         return self.ns()['_cloudtak_print_converge'](str(self.ct), self.logs.append)
 
-    def takportal_started(self):
-        """What TAK Portal's `-f docker-compose.yml -f docker-compose.plugin-print.yml up` leaves."""
-        self.rows = [('cloudtak-print', [f'{self.ct}/docker-compose.yml', f'{self.ct}/{PLUGIN}'])]
+    def takportal_started(self, ports=''):
+        """What TAK Portal's `-f docker-compose.yml -f docker-compose.plugin-print.yml up` leaves.
+        `ports` is docker's published-ports text (the Print file of ops #279 publishes the loopback
+        port itself, which is why Compose never adds the overlay to the labels)."""
+        self.rows = [('cloudtak-print', [f'{self.ct}/docker-compose.yml', f'{self.ct}/{PLUGIN}'], ports)]
 
 
 # ── 1. Compose: the overlay, and only a startable file ───────────────────────
@@ -317,6 +320,30 @@ def test_converged_print_is_left_alone(tmp_path):
     st.compose.clear()
     assert st.converge() == 'ok'
     assert st.compose == []                                     # no restart loop
+
+
+LOOPBACK = '127.0.0.1:5010->5010/tcp'
+
+
+def test_print_that_already_publishes_the_loopback_port_is_left_alone(tmp_path):
+    # ops #279: the Print file TAK Portal installs now publishes 127.0.0.1:5010 itself, so an
+    # `up` with the overlay changes nothing and the labels never list it: not drift, no restart.
+    st = Stack(tmp_path)
+    st.takportal_started(LOOPBACK)
+    assert st.ns()['_cloudtak_print_drift'](str(st.ct)) == []
+    assert st.converge() == 'ok'
+    assert st.compose == []
+    assert (st.ct / OVERLAY).exists() and st.caddy == [True]    # the route still follows the overlay
+
+
+@pytest.mark.parametrize('ports', ['', '5010/tcp', '0.0.0.0:5010->5010/tcp, [::]:5010->5010/tcp',
+                                   '127.0.0.1:5011->5010/tcp'])
+def test_print_without_the_loopback_port_is_still_drift(tmp_path, ports):
+    st = Stack(tmp_path)
+    st.takportal_started(ports)
+    assert st.ns()['_cloudtak_print_drift'](str(st.ct)) == ['cloudtak-print']
+    assert st.converge() == 'ok'
+    assert len(st.compose) == 1
 
 
 def test_custom_file_only_when_it_exists(tmp_path):
@@ -502,6 +529,19 @@ def test_gd_print_without_the_overlay_is_drift_and_asks_for_the_repair(gd, tmp_p
     assert _repair_calls(calls) == [] and "Print started without infra-TAK's /print-api settings" in gd.log()
     calls = gd(yml=PROFILE, labels=rows, console={'state': 'repairing'})
     assert len(_repair_calls(calls)) == 1 and _alerts(calls) == []
+
+
+def test_gd_print_publishing_the_loopback_port_is_clean(gd, tmp_path):
+    # ops #279: started from TAK Portal's file alone, but that file publishes 127.0.0.1:5010 itself
+    (tmp_path / 'CloudTAK' / PLUGIN).write_text(PLUGIN_OK)
+    rows = _gd_rows(gd, tmp_path, ['docker-compose.yml', PLUGIN])
+    rows['cloudtak-print'] += '|127.0.0.1:5010->5010/tcp'
+    gd(yml=PROFILE, labels=rows)
+    calls = gd(yml=PROFILE, labels=rows)
+    assert _repair_calls(calls) == [] and _alerts(calls) == [] and 'drift' not in gd.log()
+    rows['cloudtak-print'] = rows['cloudtak-print'].replace('127.0.0.1', '0.0.0.0')
+    gd(yml=PROFILE, labels=rows)
+    assert "Print started without infra-TAK's /print-api settings" in gd.log()
 
 
 def test_gd_print_with_the_overlay_is_clean(gd, tmp_path):

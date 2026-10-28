@@ -2005,9 +2005,10 @@ def _do_pg_dump(req):
     return _dump_to_file(argv, path, req.get('timeout'), 'pg_dump')
 
 
-def _dump_to_file(argv, path, timeout, opname):
+def _dump_to_file(argv, path, timeout, opname, sidecar=True):
     """Run a dump argv with stdout pointed at a root-opened `path`, then chmod 0600
-    and write the HMAC sidecar. Shared by pg_dump and stack_pg_dump."""
+    and write the HMAC sidecar (`sidecar=False` for non-pg_restore output such as the
+    Node-RED tar). Shared by pg_dump, stack_pg_dump and stack_nodered_tar."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     timeout = min(int(timeout or DEFAULT_TIMEOUT), _PG_DUMP_MAX_TIMEOUT)
     # stdout goes straight to the root-opened file — the 32MiB socket cap never
@@ -2052,10 +2053,11 @@ def _dump_to_file(argv, path, timeout, opname):
     # will accept it (and reject any console-planted archive). Best-effort: if the
     # sidecar can't be written, restore simply won't trust the dump later.
     try:
-        sc = path + '.hmac'
-        fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        os.write(fd, _dump_hmac(path).encode())
-        os.close(fd)
+        if sidecar:
+            sc = path + '.hmac'
+            fd = os.open(sc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            os.write(fd, _dump_hmac(path).encode())
+            os.close(fd)
     except OSError:
         pass
     import hashlib
@@ -2115,6 +2117,50 @@ def _do_stack_pg_dump(req):
     argv = [docker, 'exec', req['container'], 'pg_dump', '-U', user,
             '--lock-wait-timeout=' + _PG_DUMP_LOCK_WAIT, '-Fc', db]
     return _dump_to_file(argv, path, req.get('timeout'), 'stack_pg_dump')
+
+
+# v10.3.x: the Node-RED archive (global context, config-backups, flows). The tar used
+# to stream through the exec proxy, so one reply carried it base64-encoded and a busy
+# Node-RED (test12: 26.7 MB tar) passed MAX_MSG — "Back up now" ended INCOMPLETE. Like
+# the pg dumps, the broker now writes it to disk itself. Nothing caller-supplied reaches
+# the argv: the container and the script are fixed here; the caller names only the label.
+_STACK_NODERED_CONTAINER = 'nodered'
+_STACK_NODERED_TAR_NAME = 'nodered-data.tar'
+_STACK_NODERED_TAR_SH = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
+                         'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
+                         '[ $# -gt 0 ] && exec tar -cf - "$@"')
+
+
+def _check_stack_nodered_tar(req):
+    p = _abs(req.get('path'))
+    rel = p[len(STACK_BACKUP_DIR) + 1:] if p.startswith(STACK_BACKUP_DIR + '/') else ''
+    parts = rel.split('/')
+    if (len(parts) != 2 or not _stack_backup_name_ok(parts[0])
+            or parts[1] != _STACK_NODERED_TAR_NAME):
+        raise Denied(f'stack_nodered_tar: destination must be '
+                     f'{STACK_BACKUP_DIR}/<label>/{_STACK_NODERED_TAR_NAME}: {p}')
+    return p
+
+
+def _do_stack_nodered_tar(req):
+    path = _check_stack_nodered_tar(req)
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        return {'ok': False, 'error': 'docker not found on trusted PATH'}
+    for d, mode in ((STACK_BACKUP_DIR, 0o711), (os.path.dirname(path), 0o700)):
+        if os.path.islink(d):
+            return {'ok': False, 'error': f'refusing symlinked backup dir: {d}'}
+        os.makedirs(d, mode=mode, exist_ok=True)
+        os.chmod(d, mode)
+    argv = [docker, 'exec', _STACK_NODERED_CONTAINER, 'sh', '-c', _STACK_NODERED_TAR_SH]
+    res = _dump_to_file(argv, path, req.get('timeout'), 'stack_nodered_tar', sidecar=False)
+    if res.get('ok') and not res.get('size'):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return {'ok': False, 'error': 'nodered tar is empty'}
+    return res
 
 
 def _check_pg_restore(req):
@@ -3667,6 +3713,8 @@ def _evaluate(req):
             _check_pg_dump(req)
         elif op == 'stack_pg_dump':
             _check_stack_pg_dump(req)
+        elif op == 'stack_nodered_tar':
+            _check_stack_nodered_tar(req)
         elif op == 'stack_pg_restore':
             _check_stack_pg_restore(req)
         elif op == 'pg_restore':
@@ -3768,7 +3816,7 @@ def _dispatch(req, peer):
         inner = req.get('req') or {}
         verdict, reason = _evaluate(inner)
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
-    if op in ('pg_dump', 'stack_pg_dump', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
+    if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
               'pg_old_cluster'):
         verdict, reason = _evaluate(req)
@@ -3778,6 +3826,8 @@ def _dispatch(req, peer):
             summary = JAVA_CACERTS
         elif op == 'certifi_upgrade':
             summary = CERTIFI_EDITOR_DIR
+        elif op == 'stack_nodered_tar':
+            summary = f"{_STACK_NODERED_CONTAINER} -> {req.get('path')}"
         elif op in ('stack_pg_dump', 'stack_pg_restore'):
             summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
         elif op == 'pg_old_cluster':
@@ -3801,6 +3851,8 @@ def _dispatch(req, peer):
             return _do_pg_dump(req)
         if op == 'stack_pg_dump':
             return _do_stack_pg_dump(req)
+        if op == 'stack_nodered_tar':
+            return _do_stack_nodered_tar(req)
         if op == 'stack_pg_restore':
             return _do_stack_pg_restore(req)
         if op == 'pg_restore':
@@ -4590,6 +4642,10 @@ def cli_selftest():
         ('Policy blocks stack_pg_dump outside the backup tree',
          {'op': 'stack_pg_dump', 'container': 'authentik-postgresql-1',
           'path': '/etc/evil.pgdump'}),
+        ('Policy blocks stack_nodered_tar outside the backup tree',
+         {'op': 'stack_nodered_tar', 'path': '/etc/evil.tar'}),
+        ('Policy blocks stack_nodered_tar of another file name',
+         {'op': 'stack_nodered_tar', 'path': '/var/lib/infratak-backups/x/other.tar'}),
         ('Policy blocks stack_pg_restore outside the backup tree',
          {'op': 'stack_pg_restore', 'container': 'authentik-postgresql-1',
           'path': '/opt/tak/snapshots/x/cot.pgdump'}),

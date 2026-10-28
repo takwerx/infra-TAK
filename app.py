@@ -895,6 +895,40 @@ def _stack_pg_dump_priv(container, dest_path, timeout=3600):
     return os.path.getsize(dest_path), _sha256_path(dest_path)
 
 
+# Node-RED /data archive for the full-stack backup: global context, config-backups/ and the
+# flows, as data/... paths. The broker holds its own copy of this script (it takes nothing
+# from the caller); keep the two in step.
+_STACK_NODERED_TAR_SH = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
+                         'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
+                         '[ $# -gt 0 ] && exec tar -cf - "$@"')
+
+
+def _stack_nodered_tar_priv(dest_path, timeout=600):
+    """Archive the Node-RED container's /data into the full-stack backup tree. Non-root: the
+    broker's `stack_nodered_tar` op writes the tar to disk itself — streamed through the exec
+    proxy it came back as ONE base64 reply, and a busy Node-RED (a 26.7 MB tar on test12) went
+    past the broker's 32 MiB MAX_MSG, so the backup ended INCOMPLETE. Root: the same docker
+    exec, run here. Returns (size, sha256); raises BrokerError / RuntimeError on failure."""
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'stack_nodered_tar', 'path': dest_path, 'timeout': timeout},
+                               timeout=timeout + 30)
+        if not resp.get('ok'):
+            raise BrokerError(f"broker stack_nodered_tar failed: {resp.get('error')}")
+        return int(resp.get('size') or 0), resp.get('sha256') or ''
+    os.makedirs(os.path.dirname(dest_path), mode=0o700, exist_ok=True)
+    with open(dest_path, 'wb') as out:
+        r = subprocess.run(['docker', 'exec', 'nodered', 'sh', '-c', _STACK_NODERED_TAR_SH],
+                           stdout=out, stderr=subprocess.PIPE, timeout=timeout)
+    if r.returncode != 0 or os.path.getsize(dest_path) == 0:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"tar in nodered failed: {(r.stderr or b'').decode(errors='replace')[:300]}")
+    os.chmod(dest_path, 0o600)
+    return os.path.getsize(dest_path), _sha256_path(dest_path)
+
+
 def _pg_dump_priv(dest_path, db='cot', timeout=600, container=None):
     """v10.0.8 (PLAN §B): local pg_dump written to disk BY THE BROKER — the dump
     never crosses the socket, so the 32MB message cap that forced the non-root
@@ -1203,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.0-alpha"
+VERSION = "10.3.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -9797,6 +9831,29 @@ def set_update_channel():
     return jsonify({'ok': True, 'channel': channel})
 
 
+def _git_ls_remote(*patterns):
+    """{ref: sha} from `git ls-remote` on the public repo, or None on failure.
+
+    Used when the GitHub REST API refuses us. The API is 60 calls/hour per IP
+    unauthenticated and the console, Guard Dog's watcher and the version lookups all
+    spend from that one bucket, so "Check for new release" failed on any box that had
+    been clicked a few times. git's smart-HTTP endpoint is not part of that quota.
+    """
+    try:
+        r = subprocess.run(['git', 'ls-remote', f'https://github.com/{GITHUB_REPO}.git'] + list(patterns),
+                           capture_output=True, text=True, timeout=10,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+        if r.returncode != 0:
+            return None
+        out = {}
+        for line in r.stdout.splitlines():
+            sha, _, ref = line.partition('\t')
+            if sha and ref:
+                out[ref.strip()] = sha.strip()
+        return out
+    except Exception:
+        return None
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -9846,6 +9903,22 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': latest_label, 'notes': notes,
                 'body': body, 'channel': 'dev', 'update_available': _is_ahead})
         except Exception as e:
+            _refs = _git_ls_remote('refs/heads/dev')
+            _full = (_refs or {}).get('refs/heads/dev', '')
+            if _full:
+                try:
+                    _lsha = subprocess.run(
+                        ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
+                         'rev-parse', '--short', 'HEAD'],
+                        capture_output=True, text=True, timeout=5).stdout.strip()
+                except Exception:
+                    _lsha = ''
+                _ahead = not _full.startswith(_lsha or 'XXXXXXXX')
+                _label = f'dev@{_full[:7]}'
+                _body = f'Latest commit on dev: {_full[:7]}\n\nClick "Pull dev" to update to this commit.'
+                update_cache.update({'latest': _label, 'checked': now, 'notes': 'dev branch', 'body': _body})
+                return _update_check_response({'current': VERSION, 'latest': _label, 'notes': 'dev branch',
+                    'body': _body, 'channel': 'dev', 'update_available': _ahead})
             # v10.1.40: check_failed distinguishes "I could not find out" from "there is
             # nothing new". Without it the UI's `else` branch printed "Up to date" over a
             # GitHub rate-limit (unauthenticated = 60/hour/IP, and the Guard Dog updates
@@ -9919,6 +9992,30 @@ def update_check():
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
             'channel': 'main', 'update_available': is_newer})
     except Exception as e:
+        # API refused (rate limit, DNS, timeout): read the tag list over git instead. The
+        # main-branch ancestry filter above needs the API, so this trusts the tag list —
+        # tags are only cut at ship, on main, so a dev-only tag is not expected.
+        _refs = _git_ls_remote('refs/tags/*')
+        _vers = []
+        for _ref in (_refs or {}):
+            _n = _ref.rsplit('/', 1)[-1]
+            if _n.endswith('^{}'):
+                continue
+            try:
+                _vers.append((_parse_version_tuple(_n.lstrip('v')), _n))
+            except (ValueError, IndexError):
+                continue
+        if _vers:
+            _vers.sort(key=lambda x: x[0], reverse=True)
+            _lt = _vers[0][1].lstrip('v')
+            try:
+                _newer = _parse_version_tuple(_lt) > _parse_version_tuple(VERSION) and _lt.strip() != VERSION.strip()
+            except (ValueError, IndexError):
+                _newer = False
+            _notes = f'Version {_vers[0][1]}'
+            update_cache.update({'latest': _lt, 'checked': now, 'notes': _notes, 'body': ''})
+            return _update_check_response({'current': VERSION, 'latest': _lt, 'notes': _notes, 'body': '',
+                'channel': 'main', 'update_available': _newer})
         return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False, 'check_failed': True})
 
 def _fetch_latest_tag_name():
@@ -23405,6 +23502,9 @@ def _f2b_rewrite_all_jails():
         c = _f2b_read_recidive_config()
         _f2b_write_recidive_config(c['maxretry'], c['findtime'])
         done.append('recidive')
+    if os.path.exists(_F2B_MANUAL_JAIL_PATH):
+        _f2b_manual_ensure_jail()
+        done.append(_F2B_MANUAL_JAIL)
     return done
 
 
@@ -23505,7 +23605,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         # 2026-10-21: the same for takserver bans, now TAK-ports-only. Its commonest
         # repeat offender is an operator's own phone with an old certificate, which
         # re-trips every hour; escalating that cost the admin the console for 7 days.
-        "ignoreregex = \\[(?:mediamtx-rtsp|takserver)\\] Ban\n"
+        "ignoreregex = \\[(?:mediamtx-rtsp|takserver|infratak-manual)\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -23699,6 +23799,408 @@ def fail2ban_recidive_unban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# --- Manual bans (infra-TAK #313) -------------------------------------------------------
+# An operator-kept list of addresses and ranges to block, with a note, and either for good
+# or for a set number of days. The list lives in settings ('fail2ban_manual_bans') and is
+# the source of truth; a dedicated fail2ban jail ('infratak-manual', bantime -1, no log to
+# match) does the blocking, so it uses the same firewall action as every other jail on
+# Ubuntu and Rocky. Expiry is ours, not fail2ban's: one jail cannot hold a different ban
+# time per address, so _f2b_manual_reconcile() lifts a ban the minute it runs out.
+#
+# This is the one place the console lets an operator block every port for good, so it is
+# built so nobody can lock themselves out by accident: an entry that contains the caller's
+# own address, the box's own addresses, its local/VPN/container networks or anything on the
+# trusted list is refused, and a trusted address added later wins over an older entry.
+_F2B_MANUAL_JAIL = 'infratak-manual'
+_F2B_MANUAL_JAIL_PATH = '/etc/fail2ban/jail.d/infratak-manual.conf'
+_F2B_MANUAL_FILTER_PATH = '/etc/fail2ban/filter.d/infratak-manual.conf'
+_F2B_MANUAL_MAX_ENTRIES = 500
+_F2B_MANUAL_MAX_NOTE = 200
+_F2B_MANUAL_MAX_DAYS = 3650
+_F2B_MANUAL_MIN_PREFIX = 8              # refuse anything wider than a /8
+_F2B_MANUAL_LOCK = threading.RLock()
+_F2B_MANUAL_FILTER = (
+    "[Definition]\n"
+    "# infra-TAK Manual bans. Addresses are added with `fail2ban-client set infratak-manual\n"
+    "# banip`, never found in a log, so this pattern is built to match nothing.\n"
+    "failregex = ^infratak-manual-bans-never-matches-a-log-line <HOST>$\n"
+    "ignoreregex =\n"
+)
+
+
+def _f2b_manual_jail_text():
+    return (
+        "[infratak-manual]\n"
+        "enabled  = true\n"
+        "filter   = infratak-manual\n"
+        "logpath  = /var/log/fail2ban.log\n"
+        "maxretry = 1\n"
+        "findtime = 60\n"
+        "bantime  = -1\n"
+        f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+        f"action   = {_f2b_banaction()}\n"
+    )
+
+
+def _f2b_manual_net(text):
+    """Parse an address or range into a network (a single host stays a host). Raises
+    ValueError with a sentence an operator can act on."""
+    s = str(text or '').strip()
+    if not s or len(s) > 64 or not re.fullmatch(r'[0-9A-Fa-f:.]+(?:/\d{1,3})?', s):
+        raise ValueError('Enter an IP address or a range like 203.0.113.0/24.')
+    try:
+        net = ipaddress.ip_network(s, strict=True)
+    except ValueError as e:
+        if 'host bits' in str(e):
+            try:
+                suggest = str(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                suggest = ''
+            raise ValueError('That range has extra bits set' + (f' — did you mean {suggest}?' if suggest else '.'))
+        raise ValueError('Enter an IP address or a range like 203.0.113.0/24.')
+    if net.version != 4:
+        # fail2ban's ufw action cannot add an IPv6 rule while IPv4 rules exist ("Invalid
+        # position '1'", tested on Ubuntu 24.04 / ufw 0.36), and iptables-allports on Rocky
+        # is IPv4 only. Say so rather than list a ban the firewall is not enforcing.
+        raise ValueError('IPv6 addresses can\'t be banned here yet: the firewall rule infra-TAK '
+                         'uses only blocks IPv4.')
+    if net.prefixlen < _F2B_MANUAL_MIN_PREFIX:
+        raise ValueError('That range is too wide to ban by hand '
+                         f'(smallest allowed is /{_F2B_MANUAL_MIN_PREFIX}).')
+    return net
+
+
+def _f2b_manual_label(net):
+    """How an entry is written and shown: a bare address for one host, CIDR for a range."""
+    return str(net.network_address) if net.num_addresses == 1 else str(net)
+
+
+def _f2b_manual_overlap(net, others):
+    """The first of `others` (address or CIDR strings) that shares any address with `net`."""
+    for o in others:
+        try:
+            other = ipaddress.ip_network(str(o).strip(), strict=False)
+        except ValueError:
+            continue
+        if other.version == net.version and net.overlaps(other):
+            return str(o).strip()
+    return None
+
+
+def _f2b_manual_protected_reason(net, client_ip=''):
+    """Why this entry must not be banned, or None. Used when adding AND at every
+    reconcile, so a trusted address added later still wins over an older entry."""
+    if client_ip:
+        hit = _f2b_manual_overlap(net, [client_ip])
+        if hit:
+            return (f'That includes your own address ({client_ip}). Banning it would block you '
+                    'from this console.')
+    hit = _f2b_manual_overlap(net, _f2b_trusted_ignoreip().split())
+    if hit:
+        return (f'That includes {hit}, which is on this box\'s never-ban list (this server, its '
+                'local networks, or a trusted network you added), so banning it could cut the '
+                'box off. If it is a trusted network you added, remove it from Trusted '
+                'Upstream Networks first.')
+    return None
+
+
+def _f2b_manual_load():
+    raw = load_settings().get('fail2ban_manual_bans')
+    out = []
+    for e in (raw if isinstance(raw, list) else []):
+        if not isinstance(e, dict):
+            continue
+        try:
+            net = _f2b_manual_net(e.get('target'))
+        except ValueError:
+            continue
+        exp = e.get('expires')
+        out.append({
+            'id': str(e.get('id') or secrets.token_hex(6)),
+            'target': _f2b_manual_label(net),
+            'note': str(e.get('note') or '')[:_F2B_MANUAL_MAX_NOTE],
+            'created': int(e.get('created') or 0),
+            'expires': int(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None,
+        })
+    return out
+
+
+def _f2b_manual_save(entries):
+    s = load_settings()
+    s['fail2ban_manual_bans'] = entries
+    save_settings(s)
+
+
+def _f2b_manual_active(entries, now=None):
+    now = time.time() if now is None else now
+    return [e for e in entries if e['expires'] is None or e['expires'] > now]
+
+
+def _f2b_manual_banned():
+    """Targets the jail is blocking right now, as {network: text fail2ban uses for it}.
+    None when it cannot be read (jail not loaded, daemon down)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', _F2B_MANUAL_JAIL]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for tok in _f2b_parse_status(r.stdout)['banned_ips']:
+        try:
+            out[ipaddress.ip_network(tok, strict=False)] = tok
+        except ValueError:
+            continue
+    return out
+
+
+def _f2b_manual_enforced(banned):
+    """The part of `banned` the firewall is really enforcing. fail2ban keeps its own list, so a
+    rule removed by hand (or one ufw refused) leaves an address listed as banned and connecting
+    freely. Where the firewall can be read (ufw) check it; elsewhere trust fail2ban."""
+    if not banned:
+        return banned
+    blocked = _f2b_ufw_blocked_ips()
+    if blocked is None:
+        return banned
+    return {net: text for net, text in banned.items()
+            if text in blocked or _f2b_manual_label(net) in blocked}
+
+
+def _f2b_manual_ensure_jail():
+    """Write the jail and filter when missing or out of date (the never-ban list is baked
+    in) and make fail2ban load them. Returns an error string, or '' on success."""
+    try:
+        want = _f2b_manual_jail_text()
+        try:
+            have = _read_priv(_F2B_MANUAL_JAIL_PATH)
+        except Exception:
+            have = ''
+        try:
+            have_filter = _read_priv(_F2B_MANUAL_FILTER_PATH)
+        except Exception:
+            have_filter = ''
+        changed = False
+        if have_filter != _F2B_MANUAL_FILTER:
+            _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+            _write_priv(_F2B_MANUAL_FILTER_PATH, _F2B_MANUAL_FILTER)
+            changed = True
+        if have != want:
+            _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+            _write_priv(_F2B_MANUAL_JAIL_PATH, want)
+            changed = True
+        # Repeat Offender Protection reads every jail's "Ban" lines. Without this exemption it
+        # would ban a manual entry a second time for 7 days, and lift the firewall rule both
+        # bans share when that one runs out - ending a permanent manual ban early.
+        if _f2b_recidive_enabled():
+            _rec = _f2b_read_text('/etc/fail2ban/jail.d/infratak-recidive.conf')
+            if _rec is not None and _F2B_MANUAL_JAIL not in _rec:
+                _rc = _f2b_read_recidive_config()
+                _f2b_write_recidive_config(_rc['maxretry'], _rc['findtime'])
+                changed = True
+        if changed or _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+            subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']),
+                           capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, timeout=30)
+        if _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+            return 'fail2ban did not load the manual-bans jail'
+    except Exception as e:
+        return str(e)[:200]
+    return ''
+
+
+def _f2b_manual_reconcile():
+    """Make the jail match the list: ban what is missing, lift what is gone, expired or
+    now protected. Safe to run any time and from several workers. Returns
+    {'errors': [...], 'banned': {network: text} or None}."""
+    with _F2B_MANUAL_LOCK:
+        errors = []
+        if not _f2b_is_available():
+            return {'errors': ['fail2ban not installed'], 'banned': None}
+        entries = _f2b_manual_load()
+        desired = {}
+        for e in _f2b_manual_active(entries):
+            net = _f2b_manual_net(e['target'])
+            if _f2b_manual_protected_reason(net):
+                continue
+            desired[net] = e['target']
+        if not desired and not os.path.exists(_F2B_MANUAL_JAIL_PATH):
+            return {'errors': [], 'banned': {}}
+        err = _f2b_manual_ensure_jail()
+        if err:
+            return {'errors': [err], 'banned': None}
+        banned = _f2b_manual_banned()
+        if banned is None:
+            return {'errors': ['could not read the manual-bans jail'], 'banned': None}
+        enforced = _f2b_manual_enforced(banned)
+        for net, text in desired.items():
+            if net in banned and net in enforced:
+                continue
+            if net in banned:
+                # listed by fail2ban but missing from the firewall: clear it so it is re-added
+                subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'unbanip', text]),
+                               capture_output=True, text=True, timeout=15)
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'banip', text]),
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                errors.append(f'{text}: {(r.stderr or r.stdout).strip()[:120] or "ban failed"}')
+        for net, text in list(banned.items()):
+            if net in desired:
+                continue
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', _F2B_MANUAL_JAIL, 'unbanip', text]),
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode != 0:
+                errors.append(f'{text}: {(r.stderr or r.stdout).strip()[:120] or "unban failed"}')
+        return {'errors': errors, 'banned': _f2b_manual_enforced(_f2b_manual_banned())}
+
+
+def _f2b_manual_view(e, banned, client_ip='', now=None):
+    now = time.time() if now is None else now
+    net = _f2b_manual_net(e['target'])
+    if e['expires'] is not None and e['expires'] <= now:
+        state = 'expired'
+    elif _f2b_manual_protected_reason(net, client_ip):
+        state = 'protected'
+    elif banned is not None and net in banned:
+        state = 'banned'
+    else:
+        state = 'pending'
+    return dict(e, state=state, permanent=e['expires'] is None)
+
+
+def _f2b_manual_days(raw):
+    """Expiry time (epoch seconds) for a number of days from now; None (permanent) for
+    null/0/''. Raises ValueError."""
+    if raw is None or raw == '' or raw == 0 or raw == '0':
+        return None
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError('Days must be a whole number.')
+    if days < 1 or days > _F2B_MANUAL_MAX_DAYS:
+        raise ValueError(f'Days must be between 1 and {_F2B_MANUAL_MAX_DAYS}, or choose permanent.')
+    return int(time.time()) + days * 86400
+
+
+def _f2b_manual_clean_note(raw):
+    note = re.sub(r'[\x00-\x20\x7f]+', ' ', str(raw or '')).strip()
+    if len(note) > _F2B_MANUAL_MAX_NOTE:
+        raise ValueError(f'Keep the note under {_F2B_MANUAL_MAX_NOTE} characters.')
+    return note
+
+
+@app.route('/api/fail2ban/manual-bans', methods=['GET', 'POST'])
+@login_required
+def fail2ban_manual_bans_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    client_ip = _f2b_console_client_ip()
+    if request.method == 'GET':
+        banned = _f2b_manual_enforced(_f2b_manual_banned())
+        return jsonify({'ok': True, 'client_ip': client_ip,
+                        'bans': [_f2b_manual_view(e, banned, client_ip) for e in _f2b_manual_load()]})
+    data = request.get_json(silent=True) or {}
+    try:
+        net = _f2b_manual_net(data.get('target'))
+        note = _f2b_manual_clean_note(data.get('note'))
+        expires = _f2b_manual_days(data.get('days'))
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    why = _f2b_manual_protected_reason(net, client_ip)
+    if why:
+        return jsonify({'ok': False, 'error': why}), 400
+    with _F2B_MANUAL_LOCK:
+        entries = _f2b_manual_load()
+        if len(entries) >= _F2B_MANUAL_MAX_ENTRIES:
+            return jsonify({'ok': False, 'error': f'The list is full ({_F2B_MANUAL_MAX_ENTRIES}). Remove some first.'}), 400
+        if any(e['target'] == _f2b_manual_label(net) for e in entries):
+            return jsonify({'ok': False, 'error': f'{_f2b_manual_label(net)} is already on the list. Edit it instead.'}), 400
+        entry = {'id': secrets.token_hex(6), 'target': _f2b_manual_label(net), 'note': note,
+                 'created': int(time.time()), 'expires': expires}
+        _f2b_manual_save(entries + [entry])
+        res = _f2b_manual_reconcile()
+        banned = res['banned']
+        if banned is None or net not in banned:
+            _f2b_manual_save(entries)          # not enforced: do not keep a ban that is not real
+            _f2b_manual_reconcile()
+            return jsonify({'ok': False, 'error': 'fail2ban could not apply the ban: '
+                            + ('; '.join(res['errors']) or 'unknown error')}), 500
+    print(f"fail2ban: manual ban added {entry['target']} "
+          f"({'permanent' if expires is None else 'until ' + str(expires)})", flush=True)
+    audit('fail2ban:manual-ban add', f"{entry['target']} {'permanent' if expires is None else 'expires ' + str(expires)}")
+    return jsonify({'ok': True, 'ban': _f2b_manual_view(entry, banned, client_ip)})
+
+
+@app.route('/api/fail2ban/manual-bans/<ban_id>', methods=['PUT', 'DELETE'])
+@login_required
+def fail2ban_manual_ban_item_api(ban_id):
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    client_ip = _f2b_console_client_ip()
+    with _F2B_MANUAL_LOCK:
+        entries = _f2b_manual_load()
+        cur = next((e for e in entries if e['id'] == ban_id), None)
+        if cur is None:
+            return jsonify({'ok': False, 'error': 'That ban is no longer on the list.'}), 404
+        if request.method == 'DELETE':
+            _f2b_manual_save([e for e in entries if e['id'] != ban_id])
+            res = _f2b_manual_reconcile()
+            print(f"fail2ban: manual ban removed {cur['target']}", flush=True)
+            audit('fail2ban:manual-ban remove', cur['target'])
+            return jsonify({'ok': not res['errors'], 'errors': res['errors']})
+        data = request.get_json(silent=True) or {}
+        new = dict(cur)
+        try:
+            if 'target' in data:
+                net = _f2b_manual_net(data.get('target'))
+                new['target'] = _f2b_manual_label(net)
+                if new['target'] != cur['target']:
+                    if any(e['target'] == new['target'] for e in entries):
+                        raise ValueError(f"{new['target']} is already on the list.")
+                    why = _f2b_manual_protected_reason(net, client_ip)
+                    if why:
+                        raise ValueError(why)
+            if 'note' in data:
+                new['note'] = _f2b_manual_clean_note(data.get('note'))
+            if 'days' in data:
+                new['expires'] = _f2b_manual_days(data.get('days'))
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+        _f2b_manual_save([new if e['id'] == ban_id else e for e in entries])
+        res = _f2b_manual_reconcile()
+        banned = res['banned']
+        new_net = _f2b_manual_net(new['target'])
+        live = bool(_f2b_manual_active([new])) and not _f2b_manual_protected_reason(new_net)
+        if live and (banned is None or new_net not in banned):
+            _f2b_manual_save(entries)
+            _f2b_manual_reconcile()
+            return jsonify({'ok': False, 'error': 'fail2ban could not apply the change: '
+                            + ('; '.join(res['errors']) or 'unknown error')}), 500
+    audit('fail2ban:manual-ban edit', f"{cur['target']} -> {new['target']}")
+    return jsonify({'ok': True, 'ban': _f2b_manual_view(new, banned, client_ip)})
+
+
+def _f2b_manual_loop():
+    """Lift expired bans and re-apply any that fail2ban lost, once a minute."""
+    time.sleep(45)
+    while True:
+        try:
+            if _f2b_is_available() and (_f2b_manual_load() or os.path.exists(_F2B_MANUAL_JAIL_PATH)):
+                res = _f2b_manual_reconcile()
+                if res['errors']:
+                    print('fail2ban: manual bans: ' + '; '.join(res['errors']), flush=True)
+        except Exception as e:
+            print(f'fail2ban: manual bans loop: {e}', flush=True)
+        time.sleep(60)
+
+try:
+    threading.Thread(target=_f2b_manual_loop, daemon=True, name='f2b-manual-bans').start()
+except Exception:
+    pass
+
+
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
@@ -23836,6 +24338,8 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/jail.d/infratak-takserver.conf',
             '/etc/fail2ban/filter.d/authentik.conf',
             '/etc/fail2ban/filter.d/takserver.conf',
+            _F2B_MANUAL_JAIL_PATH,
+            _F2B_MANUAL_FILTER_PATH,
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
@@ -45897,8 +46401,9 @@ def _cloudtak_print_problem(ct_dir):
 
 
 def _cloudtak_print_containers(ct_dir):
-    """[(name, [config files])] for the running cloudtak-print containers of the CloudTAK project,
-    or None when CloudTAK isn't running (or docker can't tell)."""
+    """[(name, [config files], ports)] for the running cloudtak-print containers of the CloudTAK
+    project (`ports` is docker's own published-ports text), or None when CloudTAK isn't running
+    (or docker can't tell)."""
     proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
                             '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
     if not proj:
@@ -45906,27 +46411,38 @@ def _cloudtak_print_containers(ct_dir):
     rows = _ct_docker_out(['ps', '--filter', f'label=com.docker.compose.project={proj}',
                            '--filter', f'label=com.docker.compose.service={CLOUDTAK_PRINT_SERVICE}',
                            '--format', '{{.Names}}|{{.Label "com.docker.compose.project.config_files"}}'
-                           '|{{.Label "com.docker.compose.service"}}'])
+                           '|{{.Label "com.docker.compose.service"}}|{{.Ports}}'])
     if rows is None:
         return None
     out = []
     for row in rows.splitlines():
         name, _, rest = row.partition('|')
-        files, _, service = rest.partition('|')
+        files, _, rest = rest.partition('|')
+        service, _, ports = rest.partition('|')
         if name.strip() and service.strip() == CLOUDTAK_PRINT_SERVICE:
-            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()]))
+            out.append((name.strip(), [f.strip() for f in files.split(',') if f.strip()], ports.strip()))
     return out
 
 
+def _cloudtak_print_set_up(files, ports):
+    """Is this cloudtak-print container reachable for /print-api: either started with infra-TAK's
+    overlay, or already publishing 127.0.0.1:5010 (ops #279: the Print file TAK Portal installs
+    now publishes it itself, so Compose gives the overlay's start the same container and never
+    adds the overlay to its labels). The loopback port is the only thing the overlay does."""
+    return (CLOUDTAK_PRINT_OVERLAY in {os.path.basename(f) for f in files}
+            or f'127.0.0.1:{CLOUDTAK_PRINT_PORT}->{CLOUDTAK_PRINT_PORT}/tcp' in (ports or ''))
+
+
 def _cloudtak_print_drift(ct_dir):
-    """Running cloudtak-print containers that were NOT started with infra-TAK's Print overlay while
-    TAK Portal's Print is installed — what every TAK Portal install / update / rebuild of Print
-    leaves (no loopback port, wrong internal URLs). Guard Dog's tak-cloudtak-watch.sh applies the
-    same rule. [] when clean, not installed, or docker can't tell."""
+    """Running cloudtak-print containers that aren't set up for /print-api (no overlay and no
+    loopback port, see _cloudtak_print_set_up) while TAK Portal's Print is installed — what a
+    TAK Portal install / update / rebuild of an older Print file leaves. Guard Dog's
+    tak-cloudtak-watch.sh applies the same rule. [] when clean, not installed, or docker can't
+    tell."""
     if not os.path.isfile(os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE)):
         return []
-    return [n for n, files in (_cloudtak_print_containers(ct_dir) or [])
-            if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+    return [n for n, files, ports in (_cloudtak_print_containers(ct_dir) or [])
+            if not _cloudtak_print_set_up(files, ports)]
 
 
 def _cloudtak_print_converge(ct_dir, plog=None):
@@ -45964,10 +46480,14 @@ def _cloudtak_print_converge(ct_dir, plog=None):
                 with open(overlay, 'w', encoding='utf-8') as f:
                     f.write(_CLOUDTAK_PRINT_OVERLAY_YML)
             rows = _cloudtak_print_containers(ct_dir)
-            stale = [n for n, files in (rows or [])
-                     if CLOUDTAK_PRINT_OVERLAY not in {os.path.basename(f) for f in files}]
+            stale = [n for n, files, ports in (rows or [])
+                     if not _cloudtak_print_set_up(files, ports)]
+            # a changed overlay only matters to a container that was started with it (ops #279:
+            # one that publishes the port by itself never reads it)
+            used = any(CLOUDTAK_PRINT_OVERLAY in {os.path.basename(f) for f in files}
+                       for _n, files, _p in (rows or []))
             result = 'ok'
-            if rows is not None and (changed or stale or not rows):
+            if rows is not None and ((changed and used) or stale or not rows):
                 base = 'docker-compose.yml'
                 if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
                     base = 'compose.yaml'
@@ -66076,8 +66596,9 @@ def _tak_api_user_check_once(cn, ldap_groups):
 def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
-    Picks a real non-admin LDAP user with TAK groups (one connected right now if there is
-    one, else the first in LDAP; never a file user or a ROLE_ADMIN member) and, as a
+    Picks a real non-admin LDAP user with a read/write TAK group (one connected right now if
+    there is one, else the first in LDAP; never a file user, a ROLE_ADMIN member, or a user
+    whose groups are all *_READ / *_WRITE: TAK lists no write-only group, ops #278) and, as a
     throwaway cert for that user, reads its groups (groups/all), lists missions, creates a
     mission in one of its groups (tool `infratak-check`, which ATAK's Data Sync doesn't
     list) and deletes it again. A fresh cert for every login. A round is up to
@@ -66092,8 +66613,12 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
 
     def _pick(groups):
         for cn in sorted(groups or {}, key=str.lower):
-            g = [x for x in groups[cn] if x not in ('__ANON__', '')]
-            if (g and 'ROLE_ADMIN' not in g and cn.lower() not in file_users
+            all_g = [x for x in groups[cn] if x not in ('__ANON__', '')]
+            # Only groups the user can read AND write: TAK lists a *_WRITE (feed-in only)
+            # group on no groups/all, and the mission create needs write access, so a
+            # write-only Node-RED feed user would always read as "no groups" (ops #278).
+            g = [x for x in all_g if not re.search(r'_(?:read|write)$', x, re.I)]
+            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users
                     and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
                 return cn, g
         return None
@@ -66107,7 +66632,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
             return 'unknown', "can't read the users' groups from LDAP"
         pick = _pick(groups)
     if not pick:
-        return 'unknown', "no non-admin LDAP user with TAK groups to check with"
+        return 'unknown', "no non-admin LDAP user with read/write TAK groups to check with"
     cn, ldap_groups = pick
     t0 = time.time()
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
@@ -84243,20 +84768,10 @@ def _stack_backup(label=None, plog=None):
         #    "openat certs/admin.key: read-only file system"), and the restore needs only
         #    these. Read-only here; the SACRED union rule governs the restore (W12.d).
         if _installed('nodered'):
-            nr_tar = os.path.join(stage, 'nodered-data.tar')
-            _nr_tar_sh = ('cd / && set -- && for p in data/context data/config-backups data/flows.json '
-                          'data/flows_cred.json; do [ -e "$p" ] && set -- "$@" "$p"; done; '
-                          '[ $# -gt 0 ] && exec tar -cf - "$@"')
             try:
-                with open(nr_tar, 'wb') as out:
-                    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'nodered', 'sh', '-c', _nr_tar_sh]),
-                                       stdout=out, stderr=subprocess.PIPE, timeout=600)
-                if r.returncode == 0 and os.path.getsize(nr_tar) > 0:
-                    _copy_in(nr_tar, 'nodered-data.tar', 'volume', 'nodered:/data (context, config-backups, flows)')
-                else:
-                    _part('nodered-data.tar', 'volume', False,
-                          note=(r.stderr or b'').decode(errors='replace')[:300])
-                    plog(f"  stack backup: nodered-data.tar FAILED: {(r.stderr or b'').decode(errors='replace')[:300]}")
+                sz, digest = _stack_nodered_tar_priv(os.path.join(dest, 'nodered-data.tar'))
+                _part('nodered-data.tar', 'volume', True, sz, digest, 'nodered:/data (context, config-backups, flows)')
+                plog(f"  stack backup: nodered-data.tar written ({sz // 1024} KB)")
             except Exception as e:
                 _part('nodered-data.tar', 'volume', False, note=str(e)[:300])
                 plog(f"  stack backup: nodered-data.tar FAILED: {str(e)[:300]}")
@@ -91165,16 +91680,60 @@ _OS_UPGRADE_SH_FLIP = (
     '\n'
 )
 
+# ops #284 (field, 2026-10-27): the TAK 5.8 migration's upgrade-db.sh keeps the old 15
+# cluster, stopped, as its rollback copy (GH #273 — the Guard Dog card offers Remove), and
+# pg_upgradecluster moves it off 5432. The preflight already let that box through, then this
+# check demanded "exactly one cluster" AFTER the flip and stopped a box that was on 24.04
+# with nothing wrong. The rule now matches _os_upgrade_pg_layout(): exactly one cluster
+# online, and it is PG_EXPECT on 5432; anything else must be an older major, stopped, and
+# not configured on 5432 (a second cluster on 5432 races TAK's for the port at boot).
+# A failure here is after the flip, so it says what the job did NOT do and how to finish.
 _OS_UPGRADE_SH_PG_CHECK = (
     'if [ -n "$PG_EXPECT" ]; then\n'
-    '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot"; fi\n'
+    '  if dpkg -l "postgresql-16*" 2>/dev/null | grep -q "^ii"; then fail reassert "postgresql-16 was installed despite the pin — it would take :5432 from TAK on reboot. $PG_NEXT"; fi\n'
     '  CL="$(pg_lsclusters --no-header 2>/dev/null)"\n'
     '  echo "[$(TS)] pg_lsclusters: ${CL:-none}"\n'
-    '  N="$(printf "%s\\n" "$CL" | grep -c .)"\n'
-    '  [ "$N" -eq 1 ] || fail reassert "expected exactly one PostgreSQL cluster, found $N: $CL"\n'
-    '  printf "%s\\n" "$CL" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online" || fail reassert "expected PostgreSQL ${PG_EXPECT} on 5432 online, found: $CL"\n'
+    '  LIVE="$(printf "%s\\n" "$CL" | awk \'$4 == "online"\')"\n'
+    '  if [ "$(printf "%s\\n" "$LIVE" | grep -c .)" -ne 1 ] || ! printf "%s\\n" "$LIVE" | grep -qE "^${PG_EXPECT}[[:space:]]+[^[:space:]]+[[:space:]]+5432[[:space:]]+online"; then\n'
+    '    fail reassert "TAK Server\'s database must be the only running PostgreSQL cluster: ${PG_EXPECT} on port 5432. Running now: ${LIVE:-none}. Make that true first (sudo pg_lsclusters shows them; sudo pg_ctlcluster <version> <name> start|stop). $PG_NEXT"\n'
+    '  fi\n'
+    '  BAD="$(printf "%s\\n" "$CL" | awk -v want="$PG_EXPECT" \'NF && $4 != "online" && ($4 !~ /^down/ || $3 == "5432" || $1 !~ /^[0-9]+$/ || $1 + 0 >= want + 0)\')"\n'
+    '  if [ -n "$BAD" ]; then\n'
+    '    fail reassert "a stopped PostgreSQL cluster other than an older leftover is configured here: $BAD. Only an older, stopped cluster on another port is safe to keep beside TAK Server\'s ${PG_EXPECT} on 5432. $PG_NEXT"\n'
+    '  fi\n'
+    '  OLDCL="$(printf "%s\\n" "$CL" | awk \'$4 ~ /^down/ { printf "%s%s/%s on %s", (n++ ? ", " : ""), $1, $2, $3 }\')"\n'
+    '  [ -n "$OLDCL" ] && echo "[$(TS)] kept as it is: stopped PostgreSQL $OLDCL (the copy the TAK Server 5.8 migration keeps as its rollback; TAK Server uses ${PG_EXPECT} on 5432). Remove it from Guard Dog when you no longer need it."\n'
     'fi\n'
 )
+
+
+def _os_upgrade_pg_layout(clusters, expect='18'):
+    """(ok, detail) for the local PostgreSQL clusters [(version, name, port, status), ...],
+    the same rule as _OS_UPGRADE_SH_PG_CHECK so the preflight refuses BEFORE the flip what
+    the reassert step would refuse after it. Accepted: exactly one cluster online, `expect`
+    on 5432; every other cluster an older major, stopped, configured on another port (the
+    5.8 migration's rollback copy, ops #284)."""
+    def _t(cs):
+        return ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in cs) or 'none'
+    live = [c for c in clusters if c[3] == 'online']
+    rest = [c for c in clusters if c[3] != 'online']
+    if len(live) != 1 or live[0][0] != expect or live[0][2] != '5432':
+        stop = [c for c in live if not (c[0] == expect and c[2] == '5432')]
+        how = (' — stop ' + ' and '.join(f'{c[0]}/{c[1]} (sudo pg_ctlcluster {c[0]} {c[1]} stop, and set '
+                                         f'/etc/postgresql/{c[0]}/{c[1]}/start.conf to manual)' for c in stop)
+               if stop and any(c[0] == expect and c[2] == '5432' for c in live) else '')
+        return False, (f'TAK Server\'s database must be the only running PostgreSQL cluster '
+                       f'({expect} on 5432); running: {_t(live)}{how}')
+    bad = [c for c in rest if not c[3].startswith('down') or c[2] == '5432'
+           or not c[0].isdigit() or int(c[0]) >= int(expect)]
+    if bad:
+        return False, (f'PostgreSQL {_t(live)}, but {_t(bad)} is also configured — only an older, '
+                       f'stopped cluster on another port is safe to keep beside it')
+    detail = f'PostgreSQL {_t(live)}'
+    if rest:
+        detail += (f'; the stopped {_t(rest)} (the copy the 5.8 migration keeps) is left as it is — '
+                   f'remove it from Guard Dog when you no longer need it')
+    return True, detail
 
 _OS_UPGRADE_SH_REBOOT = (
     # ---- 8. reboot ------------------------------------------------------------
@@ -91494,8 +92053,11 @@ def _os_upgrade_preflight(for_start=False, data=None):
                     ok = False
                     detail += ' — PostgreSQL cluster is ' + ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in clusters) + ', not 18 (the 5.8 migration did not finish)'
                 else:
-                    pg_expect = '18'
-                    detail += '; PostgreSQL ' + ', '.join(f'{c[0]}/{c[1]}:{c[2]} {c[3]}' for c in clusters)
+                    # ops #284: the reassert step's rule, asked while nothing has changed yet.
+                    ok, pg_detail = _os_upgrade_pg_layout(clusters, '18')
+                    detail += ' — ' + pg_detail if not ok else '; ' + pg_detail
+                    if ok:
+                        pg_expect = '18'
             add('takserver_58', ok, detail)
 
     # 3. Local DB — a split-box remote DB server has no console and is not touched.
@@ -91686,6 +92248,11 @@ def _os_upgrade_script(install_dir, console_user, console_port, pg_expect=''):
             '  sed -i "s/^string_mask = utf8only/string_mask = nombstr/" /etc/ssl/openssl.cnf && echo "[$(TS)] re-applied string_mask = nombstr"\n'
             'fi\n'
             'apt-get -y -o DPkg::Lock::Timeout=300 install python3 python3-pip python3-venv openssl sshpass git wget curl ca-certificates || fail reassert "base dependencies could not be installed"\n'
+            # ops #284: what a reassert failure leaves undone, as the exact commands for this box.
+            'PG_NEXT="Ubuntu 24.04 is installed and the console\'s Python was rebuilt, but the console was NOT restarted and the box was NOT rebooted. Once that is fixed, finish by hand: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg"\n'
+            'systemctl list-unit-files docker.service 2>/dev/null | grep -q docker.service && PG_NEXT="$PG_NEXT; sudo systemctl enable docker"\n'
+            'systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker && PG_NEXT="$PG_NEXT; sudo systemctl restart takwerx-broker"\n'
+            'PG_NEXT="$PG_NEXT; sudo systemctl restart takwerx-console; echo rebooting | sudo tee $STATUS; sudo reboot — after the reboot the console checks that everything came back"\n'
         ),
         _OS_UPGRADE_SH_PG_CHECK,
         (
@@ -91766,6 +92333,22 @@ def _os_upgrade_start_job(data):
     return _os_upgrade_launch(pf, remote)
 
 
+def _os_upgrade_unit_cmd():
+    """The one systemd-run shape the broker allows for the OS-upgrade unit."""
+    return [
+        'systemd-run',
+        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
+        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
+        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
+        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
+        '--setenv=DEBIAN_FRONTEND=noninteractive',
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
+        '--no-block',
+        '/bin/bash', _OS_UPGRADE_SCRIPT,
+    ]
+
+
 def _os_upgrade_launch(pf, remote='?'):
     """Write the baseline + script and spawn the detached unit. (http_status, payload).
     Split from _os_upgrade_start_job so the W12.c backup thread can call it."""
@@ -91784,20 +92367,8 @@ def _os_upgrade_launch(pf, remote='?'):
         _write_priv(_OS_UPGRADE_SCRIPT, script, perm=0o755)
     except Exception as e:
         return 500, {'ok': False, 'error': f'could not prepare the upgrade job: {str(e)[:200]}'}
-    cmd = [
-        'systemd-run',
-        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
-        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
-        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
-        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
-        '--setenv=DEBIAN_FRONTEND=noninteractive',
-        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
-        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
-        '--no-block',
-        '/bin/bash', _OS_UPGRADE_SCRIPT,
-    ]
     try:
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=20)
+        r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
     except Exception as e:
         return 500, {'ok': False, 'error': f'systemd-run spawn failed: {str(e)[:200]}'}
     if r.returncode != 0:
@@ -91962,6 +92533,121 @@ def _startup_os_upgrade_verify():
             print(f"[os-upgrade] post-reboot verify error: {e}", flush=True)
 
     threading.Thread(target=_verify, daemon=True, name='os-upgrade-verify').start()
+    return True
+
+
+# ops #284 (field, 2026-10-27): boxes that v10.3.0 stopped at `reassert` over the 5.8
+# migration's stopped PG 15 are on 24.04 with the rebuilt venv, but the job's cleanup and
+# console restart never ran. Updating the console is the restart; this does the rest, once,
+# with the fixed check: re-run reassert's PG rule, the cleanup it skipped, then the same
+# post-reboot verify (no reboot: the console's existing "restart needed" flag asks for it).
+# Same transient unit, script path and gated systemd-run shape as the job — no broker change.
+_OS_UPGRADE_FINISH_MARK = _OS_UPGRADE_DIR + '/finish-reassert-tried'
+
+
+def _os_upgrade_finish_script(pg_expect):
+    """Bash that finishes a box the job stopped at reassert (see above). Pure, for tests."""
+    q = shlex.quote
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK: finish an OS upgrade that stopped at reassert (ops #284). Written by the\n'
+            '# console, run as root in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            f'STATE_DIR={q(_OS_UPGRADE_DIR)}\n'
+            f'STATUS={q(_OS_UPGRADE_STATUS)}\n'
+            'PRE="$STATE_DIR/pre"\n'
+            f'PG_EXPECT={q(pg_expect)}\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        (
+            'echo "[$(TS)] === finishing the OS upgrade that stopped at reassert (console update, pid $$) ==="\n'
+            'step reassert\n'
+            '. /etc/os-release\n'
+            '[ "$VERSION_ID" = "24.04" ] || fail reassert "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 24.04"\n'
+            'PG_NEXT="Nothing was changed by this retry. Finish by hand: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg; sudo systemctl enable docker; echo rebooting | sudo tee $STATUS; sudo reboot"\n'
+        ),
+        _OS_UPGRADE_SH_PG_CHECK,
+        (
+            'if systemctl list-unit-files docker.service 2>/dev/null | grep -q docker.service; then systemctl enable docker >/dev/null 2>&1 || true; fi\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'systemctl daemon-reload\n'
+            'if systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker; then systemctl restart takwerx-broker || echo "[$(TS)] WARN: takwerx-broker restart returned $?"; fi\n'
+            'echo "[$(TS)] reassert complete; the console now checks that every service and container is back"\n'
+            'echo "verifying" > "$STATUS"\n'
+        ),
+    ))
+
+
+def _os_upgrade_finish_eligible():
+    """(ok, why) for _startup_os_upgrade_finish_reassert. Read-only."""
+    if _os_upgrade_read_status() != 'failed:reassert':
+        return False, 'status is not failed:reassert'
+    if _read_os_release()[0] != _OS_UPGRADE_TO:
+        return False, 'not on Ubuntu 24.04'
+    if os.path.exists(_OS_UPGRADE_FINISH_MARK):
+        return False, 'already tried once'
+    try:
+        expect = (json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or '')
+    except Exception:
+        expect = ''
+    if not expect:
+        return False, 'baseline has no pg_expect'
+    ok, detail = _os_upgrade_pg_layout(_os_upgrade_pg_clusters(), expect)
+    return (ok, detail if ok else 'PostgreSQL layout still unsafe: ' + detail)
+
+
+def _startup_os_upgrade_finish_reassert(initial_wait_s=60, wait_s=2700, poll_s=10):
+    """Start the finish thread when eligible. Returns True when it started."""
+    ok, why = _os_upgrade_finish_eligible()
+    if not ok:
+        return False
+
+    def _finish():
+        try:
+            # The console update that brought this code in runs its post-update deploy now;
+            # the finish restarts the broker, so it waits for that to end.
+            time.sleep(initial_wait_s)
+            lock = '/var/lib/takwerx-console/update-now.lock'
+            end = time.time() + wait_s
+            while (_POST_UPDATE_ACTIVE['on'] or os.path.exists(lock)) and time.time() < end:
+                time.sleep(poll_s)
+            ok2, why2 = _os_upgrade_finish_eligible()
+            if not ok2:
+                print(f"[os-upgrade] finish after reassert skipped: {why2}", flush=True)
+                return
+            _write_priv(_OS_UPGRADE_FINISH_MARK, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ') + '\n', perm=0o644)
+            expect = json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or ''
+            load, active, _s, _r, _p = _os_upgrade_unit_state()
+            if active in ('active', 'activating'):
+                return
+            if load == 'loaded':
+                subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _OS_UPGRADE_UNIT]),
+                               capture_output=True, timeout=5)
+            _write_priv(_OS_UPGRADE_SCRIPT, _os_upgrade_finish_script(expect), perm=0o755)
+            _os_upgrade_write_status('running:reassert')
+            r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                _os_upgrade_write_status('failed:reassert')
+                print(f"[os-upgrade] finish after reassert: systemd-run returned {r.returncode}: "
+                      f"{(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+                return
+            print("[os-upgrade] finishing the upgrade that stopped at reassert (fixed check)", flush=True)
+            try:
+                audit('os-upgrade:finish-reassert', f'pg_expect={expect}')
+            except Exception:
+                pass
+            end = time.time() + 600
+            while time.time() < end:
+                time.sleep(poll_s)
+                if not _os_upgrade_read_status().startswith('running:'):
+                    break
+            if _os_upgrade_read_status() == 'verifying':
+                _startup_os_upgrade_verify()
+        except Exception as e:
+            print(f"[os-upgrade] finish after reassert error: {e}", flush=True)
+
+    threading.Thread(target=_finish, daemon=True, name='os-upgrade-finish').start()
     return True
 
 
@@ -92368,6 +93054,7 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
         (
             # ---- 6. reassert ----------------------------------------------------------
             'step reassert\n'
+            'PG_NEXT="Ubuntu 24.04 is installed on this database server, but it was NOT rebooted and the TLS check that follows did not run. Once that is fixed, compare SHOW ssl, the infra-TAK-dbtls lines in postgresql.conf and the hostssl rules with the copies in $PRE/pg, then: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg; sudo reboot"\n'
         ),
         _OS_UPGRADE_SH_PG_CHECK,
         (
@@ -92380,7 +93067,7 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
             '[ "$(grep -c "infra-TAK-dbtls" "$CONF")" = "$(cat "$PRE/pg/dbtls-count" 2>/dev/null)" ] || fail reassert "the infra-TAK TLS lines in postgresql.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
             'grep -E "^[[:space:]]*hostssl" "$HBA" | cmp -s - "$PRE/pg/hostssl" || fail reassert "the hostssl rules in pg_hba.conf changed during the upgrade — the pre-upgrade copy is in $PRE/pg"\n'
             'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
-            'echo "[$(TS)] reassert complete: one PostgreSQL ${PG_EXPECT} cluster on 5432; TLS settings and hostssl rules as before"\n'
+            'echo "[$(TS)] reassert complete: PostgreSQL ${PG_EXPECT} on 5432 is the only running cluster; TLS settings and hostssl rules as before"\n'
             '\n'
         ),
         _OS_UPGRADE_SH_REBOOT,
@@ -92539,9 +93226,12 @@ def _dbserver_preflight(for_start=False, data=None, settings=None, probe=None):
     cl = d.get('clusters') or []
     tak_n, tak_ssl = d.get('tak_sessions'), d.get('tak_sessions_ssl')
     cl_text = ', '.join('/'.join(c) for c in cl) or 'none'
-    if len(cl) != 1 or cl[0][:1] != ['18'] or cl[0][2:4] != ['5432', 'online']:
-        hint = ' — run the TAK Server 5.8 update first (it moves the database to PostgreSQL 18)' if any(c[:1] == ['15'] for c in cl) else ''
-        add('is_tak_db', False, f'expected exactly one PostgreSQL 18 cluster on 5432, online; found {cl_text}{hint}')
+    # ops #284: the reassert step's rule — the 5.8 migration's stopped 15 copy may stay.
+    pg_ok, pg_detail = _os_upgrade_pg_layout([tuple(c[:4]) for c in cl if len(c) >= 4], '18')
+    if not pg_ok:
+        hint = (' — run the TAK Server 5.8 update first (it moves the database to PostgreSQL 18)'
+                if not any(c[:1] == ['18'] for c in cl) and any(c[:1] == ['15'] for c in cl) else '')
+        add('is_tak_db', False, f'{pg_detail}; found {cl_text}{hint}')
     elif not d.get('cot'):
         add('is_tak_db', False, 'PostgreSQL 18 is running but there is no cot database — this is not TAK Server\'s database')
     elif not tak_n:
@@ -101806,6 +102496,12 @@ def _startup_migrations():
                 print("Startup migration: OS upgrade post-reboot verify started", flush=True)
         except Exception as _ou_err:
             print(f"Startup migration: OS upgrade verify start error (non-fatal): {_ou_err}")
+        # ops #284: a box v10.3.0 stopped at `reassert` (5.8's stopped PG 15) finishes here.
+        try:
+            if _startup_os_upgrade_finish_reassert():
+                print("Startup migration: finishing the OS upgrade that stopped at reassert", flush=True)
+        except Exception as _of_err:
+            print(f"Startup migration: OS upgrade finish start error (non-fatal): {_of_err}")
 
         # v10.3.0 W4.e: a database server job (upgrade / updates / reboot) that was in
         # flight when this console stopped is watched again — it kept running on the

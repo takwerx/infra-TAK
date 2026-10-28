@@ -524,14 +524,13 @@ def test_start_route_is_password_gated_and_reruns_preflight():
     # server-side re-run, never the client's copy; refused with 409 + the checks
     assert '_os_upgrade_preflight(for_start=True, data=data)' in start
     assert "return 409, {'ok': False, 'error': 'preflight failed: '" in start
-    assert start.index('_os_upgrade_preflight(for_start=True') < start.index('systemd-run')
+    assert start.index('_os_upgrade_preflight(for_start=True') < start.index('_os_upgrade_unit_cmd()')
     assert "_write_priv(_OS_UPGRADE_SCRIPT, script, perm=0o755)" in start
 
 
 def test_start_builds_exactly_the_broker_shape():
     start = _fn('_os_upgrade_launch')
-    i = start.index('cmd = [')
-    cmd = start[i:start.index(']', i)]
+    cmd = _fn('_os_upgrade_unit_cmd')
     for tok in ("'systemd-run'", "'--unit=' + _OS_UPGRADE_UNIT.replace('.service', '')",
                 "'--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE",
                 "'--property=StandardError=append:' + _OS_UPGRADE_LOGFILE",
@@ -539,7 +538,7 @@ def test_start_builds_exactly_the_broker_shape():
                 "'--setenv=RELEASE_UPGRADER_NO_SCREEN=1'", "'--no-block'", "'/bin/bash', _OS_UPGRADE_SCRIPT"):
         assert tok in cmd, tok
     assert cmd.count('--setenv=') == 3
-    assert '_sudo_wrap(cmd)' in start
+    assert '_sudo_wrap(_os_upgrade_unit_cmd())' in start
 
 
 def test_stack_backup_step_states():
@@ -627,9 +626,9 @@ def test_broker_accepts_exactly_the_shape_the_console_sends(broker):
                                '/bin/bash', '/opt/infratak/scripts/migrate-console-nonroot.sh',
                                '--apply', '--auto-rollback'])
     # the shape app.py builds IS this shape (same tokens, same order)
-    start = _fn('_os_upgrade_launch')
-    for tok in OSUP[2:9]:
-        assert repr(tok) in start or tok.split('=', 1)[0] in start, tok
+    ns = _ns()
+    exec(compile(_fn('_os_upgrade_unit_cmd'), 'app.py:_os_upgrade_unit_cmd', 'exec'), ns)
+    assert ns['_os_upgrade_unit_cmd']() == OSUP
 
 
 def _variants():

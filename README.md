@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.0-alpha)**
+**Current release: [v10.3.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,24 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.1-alpha — 2026-10-28 — Ubuntu 24.04 upgrade no longer stops at "reassert"; Manual bans on the Fail2ban page
+
+**Headline: the 22.04 → 24.04 upgrade from the Console page no longer stops at the `reassert` step on boxes that still keep the stopped PostgreSQL 15 copy from the TAK Server 5.8 update, and a box that v10.3.0 already stopped there finishes the upgrade by itself after you click Update Now — no SSH needed. The Fail2ban page gains a Manual bans card.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.1-alpha))
+
+**Ubuntu 24.04 upgrade.**
+- The TAK Server 5.8 update keeps the old PostgreSQL 15 cluster, stopped, as its rollback copy. The upgrade now accepts that: it only refuses when it is truly unsafe (anything other than 18 running on 5432), and it refuses before anything changes, with a clear next step.
+- **Stuck on v10.3.0?** If your upgrade stopped at `reassert` (`expected exactly one PostgreSQL cluster, found 2`), update the console (Update Now). It finishes the remaining steps on its own, without a reboot.
+
+**Manual bans (GH #313).** Ban an IPv4 address or range from the Fail2ban page, permanently or for a number of days, with an optional note. Entries can be edited or removed, and the console checks the firewall really blocks them.
+
+**Fixes.**
+- "Back up now" no longer ends INCOMPLETE on a box with a large Node-RED data folder.
+- No TAK Server restart after an update or Authentik restart because the login check picked a write-only feed user.
+- Guard Dog no longer raises a drift alarm that can't clear after a TAK Portal Print install or update.
+- The update check still works when GitHub's API refuses the request (rate limit).
+- Full-stack backups moved to the Guard Dog page, collapsed by default.
+- On two-server installs, the TAK DB card's "Restart needed" opens the database server's preflight (updates, reboot, upgrade).
 
 ### v10.3.0-alpha — 2026-10-27 — Ubuntu 24.04: install it, or upgrade a running box from the console; full-stack backup; the console works on a phone
 
