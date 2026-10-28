@@ -92333,6 +92333,22 @@ def _os_upgrade_start_job(data):
     return _os_upgrade_launch(pf, remote)
 
 
+def _os_upgrade_unit_cmd():
+    """The one systemd-run shape the broker allows for the OS-upgrade unit."""
+    return [
+        'systemd-run',
+        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
+        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
+        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
+        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
+        '--setenv=DEBIAN_FRONTEND=noninteractive',
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
+        '--no-block',
+        '/bin/bash', _OS_UPGRADE_SCRIPT,
+    ]
+
+
 def _os_upgrade_launch(pf, remote='?'):
     """Write the baseline + script and spawn the detached unit. (http_status, payload).
     Split from _os_upgrade_start_job so the W12.c backup thread can call it."""
@@ -92351,20 +92367,8 @@ def _os_upgrade_launch(pf, remote='?'):
         _write_priv(_OS_UPGRADE_SCRIPT, script, perm=0o755)
     except Exception as e:
         return 500, {'ok': False, 'error': f'could not prepare the upgrade job: {str(e)[:200]}'}
-    cmd = [
-        'systemd-run',
-        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
-        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
-        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
-        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
-        '--setenv=DEBIAN_FRONTEND=noninteractive',
-        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
-        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
-        '--no-block',
-        '/bin/bash', _OS_UPGRADE_SCRIPT,
-    ]
     try:
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=20)
+        r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
     except Exception as e:
         return 500, {'ok': False, 'error': f'systemd-run spawn failed: {str(e)[:200]}'}
     if r.returncode != 0:
@@ -92529,6 +92533,121 @@ def _startup_os_upgrade_verify():
             print(f"[os-upgrade] post-reboot verify error: {e}", flush=True)
 
     threading.Thread(target=_verify, daemon=True, name='os-upgrade-verify').start()
+    return True
+
+
+# ops #284 (field, 2026-10-27): boxes that v10.3.0 stopped at `reassert` over the 5.8
+# migration's stopped PG 15 are on 24.04 with the rebuilt venv, but the job's cleanup and
+# console restart never ran. Updating the console is the restart; this does the rest, once,
+# with the fixed check: re-run reassert's PG rule, the cleanup it skipped, then the same
+# post-reboot verify (no reboot: the console's existing "restart needed" flag asks for it).
+# Same transient unit, script path and gated systemd-run shape as the job — no broker change.
+_OS_UPGRADE_FINISH_MARK = _OS_UPGRADE_DIR + '/finish-reassert-tried'
+
+
+def _os_upgrade_finish_script(pg_expect):
+    """Bash that finishes a box the job stopped at reassert (see above). Pure, for tests."""
+    q = shlex.quote
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK: finish an OS upgrade that stopped at reassert (ops #284). Written by the\n'
+            '# console, run as root in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            f'STATE_DIR={q(_OS_UPGRADE_DIR)}\n'
+            f'STATUS={q(_OS_UPGRADE_STATUS)}\n'
+            'PRE="$STATE_DIR/pre"\n'
+            f'PG_EXPECT={q(pg_expect)}\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        (
+            'echo "[$(TS)] === finishing the OS upgrade that stopped at reassert (console update, pid $$) ==="\n'
+            'step reassert\n'
+            '. /etc/os-release\n'
+            '[ "$VERSION_ID" = "24.04" ] || fail reassert "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 24.04"\n'
+            'PG_NEXT="Nothing was changed by this retry. Finish by hand: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg; sudo systemctl enable docker; echo rebooting | sudo tee $STATUS; sudo reboot"\n'
+        ),
+        _OS_UPGRADE_SH_PG_CHECK,
+        (
+            'if systemctl list-unit-files docker.service 2>/dev/null | grep -q docker.service; then systemctl enable docker >/dev/null 2>&1 || true; fi\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'systemctl daemon-reload\n'
+            'if systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker; then systemctl restart takwerx-broker || echo "[$(TS)] WARN: takwerx-broker restart returned $?"; fi\n'
+            'echo "[$(TS)] reassert complete; the console now checks that every service and container is back"\n'
+            'echo "verifying" > "$STATUS"\n'
+        ),
+    ))
+
+
+def _os_upgrade_finish_eligible():
+    """(ok, why) for _startup_os_upgrade_finish_reassert. Read-only."""
+    if _os_upgrade_read_status() != 'failed:reassert':
+        return False, 'status is not failed:reassert'
+    if _read_os_release()[0] != _OS_UPGRADE_TO:
+        return False, 'not on Ubuntu 24.04'
+    if os.path.exists(_OS_UPGRADE_FINISH_MARK):
+        return False, 'already tried once'
+    try:
+        expect = (json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or '')
+    except Exception:
+        expect = ''
+    if not expect:
+        return False, 'baseline has no pg_expect'
+    ok, detail = _os_upgrade_pg_layout(_os_upgrade_pg_clusters(), expect)
+    return (ok, detail if ok else 'PostgreSQL layout still unsafe: ' + detail)
+
+
+def _startup_os_upgrade_finish_reassert(initial_wait_s=60, wait_s=2700, poll_s=10):
+    """Start the finish thread when eligible. Returns True when it started."""
+    ok, why = _os_upgrade_finish_eligible()
+    if not ok:
+        return False
+
+    def _finish():
+        try:
+            # The console update that brought this code in runs its post-update deploy now;
+            # the finish restarts the broker, so it waits for that to end.
+            time.sleep(initial_wait_s)
+            lock = '/var/lib/takwerx-console/update-now.lock'
+            end = time.time() + wait_s
+            while (_POST_UPDATE_ACTIVE['on'] or os.path.exists(lock)) and time.time() < end:
+                time.sleep(poll_s)
+            ok2, why2 = _os_upgrade_finish_eligible()
+            if not ok2:
+                print(f"[os-upgrade] finish after reassert skipped: {why2}", flush=True)
+                return
+            _write_priv(_OS_UPGRADE_FINISH_MARK, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ') + '\n', perm=0o644)
+            expect = json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or ''
+            load, active, _s, _r, _p = _os_upgrade_unit_state()
+            if active in ('active', 'activating'):
+                return
+            if load == 'loaded':
+                subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _OS_UPGRADE_UNIT]),
+                               capture_output=True, timeout=5)
+            _write_priv(_OS_UPGRADE_SCRIPT, _os_upgrade_finish_script(expect), perm=0o755)
+            _os_upgrade_write_status('running:reassert')
+            r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                _os_upgrade_write_status('failed:reassert')
+                print(f"[os-upgrade] finish after reassert: systemd-run returned {r.returncode}: "
+                      f"{(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+                return
+            print("[os-upgrade] finishing the upgrade that stopped at reassert (fixed check)", flush=True)
+            try:
+                audit('os-upgrade:finish-reassert', f'pg_expect={expect}')
+            except Exception:
+                pass
+            end = time.time() + 600
+            while time.time() < end:
+                time.sleep(poll_s)
+                if not _os_upgrade_read_status().startswith('running:'):
+                    break
+            if _os_upgrade_read_status() == 'verifying':
+                _startup_os_upgrade_verify()
+        except Exception as e:
+            print(f"[os-upgrade] finish after reassert error: {e}", flush=True)
+
+    threading.Thread(target=_finish, daemon=True, name='os-upgrade-finish').start()
     return True
 
 
@@ -102377,6 +102496,12 @@ def _startup_migrations():
                 print("Startup migration: OS upgrade post-reboot verify started", flush=True)
         except Exception as _ou_err:
             print(f"Startup migration: OS upgrade verify start error (non-fatal): {_ou_err}")
+        # ops #284: a box v10.3.0 stopped at `reassert` (5.8's stopped PG 15) finishes here.
+        try:
+            if _startup_os_upgrade_finish_reassert():
+                print("Startup migration: finishing the OS upgrade that stopped at reassert", flush=True)
+        except Exception as _of_err:
+            print(f"Startup migration: OS upgrade finish start error (non-fatal): {_of_err}")
 
         # v10.3.0 W4.e: a database server job (upgrade / updates / reboot) that was in
         # flight when this console stopped is watched again — it kept running on the
