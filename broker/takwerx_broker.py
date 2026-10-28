@@ -2747,7 +2747,7 @@ TAKPORTAL_WRAPPED = ('cat', 'tee')
 TAKPORTAL_HELPER = '/usr/local/libexec/tak-portal/marketplace-helper'
 TAKPORTAL_LEFTOVER_SUDOERS = '/etc/sudoers.d/tak-portal-marketplace'
 TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
-# sha256 of host-helpers/marketplace-helper in TAK Portal releases 2.0.19-2.0.21
+# sha256 of host-helpers/marketplace-helper (version 1) in TAK Portal releases 2.0.19-2.0.22
 # (ValleyTacticalSolutions/TAK-Portal). The helper is granted as root, so we only
 # ever install bytes we have reviewed; a portal that ships a different helper gets
 # it granted after the new hash is added here (with a /module-scan), never before.
@@ -3020,7 +3020,8 @@ def _takportal_decide(user=BROKER_USER):
     not an authority: a box where the portal is old stays on the legacy text by
     design (AJ, ops #16), and the status row says so."""
     out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
-           'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found'}
+           'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found',
+           'helper_unreviewed': False}
     try:
         portal = os.path.join(pwd.getpwnam(user).pw_dir, 'TAK-Portal')
     except KeyError:
@@ -3043,8 +3044,9 @@ def _takportal_decide(user=BROKER_USER):
             out['helper_bytes'] = data
             out['helper_reason'] = ''
         else:
-            out['helper_reason'] = ('this TAK Portal ships a marketplace helper infra-TAK has not '
-                                    'reviewed (sha256 not pinned)')
+            out['helper_unreviewed'] = True
+            out['helper_reason'] = ('this TAK Portal ships a newer marketplace helper that infra-TAK '
+                                    'has not reviewed yet (sha256 not pinned)')
     else:
         out['helper_reason'] = 'no host-helpers/marketplace-helper in the TAK Portal checkout'
     tup = _takportal_version_tuple(ver)
@@ -3151,7 +3153,8 @@ def _do_takportal_sudoers(req):
                 'variant': variant, 'variant_reason': decision['reason'],
                 'wrappers_ok': wrappers_ok,
                 'helper': {'granted': bool(hardened and helper_ok),
-                           'installed': helper_ok, 'reason': decision['helper_reason']},
+                           'installed': helper_ok, 'reason': decision['helper_reason'],
+                           'unreviewed': bool(decision.get('helper_unreviewed'))},
                 'leftover_marketplace_sudoers': os.path.lexists(TAKPORTAL_LEFTOVER_SUDOERS)}
     if action == 'remove':
         # The wrappers and the helper exist only for this grant; they go with it.
