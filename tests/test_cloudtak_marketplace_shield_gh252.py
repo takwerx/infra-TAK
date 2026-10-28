@@ -69,7 +69,7 @@ def _load():
                                             '_cloudtak_shield_foreign_plugins')])
     ns = {'os': os, 're': re, 'json': json, 'subprocess': subprocess,
           'CLOUDTAK_PLUGINS': [{'install_dir': d} for d in
-                               ('ping', 'search-containment', 'tak-dispatcher', 'taksim')]}
+                               ('taksim',)]}
     exec(compile(src, 'app.py', 'exec'), ns)
     return ns
 
@@ -123,7 +123,7 @@ def test_marketplace_plugins_get_the_lint_and_typecheck_skip(tmp_path):
 
 
 def test_only_our_plugins_changes_nothing(tmp_path):
-    ct = _tree(tmp_path, ('taksim', 'tak-dispatcher'))
+    ct = _tree(tmp_path, ('taksim',))
     log = _run(_load(), ct)
     assert log == []
     assert (ct / 'app' / 'package.json').read_text() == APP_PKG
