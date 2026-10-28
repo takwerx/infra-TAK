@@ -40849,6 +40849,15 @@ def takportal_ssh_status():
             row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
                 '' if _h.get('granted') else
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
+            # TAK Portal 2.0.23+ ships a newer helper. It runs as root, so infra-TAK keeps
+            # the old pinned one until the new bytes are reviewed. Box test (ops #295, 2.0.24):
+            # Deploy/Redeploy To Caddy does not need it here. The portal falls back to
+            # copying through the broker's cp shim, so say that, not "will fail".
+            if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
+                row('Marketplace helper', 'na', 'newer version not reviewed yet',
+                    'This TAK Portal ships a newer marketplace helper that infra-TAK has not reviewed, '
+                    'so infra-TAK keeps the older one. The Marketplace "Deploy To Caddy" button does not '
+                    'need the newer helper on an infra-TAK box. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
                 'Run Repair to rewrite it.')
