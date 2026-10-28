@@ -26566,7 +26566,7 @@ def _node_security_items(versions=None):
             'installed': f'Node.js {worst}', 'target': 'a Node.js with the security fix',
             'summary': f'Node.js inside {label} is out of date',
             'identity': 'node-' + '+'.join(ids),
-            'security': [f"Node.js inside {label} is out of date ({worst}). It fixes {reason}."],
+            'security': [f"{label} is running Node.js {worst}. Newer Node.js fixes {reason}."],
             'how': f'Open {label} in infra-TAK and press Update.'})
     return items
 

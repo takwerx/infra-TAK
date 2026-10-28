@@ -160,7 +160,7 @@ def test_old_node_makes_one_security_item_per_module():
     tp = items[2]
     assert tp['identity'] == 'node-CVE-2026-111497'
     assert tp['summary'] == 'Node.js inside TAK Portal is out of date'
-    assert 'v22.23.0' in tp['security'][0] and 'CVE-2026-111497' in tp['security'][0]
+    assert tp['security'][0].startswith('TAK Portal is running Node.js v22.23.0. Newer Node.js fixes CVE-2026-111497:')
     assert 'actively attacked' in tp['security'][0]
     assert tp['how'] == 'Open TAK Portal in infra-TAK and press Update.'
 
