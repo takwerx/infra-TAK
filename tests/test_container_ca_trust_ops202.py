@@ -277,7 +277,8 @@ def test_compose_merges_cloudtak_media(tmp_path):
 def test_every_mediamtx_pip_install_upgrades_certifi():
     # v10.3.0 W4.b moved the local installs into _mediamtx_editor_install_py_deps(); the remote
     # deploy keeps its shell string. Both paths must upgrade certifi, flag matching the install.
-    cmds = re.findall(r"f'(pip3 install \{_pkgs\}[^']*)'", APP)
+    # GH #330: the remote strings now open with `export PYTHONNOUSERSITE=1; ` (root's ~/.local).
+    cmds = re.findall(r"f'export PYTHONNOUSERSITE=1; (pip3 install \{_pkgs\}[^']*)'", APP)
     assert len(cmds) == 2        # remote deploy + its fallback
     for c in cmds:
         assert ' && pip3 install -U certifi' in c, c
