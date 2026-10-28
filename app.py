@@ -92467,6 +92467,39 @@ def _os_upgrade_routes_available():
     return os_type in (_OS_UPGRADE_FROM, _OS_UPGRADE_TO)
 
 
+def _ubuntu_pro_security_covered(raw=None):
+    """True only on positive evidence that Ubuntu Pro security updates (esm-infra) are
+    attached, enabled and not expired. The 24.04 card quiets down on this (GH #320).
+    Any doubt - no `pro` client, a command error, odd JSON, expired or missing expiry -
+    is False, so the full card shows exactly as it did before. `raw` is injectable for
+    tests; production asks `pro status`, which needs no privilege (read-only, cached)."""
+    try:
+        if raw is None:
+            pro = '/usr/bin/pro'
+            if not os.path.exists(pro):
+                return False
+            r = subprocess.run([pro, 'status', '--format', 'json'], capture_output=True,
+                               text=True, timeout=15)
+            if r.returncode != 0:
+                return False
+            raw = r.stdout
+        d = json.loads(raw)
+        if not isinstance(d, dict) or d.get('attached') is not True:
+            return False
+        svc = [x for x in (d.get('services') or []) if isinstance(x, dict) and x.get('name') == 'esm-infra']
+        if len(svc) != 1 or svc[0].get('status') != 'enabled':
+            return False
+        exp = d.get('expires')
+        if not isinstance(exp, str) or not exp:
+            return False
+        when = datetime.fromisoformat(exp.replace('Z', '+00:00'))
+        if when.tzinfo is None:
+            return False
+        return when > datetime.now(when.tzinfo)
+    except Exception:
+        return False
+
+
 def _startup_os_upgrade_verify():
     """Post-reboot half of step 8: the console that boots after the flip sees status
     `rebooting`, marks `verifying`, waits for the baseline containers/services to come
@@ -92701,6 +92734,9 @@ def console_os_upgrade_status_api():
         st.update({'ok': True, 'os_type': os_type, 'os_name': os_name,
                    'from': _OS_UPGRADE_FROM, 'to': _OS_UPGRADE_TO,
                    'can_start': os_type == _OS_UPGRADE_FROM and st['state'] not in ('running', 'rebooting', 'verifying')})
+        # GH #320: Pro-covered 22.04 boxes get the one-line card. Only asked when the idle
+        # card can show; a running/failed/done upgrade always renders in full.
+        st['pro_covered'] = bool(st['can_start'] and st['state'] == 'idle' and _ubuntu_pro_security_covered())
         return jsonify(st)
     except Exception as e:
         return jsonify({'ok': False, 'state': 'unknown', 'error': f'status error: {str(e)[:200]}'}), 500
