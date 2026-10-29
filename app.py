@@ -42021,7 +42021,11 @@ def mediamtx_recovery():
         # Check if web editor actually came up
         ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
         active = ok_check and (check_out or '').strip() == 'active'
-        if not active and not deps_ok:
+        if not deps_ok:
+            # GH #330: right after the restart the unit still reads 'active' for the second
+            # before the import fails, so a box with no Flask was told "running". Without its
+            # packages it cannot stay up: say that, whatever is-active said.
+            active = False
             msg = ("Patch applied, but the web editor's Python packages "
                    f"({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {deps_detail}")
         elif active:

@@ -272,6 +272,14 @@ def test_ensure_reports_pips_error_when_install_fails(monkeypatch):
 
 # --- wiring --------------------------------------------------------------------------------
 
+def test_patch_never_says_running_when_the_packages_are_missing():
+    """Box test (Azure, PyPI unreachable): is-active read 'active' a second after the restart,
+    before the import failed, and Patch said "restarted and is running"."""
+    body = _fn('mediamtx_recovery')
+    i = body.index('if not deps_ok:')
+    assert i < body.index('elif active:')
+    assert 'active = False' in body[i:body.index('elif active:')]
+
 def test_patch_web_editor_installs_packages_before_the_restart():
     body = _fn('mediamtx_recovery')
     i_deps = body.index('_mediamtx_editor_ensure_py_deps()')
