@@ -206,6 +206,29 @@ def test_h2_each_broken_thing_is_named(mutate, expect_failed):
     assert expect_failed in {n for n, c in checks.items() if not c['ok']}
 
 
+def test_an_explicit_client_check_skip_passes_but_is_named_as_skipped():
+    _, inp = done_input('h2-57-to-58-then-os', client_check={'skipped': True, 'reason': 'needs device'})
+    cell = hist.resolve(DATA, 'h2-57-to-58-then-os')
+    rep = hist.judge(cell, inp, 'end', DATA)
+    assert rep.passed
+    assert rep.as_dict('end')['skipped'] == ['client check passes']
+    line = hist.release_line([rep.as_dict('end')])
+    assert 'passed (client check skipped: needs device)' in line
+
+
+def test_a_skip_never_covers_a_missing_or_failed_client_check():
+    for cc in ({}, {'passed': False}, {'skipped': False}, {'skipped': 'yes'}):
+        _, inp = done_input('h2-57-to-58-then-os', client_check=cc)
+        assert 'client check passes' in failed_names('h2-57-to-58-then-os', inp)
+
+
+def test_a_skipped_client_check_does_not_hide_another_failure():
+    _, inp = done_input('h2-57-to-58-then-os', client_check={'skipped': True, 'reason': 'needs device'})
+    inp['boxes']['core']['after']['os_release'] = '22.04'
+    ok, _ = verdict('h2-57-to-58-then-os', inp)
+    assert not ok
+
+
 def test_candidate_sha_match_passes_even_when_abbreviated():
     _, inp = done_input('h2-57-to-58-then-os', candidate_sha='abcdef0')
     assert verdict('h2-57-to-58-then-os', inp)[0]

@@ -12,8 +12,9 @@
 # console password of the history boxes: it is the same on every box built by the replay, and it is
 # never printed), and CLIENT_CHECK_CMD: a command that gets the box IP as $1, exits 0 when the client
 # check passes and whose last output line ends in "anon=N (named=X ...)" like takdev-client-check.
-# With no CLIENT_CHECK_CMD the client check counts as NOT RUN, and the cell fails: a run that never
-# asked the clients is not a pass.
+# With no CLIENT_CHECK_CMD (a cloud box has no enrolled phone client) the client check is written as
+# SKIPPED, needs device: the cell can still pass, and the result and release line say it was skipped.
+# A CLIENT_CHECK_CMD that runs and fails is a failure.
 #
 # Runs in the foreground and finishes before it returns. The run box is deleted on exit (or kept
 # with --keep); if this script is killed, the box still stops itself at the auto-shutdown time and
@@ -114,7 +115,9 @@ for b in "${BOXES[@]}"; do
 done
 
 # 5. client check
-echo '{"passed": false, "reason": "CLIENT_CHECK_CMD not set: not run"}' > "$PREFIX-client.json"
+# No CLIENT_CHECK_CMD: a cloud box has no enrolled phone client, so say so plainly. The judge shows
+# the check as SKIPPED (needs device) in the result and the release line; it is not a silent pass.
+echo '{"skipped": true, "reason": "needs device (no client enrolled to a cloud box)"}' > "$PREFIX-client.json"
 if [ -n "${CLIENT_CHECK_CMD:-}" ]; then
   if out="$($CLIENT_CHECK_CMD "$IP" 2>&1)"; then ok=true; else ok=false; fi
   anon="$(sed -n 's/.*anon=[0-9]* (named=\([0-9]*\).*/\1/p' <<<"$out" | tail -1)"

@@ -41,10 +41,10 @@ Everything lives in resource group `rg-tak-hist` of the lane's Azure subscriptio
 - `az login`, and `HIST_AZURE_SUBSCRIPTION` set to the lane subscription id; an SSH key at `~/.ssh/id_ed25519_infratak` (or `HIST_SSH_KEY`).
 - The TAK Server 5.7 and 5.8 packages from tak.gov (uploaded through the console, as customers do). They are not in this repo.
 - `INFRATAK_CONSOLE_PASSWORD_FILE`: a mode-600 file with the console password of the history boxes. Never put it on a command line or in a report.
-- `CLIENT_CHECK_CMD`: command that takes the box IP and runs the client check (see `run-scenario.sh`). Without it the client check counts as **not run** and the cell fails.
+- `CLIENT_CHECK_CMD`: command that takes the box IP and runs the client check (see `run-scenario.sh`). Without it the client check is reported as **skipped: needs device** (a cloud box has no enrolled phone client): the cell can pass, and the result and the release line say the client check was skipped. A command that runs and fails still fails the cell.
 
 ## Not automated yet (be honest in reports)
 
 - Step 1 (replaying the released path through the console) is done by hand following `plan`; only the proof (`note-step`) and the checks are scripted.
-- The client check against a *cloud* box needs the tak-dev emulator enrolled to that box's name; the existing `takdev-client-check` knows only the fleet boxes.
+- The client check against a *cloud* box needs a client enrolled to that box (the tak-dev emulator); no such tool exists yet, so cloud cells report it as skipped, needs device. Set `CLIENT_CHECK_CMD` once there is one.
 - The two-server database box's own `status` file is read from the same path as the core's; confirm on the first real h5 run.

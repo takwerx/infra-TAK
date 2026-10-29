@@ -20,7 +20,7 @@ CELL is a scenario id, or 'scenario-id:variant' for the h1 variants. Exit status
 
 Pass rule (ops #285): per scenario the upgrade status is `done`, the log has no `failed`, the box
 is Ubuntu 24.04, the expected PostgreSQL clusters are on the expected ports, TAK Server + console
-(+ Authentik where the history has it) are up, and the client check passes. An unsafe scenario
+(+ Authentik where the history has it) are up, and the client check passes (or says plainly it was skipped, needs device). An unsafe scenario
 passes only if the console REFUSED before any change: preflight red, a next step named, and the
 box exactly as it was.
 """
@@ -137,8 +137,8 @@ class Report:
         self.cell = cell
         self.checks = []
 
-    def add(self, name, ok, detail=''):
-        self.checks.append({'name': name, 'ok': bool(ok), 'detail': detail})
+    def add(self, name, ok, detail='', skipped=False):
+        self.checks.append({'name': name, 'ok': bool(ok), 'detail': detail, 'skipped': bool(skipped)})
         return bool(ok)
 
     @property
@@ -146,7 +146,8 @@ class Report:
         return bool(self.checks) and all(c['ok'] for c in self.checks)
 
     def as_dict(self, stage):
-        return {'cell': self.cell, 'stage': stage, 'passed': self.passed, 'checks': self.checks}
+        return {'cell': self.cell, 'stage': stage, 'passed': self.passed, 'checks': self.checks,
+                'skipped': [c['name'] for c in self.checks if c.get('skipped')]}
 
 
 def _clusters(rows):
@@ -258,10 +259,21 @@ def judge_done(cell, inp, data):
         rep.add('%s: PostgreSQL clusters as expected' % db_name, _clusters(db.get('clusters')) == _clusters(ex.get('clusters_db')),
                 'have %s, want %s' % (_fmt_clusters(db.get('clusters')), _fmt_clusters(ex.get('clusters_db'))))
     _candidate_check(rep, inp, after)
+    _client_check(rep, inp)
+    return rep
+
+
+def _client_check(rep, inp):
+    """The phone-client check. A cloud box has no enrolled client, so run-scenario.sh can say
+    {"skipped": true, "reason": "needs device"}: the cell then reports the check as SKIPPED, not
+    failed, and the result and the release line carry that. No file at all, or a check that ran
+    and failed, is still a failure: only an explicit skip is let through."""
     cc = inp.get('client_check') or {}
+    if cc.get('skipped') is True:
+        rep.add('client check passes', True, 'skipped: %s' % (cc.get('reason') or 'needs device'), skipped=True)
+        return
     rep.add('client check passes', cc.get('passed') is True and cc.get('anon_named', 0) == 0,
             'passed' if cc.get('passed') is True else 'not passed or not run')
-    return rep
 
 
 def _candidate_check(rep, inp, after):
@@ -303,9 +315,7 @@ def judge_refused(cell, inp):
             'package list hash %s -> %s' % (before.get('pkg_hash') or '?', after.get('pkg_hash') or '?'))
     _service_checks(rep, core_name, after, ex, check_baseline=False)
     _candidate_check(rep, inp, after)
-    cc = inp.get('client_check') or {}
-    rep.add('client check passes', cc.get('passed') is True and cc.get('anon_named', 0) == 0,
-            'passed' if cc.get('passed') is True else 'not passed or not run')
+    _client_check(rep, inp)
     return rep
 
 
@@ -341,6 +351,14 @@ def assemble(prefix, boxes, final='', candidate=''):
 
 # ---- release notes --------------------------------------------------------------------------
 
+def _verdict(r):
+    """'passed', 'FAILED', or 'passed (client check skipped: needs device)': a skip is never hidden."""
+    if not r.get('passed'):
+        return 'FAILED'
+    skipped = [c for c in r.get('checks') or [] if c.get('skipped')]
+    return 'passed (%s)' % '; '.join('client check skipped: ' + c['detail'].replace('skipped: ', '') for c in skipped) if skipped else 'passed'
+
+
 def release_line(results):
     """One line for a release note that adds an in-place upgrade: which histories it was tested
     on and what each said. A failed or missing cell is listed as such, never dropped."""
@@ -348,7 +366,7 @@ def release_line(results):
         raise Bad('give at least one RESULT.json')
     parts = []
     for r in results:
-        parts.append('%s %s' % (r['cell'], 'passed' if r.get('passed') else 'FAILED'))
+        parts.append('%s %s' % (r['cell'], _verdict(r)))
     return 'Tested on box histories: ' + '; '.join(parts) + '.'
 
 
@@ -360,7 +378,7 @@ def release_line_all(results, data=None):
     parts = []
     for c in cells(data):
         r = by.get(c)
-        parts.append('%s %s' % (c, 'NOT RUN' if r is None else ('passed' if r.get('passed') else 'FAILED')))
+        parts.append('%s %s' % (c, 'NOT RUN' if r is None else _verdict(r)))
     return 'Tested on box histories: ' + '; '.join(parts) + '.'
 
 
