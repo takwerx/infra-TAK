@@ -955,7 +955,7 @@ class EditorBox:
             'threading': types.SimpleNamespace(Thread=_T),
             '_sudo_wrap': lambda c: c,
             '_mediamtx_editor_python_ok': lambda: self.ok_seq.pop(0) if self.ok_seq else True,
-            '_mediamtx_editor_install_py_deps': lambda: (self.installs.append(1) or (install_ok, 'ok' if install_ok else 'E: no network')),
+            '_mediamtx_editor_ensure_py_deps': lambda: (self.installs.append(1) or (install_ok, 'packages reinstalled' if install_ok else 'E: no network')),
             'print': lambda *a, **k: self.logs.append(' '.join(map(str, a))),
             '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
             '_MEDIAMTX_EDITOR_UNIT': '/etc/systemd/system/mediamtx-webeditor.service',
@@ -989,7 +989,7 @@ def test_one_package_list_everywhere():
     """deploy, Patch and the remote deploy all install the same list through the constant."""
     assert "pip3 install Flask" not in APP
     assert APP.count('_mediamtx_editor_install_py_deps()') >= 3        # deploy, patch, heal
-    assert "f'pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1'" in APP  # remote deploy
+    assert "_pi {_pkgs} && _pi -U certifi" in APP and "_pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)" in APP  # remote deploy + Patch
     assert '_startup_heal_mediamtx_editor_python()' in _fn('_startup_migrations')
 
 

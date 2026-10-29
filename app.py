@@ -14258,7 +14258,21 @@ def mediamtx_page():
     if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
         mediamtx_deploy_status.update({'complete': False, 'error': False})
     mtx_vinfo = _get_mediamtx_version_info() if mtx.get('installed') else {}
+    # GH #330: an editor crash-looping on `No module named 'flask'` only showed up as a 502.
+    # Say it on the page. Local editor only, and the import check only runs when it is down.
+    editor_missing_deps = False
+    if (mtx.get('installed') and mediamtx_deploy_cfg.get('target_mode') != 'remote'
+            and not mediamtx_deploy_status.get('running', False)
+            and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        try:
+            _ed = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                                 capture_output=True, text=True, timeout=10)
+            if (_ed.stdout or '').strip() != 'active':
+                editor_missing_deps = not _mediamtx_editor_python_ok()
+        except Exception:
+            pass
     return render_template('mediamtx.html',
+        editor_missing_deps=editor_missing_deps,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
         mediamtx_deploy_cfg=mediamtx_deploy_cfg,
@@ -41984,6 +41998,15 @@ def mediamtx_recovery():
                     _write_priv(_tp_unit, _ut_new)
             except Exception:
                 pass
+        # GH #330: an editor dying on `No module named 'flask'` was restarted into the same
+        # crash. Get its packages importable (as the editor runs) before the restart.
+        try:
+            if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+                deps_ok, deps_detail = _mediamtx_editor_remote_py_deps(deploy_cfg)
+            else:
+                deps_ok, deps_detail = _mediamtx_editor_ensure_py_deps()
+        except Exception as _de:
+            deps_ok, deps_detail = False, str(_de)[:200]
         cmd = (
             'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
@@ -41998,10 +42021,18 @@ def mediamtx_recovery():
         # Check if web editor actually came up
         ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
         active = ok_check and (check_out or '').strip() == 'active'
-        msg = 'Web editor patched; mediamtx-webeditor restarted and is running.' if active else (
-            'Patch applied and service restarted, but mediamtx-webeditor may still be down. '
-            'Click **Web editor logs** on this page to see why.'
-        )
+        if not deps_ok:
+            # GH #330: right after the restart the unit still reads 'active' for the second
+            # before the import fails, so a box with no Flask was told "running". Without its
+            # packages it cannot stay up: say that, whatever is-active said.
+            active = False
+            msg = ("Patch applied, but the web editor's Python packages "
+                   f"({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {deps_detail}")
+        elif active:
+            msg = 'Web editor patched; mediamtx-webeditor restarted and is running.'
+        else:
+            msg = ('Patch applied and service restarted, but mediamtx-webeditor may still be down. '
+                   'Click **Web editor logs** on this page to see why.')
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -42242,11 +42273,6 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
-    _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
-    ok, _ = _module_run(deploy_cfg, f'pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1', timeout=120)
-    if not ok:
-        _module_run(deploy_cfg, f'pip3 install {_pkgs} 2>&1 && pip3 install -U certifi 2>&1', timeout=120)
-    plog("✓ Python packages installed")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
     # any chown / unit install happens. See `_ensure_takwerx_system_user`
@@ -42255,6 +42281,11 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     created = _ensure_takwerx_system_user_remote(deploy_cfg, plog=plog)
     if not created:
         plog("  ✓ takwerx system user already present on remote host")
+
+    # After the user exists: the install is checked by importing as takwerx (GH #330).
+    _deps_ok, _deps_out = _mediamtx_editor_remote_py_deps(deploy_cfg)
+    plog("✓ Python packages installed" if _deps_ok else
+         f"  ⚠ web editor Python packages not importable as takwerx: {_deps_out}")
 
     # Step 2: Version + arch on remote
     plog("")
@@ -42839,8 +42870,13 @@ def run_mediamtx_deploy():
         # ops #202: certifi -U on every deploy — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
         plog("  Installing Python packages...")
-        _mediamtx_editor_install_py_deps()
-        plog("✓ Python packages installed")
+        # GH #330: this said ✓ whatever pip did. Step 5 retries and checks the import as the editor.
+        _s1_ok, _s1_out = _mediamtx_editor_install_py_deps()
+        if _s1_ok:
+            plog("✓ Python packages installed")
+        else:
+            _s1_tail = ((_s1_out or '').strip().splitlines()[-1:] or ['no output'])[0][:200]
+            plog(f"  ⚠ Python packages not installed yet ({_s1_tail}); retrying when the web editor is installed")
 
         # v0.9.31: ensure `takwerx` system user exists before any chown / unit
         # install happens. mediamtx.service + mediamtx-webeditor.service both
@@ -43362,10 +43398,15 @@ WantedBy=multi-user.target
             plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
 
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
+        # GH #330: checked as the editor runs (takwerx, its HOME), not as the console.
+        _editor_deps_err = None
         if os.path.exists(editor_file):
-            _ok_deps, _ = _mediamtx_editor_install_py_deps()
+            _mediamtx_editor_install_py_deps()
+            _ok_deps, _deps_detail = _mediamtx_editor_ensure_py_deps()
             if not _ok_deps:
-                plog("  ⚠ pip install for web editor deps had issues (check logs); trying to start anyway")
+                _editor_deps_err = _deps_detail
+                plog(f"  ✗ Web editor Python packages ({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {_deps_detail}")
+                plog("    The web editor will not start until they are. Click Patch web editor to retry.")
             else:
                 plog("  ✓ Web editor Python deps installed")
 
@@ -43616,7 +43657,12 @@ WantedBy=multi-user.target
 
             plog("")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            plog(f"🎉 MediaMTX v{version} deployed successfully!")
+            if _editor_deps_err:
+                # GH #330: the editor crash-loops without Flask; don't call that a success.
+                plog(f"⚠ MediaMTX v{version} deployed, but the web editor cannot start: its Python packages could not be installed ({_editor_deps_err}).")
+                plog("   Click Patch web editor on this page to retry.")
+            else:
+                plog(f"🎉 MediaMTX v{version} deployed successfully!")
             if domain:
                 mtx_display_domain = f"stream.{domain}"
                 plog(f"   Web Console: https://{_pub_hostport(mtx_display_domain)}")
@@ -100924,38 +100970,167 @@ _MEDIAMTX_EDITOR_PY_PKGS = ('Flask', 'ruamel.yaml', 'requests', 'psutil')
 _MEDIAMTX_EDITOR_PY_IMPORTS = 'import flask, ruamel.yaml, requests, psutil'
 _MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
 _MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+_MEDIAMTX_EDITOR_USER = 'takwerx'
+_MEDIAMTX_EDITOR_HOME_DROPIN = '/etc/systemd/system/mediamtx-webeditor.service.d/20-infratak-home.conf'
+# pip's refusal to replace an apt-installed package (no RECORD file), pip 23.x and 24.x wording.
+_MEDIAMTX_PIP_DISTRO_OWNED = 'Cannot uninstall'
 
 
 def _mediamtx_editor_install_py_deps(timeout=120):
     """(ok, output) — `pip3 install … --break-system-packages` (PEP 668 on 24.04 / Debian 12),
     retried without the flag on an older pip that does not know it. Runs as the console
-    process, exactly as the deploy always has, so the packages land where the editor's
-    interpreter looks for them."""
+    process, exactly as the deploy always has: as root that is the system site, as the
+    non-root console it is takwerx's `pip --user` site under the console's HOME.
+
+    GH #330: PYTHONNOUSERSITE=1 as root — a Flask in /root/.local satisfies pip ("already
+    satisfied") and passes root's own import check, but the editor runs as takwerx and
+    cannot see it, so nothing was ever installed where the editor looks.
+
+    GH #330 (fresh deploy): as root on Ubuntu 24.04, Flask 3.1 needs blinker >= 1.9 and the
+    distro's python3-blinker 1.7 (pulled in by software-properties-common via oauthlib) has
+    no RECORD file, so pip stops with "Cannot uninstall blinker … installed by debian" and
+    installs NOTHING. Retry with --ignore-installed: pip writes its copy to /usr/local, which
+    shadows /usr/lib/python3/dist-packages, and leaves the apt one alone."""
+    env = dict(os.environ)
+    if os.geteuid() == 0:
+        env['PYTHONNOUSERSITE'] = '1'
+
+    def _pip(args):
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout, env=env)
+        if r.returncode != 0 and _MEDIAMTX_PIP_DISTRO_OWNED in (r.stdout or ''):
+            r = subprocess.run(args + ['--ignore-installed'], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
+        return r
+
     base = ['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)
     _flag = ['--break-system-packages']
-    r = subprocess.run(base + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    r = _pip(base + _flag)
     if r.returncode != 0 and 'no such option' in (r.stdout or ''):
         _flag = []
-        r = subprocess.run(base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, timeout=timeout)
+        r = _pip(base)
     if r.returncode == 0:
         # ops #202: certifi -U every time — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
-        subprocess.run(['pip3', 'install', '-U', 'certifi'] + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        _pip(['pip3', 'install', '-U', 'certifi'] + _flag)
     return r.returncode == 0, (r.stdout or '')
 
 
-def _mediamtx_editor_python_ok():
-    """True when the editor's interpreter can import its packages in the console's own
-    context (the one deploy installed them in). Unknown -> True: never "heal" on a guess."""
+def _mediamtx_editor_home():
+    """The HOME systemd gives the editor: our drop-in's when present, else takwerx's passwd
+    entry. None when takwerx does not exist."""
     try:
-        r = subprocess.run(['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
-                           capture_output=True, text=True, timeout=30)
+        if os.path.exists(_MEDIAMTX_EDITOR_HOME_DROPIN):
+            m = re.search(r'^Environment=HOME=(\S+)', _read_priv(_MEDIAMTX_EDITOR_HOME_DROPIN) or '', re.M)
+            if m:
+                return m.group(1)
+        import pwd
+        return pwd.getpwnam(_MEDIAMTX_EDITOR_USER).pw_dir
+    except Exception:
+        return None
+
+
+def _mediamtx_editor_python_ok():
+    """True when the editor can import its packages the way it actually runs: as takwerx,
+    with the HOME systemd gives it, and nothing from the console's environment.
+
+    GH #330: this used to ask in the console's own context. On a box where that differs
+    from the editor's (packages only in /root/.local; or a non-root console with
+    HOME=/home/takwerx while takwerx's passwd home is still /nonexistent) the check passed,
+    the heal never ran, and the editor crash-looped on `No module named 'flask'`.
+    Unknown -> True: never "heal" on a guess."""
+    try:
+        home = _mediamtx_editor_home()
+        if not home:
+            return True
+        argv = ['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS]
+        # sbin too: runuser lives in /usr/sbin, and subprocess looks argv[0] up in THIS PATH.
+        # Without it the root check raised FileNotFoundError -> "unknown" -> True, every time.
+        env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': home}
+        if os.geteuid() == 0:
+            argv = ['runuser', '-u', _MEDIAMTX_EDITOR_USER, '--', 'env', f'HOME={home}'] + argv
+        else:
+            import pwd
+            if pwd.getpwuid(os.geteuid()).pw_name != _MEDIAMTX_EDITOR_USER:
+                env['HOME'] = os.environ.get('HOME') or home   # cannot be takwerx: console's view
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
         return r.returncode == 0
     except Exception:
         return True
+
+
+def _mediamtx_editor_pin_home():
+    """GH #330, non-root console only: point the editor's HOME at the console's, where
+    `pip --user` puts the editor's packages. Returns True when it wrote the drop-in.
+
+    start.sh's root -> non-root flip runs `usermod -d /home/takwerx … || true`, and usermod
+    refuses (exit 8, "user takwerx is currently used by process") while mediamtx and the
+    editor are running as takwerx. So on a migrated box takwerx's passwd home stays
+    /nonexistent: the console (HOME=/home/takwerx from its unit) installs Flask there, the
+    editor (HOME=/nonexistent from systemd) never sees it. A drop-in, like the journal one,
+    because the deploy rewrites the unit itself."""
+    if os.geteuid() == 0:
+        return False
+    try:
+        import pwd
+        if pwd.getpwuid(os.geteuid()).pw_name != _MEDIAMTX_EDITOR_USER:
+            return False
+        home = os.environ.get('HOME') or ''
+        # It goes into a unit file: a plain absolute path only, nothing that could add a line.
+        if (not re.fullmatch(r'/[A-Za-z0-9._/-]+', home) or not os.path.isdir(home)
+                or home == _mediamtx_editor_home()):
+            return False
+        subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.dirname(_MEDIAMTX_EDITOR_HOME_DROPIN)]),
+                       capture_output=True, timeout=20)
+        _write_priv(_MEDIAMTX_EDITOR_HOME_DROPIN,
+                    "# infra-TAK GH #330: the editor imports Flask from the console's pip --user site.\n"
+                    f"[Service]\nEnvironment=HOME={home}\n")
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        return True
+    except Exception as e:
+        print(f'MediaMTX web editor: HOME drop-in error (non-fatal): {e}', flush=True)
+        return False
+
+
+def _mediamtx_editor_ensure_py_deps():
+    """(ok, detail) — leave the editor able to import its packages as it runs. Shared by the
+    deploy, Patch web editor and the startup heal. Does not restart the editor."""
+    if _mediamtx_editor_python_ok():
+        return True, 'already importable'
+    if _mediamtx_editor_pin_home() and _mediamtx_editor_python_ok():
+        return True, "editor now uses the console's HOME, where its packages are"
+    ok, out = _mediamtx_editor_install_py_deps()
+    if _mediamtx_editor_python_ok():
+        return True, 'packages reinstalled'
+    tail = (out or '').strip().splitlines()[-1:] or ['no output']
+    return False, (tail[0][:200] if not ok else 'installed, but the editor still cannot import them')
+
+
+# Remote MediaMTX: the SSH user is root, so the same /root/.local trap applies.
+_MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK = (f'runuser -u {_MEDIAMTX_EDITOR_USER} -- /usr/bin/python3 -c '
+                                        + shlex.quote(_MEDIAMTX_EDITOR_PY_IMPORTS) + ' 2>&1')
+
+
+def _mediamtx_editor_remote_py_deps(deploy_cfg):
+    """(ok, output) — remote twin of _mediamtx_editor_ensure_py_deps: install system-wide as
+    root, then check the import as takwerx (what the editor runs as)."""
+    _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
+
+    def _pip(flag):
+        # Same apt-owned-blinker retry as the local install (GH #330).
+        return (f'export PYTHONNOUSERSITE=1; _pi() {{ o=$(pip3 install "$@" {flag} 2>&1); rc=$?; '
+                f'echo "$o"; if [ $rc -ne 0 ] && echo "$o" | grep -q {shlex.quote(_MEDIAMTX_PIP_DISTRO_OWNED)}; '
+                f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
+                f'_pi {_pkgs} && _pi -U certifi')
+
+    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    if not ok and 'no such option' in (out or ''):
+        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
+    chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
+    if chk:
+        return True, out
+    tail = ((chk_out or '') if ok else (out or '')).strip().splitlines()[-1:] or ['no output']
+    return False, tail[0][:200]
 
 
 def _startup_heal_mediamtx_editor_python():
@@ -100975,18 +101150,18 @@ def _startup_heal_mediamtx_editor_python():
         except Exception:
             pyver = '?'
         print(f"Startup migration: MediaMTX web editor cannot import its packages on Python {pyver} "
-              f"(an OS upgrade moves Python) — reinstalling {', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}", flush=True)
+              f"(an OS upgrade, or a HOME the editor does not share) — fixing "
+              f"{', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}", flush=True)
         try:
-            ok, out = _mediamtx_editor_install_py_deps()
+            ok, detail = _mediamtx_editor_ensure_py_deps()
         except Exception as e:
-            ok, out = False, str(e)
-        if ok and _mediamtx_editor_python_ok():
+            ok, detail = False, str(e)[:200]
+        if ok:
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                            capture_output=True, timeout=60)
-            print("Startup migration: ✓ MediaMTX web editor packages reinstalled and editor restarted", flush=True)
+            print(f"Startup migration: ✓ MediaMTX web editor fixed ({detail}) and restarted", flush=True)
         else:
-            tail = (out or '').strip().splitlines()[-1:] or ['no output']
-            print(f"Startup migration: ✗ MediaMTX web editor packages could not be reinstalled: {tail[0][:200]}", flush=True)
+            print(f"Startup migration: ✗ MediaMTX web editor packages could not be reinstalled: {detail}", flush=True)
 
     threading.Thread(target=_heal, daemon=True, name='mediamtx-editor-python-heal').start()
     return True

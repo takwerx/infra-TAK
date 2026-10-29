@@ -277,13 +277,15 @@ def test_compose_merges_cloudtak_media(tmp_path):
 def test_every_mediamtx_pip_install_upgrades_certifi():
     # v10.3.0 W4.b moved the local installs into _mediamtx_editor_install_py_deps(); the remote
     # deploy keeps its shell string. Both paths must upgrade certifi, flag matching the install.
-    cmds = re.findall(r"f'(pip3 install \{_pkgs\}[^']*)'", APP)
-    assert len(cmds) == 2        # remote deploy + its fallback
-    for c in cmds:
-        assert ' && pip3 install -U certifi' in c, c
-        assert c.endswith('--break-system-packages 2>&1') == ('--break-system-packages' in c.split('&&')[0])
+    # GH #330: the remote command is built by _pip(flag) (root's ~/.local off, apt-owned blinker
+    # retried with --ignore-installed); certifi goes through the same helper with the same flag.
+    r = APP.index('def _mediamtx_editor_remote_py_deps(')
+    remote = APP[r:APP.index('\ndef ', r + 1)]
+    assert "f'_pi {_pkgs} && _pi -U certifi')" in remote
+    assert 'pip3 install "$@" {flag} 2>&1' in remote
+    assert "_pip('--break-system-packages')" in remote and "_pip('')" in remote   # + old-pip fallback
     i = APP.index('def _mediamtx_editor_install_py_deps(')
     body = APP[i:APP.index('\ndef ', i + 1)]
-    assert "['pip3', 'install', '-U', 'certifi'] + _flag" in body
+    assert "_pip(['pip3', 'install', '-U', 'certifi'] + _flag)" in body
     assert "_flag = []" in body                 # old pip: certifi without the flag too
     assert "if 'pip3 install Flask" not in APP
