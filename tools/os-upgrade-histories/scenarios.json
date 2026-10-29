@@ -16,9 +16,10 @@
     },
     "log_fail_pattern": "(?i)\\bfail(ed|ure)?\\b",
     "log_allow": [
-      "snapd\\.failure\\.service is a disabled or a static unit not running"
+      "snapd\\.failure\\.service is a disabled or a static unit not running",
+      "Failed to stop chrony-wait\\.service: Unit chrony-wait\\.service not loaded"
     ],
-    "log_allow_why": "snapd.failure.service: the Ubuntu 24.04 package scripts print this when they skip a unit that is not enabled; seen on a clean h2 upgrade, nothing failed (ops #285)",
+    "log_allow_why": "snapd.failure.service: the Ubuntu 24.04 package scripts print this when they skip a unit that is not enabled; seen on a clean h2 upgrade, nothing failed. chrony-wait.service: the same scripts try to stop a unit this image never loaded; seen on the two-server upgrade, which finished done on both servers (ops #285)",
     "os_from": "22.04",
     "os_to": "24.04"
   },
