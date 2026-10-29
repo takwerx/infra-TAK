@@ -83543,6 +83543,27 @@ def _tak_target_version_gate(*filenames):
     return None
 
 
+def _tak_already_on_58():
+    """True when this box already runs TAK Server 5.8+ on PostgreSQL 18.
+
+    Such a box has nothing left to migrate: the 5.8 migration would stop TAK, "install"
+    the same major, find no PostgreSQL 15 for upgrade-db.sh and exit 1, and the console
+    then reports a healthy server as "MID-UPGRADE" (field: ops #309). A 5.8.x update for
+    it is the ordinary package upgrade. Both facts must be positive - the installed
+    version AND the database actually answering as 18 (a managed database is asked, not
+    the local cluster) - so a PG-15 box, or one whose database cannot be read, still
+    takes the guarded migration or the gate. Two-server boxes are left to their own
+    migration, which already skips Server One when it is on 18.
+    """
+    try:
+        ver = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
+        if not ver or ver < TAK_GATE_BLOCK_FROM:
+            return False
+        return bool(((_tak_58_preflight() or {}).get('facts') or {}).get('already_migrated'))
+    except Exception:
+        return False
+
+
 @app.route('/api/takserver/update', methods=['POST'])
 @login_required
 def takserver_update():
@@ -83579,6 +83600,13 @@ def takserver_update():
         pass
     _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM
                 for f in (_pending_zips if _tak_is_container() else _pending))
+    # ops #309: a box already on 5.8 + PostgreSQL 18 has no migration to run, and the gate
+    # exists only to keep the PG-15 wedge away from the plain path. Take the ordinary
+    # upgrade below for it.
+    _gate = _tak_target_version_gate
+    if _is58 and _tak_already_on_58():
+        _is58 = False
+        _gate = lambda *_a: None
     if _is58 and _tak_is_container():
         # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
         # existing data-preserving container upgrade cannot be used - it deliberately
@@ -83671,7 +83699,7 @@ def takserver_update():
         if not _zips:
             return jsonify({'error': 'Container upgrade: upload the new takserver-docker-*.zip bundle (not a .deb).'}), 400
         _zip = os.path.join(UPLOAD_DIR, sorted(_zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
-        _g = _tak_target_version_gate(_zip)
+        _g = _gate(_zip)
         if _g:
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
@@ -83694,7 +83722,7 @@ def takserver_update():
             _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
             if not _core_rpm or not _db_rpm:
                 return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
-            _g = _tak_target_version_gate(_core_rpm, _db_rpm)
+            _g = _gate(_core_rpm, _db_rpm)
             if _g:
                 return jsonify({'error': _g}), 400
             _s1 = _tak_cfg.get('server_one', {})
@@ -83712,7 +83740,7 @@ def takserver_update():
                        key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
         if not _rpms:
             return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
-        _g = _tak_target_version_gate(_rpms[0])
+        _g = _gate(_rpms[0])
         if _g:
             return jsonify({'error': _g}), 400
         # external_db: pass the RDS block so the upgrade runs SchemaManager against the managed DB.
@@ -83736,7 +83764,7 @@ def takserver_update():
         db_pkg = next((f for f in pkg_files if 'database' in f.lower()), '')
         if not core_pkg or not db_pkg:
             return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .deb packages. Upload both.'}), 400
-        _g = _tak_target_version_gate(core_pkg, db_pkg)
+        _g = _gate(core_pkg, db_pkg)
         if _g:
             return jsonify({'error': _g}), 400
         s1 = tak_cfg.get('server_one', {})
@@ -83754,7 +83782,7 @@ def takserver_update():
         single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
         if not single_pkgs:
             return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
-        _g = _tak_target_version_gate(single_pkgs[0])
+        _g = _gate(single_pkgs[0])
         if _g:
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
