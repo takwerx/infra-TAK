@@ -67214,7 +67214,14 @@ _TAK_API_CHECK_RETRY_MAX_S = 60
 # logins), yet the device's own logins still got through now and then (17 searches in 7 min),
 # so "TAK is asking for the user" kept the full 5 min. A working TAK sends one search per
 # login, so the user only counts as looked up when its searches reach half the check's logins.
-_TAK_API_CHECK_STUCK_S = 30
+# ops #316, test6 2026-10-29: a busy TAK (CloudTAK, Node-RED and the emulator all on its API)
+# also looks "stuck" like that for a while after the outpost restarts, then recovers by
+# itself. Probed with a fresh login every 10 s: no groups for 75 s, 150 s and (twice) longer,
+# with no search for the user until the moment it came back. At 30 s this shortcut restarted
+# TAK on 3 of 5 updates, a restart the API did not need. So it only believes "stuck" once TAK
+# has looked other users up for this long, which clears those windows and still leaves the
+# rest of the 5 min wait for the test8 case above (never recovers).
+_TAK_API_CHECK_STUCK_S = 180
 
 
 def _ldap_outpost_tak_searches(since):
