@@ -2172,6 +2172,52 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     return changed
 
 
+def rotate_proxy_auth_secret(ctx, secret, plog=None):
+    """Hand every built deployment the console's new proxy-auth secret.
+
+    Returns `(touched, errors)`: how many deployments were switched and one
+    message per deployment that could not be.
+
+    ⚠️ **ATLAS keeps its own copy** (`TAKMDM_PROXY_AUTH_SECRET` in its `.env`,
+    written once by `_arm_admin_gates`). When the console rotates the secret and
+    Caddy starts sending the new one, an ATLAS still holding the old one refuses
+    every admin request. So the console calls this as part of the same rotation,
+    and calls it again with the OLD secret to put things back if anything fails.
+
+    ⚠️ **Only a deployment that already has the line is touched.** No line
+    means the header check was never armed there, and arming it is
+    `_arm_admin_gates`' call (it verifies the vhost injects first), not a
+    rotation's.
+
+    ⚠️ `up -d api`, not `restart`: a restart reuses the container and its old
+    environment (see the note at the first `up -d` in `_run_deploy`).
+    """
+    touched, errors = 0, []
+    for inst in load_instances(ctx):
+        label = (inst or {}).get('name') or (inst or {}).get('slug') or 'ATLAS'
+        try:
+            if not instance_is_built(ctx, inst):
+                continue
+            env_path = os.path.join(instance_paths(ctx, inst)['dir'], '.env')
+            _repair_env_ownership(env_path, ctx, plog)
+            with open(env_path, 'r', encoding='utf-8') as handle:
+                has_line = any(l.startswith('TAKMDM_PROXY_AUTH_SECRET=')
+                               for l in handle.read().splitlines())
+            if not has_line:
+                continue
+            changed = write_env_value(env_path, 'TAKMDM_PROXY_AUTH_SECRET', secret)
+            if changed:
+                r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
+                if r.returncode != 0:
+                    raise RuntimeError(compose_error(r, 'docker compose up'))
+            touched += 1
+            if plog:
+                plog('  \u2713 ' + label + ' switched to the new proxy-auth secret')
+        except Exception as exc:
+            errors.append('%s: %s' % (label, str(exc)[:200]))
+    return touched, errors
+
+
 def _proxy_auth_secret_path(ctx=None):
     """Where the console keeps the shared secret.
 

@@ -3836,8 +3836,15 @@ def _apply_authentik_session():
         _pa_secret = (pa.get('secret') or '').strip()
         # An empty secret must never authenticate — compare_digest('','') is True,
         # which would silently degrade back to header-only trust. Fail closed.
-        if not _pa_secret or not hmac.compare_digest(
-                request.headers.get('X-Infratak-Proxy-Auth') or '', _pa_secret):
+        _pa_sent = request.headers.get('X-Infratak-Proxy-Auth') or ''
+        # ops #330: while a rotation is in flight Caddy is still sending the old
+        # value until its reload lands, so the old one is accepted until the
+        # rotation finishes (it is dropped from the file then). Same empty-string
+        # rule applies.
+        _pa_prev = (pa.get('previous') or '').strip()
+        if not _pa_secret or not (
+                hmac.compare_digest(_pa_sent, _pa_secret)
+                or (_pa_prev and hmac.compare_digest(_pa_sent, _pa_prev))):
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
@@ -31103,6 +31110,179 @@ def caddy_set_ports():
         threading.Thread(target=_sync_ak_after_ports, daemon=True).start()
     return jsonify({'success': True, 'changed': True, 'https_port': hp, 'http_port': cp,
                     'console_url': _pub_url(_console_public_host(settings), settings)})
+
+
+# ops #330 — rotate the X-Infratak-Proxy-Auth secret from the console.
+# Moving parts, in order: (1) back up the secret file and the Caddyfile (0600, in
+# .config), (2) mint a new secret and let the console accept old+new while Caddy
+# catches up, (3) regenerate the Caddyfile — generate_caddyfile() runs `caddy
+# validate` and puts the old file back on a genuine parse error — and check the new
+# secret is really in it, (4) reload Caddy WITHOUT the restart fallback (a refused
+# config must keep serving the old one; no --force, so WebSockets stay up), (5) check Caddy's running config has the
+# new secret, (6) hand ATLAS its copy. Any failure puts all of it back.
+_PROXY_AUTH_BACKUP_FILE = os.path.join(CONFIG_DIR, 'proxy_auth.pre-rotate.json')
+_PROXY_AUTH_CADDYFILE_BACKUP = os.path.join(CONFIG_DIR, 'Caddyfile.pre-rotate')
+_proxy_auth_rotate_lock = threading.Lock()
+
+
+def _caddy_running_config_has(needle):
+    """True/False when Caddy's admin API answers, None when it can't be asked."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen('http://127.0.0.1:2019/config/', timeout=10) as resp:
+            return needle in resp.read().decode('utf-8', 'replace')
+    except Exception:
+        return None
+
+
+def _write_private_file(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(content)
+
+
+def _proxy_auth_atlas_apply(secret, plog):
+    """Give ATLAS (if installed) `secret`. Returns a list of error strings."""
+    try:
+        if not load_settings().get('atlas_enabled'):
+            return []
+        _touched, errs = mod_registry.atlas.rotate_proxy_auth_secret(
+            mod_registry.get_ctx(), secret, plog)
+        return errs
+    except Exception as e:
+        return ['ATLAS: %s' % str(e)[:200]]
+
+
+def _rotate_proxy_auth_secret(plog=None):
+    """Rotate the proxy-auth secret. Returns {'success', 'error', 'steps', 'rolled_back'}.
+    Never raises. Safe to call only on a box whose Caddy fronts the console."""
+    steps = []
+
+    def say(msg):
+        steps.append(msg)
+        print('[proxy-auth] ' + msg, flush=True)
+        if plog:
+            try:
+                plog(msg)
+            except Exception:
+                pass
+
+    if not _proxy_auth_rotate_lock.acquire(blocking=False):
+        return {'success': False, 'error': 'A rotation is already running.', 'steps': steps}
+    try:
+        settings = load_settings()
+        if not (settings.get('fqdn') or '').strip():
+            return {'success': False, 'steps': steps,
+                    'error': 'Caddy is not set up with a domain on this server, so there is no proxy auth value to rotate.'}
+        old_state = _proxy_auth_state(create=True)
+        old_secret = (old_state.get('secret') or '').strip()
+        try:
+            prev_caddyfile = _read_priv(CADDYFILE_PATH)
+        except Exception as e:
+            prev_caddyfile = None
+            say('Could not read the current Caddyfile: %s' % str(e)[:120])
+        if not prev_caddyfile or not old_secret or old_secret not in prev_caddyfile:
+            return {'success': False, 'steps': steps,
+                    'error': 'Caddy is not sending a proxy auth value right now (no Authentik sign-in in front of the console, or the Caddyfile is out of date), so nothing was changed. Press Reload on this page and try again.'}
+        try:
+            _write_private_file(_PROXY_AUTH_BACKUP_FILE, json.dumps(old_state))
+            _write_private_file(_PROXY_AUTH_CADDYFILE_BACKUP, prev_caddyfile)
+        except Exception as e:
+            return {'success': False, 'steps': steps,
+                    'error': 'Could not write the backup, so nothing was changed: %s' % str(e)[:160]}
+        say('Backed up the current value and Caddyfile')
+
+        new_secret = secrets.token_hex(32)
+        new_state = dict(old_state)
+        new_state['secret'] = new_secret
+        new_state['previous'] = old_secret
+        new_state['rotated_at'] = int(time.time())
+        new_state.setdefault('enforce', False)
+        atlas_switched = [False]
+
+        def rollback(reason):
+            say('Failed: %s. Putting the old value back.' % reason)
+            problems = []
+            try:
+                _save_proxy_auth_state(old_state)
+            except Exception as e:
+                problems.append('restoring the secret file failed: %s' % str(e)[:120])
+            try:
+                _write_priv(CADDYFILE_PATH, prev_caddyfile)
+                ok, detail = _caddy_reload_if_changed(restart_on_error=False)
+                if not ok:
+                    problems.append('Caddy did not reload the old config: %s' % detail)
+            except Exception as e:
+                problems.append('restoring the Caddyfile failed: %s' % str(e)[:120])
+            if atlas_switched[0]:
+                errs = _proxy_auth_atlas_apply(old_secret, plog)
+                problems.extend(errs)
+            if problems:
+                say('Rollback problems: ' + '; '.join(problems))
+            else:
+                say('Rolled back. Nothing changed.')
+            audit('proxy-auth:rotate-failed', reason[:300], force=True)
+            return {'success': False, 'rolled_back': not problems, 'steps': steps,
+                    'error': reason + ('' if not problems else
+                                       ' Rollback was incomplete: ' + '; '.join(problems))}
+
+        try:
+            _save_proxy_auth_state(new_state)
+        except Exception as e:
+            return rollback('could not save the new value: %s' % str(e)[:120])
+        say('New value saved; the console accepts old and new while Caddy switches')
+
+        try:
+            generate_caddyfile(settings)
+            written = _read_priv(CADDYFILE_PATH) or ''
+        except Exception as e:
+            return rollback('could not write the Caddyfile: %s' % str(e)[:160])
+        if new_secret not in written or old_secret in written:
+            return rollback('Caddy rejected the new Caddyfile (' +
+                            (_caddy_last_validate_error.get('err') or 'it did not contain the new value')[:200] + ')')
+        say('Caddyfile rewritten and checked with caddy validate')
+
+        ok, detail = _caddy_reload_if_changed(restart_on_error=False)
+        if not ok:
+            return rollback('Caddy did not reload (%s)' % (detail or 'unknown'))
+        if _caddy_running_config_has(new_secret) is False:
+            return rollback('Caddy reloaded but is not running the new value')
+        say('Caddy reloaded with the new value')
+
+        errs = _proxy_auth_atlas_apply(new_secret, plog)
+        atlas_switched[0] = True
+        if errs:
+            return rollback('ATLAS did not take the new value (%s)' % '; '.join(errs))
+
+        final_state = dict(new_state)
+        final_state.pop('previous', None)
+        try:
+            _save_proxy_auth_state(final_state)
+        except Exception as e:
+            say('Warning: could not drop the old value from the secret file: %s' % str(e)[:120])
+        audit('proxy-auth:rotated', 'X-Infratak-Proxy-Auth secret rotated', force=True)
+        say('Done. The old value no longer works.')
+        return {'success': True, 'steps': steps}
+    finally:
+        _proxy_auth_rotate_lock.release()
+
+
+@app.route('/api/caddy/proxy-auth', methods=['GET'])
+@login_required
+def caddy_proxy_auth_status():
+    """Whether the proxy auth gate is armed and when it was last rotated. Never the value."""
+    st = _proxy_auth_state()
+    return jsonify({'success': True, 'armed': bool(st.get('enforce')),
+                    'has_secret': bool((st.get('secret') or '').strip()),
+                    'rotated_at': st.get('rotated_at')})
+
+
+@app.route('/api/caddy/proxy-auth/rotate', methods=['POST'])
+@login_required
+def caddy_proxy_auth_rotate():
+    res = _rotate_proxy_auth_secret()
+    return jsonify(res), (200 if res.get('success') else 500)
 
 
 @app.route('/api/caddy/caddyfile')

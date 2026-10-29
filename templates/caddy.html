@@ -129,6 +129,19 @@
 </div>
 </div>
 </details>
+<details id="caddy-proxy-auth-section" style="margin-bottom:24px">
+<summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--text-secondary);padding:12px 0;user-select:none">Proxy auth value <span id="proxy-auth-summary" style="font-size:11px;color:var(--text-dim);font-weight:400"></span></summary>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-top:8px">
+<div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:14px">Caddy adds a secret header, <span style="font-family:'JetBrains Mono',monospace">X-Infratak-Proxy-Auth</span>, after a user signs in through Authentik. The console only trusts the sign-in headers when that secret comes with them. Rotate it if you think it leaked, or on your own schedule. The new value is never shown. It goes straight into the Caddyfile and the console.</div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<button onclick="rotateProxyAuth()" id="rotate-proxy-auth-btn" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Rotate now</button>
+</div>
+<div id="rotate-proxy-auth-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:10px;white-space:pre-wrap"></div>
+<div style="margin-top:12px;padding:12px 16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.6">
+Rotating backs up the current value and Caddyfile, writes the new Caddyfile, checks it, and reloads Caddy. ATLAS is updated too if it is installed. If anything fails, the old value is put back and you are told why. Signed-in users stay signed in. WebSocket streams are not dropped.
+</div>
+</div>
+</details>
 <div class="section-title">SSL Certificate</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 {% set _sslmode = settings.get('ssl_mode','') %}
@@ -742,8 +755,31 @@ async function saveCaddyPorts(hp,cp){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.style.opacity='1'}
 }
 function resetCaddyPorts(){saveCaddyPorts('443','80')}
+// ops #330 — rotate the proxy auth value (never displayed).
+async function loadProxyAuth(){
+    var el=document.getElementById('proxy-auth-summary');if(!el)return;
+    try{var d=await (await fetch('/api/caddy/proxy-auth')).json();
+        if(!d.success)return;
+        var t=d.rotated_at?('last rotated '+new Date(d.rotated_at*1000).toLocaleString()):'never rotated';
+        el.textContent='— '+(d.armed?'on':'not armed yet')+' · '+t;
+    }catch(e){}
+}
+async function rotateProxyAuth(){
+    var btn=document.getElementById('rotate-proxy-auth-btn'),status=document.getElementById('rotate-proxy-auth-status');
+    if(!confirm('Rotate the proxy auth value?\n\nCaddy reloads with a new secret. People who are signed in stay signed in. If anything fails, the old value is put back.'))return;
+    btn.disabled=true;btn.style.opacity='0.7';status.style.color='var(--text-dim)';status.textContent='Rotating…';
+    try{
+        var r=await fetch('/api/caddy/proxy-auth/rotate',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        var steps=(d.steps||[]).join('\n');
+        if(!d.success){status.style.color='var(--red)';status.textContent='Not rotated: '+(d.error||'unknown')+(steps?'\n\n'+steps:'');btn.disabled=false;btn.style.opacity='1';return}
+        status.style.color='var(--green)';status.textContent='Rotated.\n\n'+steps;
+        loadProxyAuth();
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message}
+    btn.disabled=false;btn.style.opacity='1';
+}
 window.CONSOLE_PORT={{ (settings.console_port or 5001)|tojson }};
-loadServiceDomains();
+loadServiceDomains();loadProxyAuth();
 {% if deploying %}pollCaddyLog();{% endif %}
 </script>
 {% endblock %}
