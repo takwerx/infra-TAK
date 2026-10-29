@@ -114,6 +114,8 @@ def test_deploy_and_update_both_use_it():
     text = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     raises = re.findall(r"raise RuntimeError\([^)]*compose up[^)]*\)", text)
 
-    assert len(raises) == 2, raises
+    # Deploy, update, and the proxy-auth rotation (ops #330) each raise it; the
+    # rotation is covered here too so its failure reads the same as the others.
+    assert len(raises) == 3, raises
     for call in raises:
         assert 'compose_error' in call, call
