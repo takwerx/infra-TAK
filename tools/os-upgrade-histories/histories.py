@@ -359,7 +359,7 @@ def _verdict(r):
     if not r.get('passed'):
         return 'FAILED'
     skipped = [c for c in r.get('checks') or [] if c.get('skipped')]
-    return 'passed (%s)' % '; '.join('client check skipped: ' + c['detail'].replace('skipped: ', '') for c in skipped) if skipped else 'passed'
+    return 'passed (%s)' % '; '.join('client check skipped: ' + c['detail'].replace('skipped: ', '').split(' (')[0] for c in skipped) if skipped else 'passed'
 
 
 def release_line(results):
