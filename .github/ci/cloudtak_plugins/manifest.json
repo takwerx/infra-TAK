@@ -8,21 +8,21 @@
       "plugin_subpath": "plugin",
       "server_subpath": "server",
       "install_dir": "tak-dispatcher",
-      "in_catalog": true
+      "in_catalog": false
     },
     {
       "key": "ping",
       "name": "Cell Ping / RTT",
       "repo": "https://github.com/clptak/cloudtak-plugin-cellphone",
       "install_dir": "ping",
-      "in_catalog": true
+      "in_catalog": false
     },
     {
       "key": "search-containment",
       "name": "Search Containment",
       "repo": "https://github.com/clptak/cloudtak-plugin-search-containment",
       "install_dir": "search-containment",
-      "in_catalog": true
+      "in_catalog": false
     },
     {
       "key": "taksim",

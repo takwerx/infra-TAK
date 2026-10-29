@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.2-alpha)**
+**Current release: [v10.3.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.3-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,28 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.3-alpha — 2026-10-29 — Fail2ban bans again on Ubuntu 24.04; MediaMTX web editor and no-Caddy fixes; LDAP logins on custom-cert boxes
+
+**Headline: on Ubuntu 24.04 four Fail2ban jails (TAK Server, TAK Portal, Authentik, repeat offenders) were reading no logs and never banned anyone; they work again after a console update. MediaMTX starts on boxes without Caddy and its web editor comes back after an update, on root and non-root consoles. Boxes with their own certificate (Cloudflare Origin or a private CA) can log in to TAK Server again.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.3-alpha))
+
+**Fail2ban (GH #338).**
+- Ubuntu 24.04's fail2ban defaults every jail to the systemd journal, so jails that watch a log file were watching nothing. infra-TAK's jails now say to read their file, and existing boxes are repaired when the console starts.
+- The Fail2ban page now shows a jail as dead when it is loaded but watches no file.
+
+**MediaMTX (GH #330).**
+- The web editor's own Update no longer leaves `stream.<domain>` on a 502; a box already showing the 502 heals after a console update.
+- On a root console, Flask now installs next to Ubuntu's own packages. If the editor still can't start, the deploy says so and the MediaMTX page shows a red banner; **Patch web editor** fixes it.
+- MediaMTX no longer crash-loops (`216/GROUP`) on a box without Caddy.
+
+**TAK Server and LDAP.**
+- On a box with a custom certificate, the LDAP outpost can now move to the public hostname, which fixes TAK logins failing with `exceeded stage recursion depth`.
+- Update TAK Server on a box already on 5.8 and PostgreSQL 18 runs the normal update instead of the 5.8 migration, which used to stop with a false "mid-upgrade" message.
+
+**Smaller fixes.**
+- ATLAS deployment rows wrap on phones, so Rename, Update and the other buttons stay reachable (GH #336).
+- On Ubuntu 22.04 boxes covered by Ubuntu Pro, the 24.04 upgrade card is one line (GH #320).
+- Cell Ping, Search Containment and CloudTAK Dispatcher now come from the TAK Portal marketplace instead of infra-TAK's plugin list. Boxes that already have them keep them.
 
 ### v10.3.2-alpha — 2026-10-28 — Security: old Node.js in TAK Portal, CloudTAK, Node-RED or Remote Assist is flagged and emailed; CloudTAK plugins survive rebuilds
 
