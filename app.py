@@ -42169,6 +42169,8 @@ def _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file):
         subprocess.run(_sudo_wrap(['chmod', 'g+rx', _d]), capture_output=True, timeout=15)
     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]),
                    capture_output=True, timeout=15)
+    # A MediaMTX unit written before Caddy existed has no group line (ops #313).
+    _mediamtx_unit_ensure_caddy_group()
 
 
 _MEDIAMTX_CONF_DIR = '/usr/local/etc'
@@ -43062,11 +43064,14 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
-SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
 """
+        # The group line is only valid once Caddy has created the group; a unit that
+        # names a missing group dies with 216/GROUP (ops #313). Caddy installed later
+        # gets the line from _mediamtx_unit_ensure_caddy_group() when the cert is wired.
+        mediamtx_svc = _mediamtx_unit_with_caddy_group(mediamtx_svc) if _caddy_group_exists() else mediamtx_svc
         _write_priv('/etc/systemd/system/mediamtx.service', mediamtx_svc)
         plog("✓ mediamtx.service created")
 
@@ -43531,6 +43536,8 @@ WantedBy=multi-user.target
                               f'{cert_base}/{mtx_domain}'):
                         subprocess.run(_sudo_wrap(['chmod', 'g+rx', d]), capture_output=True)
                     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True)
+                    # Step 5 only writes the group line when the caddy group existed then (ops #313).
+                    _mediamtx_unit_ensure_caddy_group()
                     # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
                     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
                     # v10.1.33: message corrected — the group comes from the unit's
@@ -43569,9 +43576,14 @@ WantedBy=multi-user.target
         for _i in range(15):
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
             if r.stdout.strip() == 'active':
-                mtx_active = True
-                plog("✓ MediaMTX is active")
-                break
+                # A crash-looping unit (Restart=always) can read "active" for an instant
+                # between restarts; make sure it is still up a few seconds later (ops #313).
+                time.sleep(4)
+                r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
+                if r.stdout.strip() == 'active':
+                    mtx_active = True
+                    plog("✓ MediaMTX is active")
+                    break
             time.sleep(2)
         if not mtx_active:
             plog("⚠ MediaMTX did not become active within 30s — check: systemctl status mediamtx")
@@ -63216,6 +63228,9 @@ def _reassert_mediamtx_cert_grant(plog=None):
         # Grant is intact only if cert+key are group-readable AND every dir up the Caddy chain
         # is group-readable+traversable (rx). Any missing bit → re-apply.
         need = (_grp(cert_mode) & 4) == 0 or (bool(key_mode) and (_grp(key_mode) & 4) == 0)
+        # A unit written before Caddy existed has no group line; add it and bounce below.
+        if _mediamtx_unit_ensure_caddy_group():
+            need = True
         if not need:
             for d in (cert_base, cert_dir):
                 dmode = _pmode(d)
@@ -97796,11 +97811,57 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
-SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def _caddy_group_exists():
+    """True when the `caddy` group is on this box (Caddy's package creates it)."""
+    try:
+        return subprocess.run(['getent', 'group', 'caddy'], capture_output=True,
+                              timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _mediamtx_unit_with_caddy_group(txt):
+    """Return `txt` with `SupplementaryGroups=caddy` right after `User=takwerx`.
+
+    Idempotent. systemd refuses to start a unit whose SupplementaryGroups= names a group
+    that does not exist (status=216/GROUP), and the `caddy` group only exists once Caddy
+    is installed, so the line may only be written when the group is there (ops #313)."""
+    if re.search(r'(?m)^SupplementaryGroups=.*\bcaddy\b', txt):
+        return txt
+    return re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
+
+
+def _mediamtx_unit_text():
+    """The mediamtx.service text for THIS box: group `caddy` only if it exists."""
+    if _caddy_group_exists():
+        return _mediamtx_unit_with_caddy_group(_MEDIAMTX_UNIT_TEXT)
+    return _MEDIAMTX_UNIT_TEXT
+
+
+def _mediamtx_unit_ensure_caddy_group(unit_path='/etc/systemd/system/mediamtx.service'):
+    """Add `SupplementaryGroups=caddy` to an installed unit that lacks it, once Caddy exists.
+
+    MediaMTX deployed before Caddy has no group line (see _mediamtx_unit_text); when Caddy
+    comes later and the stream cert is wired, the service needs the group to read it.
+    Returns True when the unit was changed; the CALLER does daemon-reload + restart.
+    Never raises."""
+    try:
+        if not _caddy_group_exists():
+            return False
+        cur = _read_priv(unit_path)
+        new = _mediamtx_unit_with_caddy_group(cur)
+        if new == cur:
+            return False
+        _write_priv(unit_path, new)
+        return True
+    except Exception:
+        return False
 
 
 _MEDIAMTX_TRUSTED_PROXIES_KEY = 'INFRATAK_TRUSTED_PROXIES'
@@ -98027,7 +98088,7 @@ def _startup_converge_mediamtx_unit_nonroot():
                 _grant_caddy_cert_read(cb, cd, cf, kf)
         subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
 
-        _write_priv(unit_path, _MEDIAMTX_UNIT_TEXT)
+        _write_priv(unit_path, _mediamtx_unit_text())
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
         ok = False
