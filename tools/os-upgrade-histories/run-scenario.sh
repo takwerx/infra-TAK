@@ -64,6 +64,10 @@ IP="$("${B[@]}" ip "$(name_of "${BOXES[0]}")")"
 "${B[@]}" open-ports "$(name_of "${BOXES[0]}")" "5001,443,8089,8443,8446"
 URL="https://$IP:5001"
 
+# 1b. the snapshots hold released history (v10.2.x, before the OS upgrade existed): put the candidate on the box the way
+# a customer does, Update Now, on CANDIDATE_CHANNEL (main = the latest release, dev = the integration branch)
+[ "$RUNKIND" = os-upgrade ] && "${D[@]}" "$URL" update-now --channel "${CANDIDATE_CHANNEL:-main}" --wait > "$PREFIX-update.json"
+
 collect() { "${B[@]}" facts "$(name_of "$1")"; }
 # 2. facts before
 for b in "${BOXES[@]}"; do collect "$b" > "$PREFIX-$b-before.json"; done
@@ -72,6 +76,8 @@ for b in "${BOXES[@]}"; do collect "$b" > "$PREFIX-$b-before.json"; done
 echo '{}' > "$PREFIX-preflight.json"; echo '{}' > "$PREFIX-start.json"; FINAL=''
 case "$RUNKIND" in
   os-upgrade)
+    # a snapshot gets older every day: do what the operator does first, Install updates and Reboot, until only a real refusal is left
+    "${D[@]}" "$URL" prepare > /dev/null
     "${D[@]}" "$URL" preflight > "$PREFIX-preflight.json"
     "${D[@]}" "$URL" start > "$PREFIX-start.json"
     if [ "$RESULT" = refused ]; then
@@ -86,7 +92,7 @@ case "$RUNKIND" in
       fi
     fi ;;
   update-now-then-wait)
-    "${D[@]}" "$URL" update-now --channel dev > "$PREFIX-update.json" || true
+    "${D[@]}" "$URL" update-now --channel "${CANDIDATE_CHANNEL:-main}" > "$PREFIX-update.json" || true
     # the console restarts onto the candidate and the heal finishes the upgrade by itself; no reboot is asked of the operator
     "${D[@]}" "$URL" wait-status --timeout 1800 --ignore-failed-for 120 > "$PREFIX-status.json" || true
     FINAL="$(J raw < "$PREFIX-status.json" 2>/dev/null || true)" ;;

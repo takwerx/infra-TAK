@@ -1,6 +1,6 @@
 # Box-history matrix for one-way, in-place upgrades (ops #285)
 
-**Why.** The Ubuntu 22.04 → 24.04 upgrade in v10.3.0 was only ever tested on boxes that had one PostgreSQL cluster. Real boxes that took the TAK 5.7 → 5.8 update keep PostgreSQL 15 stopped on 5434 next to PostgreSQL 18 on 5432. The upgrade stopped those boxes halfway (infra-TAK #316, #318). A test that builds the *end state by hand* cannot find that; a box that lived the *real history* can.
+**Why.** The Ubuntu 22.04 → 24.04 upgrade in v10.3.0 was only ever tested on boxes that had one PostgreSQL cluster. Real boxes that took the TAK 5.7 → 5.8 update keep PostgreSQL 15 stopped on 5433 next to PostgreSQL 18 on 5432. The upgrade stopped those boxes halfway (infra-TAK #316, #318). A test that builds the *end state by hand* cannot find that; a box that lived the *real history* can.
 
 **The rule.** Any release test for the OS upgrade (or another one-way, in-place upgrade: database server, remote hosts, a future Rocky 9 → 10) runs this matrix against the candidate. `tools/pick-tests.py` lists it as **Tier 6** whenever a change touches that code.
 
@@ -12,7 +12,7 @@
 | `h1-fresh-single:b-authentik` | same + Authentik | `done`, Authentik container back |
 | `h1-fresh-single:c-docker-tak` | same, Docker (hardened) TAK Server | `done`, `takserver` container back |
 | `h1-fresh-single:d-full` | same + Authentik + broker + Docker modules | `done`, all back |
-| `h2-57-to-58-then-os` | infra-TAK v10.1.85, TAK **5.7** / PG 15, console Update Now to v10.2.30, the console's **5.8 update** (PG 15 stopped on 5434 + PG 18 on 5432), Authentik + broker + Docker modules | `done`, **both** clusters as they were, log says the stopped 15 was kept |
+| `h2-57-to-58-then-os` | infra-TAK v10.1.85, TAK **5.7** / PG 15, console Update Now to v10.2.30, the console's **5.8 update** (PG 15 stopped on 5433 + PG 18 on 5432), Authentik + broker + Docker modules | `done`, **both** clusters as they were, log says the stopped 15 was kept |
 | `h3-old-pg-left-online` | h2, then PG 15 started again | **refused before any change**, names `pg_ctlcluster 15 main stop` |
 | `h4-stuck-reassert` | h2, then the *released v10.3.0* OS upgrade, which stops at `failed:reassert` | Update Now to the candidate finishes it by itself: `done`, no reboot asked |
 | `h5-two-server` | core + database server (test8 style), TAK 5.8 | core `done`, then the database server `done` from the core console |

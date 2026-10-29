@@ -29,9 +29,12 @@ INSTALL_DIR="$(systemctl show -p WorkingDirectory --value takwerx-console 2>/dev
 export INFRATAK_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null)"
 export INFRATAK_SHA="$(git -c safe.directory='*' -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null)"
 export BASELINE_JSON="$(cat "$STATE/baseline.json" 2>/dev/null)"
-export LOG_TEXT="$(tail -c 400000 "$LOG" 2>/dev/null)"
+# The log goes through a file, not the environment: one environment string over 128 KB makes exec fail
+# with "Argument list too long" (the first real 24.04 box, ops #285).
+export LOG_COPY="$(mktemp)"; trap 'rm -f "$LOG_COPY"' EXIT
+tail -c 400000 "$LOG" > "$LOG_COPY" 2>/dev/null
 
-exec python3 -I - <<'PY'
+python3 -I - <<'PY'
 import json, os
 
 e = os.environ
@@ -62,7 +65,7 @@ facts = {
     'provenance': [l for l in e.get('PROVENANCE', '').splitlines() if l.strip()],
     'infratak_version': e.get('INFRATAK_VERSION', '').strip(),
     'infratak_sha': e.get('INFRATAK_SHA', '').strip(),
-    'log': e.get('LOG_TEXT', ''),
+    'log': open(e['LOG_COPY'], encoding='utf-8', errors='replace').read(),
 }
 print(json.dumps(facts))
 PY

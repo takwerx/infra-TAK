@@ -69,7 +69,7 @@ def test_h2_is_the_real_released_path_not_a_hand_built_end_state():
     assert labels.index('takserver-deploy:5.7') < labels.index('takserver-58-migrate:5.8')
     assert any(l.startswith('infratak-install:v10.1.') for l in labels)
     assert hist.resolve(DATA, 'h2-57-to-58-then-os')['start']['clusters'] == [
-        ['15', 'main', '5434', 'down'], ['18', 'main', '5432', 'online']]
+        ['15', 'main', '5433', 'down'], ['18', 'main', '5432', 'online']]
 
 
 def test_h3_and_h4_are_built_on_h2_and_h3_is_the_unsafe_one():
@@ -127,7 +127,7 @@ def facts(cell, **kw):
          'containers': {'running': ['authentik-server-1'], 'unhealthy': []},
          'baseline_services': {'takwerx-console': 'active'}, 'baseline_containers': ['authentik-server-1'],
          'apt_conf_left': False, 'pkg_hash': 'p1',
-         'log': '[2026-10-27T10:00:00Z] reassert complete\n[x] kept as it is: stopped PostgreSQL 15/main on 5434 (the copy)\n',
+         'log': '[2026-10-27T10:00:00Z] reassert complete\n[x] kept as it is: stopped PostgreSQL 15/main on 5433 (the copy)\n',
          'infratak_sha': 'abcdef0123456789'}
     f.update(kw)
     return f
@@ -171,13 +171,13 @@ def test_h2_fails_when_the_stopped_pg15_was_lost():
 
 def test_h2_fails_when_pg15_came_up_online():
     cell, inp = done_input('h2-57-to-58-then-os')
-    inp['boxes']['core']['after']['clusters'] = [['15', 'main', '5434', 'online'], ['18', 'main', '5432', 'online']]
+    inp['boxes']['core']['after']['clusters'] = [['15', 'main', '5433', 'online'], ['18', 'main', '5432', 'online']]
     assert 'PostgreSQL clusters as expected' in failed_names('h2-57-to-58-then-os', inp)
 
 
 def test_down_recovery_counts_as_down():
     cell, inp = done_input('h2-57-to-58-then-os')
-    inp['boxes']['core']['after']['clusters'] = [['15', 'main', '5434', 'down,recovery'], ['18', 'main', '5432', 'online']]
+    inp['boxes']['core']['after']['clusters'] = [['15', 'main', '5433', 'down,recovery'], ['18', 'main', '5432', 'online']]
     assert verdict('h2-57-to-58-then-os', inp)[0]
 
 
@@ -186,7 +186,7 @@ def test_down_recovery_counts_as_down():
     (lambda i: i['boxes']['core']['after'].update(os_release='22.04'), 'Ubuntu 24.04'),
     (lambda i: i['boxes']['core']['after'].update(log='ok\nFATAL: step reassert failed — x\n'), 'the log has no "failed"'),
     (lambda i: i['boxes']['core']['after'].update(log=''), 'the log is there'),
-    (lambda i: i['boxes']['core']['after'].update(log='all fine\n'), 'the log says: kept as it is: stopped PostgreSQL 15/main on 5434'),
+    (lambda i: i['boxes']['core']['after'].update(log='all fine\n'), 'the log says: kept as it is: stopped PostgreSQL 15/main on 5433'),
     (lambda i: i['boxes']['core']['after']['services'].update({'takwerx-console': 'inactive'}), 'core: console running'),
     (lambda i: i['boxes']['core']['after']['services'].update({'takserver': 'inactive'}), 'core: TAK Server running'),
     (lambda i: i['boxes']['core']['after']['containers'].update(running=['nodered']), 'core: a authentik container is running'),
@@ -243,7 +243,7 @@ def test_h1_bare_and_docker_variants_expect_their_own_shape():
 def test_h4_must_not_reboot_by_itself_and_must_say_reassert_complete():
     cell = hist.resolve(DATA, 'h4-stuck-reassert')
     before = facts(cell, status='failed:reassert', boot_id='boot-1')
-    after = facts(cell, boot_id='boot-1', log='finishing the OS upgrade that stopped at reassert\nreassert complete\nkept as it is: stopped PostgreSQL 15/main on 5434\n')
+    after = facts(cell, boot_id='boot-1', log='finishing the OS upgrade that stopped at reassert\nreassert complete\nkept as it is: stopped PostgreSQL 15/main on 5433\n')
     inp = done_input('h4-stuck-reassert', after=after, before=before)[1]
     assert verdict('h4-stuck-reassert', inp)[0]
     after['boot_id'] = 'boot-2'
@@ -264,13 +264,13 @@ def test_h5_needs_the_database_server_upgraded_too():
 # ---- judge: the unsafe cell ---------------------------------------------------------------------
 
 REFUSED_DETAIL = ("TAK Server 5.8; TAK Server's database must be the only running PostgreSQL cluster (18 on 5432); "
-                  "running: 15/main:5434 online, 18/main:5432 online — stop 15/main (sudo pg_ctlcluster 15 main stop, "
+                  "running: 15/main:5433 online, 18/main:5432 online — stop 15/main (sudo pg_ctlcluster 15 main stop, "
                   "and set /etc/postgresql/15/main/start.conf to manual)")
 
 
 def refused_input(**kw):
     cell = hist.resolve(DATA, 'h3-old-pg-left-online')
-    clusters = [['15', 'main', '5434', 'online'], ['18', 'main', '5432', 'online']]
+    clusters = [['15', 'main', '5433', 'online'], ['18', 'main', '5432', 'online']]
     before = facts(cell, os_release='22.04', status='', boot_id='boot-1', clusters=clusters, pkg_hash='p1', containers={'running': ['takserver', 'authentik-server-1'], 'unhealthy': []})
     after = copy.deepcopy(before)
     inp = {'boxes': {'core': {'before': before, 'after': after}},
@@ -671,11 +671,12 @@ def test_wait_status_rides_out_a_console_that_is_not_answering(monkeypatch):
         password = 'x'
 
         def login(self):
+            pass
+
+        def call(self, method, path, payload=None, timeout=60):
             calls['n'] += 1
             if calls['n'] < 3:
                 raise drive.DriveError('cannot reach')
-
-        def call(self, method, path, payload=None, timeout=60):
             return 200, {'raw': 'done'}
 
     monkeypatch.setattr(drive.time, 'sleep', lambda s: None)

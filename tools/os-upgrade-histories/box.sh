@@ -13,7 +13,8 @@
 #   box.sh snapshot NAME SNAPSHOT [--cell CELL]         stop, snapshot the OS disk (incremental), keep NAME stopped
 #   box.sh restore SNAPSHOT NAME [--role core|db]       new run box from the snapshot; the snapshot is untouched
 #   box.sh open-ports NAME PORT[,PORT...]               allow these ports from THIS Mac's address only
-#   box.sh ip NAME | ssh NAME CMD... | start NAME | stop NAME
+#   box.sh put NAME FILE...                             copy files to /tmp/h on the box
+#   box.sh ip NAME | ssh NAME CMD... (alias: exec) | start NAME | stop NAME
 #   box.sh delete NAME                                  VM + disk + NIC + IP + NSG
 #   box.sh sweep [--delete-expired]                     what is running / expired in the resource group
 #
@@ -139,6 +140,13 @@ cmd_open_ports() { guard_subscription; allow_ports "${1:?NAME}" "${2:?PORT[,PORT
 
 cmd_ip() { guard_subscription; vm_ip "${1:?NAME}"; }
 cmd_ssh() { local name="${1:?NAME}"; shift; guard_subscription; ssh "${ssh_opts[@]}" "$ADMIN_USER@$(vm_ip "$name")" "$@"; }
+# Copy local files to /tmp/h on the box (replay.sh reads its packages and the console password from there).
+cmd_put() {
+  local name="${1:?NAME}"; shift; [ $# -gt 0 ] || die "put NAME FILE..."; guard_subscription
+  local ip; ip="$(vm_ip "$name")"
+  ssh "${ssh_opts[@]}" "$ADMIN_USER@$ip" "mkdir -p /tmp/h"
+  scp "${ssh_opts[@]}" "$@" "$ADMIN_USER@$ip:/tmp/h/"
+}
 cmd_start() { guard_subscription; az_ vm start -g "$RG" -n "${1:?NAME}" -o none; wait_ssh "$(vm_ip "$1")"; }
 cmd_stop() { guard_subscription; az_ vm deallocate -g "$RG" -n "${1:?NAME}" -o none; }
 
@@ -234,6 +242,8 @@ case "$sub" in
   snapshot) cmd_snapshot "$@" ;;
   restore) cmd_restore "$@" ;;
   open-ports) cmd_open_ports "$@" ;;
+  put) cmd_put "$@" ;;
+  exec) cmd_ssh "$@" ;;
   ip) cmd_ip "$@" ;;
   ssh) cmd_ssh "$@" ;;
   start) cmd_start "$@" ;;

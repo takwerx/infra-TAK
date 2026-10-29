@@ -7,8 +7,8 @@
       "region": "westus2",
       "owner": "claude-lane",
       "image": "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
-      "size_core": "Standard_D4s_v4",
-      "size_db": "Standard_D2s_v4",
+      "size_core": "Standard_D4ds_v4",
+      "size_db": "Standard_D2ds_v4",
       "os_disk_gb": 128,
       "auto_shutdown_utc": "0600",
       "snapshot_expires_days": 45,
@@ -24,7 +24,7 @@
     "infratak-install": "install a RELEASED infra-TAK tag with start.sh, exactly as the README says (arg: ref)",
     "console-update": "console 'Update Now' to a RELEASED tag, the way a customer updates (arg: ref)",
     "takserver-deploy": "deploy TAK Server through the console from the tak.gov package (arg: version, 5.7 or 5.8)",
-    "takserver-58-migrate": "the console's guided TAK Server 5.8 update on a 5.7 box: PostgreSQL 15 -> 18, the old 15 kept stopped on 5434",
+    "takserver-58-migrate": "the console's guided TAK Server 5.8 update on a 5.7 box: PostgreSQL 15 -> 18, the old 15 kept stopped on 5433",
     "start-old-cluster": "start the stopped PostgreSQL 15 cluster again (pg_ctlcluster 15 main start), the way an operator might (arg: cluster)",
     "module-deploy": "deploy a module through the console (arg: module = authentik | broker | docker-modules | docker-tak)",
     "two-server-deploy": "console two-server install: core + database server on a second VM (arg: version)",
@@ -140,7 +140,7 @@
     {
       "id": "h2-57-to-58-then-os",
       "title": "Installed on TAK 5.7 / PostgreSQL 15, then the console's 5.8 update, then the OS upgrade",
-      "why": "The case we missed (ops #284): PostgreSQL 15 is kept stopped on 5434 next to PostgreSQL 18 on 5432.",
+      "why": "The case we missed (ops #284): PostgreSQL 15 is kept stopped on 5433 next to PostgreSQL 18 on 5432.",
       "boxes": [
         "core"
       ],
@@ -182,7 +182,7 @@
           [
             "15",
             "main",
-            "5434",
+            "5433",
             "down"
           ],
           [
@@ -201,7 +201,7 @@
           [
             "15",
             "main",
-            "5434",
+            "5433",
             "down"
           ],
           [
@@ -218,7 +218,7 @@
           "authentik"
         ],
         "log_must_match": [
-          "kept as it is: stopped PostgreSQL 15/main on 5434"
+          "kept as it is: stopped PostgreSQL 15/main on 5433"
         ]
       }
     },
@@ -241,7 +241,7 @@
           [
             "15",
             "main",
-            "5434",
+            "5433",
             "online"
           ],
           [
@@ -283,7 +283,7 @@
           [
             "15",
             "main",
-            "5434",
+            "5433",
             "down"
           ],
           [
@@ -303,7 +303,7 @@
           [
             "15",
             "main",
-            "5434",
+            "5433",
             "down"
           ],
           [
