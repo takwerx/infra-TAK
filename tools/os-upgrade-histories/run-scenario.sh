@@ -103,7 +103,7 @@ case "$RUNKIND" in
   update-now-then-wait)
     "${D[@]}" "$URL" update-now --channel "${CANDIDATE_CHANNEL:-main}" > "$PREFIX-update.json" || true
     # the console restarts onto the candidate and the heal finishes the upgrade by itself; no reboot is asked of the operator
-    "${D[@]}" "$URL" wait-status --timeout 1800 --ignore-failed-for 120 > "$PREFIX-status.json" || true
+    "${D[@]}" "$URL" wait-status --timeout 1800 --ignore-failed-for 1200 > "$PREFIX-status.json" || true
     FINAL="$(J raw < "$PREFIX-status.json" 2>/dev/null || true)" ;;
   *) echo "unknown run kind $RUNKIND" >&2; exit 2 ;;
 esac

@@ -31,6 +31,7 @@
     "start-old-cluster": "start the stopped PostgreSQL 15 cluster again (pg_ctlcluster 15 main start), the way an operator might (arg: cluster)",
     "module-deploy": "deploy a module through the console (arg: module = authentik | broker | docker-modules | docker-tak)",
     "two-server-deploy": "console two-server install: core + database server on a second VM (arg: version)",
+    "takserver-update": "the console's plain TAK Server update on a box already on 5.8 / PostgreSQL 18: upload the newer package, press Update (arg: version, e.g. 5.8-RELEASE92)",
     "os-upgrade-released": "run the console's OS upgrade with a RELEASED tag's code, and expect it to stop (args: ref, expect_status)"
   },
   "scenarios": [
@@ -326,7 +327,72 @@
         "log_must_match": [
           "reassert complete"
         ],
+        "log_allow": [
+          "FATAL: step reassert failed — expected exactly one PostgreSQL cluster",
+          "sort: write (failed|error)"
+        ],
+        "log_allow_why": "this box STARTS with the failed v10.3.0 attempt in its log; only that one line (and the sort noise it printed) is allowed, and 'reassert complete' must come after it",
         "no_automatic_reboot": true
+      }
+    },
+    {
+      "id": "h6-58-r92-then-os",
+      "title": "Installed on 5.7, the console's 5.8 update (RELEASE84), then the TAK Server update to 5.8 RELEASE92, then the OS upgrade",
+      "why": "The headline test for the current TAK Server release: RELEASE92 on a box that lived the real 5.7 to 5.8 history, through the 24.04 upgrade (AJ, Wed Oct 28, 2026).",
+      "boxes": [
+        "core"
+      ],
+      "derive_from": "h2-57-to-58-then-os",
+      "history": [
+        {
+          "step": "takserver-update",
+          "version": "5.8-RELEASE92"
+        }
+      ],
+      "start": {
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5433",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "status": ""
+      },
+      "run": "os-upgrade",
+      "expect": {
+        "result": "done",
+        "clusters": [
+          [
+            "15",
+            "main",
+            "5433",
+            "down"
+          ],
+          [
+            "18",
+            "main",
+            "5432",
+            "online"
+          ]
+        ],
+        "services_active": [
+          "takwerx-console"
+        ],
+        "containers_match": [
+          "authentik"
+        ],
+        "log_must_match": [
+          "kept as it is: stopped PostgreSQL 15/main on 5433"
+        ],
+        "tak_version": "5.8-RELEASE92"
       }
     },
     {

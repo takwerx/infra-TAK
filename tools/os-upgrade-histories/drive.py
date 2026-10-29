@@ -141,6 +141,7 @@ def wait_status(con, timeout, ignore_failed_for=0, target='core'):
     start = time.time()
     last = {}
     seen = ''
+    ran = False
     while time.time() - start < timeout:
         try:
             code, st = con.call('GET', PATHS[target]['status'], timeout=20)
@@ -155,7 +156,12 @@ def wait_status(con, timeout, ignore_failed_for=0, target='core'):
                     seen = label
                 if kind == 'done':
                     return True, last
-                if kind == 'failed' and time.time() - start >= ignore_failed_for:
+                if label.startswith('running'):
+                    ran = True
+                # a failed status counts at once when the job has run since we started watching (the finish
+                # itself failed); before that it is the old status, and the new console's finish starts a
+                # minute after the restart and waits for the post-update deploy
+                if kind == 'failed' and (ran or time.time() - start >= ignore_failed_for):
                     return False, last
         except DriveError as e:
             if seen != 'unreachable':

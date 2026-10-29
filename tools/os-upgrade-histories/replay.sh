@@ -12,6 +12,7 @@
 #   replay.sh os-upgrade-released REF         pinned console update, then START the OS upgrade (the caller waits from outside)
 #   replay.sh console-update REF              the git steps of 'Update Now', pinned to REF (see below)
 #   replay.sh takserver-58-migrate            upload the 5.8 package, the guided 5.8 update (PG 15 -> 18)
+#   replay.sh takserver-update VERSION        upload a newer package for a box already on 5.8, press Update (e.g. 5.8-RELEASE92)
 #   replay.sh start-old-cluster 15/main      pg_ctlcluster 15 main start (the way an operator might)
 #   replay.sh module-deploy MODULE            authentik | broker | docker-modules | docker-tak
 #
@@ -163,6 +164,20 @@ takserver-58-migrate)
     pg_lsclusters > "$OUT/clusters-after-58.txt" 2>&1
     note "takserver-58-migrate:5.8" ;;
 
+takserver-update)
+    VER="${2:?VERSION e.g. 5.8-RELEASE92}"
+    wait_console
+    step "upload the TAK Server $VER package"
+    upload "takserver_${VER}_all.deb"
+    step "TAK Server update (the console's Update button, newest upload)"
+    curlc -X POST "$API/api/takserver/update" > "$OUT/takserver-update-start.json"
+    grep -q '"success": *true' "$OUT/takserver-update-start.json" || fail "update refused: $(head -c 300 "$OUT/takserver-update-start.json")"
+    st=$(poll /api/takserver/update/log index "$OUT/takserver-update.log" 3600)
+    [ "$st" = complete ] || fail "TAK Server update ended: $st"
+    tak_answers || fail "TAK Server $VER never answered"
+    pg_lsclusters > "$OUT/clusters-after-update.txt" 2>&1
+    note "takserver-update:$VER" ;;
+
 start-old-cluster)
     C="${2:-15/main}"; CV="${C%%/*}"; CN="${C#*/}"; [ "$CN" != "$C" ] || CN=main
     step "start PostgreSQL $CV $CN again"
@@ -188,6 +203,6 @@ module-deploy)
     [ "$st" = complete ] || fail "$MOD deploy ended: $st"
     note "module-deploy:$MOD" ;;
 
-*) echo "usage: replay.sh image|infratak-install REF|console-update REF|takserver-deploy VER|takserver-58-migrate|start-old-cluster C|module-deploy MOD" >&2; exit 2 ;;
+*) echo "usage: replay.sh image|infratak-install REF|console-update REF|takserver-deploy VER|takserver-58-migrate|takserver-update VER|start-old-cluster C|module-deploy MOD" >&2; exit 2 ;;
 esac
 step "done: $*"

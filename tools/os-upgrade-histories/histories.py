@@ -43,6 +43,7 @@ STEP_ARG = {
     'module-deploy': 'module',
     'two-server-deploy': 'version',
     'os-upgrade-released': 'ref',
+    'takserver-update': 'version',
 }
 
 # Always-true services of a healthy box that the upgrade was run on.
@@ -189,6 +190,9 @@ def _service_checks(rep, tag, facts, expect, check_baseline=True):
     rep.add('%s: no unhealthy or restarting container' % tag, not bad, ', '.join(bad) if bad else '%d running' % len(running))
     lost = sorted(set(facts.get('baseline_containers') or []) - set(running)) if check_baseline else []
     rep.add('%s: every container from before the upgrade is back' % tag, not lost, ', '.join(lost) if lost else 'ok')
+    if expect.get('tak_version'):
+        have = facts.get('tak_version') or ''
+        rep.add('%s: TAK Server is %s' % (tag, expect['tak_version']), have == expect['tak_version'], 'package version is %r' % have)
     for sub in expect.get('containers_match') or []:
         rep.add('%s: a %s container is running' % (tag, sub), any(sub in c for c in running),
                 'found' if any(sub in c for c in running) else 'none of: ' + (', '.join(running) or 'no containers'))
@@ -234,7 +238,7 @@ def judge_done(cell, inp, data):
     log = after.get('log') or ''
     rep.add('the log is there', bool(log.strip()), '%d chars' % len(log))
     pat = re.compile(cfg['log_fail_pattern'])
-    allow = [re.compile(a) for a in cfg.get('log_allow') or []]
+    allow = [re.compile(a) for a in (cfg.get('log_allow') or []) + (ex.get('log_allow') or [])]
     bad = [l.strip()[:160] for l in log.splitlines() if pat.search(l) and not any(a.search(l) for a in allow)]
     rep.add('the log has no "failed"', not bad, '; '.join(bad[:3]) + (' (+%d more)' % (len(bad) - 3) if len(bad) > 3 else '') if bad else 'clean')
     for rx in ex.get('log_must_match') or []:

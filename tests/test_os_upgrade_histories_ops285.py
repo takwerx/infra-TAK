@@ -51,7 +51,7 @@ DATA = hist.load()
 def test_every_history_ops285_asked_for_is_a_cell():
     ids = {c.split(':')[0] for c in hist.cells(DATA)}
     assert ids == {'h1-fresh-single', 'h2-57-to-58-then-os', 'h3-old-pg-left-online',
-                   'h4-stuck-reassert', 'h5-two-server'}
+                   'h4-stuck-reassert', 'h5-two-server', 'h6-58-r92-then-os'}
 
 
 def test_every_cell_resolves_and_uses_known_steps():
@@ -332,7 +332,7 @@ def start_input(cell_id, **kw):
 
 
 @pytest.mark.parametrize('cell_id', ['h2-57-to-58-then-os', 'h3-old-pg-left-online', 'h4-stuck-reassert', 'h5-two-server',
-                                     'h1-fresh-single:b-authentik'])
+                                     'h6-58-r92-then-os', 'h1-fresh-single:b-authentik'])
 def test_a_snapshot_with_the_recorded_history_is_accepted(cell_id):
     assert verdict(cell_id, start_input(cell_id), 'start')[0]
 
@@ -710,6 +710,17 @@ def test_wait_status_ignores_a_starting_failed_state_only_for_the_grace_period(m
     ok, last = drive.wait_status(Stuck(), 3600, ignore_failed_for=60)
     assert not ok and last['raw'] == 'failed:reassert' and clock['t'] >= 60
 
+    # the finish ran and failed again: that ends the wait at once, however long the grace period is
+    answers3 = iter(['failed:reassert', 'running:reassert', 'failed:reassert'] + ['failed:reassert'] * 50)
+    clock['t'] = 0.0
+
+    class Retried(Con):
+        def call(self, method, path, payload=None, timeout=60):
+            return 200, {'raw': next(answers3)}
+
+    ok, last = drive.wait_status(Retried(), 3600, ignore_failed_for=1200)
+    assert not ok and last['raw'] == 'failed:reassert' and clock['t'] < 100
+
 
 def test_dbserver_status_uses_the_core_record_shape():
     assert drive.status_state('dbserver', {'job': 'os-upgrade', 'state': 'done'})[0] == 'done'
@@ -749,3 +760,11 @@ def test_picker_leaves_ordinary_changes_and_the_harness_itself_alone():
     assert 'osupgrade' not in _ids(_diff('start.sh', ['echo hi']))
     assert 'osupgrade' not in _ids(_diff('tools/os-upgrade-histories/histories.py', ['_os_upgrade_x = 1']))
     assert 'osupgrade' not in _ids(_diff('tests/test_x.py', ['_os_upgrade_y = 1']))
+
+
+def test_the_r92_cell_checks_the_tak_server_version_after_the_upgrade():
+    cell, inp = done_input('h6-58-r92-then-os')
+    inp['boxes']['core']['after']['tak_version'] = '5.8-RELEASE92'
+    assert verdict('h6-58-r92-then-os', inp)[0]
+    inp['boxes']['core']['after']['tak_version'] = '5.8-RELEASE84'
+    assert 'core: TAK Server is 5.8-RELEASE92' in failed_names('h6-58-r92-then-os', inp)

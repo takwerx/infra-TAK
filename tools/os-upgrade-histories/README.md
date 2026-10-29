@@ -15,6 +15,7 @@
 | `h2-57-to-58-then-os` | infra-TAK v10.1.85, TAK **5.7** / PG 15, console Update Now to v10.2.30, the console's **5.8 update** (PG 15 stopped on 5433 + PG 18 on 5432), Authentik + broker + Docker modules | `done`, **both** clusters as they were, log says the stopped 15 was kept |
 | `h3-old-pg-left-online` | h2, then PG 15 started again | **refused before any change**, names `pg_ctlcluster 15 main stop` |
 | `h4-stuck-reassert` | h2, then the *released v10.3.0* OS upgrade, which stops at `failed:reassert` | Update Now to the candidate finishes it by itself: `done`, no reboot asked |
+| `h6-58-r92-then-os` | h2, then the console's plain TAK Server update to **5.8 RELEASE92** (the headline release), then the OS upgrade | `done`, both clusters as they were, TAK Server still RELEASE92 |
 | `h5-two-server` | core + database server (test8 style), TAK 5.8 | core `done`, then the database server `done` from the core console |
 
 Add a cell by adding it to `scenarios.json`; `tests/test_os_upgrade_histories_ops285.py` checks the file and this table agree.

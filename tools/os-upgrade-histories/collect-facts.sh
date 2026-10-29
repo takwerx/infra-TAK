@@ -27,6 +27,7 @@ export UNITS="$(systemctl is-active takserver takwerx-console takwerx-broker doc
 INSTALL_DIR="$(systemctl show -p WorkingDirectory --value takwerx-console 2>/dev/null)"
 [ -n "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR" ] || INSTALL_DIR=/opt/infra-TAK
 export INFRATAK_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null)"
+export TAK_VERSION="$(dpkg-query -W -f='${Version}' takserver 2>/dev/null)"
 export INFRATAK_SHA="$(git -c safe.directory='*' -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null)"
 export BASELINE_JSON="$(cat "$STATE/baseline.json" 2>/dev/null)"
 # The log goes through a file, not the environment: one environment string over 128 KB makes exec fail
@@ -70,6 +71,7 @@ facts = {
     'provenance': [l for l in e.get('PROVENANCE', '').splitlines() if l.strip()],
     'infratak_version': e.get('INFRATAK_VERSION', '').strip(),
     'infratak_sha': e.get('INFRATAK_SHA', '').strip(),
+    'tak_version': e.get('TAK_VERSION', '').strip(),
     'log': open(e['LOG_COPY'], encoding='utf-8', errors='replace').read(),
 }
 print(json.dumps(facts))
