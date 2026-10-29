@@ -67025,6 +67025,12 @@ _TAK_API_CHECK_RETRY_MAX_S = 60
 # so "TAK is asking for the user" kept the full 5 min. A working TAK sends one search per
 # login, so the user only counts as looked up when its searches reach half the check's logins.
 _TAK_API_CHECK_STUCK_S = 30
+# ops #316: test6, the check user was the tak-dev emulator and TAK's API gave it no groups
+# while it gave everyone else theirs (the same on the released v10.3.2-alpha), and the update
+# restarted TAK Server, dropping every client. Before a "broken" verdict restarts TAK, up to
+# this many other users get the same check; one of them passing means only the first user's
+# lookup is stale.
+_TAK_API_CHECK_OTHERS = 3
 
 
 def _ldap_outpost_tak_searches(since):
@@ -67213,21 +67219,27 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
     off, for up to `wait_s`. `early`: from round 2 on, stop waiting as soon as TAK is
     plainly not asking LDAP for the user while it asks for others (`_tak_api_check_stuck`).
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
-    refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
-    check with, or the cert or the API couldn't be used)."""
+    refused the list or the create, while LDAP gives it groups, and no other user passes
+    either); 'oneuser' (the same for that user only: another user passes the whole check,
+    ops #316); 'unknown' (no user to check with, or the cert or the API couldn't be used)."""
     file_users = _tak_file_users()
 
-    def _pick(groups):
+    def _picks(groups, skip=()):
+        out = []
         for cn in sorted(groups or {}, key=str.lower):
             all_g = [x for x in groups[cn] if x not in ('__ANON__', '')]
             # Only groups the user can read AND write: TAK lists a *_WRITE (feed-in only)
             # group on no groups/all, and the mission create needs write access, so a
             # write-only Node-RED feed user would always read as "no groups" (ops #278).
             g = [x for x in all_g if not re.search(r'_(?:read|write)$', x, re.I)]
-            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users
+            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users and cn not in skip
                     and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
-                return cn, g
-        return None
+                out.append((cn, g))
+        return out
+
+    def _pick(groups):
+        found = _picks(groups)
+        return found[0] if found else None
 
     live = {s['cn'] for s in (_tak_client_sessions() or []) if s['cn'] and not s['unnamed']}
     groups = _ldap_users_tak_groups(ldap_pass, live) if live else {}
@@ -67241,6 +67253,29 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         return 'unknown', "no non-admin LDAP user with read/write TAK groups to check with"
     cn, ldap_groups = pick
     t0 = time.time()
+
+    def _second_opinion(verdict, summary):
+        """ops #316: the check user got no groups. TAK looks every login up on its own, and one
+        user's lookup can stay empty (a stale cache entry, test6's emulator) while TAK's API
+        gives everyone else their groups, so a restart wouldn't help the other users. Ask up to
+        `_TAK_API_CHECK_OTHERS` other users first; if one of them passes the full check, only
+        `cn` is affected: 'oneuser', no TAK restart. None of them passing (or none to ask)
+        leaves the verdict as it was."""
+        try:
+            others = _picks(_ldap_users_tak_groups(ldap_pass), skip=(cn,))[:_TAK_API_CHECK_OTHERS]
+        except Exception:
+            others = []
+        for other, other_groups in others:
+            for _ in range(_TAK_API_CHECK_TRIES):
+                v, s2 = _tak_api_user_check_once(other, other_groups)
+                if v != 'broken':
+                    break
+            if v == 'ok':
+                plog(f"  {tag}: HTTPS check as {other} passes ({s2}) while {cn} gets no groups")
+                return 'oneuser', (f"{summary}; but TAK's API gives {other} its groups ({s2}), so only "
+                                   f"{cn} is affected and a TAK Server restart wouldn't help the others")
+        return verdict, summary
+
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
     logins, said = [], None
     while True:
@@ -67260,8 +67295,8 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
             path, why = _tak_api_check_stuck(cn, t0, logins)
             if path == 'stuck':
                 plog(f"  {tag}: HTTPS check round {rnd}: {why} — not waiting the rest of the {wait_s}s, "
-                     f"TAK Server needs a restart")
-                return verdict, f"{summary}; {why}"
+                     f"checking with another user before TAK Server is restarted")
+                return _second_opinion(verdict, f"{summary}; {why}")
             if path != said:
                 plog(f"  {tag}: HTTPS check round {rnd}: {why} — keeping the {wait_s}s wait")
                 said = path
@@ -67269,7 +67304,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         if left <= 0:
             if early:
                 plog(f"  {tag}: HTTPS check: still no groups for {cn} after the full {wait_s}s wait")
-            return verdict, summary
+            return _second_opinion(verdict, summary) if verdict == 'broken' else (verdict, summary)
         wait = int(min(delay, left))
         plog(f"  {tag}: HTTPS check round {rnd} ({n} login(s)): {summary} — trying again in {wait}s")
         time.sleep(wait)
@@ -67456,6 +67491,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
                 _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
+            if api_verdict == 'oneuser':
+                plog(f"  {tag}: {summary}; HTTPS/API side works for other users, not for one: {api_summary} — "
+                     f"no TAK Server restart")
+                _finish(outcome + ' (HTTPS fine for other users)', healed_ldap_start=ldap_start,
+                        healed_gd_restart=gd_restart)
+                return False
             if api_verdict == 'unknown':
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
                 _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
@@ -67493,6 +67534,9 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         elif api_verdict == 'unknown':
             plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
             _finish('restarted (HTTPS not checked)')
+        elif api_verdict == 'oneuser':
+            plog(f"  {tag}: after the restart, HTTPS/API side works for other users, not for one: {api_summary}")
+            _finish('restarted (HTTPS fine for other users)')
         else:
             plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
                  f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
