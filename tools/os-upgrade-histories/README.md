@@ -34,7 +34,7 @@ Per cell the judge checks: upgrade status `done`; the log has no `failed` (edit 
 
 ## Cloud rules (OPS-WORKER.md, Oct 27, 2026)
 
-Everything lives in resource group `rg-tak-hist` of the lane's Azure subscription, named in `HIST_AZURE_SUBSCRIPTION` (the id is not kept in this repo; `box.sh` refuses any other subscription before every command). Each VM gets Azure auto-shutdown (06:00 UTC = 11 PM PT) the moment it exists, before anything is installed, and is deleted again if that fails. Every resource carries `owner=claude-lane` and `expires=`. SSH and the console are open only to the address of the machine that created the box. `run-scenario.sh` stays in the foreground until the cell has a verdict. Start every session with `box.sh sweep` (`--delete-expired` removes only expired lane resources).
+Everything lives in resource group `rg-tak-hist` of the lane's Azure subscription, named in `HIST_AZURE_SUBSCRIPTION` (the id is not kept in this repo; `box.sh` refuses any other subscription before every command). Each VM gets Azure auto-shutdown (3 hours after it is created; `HIST_SHUTDOWN_HOURS` can say 1 to 4, never more) the moment it exists, before anything is installed, and is deleted again if that fails. Every resource carries `owner=claude-lane` and `expires=`. SSH and the console are open only to the address of the machine that created the box. `run-scenario.sh` stays in the foreground until the cell has a verdict. Start every session with `box.sh sweep` (`--delete-expired` removes only expired lane resources).
 
 ## What you need
 

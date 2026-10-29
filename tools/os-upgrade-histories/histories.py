@@ -98,17 +98,20 @@ def resolve(data, cell):
         parent = resolve(data, scn['derive_from'])
         steps = parent['history'] + steps
     expect = copy.deepcopy(scn['expect'])
+    start = copy.deepcopy(scn['start'])
     if variant:
         expect.update(scn['variants'][variant].get('expect') or {})
+        start.update(scn['variants'][variant].get('start') or {})
     short = sid.split('-')[0] + (('-' + variant.split('-')[0]) if variant else '')
     return {
         'cell': cell, 'id': sid, 'variant': variant, 'title': scn['title'], 'why': scn.get('why', ''),
         'boxes': scn['boxes'], 'history': steps,
         'labels': [step_label(s) for s in steps],
-        'start': copy.deepcopy(scn['start']), 'run': scn['run'], 'expect': expect,
+        'start': start, 'run': scn['run'], 'expect': expect,
         'snapshot': 'snap-' + short,
         'derive_from': scn.get('derive_from', ''),
         'post_prepare': list(scn.get('post_prepare') or []),
+        'private_ips': dict(scn.get('private_ips') or {}),
     }
 
 
@@ -390,8 +393,8 @@ def render_plan(cell, data):
     out = ['%s — %s' % (cell['cell'], cell['title']), cell['why'], '',
            'Boxes: ' + ', '.join(cell['boxes']) + '   Snapshot: ' + cell['snapshot'] +
            (('   (built from ' + cell['derive_from'] + ')') if cell['derive_from'] else ''),
-           'Resource group: %s (tags owner=%s, expires=<date>), auto-shutdown %s UTC set when the VM is created' % (
-               azure['resource_group'], azure['owner'], azure['auto_shutdown_utc']),
+           'Resource group: %s (tags owner=%s, expires=<date>), auto-shutdown %s hours after creation, set when the VM is created' % (
+               azure['resource_group'], azure['owner'], azure['auto_shutdown_hours']),
            '', 'Replay these, in order, on the VM (each one is noted with box.sh note-step):']
     for i, s in enumerate(cell['history'], 1):
         out.append('  %d. %s — %s' % (i, step_label(s), data['steps'][s['step']]))

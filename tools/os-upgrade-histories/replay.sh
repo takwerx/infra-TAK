@@ -13,6 +13,8 @@
 #   replay.sh console-update REF              the git steps of 'Update Now', pinned to REF (see below)
 #   replay.sh takserver-58-migrate            upload the 5.8 package, the guided 5.8 update (PG 15 -> 18)
 #   replay.sh takserver-update VERSION        upload a newer package for a box already on 5.8, press Update (e.g. 5.8-RELEASE92)
+#   replay.sh two-server-prepare DBHOST       console two-server page, steps 1-2: save the layout, make the console's SSH key (its public half lands in /tmp/h/out/server-one.pub)
+#   replay.sh two-server-deploy VERSION DBHOST  steps 4-6: Deploy Server One (database), Deploy Server Two (core), Deploy TAK Server; VERSION is 5.8
 #   replay.sh start-old-cluster 15/main      pg_ctlcluster 15 main start (the way an operator might)
 #   replay.sh module-deploy MODULE            authentik | broker | docker-modules | docker-tak
 #
@@ -32,6 +34,9 @@ PKG_57="${PKG_57:-takserver_5.7-RELEASE43_all.deb}"
 PKG_58="${PKG_58:-takserver_5.8-RELEASE84_all.deb}"
 POL_57="${POL_57:-deb_policy_5.7.pol}"
 POL_58="${POL_58:-deb_policy_5.8.pol}"
+CORE_58="${CORE_58:-takserver-core_5.8-RELEASE84_all.deb}"
+DB_58="${DB_58:-takserver-database_5.8-RELEASE84_all.deb}"
+ZIP_58="${ZIP_58:-takserver-docker-hardened-5.8-RELEASE-84.zip}"
 KEY="${KEY:-takserver-public-gpg.key}"
 
 step() { echo "== $(date -u +%H:%M:%S) $*" | tee -a "$OUT/steps.log"; }
@@ -178,6 +183,49 @@ takserver-update)
     pg_lsclusters > "$OUT/clusters-after-update.txt" 2>&1
     note "takserver-update:$VER" ;;
 
+two-server-prepare)
+    DBHOST="${2:?DBHOST, the database server private address}"
+    login
+    step "save the two-server layout (Server One = $DBHOST, this box = Server Two)"
+    curlc -H 'Content-Type: application/json' -X POST "$API/api/takserver/deployment-config" -d "$(python3 -I -c '
+import json, sys
+print(json.dumps({"config": {"mode": "two_server",
+    "server_one": {"host": sys.argv[1], "ssh_user": "azureuser", "ssh_port": 22, "auth_method": "ssh_key", "os_family": "ubuntu"},
+    "server_two": {"use_localhost": True},
+    "database": {"port": 5432, "name": "cot", "user": "martiuser", "enable_postgres_tls": True}}}))' "$DBHOST")" > "$OUT/two-server-config.json"
+    grep -q '"success": *true' "$OUT/two-server-config.json" || fail "layout not saved: $(head -c 300 "$OUT/two-server-config.json")"
+    step "Setup SSH key (step 2)"
+    curlc -X POST -H 'Content-Type: application/json' -d '{}' "$API/api/takserver/two-server/ensure-ssh-key" > "$OUT/two-server-key.json"
+    grep -q '"success": *true' "$OUT/two-server-key.json" || fail "ssh key: $(head -c 300 "$OUT/two-server-key.json")"
+    KP="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["public_key_path"])' "$OUT/two-server-key.json")"
+    case "$KP" in /*.pub) ;; *) fail "unexpected key path" ;; esac
+    cat "$KP" > "$OUT/server-one.pub" || fail "cannot read the public key"
+    step "public key is in $OUT/server-one.pub: put it in Server One's authorized_keys (the one-time ssh-copy-id), then run two-server-deploy" ;;
+
+two-server-deploy)
+    VER="${2:?VERSION 5.8}"; DBHOST="${3:?DBHOST}"
+    [ "$VER" = 5.8 ] || fail "version $VER: only 5.8 is packaged for this step"
+    login
+    step "upload the core + database packages, key and policy"
+    upload "$CORE_58" "$DB_58" "$KEY" "$POL_58"
+    step "Deploy Server One (database) on $DBHOST"
+    curlc --max-time 1500 -H 'Content-Type: application/json' -X POST "$API/api/takserver/two-server/deploy-server-one" -d '{}' > "$OUT/two-server-one.json"
+    grep -q '"success": *true' "$OUT/two-server-one.json" || fail "Server One: $(head -c 600 "$OUT/two-server-one.json")"
+    step "Deploy Server Two (core, this box)"
+    curlc --max-time 1500 -H 'Content-Type: application/json' -X POST "$API/api/takserver/two-server/deploy-server-two" -d '{}' > "$OUT/two-server-two.json"
+    grep -q '"success": *true' "$OUT/two-server-two.json" || fail "Server Two: $(head -c 600 "$OUT/two-server-two.json")"
+    step "Deploy TAK Server (two_server)"
+    curlc -H 'Content-Type: application/json' -X POST "$API/api/deploy/takserver" -d '{
+      "cert_country":"US","cert_state":"CA","cert_city":"SACRAMENTO","cert_org":"TAKWERX","cert_ou":"HIST",
+      "root_ca_name":"ROOT-CA-01","intermediate_ca_name":"INTERMEDIATE-CA-01",
+      "intermediate_ca_validity_days":730,"issued_cert_validity_days":"",
+      "enable_admin_ui":false,"enable_webtak":false,"webadmin_password":"","deployment_mode":"two_server"}' > "$OUT/deploy-start.json"
+    grep -q '"success": *true' "$OUT/deploy-start.json" || fail "deploy refused: $(head -c 300 "$OUT/deploy-start.json")"
+    st=$(poll /api/deploy/log after "$OUT/deploy-two-server.log" 3600)
+    [ "$st" = complete ] || fail "two-server TAK deploy ended: $st"
+    tak_answers || fail "TAK Server never answered"
+    note "two-server-deploy:$VER" ;;
+
 start-old-cluster)
     C="${2:-15/main}"; CV="${C%%/*}"; CN="${C#*/}"; [ "$CN" != "$C" ] || CN=main
     step "start PostgreSQL $CV $CN again"
@@ -194,6 +242,28 @@ module-deploy)
     broker)   # the privileged broker is installed by start.sh itself; there is nothing to deploy, only to confirm it is the history
         systemctl is-active --quiet takwerx-broker || fail "takwerx-broker is not running"
         note "module-deploy:broker"; step "done: $*"; exit 0 ;;
+    docker-tak)   # the Docker (hardened) TAK Server: Docker first (the operator installs it, Docker's own convenience script),
+                  # then the bundle uploaded and Deploy on the TAK Server page with the container method
+        step "install Docker Engine (get.docker.com, as an operator does before a container TAK Server)"
+        if ! docker --version >/dev/null 2>&1; then
+            curl -fsSL --max-time 120 https://get.docker.com -o "$OUT/get-docker.sh" || fail "could not fetch get.docker.com"
+            sh "$OUT/get-docker.sh" > "$OUT/get-docker.log" 2>&1 || fail "Docker install failed: $(tail -c 300 "$OUT/get-docker.log")"
+        fi
+        systemctl enable --now docker >/dev/null 2>&1 || true
+        step "upload the hardened Docker bundle"
+        upload "$ZIP_58"
+        step "deploy TAK Server (container method)"
+        curlc -H 'Content-Type: application/json' -X POST "$API/api/deploy/takserver" -d '{
+          "install_method":"container",
+          "cert_country":"US","cert_state":"CA","cert_city":"SACRAMENTO","cert_org":"TAKWERX","cert_ou":"HIST",
+          "root_ca_name":"ROOT-CA-01","intermediate_ca_name":"INTERMEDIATE-CA-01",
+          "intermediate_ca_validity_days":730,"issued_cert_validity_days":"",
+          "enable_admin_ui":false,"enable_webtak":false,"webadmin_password":"","deployment_mode":"single_server"}' > "$OUT/deploy-start.json"
+        grep -q '"success": *true' "$OUT/deploy-start.json" || fail "container deploy refused: $(head -c 300 "$OUT/deploy-start.json")"
+        st=$(poll /api/deploy/log after "$OUT/deploy-container.log" 5400)
+        [ "$st" = complete ] || fail "container TAK deploy ended: $st"
+        tak_answers || fail "TAK Server (container) never answered"
+        note "module-deploy:docker-tak"; step "done: $*"; exit 0 ;;
     *) fail "module $MOD: not automated yet" ;;
     esac
     step "deploy module $MOD"
@@ -203,6 +273,6 @@ module-deploy)
     [ "$st" = complete ] || fail "$MOD deploy ended: $st"
     note "module-deploy:$MOD" ;;
 
-*) echo "usage: replay.sh image|infratak-install REF|console-update REF|takserver-deploy VER|takserver-58-migrate|takserver-update VER|start-old-cluster C|module-deploy MOD" >&2; exit 2 ;;
+*) echo "usage: replay.sh image|two-server-prepare DBHOST|two-server-deploy VER DBHOST|infratak-install REF|console-update REF|takserver-deploy VER|takserver-58-migrate|takserver-update VER|start-old-cluster C|module-deploy MOD" >&2; exit 2 ;;
 esac
 step "done: $*"

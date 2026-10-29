@@ -113,7 +113,7 @@ def test_readme_names_every_cell():
 
 def test_azure_defaults_follow_the_cloud_vm_rules():
     az = DATA['defaults']['azure']
-    assert az['auto_shutdown_utc'] == '0600'                  # 11 PM PT
+    assert az['auto_shutdown_hours'] == 3                      # job length plus an hour, never past 4 (OPS-WORKER.md)
     assert az['owner'] == 'claude-lane' and az['resource_group'].startswith('rg-')
     assert 'subscription' not in az          # the id stays out of the public repo: HIST_AZURE_SUBSCRIPTION
 
@@ -397,7 +397,7 @@ def test_cli_list_plan_and_judge_exit_codes(tmp_path):
     out = run_cli('list')
     assert out.returncode == 0 and 'h4-stuck-reassert' in out.stdout
     plan = run_cli('plan', 'h2-57-to-58-then-os')
-    assert plan.returncode == 0 and 'takserver-58-migrate:5.8' in plan.stdout and 'auto-shutdown 0600 UTC' in plan.stdout
+    assert plan.returncode == 0 and 'takserver-58-migrate:5.8' in plan.stdout and 'auto-shutdown 3 hours after creation' in plan.stdout
     _, inp = done_input('h2-57-to-58-then-os')
     good = tmp_path / 'good.json'
     good.write_text(json.dumps(inp))
@@ -488,7 +488,12 @@ def test_create_sets_auto_shutdown_before_anything_else_touches_the_box(fake_az)
     shutdown = next(i for i, l in enumerate(ls) if l.startswith('az vm auto-shutdown'))
     first_ssh = next(i for i, l in enumerate(ls) if l.startswith('ssh '))
     assert create < shutdown < first_ssh
-    assert '--time 0600' in ls[shutdown]
+    # three hours from now (UTC clock time), never the old fixed 06:00
+    import datetime
+    want = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)).replace(second=0, microsecond=0)
+    got = int(ls[shutdown].split('--time ')[1].split()[0])
+    mins = lambda hhmm: (hhmm // 100) * 60 + hhmm % 100
+    assert abs(mins(got) - (want.hour * 60 + want.minute)) % 1440 <= 2 or abs(mins(got) - (want.hour * 60 + want.minute)) % 1440 >= 1438
     vm_create = ls[create]
     assert 'owner=claude-lane' in vm_create and 'expires=' in vm_create and 'history=h2-57-to-58-then-os' in vm_create
     assert '-g rg-tak-hist' in vm_create and '--nsg-rule NONE' in vm_create

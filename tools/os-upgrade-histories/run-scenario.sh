@@ -59,7 +59,9 @@ trap cleanup EXIT
 # 1. restore. The first box uses SNAP, a second box (database server) uses SNAP-db.
 for b in "${BOXES[@]}"; do
   s="$SNAP"; [ "$b" != "${BOXES[0]}" ] && s="$SNAP-$b"
-  "${B[@]}" restore "$s" "$(name_of "$b")" --role "$b"
+  # a two-server cell: each box comes back on the private address it was built with
+  pip="$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["private_ips"].get(sys.argv[1], ""))' "$b" <<<"$CELLJSON")"
+  "${B[@]}" restore "$s" "$(name_of "$b")" --role "$b" ${pip:+--private-ip "$pip"}
 done
 IP="$("${B[@]}" ip "$(name_of "${BOXES[0]}")")"
 "${B[@]}" open-ports "$(name_of "${BOXES[0]}")" "5001,443,8089,8443,8446"

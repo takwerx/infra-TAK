@@ -10,7 +10,7 @@
       "size_core": "Standard_D4ds_v4",
       "size_db": "Standard_D2ds_v4",
       "os_disk_gb": 128,
-      "auto_shutdown_utc": "0600",
+      "auto_shutdown_hours": 3,
       "snapshot_expires_days": 45,
       "run_expires_days": 2
     },
@@ -68,6 +68,9 @@
               "step": "module-deploy",
               "module": "docker-tak"
             }
+          },
+          "start": {
+            "clusters": []
           },
           "expect": {
             "clusters": [],
@@ -397,6 +400,10 @@
     },
     {
       "id": "h5-two-server",
+      "private_ips": {
+        "core": "10.50.0.10",
+        "db": "10.50.0.11"
+      },
       "title": "Two-server layout (core + remote database) through the OS upgrade",
       "why": "test8-style box: the database lives on a second host. Core first, then the database server from the core console.",
       "boxes": [
@@ -417,14 +424,7 @@
         }
       ],
       "start": {
-        "clusters": [
-          [
-            "18",
-            "main",
-            "5432",
-            "online"
-          ]
-        ],
+        "clusters": [],
         "clusters_db": [
           [
             "18",

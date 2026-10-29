@@ -7,11 +7,11 @@
 # restore the snapshot for every run, delete the run box. A one-way upgrade then never costs the
 # only box in that state (the test12 problem).
 #
-#   box.sh create NAME [--role core|db] [--cell CELL]   new 22.04 VM, auto-shutdown set right away
+#   box.sh create NAME [--role core|db] [--cell CELL] [--private-ip IP]   new 22.04 VM, auto-shutdown set right away
 #   box.sh note-step NAME LABEL                         record a replayed history step on the box
 #   box.sh facts NAME                                   JSON facts about the box (collect-facts.sh)
 #   box.sh snapshot NAME SNAPSHOT [--cell CELL]         stop, snapshot the OS disk (incremental), keep NAME stopped
-#   box.sh restore SNAPSHOT NAME [--role core|db]       new run box from the snapshot; the snapshot is untouched
+#   box.sh restore SNAPSHOT NAME [--role core|db] [--private-ip IP]   new run box from the snapshot; the snapshot is untouched
 #   box.sh open-ports NAME PORT[,PORT...]               allow these ports from THIS Mac's address only
 #   box.sh put NAME FILE...                             copy files to /tmp/h on the box
 #   box.sh ip NAME | ssh NAME CMD... (alias: exec) | start NAME | stop NAME
@@ -37,7 +37,7 @@ ADMIN_USER="${HIST_ADMIN_USER:-azureuser}"
 cfg() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1]))["defaults"]["azure"]; print(d[sys.argv[2]])' "$HERE/scenarios.json" "$1"; }
 RG="$(cfg resource_group)"; REGION="$(cfg region)"; OWNER="$(cfg owner)"
 IMAGE="$(cfg image)"; SIZE_CORE="$(cfg size_core)"; SIZE_DB="$(cfg size_db)"; DISK_GB="$(cfg os_disk_gb)"
-SHUTDOWN_UTC="$(cfg auto_shutdown_utc)"; SNAP_DAYS="$(cfg snapshot_expires_days)"; RUN_DAYS="$(cfg run_expires_days)"
+SHUTDOWN_HOURS="${HIST_SHUTDOWN_HOURS:-$(cfg auto_shutdown_hours)}"; SNAP_DAYS="$(cfg snapshot_expires_days)"; RUN_DAYS="$(cfg run_expires_days)"
 
 die() { echo "box.sh: $*" >&2; exit 1; }
 # The subscription id is not kept in this (public) repo: the operator names it.
@@ -84,10 +84,15 @@ ensure_rg() {
   fi
 }
 
-# Auto-shutdown (deallocate) at 06:00 UTC = 11 PM PT. Fails the whole create if it cannot be set.
+# Auto-shutdown (deallocate) SHUTDOWN_HOURS from now (3 by default, never more than 4: OPS-WORKER.md), as the UTC clock
+# time Azure wants. Fails the whole create if it cannot be set.
+shutdown_time_utc() {
+  python3 -I -c 'import datetime,sys; h=int(sys.argv[1]); assert 1 <= h <= 4, "HIST_SHUTDOWN_HOURS must be 1 to 4"; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=h)).strftime("%H%M"))' "$SHUTDOWN_HOURS"
+}
 set_auto_shutdown() {
-  local name="$1"
-  if ! az_ vm auto-shutdown -g "$RG" -n "$name" --time "$SHUTDOWN_UTC" -o none; then
+  local name="$1" at; at="$(shutdown_time_utc)" || die "HIST_SHUTDOWN_HOURS must be a number from 1 to 4"
+  SHUTDOWN_UTC="$at"
+  if ! az_ vm auto-shutdown -g "$RG" -n "$name" --time "$at" -o none; then
     say "auto-shutdown could not be set on $name: deleting the VM again (a box with no stop is not allowed)"
     az_ vm delete -g "$RG" -n "$name" --yes -o none || true
     die "auto-shutdown failed for $name"
@@ -109,22 +114,30 @@ wait_ssh() {
   die "ssh to $ip did not come up in 4 minutes"
 }
 
+# A two-server cell keeps its boxes' PRIVATE addresses (the console's database settings, pg_hba and the firewall rule
+# all name them), so a box restored from the snapshot must come back on the same ones. Inside the lane's own network only.
+check_private_ip() {
+  [ -z "$1" ] && return 0
+  case "$1" in 10.50.0.[0-9]|10.50.0.[0-9][0-9]|10.50.0.[0-9][0-9][0-9]) ;; *) die "--private-ip must be an address in the lane network 10.50.0.0/24" ;; esac
+}
+
 role_size() { case "${1:-core}" in db) echo "$SIZE_DB" ;; core) echo "$SIZE_CORE" ;; *) die "--role is core or db" ;; esac; }
 
 cmd_create() {
   local name="${1:?NAME}"; shift || true
-  local role=core cell=""
-  while [ $# -gt 0 ]; do case "$1" in --role) role="$2"; shift 2 ;; --cell) cell="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  local role=core cell="" pip=""
+  while [ $# -gt 0 ]; do case "$1" in --role) role="$2"; shift 2 ;; --cell) cell="$2"; shift 2 ;; --private-ip) pip="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  check_private_ip "$pip"
   guard_subscription; ensure_rg
   local exp; exp="$(expires_in "$RUN_DAYS")"
   [ -f "$KEY.pub" ] || [ "$DRY_RUN" = 1 ] || die "no SSH key $KEY.pub (set HIST_SSH_KEY)"
   az_ vm create -g "$RG" -n "$name" -l "$REGION" --image "$IMAGE" --size "$(role_size "$role")" \
     --os-disk-size-gb "$DISK_GB" --admin-username "$ADMIN_USER" --ssh-key-values "$KEY.pub" \
-    --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default \
+    --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default ${pip:+--private-ip-address "$pip"} \
     --tags "owner=$OWNER" "expires=$exp" "role=$role" ${cell:+"history=$cell"} -o none
   set_auto_shutdown "$name"
   allow_ports "$name" 22
-  say "created $name (expires $exp, auto-shutdown $SHUTDOWN_UTC UTC)"
+  say "created $name (expires $exp, auto-shutdown $SHUTDOWN_UTC UTC, $SHUTDOWN_HOURS h from now)"
   wait_ssh "$(vm_ip "$name")"
 }
 
@@ -182,8 +195,9 @@ cmd_snapshot() {
 
 cmd_restore() {
   local snap="${1:?SNAPSHOT}" name="${2:?NAME}"; shift 2 || true
-  local role=core
-  while [ $# -gt 0 ]; do case "$1" in --role) role="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  local role=core pip=""
+  while [ $# -gt 0 ]; do case "$1" in --role) role="$2"; shift 2 ;; --private-ip) pip="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  check_private_ip "$pip"
   guard_subscription; ensure_rg
   local exp; exp="$(expires_in "$RUN_DAYS")"
   az_ disk create -g "$RG" -n "${name}-osdisk" -l "$REGION" --source "$snap" --sku Premium_LRS \
@@ -193,7 +207,7 @@ cmd_restore() {
   local try
   for try in 1 2 3; do
     az_ vm create -g "$RG" -n "$name" -l "$REGION" --attach-os-disk "${name}-osdisk" --os-type Linux \
-      --size "$(role_size "$role")" --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default \
+      --size "$(role_size "$role")" --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default ${pip:+--private-ip-address "$pip"} \
       --tags "owner=$OWNER" "expires=$exp" "role=$role" "restored_from=$snap" -o none && break
     [ "$DRY_RUN" = 1 ] || [ "$(az vm show -g "$RG" -n "$name" --query provisioningState -o tsv 2>/dev/null)" = Succeeded ] && break
     [ "$try" = 3 ] && die "could not create $name"
@@ -201,7 +215,7 @@ cmd_restore() {
   done
   set_auto_shutdown "$name"
   allow_ports "$name" 22
-  say "restored $snap as $name (expires $exp, auto-shutdown $SHUTDOWN_UTC UTC)"
+  say "restored $snap as $name (expires $exp, auto-shutdown $SHUTDOWN_UTC UTC, $SHUTDOWN_HOURS h from now)"
   wait_ssh "$(vm_ip "$name")"
 }
 
