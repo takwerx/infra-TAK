@@ -1023,3 +1023,22 @@ def test_the_removal_password_is_cleared_once_it_is_sent():
     # the first version of this guard.
     assert "if (pw) pw.value = ''" in body, (
         "the console password is left in the DOM after the removal is sent")
+
+
+def test_a_deployment_row_wraps_instead_of_running_off_a_phone():
+    """⚠️ GH #336: on a phone the row's Rename and Update buttons were cut off.
+
+    The row is a flex row of name, agency, link, state, badge and up to five
+    buttons. base.html's phone guard clips `.main` sideways, so anything a row
+    does not wrap is not scrolled to — it is gone. And a hostname has no spaces,
+    so without `overflow-wrap` the link alone can be wider than the screen.
+    """
+    page = (ROOT / "templates" / "atlas.html").read_text(encoding="utf-8")
+    rule = re.search(r"^\.url-row\{([^}]*)\}", page, re.M)
+    assert rule, "the .url-row rule is gone"
+    assert "flex-wrap:wrap" in rule.group(1), (
+        "a deployment row that does not wrap loses its buttons on a phone")
+
+    link = re.search(r"^\.url-row \.atlas-link\{([^}]*)\}", page, re.M)
+    assert link and "overflow-wrap:anywhere" in link.group(1), (
+        "a long deployment URL can be wider than a phone on its own")
