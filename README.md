@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.0-alpha)**
+**Current release: [v10.3.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -441,6 +441,40 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.2-alpha — 2026-10-28 — Security: old Node.js in TAK Portal, CloudTAK, Node-RED or Remote Assist is flagged and emailed; CloudTAK plugins survive rebuilds
+
+**Headline: a Node.js bug that is being actively exploited (CVE-2026-111497) lives inside the TAK Portal, CloudTAK, Node-RED and Remote Assist images, so a module could be on its latest release and still run a vulnerable Node. The console now checks the Node version each of them really runs, sends a security email and shows a red flag on the card until you press Update, and Update now rebuilds on the newest Node.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.2-alpha))
+
+**Node.js security.**
+- Old Node.js in TAK Portal, CloudTAK, Node-RED or Remote Assist triggers one "Security update pending" email and a red "Node.js out of date — press Update" flag on the module's card.
+- CloudTAK Deploy and Update now pull the newest base image before building, so Update really moves CloudTAK onto the fixed Node. Node-RED Update moves to an image with the fixed Node.
+
+**CloudTAK plugins.**
+- Plugins installed by infra-TAK (and TAK Portal Marketplace plugins) stay in the CloudTAK build when a newer CloudTAK excludes its plugins folder from the image.
+- After a plugin install or a CloudTAK Update, the console checks that each plugin's menu entry is really in the rebuilt app, and warns in the install log if one is missing.
+
+**TAK Portal.**
+- Marketplace "Deploy To Caddy" no longer fails with "Caddy rejected the updated file" when the console doesn't run as root.
+- TAK Portal 2.0.23+ ships a newer marketplace helper. infra-TAK keeps the reviewed one for now, and the TAK Portal card says so. Deploy To Caddy does not need the newer one.
+
+### v10.3.1-alpha — 2026-10-28 — Ubuntu 24.04 upgrade no longer stops at "reassert"; Manual bans on the Fail2ban page
+
+**Headline: the 22.04 → 24.04 upgrade from the Console page no longer stops at the `reassert` step on boxes that still keep the stopped PostgreSQL 15 copy from the TAK Server 5.8 update, and a box that v10.3.0 already stopped there finishes the upgrade by itself after you click Update Now — no SSH needed. The Fail2ban page gains a Manual bans card.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.1-alpha))
+
+**Ubuntu 24.04 upgrade.**
+- The TAK Server 5.8 update keeps the old PostgreSQL 15 cluster, stopped, as its rollback copy. The upgrade now accepts that: it only refuses when it is truly unsafe (anything other than 18 running on 5432), and it refuses before anything changes, with a clear next step.
+- **Stuck on v10.3.0?** If your upgrade stopped at `reassert` (`expected exactly one PostgreSQL cluster, found 2`), update the console (Update Now). It finishes the remaining steps on its own, without a reboot.
+
+**Manual bans (GH #313).** Ban an IPv4 address or range from the Fail2ban page, permanently or for a number of days, with an optional note. Entries can be edited or removed, and the console checks the firewall really blocks them.
+
+**Fixes.**
+- "Back up now" no longer ends INCOMPLETE on a box with a large Node-RED data folder.
+- No TAK Server restart after an update or Authentik restart because the login check picked a write-only feed user.
+- Guard Dog no longer raises a drift alarm that can't clear after a TAK Portal Print install or update.
+- The update check still works when GitHub's API refuses the request (rate limit).
+- Full-stack backups moved to the Guard Dog page, collapsed by default.
+- On two-server installs, the TAK DB card's "Restart needed" opens the database server's preflight (updates, reboot, upgrade).
 
 ### v10.3.0-alpha — 2026-10-27 — Ubuntu 24.04: install it, or upgrade a running box from the console; full-stack backup; the console works on a phone
 

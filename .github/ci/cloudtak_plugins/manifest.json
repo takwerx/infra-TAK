@@ -1,0 +1,44 @@
+{
+  "_comment": "Every CloudTAK plugin takwerx ships. Read by bundle_check.py and the nightly (ops #301). tests/test_cloudtak_plugin_nightly_ops301.py keeps it in step with CLOUDTAK_PLUGINS in app.py. in_catalog=false: not in infra-TAK's own catalog (TAK Portal installs it), so infra-TAK's build shield treats it as a foreign plugin.",
+  "plugins": [
+    {
+      "key": "tak-dispatcher",
+      "name": "CloudTAK Dispatcher",
+      "repo": "https://github.com/takwerx/cloudtak-dispatcher-plugin",
+      "plugin_subpath": "plugin",
+      "server_subpath": "server",
+      "install_dir": "tak-dispatcher",
+      "in_catalog": false
+    },
+    {
+      "key": "ping",
+      "name": "Cell Ping / RTT",
+      "repo": "https://github.com/clptak/cloudtak-plugin-cellphone",
+      "install_dir": "ping",
+      "in_catalog": false
+    },
+    {
+      "key": "search-containment",
+      "name": "Search Containment",
+      "repo": "https://github.com/clptak/cloudtak-plugin-search-containment",
+      "install_dir": "search-containment",
+      "in_catalog": false
+    },
+    {
+      "key": "taksim",
+      "name": "TAK Simulator panel",
+      "local_path": "cloudtak-plugins/taksim/plugin",
+      "server_path": "cloudtak-plugins/taksim/server",
+      "install_dir": "taksim",
+      "in_catalog": true
+    },
+    {
+      "key": "print",
+      "name": "Print",
+      "repo": "https://github.com/clptak/cloudtak-plugin-print",
+      "plugin_subpath": "plugin",
+      "install_dir": "print",
+      "in_catalog": false
+    }
+  ]
+}

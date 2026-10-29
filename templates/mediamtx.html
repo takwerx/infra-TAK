@@ -78,6 +78,10 @@
 
   {% if mtx.installed %}
 
+  {% if editor_missing_deps %}
+  <div id="editor-deps-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-top:12px;font-size:13px;color:var(--red)">The web editor is not starting: its Python packages (Flask) are missing. Click <strong>Patch web editor</strong> below to reinstall them.</div>
+  {% endif %}
+
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -393,9 +397,16 @@ function runRecovery() {
   fetch('/api/mediamtx/recovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' })
     .then(r => r.json())
     .then(d => {
-      if (d.success) {
+      if (d.success && d.webeditor_running === false) {
+        // GH #330: the editor is still down (e.g. its packages could not be installed): keep it on screen.
+        statusEl.textContent = d.message || 'Patch applied, but the web editor is still down.';
+        statusEl.style.color = 'var(--red)';
+        return;
+      } else if (d.success) {
         statusEl.textContent = (d.message || '✓ Patched. Web editor restarted.');
         statusEl.style.color = 'var(--green)';
+        const _db = document.getElementById('editor-deps-banner');
+        if (_db) _db.remove();
       } else {
         statusEl.textContent = d.error || 'Patch failed';
         statusEl.style.color = 'var(--red)';

@@ -166,7 +166,8 @@ def test_unreviewed_helper_is_never_installed(b, tmp_path, monkeypatch):
     _portal(tmp_path, monkeypatch, b, version='2.0.40', helper=b'#!/bin/bash\nrm -rf /\n')
     d = b._takportal_decide()
     assert d['variant'] == 'hardened'
-    assert d['helper_bytes'] is None and 'not pinned' in d['helper_reason']
+    assert d['helper_bytes'] is None and 'not reviewed' in d['helper_reason']
+    assert d['helper_unreviewed'] is True
 
 
 def test_helper_file_proves_new_even_if_package_json_lags(b, tmp_path, monkeypatch):
@@ -194,6 +195,12 @@ def test_symlinked_portal_dir_is_not_followed(b, tmp_path, monkeypatch):
 
 def test_pinned_hash_matches_portal_2_0_19_to_2_0_21_helper(b):
     assert 'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4' in b.TAKPORTAL_HELPER_SHA256
+
+
+def test_portal_2_0_23_helper_stays_unpinned_until_reviewed(b):
+    # Helper v2 (TAK Portal 2.0.23+) has not been reviewed.
+    # It must not be pinned as is; pin only after the review (ops #295).
+    assert 'e05feed906832e649b5257caf840c19044aeac45352952b268e547117dc4c7f2' not in b.TAKPORTAL_HELPER_SHA256
 
 
 # ------------------------------------------------------------- ownership refusals

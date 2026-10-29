@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.1-alpha"
+VERSION = "10.3.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1425,6 +1425,8 @@ MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9
                               # fix + embedded hls.js are on installer dev awaiting tag) — an
                               # unpinned ref is a supply-chain gap our own /module-scan rule bans.
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
+# The local editor unit's pre-start line that runs the script below (dash: best-effort).
+_MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
 """Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
@@ -1440,7 +1442,10 @@ def main():
     OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
     MARKER  = '# --- infra-TAK LDAP overlay ---'
 
-    if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
+    # The port/bind/API patches below do not depend on the overlay: without them an
+    # upstream self-update brings the editor back on 0.0.0.0:5000 and stream.<domain>
+    # (Caddy -> 127.0.0.1:5080) answers 502 (GH #330). Only the import needs the file.
+    if not os.path.exists(EDITOR):
         return
 
     with open(EDITOR, 'r') as f:
@@ -1472,7 +1477,7 @@ def main():
         changed = True
 
     # 3. LDAP overlay import injection
-    if MARKER not in src:
+    if MARKER not in src and os.path.exists(OVERLAY):
         inject = (
             "\n" + MARKER + "\n"
             "import os as _os\n"
@@ -8961,6 +8966,17 @@ def _diag_section_authentik(settings):
     env = _diag_cmd(['docker', 'inspect', 'authentik-ldap-1', '--format', '{{range .Config.Env}}{{println .}}{{end}}'])
     host = next((l for l in env.splitlines() if l.startswith('AUTHENTIK_HOST=')), 'AUTHENTIK_HOST=(not found)')
     out.append(f"ldap outpost {host}   (internal http://authentik-server… = routing-spiral risk; https://<fqdn> = normal)")
+    if 'http://authentik-server' in host:
+        # ops #306: say why the console has not moved the outpost to https://<fqdn> yet.
+        def move_check():
+            ak_host = _get_authentik_host(settings)
+            ok, problem, _sha = _ldap_outpost_fqdn_precheck(ak_host) if ak_host else (False, 'no Authentik hostname set', '')
+            out.append(f"  move to https://{ak_host}: " + ('possible (DNS and Caddy certificate check passes)' if ok
+                                                              else f'blocked — {problem}'))
+        try:
+            move_check()
+        except Exception as e:
+            out.append(f"  (move check failed: {type(e).__name__}: {str(e)[:160]})")
     # One statement: psql -c prints only the LAST result of a multi-statement string.
     sql = ("SELECT 'idle_in_tx='||count(*) FROM pg_stat_activity WHERE state='idle in transaction' "
            "UNION ALL SELECT 'tasks_'||state||'='||count(*) FROM authentik_tasks_task GROUP BY state")
@@ -9125,6 +9141,13 @@ def _diag_section_takserver(settings):
         out.append(f"cot database sessions: not shown — the database is not on this box ({_mode})")
     else:
         out.extend(_cot_stall_report())
+        # ops #306: whether a "failed 5.8 migration" left the database unusable is one number.
+        try:
+            _sv = _tak58_schema_version()
+            out.append(f"cot schema_version: {_sv if _sv is not None else 'unreadable'}"
+                       f"   (TAK Server 5.8 needs >= {_TAK58_MIN_SCHEMA_VERSION})")
+        except Exception as e:
+            out.append(f"cot schema_version: ({type(e).__name__}: {str(e)[:120]})")
     out.extend(_diag_tak_update_history())
     return out
 
@@ -14235,7 +14258,21 @@ def mediamtx_page():
     if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
         mediamtx_deploy_status.update({'complete': False, 'error': False})
     mtx_vinfo = _get_mediamtx_version_info() if mtx.get('installed') else {}
+    # GH #330: an editor crash-looping on `No module named 'flask'` only showed up as a 502.
+    # Say it on the page. Local editor only, and the import check only runs when it is down.
+    editor_missing_deps = False
+    if (mtx.get('installed') and mediamtx_deploy_cfg.get('target_mode') != 'remote'
+            and not mediamtx_deploy_status.get('running', False)
+            and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        try:
+            _ed = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                                 capture_output=True, text=True, timeout=10)
+            if (_ed.stdout or '').strip() != 'active':
+                editor_missing_deps = not _mediamtx_editor_python_ok()
+        except Exception:
+            pass
     return render_template('mediamtx.html',
+        editor_missing_deps=editor_missing_deps,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
         mediamtx_deploy_cfg=mediamtx_deploy_cfg,
@@ -20627,6 +20664,10 @@ def _f2b_selfheal_sshd_backend(plog=None):
             else:
                 out.append(line)
         if hit:
+            # The jail now has one source, the journal. Drop the `backend = auto` that came
+            # with the logpath (_f2b_pin_file_backend) so the file names one backend only.
+            out = [l for l in out if l == 'backend  = systemd\n'
+                   or not re.match(r'^\s*backend\s*=', l)]
             try:
                 _write_priv(path, ''.join(out))
                 changed.append(os.path.basename(path))
@@ -20975,11 +21016,39 @@ def _f2b_log_has_rotated_history(logpath):
     return False
 
 
+# /api/fail2ban/status is on a 30 s page poll and the probe below costs one privileged
+# fail2ban-client call per file-fed jail, so answers are kept briefly (same reason as
+# _F2B_AK_LEVEL_CACHE). {jail: (monotonic time, verdict)}.
+_F2B_NO_FILE_TTL = 60
+_F2B_NO_FILE_CACHE = {}
+
+
+def _f2b_jail_reads_no_file(jail):
+    """True when the RUNNING jail tails no log file at all; False when it tails one or
+    the answer is unclear (daemon unreachable, unknown jail: never convict on that).
+
+    `fail2ban-client get <jail> logpath` prints `No file is currently monitored` for a
+    jail on the systemd backend, whatever its config file says (fail2ban 1.0.2, Ubuntu
+    24.04; infra-TAK #338)."""
+    now = time.monotonic()
+    hit = _F2B_NO_FILE_CACHE.get(jail)
+    if hit and now - hit[0] < _F2B_NO_FILE_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'get', jail, 'logpath']),
+                           capture_output=True, text=True, timeout=15)
+        verdict = r.returncode == 0 and 'No file is currently monitored' in (r.stdout or '')
+    except Exception:
+        verdict = False
+    _F2B_NO_FILE_CACHE[jail] = (now, verdict)
+    return verdict
+
+
 def _f2b_dead_jails():
     """Jails that are configured but protecting nothing. [(jail, filter, reason)].
 
-    THREE failure modes, because fixing only the first still leaves a green console
-    over a control that cannot fire:
+    FOUR failure modes, because fixing only the first still leaves a green console
+    over a control that cannot fire (the fourth, DEAF, is commented in the loop):
 
     1. NOT LOADED — enabled on disk but absent from the running daemon, usually a
        missing filter file. (test6/authentik, ≥2026-06-29.)
@@ -21020,6 +21089,16 @@ def _f2b_dead_jails():
         if not lm:
             continue
         lp = lm.group(1)
+        # Mode 4 (infra-TAK #338) — DEAF: loaded with a logpath on disk, but the running
+        # jail tails no file at all, because it inherited the distro's journal backend
+        # (Ubuntu 24.04). It starts cleanly and reports nothing, so ask fail2ban itself.
+        if _f2b_jail_reads_no_file(name):
+            dead.append((name, filt,
+                         'loaded, but fail2ban is not reading its log %s (it reports "No '
+                         'file is currently monitored"), so this jail can never fire. It is '
+                         'reading the systemd journal instead. The console repairs this on '
+                         'its next restart; to fix it now, toggle this jail off and on.' % lp))
+            continue
         try:
             if os.path.getsize(lp) == 0 and not _f2b_log_has_rotated_history(lp):
                 # v10.1.40 — the Authentik jail is NOT covered by the 0-byte rule, and
@@ -21174,12 +21253,36 @@ def _f2b_ensure_ak_logfile(plog=None):
     return True
 
 
+def _f2b_pin_file_backend(text):
+    """Jail text that reads a log file, with `backend = auto` added when it names no backend.
+
+    infra-TAK #338. Ubuntu 24.04's fail2ban (1.0.2-3 on) ships jail.d/defaults-debian.conf
+    with `[DEFAULT] backend = systemd`; 22.04's (0.11.2) had no such line, so the default was
+    `auto`, which tails the file. A jail with a logpath and no backend of its own inherits
+    the journal, and fail2ban then ignores logpath entirely: the takserver, takportal,
+    authentik and recidive jails started cleanly after an in-place 22.04 -> 24.04 upgrade,
+    reported `No file is currently monitored`, and could never ban. TAK Server, Caddy,
+    Authentik's forwarder and fail2ban itself all write files, not the journal. `auto` is
+    the stock jail.conf default (Ubuntu 22.04, and Rocky/RHEL's EPEL 1.1.0 without the
+    fail2ban-systemd package), so pinning it changes nothing on those boxes.
+
+    Added right under the section header, not beside logpath, so a logpath continued
+    over several lines stays intact. Text that already names a backend is returned as is."""
+    if (not re.search(r'^\s*logpath\s*=', text, re.M)
+            or re.search(r'^\s*backend\s*=', text, re.M)):
+        return text
+    return re.sub(r'(?m)^(\[[^\]\n]+\][ \t]*)$', r'\1\nbackend  = auto', text, count=1)
+
+
 def _f2b_guard_jail_logpaths(plog=None):
     """One jail's missing logpath must never take down every jail. Enforce that.
 
     Runs before anything (re)starts fail2ban, over every enabled infratak-* jail:
 
-      1. RE-ARM first — a jail parked by an earlier pass whose log now exists comes
+      0. PIN the file backend on every jail that reads a log file and names no backend
+         (_f2b_pin_file_backend). Otherwise the distro's default backend wins, and on
+         Ubuntu 24.04 that is the journal: the jail loads, reads nothing and never bans.
+      1. RE-ARM — a jail parked by an earlier pass whose log now exists comes
          back. Without this the guard would be a one-way door: install TAK Server the
          day after the takserver jail got parked and it would stay parked forever.
       2. CREATE the logs we own (_F2B_SELF_OWNED_LOGS), plus the portal access log via
@@ -21206,6 +21309,31 @@ def _f2b_guard_jail_logpaths(plog=None):
         return False
     import glob as _glob
     changed = False
+
+    # ── 0. Read the log file, not the distro's default backend ────────────────
+    pinned = []
+    for jpath in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))
+                        + _glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
+        try:
+            with open(jpath) as f:
+                text = f.read()
+        except OSError:
+            continue
+        new = _f2b_pin_file_backend(text)
+        if new == text:
+            continue
+        try:
+            _write_priv(jpath, new)
+        except Exception as e:
+            _log(f'fail2ban: could not set the file backend in {os.path.basename(jpath)} '
+                 f'(non-fatal): {e}')
+            continue
+        changed = True
+        pinned.append(os.path.basename(jpath))
+    if pinned:
+        _log('fail2ban: set `backend = auto` (read the log file) in %s. They named no backend, '
+             'and where the distro defaults to the systemd journal (Ubuntu 24.04) they read '
+             'nothing and could never ban anyone.' % ', '.join(pinned))
 
     # ── 1. Re-arm jails whose log has come back ───────────────────────────────
     for parked in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
@@ -21287,6 +21415,7 @@ def _f2b_guard_jail_logpaths(plog=None):
         return False
 
     # ── 4. Bring the daemon back ──────────────────────────────────────────────
+    _F2B_NO_FILE_CACHE.clear()            # a jail pinned above reads its file after this
     try:
         act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                              capture_output=True, text=True, timeout=15).stdout.strip()
@@ -22074,6 +22203,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = authentik\n"
         "logpath  = /var/log/authentik/auth.log\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22119,6 +22249,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = takserver\n"
         "logpath  = /opt/tak/logs/takserver-messaging.log\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22265,7 +22396,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     # from the journal. Writing a logpath that does not exist would kill the
     # whole fail2ban daemon at config-parse time — see _f2b_sshd_logpath().
     _lp = _f2b_sshd_logpath()
-    _source_line = f"logpath  = {_lp}\n" if _lp else "backend  = systemd\n"
+    _source_line = f"logpath  = {_lp}\nbackend  = auto\n" if _lp else "backend  = systemd\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
@@ -22986,6 +23117,7 @@ def _f2b_arm_clientfeed_jail(log_fn=None):
             "enabled  = true\n"
             "filter   = clientfeed\n"
             f"logpath  = {CLIENTFEED_FAIL_LOG}\n"
+            "backend  = auto\n"
             f"maxretry = {CLIENTFEED_F2B_MAXRETRY}\n"
             f"findtime = {CLIENTFEED_F2B_FINDTIME}\n"
             f"bantime  = {CLIENTFEED_F2B_BANTIME}\n"
@@ -23321,6 +23453,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = takportal\n"
         f"logpath  = {TAKPORTAL_CADDY_LOG}\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -23590,6 +23723,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "enabled  = true\n"
         "filter   = recidive\n"
         "logpath  = /var/log/fail2ban.log\n"
+        "backend  = auto\n"
         f"bantime  = {_F2B_RECIDIVE_BANTIME}\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
@@ -23834,6 +23968,7 @@ def _f2b_manual_jail_text():
         "enabled  = true\n"
         "filter   = infratak-manual\n"
         "logpath  = /var/log/fail2ban.log\n"
+        "backend  = auto\n"
         "maxretry = 1\n"
         "findtime = 60\n"
         "bantime  = -1\n"
@@ -23939,6 +24074,12 @@ def _f2b_manual_active(entries, now=None):
 def _f2b_manual_banned():
     """Targets the jail is blocking right now, as {network: text fail2ban uses for it}.
     None when it cannot be read (jail not loaded, daemon down)."""
+    # Ask for the jail by name only when it is loaded. The Fail2ban page reads this every
+    # 30 s, and on a box with no manual bans the jail does not exist, so each read logged
+    # `UnknownJailException('infratak-manual')` as an ERROR in /var/log/fail2ban.log
+    # (infra-TAK #338). Listing jails logs nothing.
+    if _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+        return None
     try:
         r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', _F2B_MANUAL_JAIL]),
                            capture_output=True, text=True, timeout=15)
@@ -26451,6 +26592,159 @@ def _apply_security_identity(item):
     return item
 
 
+# ops #296: the Node.js inside a module's image is baked in at build time, so a module on
+# its latest release can still run a Node from before a Node security release. This table
+# is the ONE place that says which Node is fixed; the red flag on the console cards and the
+# security email both read it. When Node ships its next security release, add an entry (one
+# per advisory, newest last) with the fixed version of each major line still supported —
+# a major that is not listed claims nothing — and bump NODERED_IMAGE. Boxes below the new
+# versions then get the flag, and one more email (the email identity is the set of releases
+# a module is still below). `reason` is shown to the operator as-is.
+# https://nodejs.org/en/blog/vulnerability
+NODE_SECURITY_RELEASES = (
+    {'id': 'CVE-2026-111497', 'released': '2026-10-21',
+     'fixed': {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'},
+     'reason': 'a Brotli decoder memory-corruption bug that can lead to remote code execution, '
+               'being actively attacked'},
+)
+
+# Node-based modules whose containers are checked: module key (as in /api/modules/version) →
+# label, the container names / compose (project, services) that run Node, and where the
+# operator presses Update. The CloudTAK media helper is left out on purpose: it is an
+# upstream image that infra-TAK's Update cannot rebuild, so flagging it could never clear.
+NODE_MODULE_CONTAINERS = {
+    'takportal': {'label': 'TAK Portal', 'names': ('tak-portal', 'tak-portal-worker'),
+                  'projects': ('tak-portal',), 'services': ('tak-portal', 'tak-portal-worker')},
+    'cloudtak': {'label': 'CloudTAK', 'names': (), 'projects': ('cloudtak',),
+                 'services': ('api', 'events', 'tiles', 'retention', 'cloudtak-print')},
+    'nodered': {'label': 'Node-RED', 'names': ('nodered',), 'projects': (), 'services': ()},
+    'remote_assist': {'label': 'Remote Assist', 'names': (), 'projects': ('eud-remote-assist',),
+                      'services': ('server',)},
+}
+
+
+def _node_version_tuple(v):
+    m = re.match(r'^\s*v?(\d+)\.(\d+)\.(\d+)\s*$', v or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _node_releases_missing(version):
+    """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
+    that does not parse, or a major no entry lists, is not claimed."""
+    ver = _node_version_tuple(version)
+    if ver is None:
+        return []
+    out = []
+    for rel in NODE_SECURITY_RELEASES:
+        fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
+        if fixed is not None and ver < fixed:
+            out.append(rel)
+    return out
+
+
+def _node_container_versions():
+    """{module_key: {container: 'v22.23.4' | None}} for the running containers of the
+    modules in NODE_MODULE_CONTAINERS; None when a container has no `node` or does not
+    answer (unknown claims nothing). Raises when docker cannot be listed. Local
+    containers only — a module deployed to another host is not visible."""
+    r = subprocess.run(
+        _sudo_wrap(['docker', 'ps', '--format',
+                    '{{.Names}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}']),
+        capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or 'docker ps failed').strip()[:200])
+    out = {}
+    deadline = time.time() + 60
+    for line in r.stdout.splitlines():
+        name, _, rest = line.partition('|')
+        project, _, service = rest.partition('|')
+        for key, m in NODE_MODULE_CONTAINERS.items():
+            if name in m['names'] or (project in m['projects'] and service in m['services']):
+                if time.time() > deadline:
+                    break
+                try:
+                    p = subprocess.run(_sudo_wrap(['docker', 'exec', name, 'node', '--version']),
+                                       capture_output=True, text=True, timeout=10)
+                    ver = p.stdout.strip() if p.returncode == 0 and _node_version_tuple(p.stdout) else None
+                except Exception:
+                    ver = None
+                out.setdefault(key, {})[name] = ver
+    return out
+
+
+def _node_security_gaps(versions=None):
+    """{module_key: {'label', 'outdated': {container: version}, 'releases': [entries]}} for
+    the modules whose Node is below a NODE_SECURITY_RELEASES fix. `versions` is the
+    _node_container_versions() shape; it is read from docker when not given."""
+    versions = _node_container_versions() if versions is None else versions
+    gaps = {}
+    for key, per_container in versions.items():
+        outdated, rels = {}, {}
+        for cname, ver in per_container.items():
+            missing = _node_releases_missing(ver)
+            if missing:
+                outdated[cname] = ver
+                rels.update({r['id']: r for r in missing})
+        if outdated:
+            gaps[key] = {'label': NODE_MODULE_CONTAINERS[key]['label'], 'outdated': outdated,
+                         'releases': [rels[i] for i in sorted(rels)]}
+    return gaps
+
+
+def _node_security_items(versions=None):
+    """Update-email items (ops #296): one per Node-based module whose container Node is
+    below a security fix. The identity is the set of releases it is still below, so it
+    mails once and again when the next Node security release ships. Raises when docker
+    cannot be read — the caller carries its dedup state over a blip."""
+    items = []
+    for key, g in sorted(_node_security_gaps(versions).items()):
+        label, rels = g['label'], g['releases']
+        ids = [r['id'] for r in rels]
+        worst = min(g['outdated'].values(), key=lambda v: _node_version_tuple(v))
+        reason = '; '.join(f"{r['id']}: {r['reason']}" for r in rels)
+        items.append({
+            'key': f'node:{key}', 'label': f'{label} Node.js',
+            'installed': f'Node.js {worst}', 'target': 'a Node.js with the security fix',
+            'summary': f'Node.js inside {label} is out of date',
+            'identity': 'node-' + '+'.join(ids),
+            'security': [f"{label} is running Node.js {worst}. Newer Node.js fixes {reason}."],
+            'how': f'Open {label} in infra-TAK and press Update.'})
+    return items
+
+
+# The console cards read the same table, from a cache: the probe is a docker exec per
+# container and /api/modules/version is polled every 30 s per open browser.
+NODE_SECURITY_CACHE_S = 600
+_node_card_cache = {'at': 0.0, 'gaps': {}, 'busy': False}
+
+
+def _node_card_gaps():
+    """Cached _node_security_gaps() for the cards. Never blocks the poll: a stale cache is
+    served while a daemon thread refreshes it; a failed probe keeps the last answer."""
+    c = _node_card_cache
+    if time.time() - c['at'] >= NODE_SECURITY_CACHE_S and not c['busy']:
+        c['busy'] = True
+
+        def _refresh():
+            try:
+                c['gaps'] = _node_security_gaps()
+            except Exception as e:
+                print(f"[node-security] card check failed: {e}", flush=True)
+            finally:
+                c['at'] = time.time()
+                c['busy'] = False
+        threading.Thread(target=_refresh, daemon=True, name='node-security').start()
+    return c['gaps']
+
+
+def _node_card_flag(gap):
+    """Plain sentence for the red card flag."""
+    worst = min(gap['outdated'].values(), key=lambda v: _node_version_tuple(v))
+    ids = ', '.join(r['id'] for r in gap['releases'])
+    return (f"Security update: Node.js on this module is out of date ({worst}, {ids}). "
+            f"Press Update.")
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -26566,6 +26860,15 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
     except Exception as e:
         unknown.update({'os-security', 'kernel-security'})
         print(f"[update-notify] OS security check failed: {e}", flush=True)
+    try:
+        nv = _node_container_versions()
+        # a container that did not answer is unknown, not fixed: keep its dedup state
+        unknown.update('node:' + k for k, per in nv.items() if None in per.values())
+        pending.extend(_node_security_items(nv))
+    except Exception as e:
+        # ops #296: containers we could not read are not "fixed" — carry their dedup state.
+        unknown.update('node:' + k for k in NODE_MODULE_CONTAINERS)
+        print(f"[update-notify] Node.js security check failed: {e}", flush=True)
     try:
         for p in _detect_cloudtak_plugins():
             if p.get('installed') and p.get('update_available') and not p.get('local'):
@@ -38912,6 +39215,13 @@ def get_all_module_versions():
             except (ValueError, IndexError):
                 pass
         result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
+    # ops #296: red "Node.js is out of date" flag — same table as the security email.
+    try:
+        for key, gap in _node_card_gaps().items():
+            if modules.get(key, {}).get('installed') and key in result:
+                result[key] = {**result[key], 'node_security': _node_card_flag(gap)}  # copy: helpers may cache
+    except Exception as e:
+        print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
     return result
 
 
@@ -40137,6 +40447,61 @@ TAKPORTAL_CONTAINER_TAK_NOTE = (
     "https://github.com/ValleyTacticalSolutions/TAK-Portal/issues/61")
 
 
+TAKPORTAL_CADDY_SHIM_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        'scripts', 'takportal-caddy-validate-shim.sh')
+TAKPORTAL_CADDY_SHIM_MARKER = 'infratak-caddy-validate-shim'
+
+
+def _takportal_install_caddy_validate_shim(log_fn=None):
+    """ops #298: put scripts/takportal-caddy-validate-shim.sh at ~/.local/bin/caddy.
+
+    TAK Portal's Marketplace "Deploy To Caddy" runs `caddy validate` over SSH as the console
+    user. On a non-root box that user cannot open Caddy's access log (0644 caddy:caddy) or read
+    /var/lib/caddy, so validate exits 1 with "permission denied" and the Portal says "Caddy
+    rejected the updated file" about a good file. The shim treats a validate whose ONLY errors
+    are permission-denied as inconclusive (the same carve-out _caddy_validate_config() has);
+    any other error keeps Caddy's own exit code. Nothing privileged: it is a file in the console
+    user's own home, ahead of /usr/bin on its login PATH. A root console needs nothing.
+
+    Never replaces a ~/.local/bin/caddy that is not ours. Idempotent. Returns one of
+    'installed' | 'current' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        if os.geteuid() == 0:
+            return 'skipped'
+        dest_dir = os.path.expanduser('~/.local/bin')
+        dest = os.path.join(dest_dir, 'caddy')
+        path = os.pathsep.join(d for d in os.environ.get('PATH', '').split(os.pathsep)
+                               if d and os.path.abspath(d) != os.path.abspath(dest_dir))
+        if not shutil.which('caddy', path=path):
+            return 'skipped'              # no host Caddy (Docker or none): nothing to validate
+        with open(TAKPORTAL_CADDY_SHIM_SRC, 'r', encoding='utf-8') as f:
+            want = f.read()
+        if os.path.lexists(dest):
+            with open(dest, 'r', encoding='utf-8', errors='replace') as f:
+                have = f.read()
+            if TAKPORTAL_CADDY_SHIM_MARKER not in have:
+                _say(f"  \u26a0 {dest} exists and is not infra-TAK's; leaving it alone "
+                     "(Marketplace Deploy To Caddy may fail validating as this user)")
+                return 'skipped'
+            if have == want and os.access(dest, os.X_OK) and not os.path.islink(dest):
+                return 'current'
+        os.makedirs(dest_dir, exist_ok=True)
+        tmp = dest + '.tmp-infratak'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(want)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+        _say(f"  \u2713 Caddy validate helper installed ({dest}): Marketplace Deploy To Caddy "
+             "no longer fails on Caddy files this user cannot open")
+        return 'installed'
+    except Exception as e:
+        _say(f"  \u26a0 Caddy validate helper not installed (non-fatal): {e}")
+        return 'error'
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -40226,6 +40591,9 @@ def _takportal_setup_ssh(log_fn=None):
         # was in. A box that cannot carry the grant (remote/containerized TAK)
         # reports a skip, not a failure.
         _takportal_install_sudoers(log_fn=log_fn)
+
+        # ops #298: Marketplace Deploy To Caddy validates as this user.
+        _takportal_install_caddy_validate_shim(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -40849,6 +41217,15 @@ def takportal_ssh_status():
             row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
                 '' if _h.get('granted') else
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
+            # TAK Portal 2.0.23+ ships a newer helper. It runs as root, so infra-TAK keeps
+            # the old pinned one until the new bytes are reviewed. Box test (ops #295, 2.0.24):
+            # Deploy/Redeploy To Caddy does not need it here. The portal falls back to
+            # copying through the broker's cp shim, so say that, not "will fail".
+            if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
+                row('Marketplace helper', 'na', 'newer version not reviewed yet',
+                    'This TAK Portal ships a newer marketplace helper that infra-TAK has not reviewed, '
+                    'so infra-TAK keeps the older one. The Marketplace "Deploy To Caddy" button does not '
+                    'need the newer helper on an infra-TAK box. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
                 'Run Repair to rewrite it.')
@@ -41714,6 +42091,26 @@ def mediamtx_recovery():
         _tp_unit = '/etc/systemd/system/mediamtx-webeditor.service'
         _tp_line = (f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
                     f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}')
+        # GH #330: a local unit deployed before Authentik never ran ensure_overlay.py, so the
+        # next editor self-update undid this patch (port 5000 -> 502). The restart below
+        # daemon-reloads it in.
+        if not (deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()):
+            try:
+                _ut = _read_priv(_tp_unit) or ''
+                _ut_new = _mediamtx_editor_unit_with_prestart(_ut)
+                if _ut_new != _ut:
+                    _write_priv(_tp_unit, _ut_new)
+            except Exception:
+                pass
+        # GH #330: an editor dying on `No module named 'flask'` was restarted into the same
+        # crash. Get its packages importable (as the editor runs) before the restart.
+        try:
+            if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+                deps_ok, deps_detail = _mediamtx_editor_remote_py_deps(deploy_cfg)
+            else:
+                deps_ok, deps_detail = _mediamtx_editor_ensure_py_deps()
+        except Exception as _de:
+            deps_ok, deps_detail = False, str(_de)[:200]
         cmd = (
             'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
@@ -41728,10 +42125,18 @@ def mediamtx_recovery():
         # Check if web editor actually came up
         ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
         active = ok_check and (check_out or '').strip() == 'active'
-        msg = 'Web editor patched; mediamtx-webeditor restarted and is running.' if active else (
-            'Patch applied and service restarted, but mediamtx-webeditor may still be down. '
-            'Click **Web editor logs** on this page to see why.'
-        )
+        if not deps_ok:
+            # GH #330: right after the restart the unit still reads 'active' for the second
+            # before the import fails, so a box with no Flask was told "running". Without its
+            # packages it cannot stay up: say that, whatever is-active said.
+            active = False
+            msg = ("Patch applied, but the web editor's Python packages "
+                   f"({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {deps_detail}")
+        elif active:
+            msg = 'Web editor patched; mediamtx-webeditor restarted and is running.'
+        else:
+            msg = ('Patch applied and service restarted, but mediamtx-webeditor may still be down. '
+                   'Click **Web editor logs** on this page to see why.')
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -41899,6 +42304,8 @@ def _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file):
         subprocess.run(_sudo_wrap(['chmod', 'g+rx', _d]), capture_output=True, timeout=15)
     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]),
                    capture_output=True, timeout=15)
+    # A MediaMTX unit written before Caddy existed has no group line (ops #313).
+    _mediamtx_unit_ensure_caddy_group()
 
 
 _MEDIAMTX_CONF_DIR = '/usr/local/etc'
@@ -41972,11 +42379,6 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
-    _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
-    ok, _ = _module_run(deploy_cfg, f'pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1', timeout=120)
-    if not ok:
-        _module_run(deploy_cfg, f'pip3 install {_pkgs} 2>&1 && pip3 install -U certifi 2>&1', timeout=120)
-    plog("✓ Python packages installed")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
     # any chown / unit install happens. See `_ensure_takwerx_system_user`
@@ -41985,6 +42387,11 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     created = _ensure_takwerx_system_user_remote(deploy_cfg, plog=plog)
     if not created:
         plog("  ✓ takwerx system user already present on remote host")
+
+    # After the user exists: the install is checked by importing as takwerx (GH #330).
+    _deps_ok, _deps_out = _mediamtx_editor_remote_py_deps(deploy_cfg)
+    plog("✓ Python packages installed" if _deps_ok else
+         f"  ⚠ web editor Python packages not importable as takwerx: {_deps_out}")
 
     # Step 2: Version + arch on remote
     plog("")
@@ -42569,8 +42976,13 @@ def run_mediamtx_deploy():
         # ops #202: certifi -U on every deploy — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
         plog("  Installing Python packages...")
-        _mediamtx_editor_install_py_deps()
-        plog("✓ Python packages installed")
+        # GH #330: this said ✓ whatever pip did. Step 5 retries and checks the import as the editor.
+        _s1_ok, _s1_out = _mediamtx_editor_install_py_deps()
+        if _s1_ok:
+            plog("✓ Python packages installed")
+        else:
+            _s1_tail = ((_s1_out or '').strip().splitlines()[-1:] or ['no output'])[0][:200]
+            plog(f"  ⚠ Python packages not installed yet ({_s1_tail}); retrying when the web editor is installed")
 
         # v0.9.31: ensure `takwerx` system user exists before any chown / unit
         # install happens. mediamtx.service + mediamtx-webeditor.service both
@@ -42792,11 +43204,14 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
-SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
 """
+        # The group line is only valid once Caddy has created the group; a unit that
+        # names a missing group dies with 216/GROUP (ops #313). Caddy installed later
+        # gets the line from _mediamtx_unit_ensure_caddy_group() when the cert is wired.
+        mediamtx_svc = _mediamtx_unit_with_caddy_group(mediamtx_svc) if _caddy_group_exists() else mediamtx_svc
         _write_priv('/etc/systemd/system/mediamtx.service', mediamtx_svc)
         plog("✓ mediamtx.service created")
 
@@ -43054,18 +43469,17 @@ WantedBy=multi-user.target
             )
 
         # Write self-healing overlay script — runs before every service start
-        # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated
-        if ldap_available:
-            heal_path = f'{webeditor_dir}/ensure_overlay.py'
-            with open(heal_path, 'w') as hf:
-                hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
-            os.chmod(heal_path, 0o755)
-            plog("✓ Self-healing overlay script installed (runs on every service start)")
+        # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated.
+        # With or without Authentik (GH #330): the port/bind patches are what keep a
+        # self-updated editor on 127.0.0.1:5080, where Caddy sends stream.<domain>.
+        heal_path = f'{webeditor_dir}/ensure_overlay.py'
+        with open(heal_path, 'w') as hf:
+            hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+        os.chmod(heal_path, 0o755)
+        plog("✓ Self-healing overlay script installed (runs on every service start)")
 
-        exec_start_pre = ''
-        if ldap_available:
-            # Dash prefix: pre-step failure must not block the editor from starting
-            exec_start_pre = f'ExecStartPre=-/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
+        # Dash prefix: pre-step failure must not block the editor from starting
+        exec_start_pre = f'{_MEDIAMTX_EDITOR_PRESTART}\n'
 
         editor_file = f'{webeditor_dir}/mediamtx_config_editor.py'
         if os.path.exists(editor_file):
@@ -43093,10 +43507,15 @@ WantedBy=multi-user.target
             plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
 
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
+        # GH #330: checked as the editor runs (takwerx, its HOME), not as the console.
+        _editor_deps_err = None
         if os.path.exists(editor_file):
-            _ok_deps, _ = _mediamtx_editor_install_py_deps()
+            _mediamtx_editor_install_py_deps()
+            _ok_deps, _deps_detail = _mediamtx_editor_ensure_py_deps()
             if not _ok_deps:
-                plog("  ⚠ pip install for web editor deps had issues (check logs); trying to start anyway")
+                _editor_deps_err = _deps_detail
+                plog(f"  ✗ Web editor Python packages ({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {_deps_detail}")
+                plog("    The web editor will not start until they are. Click Patch web editor to retry.")
             else:
                 plog("  ✓ Web editor Python deps installed")
 
@@ -43262,6 +43681,8 @@ WantedBy=multi-user.target
                               f'{cert_base}/{mtx_domain}'):
                         subprocess.run(_sudo_wrap(['chmod', 'g+rx', d]), capture_output=True)
                     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True)
+                    # Step 5 only writes the group line when the caddy group existed then (ops #313).
+                    _mediamtx_unit_ensure_caddy_group()
                     # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
                     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
                     # v10.1.33: message corrected — the group comes from the unit's
@@ -43300,9 +43721,14 @@ WantedBy=multi-user.target
         for _i in range(15):
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
             if r.stdout.strip() == 'active':
-                mtx_active = True
-                plog("✓ MediaMTX is active")
-                break
+                # A crash-looping unit (Restart=always) can read "active" for an instant
+                # between restarts; make sure it is still up a few seconds later (ops #313).
+                time.sleep(4)
+                r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
+                if r.stdout.strip() == 'active':
+                    mtx_active = True
+                    plog("✓ MediaMTX is active")
+                    break
             time.sleep(2)
         if not mtx_active:
             plog("⚠ MediaMTX did not become active within 30s — check: systemctl status mediamtx")
@@ -43347,7 +43773,12 @@ WantedBy=multi-user.target
 
             plog("")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            plog(f"🎉 MediaMTX v{version} deployed successfully!")
+            if _editor_deps_err:
+                # GH #330: the editor crash-loops without Flask; don't call that a success.
+                plog(f"⚠ MediaMTX v{version} deployed, but the web editor cannot start: its Python packages could not be installed ({_editor_deps_err}).")
+                plog("   Click Patch web editor on this page to retry.")
+            else:
+                plog(f"🎉 MediaMTX v{version} deployed successfully!")
             if domain:
                 mtx_display_domain = f"stream.{domain}"
                 plog(f"   Web Console: https://{_pub_hostport(mtx_display_domain)}")
@@ -43388,63 +43819,12 @@ _cloudtak_deploy_lock = threading.Lock()
 #   Set repo instead (or in addition) once the plugin has its own public repo.
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# ops #299: Cell Ping / RTT, Search Containment and CloudTAK Dispatcher moved to TAK Portal's
+# marketplace and are no longer hosted here. A box that already has one keeps it: the folder is
+# an untracked plugin dir like any marketplace plugin, so the foreign-plugin handling (carry
+# across a CloudTAK update, lint shield, npm deps, keep-in-build) covers it. Only the
+# Simulator panel stays until TAK Portal lists it.
 CLOUDTAK_PLUGINS = [
-    {
-        'key': 'ping',
-        'name': 'Cell Ping / RTT',
-        'description': (
-            'Plot cellphone tower coverage as CoT features. '
-            'Cell Ping produces a u-d-c-c uncertainty circle; '
-            'RTT produces a u-rb-a arc (±70° wedge). '
-            'Posts directly to an active DataSync mission.'
-        ),
-        'repo': 'https://github.com/clptak/cloudtak-plugin-cellphone',
-        'install_dir': 'ping',
-        'requires': 'CloudTAK 13.2+',
-        'author': 'clptak',
-        'license': 'MIT',
-    },
-    {
-        'key': 'search-containment',
-        'name': 'Search Containment',
-        'description': (
-            'ATAK Chokepoint-style containment for SAR: pick a mission shape, line, '
-            'or manual point, offset a containment ring by a distance, and generate '
-            'numbered markers wherever the trail network (snapping tileset) crosses '
-            'the ring — posted into the active DataSync mission. Requires a '
-            'snapping-enabled vector basemap (e.g. snapping.pmtiles).'
-        ),
-        'repo': 'https://github.com/clptak/cloudtak-plugin-search-containment',
-        'install_dir': 'search-containment',
-        'requires': 'CloudTAK 13.45+',
-        'author': 'clptak',
-        # No LICENSE file in the repo yet (author's ping plugin is MIT) — asked to add one.
-        'license': 'Unlicensed',
-    },
-    {
-        'key': 'tak-dispatcher',
-        'name': 'CloudTAK Dispatcher',
-        'description': (
-            'Standalone dispatcher plugin for CloudTAK — create incidents on the map, '
-            'notify responders via mission thread and direct message. Works without the '
-            'TAK-CAD server plugin; auto-upgrades to full TAK-CAD mode when detected.'
-        ),
-        # Deployed from its own public repo (like ping). The web plugin and the CloudTAK
-        # API routes live in separate subdirs: the installer clones the repo to a cache dir,
-        # copies plugin/ into web/plugins/ and server/*.ts into api/routes/. The server files
-        # must NOT land under web/plugins or CloudTAK's web build (vue-tsc) would type-check
-        # them (they import server-only api libs). plugin-takcad.ts is the optional TAK-CAD
-        # proxy; plugin-dispatcher.ts is the standalone Events/Incidents store.
-        'repo': 'https://github.com/takwerx/cloudtak-dispatcher-plugin',
-        'plugin_subpath': 'plugin',
-        'server_subpath': 'server',
-        'install_dir': 'tak-dispatcher',
-        # v10.1.4: server routes migrated to the 13.45 hub/api split contract
-        # (api/stateless/routes/, ConfigStateless) — the installer refuses pre-split trees.
-        'requires': 'CloudTAK 13.45+',
-        'author': 'takwerx',
-        'license': 'Proprietary',
-    },
     {
         'key': 'taksim',
         'name': 'TAK Simulator',
@@ -45268,7 +45648,14 @@ def _run_cloudtak_plugin_action(plugin_key, action):
                  'restart the console (startup heal re-patches it) or redeploy CloudTAK.')
 
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
-        plog(f'✓ Plugin {action_label} successfully.')
+        # ops #301: look in the web app that is now being served before calling it a success.
+        _in_app = (_cloudtak_verify_plugins_in_app(ct_dir, plog, only=[plugin['install_dir']])
+                   if action in ('install', 'update') else None)
+        if _in_app is False:
+            plog(f'⚠ Plugin {action_label}, but its menu entry did not make it into the rebuilt CloudTAK (see above).')
+            cloudtak_plugin_status['warning'] = 'menu entry not found in the built web app'
+        else:
+            plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
             plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
             plog('    If still on the old version: DevTools (F12) → Application → Clear site data, then reload.')
@@ -46900,9 +47287,183 @@ def _cloudtak_plugin_missing_deps(web, foreign):
     return missing
 
 
+# ops #299: CloudTAK main added `app/plugins/*` to .dockerignore (only *.ts and README stay), so
+# upstream's own plugin installer (WEB_PLUGINS) is the only way a plugin reaches the image. We
+# install by COPYING folders into app/plugins/, so on the first release that carries the line every
+# plugin we or TAK Portal installed would be left out of the build context: the build succeeds and
+# the menu item never appears. BuildKit reads `<Dockerfile>.dockerignore` before `.dockerignore`, so
+# an untracked Dockerfile.dockerignore (a copy of .dockerignore plus `!app/plugins/<dir>` per
+# installed folder) puts them back without touching a tracked file.
+_CT_DOCKERIGNORE_MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
+_CT_PLUGIN_DIR_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def _cloudtak_keep_plugins_in_build(ct_dir, plog):
+    """ops #299: make the api image build keep the plugin folders in this tree. Writes (or removes)
+    CloudTAK's untracked Dockerfile.dockerignore; never touches one we did not write. Never raises."""
+    try:
+        rel = os.path.relpath(_cloudtak_plugins_dir(ct_dir), ct_dir).replace(os.sep, '/')
+        base = os.path.join(ct_dir, '.dockerignore')
+        out = os.path.join(ct_dir, 'Dockerfile.dockerignore')
+        mine = False
+        if os.path.exists(out):
+            with open(out, encoding='utf-8', errors='replace') as f:
+                mine = f.readline().rstrip('\r\n') == _CT_DOCKERIGNORE_MARK
+            if not mine:
+                return                      # the operator's own file: theirs to keep
+        text = ''
+        if os.path.isfile(base):
+            with open(base, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        excluded = {rel, rel + '/', rel + '/*', rel + '/**'}
+        names = []
+        if any(ln.strip() in excluded for ln in text.splitlines()):
+            plugins = os.path.join(ct_dir, rel)
+            try:
+                names = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
+                               and os.path.isdir(os.path.join(plugins, n)))
+            except OSError:
+                names = []
+        if not names:
+            if mine:
+                os.remove(out)
+                plog('  Removed Dockerfile.dockerignore (CloudTAK no longer leaves plugins out of the build)')
+            return
+        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '']
+        for n in names:
+            lines += [f'!{rel}/{n}', f'{rel}/{n}/**/node_modules/']
+        want = '\n'.join(lines) + '\n'
+        have = None
+        if mine:
+            with open(out, encoding='utf-8') as f:
+                have = f.read()
+        if have != want:
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(want)
+            plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
+                 f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
+    except Exception as e:
+        plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
+
+
+# ops #301: "installed" is not "in the app". CloudTAK 13.102.0 moved its web folder; a plugin installer
+# that kept copying into the old one reported success and the plugin never reached the build (ops
+# #297, found by hand). After a rebuild we look in the web app the api container is SERVING for the
+# menu entry each plugin registers (its own `menu.add({key, label})`). A miss is a warning in the
+# install log, never a rollback: the check reads plugin source with regexes and can be wrong, the
+# build itself worked. The nightly in .github/workflows/cloudtak-plugins-nightly.yml does the same
+# on a stock CloudTAK build.
+_CT_MENU_ADD_RE = re.compile(r'\bmenu\s*\.\s*add\s*\(\s*(?=\{)')
+_CT_JS_STR = r"""(?:'((?:\\.|[^'\\\n])*)'|"((?:\\.|[^"\\\n])*)")"""
+_CT_JS_CONST_RE = re.compile(r'\bconst\s+([A-Za-z_]\w*)\s*(?::\s*string\s*)?=\s*' + _CT_JS_STR)
+_CT_APP_DIST = '/home/etl/app/dist'
+# $1 = menu key, $2 = label, $3 = the web app folder. The bundler writes strings with backticks
+# (rolldown) or double quotes (esbuild), so all three quote styles are tried; the label has to be a
+# `label:` value and the key has to be a string in the same file. Prints FOUND, MISSING or NODIST.
+_CT_IN_APP_SH = ('if [ -d "$3" ]; then '
+                 'r=$(find "$3" -name "*.js" | xargs -r grep -lF -e "label:\\"$2\\"" -e "label:\'$2\'" -e "label:\\`$2\\`" '
+                 '| xargs -r grep -lF -e "\\"$1\\"" -e "\'$1\'" -e "\\`$1\\`" | head -n 1); '
+                 'if [ -n "$r" ]; then echo FOUND; else echo MISSING; fi; else echo NODIST; fi')
+_CT_JS_PLAIN_RE = re.compile(r'[^\x00-\x1f\\\'"`$]{1,199}')
+
+
+def _cloudtak_plugin_menu_entries(plugin_dir):
+    """[(key, label)] a plugin registers with `menu.add({key: ..., label: ...})`, read from its source.
+    Only plain string literals and `const NAME = '...'` are understood; anything else is skipped."""
+    out = []
+    for root, dirs, files in os.walk(plugin_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ('node_modules', 'dist', '.git', 'test', 'tests', '__tests__'))
+        for n in sorted(files):
+            if not n.endswith(('.ts', '.js', '.mjs', '.vue')) or n.endswith('.d.ts'):
+                continue
+            try:
+                with open(os.path.join(root, n), encoding='utf-8', errors='replace') as f:
+                    text = f.read(500000)
+            except OSError:
+                continue
+            consts = {m.group(1): m.group(2) if m.group(2) is not None else m.group(3)
+                      for m in _CT_JS_CONST_RE.finditer(text)}
+            for m in _CT_MENU_ADD_RE.finditer(text):
+                i = m.end()
+                depth, quote, j = 0, None, i
+                while j < len(text):
+                    c = text[j]
+                    if quote:
+                        if c == '\\':
+                            j += 1
+                        elif c == quote:
+                            quote = None
+                    elif c in '\'"`':
+                        quote = c
+                    elif c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                body = text[i:j + 1]
+                vals = {}
+                for prop in ('key', 'label'):
+                    pm = re.search(r'(?:^|[\s,{])' + prop + r'\s*:\s*(?:' + _CT_JS_STR + r'|([A-Za-z_]\w*)\b)', body)
+                    if not pm:
+                        continue
+                    vals[prop] = (pm.group(1) if pm.group(1) is not None else pm.group(2)
+                                  if pm.group(2) is not None else consts.get(pm.group(3)))
+                k, lab = vals.get('key'), vals.get('label')
+                if (k and lab and _CT_JS_PLAIN_RE.fullmatch(k) and _CT_JS_PLAIN_RE.fullmatch(lab)
+                        and k.isascii() and lab.isascii() and (k, lab) not in out):
+                    out.append((k, lab))
+    return out
+
+
+def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
+    """Look for each plugin's menu entry in the web app the local api container serves.
+    Returns False when one is missing (and says which), True when all were found, None when it
+    could not look (container not running, no web app in it, no plugin with a menu entry).
+    `only`: install_dir names to check; default is every folder in the plugins dir. Never raises."""
+    try:
+        base = _cloudtak_plugins_dir(ct_dir)
+        names = sorted(n for n in os.listdir(base)
+                       if _CT_PLUGIN_DIR_RE.fullmatch(n) and os.path.isdir(os.path.join(base, n))) \
+            if os.path.isdir(base) else []
+        if only is not None:
+            names = [n for n in names if n in only]
+        found, missing = [], []
+        for n in names[:30]:
+            for key, label in _cloudtak_plugin_menu_entries(os.path.join(base, n)):
+                rc, out = _cloudtak_compose_at(
+                    ct_dir, ['exec', '-T', 'api', 'sh', '-c', _CT_IN_APP_SH, '_', key, label, _CT_APP_DIST],
+                    timeout=120)
+                # docker compose adds its own warning lines (stdout+stderr are joined): only our verdict words count
+                verdict = [ln.strip() for ln in (out or '').splitlines()
+                           if ln.strip() in ('FOUND', 'MISSING', 'NODIST')][-1:] or ['']
+                if rc == 0 and verdict[0] == 'FOUND':
+                    found.append((n, label))
+                elif rc == 0 and verdict[0] == 'MISSING':
+                    missing.append((n, label))
+                else:
+                    plog(f"  Could not look inside the CloudTAK api container to check the plugin menu entries "
+                         f"({(out or '').strip()[:120] or 'no output'})")
+                    return None
+        for n, label in found:
+            plog(f"  ✓ {n}: menu entry '{label}' is in the built web app")
+        for n, label in missing:
+            plog(f"  ⚠ {n}: menu entry '{label}' is NOT in the built web app. The plugin files were copied but "
+                 f"did not make it into the build, so the menu item will not show. Likely cause: CloudTAK "
+                 f"changed where it builds plugins from (this happened in 13.102.0). Please report it with this log.")
+        if not found and not missing:
+            return None
+        return not missing
+    except Exception as e:
+        plog(f"  ⚠ Could not check the plugin menu entries (non-fatal): {str(e)[:160]}")
+        return None
+
+
 def _cloudtak_shield_foreign_plugins(ct_dir, plog):
     """GH #252: re-apply TAK Portal's marketplace build edits before an image build. Never
     raises and never blocks the build: at worst the build fails as it would have anyway."""
+    _cloudtak_keep_plugins_in_build(ct_dir, plog)   # ops #299: ours and TAK Portal's alike
     try:
         foreign = _cloudtak_foreign_plugins(ct_dir)
         if not foreign:
@@ -47005,10 +47566,11 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 # plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
 # copy in shell, the functions above are sent as they are and run by the remote python3.
 _CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE')
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
 _CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                     '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                    '_cloudtak_plugin_missing_deps', '_cloudtak_shield_foreign_plugins')
+                    '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
+                    '_cloudtak_shield_foreign_plugins')
 
 
 def _cloudtak_shield_py():
@@ -48664,6 +49226,10 @@ def run_cloudtak_deploy(cfg=None):
         # GH #252: a redeploy over a tree with TAK Portal marketplace plugins must not lint them.
         _cloudtak_shield_foreign_plugins(cloudtak_dir, plog)
 
+        # ops #296: --no-cache does not re-fetch the FROM image, so a rebuild kept the Node it
+        # was first built on. Pull the base images first (a failed pull only warns).
+        _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
+
         # Build with retry logic (up to 2 attempts)
         MAX_BUILD_ATTEMPTS = 2
         BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
@@ -50280,6 +50846,8 @@ def run_cloudtak_update():
             # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
             # capture_output=True with timeout=2700 causes broker to timeout at 10min.
             # Stream output instead (same as deploy function).
+            # ops #296: same as ops #135 — build on the newest Node, not the one first built on.
+            _pull_base_images(cloudtak_dir, wrap=_sudo_wrap, plog=plog)
             plog("  Streaming build output...")
             # v10.1.4 WS8: on non-root boxes `docker` here is the broker shim, which
             # buffers and dies at the broker's 600s default — the streaming Popen alone
@@ -50393,6 +50961,7 @@ def run_cloudtak_update():
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
+            _cloudtak_verify_plugins_in_app(cloudtak_dir, plog)   # ops #301: plugins survived the new CloudTAK?
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -61245,16 +61814,50 @@ def _ldap_outpost_fqdn_precheck(fqdn, timeout=5):
     _ips, problem = _dns_resolve_ipv4(fqdn)
     if problem == 'missing':
         return False, f"{fqdn} has no DNS A record", ''
-    try:
-        ctx = ssl.create_default_context()
+    def _handshake(ctx):
         with socket.create_connection(('127.0.0.1', _caddy_https_port()), timeout=timeout) as raw:
             with ctx.wrap_socket(raw, server_hostname=fqdn) as tls:
-                der = tls.getpeercert(binary_form=True) or b''
+                return tls.getpeercert(binary_form=True) or b''
+    try:
+        der = _handshake(ssl.create_default_context())
     except ssl.SSLCertVerificationError as e:
-        return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+        # ops #306: an operator's own certificate (ssl_mode 'custom', e.g. a Cloudflare Origin
+        # cert) is not in this box's trust store, so the check above fails for it. The outpost
+        # runs with AUTHENTIK_INSECURE=true and never verifies the chain, so an untrusted chain
+        # is fine for it, while keeping it on internal routing leaves every LDAP bind failing
+        # with "exceeded stage recursion depth" on Authentik 2026.x. Only a trust-chain failure
+        # on a custom-cert box with an insecure-mode outpost is waived, and the handshake still
+        # has to complete: a name Caddy has no certificate for is still refused.
+        if (getattr(e, 'verify_code', None) not in _LDAP_UNTRUSTED_CHAIN_CODES
+                or (load_settings().get('ssl_mode') or '') != 'custom'
+                or not _ldap_outpost_skips_tls_verify()):
+            return False, f"Caddy's certificate for {fqdn} is not valid ({getattr(e, 'verify_message', '') or e})", ''
+        try:
+            unverified = ssl.create_default_context()
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            der = _handshake(unverified)
+        except (ssl.SSLError, OSError) as e2:
+            return False, f"Caddy has no working certificate for {fqdn} ({e2})", ''
     except (ssl.SSLError, OSError) as e:
         return False, f"Caddy has no working certificate for {fqdn} ({e})", ''
     return True, '', hashlib.sha256(der).hexdigest()
+
+
+# OpenSSL verify codes for "the chain does not end in a CA this box trusts": self-signed leaf,
+# self-signed cert in the chain, issuer not found, leaf signature not verifiable. Not expiry,
+# not a name mismatch.
+_LDAP_UNTRUSTED_CHAIN_CODES = (18, 19, 20, 21)
+
+
+def _ldap_outpost_skips_tls_verify():
+    """True when ~/authentik/docker-compose.yml runs the LDAP outpost with AUTHENTIK_INSECURE
+    true (the infra-TAK template always does), i.e. it does not check Caddy's certificate."""
+    try:
+        with open(os.path.join(os.path.expanduser('~/authentik'), 'docker-compose.yml')) as f:
+            return bool(re.search(r'AUTHENTIK_INSECURE:\s*["\']?true["\']?\s*$', f.read(), re.M | re.I))
+    except OSError:
+        return False
 
 
 def _ldap_fqdn_move_backoff(fqdn, cert_sha256, now=None):
@@ -62775,6 +63378,9 @@ def _reassert_mediamtx_cert_grant(plog=None):
         # Grant is intact only if cert+key are group-readable AND every dir up the Caddy chain
         # is group-readable+traversable (rx). Any missing bit → re-apply.
         need = (_grp(cert_mode) & 4) == 0 or (bool(key_mode) and (_grp(key_mode) & 4) == 0)
+        # A unit written before Caddy existed has no group line; add it and bounce below.
+        if _mediamtx_unit_ensure_caddy_group():
+            need = True
         if not need:
             for d in (cert_base, cert_dir):
                 dmode = _pmode(d)
@@ -66419,6 +67025,12 @@ _TAK_API_CHECK_RETRY_MAX_S = 60
 # so "TAK is asking for the user" kept the full 5 min. A working TAK sends one search per
 # login, so the user only counts as looked up when its searches reach half the check's logins.
 _TAK_API_CHECK_STUCK_S = 30
+# ops #316: test6, the check user was the tak-dev emulator and TAK's API gave it no groups
+# while it gave everyone else theirs (the same on the released v10.3.2-alpha), and the update
+# restarted TAK Server, dropping every client. Before a "broken" verdict restarts TAK, up to
+# this many other users get the same check; one of them passing means only the first user's
+# lookup is stale.
+_TAK_API_CHECK_OTHERS = 3
 
 
 def _ldap_outpost_tak_searches(since):
@@ -66607,21 +67219,27 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
     off, for up to `wait_s`. `early`: from round 2 on, stop waiting as soon as TAK is
     plainly not asking LDAP for the user while it asks for others (`_tak_api_check_stuck`).
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
-    refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
-    check with, or the cert or the API couldn't be used)."""
+    refused the list or the create, while LDAP gives it groups, and no other user passes
+    either); 'oneuser' (the same for that user only: another user passes the whole check,
+    ops #316); 'unknown' (no user to check with, or the cert or the API couldn't be used)."""
     file_users = _tak_file_users()
 
-    def _pick(groups):
+    def _picks(groups, skip=()):
+        out = []
         for cn in sorted(groups or {}, key=str.lower):
             all_g = [x for x in groups[cn] if x not in ('__ANON__', '')]
             # Only groups the user can read AND write: TAK lists a *_WRITE (feed-in only)
             # group on no groups/all, and the mission create needs write access, so a
             # write-only Node-RED feed user would always read as "no groups" (ops #278).
             g = [x for x in all_g if not re.search(r'_(?:read|write)$', x, re.I)]
-            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users
+            if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users and cn not in skip
                     and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
-                return cn, g
-        return None
+                out.append((cn, g))
+        return out
+
+    def _pick(groups):
+        found = _picks(groups)
+        return found[0] if found else None
 
     live = {s['cn'] for s in (_tak_client_sessions() or []) if s['cn'] and not s['unnamed']}
     groups = _ldap_users_tak_groups(ldap_pass, live) if live else {}
@@ -66635,6 +67253,29 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         return 'unknown', "no non-admin LDAP user with read/write TAK groups to check with"
     cn, ldap_groups = pick
     t0 = time.time()
+
+    def _second_opinion(verdict, summary):
+        """ops #316: the check user got no groups. TAK looks every login up on its own, and one
+        user's lookup can stay empty (a stale cache entry, test6's emulator) while TAK's API
+        gives everyone else their groups, so a restart wouldn't help the other users. Ask up to
+        `_TAK_API_CHECK_OTHERS` other users first; if one of them passes the full check, only
+        `cn` is affected: 'oneuser', no TAK restart. None of them passing (or none to ask)
+        leaves the verdict as it was."""
+        try:
+            others = _picks(_ldap_users_tak_groups(ldap_pass), skip=(cn,))[:_TAK_API_CHECK_OTHERS]
+        except Exception:
+            others = []
+        for other, other_groups in others:
+            for _ in range(_TAK_API_CHECK_TRIES):
+                v, s2 = _tak_api_user_check_once(other, other_groups)
+                if v != 'broken':
+                    break
+            if v == 'ok':
+                plog(f"  {tag}: HTTPS check as {other} passes ({s2}) while {cn} gets no groups")
+                return 'oneuser', (f"{summary}; but TAK's API gives {other} its groups ({s2}), so only "
+                                   f"{cn} is affected and a TAK Server restart wouldn't help the others")
+        return verdict, summary
+
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
     logins, said = [], None
     while True:
@@ -66654,8 +67295,8 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
             path, why = _tak_api_check_stuck(cn, t0, logins)
             if path == 'stuck':
                 plog(f"  {tag}: HTTPS check round {rnd}: {why} — not waiting the rest of the {wait_s}s, "
-                     f"TAK Server needs a restart")
-                return verdict, f"{summary}; {why}"
+                     f"checking with another user before TAK Server is restarted")
+                return _second_opinion(verdict, f"{summary}; {why}")
             if path != said:
                 plog(f"  {tag}: HTTPS check round {rnd}: {why} — keeping the {wait_s}s wait")
                 said = path
@@ -66663,7 +67304,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         if left <= 0:
             if early:
                 plog(f"  {tag}: HTTPS check: still no groups for {cn} after the full {wait_s}s wait")
-            return verdict, summary
+            return _second_opinion(verdict, summary) if verdict == 'broken' else (verdict, summary)
         wait = int(min(delay, left))
         plog(f"  {tag}: HTTPS check round {rnd} ({n} login(s)): {summary} — trying again in {wait}s")
         time.sleep(wait)
@@ -66850,6 +67491,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 plog(f"  ✓ {tag}: {summary}; {api_summary} — no TAK Server restart needed")
                 _finish(outcome, healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
+            if api_verdict == 'oneuser':
+                plog(f"  {tag}: {summary}; HTTPS/API side works for other users, not for one: {api_summary} — "
+                     f"no TAK Server restart")
+                _finish(outcome + ' (HTTPS fine for other users)', healed_ldap_start=ldap_start,
+                        healed_gd_restart=gd_restart)
+                return False
             if api_verdict == 'unknown':
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
                 _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
@@ -66887,6 +67534,9 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         elif api_verdict == 'unknown':
             plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
             _finish('restarted (HTTPS not checked)')
+        elif api_verdict == 'oneuser':
+            plog(f"  {tag}: after the restart, HTTPS/API side works for other users, not for one: {api_summary}")
+            _finish('restarted (HTTPS fine for other users)')
         else:
             plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
                  f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
@@ -83102,6 +83752,27 @@ def _tak_target_version_gate(*filenames):
     return None
 
 
+def _tak_already_on_58():
+    """True when this box already runs TAK Server 5.8+ on PostgreSQL 18.
+
+    Such a box has nothing left to migrate: the 5.8 migration would stop TAK, "install"
+    the same major, find no PostgreSQL 15 for upgrade-db.sh and exit 1, and the console
+    then reports a healthy server as "MID-UPGRADE" (field: ops #309). A 5.8.x update for
+    it is the ordinary package upgrade. Both facts must be positive - the installed
+    version AND the database actually answering as 18 (a managed database is asked, not
+    the local cluster) - so a PG-15 box, or one whose database cannot be read, still
+    takes the guarded migration or the gate. Two-server boxes are left to their own
+    migration, which already skips Server One when it is on 18.
+    """
+    try:
+        ver = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
+        if not ver or ver < TAK_GATE_BLOCK_FROM:
+            return False
+        return bool(((_tak_58_preflight() or {}).get('facts') or {}).get('already_migrated'))
+    except Exception:
+        return False
+
+
 @app.route('/api/takserver/update', methods=['POST'])
 @login_required
 def takserver_update():
@@ -83138,6 +83809,13 @@ def takserver_update():
         pass
     _is58 = any((_tak_artifact_version(f) or (0, 0)) >= TAK_GATE_BLOCK_FROM
                 for f in (_pending_zips if _tak_is_container() else _pending))
+    # ops #309: a box already on 5.8 + PostgreSQL 18 has no migration to run, and the gate
+    # exists only to keep the PG-15 wedge away from the plain path. Take the ordinary
+    # upgrade below for it.
+    _gate = _tak_target_version_gate
+    if _is58 and _tak_already_on_58():
+        _is58 = False
+        _gate = lambda *_a: None
     if _is58 and _tak_is_container():
         # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
         # existing data-preserving container upgrade cannot be used - it deliberately
@@ -83230,7 +83908,7 @@ def takserver_update():
         if not _zips:
             return jsonify({'error': 'Container upgrade: upload the new takserver-docker-*.zip bundle (not a .deb).'}), 400
         _zip = os.path.join(UPLOAD_DIR, sorted(_zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
-        _g = _tak_target_version_gate(_zip)
+        _g = _gate(_zip)
         if _g:
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
@@ -83253,7 +83931,7 @@ def takserver_update():
             _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
             if not _core_rpm or not _db_rpm:
                 return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
-            _g = _tak_target_version_gate(_core_rpm, _db_rpm)
+            _g = _gate(_core_rpm, _db_rpm)
             if _g:
                 return jsonify({'error': _g}), 400
             _s1 = _tak_cfg.get('server_one', {})
@@ -83271,7 +83949,7 @@ def takserver_update():
                        key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
         if not _rpms:
             return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
-        _g = _tak_target_version_gate(_rpms[0])
+        _g = _gate(_rpms[0])
         if _g:
             return jsonify({'error': _g}), 400
         # external_db: pass the RDS block so the upgrade runs SchemaManager against the managed DB.
@@ -83295,7 +83973,7 @@ def takserver_update():
         db_pkg = next((f for f in pkg_files if 'database' in f.lower()), '')
         if not core_pkg or not db_pkg:
             return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .deb packages. Upload both.'}), 400
-        _g = _tak_target_version_gate(core_pkg, db_pkg)
+        _g = _gate(core_pkg, db_pkg)
         if _g:
             return jsonify({'error': _g}), 400
         s1 = tak_cfg.get('server_one', {})
@@ -83313,7 +83991,7 @@ def takserver_update():
         single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
         if not single_pkgs:
             return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
-        _g = _tak_target_version_gate(single_pkgs[0])
+        _g = _gate(single_pkgs[0])
         if _g:
             return jsonify({'error': _g}), 400
         upgrade_log.clear()
@@ -92333,6 +93011,22 @@ def _os_upgrade_start_job(data):
     return _os_upgrade_launch(pf, remote)
 
 
+def _os_upgrade_unit_cmd():
+    """The one systemd-run shape the broker allows for the OS-upgrade unit."""
+    return [
+        'systemd-run',
+        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
+        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
+        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
+        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
+        '--setenv=DEBIAN_FRONTEND=noninteractive',
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
+        '--no-block',
+        '/bin/bash', _OS_UPGRADE_SCRIPT,
+    ]
+
+
 def _os_upgrade_launch(pf, remote='?'):
     """Write the baseline + script and spawn the detached unit. (http_status, payload).
     Split from _os_upgrade_start_job so the W12.c backup thread can call it."""
@@ -92351,20 +93045,8 @@ def _os_upgrade_launch(pf, remote='?'):
         _write_priv(_OS_UPGRADE_SCRIPT, script, perm=0o755)
     except Exception as e:
         return 500, {'ok': False, 'error': f'could not prepare the upgrade job: {str(e)[:200]}'}
-    cmd = [
-        'systemd-run',
-        '--unit=' + _OS_UPGRADE_UNIT.replace('.service', ''),
-        '--description=infra-TAK OS upgrade Ubuntu 22.04 -> 24.04 (detached)',
-        '--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE,
-        '--property=StandardError=append:' + _OS_UPGRADE_LOGFILE,
-        '--setenv=DEBIAN_FRONTEND=noninteractive',
-        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
-        '--setenv=RELEASE_UPGRADER_NO_SCREEN=1',
-        '--no-block',
-        '/bin/bash', _OS_UPGRADE_SCRIPT,
-    ]
     try:
-        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=20)
+        r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
     except Exception as e:
         return 500, {'ok': False, 'error': f'systemd-run spawn failed: {str(e)[:200]}'}
     if r.returncode != 0:
@@ -92454,6 +93136,39 @@ def _os_upgrade_routes_available():
     return os_type in (_OS_UPGRADE_FROM, _OS_UPGRADE_TO)
 
 
+def _ubuntu_pro_security_covered(raw=None):
+    """True only on positive evidence that Ubuntu Pro security updates (esm-infra) are
+    attached, enabled and not expired. The 24.04 card quiets down on this (GH #320).
+    Any doubt - no `pro` client, a command error, odd JSON, expired or missing expiry -
+    is False, so the full card shows exactly as it did before. `raw` is injectable for
+    tests; production asks `pro status`, which needs no privilege (read-only, cached)."""
+    try:
+        if raw is None:
+            pro = '/usr/bin/pro'
+            if not os.path.exists(pro):
+                return False
+            r = subprocess.run([pro, 'status', '--format', 'json'], capture_output=True,
+                               text=True, timeout=15)
+            if r.returncode != 0:
+                return False
+            raw = r.stdout
+        d = json.loads(raw)
+        if not isinstance(d, dict) or d.get('attached') is not True:
+            return False
+        svc = [x for x in (d.get('services') or []) if isinstance(x, dict) and x.get('name') == 'esm-infra']
+        if len(svc) != 1 or svc[0].get('status') != 'enabled':
+            return False
+        exp = d.get('expires')
+        if not isinstance(exp, str) or not exp:
+            return False
+        when = datetime.fromisoformat(exp.replace('Z', '+00:00'))
+        if when.tzinfo is None:
+            return False
+        return when > datetime.now(when.tzinfo)
+    except Exception:
+        return False
+
+
 def _startup_os_upgrade_verify():
     """Post-reboot half of step 8: the console that boots after the flip sees status
     `rebooting`, marks `verifying`, waits for the baseline containers/services to come
@@ -92532,6 +93247,121 @@ def _startup_os_upgrade_verify():
     return True
 
 
+# ops #284 (field, 2026-10-27): boxes that v10.3.0 stopped at `reassert` over the 5.8
+# migration's stopped PG 15 are on 24.04 with the rebuilt venv, but the job's cleanup and
+# console restart never ran. Updating the console is the restart; this does the rest, once,
+# with the fixed check: re-run reassert's PG rule, the cleanup it skipped, then the same
+# post-reboot verify (no reboot: the console's existing "restart needed" flag asks for it).
+# Same transient unit, script path and gated systemd-run shape as the job — no broker change.
+_OS_UPGRADE_FINISH_MARK = _OS_UPGRADE_DIR + '/finish-reassert-tried'
+
+
+def _os_upgrade_finish_script(pg_expect):
+    """Bash that finishes a box the job stopped at reassert (see above). Pure, for tests."""
+    q = shlex.quote
+    return ''.join((
+        (
+            '#!/bin/bash\n'
+            '# infra-TAK: finish an OS upgrade that stopped at reassert (ops #284). Written by the\n'
+            '# console, run as root in the transient unit infratak-os-upgrade. Do not run by hand.\n'
+            'set -o pipefail\n'
+            f'STATE_DIR={q(_OS_UPGRADE_DIR)}\n'
+            f'STATUS={q(_OS_UPGRADE_STATUS)}\n'
+            'PRE="$STATE_DIR/pre"\n'
+            f'PG_EXPECT={q(pg_expect)}\n'
+        ),
+        _OS_UPGRADE_SH_FUNCS,
+        (
+            'echo "[$(TS)] === finishing the OS upgrade that stopped at reassert (console update, pid $$) ==="\n'
+            'step reassert\n'
+            '. /etc/os-release\n'
+            '[ "$VERSION_ID" = "24.04" ] || fail reassert "this box is ${PRETTY_NAME:-unknown}, not Ubuntu 24.04"\n'
+            'PG_NEXT="Nothing was changed by this retry. Finish by hand: sudo rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg; sudo systemctl enable docker; echo rebooting | sudo tee $STATUS; sudo reboot"\n'
+        ),
+        _OS_UPGRADE_SH_PG_CHECK,
+        (
+            'if systemctl list-unit-files docker.service 2>/dev/null | grep -q docker.service; then systemctl enable docker >/dev/null 2>&1 || true; fi\n'
+            'rm -f /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+            'systemctl daemon-reload\n'
+            'if systemctl list-unit-files takwerx-broker.service 2>/dev/null | grep -q takwerx-broker; then systemctl restart takwerx-broker || echo "[$(TS)] WARN: takwerx-broker restart returned $?"; fi\n'
+            'echo "[$(TS)] reassert complete; the console now checks that every service and container is back"\n'
+            'echo "verifying" > "$STATUS"\n'
+        ),
+    ))
+
+
+def _os_upgrade_finish_eligible():
+    """(ok, why) for _startup_os_upgrade_finish_reassert. Read-only."""
+    if _os_upgrade_read_status() != 'failed:reassert':
+        return False, 'status is not failed:reassert'
+    if _read_os_release()[0] != _OS_UPGRADE_TO:
+        return False, 'not on Ubuntu 24.04'
+    if os.path.exists(_OS_UPGRADE_FINISH_MARK):
+        return False, 'already tried once'
+    try:
+        expect = (json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or '')
+    except Exception:
+        expect = ''
+    if not expect:
+        return False, 'baseline has no pg_expect'
+    ok, detail = _os_upgrade_pg_layout(_os_upgrade_pg_clusters(), expect)
+    return (ok, detail if ok else 'PostgreSQL layout still unsafe: ' + detail)
+
+
+def _startup_os_upgrade_finish_reassert(initial_wait_s=60, wait_s=2700, poll_s=10):
+    """Start the finish thread when eligible. Returns True when it started."""
+    ok, why = _os_upgrade_finish_eligible()
+    if not ok:
+        return False
+
+    def _finish():
+        try:
+            # The console update that brought this code in runs its post-update deploy now;
+            # the finish restarts the broker, so it waits for that to end.
+            time.sleep(initial_wait_s)
+            lock = '/var/lib/takwerx-console/update-now.lock'
+            end = time.time() + wait_s
+            while (_POST_UPDATE_ACTIVE['on'] or os.path.exists(lock)) and time.time() < end:
+                time.sleep(poll_s)
+            ok2, why2 = _os_upgrade_finish_eligible()
+            if not ok2:
+                print(f"[os-upgrade] finish after reassert skipped: {why2}", flush=True)
+                return
+            _write_priv(_OS_UPGRADE_FINISH_MARK, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ') + '\n', perm=0o644)
+            expect = json.loads(_read_priv(_OS_UPGRADE_BASELINE) or '{}').get('pg_expect') or ''
+            load, active, _s, _r, _p = _os_upgrade_unit_state()
+            if active in ('active', 'activating'):
+                return
+            if load == 'loaded':
+                subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', _OS_UPGRADE_UNIT]),
+                               capture_output=True, timeout=5)
+            _write_priv(_OS_UPGRADE_SCRIPT, _os_upgrade_finish_script(expect), perm=0o755)
+            _os_upgrade_write_status('running:reassert')
+            r = subprocess.run(_sudo_wrap(_os_upgrade_unit_cmd()), capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                _os_upgrade_write_status('failed:reassert')
+                print(f"[os-upgrade] finish after reassert: systemd-run returned {r.returncode}: "
+                      f"{(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+                return
+            print("[os-upgrade] finishing the upgrade that stopped at reassert (fixed check)", flush=True)
+            try:
+                audit('os-upgrade:finish-reassert', f'pg_expect={expect}')
+            except Exception:
+                pass
+            end = time.time() + 600
+            while time.time() < end:
+                time.sleep(poll_s)
+                if not _os_upgrade_read_status().startswith('running:'):
+                    break
+            if _os_upgrade_read_status() == 'verifying':
+                _startup_os_upgrade_verify()
+        except Exception as e:
+            print(f"[os-upgrade] finish after reassert error: {e}", flush=True)
+
+    threading.Thread(target=_finish, daemon=True, name='os-upgrade-finish').start()
+    return True
+
+
 @app.route('/api/console/os-upgrade/preflight')
 @login_required
 def console_os_upgrade_preflight_api():
@@ -92573,6 +93403,9 @@ def console_os_upgrade_status_api():
         st.update({'ok': True, 'os_type': os_type, 'os_name': os_name,
                    'from': _OS_UPGRADE_FROM, 'to': _OS_UPGRADE_TO,
                    'can_start': os_type == _OS_UPGRADE_FROM and st['state'] not in ('running', 'rebooting', 'verifying')})
+        # GH #320: Pro-covered 22.04 boxes get the one-line card. Only asked when the idle
+        # card can show; a running/failed/done upgrade always renders in full.
+        st['pro_covered'] = bool(st['can_start'] and st['state'] == 'idle' and _ubuntu_pro_security_covered())
         return jsonify(st)
     except Exception as e:
         return jsonify({'ok': False, 'state': 'unknown', 'error': f'status error: {str(e)[:200]}'}), 500
@@ -97172,11 +98005,57 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
-SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def _caddy_group_exists():
+    """True when the `caddy` group is on this box (Caddy's package creates it)."""
+    try:
+        return subprocess.run(['getent', 'group', 'caddy'], capture_output=True,
+                              timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _mediamtx_unit_with_caddy_group(txt):
+    """Return `txt` with `SupplementaryGroups=caddy` right after `User=takwerx`.
+
+    Idempotent. systemd refuses to start a unit whose SupplementaryGroups= names a group
+    that does not exist (status=216/GROUP), and the `caddy` group only exists once Caddy
+    is installed, so the line may only be written when the group is there (ops #313)."""
+    if re.search(r'(?m)^SupplementaryGroups=.*\bcaddy\b', txt):
+        return txt
+    return re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
+
+
+def _mediamtx_unit_text():
+    """The mediamtx.service text for THIS box: group `caddy` only if it exists."""
+    if _caddy_group_exists():
+        return _mediamtx_unit_with_caddy_group(_MEDIAMTX_UNIT_TEXT)
+    return _MEDIAMTX_UNIT_TEXT
+
+
+def _mediamtx_unit_ensure_caddy_group(unit_path='/etc/systemd/system/mediamtx.service'):
+    """Add `SupplementaryGroups=caddy` to an installed unit that lacks it, once Caddy exists.
+
+    MediaMTX deployed before Caddy has no group line (see _mediamtx_unit_text); when Caddy
+    comes later and the stream cert is wired, the service needs the group to read it.
+    Returns True when the unit was changed; the CALLER does daemon-reload + restart.
+    Never raises."""
+    try:
+        if not _caddy_group_exists():
+            return False
+        cur = _read_priv(unit_path)
+        new = _mediamtx_unit_with_caddy_group(cur)
+        if new == cur:
+            return False
+        _write_priv(unit_path, new)
+        return True
+    except Exception:
+        return False
 
 
 _MEDIAMTX_TRUSTED_PROXIES_KEY = 'INFRATAK_TRUSTED_PROXIES'
@@ -97403,7 +98282,7 @@ def _startup_converge_mediamtx_unit_nonroot():
                 _grant_caddy_cert_read(cb, cd, cf, kf)
         subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
 
-        _write_priv(unit_path, _MEDIAMTX_UNIT_TEXT)
+        _write_priv(unit_path, _mediamtx_unit_text())
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
         ok = False
@@ -99316,6 +100195,7 @@ def _fail2ban_install_and_configure(plog):
         "enabled  = true\n"
         "filter   = authentik\n"
         "logpath  = /var/log/authentik/auth.log\n"
+        "backend  = auto\n"
         "# 5 failed logins within 10 minutes → ban for 1 hour\n"
         "maxretry = 5\n"
         "findtime = 600\n"
@@ -100300,38 +101180,167 @@ _MEDIAMTX_EDITOR_PY_PKGS = ('Flask', 'ruamel.yaml', 'requests', 'psutil')
 _MEDIAMTX_EDITOR_PY_IMPORTS = 'import flask, ruamel.yaml, requests, psutil'
 _MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
 _MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+_MEDIAMTX_EDITOR_USER = 'takwerx'
+_MEDIAMTX_EDITOR_HOME_DROPIN = '/etc/systemd/system/mediamtx-webeditor.service.d/20-infratak-home.conf'
+# pip's refusal to replace an apt-installed package (no RECORD file), pip 23.x and 24.x wording.
+_MEDIAMTX_PIP_DISTRO_OWNED = 'Cannot uninstall'
 
 
 def _mediamtx_editor_install_py_deps(timeout=120):
     """(ok, output) — `pip3 install … --break-system-packages` (PEP 668 on 24.04 / Debian 12),
     retried without the flag on an older pip that does not know it. Runs as the console
-    process, exactly as the deploy always has, so the packages land where the editor's
-    interpreter looks for them."""
+    process, exactly as the deploy always has: as root that is the system site, as the
+    non-root console it is takwerx's `pip --user` site under the console's HOME.
+
+    GH #330: PYTHONNOUSERSITE=1 as root — a Flask in /root/.local satisfies pip ("already
+    satisfied") and passes root's own import check, but the editor runs as takwerx and
+    cannot see it, so nothing was ever installed where the editor looks.
+
+    GH #330 (fresh deploy): as root on Ubuntu 24.04, Flask 3.1 needs blinker >= 1.9 and the
+    distro's python3-blinker 1.7 (pulled in by software-properties-common via oauthlib) has
+    no RECORD file, so pip stops with "Cannot uninstall blinker … installed by debian" and
+    installs NOTHING. Retry with --ignore-installed: pip writes its copy to /usr/local, which
+    shadows /usr/lib/python3/dist-packages, and leaves the apt one alone."""
+    env = dict(os.environ)
+    if os.geteuid() == 0:
+        env['PYTHONNOUSERSITE'] = '1'
+
+    def _pip(args):
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout, env=env)
+        if r.returncode != 0 and _MEDIAMTX_PIP_DISTRO_OWNED in (r.stdout or ''):
+            r = subprocess.run(args + ['--ignore-installed'], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
+        return r
+
     base = ['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)
     _flag = ['--break-system-packages']
-    r = subprocess.run(base + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    r = _pip(base + _flag)
     if r.returncode != 0 and 'no such option' in (r.stdout or ''):
         _flag = []
-        r = subprocess.run(base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, timeout=timeout)
+        r = _pip(base)
     if r.returncode == 0:
         # ops #202: certifi -U every time — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
-        subprocess.run(['pip3', 'install', '-U', 'certifi'] + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        _pip(['pip3', 'install', '-U', 'certifi'] + _flag)
     return r.returncode == 0, (r.stdout or '')
 
 
-def _mediamtx_editor_python_ok():
-    """True when the editor's interpreter can import its packages in the console's own
-    context (the one deploy installed them in). Unknown -> True: never "heal" on a guess."""
+def _mediamtx_editor_home():
+    """The HOME systemd gives the editor: our drop-in's when present, else takwerx's passwd
+    entry. None when takwerx does not exist."""
     try:
-        r = subprocess.run(['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
-                           capture_output=True, text=True, timeout=30)
+        if os.path.exists(_MEDIAMTX_EDITOR_HOME_DROPIN):
+            m = re.search(r'^Environment=HOME=(\S+)', _read_priv(_MEDIAMTX_EDITOR_HOME_DROPIN) or '', re.M)
+            if m:
+                return m.group(1)
+        import pwd
+        return pwd.getpwnam(_MEDIAMTX_EDITOR_USER).pw_dir
+    except Exception:
+        return None
+
+
+def _mediamtx_editor_python_ok():
+    """True when the editor can import its packages the way it actually runs: as takwerx,
+    with the HOME systemd gives it, and nothing from the console's environment.
+
+    GH #330: this used to ask in the console's own context. On a box where that differs
+    from the editor's (packages only in /root/.local; or a non-root console with
+    HOME=/home/takwerx while takwerx's passwd home is still /nonexistent) the check passed,
+    the heal never ran, and the editor crash-looped on `No module named 'flask'`.
+    Unknown -> True: never "heal" on a guess."""
+    try:
+        home = _mediamtx_editor_home()
+        if not home:
+            return True
+        argv = ['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS]
+        # sbin too: runuser lives in /usr/sbin, and subprocess looks argv[0] up in THIS PATH.
+        # Without it the root check raised FileNotFoundError -> "unknown" -> True, every time.
+        env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': home}
+        if os.geteuid() == 0:
+            argv = ['runuser', '-u', _MEDIAMTX_EDITOR_USER, '--', 'env', f'HOME={home}'] + argv
+        else:
+            import pwd
+            if pwd.getpwuid(os.geteuid()).pw_name != _MEDIAMTX_EDITOR_USER:
+                env['HOME'] = os.environ.get('HOME') or home   # cannot be takwerx: console's view
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
         return r.returncode == 0
     except Exception:
         return True
+
+
+def _mediamtx_editor_pin_home():
+    """GH #330, non-root console only: point the editor's HOME at the console's, where
+    `pip --user` puts the editor's packages. Returns True when it wrote the drop-in.
+
+    start.sh's root -> non-root flip runs `usermod -d /home/takwerx … || true`, and usermod
+    refuses (exit 8, "user takwerx is currently used by process") while mediamtx and the
+    editor are running as takwerx. So on a migrated box takwerx's passwd home stays
+    /nonexistent: the console (HOME=/home/takwerx from its unit) installs Flask there, the
+    editor (HOME=/nonexistent from systemd) never sees it. A drop-in, like the journal one,
+    because the deploy rewrites the unit itself."""
+    if os.geteuid() == 0:
+        return False
+    try:
+        import pwd
+        if pwd.getpwuid(os.geteuid()).pw_name != _MEDIAMTX_EDITOR_USER:
+            return False
+        home = os.environ.get('HOME') or ''
+        # It goes into a unit file: a plain absolute path only, nothing that could add a line.
+        if (not re.fullmatch(r'/[A-Za-z0-9._/-]+', home) or not os.path.isdir(home)
+                or home == _mediamtx_editor_home()):
+            return False
+        subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.dirname(_MEDIAMTX_EDITOR_HOME_DROPIN)]),
+                       capture_output=True, timeout=20)
+        _write_priv(_MEDIAMTX_EDITOR_HOME_DROPIN,
+                    "# infra-TAK GH #330: the editor imports Flask from the console's pip --user site.\n"
+                    f"[Service]\nEnvironment=HOME={home}\n")
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        return True
+    except Exception as e:
+        print(f'MediaMTX web editor: HOME drop-in error (non-fatal): {e}', flush=True)
+        return False
+
+
+def _mediamtx_editor_ensure_py_deps():
+    """(ok, detail) — leave the editor able to import its packages as it runs. Shared by the
+    deploy, Patch web editor and the startup heal. Does not restart the editor."""
+    if _mediamtx_editor_python_ok():
+        return True, 'already importable'
+    if _mediamtx_editor_pin_home() and _mediamtx_editor_python_ok():
+        return True, "editor now uses the console's HOME, where its packages are"
+    ok, out = _mediamtx_editor_install_py_deps()
+    if _mediamtx_editor_python_ok():
+        return True, 'packages reinstalled'
+    tail = (out or '').strip().splitlines()[-1:] or ['no output']
+    return False, (tail[0][:200] if not ok else 'installed, but the editor still cannot import them')
+
+
+# Remote MediaMTX: the SSH user is root, so the same /root/.local trap applies.
+_MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK = (f'runuser -u {_MEDIAMTX_EDITOR_USER} -- /usr/bin/python3 -c '
+                                        + shlex.quote(_MEDIAMTX_EDITOR_PY_IMPORTS) + ' 2>&1')
+
+
+def _mediamtx_editor_remote_py_deps(deploy_cfg):
+    """(ok, output) — remote twin of _mediamtx_editor_ensure_py_deps: install system-wide as
+    root, then check the import as takwerx (what the editor runs as)."""
+    _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
+
+    def _pip(flag):
+        # Same apt-owned-blinker retry as the local install (GH #330).
+        return (f'export PYTHONNOUSERSITE=1; _pi() {{ o=$(pip3 install "$@" {flag} 2>&1); rc=$?; '
+                f'echo "$o"; if [ $rc -ne 0 ] && echo "$o" | grep -q {shlex.quote(_MEDIAMTX_PIP_DISTRO_OWNED)}; '
+                f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
+                f'_pi {_pkgs} && _pi -U certifi')
+
+    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    if not ok and 'no such option' in (out or ''):
+        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
+    chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
+    if chk:
+        return True, out
+    tail = ((chk_out or '') if ok else (out or '')).strip().splitlines()[-1:] or ['no output']
+    return False, tail[0][:200]
 
 
 def _startup_heal_mediamtx_editor_python():
@@ -100351,20 +101360,67 @@ def _startup_heal_mediamtx_editor_python():
         except Exception:
             pyver = '?'
         print(f"Startup migration: MediaMTX web editor cannot import its packages on Python {pyver} "
-              f"(an OS upgrade moves Python) — reinstalling {', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}", flush=True)
+              f"(an OS upgrade, or a HOME the editor does not share) — fixing "
+              f"{', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}", flush=True)
         try:
-            ok, out = _mediamtx_editor_install_py_deps()
+            ok, detail = _mediamtx_editor_ensure_py_deps()
         except Exception as e:
-            ok, out = False, str(e)
-        if ok and _mediamtx_editor_python_ok():
+            ok, detail = False, str(e)[:200]
+        if ok:
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                            capture_output=True, timeout=60)
-            print("Startup migration: ✓ MediaMTX web editor packages reinstalled and editor restarted", flush=True)
+            print(f"Startup migration: ✓ MediaMTX web editor fixed ({detail}) and restarted", flush=True)
         else:
-            tail = (out or '').strip().splitlines()[-1:] or ['no output']
-            print(f"Startup migration: ✗ MediaMTX web editor packages could not be reinstalled: {tail[0][:200]}", flush=True)
+            print(f"Startup migration: ✗ MediaMTX web editor packages could not be reinstalled: {detail}", flush=True)
 
     threading.Thread(target=_heal, daemon=True, name='mediamtx-editor-python-heal').start()
+    return True
+
+
+def _mediamtx_editor_unit_with_prestart(txt):
+    """The editor unit text with _MEDIAMTX_EDITOR_PRESTART just before ExecStart=, or `txt`
+    unchanged when it already runs ensure_overlay.py or has no ExecStart= to anchor on."""
+    if not txt or 'ensure_overlay.py' in txt:
+        return txt
+    out, done = [], False
+    for ln in txt.split('\n'):
+        if not done and ln.startswith('ExecStart='):
+            out.append(_MEDIAMTX_EDITOR_PRESTART)
+            done = True
+        out.append(ln)
+    return '\n'.join(out) if done else txt
+
+
+def _startup_heal_mediamtx_editor_prestart():
+    """GH #330: give a local editor unit the ensure_overlay.py pre-start it is missing.
+
+    The deploy only wrote that line when Authentik was installed first, so on a box that
+    got MediaMTX before Authentik nothing re-applies the port/bind patches after the
+    editor's own Update (Versions tab) or Rollback. Upstream's file binds 0.0.0.0:5000,
+    Caddy proxies stream.<domain> to 127.0.0.1:5080, and the operator gets a 502 with no
+    way back into the editor. Adds the line (and the script, when absent; a stale one is
+    refreshed by the container-ports heal), and restarts the editor only when its source
+    is unpatched right now. Returns True when it changed the unit."""
+    if not (os.path.exists(_MEDIAMTX_EDITOR_UNIT) and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        return False
+    unit_txt = _read_priv(_MEDIAMTX_EDITOR_UNIT) or ''
+    new_unit = _mediamtx_editor_unit_with_prestart(unit_txt)
+    if new_unit == unit_txt:
+        return False
+    ov = '/opt/mediamtx-webeditor/ensure_overlay.py'
+    if not os.path.exists(ov):
+        _write_priv(ov, MEDIAMTX_ENSURE_OVERLAY_SCRIPT, perm=0o755)
+    _write_priv(_MEDIAMTX_EDITOR_UNIT, new_unit)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+    src = _read_priv(_MEDIAMTX_EDITOR_SRC) or ''
+    if 'port=5000' in src:
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                       capture_output=True, timeout=60)
+        print("Startup migration: MediaMTX web editor was on upstream's port 5000 after its own "
+              "update (stream.<domain> gave 502) — added the pre-start patch and restarted it", flush=True)
+    else:
+        print("Startup migration: MediaMTX web editor unit now re-applies its port patch on every "
+              "start, so its own updates keep stream.<domain> working", flush=True)
     return True
 
 
@@ -101966,6 +103022,16 @@ def _startup_migrations():
         except Exception as tp_tok_err:
             print(f"Startup migration: takportal token heal error (non-fatal): {tp_tok_err}")
 
+        # ops #298 — boxes that already run TAK Portal get the Caddy validate helper on the
+        # next console start, not only on a Portal update or a Repair click. Idempotent.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_install_caddy_validate_shim(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_shim_err:
+            print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
+
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
         # per start and orphans every encrypted user row on the next restart (SSO 401
@@ -102349,6 +103415,13 @@ def _startup_migrations():
         except Exception as _mxp_err:
             print(f"Startup migration: MediaMTX editor Python heal error (non-fatal): {_mxp_err}", flush=True)
 
+        # GH #330: an editor deployed before Authentik had no pre-start patch, so its own
+        # Update put it back on port 5000 and stream.<domain> answered 502.
+        try:
+            _startup_heal_mediamtx_editor_prestart()
+        except Exception as _mxs_err:
+            print(f"Startup migration: MediaMTX editor pre-start heal error (non-fatal): {_mxs_err}", flush=True)
+
         # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
         # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
         # watcher checks for container TAK on every pass, so a Docker TAK deployed after this start
@@ -102377,6 +103450,12 @@ def _startup_migrations():
                 print("Startup migration: OS upgrade post-reboot verify started", flush=True)
         except Exception as _ou_err:
             print(f"Startup migration: OS upgrade verify start error (non-fatal): {_ou_err}")
+        # ops #284: a box v10.3.0 stopped at `reassert` (5.8's stopped PG 15) finishes here.
+        try:
+            if _startup_os_upgrade_finish_reassert():
+                print("Startup migration: finishing the OS upgrade that stopped at reassert", flush=True)
+        except Exception as _of_err:
+            print(f"Startup migration: OS upgrade finish start error (non-fatal): {_of_err}")
 
         # v10.3.0 W4.e: a database server job (upgrade / updates / reboot) that was in
         # flight when this console stopped is watched again — it kept running on the

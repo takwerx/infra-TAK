@@ -35,8 +35,15 @@
    and the uninstall dialog's list of deployments are both several lines that
    mean nothing run together. */
 .cmd{background:#050810;border:1px solid var(--border);border-radius:6px;padding:8px 11px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.55;color:#94a3b8;white-space:pre-wrap;overflow-x:auto}
-.url-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)}
+/* ⚠️ **`flex-wrap` is load-bearing.** A deployment's row carries its name,
+   agency, link, state, an update badge and up to five buttons. Without wrap it
+   ran off the right edge on a phone, and base.html's phone guard clips `.main`
+   rather than letting it pan — so Rename and Update were simply gone (GH #336).
+   The link may break anywhere because a hostname has no spaces to break at,
+   and one long agency URL is wider than a phone on its own. */
+.url-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:6px 0;border-bottom:1px solid var(--border)}
 .url-row:last-child{border-bottom:none}
+.url-row .atlas-link{overflow-wrap:anywhere;min-width:0}
 .note{font-size:12px;color:var(--text-dim);line-height:1.7}
 textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--border);border-radius:8px;color:#94a3b8;font-family:'JetBrains Mono',monospace;font-size:11px;padding:10px}
 /* The release-channel switch (W228). Two buttons rather than a toggle: a

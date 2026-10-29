@@ -524,14 +524,13 @@ def test_start_route_is_password_gated_and_reruns_preflight():
     # server-side re-run, never the client's copy; refused with 409 + the checks
     assert '_os_upgrade_preflight(for_start=True, data=data)' in start
     assert "return 409, {'ok': False, 'error': 'preflight failed: '" in start
-    assert start.index('_os_upgrade_preflight(for_start=True') < start.index('systemd-run')
+    assert start.index('_os_upgrade_preflight(for_start=True') < start.index('_os_upgrade_unit_cmd()')
     assert "_write_priv(_OS_UPGRADE_SCRIPT, script, perm=0o755)" in start
 
 
 def test_start_builds_exactly_the_broker_shape():
     start = _fn('_os_upgrade_launch')
-    i = start.index('cmd = [')
-    cmd = start[i:start.index(']', i)]
+    cmd = _fn('_os_upgrade_unit_cmd')
     for tok in ("'systemd-run'", "'--unit=' + _OS_UPGRADE_UNIT.replace('.service', '')",
                 "'--property=StandardOutput=append:' + _OS_UPGRADE_LOGFILE",
                 "'--property=StandardError=append:' + _OS_UPGRADE_LOGFILE",
@@ -539,7 +538,7 @@ def test_start_builds_exactly_the_broker_shape():
                 "'--setenv=RELEASE_UPGRADER_NO_SCREEN=1'", "'--no-block'", "'/bin/bash', _OS_UPGRADE_SCRIPT"):
         assert tok in cmd, tok
     assert cmd.count('--setenv=') == 3
-    assert '_sudo_wrap(cmd)' in start
+    assert '_sudo_wrap(_os_upgrade_unit_cmd())' in start
 
 
 def test_stack_backup_step_states():
@@ -627,9 +626,9 @@ def test_broker_accepts_exactly_the_shape_the_console_sends(broker):
                                '/bin/bash', '/opt/infratak/scripts/migrate-console-nonroot.sh',
                                '--apply', '--auto-rollback'])
     # the shape app.py builds IS this shape (same tokens, same order)
-    start = _fn('_os_upgrade_launch')
-    for tok in OSUP[2:9]:
-        assert repr(tok) in start or tok.split('=', 1)[0] in start, tok
+    ns = _ns()
+    exec(compile(_fn('_os_upgrade_unit_cmd'), 'app.py:_os_upgrade_unit_cmd', 'exec'), ns)
+    assert ns['_os_upgrade_unit_cmd']() == OSUP
 
 
 def _variants():
@@ -956,7 +955,7 @@ class EditorBox:
             'threading': types.SimpleNamespace(Thread=_T),
             '_sudo_wrap': lambda c: c,
             '_mediamtx_editor_python_ok': lambda: self.ok_seq.pop(0) if self.ok_seq else True,
-            '_mediamtx_editor_install_py_deps': lambda: (self.installs.append(1) or (install_ok, 'ok' if install_ok else 'E: no network')),
+            '_mediamtx_editor_ensure_py_deps': lambda: (self.installs.append(1) or (install_ok, 'packages reinstalled' if install_ok else 'E: no network')),
             'print': lambda *a, **k: self.logs.append(' '.join(map(str, a))),
             '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
             '_MEDIAMTX_EDITOR_UNIT': '/etc/systemd/system/mediamtx-webeditor.service',
@@ -990,7 +989,7 @@ def test_one_package_list_everywhere():
     """deploy, Patch and the remote deploy all install the same list through the constant."""
     assert "pip3 install Flask" not in APP
     assert APP.count('_mediamtx_editor_install_py_deps()') >= 3        # deploy, patch, heal
-    assert "f'pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1'" in APP  # remote deploy
+    assert "_pi {_pkgs} && _pi -U certifi" in APP and "_pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)" in APP  # remote deploy + Patch
     assert '_startup_heal_mediamtx_editor_python()' in _fn('_startup_migrations')
 
 

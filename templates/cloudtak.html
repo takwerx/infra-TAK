@@ -237,6 +237,9 @@
       After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
       <span style="color:var(--text-dim)">(A refresh — even Cmd/Ctrl+Shift+R — does not help; CloudTAK's service worker serves a cached copy. If Settings → Refresh App doesn't update it, clear it: DevTools → Application → Clear site data, then reload.)</span>
     </p>
+    <p style="font-size:12px;color:var(--text-dim);margin:0 0 14px;line-height:1.6">
+      <span style="font-weight:600;color:var(--text-secondary)">Community plugins</span> (Cell Ping, Search Containment, Dispatcher and more) are installed from the <strong style="color:var(--text-secondary)">TAK Portal marketplace</strong>. Ones you already installed here keep working. Only plugins that need infra-TAK itself are listed below.
+    </p>
     <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
       {% for p in cloudtak_plugins %}
       <div style="background:var(--bg-surface);border:1px solid {% if p.installed %}rgba(16,185,129,.35){% else %}var(--border){% endif %};border-radius:10px;padding:16px 20px" id="ct-plugin-card-{{ p.key }}">

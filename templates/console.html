@@ -168,6 +168,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
      console restart and the reboot gap). -->
 <div id="os-upgrade-card" style="display:none;background:linear-gradient(135deg,rgba(59,130,246,0.08),rgba(14,116,144,0.06));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="osup-idle" style="display:none">
+<!-- GH #320: Ubuntu Pro security updates already cover this 22.04 box, so the idle card is one line. The button is the same one. -->
+<div id="osup-idle-pro" style="display:none;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px;font-size:12px;color:var(--text-dim);line-height:1.5"><span style="color:var(--cyan);font-weight:600">&#11014; Ubuntu 24.04 LTS</span> &mdash; this box is on 22.04 and covered by Ubuntu Pro security updates, so there is no rush to upgrade.</div>
+<div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" onclick="osupOpenPreflight()" style="padding:5px 12px;background:none;border:1px solid rgba(59,130,246,0.3);color:var(--cyan);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
+</div></div>
+<div id="osup-idle-full" style="display:block">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
 <div style="flex:1;min-width:260px">
 <div style="font-size:13px;font-weight:600;color:var(--cyan)">&#11014; Upgrade to Ubuntu 24.04 LTS</div>
@@ -178,6 +185,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="btn-row" style="display:flex;gap:8px;flex-wrap:wrap">
 <button type="button" onclick="osupOpenPreflight()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Check &amp; upgrade&hellip;</button>
 </div></div>
+</div>
 </div>
 <div id="osup-progress" style="display:none">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
@@ -444,7 +452,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity', 'clientfeed') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available or v.node_security %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -776,6 +784,7 @@ function refreshModuleVersions(){
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
             }
+            if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+d.node_security.replace(/"/g,'&quot;')+'">🔒 Node.js out of date — press Update</span>';
             el.innerHTML=s;if(s)el.style.display='';
         }
     }).catch(function(){});
@@ -1431,8 +1440,16 @@ async function _osupPollOnce(){
         }
     }
 }
+// GH #320: pro_covered (server-side, positive evidence only) collapses the idle card to one line.
+function _osupIdleMode(d){
+    var pro=!!(d&&d.pro_covered);
+    var a=document.getElementById('osup-idle-pro'),b=document.getElementById('osup-idle-full');
+    if(a)a.style.display=pro?'flex':'none';
+    if(b)b.style.display=pro?'none':'block';
+}
 function _osupApply(d){
     if(!d||!d.ok)return;
+    _osupIdleMode(d);
     var dismissed=null; try{dismissed=localStorage.getItem('os-upgrade-dismissed');}catch(e){}
     if(d.state==='running'||d.state==='rebooting'||d.state==='verifying'){
         _osupLastState=d.state; _osupShow('osup-progress'); _osupRenderSteps(d); _osupStartPolling(); return;
