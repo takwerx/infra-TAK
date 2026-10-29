@@ -107,6 +107,7 @@ def resolve(data, cell):
         'start': copy.deepcopy(scn['start']), 'run': scn['run'], 'expect': expect,
         'snapshot': 'snap-' + short,
         'derive_from': scn.get('derive_from', ''),
+        'post_prepare': list(scn.get('post_prepare') or []),
     }
 
 
