@@ -94,8 +94,7 @@ class Box:
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
-                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
-                 https_bad_users=()):
+                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -142,7 +141,6 @@ class Box:
         # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
-        self.https_bad_users = set(https_bad_users)   # ops #316: TAK's API gives only these users no groups
 
     # ── TAK's HTTPS side, as a throwaway leaf cert for a user ──
     def leaf_cert(self, cn, workdir):
@@ -173,8 +171,6 @@ class Box:
                     self.searches.append((self.t, self.leaf_cn))    # the user's own ATAK, every 15 s
             else:
                 self.searches.append((self.t, self.leaf_cn))
-        if self.leaf_cn in self.https_bad_users:
-            state = 'no_groups'
         if self.https_flaky:
             if path == 'groups/all':
                 self.https_flaky -= 1
@@ -390,8 +386,7 @@ class Box:
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
                   '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_TRIES',
                   '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
-                  '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S',
-                  '_TAK_API_CHECK_OTHERS'):
+                  '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S'):
             ns[c] = _const(c)
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
@@ -832,8 +827,7 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
     rounds = [l for l in box.log if 'HTTPS check round' in l and 'trying again in' in l]
     tries = _const('_TAK_API_CHECK_TRIES')
     assert rounds and all(f'({tries} login(s))' in l for l in rounds)
-    # + the one after the restart; the other users asked before the restart (ops #316) don't count
-    assert box.leaf_certs.count('ADSB_PS') == (len(rounds) + 1) * tries + 1
+    assert len(box.leaf_certs) == (len(rounds) + 1) * tries + 1     # + the one after the restart
     restart_at = next(i for i, c in enumerate(box.calls) if c[1:2] == ['restart'])
     assert box.t - t0 >= _const('_TAK_API_CHECK_WAIT_S') and restart_at
     st = box.settings['tak_ldap_recycle']
@@ -855,7 +849,7 @@ def test_ops158_tak_that_never_asks_ldap_for_the_user_is_restarted_early():
                and 'keeping the 300s wait' in l for l in box.log)
     [early] = [l for l in box.log if 'not waiting the rest of the' in l]
     assert ('HTTPS check round 3: TAK looks other users up in LDAP' in early and 'but sent none for ADSB_PS' in early
-            and 'checking with another user before TAK Server is restarted' in early)
+            and 'TAK Server needs a restart' in early)
     assert any('falling back to restarting TAK Server' in l and 'but sent none for ADSB_PS' in l for l in box.log)
     assert any('✓ TAK LDAP recycle: after the restart: HTTPS as ADSB_PS' in l for l in box.log)
     assert box.settings['tak_ldap_recycle']['last_outcome'] == 'restarted' and box.workdirs == []
@@ -1774,39 +1768,3 @@ def test_restart_and_ldapsearch_are_argv_not_shell():
         assert 'shell=True' not in _src(name), name
     src = _src('_tak_recycle_after_ldap_outage')
     assert "['systemctl', 'restart', 'takserver']" in src and "['docker', 'restart', TAK_CONTAINER]" in src
-
-
-# ── ops #316: one user's stale lookup is not a reason to restart TAK ───────────────
-
-def test_ops316_one_user_with_no_groups_while_another_user_passes_does_not_restart_tak():
-    # test6: the check picked the connected tak-dev emulator, TAK's API gave only it no groups,
-    # and the update restarted TAK Server (clients dropped) although everyone else was fine.
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https_bad_users=['ADSB_PS'])
-    assert box.recycle() is False
-    assert box.restarts() == []
-    assert box.leaf_certs[0] == 'ADSB_PS' and 'user0' in box.leaf_certs
-    assert any('HTTPS check as user0 passes' in l and 'while ADSB_PS gets no groups' in l for l in box.log)
-    assert any('works for other users, not for one' in l and 'no TAK Server restart' in l for l in box.log)
-    assert box.settings['tak_ldap_recycle']['last_outcome'].endswith('(HTTPS fine for other users)')
-
-
-def test_ops316_early_stuck_exit_also_asks_another_user_before_restarting():
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, outpost='others',
-                      https_bad_users=['ADSB_PS'])
-    assert box.recycle() is False
-    assert box.restarts() == []
-
-
-def test_ops316_every_user_without_groups_still_restarts_tak():
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
-    assert box.recycle() is True
-    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
-    assert len(set(box.leaf_certs)) > 1   # the others were asked, none passed
-
-
-def test_ops316_only_one_eligible_user_keeps_the_restart():
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
-    _feed_groups(box, **{f'user{i}': ['FEED_WRITE'] for i in range(4)})   # no one else to ask
-    assert box.recycle() is True
-    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
-    assert set(box.leaf_certs) == {'ADSB_PS'}
