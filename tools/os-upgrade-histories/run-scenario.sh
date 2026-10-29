@@ -100,8 +100,14 @@ case "$RUNKIND" in
       FINAL="$(J raw < "$PREFIX-status.json" 2>/dev/null || true)"
       # the database server follows the core, from the core console; a core that did not finish leaves it alone
       if [ "$FINAL" = done ] && [ "$(J expect.also_upgrade_db_box <<<"$CELLJSON" 2>/dev/null || echo False)" = True ]; then
+        # the same preparation an operator does on the database server (Install updates, Reboot), then Start from the core
+        "${D[@]}" "$URL" --target dbserver prepare > /dev/null || true
         "${D[@]}" "$URL" --target dbserver start > "$PREFIX-db-start.json" || true
-        "${D[@]}" "$URL" --target dbserver wait-status --timeout 5400 > "$PREFIX-db-status.json" || true
+        if [ "$(J http_status < "$PREFIX-db-start.json" 2>/dev/null || true)" = 200 ]; then
+          "${D[@]}" "$URL" --target dbserver wait-status --timeout 5400 > "$PREFIX-db-status.json" || true
+        else
+          echo "the database server's Start was refused (the cell fails, nothing to wait for): $(head -c 300 "$PREFIX-db-start.json" 2>/dev/null)" >&2
+        fi
       fi
     fi ;;
   update-now-then-wait)

@@ -681,6 +681,19 @@ def test_driver_logs_in_and_sends_the_password_and_typed_acknowledgment_on_start
     assert body['acknowledge'] == 'I have a snapshot' and body['admin_password'] == 'right' and body['stack_backup'] is True
 
 
+def test_driver_starts_the_database_server_with_its_own_acknowledgment_and_no_stack_backup(stub, tmp_path, monkeypatch, capsys):
+    pw = tmp_path / 'pw'
+    pw.write_text('right\n')
+    pw.chmod(0o600)
+    monkeypatch.setenv('INFRATAK_CONSOLE_PASSWORD_FILE', str(pw))
+    assert drive.main([stub, '--target', 'dbserver', 'start']) == 0
+    capsys.readouterr()
+    post = next(s for s in _Stub.seen if s[1] == '/api/console/dbserver/os-upgrade/start')
+    body = json.loads(post[2])
+    assert body['acknowledge'] == 'I have a snapshot of the database server' and body['admin_password'] == 'right'
+    assert body['stack_backup'] is False
+
+
 def test_driver_never_prints_the_password(stub, tmp_path, monkeypatch, capsys):
     pw = tmp_path / 'pw'
     pw.write_text('right\n')

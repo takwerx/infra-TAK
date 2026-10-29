@@ -34,6 +34,7 @@ import urllib.parse
 import urllib.request
 
 ACK = 'I have a snapshot'   # _OS_UPGRADE_ACK in app.py: the typed snapshot acknowledgment
+ACK_DB = 'I have a snapshot of the database server'   # _DBSERVER_ACK: the database server's own
 
 
 class DriveError(Exception):
@@ -217,6 +218,58 @@ def _reboot(con):
         pass   # the box went down before it answered: that is the reboot
 
 
+def prepare_dbserver(con, timeout=3600):
+    """The same for the split install's database server, from the core console: Install updates on it,
+    Reboot it if asked, until only a real refusal is left (ops #285)."""
+    deadline = time.time() + timeout
+    for _ in range(20):
+        if time.time() > deadline:
+            break
+        code, pf = _retry(con, 'GET', PATHS['dbserver']['preflight'], timeout=180)
+        red = _red(pf)
+        if 'os_up_to_date' in red:
+            log('installing the pending Ubuntu updates on the database server (Install updates)')
+            _retry(con, 'POST', '/api/console/dbserver/updates', {}, timeout=60)
+            time.sleep(10)
+            while time.time() < deadline:
+                time.sleep(15)
+                try:
+                    con.login()
+                    _, st = con.call('GET', PATHS['dbserver']['status'], timeout=20)
+                except DriveError:
+                    continue
+                if not st.get('running'):
+                    if (st.get('state') or '').startswith('failed'):
+                        raise DriveError('Install updates on the database server failed: %s' % (st.get('detail') or '')[:300])
+                    break
+            continue
+        if 'no_reboot_pending' in red:
+            log('rebooting the database server for the installed updates (Reboot)')
+            try:
+                con.call('POST', '/api/console/dbserver/reboot', {'admin_password': con.password}, timeout=60)
+            except DriveError:
+                pass
+            time.sleep(60)   # it goes down; the preflight below fails to reach it until it is back, and _retry waits
+            while time.time() < deadline:
+                try:
+                    con.login()
+                    _, st = con.call('GET', PATHS['dbserver']['status'], timeout=20)
+                    if not st.get('running'):
+                        break
+                except DriveError:
+                    pass
+                time.sleep(15)
+            # back on the network? the preflight cannot reach it (ssh_sudo red) until it is
+            while time.time() < deadline:
+                _, pf2 = _retry(con, 'GET', PATHS['dbserver']['preflight'], timeout=180)
+                if 'ssh_sudo' not in _red(pf2):
+                    break
+                time.sleep(15)
+            continue
+        return pf
+    raise DriveError('could not bring the database server to a clean preflight in %ds (still red: %s)' % (timeout, ', '.join(_red(pf)) or 'unknown'))
+
+
 def prepare(con, timeout=3600):
     """What an operator does on the Console page before the upgrade: Install updates, Reboot if asked,
     Re-check, until nothing is red for a reason a click fixes. A snapshot gets older every day, so
@@ -293,11 +346,11 @@ def main(argv=None):
             print(json.dumps(dict(pf, http_status=code)))
             return 0
         if args.cmd == 'prepare':
-            pf = prepare(con)
+            pf = prepare_dbserver(con) if args.target == 'dbserver' else prepare(con)
             print(json.dumps(dict(pf, prepared=True)))
             return 0
         if args.cmd == 'start':
-            body = {'admin_password': con.password, 'acknowledge': ACK,
+            body = {'admin_password': con.password, 'acknowledge': ACK_DB if args.target == 'dbserver' else ACK,
                     'stack_backup': args.target == 'core' and not args.no_stack_backup}
             deadline = time.time() + 1500
             while True:
