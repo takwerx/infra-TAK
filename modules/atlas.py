@@ -2205,10 +2205,22 @@ def rotate_proxy_auth_secret(ctx, secret, plog=None):
                                for l in handle.read().splitlines())
             if not has_line:
                 continue
+            with open(env_path, 'r', encoding='utf-8') as handle:
+                before = [l.split('=', 1)[1] for l in handle.read().splitlines()
+                          if l.startswith('TAKMDM_PROXY_AUTH_SECRET=')][-1]
             changed = write_env_value(env_path, 'TAKMDM_PROXY_AUTH_SECRET', secret)
             if changed:
                 r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if r.returncode != 0:
+                    # ⚠️ Put the file back, so `.env` keeps matching the container
+                    # that is still running, and try once more to settle it. A
+                    # second failure means compose cannot run at all, so the
+                    # container was never recreated and still has the old value.
+                    write_env_value(env_path, 'TAKMDM_PROXY_AUTH_SECRET', before)
+                    try:
+                        _compose(ctx, 'up -d api', timeout=300, inst=inst)
+                    except Exception:
+                        pass
                     raise RuntimeError(compose_error(r, 'docker compose up'))
             touched += 1
             if plog:

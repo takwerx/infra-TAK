@@ -31250,10 +31250,13 @@ def _rotate_proxy_auth_secret(plog=None):
             return rollback('Caddy reloaded but is not running the new value')
         say('Caddy reloaded with the new value')
 
+        atlas_installed = bool(load_settings().get('atlas_enabled'))
         errs = _proxy_auth_atlas_apply(new_secret, plog)
         atlas_switched[0] = True
         if errs:
             return rollback('ATLAS did not take the new value (%s)' % '; '.join(errs))
+        if atlas_installed:
+            say('ATLAS updated to the new value')
 
         final_state = dict(new_state)
         final_state.pop('previous', None)

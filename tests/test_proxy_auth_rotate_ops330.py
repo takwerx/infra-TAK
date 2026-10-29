@@ -138,6 +138,7 @@ def test_success_swaps_the_secret_everywhere_and_drops_the_old_one(tmp_path, mon
     assert new in cf and OLD not in cf
     assert h.atlas_calls == [new]
     assert 'proxy-auth:rotated' in h.audits
+    assert 'ATLAS updated to the new value' in res['steps']
 
 
 def test_the_new_value_is_never_in_the_result_or_the_steps(tmp_path, monkeypatch):
@@ -333,6 +334,12 @@ def test_atlas_compose_failure_is_reported(atlas):
     rc['code'] = 1
     touched, errors = mod.rotate_proxy_auth_secret({}, 'b' * 64)
     assert touched == 0 and len(errors) == 1 and 'docker compose up' in errors[0]
+    # `.env` goes back to what the still-running container has, and compose gets one more go
+    assert env.read_text() == 'A=1\nTAKMDM_PROXY_AUTH_SECRET=' + OLD + '\nB=2\n'
+    assert calls == ['up -d api', 'up -d api']
+    # so the console's rollback (same call with the old value) finds nothing left to do
+    calls.clear()
+    assert mod.rotate_proxy_auth_secret({}, OLD) == (1, []) and calls == []
 
 
 def test_atlas_already_on_the_value_does_not_recreate_the_container(atlas):
