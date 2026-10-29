@@ -581,6 +581,32 @@ def test_dry_run_runs_nothing(fake_az):
     assert log.read_text() == ''
 
 
+def test_a_two_server_box_is_restored_on_its_private_address_and_only_inside_the_lane_network(fake_az):
+    env, log = fake_az
+    r = box(env, 'restore', 'snap-h5-db', 'run4', '--role', 'db', '--private-ip', '10.50.0.11')
+    assert r.returncode == 0, r.stderr
+    vm_create = [l for l in log.read_text().splitlines() if l.startswith('az vm create')]
+    assert vm_create and '--private-ip-address 10.50.0.11' in vm_create[0]
+    for bad in ('192.168.1.5', '10.50.1.5', '10.50.0.11; id', '8.8.8.8'):
+        r = box(env, 'create', 'run6', '--private-ip', bad)
+        assert r.returncode != 0 and 'lane network' in r.stderr, bad
+
+
+def test_the_two_server_cell_names_the_private_addresses_and_a_core_with_no_local_database():
+    cell = hist.resolve(DATA, 'h5-two-server')
+    assert cell['private_ips'] == {'core': '10.50.0.10', 'db': '10.50.0.11'}
+    assert cell['start']['clusters'] == []                       # the core of a split box has no local PostgreSQL
+    assert hist.resolve(DATA, 'h1-fresh-single:c-docker-tak')['start']['clusters'] == []   # PostgreSQL is in the container
+    assert hist.resolve(DATA, 'h1-fresh-single:a-bare')['start']['clusters'] != []
+
+
+def test_a_restored_database_server_gets_a_new_host_key_so_the_core_forgets_the_old_one_and_the_db_follows_only_a_finished_core():
+    cell = hist.resolve(DATA, 'h5-two-server')
+    assert any('ssh-keygen -R 10.50.0.11' in c for c in cell['post_prepare'])
+    script = open(os.path.join(TOOLS, 'run-scenario.sh'), encoding='utf-8').read()
+    assert '[ "$FINAL" = done ] && [ "$(J expect.also_upgrade_db_box' in script
+
+
 # ---- collect-facts.sh ---------------------------------------------------------------------------
 
 def test_collect_facts_prints_one_json_object_with_every_key_the_judge_reads():

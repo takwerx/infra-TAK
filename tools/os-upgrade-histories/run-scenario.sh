@@ -98,7 +98,8 @@ case "$RUNKIND" in
         echo '{}' > "$PREFIX-status.json"
       fi
       FINAL="$(J raw < "$PREFIX-status.json" 2>/dev/null || true)"
-      if [ "$(J expect.also_upgrade_db_box <<<"$CELLJSON" 2>/dev/null || echo False)" = True ]; then
+      # the database server follows the core, from the core console; a core that did not finish leaves it alone
+      if [ "$FINAL" = done ] && [ "$(J expect.also_upgrade_db_box <<<"$CELLJSON" 2>/dev/null || echo False)" = True ]; then
         "${D[@]}" "$URL" --target dbserver start > "$PREFIX-db-start.json" || true
         "${D[@]}" "$URL" --target dbserver wait-status --timeout 5400 > "$PREFIX-db-status.json" || true
       fi

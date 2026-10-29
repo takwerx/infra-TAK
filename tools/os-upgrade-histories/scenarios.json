@@ -404,6 +404,9 @@
         "core": "10.50.0.10",
         "db": "10.50.0.11"
       },
+      "post_prepare": [
+        "sudo -u takwerx ssh-keygen -R 10.50.0.11 >/dev/null 2>&1; true"
+      ],
       "title": "Two-server layout (core + remote database) through the OS upgrade",
       "why": "test8-style box: the database lives on a second host. Core first, then the database server from the core console.",
       "boxes": [
