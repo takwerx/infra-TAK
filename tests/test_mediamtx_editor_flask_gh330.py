@@ -77,6 +77,7 @@ class Box:
             '_MEDIAMTX_EDITOR_USER': 'takwerx', '_MEDIAMTX_EDITOR_HOME_DROPIN': DROPIN,
             '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
             '_MEDIAMTX_EDITOR_PY_IMPORTS': 'import flask, ruamel.yaml, requests, psutil',
+            '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
         }
         for name in ('_mediamtx_editor_home', '_mediamtx_editor_python_ok', '_mediamtx_editor_pin_home',
                      '_mediamtx_editor_install_py_deps', '_mediamtx_editor_ensure_py_deps'):
@@ -100,7 +101,8 @@ def test_root_console_checks_as_takwerx_with_its_passwd_home(monkeypatch):
     argv, env = b.import_checks()[0]
     assert argv[:6] == ['runuser', '-u', 'takwerx', '--', 'env', 'HOME=/nonexistent']
     assert argv[6:8] == ['/usr/bin/python3', '-c']
-    assert env == {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/nonexistent'}   # nothing of root's
+    # nothing of root's; sbin on PATH because subprocess resolves `runuser` (/usr/sbin) in it
+    assert env == {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/nonexistent'}
 
 
 def test_nonroot_console_checks_with_the_editors_home_not_its_own(monkeypatch):
@@ -158,6 +160,73 @@ def test_root_install_ignores_roots_user_site(monkeypatch):
     for argv, env in b.pips():
         assert env['PYTHONNOUSERSITE'] == '1', argv
     assert [a for a, _ in b.pips()][-1][:4] == ['pip3', 'install', '-U', 'certifi']
+
+
+BLINKER = ('ERROR: Cannot uninstall blinker 1.7.0, RECORD file not found. '
+           'Hint: The package was installed by debian.\n')
+
+
+def _apt_blinker_pip(b, fail_without_ignore=True):
+    """pip as root on Ubuntu 24.04 with python3-blinker from apt (software-properties-common)."""
+    orig = b.ns['subprocess'].run
+
+    def run(argv, **kw):
+        if argv[:2] == ['pip3', 'install'] and '--ignore-installed' not in argv and fail_without_ignore:
+            b.runs.append((argv, kw.get('env')))
+            return types.SimpleNamespace(returncode=1, stdout=BLINKER)
+        return orig(argv, **kw)
+    b.ns['subprocess'].run = run
+
+
+def test_root_install_gets_past_the_apt_owned_blinker(monkeypatch):
+    """The fresh-deploy field case: pip installed nothing and the deploy said it had."""
+    b = Box(monkeypatch, euid=0, me='root')
+    _apt_blinker_pip(b)
+    assert b.install_py_deps()[0] is True
+    argvs = [a for a, _ in b.pips()]
+    assert argvs[0] == ['pip3', 'install', 'Flask', 'ruamel.yaml', 'requests', 'psutil', '--break-system-packages']
+    assert argvs[1] == argvs[0] + ['--ignore-installed']
+    assert argvs[-1] == ['pip3', 'install', '-U', 'certifi', '--break-system-packages', '--ignore-installed']
+
+
+def test_other_pip_errors_are_not_retried_with_ignore_installed(monkeypatch):
+    b = Box(monkeypatch, euid=0, me='root', pip_rc=1)
+    assert b.install_py_deps() == (False, 'ERROR: network unreachable\n')
+    assert all('--ignore-installed' not in a for a, _ in b.pips())
+
+
+def test_remote_install_gets_past_the_apt_owned_blinker(tmp_path):
+    """Runs the real remote shell text against a fake pip3 that behaves like noble's."""
+    import os
+    import shlex
+    import subprocess
+    fake = tmp_path / 'pip3'
+    log = tmp_path / 'calls'
+    fake.write_text('#!/bin/sh\necho "$*" >> %s\ncase "$*" in *--ignore-installed*) exit 0;; esac\n'
+                    'echo "%s"; exit 1\n' % (log, BLINKER.strip()))
+    fake.chmod(0o755)
+    runs = []
+
+    def module_run(cfg, cmd, timeout=0):
+        runs.append(cmd)
+        if cmd.startswith('runuser'):
+            return True, ''
+        r = subprocess.run(['/bin/sh', '-c', cmd], capture_output=True, text=True,
+                           env={'PATH': f'{tmp_path}:/usr/bin:/bin'})
+        return r.returncode == 0, r.stdout
+    ns = {'_module_run': module_run, 'shlex': shlex,
+          '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
+          '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
+          '_MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK': 'runuser -u takwerx -- /usr/bin/python3 -c x'}
+    exec(compile(_fn('_mediamtx_editor_remote_py_deps'), 'app.py', 'exec'), ns)
+    ok, _ = ns['_mediamtx_editor_remote_py_deps']({})
+    assert ok is True
+    calls = log.read_text().splitlines()
+    assert calls == ['install Flask ruamel.yaml requests psutil --break-system-packages',
+                     'install Flask ruamel.yaml requests psutil --break-system-packages --ignore-installed',
+                     'install -U certifi --break-system-packages',
+                     'install -U certifi --break-system-packages --ignore-installed']
+    assert os.path.exists(log)
 
 
 def test_nonroot_install_keeps_the_user_site(monkeypatch):
@@ -224,3 +293,33 @@ def test_remote_check_imports_as_takwerx():
             in APP)
     body = _fn('_mediamtx_editor_remote_py_deps')
     assert '_MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK' in body
+
+
+def _deploy_body():
+    i = APP.index('\ndef run_mediamtx_deploy():')
+    return APP[i:APP.index('\ndef ', i + 1)]
+
+
+def test_deploy_step1_no_longer_claims_packages_it_did_not_install():
+    body = _deploy_body()
+    i = body.index('Installing Python packages...')
+    step1 = body[i:body.index('Ensuring takwerx system user', i)]
+    assert '_s1_ok, _s1_out = _mediamtx_editor_install_py_deps()' in step1
+    assert 'if _s1_ok:' in step1
+
+
+def test_deploy_does_not_call_a_broken_editor_a_success():
+    body = _deploy_body()
+    assert body.index('_editor_deps_err = None') < body.index('_editor_deps_err = _deps_detail')
+    i = body.index('if _editor_deps_err:')
+    assert i < body.index('deployed successfully!') and 'web editor cannot start' in body[i:i + 400]
+
+
+def test_mediamtx_page_says_when_the_editor_lacks_its_packages():
+    page = _fn('mediamtx_page')
+    assert 'editor_missing_deps = not _mediamtx_editor_python_ok()' in page
+    assert page.index("'is-active', 'mediamtx-webeditor'") < page.index('_mediamtx_editor_python_ok()')
+    assert 'editor_missing_deps=editor_missing_deps' in page
+    tpl = (REPO / 'templates' / 'mediamtx.html').read_text(encoding='utf-8')
+    assert '{% if editor_missing_deps %}' in tpl and 'id="editor-deps-banner"' in tpl
+    assert "d.webeditor_running === false" in tpl

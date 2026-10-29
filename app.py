@@ -14258,7 +14258,21 @@ def mediamtx_page():
     if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
         mediamtx_deploy_status.update({'complete': False, 'error': False})
     mtx_vinfo = _get_mediamtx_version_info() if mtx.get('installed') else {}
+    # GH #330: an editor crash-looping on `No module named 'flask'` only showed up as a 502.
+    # Say it on the page. Local editor only, and the import check only runs when it is down.
+    editor_missing_deps = False
+    if (mtx.get('installed') and mediamtx_deploy_cfg.get('target_mode') != 'remote'
+            and not mediamtx_deploy_status.get('running', False)
+            and os.path.exists(_MEDIAMTX_EDITOR_SRC)):
+        try:
+            _ed = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                                 capture_output=True, text=True, timeout=10)
+            if (_ed.stdout or '').strip() != 'active':
+                editor_missing_deps = not _mediamtx_editor_python_ok()
+        except Exception:
+            pass
     return render_template('mediamtx.html',
+        editor_missing_deps=editor_missing_deps,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
         mediamtx_deploy_cfg=mediamtx_deploy_cfg,
@@ -42852,8 +42866,13 @@ def run_mediamtx_deploy():
         # ops #202: certifi -U on every deploy — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
         plog("  Installing Python packages...")
-        _mediamtx_editor_install_py_deps()
-        plog("✓ Python packages installed")
+        # GH #330: this said ✓ whatever pip did. Step 5 retries and checks the import as the editor.
+        _s1_ok, _s1_out = _mediamtx_editor_install_py_deps()
+        if _s1_ok:
+            plog("✓ Python packages installed")
+        else:
+            _s1_tail = ((_s1_out or '').strip().splitlines()[-1:] or ['no output'])[0][:200]
+            plog(f"  ⚠ Python packages not installed yet ({_s1_tail}); retrying when the web editor is installed")
 
         # v0.9.31: ensure `takwerx` system user exists before any chown / unit
         # install happens. mediamtx.service + mediamtx-webeditor.service both
@@ -43376,11 +43395,14 @@ WantedBy=multi-user.target
 
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
         # GH #330: checked as the editor runs (takwerx, its HOME), not as the console.
+        _editor_deps_err = None
         if os.path.exists(editor_file):
             _mediamtx_editor_install_py_deps()
             _ok_deps, _deps_detail = _mediamtx_editor_ensure_py_deps()
             if not _ok_deps:
-                plog(f"  ⚠ web editor cannot import its Python packages ({_deps_detail}); trying to start anyway")
+                _editor_deps_err = _deps_detail
+                plog(f"  ✗ Web editor Python packages ({', '.join(_MEDIAMTX_EDITOR_PY_PKGS)}) could not be installed: {_deps_detail}")
+                plog("    The web editor will not start until they are. Click Patch web editor to retry.")
             else:
                 plog("  ✓ Web editor Python deps installed")
 
@@ -43631,7 +43653,12 @@ WantedBy=multi-user.target
 
             plog("")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            plog(f"🎉 MediaMTX v{version} deployed successfully!")
+            if _editor_deps_err:
+                # GH #330: the editor crash-loops without Flask; don't call that a success.
+                plog(f"⚠ MediaMTX v{version} deployed, but the web editor cannot start: its Python packages could not be installed ({_editor_deps_err}).")
+                plog("   Click Patch web editor on this page to retry.")
+            else:
+                plog(f"🎉 MediaMTX v{version} deployed successfully!")
             if domain:
                 mtx_display_domain = f"stream.{domain}"
                 plog(f"   Web Console: https://{_pub_hostport(mtx_display_domain)}")
@@ -100941,6 +100968,8 @@ _MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
 _MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
 _MEDIAMTX_EDITOR_USER = 'takwerx'
 _MEDIAMTX_EDITOR_HOME_DROPIN = '/etc/systemd/system/mediamtx-webeditor.service.d/20-infratak-home.conf'
+# pip's refusal to replace an apt-installed package (no RECORD file), pip 23.x and 24.x wording.
+_MEDIAMTX_PIP_DISTRO_OWNED = 'Cannot uninstall'
 
 
 def _mediamtx_editor_install_py_deps(timeout=120):
@@ -100951,23 +100980,35 @@ def _mediamtx_editor_install_py_deps(timeout=120):
 
     GH #330: PYTHONNOUSERSITE=1 as root — a Flask in /root/.local satisfies pip ("already
     satisfied") and passes root's own import check, but the editor runs as takwerx and
-    cannot see it, so nothing was ever installed where the editor looks."""
+    cannot see it, so nothing was ever installed where the editor looks.
+
+    GH #330 (fresh deploy): as root on Ubuntu 24.04, Flask 3.1 needs blinker >= 1.9 and the
+    distro's python3-blinker 1.7 (pulled in by software-properties-common via oauthlib) has
+    no RECORD file, so pip stops with "Cannot uninstall blinker … installed by debian" and
+    installs NOTHING. Retry with --ignore-installed: pip writes its copy to /usr/local, which
+    shadows /usr/lib/python3/dist-packages, and leaves the apt one alone."""
     env = dict(os.environ)
     if os.geteuid() == 0:
         env['PYTHONNOUSERSITE'] = '1'
+
+    def _pip(args):
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=timeout, env=env)
+        if r.returncode != 0 and _MEDIAMTX_PIP_DISTRO_OWNED in (r.stdout or ''):
+            r = subprocess.run(args + ['--ignore-installed'], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
+        return r
+
     base = ['pip3', 'install'] + list(_MEDIAMTX_EDITOR_PY_PKGS)
     _flag = ['--break-system-packages']
-    r = subprocess.run(base + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
+    r = _pip(base + _flag)
     if r.returncode != 0 and 'no such option' in (r.stdout or ''):
         _flag = []
-        r = subprocess.run(base, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, timeout=timeout, env=env)
+        r = _pip(base)
     if r.returncode == 0:
         # ops #202: certifi -U every time — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
-        subprocess.run(['pip3', 'install', '-U', 'certifi'] + _flag, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
+        _pip(['pip3', 'install', '-U', 'certifi'] + _flag)
     return r.returncode == 0, (r.stdout or '')
 
 
@@ -100999,7 +101040,9 @@ def _mediamtx_editor_python_ok():
         if not home:
             return True
         argv = ['/usr/bin/python3', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS]
-        env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': home}
+        # sbin too: runuser lives in /usr/sbin, and subprocess looks argv[0] up in THIS PATH.
+        # Without it the root check raised FileNotFoundError -> "unknown" -> True, every time.
+        env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': home}
         if os.geteuid() == 0:
             argv = ['runuser', '-u', _MEDIAMTX_EDITOR_USER, '--', 'env', f'HOME={home}'] + argv
         else:
@@ -101068,9 +101111,17 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
     """(ok, output) — remote twin of _mediamtx_editor_ensure_py_deps: install system-wide as
     root, then check the import as takwerx (what the editor runs as)."""
     _pkgs = ' '.join(_MEDIAMTX_EDITOR_PY_PKGS)
-    ok, out = _module_run(deploy_cfg, f'export PYTHONNOUSERSITE=1; pip3 install {_pkgs} --break-system-packages 2>&1 && pip3 install -U certifi --break-system-packages 2>&1', timeout=120)
-    if not ok:
-        ok, out = _module_run(deploy_cfg, f'export PYTHONNOUSERSITE=1; pip3 install {_pkgs} 2>&1 && pip3 install -U certifi 2>&1', timeout=120)
+
+    def _pip(flag):
+        # Same apt-owned-blinker retry as the local install (GH #330).
+        return (f'export PYTHONNOUSERSITE=1; _pi() {{ o=$(pip3 install "$@" {flag} 2>&1); rc=$?; '
+                f'echo "$o"; if [ $rc -ne 0 ] && echo "$o" | grep -q {shlex.quote(_MEDIAMTX_PIP_DISTRO_OWNED)}; '
+                f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
+                f'_pi {_pkgs} && _pi -U certifi')
+
+    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    if not ok and 'no such option' in (out or ''):
+        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
     chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
     if chk:
         return True, out
