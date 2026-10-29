@@ -20664,6 +20664,10 @@ def _f2b_selfheal_sshd_backend(plog=None):
             else:
                 out.append(line)
         if hit:
+            # The jail now has one source, the journal. Drop the `backend = auto` that came
+            # with the logpath (_f2b_pin_file_backend) so the file names one backend only.
+            out = [l for l in out if l == 'backend  = systemd\n'
+                   or not re.match(r'^\s*backend\s*=', l)]
             try:
                 _write_priv(path, ''.join(out))
                 changed.append(os.path.basename(path))
@@ -21012,11 +21016,39 @@ def _f2b_log_has_rotated_history(logpath):
     return False
 
 
+# /api/fail2ban/status is on a 30 s page poll and the probe below costs one privileged
+# fail2ban-client call per file-fed jail, so answers are kept briefly (same reason as
+# _F2B_AK_LEVEL_CACHE). {jail: (monotonic time, verdict)}.
+_F2B_NO_FILE_TTL = 60
+_F2B_NO_FILE_CACHE = {}
+
+
+def _f2b_jail_reads_no_file(jail):
+    """True when the RUNNING jail tails no log file at all; False when it tails one or
+    the answer is unclear (daemon unreachable, unknown jail: never convict on that).
+
+    `fail2ban-client get <jail> logpath` prints `No file is currently monitored` for a
+    jail on the systemd backend, whatever its config file says (fail2ban 1.0.2, Ubuntu
+    24.04; infra-TAK #338)."""
+    now = time.monotonic()
+    hit = _F2B_NO_FILE_CACHE.get(jail)
+    if hit and now - hit[0] < _F2B_NO_FILE_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'get', jail, 'logpath']),
+                           capture_output=True, text=True, timeout=15)
+        verdict = r.returncode == 0 and 'No file is currently monitored' in (r.stdout or '')
+    except Exception:
+        verdict = False
+    _F2B_NO_FILE_CACHE[jail] = (now, verdict)
+    return verdict
+
+
 def _f2b_dead_jails():
     """Jails that are configured but protecting nothing. [(jail, filter, reason)].
 
-    THREE failure modes, because fixing only the first still leaves a green console
-    over a control that cannot fire:
+    FOUR failure modes, because fixing only the first still leaves a green console
+    over a control that cannot fire (the fourth, DEAF, is commented in the loop):
 
     1. NOT LOADED — enabled on disk but absent from the running daemon, usually a
        missing filter file. (test6/authentik, ≥2026-06-29.)
@@ -21057,6 +21089,16 @@ def _f2b_dead_jails():
         if not lm:
             continue
         lp = lm.group(1)
+        # Mode 4 (infra-TAK #338) — DEAF: loaded with a logpath on disk, but the running
+        # jail tails no file at all, because it inherited the distro's journal backend
+        # (Ubuntu 24.04). It starts cleanly and reports nothing, so ask fail2ban itself.
+        if _f2b_jail_reads_no_file(name):
+            dead.append((name, filt,
+                         'loaded, but fail2ban is not reading its log %s (it reports "No '
+                         'file is currently monitored"), so this jail can never fire. It is '
+                         'reading the systemd journal instead. The console repairs this on '
+                         'its next restart; to fix it now, toggle this jail off and on.' % lp))
+            continue
         try:
             if os.path.getsize(lp) == 0 and not _f2b_log_has_rotated_history(lp):
                 # v10.1.40 — the Authentik jail is NOT covered by the 0-byte rule, and
@@ -21211,12 +21253,36 @@ def _f2b_ensure_ak_logfile(plog=None):
     return True
 
 
+def _f2b_pin_file_backend(text):
+    """Jail text that reads a log file, with `backend = auto` added when it names no backend.
+
+    infra-TAK #338. Ubuntu 24.04's fail2ban (1.0.2-3 on) ships jail.d/defaults-debian.conf
+    with `[DEFAULT] backend = systemd`; 22.04's (0.11.2) had no such line, so the default was
+    `auto`, which tails the file. A jail with a logpath and no backend of its own inherits
+    the journal, and fail2ban then ignores logpath entirely: the takserver, takportal,
+    authentik and recidive jails started cleanly after an in-place 22.04 -> 24.04 upgrade,
+    reported `No file is currently monitored`, and could never ban. TAK Server, Caddy,
+    Authentik's forwarder and fail2ban itself all write files, not the journal. `auto` is
+    the stock jail.conf default (Ubuntu 22.04, and Rocky/RHEL's EPEL 1.1.0 without the
+    fail2ban-systemd package), so pinning it changes nothing on those boxes.
+
+    Added right under the section header, not beside logpath, so a logpath continued
+    over several lines stays intact. Text that already names a backend is returned as is."""
+    if (not re.search(r'^\s*logpath\s*=', text, re.M)
+            or re.search(r'^\s*backend\s*=', text, re.M)):
+        return text
+    return re.sub(r'(?m)^(\[[^\]\n]+\][ \t]*)$', r'\1\nbackend  = auto', text, count=1)
+
+
 def _f2b_guard_jail_logpaths(plog=None):
     """One jail's missing logpath must never take down every jail. Enforce that.
 
     Runs before anything (re)starts fail2ban, over every enabled infratak-* jail:
 
-      1. RE-ARM first — a jail parked by an earlier pass whose log now exists comes
+      0. PIN the file backend on every jail that reads a log file and names no backend
+         (_f2b_pin_file_backend). Otherwise the distro's default backend wins, and on
+         Ubuntu 24.04 that is the journal: the jail loads, reads nothing and never bans.
+      1. RE-ARM — a jail parked by an earlier pass whose log now exists comes
          back. Without this the guard would be a one-way door: install TAK Server the
          day after the takserver jail got parked and it would stay parked forever.
       2. CREATE the logs we own (_F2B_SELF_OWNED_LOGS), plus the portal access log via
@@ -21243,6 +21309,31 @@ def _f2b_guard_jail_logpaths(plog=None):
         return False
     import glob as _glob
     changed = False
+
+    # ── 0. Read the log file, not the distro's default backend ────────────────
+    pinned = []
+    for jpath in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))
+                        + _glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
+        try:
+            with open(jpath) as f:
+                text = f.read()
+        except OSError:
+            continue
+        new = _f2b_pin_file_backend(text)
+        if new == text:
+            continue
+        try:
+            _write_priv(jpath, new)
+        except Exception as e:
+            _log(f'fail2ban: could not set the file backend in {os.path.basename(jpath)} '
+                 f'(non-fatal): {e}')
+            continue
+        changed = True
+        pinned.append(os.path.basename(jpath))
+    if pinned:
+        _log('fail2ban: set `backend = auto` (read the log file) in %s. They named no backend, '
+             'and where the distro defaults to the systemd journal (Ubuntu 24.04) they read '
+             'nothing and could never ban anyone.' % ', '.join(pinned))
 
     # ── 1. Re-arm jails whose log has come back ───────────────────────────────
     for parked in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
@@ -21324,6 +21415,7 @@ def _f2b_guard_jail_logpaths(plog=None):
         return False
 
     # ── 4. Bring the daemon back ──────────────────────────────────────────────
+    _F2B_NO_FILE_CACHE.clear()            # a jail pinned above reads its file after this
     try:
         act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                              capture_output=True, text=True, timeout=15).stdout.strip()
@@ -22111,6 +22203,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = authentik\n"
         "logpath  = /var/log/authentik/auth.log\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22156,6 +22249,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = takserver\n"
         "logpath  = /opt/tak/logs/takserver-messaging.log\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22302,7 +22396,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     # from the journal. Writing a logpath that does not exist would kill the
     # whole fail2ban daemon at config-parse time — see _f2b_sshd_logpath().
     _lp = _f2b_sshd_logpath()
-    _source_line = f"logpath  = {_lp}\n" if _lp else "backend  = systemd\n"
+    _source_line = f"logpath  = {_lp}\nbackend  = auto\n" if _lp else "backend  = systemd\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
@@ -23023,6 +23117,7 @@ def _f2b_arm_clientfeed_jail(log_fn=None):
             "enabled  = true\n"
             "filter   = clientfeed\n"
             f"logpath  = {CLIENTFEED_FAIL_LOG}\n"
+            "backend  = auto\n"
             f"maxretry = {CLIENTFEED_F2B_MAXRETRY}\n"
             f"findtime = {CLIENTFEED_F2B_FINDTIME}\n"
             f"bantime  = {CLIENTFEED_F2B_BANTIME}\n"
@@ -23358,6 +23453,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         "enabled  = true\n"
         "filter   = takportal\n"
         f"logpath  = {TAKPORTAL_CADDY_LOG}\n"
+        "backend  = auto\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -23627,6 +23723,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "enabled  = true\n"
         "filter   = recidive\n"
         "logpath  = /var/log/fail2ban.log\n"
+        "backend  = auto\n"
         f"bantime  = {_F2B_RECIDIVE_BANTIME}\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
@@ -23871,6 +23968,7 @@ def _f2b_manual_jail_text():
         "enabled  = true\n"
         "filter   = infratak-manual\n"
         "logpath  = /var/log/fail2ban.log\n"
+        "backend  = auto\n"
         "maxretry = 1\n"
         "findtime = 60\n"
         "bantime  = -1\n"
@@ -23976,6 +24074,12 @@ def _f2b_manual_active(entries, now=None):
 def _f2b_manual_banned():
     """Targets the jail is blocking right now, as {network: text fail2ban uses for it}.
     None when it cannot be read (jail not loaded, daemon down)."""
+    # Ask for the jail by name only when it is loaded. The Fail2ban page reads this every
+    # 30 s, and on a box with no manual bans the jail does not exist, so each read logged
+    # `UnknownJailException('infratak-manual')` as an ERROR in /var/log/fail2ban.log
+    # (infra-TAK #338). Listing jails logs nothing.
+    if _F2B_MANUAL_JAIL not in _f2b_loaded_jails():
+        return None
     try:
         r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', _F2B_MANUAL_JAIL]),
                            capture_output=True, text=True, timeout=15)
@@ -100047,6 +100151,7 @@ def _fail2ban_install_and_configure(plog):
         "enabled  = true\n"
         "filter   = authentik\n"
         "logpath  = /var/log/authentik/auth.log\n"
+        "backend  = auto\n"
         "# 5 failed logins within 10 minutes → ban for 1 hour\n"
         "maxretry = 5\n"
         "findtime = 600\n"
