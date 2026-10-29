@@ -31200,6 +31200,7 @@ def _rotate_proxy_auth_secret(plog=None):
         new_state['rotated_at'] = int(time.time())
         new_state.setdefault('enforce', False)
         atlas_switched = [False]
+        caddy_loaded_new = [False]
 
         def rollback(reason):
             say('Failed: %s. Putting the old value back.' % reason)
@@ -31208,11 +31209,16 @@ def _rotate_proxy_auth_secret(plog=None):
                 _save_proxy_auth_state(old_state)
             except Exception as e:
                 problems.append('restoring the secret file failed: %s' % str(e)[:120])
+            # Only undo what happened: put the file back if it differs, and reload
+            # only if Caddy actually took the new one (a refused reload keeps serving
+            # the old config, so there is nothing to undo there).
             try:
-                _write_priv(CADDYFILE_PATH, prev_caddyfile)
-                ok, detail = _caddy_reload_if_changed(restart_on_error=False)
-                if not ok:
-                    problems.append('Caddy did not reload the old config: %s' % detail)
+                if (_read_priv(CADDYFILE_PATH) or '') != prev_caddyfile:
+                    _write_priv(CADDYFILE_PATH, prev_caddyfile)
+                if caddy_loaded_new[0]:
+                    ok, detail = _caddy_reload_if_changed(restart_on_error=False)
+                    if not ok:
+                        problems.append('Caddy did not reload the old config: %s' % detail)
             except Exception as e:
                 problems.append('restoring the Caddyfile failed: %s' % str(e)[:120])
             if atlas_switched[0]:
@@ -31246,6 +31252,7 @@ def _rotate_proxy_auth_secret(plog=None):
         ok, detail = _caddy_reload_if_changed(restart_on_error=False)
         if not ok:
             return rollback('Caddy did not reload (%s)' % (detail or 'unknown'))
+        caddy_loaded_new[0] = True
         if _caddy_running_config_has(new_secret) is False:
             return rollback('Caddy reloaded but is not running the new value')
         say('Caddy reloaded with the new value')

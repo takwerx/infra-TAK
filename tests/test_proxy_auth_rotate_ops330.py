@@ -68,7 +68,8 @@ class Host:
 
         def reload(plog=None, timeout=None, restart_on_error=True):
             host.reloads.append({'restart_on_error': restart_on_error, 'file': host.files[CF_PATH]})
-            return (reload_ok, '' if reload_ok else 'rc=1 bad config')
+            ok = reload_ok[len(host.reloads) - 1] if isinstance(reload_ok, list) else reload_ok
+            return (ok, '' if ok else 'rc=1 bad config')
 
         os_ns = types.SimpleNamespace(
             makedirs=lambda *a, **k: None, O_WRONLY=1, O_CREAT=2, O_TRUNC=4,
@@ -218,13 +219,32 @@ def test_atlas_failure_rolls_back_and_hands_atlas_the_old_value_again(tmp_path, 
     assert h.atlas_calls[-1] == OLD and len(h.atlas_calls) == 2
 
 
-def test_incomplete_rollback_is_reported_not_hidden(tmp_path, monkeypatch):
-    # reload fails both times (new, then the restore)
+def test_a_refused_reload_is_not_reloaded_again_on_the_way_back(tmp_path, monkeypatch):
+    """Caddy keeps serving the old config when it refuses a reload, so only the file needs undoing."""
     h = Host(tmp_path, monkeypatch, reload_ok=False)
+    res = h.rotate()
+    assert res['success'] is False and res['rolled_back'] is True
+    assert len(h.reloads) == 1
+
+
+def test_unwritable_caddyfile_is_a_clean_rollback(tmp_path, monkeypatch):
+    """The write fails, so nothing on disk changed: no second write, no reload."""
+    h = Host(tmp_path, monkeypatch)
+    def boom(settings=None):
+        raise OSError('Operation not permitted')
+    h.ns['generate_caddyfile'] = boom
+    res = h.rotate()
+    _assert_rolled_back(h, res)
+    assert res['rolled_back'] is True and h.reloads == [] and h.priv_writes == []
+
+
+def test_incomplete_rollback_is_reported_not_hidden(tmp_path, monkeypatch):
+    # Caddy took the new config, a later check failed, and then Caddy would not take the old one back
+    h = Host(tmp_path, monkeypatch, reload_ok=[True, False], running_has_new=False)
     res = h.rotate()
     assert res['success'] is False and res['rolled_back'] is False
     assert 'Rollback was incomplete' in res['error']
-    # the files are back even though Caddy would not reload; Caddy never took the new config
+    # the files are still put back
     assert h.state['secret'] == OLD and h.files[CF_PATH] == _caddyfile(OLD)
 
 
