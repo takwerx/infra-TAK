@@ -22,7 +22,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H=(python3 -I "$HERE/histories.py")
-D=(python3 -I "$HERE/drive.py" --insecure)   # restored test boxes are addressed by IP and are self-signed
+D=(python3 -I "$HERE/drive.py" --insecure --wait-ready 900)   # restored test boxes are addressed by IP and are self-signed
 B=(bash "$HERE/box.sh")
 
 CELL="${1:?CELL (histories.py list)}"; shift || true
@@ -69,8 +69,10 @@ URL="https://$IP:5001"
 [ "$RUNKIND" = os-upgrade ] && "${D[@]}" "$URL" update-now --channel "${CANDIDATE_CHANNEL:-main}" --wait > "$PREFIX-update.json"
 
 collect() { "${B[@]}" facts "$(name_of "$1")"; }
-# 2. facts before
-for b in "${BOXES[@]}"; do collect "$b" > "$PREFIX-$b-before.json"; done
+# 2. facts before. An os-upgrade cell takes them after the operator's preparation (below): Install updates and Reboot
+# change packages and the boot id, and that is not the console's doing.
+facts_before() { local b; for b in "${BOXES[@]}"; do collect "$b" > "$PREFIX-$b-before.json"; done; }
+[ "$RUNKIND" = os-upgrade ] || facts_before
 
 # 3. drive
 echo '{}' > "$PREFIX-preflight.json"; echo '{}' > "$PREFIX-start.json"; FINAL=''
@@ -78,13 +80,20 @@ case "$RUNKIND" in
   os-upgrade)
     # a snapshot gets older every day: do what the operator does first, Install updates and Reboot, until only a real refusal is left
     "${D[@]}" "$URL" prepare > /dev/null
+    # what the cell's history says is true on the box, and a reboot undoes (a cluster started by hand does not come back by itself)
+    while IFS= read -r c; do [ -n "$c" ] && "${B[@]}" ssh "$(name_of "${BOXES[0]}")" "$c"; done < <(python3 -I -c 'import json,sys; print("\n".join(json.load(sys.stdin).get("post_prepare") or []))' <<<"$CELLJSON")
+    facts_before
     "${D[@]}" "$URL" preflight > "$PREFIX-preflight.json"
     "${D[@]}" "$URL" start > "$PREFIX-start.json"
     if [ "$RESULT" = refused ]; then
       sleep 20      # give a wrongly accepted Start time to show itself in the status
     else
-      [ "$(J http_status < "$PREFIX-start.json")" = 200 ] || echo "Start was refused: $(cat "$PREFIX-start.json")" >&2
-      "${D[@]}" "$URL" wait-status --timeout 7200 > "$PREFIX-status.json" || true
+      if [ "$(J http_status < "$PREFIX-start.json")" = 200 ]; then
+        "${D[@]}" "$URL" wait-status --timeout 7200 > "$PREFIX-status.json" || true
+      else
+        echo "Start was refused (the cell fails, nothing to wait for): $(head -c 300 "$PREFIX-start.json")" >&2
+        echo '{}' > "$PREFIX-status.json"
+      fi
       FINAL="$(J raw < "$PREFIX-status.json" 2>/dev/null || true)"
       if [ "$(J expect.also_upgrade_db_box <<<"$CELLJSON" 2>/dev/null || echo False)" = True ]; then
         "${D[@]}" "$URL" --target dbserver start > "$PREFIX-db-start.json" || true

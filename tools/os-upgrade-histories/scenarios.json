@@ -15,7 +15,10 @@
       "run_expires_days": 2
     },
     "log_fail_pattern": "(?i)\\bfail(ed|ure)?\\b",
-    "log_allow": [],
+    "log_allow": [
+      "snapd\\.failure\\.service is a disabled or a static unit not running"
+    ],
+    "log_allow_why": "snapd.failure.service: the Ubuntu 24.04 package scripts print this when they skip a unit that is not enabled; seen on a clean h2 upgrade, nothing failed (ops #285)",
     "os_from": "22.04",
     "os_to": "24.04"
   },
@@ -236,6 +239,7 @@
           "cluster": "15/main"
         }
       ],
+      "post_prepare": ["sudo pg_ctlcluster 15 main start"],
       "start": {
         "clusters": [
           [

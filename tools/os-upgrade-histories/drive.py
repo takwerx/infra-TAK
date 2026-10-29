@@ -188,6 +188,29 @@ def _wait_console_back(con, down_for=240, back_for=900):
     raise DriveError('the console did not come back within %ds of the reboot' % back_for)
 
 
+def _retry(con, method, path, payload=None, timeout=60, for_s=600):
+    """One console call that rides out a console restart (it restarts itself after some updates)."""
+    deadline = time.time() + for_s
+    while True:
+        try:
+            return con.call(method, path, payload, timeout=timeout)
+        except DriveError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(15)
+            try:
+                con.login()
+            except DriveError:
+                pass
+
+
+def _reboot(con):
+    try:
+        con.call('POST', '/api/system/kernel-patch/reboot', {}, timeout=30)
+    except DriveError:
+        pass   # the box went down before it answered: that is the reboot
+
+
 def prepare(con, timeout=3600):
     """What an operator does on the Console page before the upgrade: Install updates, Reboot if asked,
     Re-check, until nothing is red for a reason a click fixes. A snapshot gets older every day, so
@@ -197,7 +220,7 @@ def prepare(con, timeout=3600):
     for _ in range(40):
         if time.time() > deadline:
             break
-        code, pf = con.call('GET', PATHS['core']['preflight'], timeout=120)
+        code, pf = _retry(con, 'GET', PATHS['core']['preflight'], timeout=120)
         red = _red(pf)
         if red == ['no_job_running'] or ('no_job_running' in red and len(red) == 1):
             log('a console job is still finishing (%s), waiting' % ', '.join(c.get('detail', '')[:80] for c in pf.get('checks', []) if c.get('name') == 'no_job_running'))
@@ -205,7 +228,7 @@ def prepare(con, timeout=3600):
             continue
         if 'os_up_to_date' in red:
             log('installing the pending Ubuntu updates (Install updates)')
-            con.call('POST', '/api/system/kernel-patch/start', {}, timeout=60)
+            _retry(con, 'POST', '/api/system/kernel-patch/start', {}, timeout=60)
             while time.time() < deadline:
                 time.sleep(15)
                 try:
@@ -220,7 +243,7 @@ def prepare(con, timeout=3600):
             continue
         if 'no_reboot_pending' in red:
             log('rebooting for the installed updates (Reboot)')
-            con.call('POST', '/api/system/kernel-patch/reboot', {}, timeout=30)
+            _reboot(con)
             _wait_console_back(con)
             continue
         return pf
@@ -231,6 +254,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('base')
     ap.add_argument('--target', choices=('core', 'dbserver'), default='core')
+    ap.add_argument('--wait-ready', type=int, default=0, metavar='S',
+                    help='a box that has just been restored is still booting: keep trying to log in for up to S seconds')
     ap.add_argument('--insecure', action='store_true',
                     help='do not verify the console certificate (a test box addressed by IP, self-signed)')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -248,7 +273,15 @@ def main(argv=None):
     try:
         con = Console(args.base, read_password(), insecure=args.insecure)
         if args.cmd != 'wait-status':   # waiting logs in by itself, and a console mid-reboot or rate-limiting logins is normal there
-            con.login()
+            ready_by = time.time() + args.wait_ready
+            while True:
+                try:
+                    con.login()
+                    break
+                except DriveError:
+                    if time.time() >= ready_by:
+                        raise
+                    time.sleep(10)
         if args.cmd == 'preflight':
             code, pf = con.call('GET', PATHS[args.target]['preflight'], timeout=120)
             print(json.dumps(dict(pf, http_status=code)))
@@ -258,9 +291,18 @@ def main(argv=None):
             print(json.dumps(dict(pf, prepared=True)))
             return 0
         if args.cmd == 'start':
-            code, ans = con.call('POST', PATHS[args.target]['start'], {
-                'admin_password': con.password, 'acknowledge': ACK,
-                'stack_backup': args.target == 'core' and not args.no_stack_backup}, timeout=120)
+            body = {'admin_password': con.password, 'acknowledge': ACK,
+                    'stack_backup': args.target == 'core' and not args.no_stack_backup}
+            deadline = time.time() + 1500
+            while True:
+                code, ans = _retry(con, 'POST', PATHS[args.target]['start'], body, timeout=120, for_s=180)
+                # a job the console started by itself after its restart (an Authentik re-apply) is still finishing:
+                # an operator waits and presses Start again. Any other refusal is final.
+                if code == 409 and (ans.get('error') == 'preflight failed: no_job_running' or 'try again in a few minutes' in str(ans.get('error'))) and time.time() < deadline:
+                    log('a console job is still finishing, pressing Start again in 30s')
+                    time.sleep(30)
+                    continue
+                break
             print(json.dumps(dict(ans, http_status=code)))
             return 0
         if args.cmd == 'update-now':

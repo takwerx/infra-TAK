@@ -35,7 +35,7 @@ export LOG_COPY="$(mktemp)"; trap 'rm -f "$LOG_COPY"' EXIT
 tail -c 400000 "$LOG" > "$LOG_COPY" 2>/dev/null
 
 python3 -I - <<'PY'
-import json, os
+import json, os, subprocess
 
 e = os.environ
 clusters = [l.split()[:4] for l in e.get('CLUSTERS', '').splitlines() if len(l.split()) >= 4]
@@ -51,6 +51,11 @@ try:
     base = json.loads(e.get('BASELINE_JSON') or '{}')
 except ValueError:
     base = {}
+# every service the console recorded before the upgrade (tak-health, tak-metrics-collector, ...), not just the fixed four
+for name in sorted((base.get('services') or {})):
+    if name not in units and name.replace('-', '').replace('_', '').replace('.', '').isalnum():
+        out = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True).stdout.strip()
+        units[name] = out or 'unknown'
 facts = {
     'os_release': e.get('OS_RELEASE', ''),
     'boot_id': e.get('BOOT_ID', ''),

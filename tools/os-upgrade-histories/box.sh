@@ -188,9 +188,17 @@ cmd_restore() {
   local exp; exp="$(expires_in "$RUN_DAYS")"
   az_ disk create -g "$RG" -n "${name}-osdisk" -l "$REGION" --source "$snap" --sku Premium_LRS \
     --tags "owner=$OWNER" "expires=$exp" "restored_from=$snap" -o none
-  az_ vm create -g "$RG" -n "$name" -l "$REGION" --attach-os-disk "${name}-osdisk" --os-type Linux \
-    --size "$(role_size "$role")" --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default \
-    --tags "owner=$OWNER" "expires=$exp" "role=$role" "restored_from=$snap" -o none
+  # the Azure CLI crashes now and then ("content already consumed") when two creates run at once: try again, and
+  # accept a VM that Azure did create
+  local try
+  for try in 1 2 3; do
+    az_ vm create -g "$RG" -n "$name" -l "$REGION" --attach-os-disk "${name}-osdisk" --os-type Linux \
+      --size "$(role_size "$role")" --public-ip-sku Standard --nsg-rule NONE --vnet-name "$VNET" --subnet default \
+      --tags "owner=$OWNER" "expires=$exp" "role=$role" "restored_from=$snap" -o none && break
+    [ "$DRY_RUN" = 1 ] || [ "$(az vm show -g "$RG" -n "$name" --query provisioningState -o tsv 2>/dev/null)" = Succeeded ] && break
+    [ "$try" = 3 ] && die "could not create $name"
+    sleep 20
+  done
   set_auto_shutdown "$name"
   allow_ports "$name" 22
   say "restored $snap as $name (expires $exp, auto-shutdown $SHUTDOWN_UTC UTC)"
