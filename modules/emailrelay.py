@@ -226,6 +226,13 @@ smtp_generic_maps = hash:/etc/postfix/generic
             job.update({'running': False, 'error': True})
             return
         plog("✓ Postfix running")
+        # ops #345: mail queued while the old login was failing waits out Postfix's retry
+        # back-off (up to hours). Retry it now, so a fixed login shows as fixed at once.
+        # Any user may flush; a failure here must never fail the deploy.
+        try:
+            subprocess.run(['postqueue', '-f'], capture_output=True, timeout=30)
+        except Exception:
+            pass
 
         plog("📧 Step 5/5 — Saving configuration...")
         settings['email_relay'] = {
