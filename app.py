@@ -97805,19 +97805,59 @@ def _startup_ensure_console_state_dir():
 _startup_ensure_console_state_dir()
 
 
+_REHOME_COMPOSE_FILE_RE = re.compile(r'^(?:docker-)?compose[\w.-]*\.ya?ml$')
+
+
+def _rehome_rewrite_paths(dirpath, old_dir, new_dir):
+    """ops #346: a module dir that is moved takes its absolute self-references with it, and compose
+    follows them to where the dir used to be. CloudTAK's .env carries COMPOSE_FILE=/root/CloudTAK/
+    docker-compose.yml:/root/CloudTAK/docker-compose.override.yml:..., so after `mv /root/CloudTAK
+    ~/CloudTAK` the project loaded files that no longer existed, `compose up` failed, the API never
+    came back and the re-home rolled back every time. Rewrites `old_dir` -> `new_dir` as a path
+    prefix (the whole directory name, not `/root/CloudTAK2`) in `.env` and the top-level compose
+    files of `dirpath`, in place so owner and mode stay. Paths OUTSIDE the moved dir are left alone
+    (a plugin build context under /root still builds: compose runs as root through the broker).
+    Returns the file names it changed. Never raises."""
+    old = old_dir.rstrip('/')
+    new = new_dir.rstrip('/')
+    pat = re.compile(re.escape(old) + r'(?![\w.-])')
+    changed = []
+    try:
+        names = sorted(n for n in os.listdir(dirpath)
+                       if n == '.env' or _REHOME_COMPOSE_FILE_RE.match(n))
+    except OSError:
+        return changed
+    for name in names:
+        path = os.path.join(dirpath, name)
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            with open(path, encoding='utf-8') as f:
+                text = f.read()
+            fixed = pat.sub(lambda _m: new, text)
+            if fixed != text:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(fixed)
+                changed.append(name)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return changed
+
+
 def _startup_rehome_module(subdir, container_name, wait_healthy=60):
     """v10.0.5: re-home a root-era module dir /root/<subdir> -> ~/<subdir> so the NON-ROOT console
     can MANAGE it. On a box flipped from root, modules deployed root-era live under /root, which the
     takwerx console can't traverse — so the ~200 `cd ~/<module> && docker compose …` management
     sites all target the wrong (missing) path. Moving the dir to the console home makes every one of
     them work with ZERO per-site edits. Ships via UPDATE (startup hook), broker-mediated (root cd's
-    /root). Data-safe: the module composes use named docker volumes + RELATIVE (`./`) bind mounts
-    (verified: NO absolute /root binds) — both survive the move (named volumes reattach by the
-    preserved project name; relative binds resolve from the new working dir).
+    /root). Data-safe: the module composes use docker volumes + RELATIVE (`./`) bind mounts
+    (verified: NO absolute /root binds) — both survive the move (volumes reattach by the
+    preserved project name, ANONYMOUS ones too as long as the containers are stopped, never
+    `down`ed; relative binds resolve from the new working dir).
 
     HARD SAFETY — never leave a module down (this is why the flip 'doesn't get fucked up'):
-      down (keep volumes) → verify stopped → mv+chown → up from new home → VERIFY the key
-      container returns within wait_healthy; if it does NOT, ROLL BACK (down, mv dir back to /root,
+      stop (keep containers+volumes) → verify stopped → mv+chown → up from new home → VERIFY the key
+      container returns within wait_healthy; if it does NOT, ROLL BACK (stop, mv dir back to /root,
       up from /root) so the module is restored exactly where it was. Aborts before the move if the
       stack won't stop. Idempotent (no-op once ~/<subdir> exists or /root/<subdir> is gone)."""
     try:
@@ -97848,10 +97888,13 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
                                shell=True, capture_output=True, text=True, env=_broker_shim_env())
             return 'Up' in (r.stdout or '')
         _log('root-era install at %s — migrating to %s (named volumes + relative binds preserved)' % (src, dst))
-        # 1) Stop the stack (KEEP volumes — no `-v`).
-        _compose(src, 'down')
+        # 1) Stop the stack (KEEP volumes — no `-v`). `stop`, not `down` (ops #346 box test): CloudTAK's
+        #    postgis keeps its data on an ANONYMOUS volume, which `down` orphans — the next `up` makes a
+        #    fresh empty one (3 profiles -> 0 on test12). Stopped containers keep their volumes, and
+        #    `up -d` from the new dir starts them (or recreates them with the volume carried over).
+        _compose(src, 'stop')
         if _key_up():
-            _log('WARN: %s still up after `compose down` — aborting, left in place (no data touched)' % container_name)
+            _log('WARN: %s still up after `compose stop` — aborting, left in place (no data touched)' % container_name)
             return
         # 2) Move + chown to takwerx.
         _mv = subprocess.run(_sudo_wrap(['mv', src, dst]), capture_output=True, text=True, timeout=180)
@@ -97859,11 +97902,19 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
             _log('ERROR: move failed (%s) — restarting stack in place' % (_mv.stderr or '')[:120])
             _compose(src, 'up -d')
             return
-        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', dst]), capture_output=True, timeout=300)
+        # ops #346: --from=root:root re-owns only what the root-era install made. Bind-mounted data
+        # a container owns (Postgres' data dir, Garage's store) keeps its owner instead of being
+        # handed to takwerx under the container's feet.
+        subprocess.run(_sudo_wrap(['chown', '-R', '-h', '--from=root:root', 'takwerx:takwerx', dst]),
+                       capture_output=True, timeout=300)
         if _distro_family() == 'rhel':
             # mv preserves the /root-era SELinux label (admin_home_t) — benign in the
             # field (0 AVC denials) but wrong under /home; relabel to the policy default.
             subprocess.run(_sudo_wrap(['restorecon', '-R', dst]), capture_output=True, timeout=300)
+        # ops #346: absolute self-references (CloudTAK's COMPOSE_FILE in .env) still name the old dir.
+        _fixed = _rehome_rewrite_paths(dst, src, dst)
+        if _fixed:
+            _log('rewrote %s -> %s in %s' % (src, dst, ', '.join(_fixed)))
         # 3) Up from the NEW home.
         _compose(dst, 'up -d')
         # 4) VERIFY the key container returns; ROLL BACK if not (never leave the module down).
@@ -97877,8 +97928,16 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
             _log('✓ re-homed %s -> %s and restarted (non-root manageable)' % (src, dst))
             return
         _log('WARN: %s did not return within %ss from %s — ROLLING BACK to %s' % (container_name, wait_healthy, dst, src))
-        _compose(dst, 'down')
+        _compose(dst, 'stop')                    # stop, not down: keeps the anonymous data volumes (ops #346)
+        _rehome_rewrite_paths(dst, dst, src)     # while takwerx can still write it: names point home again
         _rb = subprocess.run(_sudo_wrap(['mv', dst, src]), capture_output=True, text=True, timeout=180)
+        if _rb.returncode == 0:
+            # ops #346: back to root:root what the move gave takwerx (not a container's own data),
+            # so root's home isn't left holding takwerx-owned files.
+            subprocess.run(_sudo_wrap(['chown', '-R', '-h', '--from=takwerx:takwerx', 'root:root', src]),
+                           capture_output=True, timeout=300)
+            if _distro_family() == 'rhel':
+                subprocess.run(_sudo_wrap(['restorecon', '-R', src]), capture_output=True, timeout=300)
         _compose(src, 'up -d')
         if _rb.returncode == 0 and not os.path.exists(dst):
             _log('rolled back: %s restored at %s (re-home deferred; module running as before)' % (subdir, src))
