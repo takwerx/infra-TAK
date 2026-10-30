@@ -1628,6 +1628,15 @@ def _do_exec(req):
     cwd = req.get('cwd') or None
     if cwd and not (isinstance(cwd, str) and os.path.isdir(cwd)):
         cwd = None
+    # ops #348: `docker compose --project-directory D` means "act as if run from D". Compose
+    # resolves RELATIVE entries of COMPOSE_FILE (TAK Portal's `docker-compose.marketplace.yml` in
+    # CloudTAK's .env) against the working directory, NOT --project-directory, so the caller's
+    # cwd (the console's, usually `/`) made stop/up fail with "stat /docker-compose.marketplace.yml".
+    # D is already in the argv check_exec saw; a caller could always send it as cwd, so this
+    # grants nothing new.
+    _pd = compose_project_dir(argv)
+    if _pd:
+        cwd = _pd
     # HARDENING (env injection): NEVER honor a caller-supplied `env`. check_exec
     # validates argv only; a merged-in LD_PRELOAD/LD_LIBRARY_PATH/BASH_ENV/ENV/PATH
     # turns ANY allowed binary into arbitrary root code (the same vector the
@@ -4507,6 +4516,38 @@ def default_timeout(argv):
     if words[:1] == ['compose'] and words[1:2] and words[1] in ('build', 'up', 'pull', 'create'):
         return BUILD_TIMEOUT
     return 0
+
+
+def compose_project_dir(argv):
+    """The existing absolute directory named by `docker compose --project-directory D ...`
+    (also `--project-directory=D`), or None. Only compose's own flags before its subcommand
+    count, so a `--project-directory` that is an argument of something else (`run`, `exec`)
+    is never read."""
+    if not argv or os.path.basename(argv[0]) != 'docker':
+        return None
+    words, skip, found = [], False, None
+    pending = False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+            if pending:
+                found, pending = a, False
+            continue
+        if a.startswith('-'):
+            if len(words) == 1 and a.startswith('--project-directory='):
+                found = a.split('=', 1)[1]
+            elif a in _DOCKER_VALUE_FLAGS:
+                skip = True
+                pending = len(words) == 1 and a == '--project-directory'
+            continue
+        words.append(a)
+        if len(words) == 1 and a != 'compose':
+            return None
+        if len(words) == 2:
+            break
+    if found and found.startswith('/') and os.path.isdir(found):
+        return found
+    return None
 
 
 def client_send(req, timeout=DEFAULT_TIMEOUT):

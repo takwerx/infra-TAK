@@ -39227,10 +39227,17 @@ def _broker_compose(dirpath, action, timeout=300):
     the broker denies bash, so the old `bash -lc cd <dir> && docker compose …`
     pattern WOULD-DENY'd on every poll). `--project-directory` is equivalent to
     the cd: project name (dir basename), .env discovery, and relative binds all
-    resolve from the project directory."""
+    resolve from the project directory.
+
+    ops #348: compose resolves RELATIVE COMPOSE_FILE entries (TAK Portal's
+    docker-compose.marketplace.yml in CloudTAK's .env) against the working directory, not
+    --project-directory. Through the broker, the broker sets the cwd to the project directory
+    (it can enter /root); for a console that can enter the dir itself (root console, no broker
+    routing) it is set here too."""
+    _cwd = dirpath if (os.path.isdir(dirpath) and os.access(dirpath, os.X_OK)) else None
     return subprocess.run(
         _sudo_wrap(['docker', 'compose', '--project-directory', dirpath] + shlex.split(action)),
-        capture_output=True, text=True, timeout=timeout)
+        capture_output=True, text=True, timeout=timeout, cwd=_cwd)
 
 
 def _module_git(repo_dir, *git_args, **kw):
@@ -47143,11 +47150,12 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
         # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
         # it came back during the rm -rf, Docker re-created the folder, and Garage
         # initialized it with the OLD key; the new stack then crash-looped on a key
-        # mismatch (ops #33 box test, redeploy over an existing remote install).
+        # mismatch (ops #33 box test, redeploy over an existing remote install). ops #348: `stop`,
+        # not `down` — `down` orphans postgis' anonymous data volume (users reset, ops #346).
         return (
             inplace +
             "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-            "(cd ~/CloudTAK && docker compose down --remove-orphans) >/dev/null 2>&1 || true; fi; "
+            "(cd ~/CloudTAK && docker compose stop) >/dev/null 2>&1 || true; fi; "
             + save +
             f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} "
             "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
@@ -49468,11 +49476,14 @@ def run_cloudtak_deploy(cfg=None):
                 # Clean up docker state from failed attempt (preserve volumes). ops #216: no
                 # --remove-orphans — TAK Portal's Print / uDash containers come from their own
                 # docker-compose.plugin-<id>.yml in this project, look orphaned to us, and nothing
-                # here would start them again.
+                # here would start them again. ops #348: `stop`, not `down` — CloudTAK's postgis
+                # keeps its data on an ANONYMOUS volume, which `down` orphans (a redeploy over an
+                # existing install reset its users); stopped containers keep it, and the next
+                # `up` carries it over.
                 plog("  Cleaning up from previous build attempt...")
                 try:
                     subprocess.run(
-                        _sudo_wrap(['docker', 'compose', 'down']),
+                        _sudo_wrap(['docker', 'compose', 'stop']),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         timeout=120, cwd=cloudtak_dir
                     )
