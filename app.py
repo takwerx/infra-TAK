@@ -26890,10 +26890,15 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
     return pending
 
 
+# The sweep thread and the trigger route must not interleave (both read, mail, then save).
+_update_notify_lock = threading.Lock()
+
+
 def _update_notify_check_once():
     """One pending-update sweep. Emails the Guard Dog alert address only when at least
     one pending item's identity has not been mailed before (one email per new SHA/tag,
-    never per poll). Returns {'pending': [...], 'emailed': bool} for the trigger route."""
+    never per poll), and then only about the NEW items (ops #345). Returns
+    {'pending': [...], 'emailed': bool} for the trigger route."""
     settings = load_settings()
     to_addr = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     if not to_addr:
@@ -26919,8 +26924,11 @@ def _update_notify_check_once():
     emailed = False
     if new_items:
         server_id = _guarddog_server_identifier(settings) or socket.gethostname()
-        sec_items = [p for p in pending if p.get('security')]
-        other = [p for p in pending if not p.get('security')]
+        # ops #345: the email is about what is NEW. Updates mailed before are not listed
+        # again: the same 8 OS patches used to ride along in every email a later console
+        # update triggered (NUC, Tue Oct 27: four mails in seven hours).
+        sec_items = [p for p in new_items if p.get('security')]
+        other = [p for p in new_items if not p.get('security')]
         lines = []
         if sec_items:
             # ops #168: say it plainly, say what it fixes, say where to click.
@@ -26941,17 +26949,18 @@ def _update_notify_check_once():
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
                   f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
-                  '', 'You get one email per new pending version — not a reminder per sweep.']
+                  '', 'You get one email per new update, and only about what is new. '
+                  'Updates you were already told about are not repeated.']
         if sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
         else:
-            subj = (f"⬆ Update pending on {server_id}" if len(pending) == 1
-                    else f"⬆ {len(pending)} updates pending on {server_id}")
+            subj = (f"⬆ Update pending on {server_id}" if len(new_items) == 1
+                    else f"⬆ {len(new_items)} updates pending on {server_id}")
         try:
             _guarddog_send_alert_email_via_relay(to_addr, subj, '\n'.join(lines))
             emailed = True
-            print(f"[update-notify] emailed {len(pending)} pending update(s) to {to_addr} "
-                  f"({len(new_items)} new)", flush=True)
+            print(f"[update-notify] emailed {len(new_items)} new update(s) to {to_addr} "
+                  f"({len(pending)} pending in all)", flush=True)
         except Exception as e:
             print(f"[update-notify] email send failed: {e}", flush=True)
     # Persist ONLY what was successfully mailed (a failed send retries next sweep);
@@ -27008,7 +27017,8 @@ def _update_notify_loop():
     while True:
         wait = UPDATE_NOTIFY_INTERVAL_S
         try:
-            r = _update_notify_check_once() or {}
+            with _update_notify_lock:
+                r = _update_notify_check_once() or {}
             if r.get('quiet_until'):
                 # ops #228: deferred by a quiet window — look again once it has settled,
                 # not six hours later.
@@ -27034,7 +27044,8 @@ except Exception:
 def guarddog_update_notify_check():
     """Run one pending-update sweep now (T&E / support — nobody waits 6 h)."""
     try:
-        return jsonify({'success': True, **_update_notify_check_once()})
+        with _update_notify_lock:
+            return jsonify({'success': True, **_update_notify_check_once()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -51231,6 +51242,123 @@ def emailrelay_page():
         deploying=_em_job.get('running', False),
         deploy_done=_em_job.get('complete', False),
         deploy_error=_em_job.get('error', False))
+
+# ops #345: customers learn about updates and security fixes from Guard Dog's emails, so a
+# relay that cannot deliver has to be loud. Postfix accepts mail on localhost:25 even when
+# the smarthost refuses it, so nothing ever failed visibly (one box sat on 1,378 stuck
+# messages after Google rejected its login). The queue and its deferral reasons are the
+# evidence: `postqueue -p` works for any user and needs no log access.
+EMAIL_RELAY_STUCK_MIN = 5      # this many queued messages, whatever the reason, is "piling up"
+_RELAY_AUTH_RE = re.compile(
+    r'SASL authentication failed|authentication (?:failed|rejected|required)|'
+    r'Username and Password not accepted|Application-specific password|\b53[45][-. ]\d', re.I)
+_RELAY_REACH_RE = re.compile(
+    r'Connection (?:timed out|refused)|Network is unreachable|No route to host|'
+    r'Host or domain name not found|Name or service not known|conversation with .* timed out|'
+    r'lost connection|Cannot start TLS|TLS is required', re.I)
+_email_relay_health_cache = {'at': 0.0, 'data': None}
+
+
+def _parse_postqueue(out):
+    """`postqueue -p` text -> (messages queued, [deferral reason, ...]). The reason is the
+    parenthesised line under each queue entry; an empty queue says so on one line."""
+    out = out or ''
+    if 'Mail queue is empty' in out:
+        return 0, []
+    reasons = [l.strip().strip('()') for l in out.splitlines() if l.strip().startswith('(')]
+    m = re.search(r'--\s*[\d.]+\s*\w*bytes? in (\d+) Requests?', out, re.I)
+    count = int(m.group(1)) if m else len(re.findall(
+        r'^[0-9A-Za-z]{6,}[*!]?\s+\d+\s', out, re.M))
+    return count, reasons
+
+
+def _email_relay_problem(configured, postfix_state, queued, reasons):
+    """The plain-words problem, or None when mail is flowing. Pure: all inputs are passed in.
+    Returns {'kind', 'headline', 'detail', 'fix'}."""
+    if not configured:
+        return None
+    where = 'Email Relay page'
+    if postfix_state not in ('active', 'activating', 'reloading'):
+        return {'kind': 'stopped',
+                'headline': 'Email from this machine is not being sent',
+                'detail': 'The mail service (Postfix) is not running, so Guard Dog\'s update and '
+                          'security emails are not going out.',
+                'fix': f'Open the {where} and press Start.'}
+    auth = [r for r in reasons if _RELAY_AUTH_RE.search(r)]
+    if auth:
+        n = f'{queued:,} message{"s are" if queued != 1 else " is"} stuck. ' if queued else ''
+        return {'kind': 'login',
+                'headline': 'Your mail provider is rejecting this machine\'s email login',
+                'detail': n + 'Guard Dog\'s update and security emails are not reaching you. '
+                          'The provider said: ' + auth[-1][:200],
+                'fix': f'Open the {where}, enter a new password or app password for your mail '
+                       'account in "Switch Provider" (keep the same provider), and press '
+                       'Switch Provider. Stuck mail is sent again right away.'}
+    if queued >= EMAIL_RELAY_STUCK_MIN:
+        unreachable = any(_RELAY_REACH_RE.search(r) for r in reasons)
+        last = reasons[-1][:200] if reasons else ''
+        return {'kind': 'unreachable' if unreachable else 'stuck',
+                'headline': ('This machine cannot reach your mail provider' if unreachable
+                             else 'Email from this machine is piling up and not being delivered'),
+                'detail': f'{queued:,} messages are waiting, so Guard Dog\'s update and security '
+                          'emails are not reaching you.' + (f' Last reason: {last}' if last else ''),
+                'fix': f'Check the box has internet access and that the settings on the {where} '
+                       'are right, then press "Retry stuck mail" here.'}
+    return None
+
+
+def _email_relay_health(settings=None, force=False):
+    """Can Guard Dog's email actually leave this box? {'configured', 'ok', 'queued', and,
+    when not ok, kind/headline/detail/fix}. Cached 60 s: the banner polls it."""
+    c = _email_relay_health_cache
+    if not force and c['data'] is not None and time.time() - c['at'] < 60:
+        return c['data']
+    settings = settings if settings is not None else load_settings()
+    relay = settings.get('email_relay') or {}
+    configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
+    data = {'configured': configured, 'ok': True, 'queued': 0}
+    if configured:
+        try:
+            state = _diag_cmd(['systemctl', 'is-active', 'postfix'], priv=False).strip().splitlines()
+            state = state[0] if state else ''
+            queued, reasons = 0, []
+            if state == 'active':
+                r = subprocess.run(['postqueue', '-p'], capture_output=True, text=True, timeout=20)
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or 'postqueue failed').strip()[:120])
+                queued, reasons = _parse_postqueue(r.stdout)
+            problem = _email_relay_problem(True, state, queued, reasons)
+            data['queued'] = queued
+            if problem:
+                data.update(problem, ok=False)
+        except Exception as e:
+            # could not look: say nothing rather than cry wolf
+            print(f"[email-relay-health] check failed: {e}", flush=True)
+            if c['data'] is not None:
+                return c['data']
+    c['at'], c['data'] = time.time(), data
+    return data
+
+
+@app.route('/api/system/email-relay-health')
+@login_required
+def email_relay_health_api():
+    return jsonify(_email_relay_health())
+
+
+@app.route('/api/emailrelay/retry-queue', methods=['POST'])
+@login_required
+def emailrelay_retry_queue():
+    """Ask Postfix to retry everything it is holding now (`postqueue -f`, any user may)."""
+    try:
+        r = subprocess.run(['postqueue', '-f'], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stderr or 'postqueue -f failed').strip()[:200]})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]})
+    _email_relay_health_cache['data'] = None
+    return jsonify({'success': True})
+
 
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
