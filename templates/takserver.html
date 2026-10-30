@@ -198,6 +198,7 @@ function takPurgeFailed(){
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:8px">CoreConfig.xml patched · Service account: adm_ldapservice · Base DN: DC=takldap · Port 389</div>
 <div id="ldap-drift-banner" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.5);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#f87171">⚠ <span id="ldap-drift-msg"></span></div>
+<div id="ldap-username-banner" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.5);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#fbbf24">⚠ <span id="ldap-username-msg"></span></div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">webadmin superuser in Authentik: <span id="webadmin-superuser-status" style="color:var(--text-dim)">Checking...</span></div>
 <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
 <button type="button" id="resync-ldap-btn" onclick="resyncLdap()" style="padding:8px 16px;background:rgba(16,185,129,.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Resync LDAP to TAK Server</button>
