@@ -3073,6 +3073,17 @@ def _takportal_helper_ok():
     return _root_file_ok(TAKPORTAL_HELPER, want_sha256=TAKPORTAL_HELPER_SHA256)
 
 
+def _takportal_helper_current(decision):
+    """The installed helper is exactly the pinned one this TAK Portal ships. With
+    more than one pinned hash, "some pinned helper is installed" is not enough: a box
+    holding the old one would never pick up the portal's newer reviewed helper
+    (ops #340: apply-caddyfile only exists in the newer one)."""
+    want = decision.get('helper_bytes')
+    if want is None:
+        return _takportal_helper_ok()
+    return _root_file_ok(TAKPORTAL_HELPER, want_bytes=want)
+
+
 def _takportal_remove_leftover():
     """Drop TAK Portal <2.0.19's `NOPASSWD: ALL` marketplace drop-in. True when
     a file was removed."""
@@ -3142,7 +3153,7 @@ def _do_takportal_sudoers(req):
         hardened = (variant == 'hardened')
         wrappers_ok = _takportal_wrappers_ok() if hardened else True
         # An install would still have to put the helper in place.
-        helper_pending = hardened and decision['helper_bytes'] is not None and not helper_ok
+        helper_pending = hardened and decision['helper_bytes'] is not None and not _takportal_helper_current(decision)
         if present:
             try:
                 with open(TAKPORTAL_SUDOERS_PATH) as f:
@@ -3193,7 +3204,7 @@ def _do_takportal_sudoers(req):
         try:
             _takportal_install_wrappers()
             if decision['helper_bytes'] is not None:
-                if not _takportal_helper_ok():
+                if not _takportal_helper_current(decision):
                     _write_root_file(TAKPORTAL_HELPER, decision['helper_bytes'], 0o755)
             helper_granted = _takportal_helper_ok()
         except (OSError, Denied) as e:
