@@ -47,11 +47,12 @@ def test_floor_is_not_below_the_hardened_grant_release():
     assert _floor() >= tuple(b.TAKPORTAL_HARDENED_MIN_VERSION)
 
 
-def test_portal_2_0_26_helper_stays_unpinned_until_reviewed():
+def test_portal_2_0_26_helper_stays_unpinned():
     # marketplace-helper in TAK Portal 2.0.26 (same bytes in 2.0.28): apply-caddyfile still runs
-    # `caddy validate` as root on caller-supplied text, and now also carries on when validate only
-    # complained about permissions. Not reviewed, so not pinned (ops #295, #340).
+    # `caddy validate` as root on caller-supplied text, so it can print root-only files. Never pinned
+    # (ops #295, #340). 2.0.29 fixed that by validating as the caddy user; that one IS pinned.
     spec = importlib.util.spec_from_file_location('takwerx_broker_t343b', REPO / 'broker' / 'takwerx_broker.py')
     b = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(b)
     assert 'ba749885c92e9ea097012438a98cc0b45f3fabf4d46252d1bac54ef1720123cd' not in b.TAKPORTAL_HELPER_SHA256
+    assert '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559' in b.TAKPORTAL_HELPER_SHA256
