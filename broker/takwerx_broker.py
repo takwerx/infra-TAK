@@ -371,6 +371,7 @@ SYSTEMCTL_VERBS = {
     'enable', 'disable', 'mask', 'unmask', 'is-active', 'is-enabled',
     'is-failed', 'status', 'show', 'cat', 'daemon-reload', 'reset-failed',
     'list-units', 'list-timers', 'list-unit-files', 'kill',
+    'show-environment',        # read-only dump of the manager env (ops #347: was the one WOULD-DENY)
     'reboot',                  # operator-gated reboot after a kernel patch
     'poweroff',                # operator-gated power-off — console Power Off button, password-confirmed
 }
@@ -3754,7 +3755,7 @@ def _summary(req):
         # the persistent audit log or journald; CJIS "secrets never logged").
         # Generic rule: the token FOLLOWING a literal password-ish key.
         for i, a in enumerate(argv[:-1]):
-            if a in ('password', 'wifi-sec.psk'):
+            if a in _SECRET_VALUE_FLAGS:
                 argv[i + 1] = '***'
         # In-token secrets (v10.1.4 WS15): the CloudTAK postgis sync rides the DB
         # password INSIDE a single argv token, so the following-token rule above
@@ -3766,6 +3767,15 @@ def _summary(req):
         return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]
 
+
+# Argv keys whose NEXT token is a secret: nmcli WiFi PSK, keytool store/key
+# passwords (ops #347: `keytool -storepass <pw>` was logged in clear), openssl
+# -passin/-passout (`pass:<pw>`).
+_SECRET_VALUE_FLAGS = frozenset((
+    'password', 'wifi-sec.psk',
+    '-storepass', '-keypass', '-srcstorepass', '-deststorepass', '-srckeypass',
+    '-destkeypass', '-passin', '-passout', '-passwd',
+))
 
 _INLINE_SECRET_RES = (
     # PASSWORD '...' / PASSWORD "..." (SQL role DDL — quote style preserved, value masked)
