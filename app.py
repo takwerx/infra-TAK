@@ -31353,8 +31353,18 @@ def _caddy_restart_after_response(action='restart', verb='restart'):
     rc, out, ok = None, '', False
     try:
         generate_caddyfile(load_settings())
-        r = subprocess.run(_sudo_wrap(['systemctl', verb, 'caddy']), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True, timeout=90)
+        try:
+            r = subprocess.run(_sudo_wrap(['systemctl', verb, 'caddy']), stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True,
+                               timeout=CADDY_RELOAD_TIMEOUT if verb == 'reload' else 90)
+        except subprocess.TimeoutExpired:
+            if verb != 'reload':
+                raise
+            # ops #347: a reload that hangs has already accepted the config and is stuck
+            # draining (see _caddy_reload_checked); only a restart clears the `reloading` unit.
+            print('[caddy] deferred reload timed out — restarting to clear the stuck unit', flush=True)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=90)
         rc = r.returncode
         out = (r.stdout or '').strip()
         ok = (rc == 0)
@@ -31416,7 +31426,10 @@ def caddy_control():
         if action == 'start':
             subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True, timeout=5)
         caddy_last_action.update({'ok': None, 'action': action, 'rc': None, 'output': '', 'ts': 0})
-        threading.Thread(target=_caddy_restart_after_response, args=(action,), daemon=True).start()
+        # ops #347: the Reload button ran `systemctl restart`; pass the verb through.
+        threading.Thread(target=_caddy_restart_after_response, args=(action,),
+                         kwargs={'verb': 'reload' if action == 'reload' else 'restart'},
+                         daemon=True).start()
         enabled = ' (and enabled for boot)' if action == 'start' else ''
         return jsonify({'success': True, 'deferred': True,
                         'output': f'Caddy {action} scheduled{enabled} — check status in a few seconds; '
@@ -31796,7 +31809,9 @@ def caddy_save_domains():
         return blocked
     save_settings(settings)
     generate_caddyfile(settings)
-    threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    # ops #347: only the Caddyfile changed, so reload (a restart drops every open connection)
+    threading.Thread(target=_caddy_restart_after_response,
+                     kwargs={'action': 'reload', 'verb': 'reload'}, daemon=True).start()
     return jsonify({'success': True, 'domains': _get_all_service_domains(settings)})
 
 
@@ -61585,7 +61600,8 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'ALTER SYSTEM RESET ALL;']], 'and', timeout=15, cwd=ak_dir)
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply enterprise settings (max_connections=2000, shared_buffers=12GB, ...)")
+            _tier_cmd, _tier_lbl = _authentik_pg_command_for_ram(_local_ram_mb())
+            plog(f"  PostgreSQL tuning args changed — recreating container to apply the {_tier_lbl} settings ({_authentik_pg_tuning_summary(_tier_cmd)})")
             # ops #173: recreate + up under one hold of the compose lock (Reconfigure runs this).
             with _authentik_compose_lock('pg-tuning-recreate', plog=plog,
                                          timeout=_AK_COMPOSE_LOCK_WAIT_LONG_S) as _locked:
@@ -61596,7 +61612,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 subprocess.run(
                     _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120
                 )
-                plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
+                plog(f"  ✓ PostgreSQL recreated with {_tier_lbl} tuning ({_authentik_pg_tuning_summary(_tier_cmd)}, statement_timeout=120s, idle_session_timeout=300s)")
                 # The patch may also have ADDED services (redis) — a targeted recreate
                 # doesn't start those; full up -d is an idempotent no-op otherwise.
                 subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
@@ -64605,6 +64621,15 @@ _AUTHENTIK_PG_COMMAND_TAIL = (
     ' -c tcp_keepalives_count=6'
     ' -c jit=off'
 )
+
+
+def _authentik_pg_tuning_summary(cmd):
+    """'max_connections=…, shared_buffers=…, effective_cache_size=…' of a PG command string,
+    so log lines name what this box was actually given (ops #347: they claimed the 48 GB tier
+    on every box)."""
+    return ', '.join('%s=%s' % (k, m.group(1)) for k in
+                     ('max_connections', 'shared_buffers', 'effective_cache_size')
+                     for m in [re.search(k + r'=(\S+)', cmd or '')] if m)
 
 
 def _local_ram_mb():
@@ -71418,14 +71443,18 @@ def _authentik_fix_pg_idle_timeout(plog):
     # Authentik #20714 channels_postgres leak at production scale.
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
-    _mc_drift = _mc_current is not None and _mc_current < 2000
+    # ops #347: compare against THIS box's RAM tier, not the 48 GB tier's 2000 — a 16 GB box
+    # is correctly at 1000, and "drift" on every startup ended in "patcher reported no change".
+    _tier_cmd, _tier_lbl = _authentik_pg_command_for_ram(_local_ram_mb())
+    _mc_want = int(re.search(r'max_connections=(\d+)', _tier_cmd).group(1))
+    _mc_drift = _mc_current is not None and _mc_current != _mc_want
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
     _is_match = re.search(r'idle_session_timeout=(\d+)s', compose_content)
     _is_current = int(_is_match.group(1)) if _is_match else None
     _is_ok = _is_current == 300
     if current == 300 and not _mc_drift and _st_ok and _is_ok:
-        plog("  pg idle timeout: enterprise tuning current (max_connections=2000, shared_buffers=12GB, idle_in_transaction=300s, statement_timeout=120s, idle_session_timeout=300s) (idempotent — no-op)")
+        plog(f"  pg idle timeout: {_tier_lbl} tuning current ({_authentik_pg_tuning_summary(_tier_cmd)}, idle_in_transaction=300s, statement_timeout=120s, idle_session_timeout=300s) (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -71443,7 +71472,7 @@ def _authentik_fix_pg_idle_timeout(plog):
     if current != 300:
         _drift_parts.append(f"idle_in_transaction_session_timeout={current}s→300s")
     if _mc_drift:
-        _drift_parts.append(f"max_connections={_mc_current}→2000 (v0.9.28 enterprise)")
+        _drift_parts.append(f"max_connections={_mc_current}→{_mc_want} ({_tier_lbl})")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
     if not _is_ok:
@@ -71451,7 +71480,7 @@ def _authentik_fix_pg_idle_timeout(plog):
             f"idle_session_timeout={'absent' if _is_current is None else str(_is_current)+'s'}→300s "
             f"(reaps leaked async-thread connections; v0.9.21's 30s caused LISTEN-socket storms — 300s is safe)"
         )
-    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.28 enterprise config (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB)")
+    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying the {_tier_lbl} config ({_authentik_pg_tuning_summary(_tier_cmd)})")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
