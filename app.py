@@ -12221,6 +12221,31 @@ _PGDG_LIST = '/etc/apt/sources.list.d/pgdg.list'
 _PGDG_KEYRING = '/usr/share/keyrings/pgdg.asc'
 _PGDG_KEY_URL = 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'
 
+# GH #352 (ops #349) — Ubuntu Pro boxes could not install TAK Server at all:
+#   libgdal39 : Depends: gdal-data (>= 3.13.3+dfsg-2.pgdg24.04+1) but 3.8.4+dfsg-3ubuntu3+esm1 is to be installed
+# PGDG's PostGIS (3.7 on noble, Oct 2026) links PGDG's own GDAL/GEOS/PROJ, which are newer
+# than Ubuntu's, so on a plain box apt picks them on version alone. Ubuntu Pro ships
+# /etc/apt/preferences.d/ubuntu-pro-esm-{apps,infra} pinning its ESM copies at 510 (> 500),
+# so apt takes ESM's gdal-data 3.8.4 next to PGDG's libgdal39 and refuses the whole install.
+# Pin the GIS stack to PGDG above ESM (600; < 1000, so nothing is ever downgraded), plus
+# the shared PostgreSQL packages PGDG's postgresql-<major> needs a PGDG version of
+# (postgresql-15 Depends postgresql-common >= 241; jammy's own is 238 — an ESM copy of it
+# would break 22.04 the same way). On a box without Ubuntu Pro PGDG already wins every one
+# of these on version, so nothing changes there. Kept free of ' and % so the remote
+# fragment below can printf it as-is.
+_PGDG_GIS_PIN = '/etc/apt/preferences.d/infratak-pgdg-gis'
+_PGDG_GIS_PIN_BODY = (
+    '# Written by infra-TAK: PostGIS from apt.postgresql.org needs the GDAL/GEOS/PROJ built with it.\n'
+    '# Ubuntu Pro pins its ESM copies at 510, which leaves PostGIS uninstallable (infra-TAK GH 352).\n'
+    'Package: gdal-* libgdal* python3-gdal geos-bin libgeos* proj-* libproj* libsfcgal* libcgal* postgis* libh3*\n'
+    f'Pin: release o={_PGDG_APT_HOST}\n'
+    'Pin-Priority: 600\n'
+    '\n'
+    'Package: postgresql-common postgresql-client-common libpq5\n'
+    f'Pin: release o={_PGDG_APT_HOST}\n'
+    'Pin-Priority: 600\n'
+)
+
 # Shell fragment for the REMOTE (Server One over SSH) path. Ends with '&& ' so it
 # drops into the existing && chains. Idempotent and conflict-aware.
 _PGDG_REMOTE_SETUP_SH = (
@@ -12235,6 +12260,8 @@ _PGDG_REMOTE_SETUP_SH = (
     f'echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt ${{cn}}-pgdg main" '
     f'| sudo tee {_PGDG_LIST} >/dev/null; '
     'else echo "PGDG apt source already configured on this host - reusing it"; fi && '
+    # GH #352: keep PostGIS's GIS stack on PGDG on Ubuntu Pro DB hosts too (see _PGDG_GIS_PIN).
+    "printf '" + _PGDG_GIS_PIN_BODY.replace('\n', '\\n') + f"' | sudo tee {_PGDG_GIS_PIN} >/dev/null && "
 )
 
 
@@ -13394,6 +13421,8 @@ def takserver_two_server_runbook():
         'sudo mkdir -p /usr/share/keyrings',
         f'sudo curl {_PGDG_KEY_URL} --output {_PGDG_KEYRING}',
         f'cn={_APT_CODENAME_SH} && [ -n "$cn" ] && echo "deb [signed-by={_PGDG_KEYRING}] https://{_PGDG_APT_HOST}/pub/repos/apt ${{cn}}-pgdg main" | sudo tee {_PGDG_LIST} >/dev/null',
+        # GH #352: needed on Ubuntu Pro, harmless elsewhere.
+        "printf '" + _PGDG_GIS_PIN_BODY.replace('\n', '\\n') + f"' | sudo tee {_PGDG_GIS_PIN} >/dev/null",
         'sudo apt update',
         f'sudo apt install -y ./{db_pkg}' if db_pkg else 'sudo apt install -y ./takserver-database_x.x-RELEASExx_all.deb',
         # v0.9.12 hardening: source-scope only, deny everything else on db_port.
@@ -83753,6 +83782,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
         if _distro_family() == 'rhel':
             cmd = 'dnf -y install ' + shlex.quote(pkg_path) + ' 2>&1'
         else:
+            _pgdg_gis_pin_ensure(_say)   # GH #352: 5.8's PostGIS on an Ubuntu Pro box
             cmd = ('DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades '
                    '--allow-change-held-packages ' + shlex.quote(pkg_path) + ' 2>&1')
         rc = _tak_upgrade_apt_install_streamed(cmd, os.path.dirname(pkg_path) or '/tmp',
@@ -84340,6 +84370,8 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     appends lines to upgrade_log so operators see where apt stalled if a timeout fires.
     """
     qn = shlex.quote(pkg_name)
+    # GH #352: an upgrade pulls the newer PostGIS too — same Ubuntu Pro ESM clash as a fresh install.
+    _pgdg_gis_pin_ensure(lambda m: upgrade_log.append(m))
     # v10.0.5 non-root: pass env via Popen instead of a literal `env` wrapper, so
     # `apt-get` is the direct command and resolves to the broker shim on PATH (root).
     _aenv = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
@@ -88865,6 +88897,32 @@ def _apt_update_capture(timeout=600):
     return ok, out
 
 
+def _pgdg_gis_pin_ensure(log_fn=None):
+    """Write _PGDG_GIS_PIN (GH #352) so apt takes PostGIS's GDAL/GEOS/PROJ from PGDG
+    even where Ubuntu Pro's ESM pin (510) would win. True when the pin is in place.
+
+    Our own file, rewritten only when its content differs. A no-op on a box without
+    Ubuntu Pro (PGDG already wins on version there). DEBIAN FAMILY ONLY; never raises —
+    without the pin the install still runs and fails with apt's own message."""
+    if _distro_family() == 'rhel':
+        return False
+    try:
+        with open(_PGDG_GIS_PIN, 'r') as f:
+            if f.read() == _PGDG_GIS_PIN_BODY:
+                return True
+    except Exception:
+        pass
+    try:
+        _write_priv(_PGDG_GIS_PIN, _PGDG_GIS_PIN_BODY)
+        if log_fn:
+            log_fn(f"  Pinned PostGIS's GDAL/GEOS/PROJ to the PGDG repo ({_PGDG_GIS_PIN})")
+        return True
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ could not write {_PGDG_GIS_PIN}: {type(e).__name__}: {e}")
+        return False
+
+
 def _setup_pgdg_apt_source():
     """Configure (or reuse) the PGDG apt repo. True = apt is healthy and PGDG is
     reachable; False = hard stop, the caller must abort the deploy (Step 4 cannot
@@ -88945,6 +89003,7 @@ def _setup_pgdg_apt_source():
         wrote_ours = True
         log_step(f"  Wrote {_PGDG_LIST} ({_cn}-pgdg)")
 
+    _pgdg_gis_pin_ensure(log_step)
     wait_for_package_lock()
     log_step("  Updating package lists...")
     ok, out = _apt_update_capture()
