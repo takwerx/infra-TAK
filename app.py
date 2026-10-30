@@ -2160,6 +2160,25 @@ def _mod_result_scrub(text):
                   r'\1\2[REDACTED]', text)
 
 
+_MOD_LOG_TAIL_LINES = 40
+
+
+def _mod_log_tail(entries, n=_MOD_LOG_TAIL_LINES):
+    """The last `n` non-empty lines of a job log (strings, or dicts carrying msg/message/text),
+    ANSI-stripped, secret-scrubbed and each capped at 240 characters. Never raises."""
+    try:
+        lines = []
+        for t in (entries if isinstance(entries, (list, tuple, deque)) else str(entries or '').splitlines()):
+            if isinstance(t, dict):
+                t = t.get('msg') or t.get('message') or t.get('text') or t.get('line') or ''
+            t = _ANSI_RE.sub('', str(t)).rstrip()
+            if t.strip():
+                lines.append(_mod_result_scrub(t)[:240])
+        return lines[-n:]
+    except Exception:
+        return []
+
+
 def _mod_results_load():
     try:
         with open(MODULE_RESULTS_FILE) as f:
@@ -2228,8 +2247,10 @@ def _mod_result_versions(module, frm=None, to=None):
         pass
 
 
-def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None):
-    """Record the outcome. `error` may be a message or a whole log; the real line is extracted."""
+def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None, log_tail=None):
+    """Record the outcome. `error` may be a message or a whole log; the real line is extracted.
+    `log_tail` (failures only): the last lines of the job's log, kept so Diagnostics can show how an
+    install or deploy stopped after the in-memory log is gone (ops #353)."""
     try:
         with _MODULE_RESULTS_LOCK:
             d = _mod_results_load()
@@ -2248,7 +2269,10 @@ def _mod_result_finish(module, ok, error='', to=None, step=None, kind=None):
             if ok:
                 e['error'] = ''
                 e['summary'] = ''
+                e.pop('log_tail', None)
             else:
+                if log_tail:
+                    e['log_tail'] = _mod_log_tail(log_tail)
                 raw = error if isinstance(error, str) else '\n'.join(map(str, error or []))
                 e['error'] = _mod_result_scrub(_update_error_line(error)) or 'failed (no error text was returned)'
                 e['summary'] = _mod_result_scrub((raw.strip().splitlines() or [''])[0][:200])
@@ -2401,10 +2425,11 @@ def _tracked_finish(module, status, log, exc=None, kind='update'):
                 break
         err = (status or {}).get('error')
         if exc is not None:
-            _mod_result_finish(module, False, f'{type(exc).__name__}: {exc}', step=step or None, kind=kind)
+            _mod_result_finish(module, False, f'{type(exc).__name__}: {exc}', step=step or None, kind=kind,
+                               log_tail=entries)
         elif err:
             detail = err if isinstance(err, str) and err.strip() else entries
-            _mod_result_finish(module, False, detail, step=step or None, kind=kind)
+            _mod_result_finish(module, False, detail, step=step or None, kind=kind, log_tail=entries)
         else:
             _mod_result_finish(module, True, step=step or None, kind=kind)
     except Exception:
@@ -9355,6 +9380,343 @@ def _diag_section_tak_database(settings):
     return out
 
 
+# ── ops #353: package sources, Ubuntu Pro, and the last failed install ────────────────────────
+# A TAK Server install that stopped at the package step left a report that said only "TAK Server
+# is not installed" (infra-TAK #352): Ubuntu Pro's apt pins (510) outranked the PostgreSQL repo
+# (500) and nothing in the report named either. These two sections answer "which copy of each
+# package would apt/dnf install, and why" and "how did the last install attempt end". Read-only,
+# like the rest of Diagnostics; no contract token, account or machine id is read or printed.
+_DIAG_SRC_PKGS = ('postgresql', 'postgis', 'gdal-data', 'libpq5', 'postgresql-common')
+_DIAG_URL_CREDS_RE = re.compile(r'(?<=://)[^/\s@]+@')
+_DIAG_SRC_MAX_ROWS = 40
+_DIAG_RPM_PKG_RE = re.compile(r'^(postgresql\d*(-server|-libs|-contrib)?|postgresql-private-libs|postgis\d+(_\d+)?|'
+                              r'gdal\d*-libs|libpq5?)\.\w+\s')
+
+
+def _diag_read(path):
+    """Text of a (normally world-readable) config file, else None."""
+    try:
+        txt = _read_own_or_priv(path)
+    except Exception:
+        return None
+    return txt if isinstance(txt, str) else None
+
+
+def _diag_os_id():
+    """ID= from /etc/os-release ('ubuntu', 'rocky', …), '' when unknown."""
+    m = re.search(r'^ID=["\']?([\w.-]+)', _diag_read('/etc/os-release') or '', re.M)
+    return m.group(1).lower() if m else ''
+
+
+def _diag_ubuntu_pro():
+    """Ubuntu Pro: attached or not, and whether esm-apps / esm-infra are on. `pro status
+    --format json` is parsed and only those fields are printed; the account, contract and
+    machine id it also carries are never copied."""
+    out = []
+    pro = shutil.which('pro') or shutil.which('ubuntu-advantage')
+    if pro:
+        raw = _diag_cmd([pro, 'status', '--format', 'json'], priv=False, timeout=30)
+        try:
+            st = json.loads(raw[raw.index('{'):])
+        except ValueError:
+            st = None
+        if isinstance(st, dict):
+            out.append('Ubuntu Pro: ' + ('ATTACHED' if st.get('attached') else 'not attached'))
+            svc = {s.get('name'): s for s in (st.get('services') or []) if isinstance(s, dict)}
+            for n in ('esm-apps', 'esm-infra'):
+                s = svc.get(n)
+                if not s:
+                    out.append(f'  {n}: not listed')
+                    continue
+                # An unattached box lists each service with only `available`; status and
+                # entitled appear once a contract is attached.
+                det = (f"entitled: {s['entitled']}" if 'entitled' in s
+                       else f"available: {s['available']}" if 'available' in s else '')
+                out.append(f"  {n}: {s.get('status') or 'not enabled'}" + (f' ({det})' if det else ''))
+            on = sorted(str(n) for n, s in svc.items()
+                        if s.get('status') == 'enabled' and n not in ('esm-apps', 'esm-infra'))
+            out.append('  other enabled Pro services: ' + (', '.join(on) or 'none'))
+        else:
+            out.append('Ubuntu Pro: `pro status` gave no usable answer: ' + (raw[:160] or 'no output'))
+    else:
+        out.append('Ubuntu Pro: the pro client is not installed')
+    try:
+        esm = sorted(f for f in os.listdir('/etc/apt/sources.list.d') if 'esm' in f.lower())
+    except OSError:
+        esm = []
+    out.append('  ESM apt source files present: ' + (', '.join(esm) or 'none'))
+    return out
+
+
+def _diag_apt_pins():
+    """Every pin file apt reads, with its Package / Pin / Pin-Priority lines."""
+    files = []
+    if os.path.isfile('/etc/apt/preferences'):
+        files.append('/etc/apt/preferences')
+    try:
+        files += [os.path.join('/etc/apt/preferences.d', f) for f in sorted(os.listdir('/etc/apt/preferences.d'))
+                  if os.path.isfile(os.path.join('/etc/apt/preferences.d', f))]
+    except OSError:
+        pass
+    out = [f'pin files (/etc/apt/preferences, /etc/apt/preferences.d): {len(files)}']
+    for p in files[:30]:
+        # apt only reads files with no extension or a .pref one; say so when a file is ignored.
+        ext = os.path.splitext(p)[1]
+        note = '  (ignored by apt: only no extension or .pref is read)' if ext and ext != '.pref' else ''
+        out.append('  ' + p + note)
+        body = _diag_read(p)
+        if body is None:
+            out.append('    (not readable by the console)')
+            continue
+        keep = [l.strip() for l in body.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+        out.extend('    ' + l[:160] for l in keep[:16])
+        if len(keep) > 16:
+            out.append(f'    … {len(keep) - 16} more line(s)')
+    return out
+
+
+def _diag_apt_sources():
+    """The active (uncommented) lines of sources.list and sources.list.d/*.list|*.sources."""
+    paths = ['/etc/apt/sources.list']
+    try:
+        paths += [os.path.join('/etc/apt/sources.list.d', f) for f in sorted(os.listdir('/etc/apt/sources.list.d'))
+                  if f.endswith(('.list', '.sources'))]
+    except OSError:
+        pass
+    out, n = ['repositories (active lines):'], 0
+    for p in paths:
+        body = _diag_read(p)
+        if body is None:
+            continue
+        keep = [_DIAG_URL_CREDS_RE.sub('', l.strip()) for l in body.splitlines()
+                if l.strip() and not l.lstrip().startswith('#')]
+        if not keep:
+            continue
+        out.append('  ' + p)
+        for l in keep:
+            if n >= 80:
+                break
+            out.append('    ' + l[:200])
+            n += 1
+    if len(out) == 1:
+        out.append('  (none readable)')
+    return out
+
+
+def _diag_apt_policy_parse(text):
+    """`apt-cache policy PKG…` → {package: {installed, candidate, versions: [(ver, prio, first source)]}}."""
+    pk, cur = {}, None
+    for ln in text.splitlines():
+        m = re.match(r'^(\S[^:\s]*):\s*$', ln)
+        if m:
+            cur = pk.setdefault(m.group(1), {'installed': None, 'candidate': None, 'versions': []})
+            continue
+        if cur is None:
+            continue
+        s = ln.strip()
+        if s.startswith('Installed:'):
+            cur['installed'] = s.split(':', 1)[1].strip()
+        elif s.startswith('Candidate:'):
+            cur['candidate'] = s.split(':', 1)[1].strip()
+        else:
+            mv = re.match(r'^ {1,5}(?:\*\*\* )?(\S+) (\d+)$', ln)
+            ms = re.match(r'^ {6,}(\d+) (\S+)(?: (\S+))?', ln)
+            if mv:
+                cur['versions'].append([mv.group(1), int(mv.group(2)), None])
+            elif ms and cur['versions'] and cur['versions'][-1][2] is None and ms.group(2) != '/var/lib/dpkg/status':
+                cur['versions'][-1][2] = _DIAG_URL_CREDS_RE.sub('', f"{ms.group(2)} {ms.group(3) or ''}".strip())
+    return pk
+
+
+def _diag_apt_candidates():
+    """Installed version, the version apt would install, and where it comes from, for the
+    packages the TAK database stack depends on (plus whichever libgdal the box knows)."""
+    names = list(_DIAG_SRC_PKGS)
+    gd = _diag_cmd(['apt-cache', 'pkgnames', 'libgdal'], priv=False, timeout=20)
+    names += sorted({l.strip() for l in gd.splitlines() if re.match(r'^libgdal\d+[a-z0-9]*$', l.strip())})[:4]
+    out = [f"candidate versions (`apt-cache policy`): {', '.join(names)}"]
+    pk = _diag_apt_policy_parse(_diag_cmd(['apt-cache', 'policy'] + names, priv=False, timeout=30))
+    for n in names:
+        p = pk.get(n)
+        if not p:
+            out.append(f'  {n}: not known to apt')
+            continue
+        cand = next((v for v in p['versions'] if v[0] == p['candidate']), None)
+        out.append(f"  {n}: installed {p['installed'] or '?'}, candidate {p['candidate'] or '?'}"
+                   + (f" at priority {cand[1]} from {cand[2] or '?'}" if cand else ''))
+        # Only the competing sources matter: the newest version from each other (priority, source).
+        seen = {(cand[1], cand[2])} if cand else set()
+        for v in p['versions']:
+            if v is cand or (v[1], v[2]) in seen or v[2] is None:
+                continue
+            seen.add((v[1], v[2]))
+            out.append(f"      also offered: {v[0]} at priority {v[1]} from {v[2]}")
+            if len(seen) > 4:
+                break
+    return out
+
+
+def _diag_apt_priorities():
+    """Priority and origin of every package source apt knows (apt-cache policy, no arguments)."""
+    raw = _diag_cmd(['apt-cache', 'policy'], priv=False, timeout=30)
+    groups, last, pinned = {}, None, []
+    in_pinned = False
+    for ln in raw.splitlines():
+        if ln.startswith('Pinned packages'):
+            in_pinned = True
+            continue
+        if in_pinned:
+            if ln.strip():
+                pinned.append(ln.strip())
+            continue
+        m = re.match(r'^ *(\d+) (\S+)(?: (\S+))?', ln)
+        if m and not ln.lstrip().startswith(('release', 'origin')) and m.group(2) != '/var/lib/dpkg/status':
+            # one entry per priority + URL + suite; the components (main, universe, …) are folded in
+            suite, _, comp = (m.group(3) or '').partition('/')
+            last = groups.setdefault((m.group(1), _DIAG_URL_CREDS_RE.sub('', m.group(2)), suite), {'comp': [], 'lab': ''})
+            if comp and comp not in last['comp']:
+                last['comp'].append(comp)
+        elif last is not None and ln.lstrip().startswith('release '):
+            lab = ','.join(x for x in ln.split(None, 1)[1].split(',') if x.startswith(('o=', 'a=', 'l=')))
+            last['lab'] = last['lab'] or lab
+            last = None
+    out = [f"{k[0]} {k[1]} {k[2]}".strip() + (f" ({', '.join(v['comp'])})" if v['comp'] else '')
+           + (f"  [{v['lab']}]" if v['lab'] else '') for k, v in groups.items()]
+    res = [f'package sources by priority ({len(out)}):']
+    res.extend('  ' + l[:200] for l in out[:50])
+    if pinned:
+        # apt prints one line per pinned VERSION; the package and its priority are what matter.
+        by_pkg = {}
+        for l in pinned:
+            m = re.match(r'^(\S+) -> \S+ with priority (\d+)', l)
+            if m:
+                by_pkg.setdefault(m.group(1), m.group(2))
+        res.append(f"packages with an individual pin ({len(by_pkg)}): "
+                   + ', '.join(f'{k} ({v})' for k, v in sorted(by_pkg.items())[:25])
+                   + (' …' if len(by_pkg) > 25 else ''))
+    return res
+
+
+def _diag_rpm_sources():
+    """Enabled dnf repos (with priority, excludes and module_hotfixes), module streams, and the
+    installed / available copy of the TAK database packages with the repo each comes from."""
+    import configparser
+    out = ['enabled repositories (/etc/yum.repos.d):']
+    try:
+        files = sorted(f for f in os.listdir('/etc/yum.repos.d') if f.endswith('.repo'))
+    except OSError:
+        files = []
+    n = 0
+    for f in files:
+        body = _diag_read('/etc/yum.repos.d/' + f)
+        cp = configparser.RawConfigParser(strict=False)
+        try:
+            cp.read_string(body or '')
+        except configparser.Error:
+            out.append(f'  {f}: (could not parse)')
+            continue
+        for sec in cp.sections():
+            if cp.get(sec, 'enabled', fallback='1').strip() != '1':
+                continue
+            src = next((cp.get(sec, k) for k in ('baseurl', 'metalink', 'mirrorlist') if cp.has_option(sec, k)), '?')
+            extra = ' '.join(f'{k}={cp.get(sec, k).strip()}' for k in
+                             ('priority', 'module_hotfixes', 'exclude', 'excludepkgs', 'includepkgs')
+                             if cp.has_option(sec, k))
+            if n < 40:
+                out.append(f"  {sec} ({f}): {_DIAG_URL_CREDS_RE.sub('', src.split()[0] if src.split() else '?')[:120]}"
+                           f"{'  ' + extra if extra else ''}")
+            n += 1
+    if n == 0:
+        out.append('  (none found)')
+    elif n > 40:
+        out.append(f'  … {n - 40} more')
+    conf = [l.strip() for l in (_diag_read('/etc/dnf/dnf.conf') or '').splitlines()
+            if re.match(r'^\s*(exclude|excludepkgs|best|obsoletes)\s*=', l)]
+    if conf:
+        out.append('dnf.conf: ' + '; '.join(conf))
+    mods = _diag_cmd(['dnf', '-C', '-q', 'module', 'list', '--enabled'], priv=False, timeout=40)
+    out.append('enabled module streams (`dnf module list --enabled`):')
+    out.extend('  ' + l.strip()[:160] for l in mods.splitlines() if l.strip())
+    pats = ['postgresql*', 'postgis*', 'gdal*', 'libpq*']
+    for label, flag in (('installed', '--installed'), ('available (newest per package)', '--available')):
+        rows = _diag_cmd(['dnf', '-C', '-q', 'list', flag] + pats, priv=False, timeout=60).splitlines()
+        # The server / library / GIS packages only: PGDG has dozens of -devel, -java, -python … beside them.
+        rows = [l.strip() for l in rows if _DIAG_RPM_PKG_RE.match(l.strip()) or l.strip().startswith('Error')]
+        # PostgreSQL first, then PostGIS, libpq, GDAL: a long GDAL list must not push the server rows out.
+        fam = lambda l: next((i for i, p in enumerate(('postgresql', 'postgis', 'libpq', 'gdal')) if l.startswith(p)), 9)
+        rows.sort(key=fam)
+        out.append(f'{label} (package, version, repo): {len(rows)}')
+        out.extend('  ' + l[:160] for l in rows[:_DIAG_SRC_MAX_ROWS])
+        if len(rows) > _DIAG_SRC_MAX_ROWS:
+            out.append(f'  … {len(rows) - _DIAG_SRC_MAX_ROWS} more')
+    return out
+
+
+def _diag_section_package_sources(settings):
+    """Where the TAK Server stack's packages come from. Runs whether or not TAK Server is installed:
+    the box where the install failed is exactly the one that needs it."""
+    out = []
+    if shutil.which('apt-cache'):
+        if _diag_os_id() == 'ubuntu':
+            out.extend(_diag_ubuntu_pro())
+        else:
+            out.append('Ubuntu Pro: not applicable (this is not Ubuntu)')
+        out.extend(_diag_apt_pins())
+        out.extend(_diag_apt_sources())
+        out.extend(_diag_apt_priorities())
+        out.extend(_diag_apt_candidates())
+    elif shutil.which('dnf') or shutil.which('rpm'):
+        out.append('Ubuntu Pro: not applicable (RHEL family; apt pins do not exist, dnf repo priorities are below)')
+        out.extend(_diag_rpm_sources())
+    else:
+        out.append('no apt or dnf found on this box')
+    return out
+
+
+def _diag_section_failed_install(settings):
+    """How the last failed (or cut-off) install, deploy or update of each module ended, with the
+    end of its log: an install that stopped at the package step is visible from the report alone."""
+    tak_here = os.path.exists('/opt/tak') or _tak_is_container()
+    out = ['TAK Server on this box: ' + ('installed' if tak_here else 'NOT installed')]
+    d = _mod_results_load()
+    shown, tak_has_tail = 0, False
+    for name in sorted(d):
+        m = d.get(name) or {}
+        last = m.get('last') or {}
+        entries = ([last] if last else []) + [h for h in (m.get('history') or []) if h.get('id') != last.get('id')]
+        bad = None
+        for e in entries:            # newest first: a later success supersedes an older failure
+            if e.get('outcome') == 'ok':
+                break
+            if e.get('outcome') in ('failed', 'interrupted'):
+                bad = e
+                break
+        if not bad or shown >= 4:
+            continue
+        shown += 1
+        when = (bad.get('finished_at') or bad.get('started_at') or '?').replace('T', ' ').rstrip('Z')
+        out.append(f"{name}: last {bad.get('kind') or 'update'} {str(bad.get('outcome')).upper()} {when} UTC"
+                   f" | step: {bad.get('step') or '?'}")
+        if bad.get('error'):
+            out.append('  ' + str(bad['error'])[:400])
+        tail = bad.get('log_tail') or []
+        if tail:
+            out.append(f'  end of the log ({len(tail)} line(s)):')
+            out.extend('    ' + str(l)[:240] for l in tail)
+            tak_has_tail = tak_has_tail or name == 'takserver'
+        else:
+            out.append('  (no log lines were kept for this attempt: it was cut off by a console restart, '
+                       'or ran before logs were kept)')
+    if not tak_has_tail and deploy_status.get('error') and deploy_log:
+        out.append('TAK Server deploy log of this console session (a deploy that failed before it was recorded):')
+        out.extend('    ' + l[:240] for l in _mod_log_tail(deploy_log))
+    if not shown and not (deploy_status.get('error') and deploy_log):
+        out.append('no failed or cut-off install, deploy or update is recorded on this box'
+                   + ('' if tak_here else ' — and TAK Server is not installed, so no install attempt reached the '
+                      'deploy step on this console'))
+    return out
+
+
 def _diag_apt_history(lines, cutoff):
     """apt transactions since `cutoff` that touched TAK/PostgreSQL/Java: when, the command
     line, who asked, the matching packages, and whether the transaction finished."""
@@ -9642,6 +10004,8 @@ _DIAG_SECTIONS = (
     ('Authentik / LDAP / webadmin', _diag_section_authentik),
     ('TAK Server', _diag_section_takserver),
     ('TAK Server database — PostgreSQL, packages, snapshots', _diag_section_tak_database),
+    ('Package sources — Ubuntu Pro, apt pins / dnf repos, candidate versions', _diag_section_package_sources),
+    ('Last failed install or deploy', _diag_section_failed_install),
     ('What changed on this box — installs, OS patches, reboots, restarts', _diag_section_change_trail),
     ('TAK Portal', _diag_section_takportal),
     ('Email Relay', _diag_section_emailrelay),
@@ -88542,7 +88906,9 @@ def deploy_takserver():
         deploy_log.clear()
         deploy_warnings.clear()
         deploy_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_deploy, args=(c_config,), daemon=True).start()
+        threading.Thread(target=_run_tracked, daemon=True,   # ops #353: the outcome + log tail outlive the page
+                     args=('takserver', deploy_status, deploy_log, run_takserver_deploy, c_config),
+                     kwargs={'kind': 'deploy'}).start()
         return jsonify({'success': True})
 
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
@@ -88606,7 +88972,9 @@ def deploy_takserver():
     deploy_log.clear()
     deploy_warnings.clear()
     deploy_status.update({'running': True, 'complete': False, 'error': False})
-    threading.Thread(target=run_takserver_deploy, args=(config,), daemon=True).start()
+    threading.Thread(target=_run_tracked, daemon=True,   # ops #353: the outcome + log tail outlive the page
+                     args=('takserver', deploy_status, deploy_log, run_takserver_deploy, config),
+                     kwargs={'kind': 'deploy'}).start()
     return jsonify({'success': True})
 
 # v10.1.27 (item B3) — non-fatal warnings collected during a TAK deploy.
