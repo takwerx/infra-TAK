@@ -128,3 +128,11 @@ def test_rollback_points_files_home_and_hands_ownership_back_to_root():
     chown = tail.index("'--from=takwerx:takwerx', 'root:root', src")
     up = tail.index("_compose(src, 'up -d')")
     assert rewrite < mv < chown < up
+
+
+def test_stack_is_stopped_never_downed_so_anonymous_data_volumes_survive():
+    # Box test on test12: CloudTAK's postgis data sits on an anonymous volume; `compose down`
+    # orphaned it and the next `up` started an empty database (profiles 3 -> 0).
+    s = _rehome_src()
+    assert "_compose(src, 'stop')" in s and "_compose(dst, 'stop')" in s
+    assert "'down'" not in s

@@ -97718,13 +97718,14 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
     takwerx console can't traverse — so the ~200 `cd ~/<module> && docker compose …` management
     sites all target the wrong (missing) path. Moving the dir to the console home makes every one of
     them work with ZERO per-site edits. Ships via UPDATE (startup hook), broker-mediated (root cd's
-    /root). Data-safe: the module composes use named docker volumes + RELATIVE (`./`) bind mounts
-    (verified: NO absolute /root binds) — both survive the move (named volumes reattach by the
-    preserved project name; relative binds resolve from the new working dir).
+    /root). Data-safe: the module composes use docker volumes + RELATIVE (`./`) bind mounts
+    (verified: NO absolute /root binds) — both survive the move (volumes reattach by the
+    preserved project name, ANONYMOUS ones too as long as the containers are stopped, never
+    `down`ed; relative binds resolve from the new working dir).
 
     HARD SAFETY — never leave a module down (this is why the flip 'doesn't get fucked up'):
-      down (keep volumes) → verify stopped → mv+chown → up from new home → VERIFY the key
-      container returns within wait_healthy; if it does NOT, ROLL BACK (down, mv dir back to /root,
+      stop (keep containers+volumes) → verify stopped → mv+chown → up from new home → VERIFY the key
+      container returns within wait_healthy; if it does NOT, ROLL BACK (stop, mv dir back to /root,
       up from /root) so the module is restored exactly where it was. Aborts before the move if the
       stack won't stop. Idempotent (no-op once ~/<subdir> exists or /root/<subdir> is gone)."""
     try:
@@ -97755,10 +97756,13 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
                                shell=True, capture_output=True, text=True, env=_broker_shim_env())
             return 'Up' in (r.stdout or '')
         _log('root-era install at %s — migrating to %s (named volumes + relative binds preserved)' % (src, dst))
-        # 1) Stop the stack (KEEP volumes — no `-v`).
-        _compose(src, 'down')
+        # 1) Stop the stack (KEEP volumes — no `-v`). `stop`, not `down` (ops #346 box test): CloudTAK's
+        #    postgis keeps its data on an ANONYMOUS volume, which `down` orphans — the next `up` makes a
+        #    fresh empty one (3 profiles -> 0 on test12). Stopped containers keep their volumes, and
+        #    `up -d` from the new dir starts them (or recreates them with the volume carried over).
+        _compose(src, 'stop')
         if _key_up():
-            _log('WARN: %s still up after `compose down` — aborting, left in place (no data touched)' % container_name)
+            _log('WARN: %s still up after `compose stop` — aborting, left in place (no data touched)' % container_name)
             return
         # 2) Move + chown to takwerx.
         _mv = subprocess.run(_sudo_wrap(['mv', src, dst]), capture_output=True, text=True, timeout=180)
@@ -97792,7 +97796,7 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
             _log('✓ re-homed %s -> %s and restarted (non-root manageable)' % (src, dst))
             return
         _log('WARN: %s did not return within %ss from %s — ROLLING BACK to %s' % (container_name, wait_healthy, dst, src))
-        _compose(dst, 'down')
+        _compose(dst, 'stop')                    # stop, not down: keeps the anonymous data volumes (ops #346)
         _rehome_rewrite_paths(dst, dst, src)     # while takwerx can still write it: names point home again
         _rb = subprocess.run(_sudo_wrap(['mv', dst, src]), capture_output=True, text=True, timeout=180)
         if _rb.returncode == 0:
