@@ -67285,6 +67285,23 @@ def _docker_started_epoch(container):
     return _epoch_from_rfc3339(parts[1])
 
 
+def _ak_container_env_value(container, key):
+    """`key`'s value in `container`'s environment ('' if it isn't set), or None when the
+    container can't be inspected (missing, remote Authentik, docker error)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{json .Config.Env}}', container]),
+                           capture_output=True, text=True, timeout=10)
+        env = json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+    if not isinstance(env, list):
+        return None
+    for item in env:
+        if isinstance(item, str) and item.startswith(f'{key}='):
+            return item.split('=', 1)[1]
+    return ''
+
+
 # GH #207: Guard Dog's tak-authentik-watch.sh restarts Authentik on its own (HTTP down, or
 # an LDAP flow herd) and appends the epoch of each restart here (_record_restart, root,
 # 0644). Its first restart in 6 h touches only server+worker, so the outpost's start time
@@ -68206,9 +68223,16 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             except Exception as e:
                 verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
         if verdict in ('ok', 'healed'):
+            # ops #316: a restart drops every connected client to fix the HTTPS side alone, and
+            # on test6 that side came back by itself 75-204 s after an outpost restart (the
+            # 2026-10-30 update restart came 182 s in, with all 8 clients holding their groups).
+            # So with clients connected and grouped TAK is never restarted for it; only a TAK
+            # with nobody to drop (or none we can see) still is, after the stuck shortcut.
+            sessions = _tak_client_sessions()
+            grouped = None if sessions is None else sum(1 for x in sessions if x['groups'])
             # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=True)
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=grouped == 0)
             except Exception as e:
                 api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
             outcome ='clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
@@ -68220,9 +68244,19 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
                 _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
+            if grouped != 0:
+                who = (f"{grouped} connected client(s) have their groups" if grouped
+                       else "TAK's client list can't be read")
+                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
+                     f"TAK Server NOT restarted: {who}, and a restart would drop them all. ATAK Data Sync and "
+                     f"CloudTAK may show empty mission lists until it recovers; if they still do, restart TAK "
+                     f"Server at a quiet moment")
+                _finish(outcome + ' (HTTPS still broken, clients kept)',
+                        healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                return False
             plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
                  f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
-            summary = f"HTTPS/API side gives users no groups ({api_summary})"
+            summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
@@ -68260,7 +68294,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         return True
 
 
-def _authentik_reconfigure_heal_tak_clients(plog):
+def _ak_ldap_path_starts():
+    """Start times of the containers TAK's LDAP lookups go through (outpost, server)."""
+    return tuple(_docker_started_epoch(c) for c in ('authentik-ldap-1', 'authentik-server-1'))
+
+
+def _authentik_reconfigure_heal_tak_clients(plog, before=None):
     """End of an Authentik Reconfigure (ops #184): heal TAK's clients that connected while it
     had LDAP down. Every Reconfigure takes the LDAP path down under TAK: the LDAP flow fix
     recreates the outpost, and with an FQDN the domain sync restarts server/worker and then
@@ -68271,8 +68310,14 @@ def _authentik_reconfigure_heal_tak_clients(plog):
     reboot) left such a client on __ANON__ for good. An explicit request has no such gate:
     TAK just has to have been running before it. Inside a console update this only records
     it, and the update's final step carries it out after its other Authentik steps; a
-    Reconfigure from the Authentik page heals right here, in its own log."""
-    _tak_ldap_recycle_request('Authentik Reconfigure recreated the LDAP outpost')
+    Reconfigure from the Authentik page heals right here, in its own log.
+    ops #316: `before` = _ak_ldap_path_starts() taken when the Reconfigure began. When the
+    outpost and the server both still run from then (nothing changed, so nothing was
+    restarted), LDAP never went down and there is nothing to heal or check."""
+    if before is not None and None not in before and _ak_ldap_path_starts() == before:
+        plog("  LDAP outpost and Authentik server not restarted by this Reconfigure — TAK clients unaffected")
+    else:
+        _tak_ldap_recycle_request('Authentik Reconfigure recreated the LDAP outpost')
     try:
         _tak_recycle_after_ldap_outage(plog, 'end of Authentik Reconfigure', check_outpost=True)
     except Exception as e:
@@ -72411,6 +72456,7 @@ def run_authentik_deploy(reconfigure=False):
                         ldap_svc_pass = line.strip().split('=', 1)[1].strip()
                         break
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
+            ldap_path_before = _ak_ldap_path_starts()   # ops #316: did this Reconfigure take LDAP down?
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             _patch_authentik_compose_network()
             _ensure_authentik_compose_patches(compose_path, plog)
@@ -72460,7 +72506,7 @@ def run_authentik_deploy(reconfigure=False):
                     plog("  Waiting for Authentik API...")
                     if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=60, plog=plog):
                         plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
-                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none(recreate='if_changed')
                         if ok_flow:
                             plog("  ✓ LDAP flow & provider verified")
                         else:
@@ -72494,6 +72540,12 @@ def run_authentik_deploy(reconfigure=False):
                         if ak_host and ak_base:
                             plog("  Syncing Authentik domain from Caddy/Domains...")
                             try:
+                                # ops #316: write, and restart for, only what differs. This ran
+                                # on every post-update Reconfigure and restarted server/worker
+                                # and recreated the LDAP outpost under TAK with the domain
+                                # unchanged, and TAK's HTTPS side then gave cert logins no
+                                # groups for minutes (the update's TAK restarts on test6).
+                                restart_why = []
                                 with open(env_path) as f:
                                     env_lines = f.readlines()
                                 new_env = []
@@ -72506,12 +72558,16 @@ def run_authentik_deploy(reconfigure=False):
                                         new_env.append(line)
                                 if not seen:
                                     new_env.append(f'AUTHENTIK_HOST={ak_base}\n')
-                                with open(env_path, 'w') as f:
-                                    f.writelines(new_env)
+                                if new_env != env_lines:
+                                    with open(env_path, 'w') as f:
+                                        f.writelines(new_env)
+                                    restart_why.append('AUTHENTIK_HOST in .env')
+                                elif _ak_container_env_value('authentik-server-1', 'AUTHENTIK_HOST') not in (None, '', ak_base):
+                                    restart_why.append('server still running with the old AUTHENTIK_HOST')
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
                                 brands = json.loads(resp.read().decode())['results']
-                                if brands:
+                                if brands and brands[0].get('domain') != ak_host:
                                     bid = brands[0]['brand_uuid']
                                     urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/core/brands/{bid}/',
                                         data=json.dumps({'domain': ak_host}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
@@ -72521,34 +72577,44 @@ def run_authentik_deploy(reconfigure=False):
                                 for op in outposts:
                                     if 'embed' in op.get('name', '').lower() or op.get('type') == 'proxy':
                                         cfg = dict(op.get('config', {}))
-                                        cfg['authentik_host'] = ak_base
-                                        cfg['authentik_host_insecure'] = False
-                                        put_payload = {'name': op.get('name', 'authentik Embedded Outpost'), 'type': op.get('type', 'proxy'), 'providers': list(op.get('providers', [])), 'config': cfg}
-                                        urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{op["pk"]}/',
-                                            data=json.dumps(put_payload).encode(), headers=ak_headers, method='PUT'), timeout=10)
+                                        if cfg.get('authentik_host') != ak_base or cfg.get('authentik_host_insecure') is not False:
+                                            cfg['authentik_host'] = ak_base
+                                            cfg['authentik_host_insecure'] = False
+                                            put_payload = {'name': op.get('name', 'authentik Embedded Outpost'), 'type': op.get('type', 'proxy'), 'providers': list(op.get('providers', [])), 'config': cfg}
+                                            urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{op["pk"]}/',
+                                                data=json.dumps(put_payload).encode(), headers=ak_headers, method='PUT'), timeout=10)
+                                            restart_why.append('embedded outpost host')
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
-                                # Server/worker FIRST, LDAP only after the API answers. The old order
-                                # (LDAP recreate, then server restart) started a fresh outpost against
-                                # the server that was about to go down: it fetched its config, got a
-                                # 502 on the provider list as the server stopped, and panicked
-                                # ("Failed to run server"), once per update on every box (v10.2.11
-                                # T&E). An outpost that starts while the server is still coming up
-                                # just retries its config fetch, so LDAP last is always safe.
-                                plog("  Restarting Authentik server/worker, then LDAP (no log output for up to ~2 min)...")
-                                _ak_compose_run_locked(['restart', 'server', 'worker'], 'reconfigure-domain-restart',
-                                                       plog, ak_dir, timeout=90, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
-                                plog("  Waiting for Authentik to come back online...")
-                                if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
-                                    plog("  \u2713 Authentik is online and ready")
-                                else:
-                                    plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
-                                _ak_compose_run_locked(['up', '-d', '--force-recreate', 'ldap'], 'reconfigure-ldap-recreate',
-                                                       plog, ak_dir, timeout=60, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
-                                plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
                             except Exception as e:
                                 plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
+                                restart_why = None
+                            if restart_why == []:
+                                plog("  \u2713 Authentik domain unchanged \u2014 no Authentik or LDAP restart")
+                            elif restart_why:
+                                try:
+                                    # Server/worker FIRST, LDAP only after the API answers. The old order
+                                    # (LDAP recreate, then server restart) started a fresh outpost against
+                                    # the server that was about to go down: it fetched its config, got a
+                                    # 502 on the provider list as the server stopped, and panicked
+                                    # ("Failed to run server"), once per update on every box (v10.2.11
+                                    # T&E). An outpost that starts while the server is still coming up
+                                    # just retries its config fetch, so LDAP last is always safe.
+                                    plog(f"  Domain changed ({', '.join(restart_why)}): restarting Authentik "
+                                         f"server/worker, then LDAP (no log output for up to ~2 min)...")
+                                    _ak_compose_run_locked(['restart', 'server', 'worker'], 'reconfigure-domain-restart',
+                                                           plog, ak_dir, timeout=90, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
+                                    plog("  Waiting for Authentik to come back online...")
+                                    if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
+                                        plog("  \u2713 Authentik is online and ready")
+                                    else:
+                                        plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
+                                    _ak_compose_run_locked(['up', '-d', '--force-recreate', 'ldap'], 'reconfigure-ldap-recreate',
+                                                           plog, ak_dir, timeout=60, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
+                                    plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
+                                except Exception as e:
+                                    plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
                     else:
                         plog("  \u26a0 API not ready in time — run Update config & reconnect again to apply app access policies")
                 else:
@@ -72575,7 +72641,7 @@ def run_authentik_deploy(reconfigure=False):
                         plog("  Waiting for Authentik API (no-FQDN reconfigure)...")
                         if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=60, plog=plog):
                             plog("  Fixing LDAP flow & provider...")
-                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none()
+                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none(recreate='if_changed')
                             plog("  \u2713 LDAP flow OK" if ok_nf else f"  \u26a0 LDAP flow: {err_nf}")
                         else:
                             plog("  \u26a0 API not ready — run Update config again after Authentik is up")
@@ -72589,7 +72655,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_recovery_flow_standalone(env_path, plog)
             _sync_webadmin_after_authentik_reconfigure(plog)
             # ops #184: last, after every step above that takes LDAP down under TAK
-            _authentik_reconfigure_heal_tak_clients(plog)
+            _authentik_reconfigure_heal_tak_clients(plog, before=ldap_path_before)
             plog("")
             _authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)
             return
@@ -74905,12 +74971,15 @@ def _wait_ldap_outpost_ready(timeout_secs=180):
         time.sleep(3)
     return False, (last_status or 'unknown')
 
-def _ensure_ldap_flow_authentication_none():
+def _ensure_ldap_flow_authentication_none(recreate='always'):
     """Ensure ldap-authentication-flow exists with authentication:none and 3 stage bindings, restart LDAP outpost.
     If flow missing (blueprint never ran), create it by cloning default-authentication-flow.
     If flow exists but has no stage bindings (deleted during debugging), recreate them from blueprint stages.
     Fixes 'Flow does not apply to current user' — require_outpost blocks user binds.
     Fixes 'Access denied for user' / Insufficient access (50) — missing bindings cause auth to fail.
+    recreate='if_changed' (ops #316, the Authentik Reconfigure every console update runs):
+    recreate the outpost only when this wrote something. A recreate under a running TAK
+    Server leaves TAK's HTTPS side giving cert logins no groups for minutes.
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -74928,6 +74997,7 @@ def _ensure_ldap_flow_authentication_none():
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     # Authentik API can be slow after worker restart or under load; use 60s per request
     _api_timeout = 60
+    changed = []
 
     def _get(path):
         r = _req.Request(f'{url}/api/v3/{path}', headers=headers)
@@ -74952,7 +75022,9 @@ def _ensure_ldap_flow_authentication_none():
         default_flow = default_flow_results[0] if default_flow_results else None
 
         if ldap_flow:
-            _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
+            if ldap_flow.get('authentication') != 'none':
+                _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
+                changed.append('flow authentication')
             # Ensure 3 stage bindings are our ldap-* stages (not default/MFA — those break LDAP bind)
             ldap_flow_pk = ldap_flow['pk']
             all_bindings = []
@@ -74987,8 +75059,11 @@ def _ensure_ldap_flow_authentication_none():
             _id_stage_needs_recreation = False
             if id_stage_pk:
                 try:
-                    # Include user_fields so PATCH does not trigger "no user fields selected" validation
-                    _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
+                    _cur_id = _get(f'stages/identification/{id_stage_pk}/')
+                    if _cur_id.get('password_stage') is not None or _cur_id.get('user_fields') != ['username']:
+                        # Include user_fields so PATCH does not trigger "no user fields selected" validation
+                        _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
+                        changed.append('identification stage')
                 except Exception:
                     pass
                 # Verify the PATCH actually cleared password_stage.  On Authentik 2026.x some
@@ -75012,6 +75087,7 @@ def _ensure_ldap_flow_authentication_none():
                     pass
             wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names or _id_stage_needs_recreation
             if wrong_bindings:
+                changed.append('stage bindings')
                 for b in ldap_bindings:
                     try:
                         _delete(f'flows/bindings/{b["pk"]}/')
@@ -75045,6 +75121,7 @@ def _ensure_ldap_flow_authentication_none():
                     binding_specs = [(10, id_stage), (15, pw_stage), (20, login_stage)]
                     for order, stage_pk in binding_specs:
                         if order not in existing_orders:
+                            changed.append('stage bindings')
                             try:
                                 _post('flows/bindings/', {
                                     'target': ldap_flow_pk, 'stage': stage_pk, 'order': order,
@@ -75066,18 +75143,18 @@ def _ensure_ldap_flow_authentication_none():
                     if _live_sd != AK_LDAP_SESSION_DURATION:
                         _patch(f'stages/user_login/{_login_stage_pk}/',
                                {'session_duration': AK_LDAP_SESSION_DURATION})
+                        changed.append('bind-cache session_duration')
                         print(f'  LDAP bind-cache session_duration {_live_sd} → {AK_LDAP_SESSION_DURATION} (v10.1.17 W3)', flush=True)
                 except urllib.error.HTTPError:
                     pass
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
-            if ldap_prov:
+            want_prov = {'authentication_flow': ldap_flow_pk, 'authorization_flow': ldap_flow_pk,
+                         'bind_mode': 'cached', 'search_mode': 'cached'}
+            if ldap_prov and any(str(ldap_prov.get(k)) != str(v) for k, v in want_prov.items()):
+                changed.append('LDAP provider')
                 try:
-                    _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
-                        'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_flow_pk,
-                        'bind_mode': 'cached',
-                        'search_mode': 'cached'})
+                    _patch(f'providers/ldap/{ldap_prov["pk"]}/', want_prov)
                 except urllib.error.HTTPError as e:
                     body = ''
                     try: body = e.read().decode()[:200]
@@ -75087,6 +75164,7 @@ def _ensure_ldap_flow_authentication_none():
             if not default_flow:
                 return False, 'Default authentication flow not found. Authentik may not be fully initialized.'
             default_pk = default_flow['pk']
+            changed.append('flow created')
             all_bindings = []
             page = 1
             while True:
@@ -75134,6 +75212,9 @@ def _ensure_ldap_flow_authentication_none():
     except Exception as e:
         return False, str(e)[:120]
     # LDAP outpost caches flow results — force-recreate required after flow/binding changes
+    if recreate == 'if_changed' and not changed:
+        print('  LDAP flow & provider already correct — outpost left running (no recreate)', flush=True)
+        return True, None
     if is_remote:
         _ak_module_compose(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', 'ldap-flow-recreate', timeout=90)
     else:
