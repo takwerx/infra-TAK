@@ -2586,6 +2586,59 @@ def _host_arch():
         pass
     return a
 
+# ops #360: TAK Portal and CloudTAK ship the sharp image library, whose prebuilt Linux x64
+# binaries need an x86-64-v2 CPU. A VM whose hypervisor presents a basic CPU model (TrueNAS /
+# KVM / Proxmox defaults, VirtualBox with some settings) lacks these flags: TAK Portal then
+# restart-loops and the CloudTAK build dies with "Could not load the sharp module".
+# x86-64-v2 = cx16, lahf_lm, popcnt, sse4_1, sse4_2, ssse3 (the names /proc/cpuinfo uses).
+_CPU_V2_FLAGS = ('cx16', 'lahf_lm', 'popcnt', 'sse4_1', 'sse4_2', 'ssse3')
+_CPU_TOO_BASIC_FIX = ("In your hypervisor (TrueNAS, KVM, Proxmox, VirtualBox) set this VM's CPU type "
+                      "to host passthrough, restart the VM, then try again.")
+
+def _cpu_v2_missing(cpuinfo_text, machine=''):
+    """Flags from x86-64-v2 that this CPU lacks, from /proc/cpuinfo text.
+    Returns [] when nothing is missing OR when it can't be judged: an ARM machine, no 'flags'
+    line (non-x86), or empty text. Never blocks a deploy on a guess."""
+    if _arch_normalize(machine) == 'arm64':
+        return []
+    for line in (cpuinfo_text or '').splitlines():
+        if line.lower().startswith('flags') and ':' in line:
+            have = set(line.split(':', 1)[1].split())
+            return [f for f in _CPU_V2_FLAGS if f not in have]
+    return []
+
+def _cpu_too_basic_message(what):
+    return (f"This server's virtual CPU is too basic for {what}. {_CPU_TOO_BASIC_FIX}")
+
+def _cpu_preflight_local(what, plog):
+    """True to go on with the deploy; False (after telling the user why) to stop."""
+    try:
+        if _host_arch() == 'arm64':
+            return True
+        with open('/proc/cpuinfo') as f:
+            missing = _cpu_v2_missing(f.read(), os.uname().machine)
+    except Exception:
+        return True
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what)}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
+
+def _cpu_preflight_remote(remote_cfg, what, plog):
+    """Same check on the remote CloudTAK host over SSH. An unreadable answer goes on."""
+    ok, out = _ssh_probe(remote_cfg, "echo ARCH=$(uname -m); grep -m1 '^flags' /proc/cpuinfo 2>/dev/null; true",
+                         timeout=20)
+    if not ok:
+        return True
+    m = re.search(r'^ARCH=(\S+)', out or '', re.M)
+    missing = _cpu_v2_missing(out or '', m.group(1) if m else '')
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what + ' on the remote host')}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
+
 def _distro_family():
     """'debian' | 'rhel' — package-manager family, derived from settings.
 
@@ -8850,6 +8903,28 @@ def _diag_redact(text, settings):
     return text
 
 
+def _diag_cpu_line():
+    """ops #360: does this CPU have what TAK Portal and CloudTAK's image library needs (x86-64-v2)?"""
+    machine = os.uname().machine
+    try:
+        with open('/proc/cpuinfo') as f:
+            txt = f.read()
+    except Exception as e:
+        return f"cpu check: could not read /proc/cpuinfo ({type(e).__name__})"
+    model = next((l.split(':', 1)[1].strip() for l in txt.splitlines()
+                  if l.lower().startswith('model name') and ':' in l), '')
+    model = f"  model: {model[:80]}" if model else ''
+    if _arch_normalize(machine) == 'arm64':
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): not needed on ARM{model}"
+    if not any(l.lower().startswith('flags') for l in txt.splitlines()):
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): could not tell, no CPU flags listed{model}"
+    missing = _cpu_v2_missing(txt, machine)
+    if not missing:
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): OK{model}"
+    return (f"cpu check (TAK Portal / CloudTAK need x86-64-v2): TOO BASIC, missing {', '.join(missing)}{model}  "
+            f"-> set the VM's CPU type to host passthrough in the hypervisor")
+
+
 def _diag_section_box(settings):
     out = []
     git = lambda *a: _diag_cmd(['git', '-C', BASE_DIR] + list(a), priv=False)
@@ -8866,6 +8941,7 @@ def _diag_section_box(settings):
     except Exception:
         osname = '?'
     out.append(f"os: {osname}  kernel: {os.uname().release}  arch: {os.uname().machine}  cpus: {os.cpu_count()}")
+    out.append(_diag_cpu_line())
     vm, sw = psutil.virtual_memory(), psutil.swap_memory()
     out.append(f"ram: {vm.total // 2**30} GiB total, {vm.available // 2**30} GiB available ({vm.percent}% used)  "
                f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
@@ -42015,6 +42091,10 @@ def run_takportal_deploy():
     try:
         portal_dir = os.path.expanduser('~/TAK-Portal')
         settings = load_settings()
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('TAK Portal', plog):
+            takportal_deploy_status.update({'running': False, 'error': True})
+            return
         if settings.get('pkg_mgr', 'apt') == 'apt':
             wait_for_apt_lock(plog, takportal_deploy_log)
         # Step 1: Check Docker
@@ -49345,6 +49425,10 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog(f"✓ SSH connected to {remote_host}")
+            # ops #360: the remote host's CPU, before Docker or the build
+            if not _cpu_preflight_remote(remote_cfg, 'CloudTAK', plog):
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
             plog("")
             plog("━━━ Step 2/6: Ensuring Docker on remote ━━━")
@@ -49537,6 +49621,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            return
+
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('CloudTAK', plog):
+            cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
         # Step 1: Check Docker
