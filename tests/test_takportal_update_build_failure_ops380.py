@@ -31,7 +31,8 @@ import re
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _NAMES = {'_ANSI_RE', '_UPDATE_NOISE_RE', '_UPDATE_ERROR_RE', '_update_error_line', '_mod_result_scrub',
-          '_BUILD_PROGRESS_RE', '_BUILD_STEP_PREFIX_RE', '_BUILD_FAILED_STEP_RE', '_build_failure_text'}
+          '_BUILD_PROGRESS_RE', '_BUILD_STEP_PREFIX_RE', '_BUILD_FAILED_STEP_RE', '_BUILD_LISTING_RE',
+          '_build_failure_text'}
 
 
 def _ns():
@@ -76,6 +77,62 @@ COMPOSE_DNS_FAIL = '\n'.join([
     '#9 ERROR: process "/bin/sh -c wget -O data.zip $URL" did not complete successfully: exit code: 4',
     'failed to solve: process "/bin/sh -c wget -O data.zip $URL" did not complete successfully: exit code: 4',
 ])
+
+
+# Captured from a real failing `docker compose -p x up -d --no-start --build` on test6 (Ubuntu 24.04,
+# TAK Portal 2.0.25 with a bad `apk add` inserted): non-tty compose puts the buildkit step output
+# on STDOUT and only a Dockerfile excerpt plus the "failed to solve" wrapper on STDERR.
+REAL_STDOUT = """#1 [internal] load local bake definitions
+#1 reading from stdin 913B done
+#1 DONE 0.0s
+
+#7 [tak-portal-worker 2/8] RUN apk add --no-cache nosuchpackage-ops380
+#7 1.964 ERROR: unable to select packages:
+#7 1.964   nosuchpackage-ops380 (no such package):
+#7 1.964     required by: world[nosuchpackage-ops380]
+#7 ERROR: process "/bin/sh -c apk add --no-cache nosuchpackage-ops380" did not complete successfully: exit code: 1
+------
+ > [tak-portal-worker 2/8] RUN apk add --no-cache nosuchpackage-ops380:
+1.964 ERROR: unable to select packages:
+1.964   nosuchpackage-ops380 (no such package):
+1.964     required by: world[nosuchpackage-ops380]
+------
+"""
+REAL_STDERR = """ Image tp380-tak-portal-worker Building
+ Image tp380-tak-portal Building
+Dockerfile:3
+
+--------------------
+
+   1 |     # Dockerfile
+
+   2 |     FROM node:22-alpine
+
+   3 | >>> RUN apk add --no-cache nosuchpackage-ops380
+
+   4 |     
+
+--------------------
+
+target tak-portal: failed to solve: process "/bin/sh -c apk add --no-cache nosuchpackage-ops380" did not complete successfully: exit code: 1
+"""
+
+
+def test_real_compose_output_gives_the_reason_and_not_the_dockerfile_listing():
+    ns = _ns()
+    out = ns['_build_failure_text'](REAL_STDOUT + '\n' + REAL_STDERR)
+    assert 'ERROR: unable to select packages' in out
+    assert 'nosuchpackage-ops380 (no such package)' in out
+    assert 'failed step: apk add --no-cache nosuchpackage-ops380, exit code 1' in out
+    assert 'Image tp380' not in out and '>>>' not in out and 'Dockerfile:3' not in out
+    assert out.count('unable to select packages') == 1          # buildkit prints it twice
+
+
+def test_failed_to_solve_with_a_real_reason_is_kept():
+    ns = _ns()
+    out = ns['_build_failure_text']('failed to solve: node:22-alpine: failed to resolve source metadata for '
+                                    'docker.io/library/node:22-alpine: dial tcp: lookup registry-1.docker.io: no such host')
+    assert 'lookup registry-1.docker.io: no such host' in out
 
 
 def test_cause_and_failed_step_survive():

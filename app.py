@@ -2153,11 +2153,14 @@ _BUILD_PROGRESS_RE = re.compile(
     r'^\s*(?:\[\+\]\s|(?:Image|Container|Network|Volume|Service)\s+\S+\s+(?:Building|Built|Creating|Created|'
     r'Starting|Started|Pulling|Pulled|Recreate|Recreated|Running|Waiting|Healthy|Stopping|Stopped|Removing|'
     r'Removed|Restarting|Restarted)\s*$|'
-    r'(?:DONE|CACHED|CANCELED|\[[\w.-]+\s+\d+/\d+\]|sha256:|transferring|resolve\s|exporting|writing image|'
+    r'(?:DONE|CACHED|CANCELED|\[[^\]]+\]\s|\.{3}\s*$|sha256:|transferring|resolve\s|exporting|reading\s|writing image|'
     r'naming to|load build|load metadata|load \.dockerignore|Building\s*$)|-{3,}\s*$|>\s*\[[\w.-]+\s+\d+/\d+\]|'
     r'\d+(?:\.\d+)?\s*$)', re.I)
-_BUILD_STEP_PREFIX_RE = re.compile(r'^#\d+\s+(?:\d+(?:\.\d+)?\s+)?')
-_BUILD_FAILED_STEP_RE = re.compile(r'process "(?:/bin/sh -c )?(.+?)" did not complete successfully')
+_BUILD_STEP_PREFIX_RE = re.compile(r'^(?:#\d+\s+)?(?:\d+(?:\.\d+)?\s+)?')
+_BUILD_FAILED_STEP_RE = re.compile(
+    r'process "(?:/bin/sh -c )?(.+?)" did not complete successfully(?::\s*exit code:\s*(\d+))?')
+# compose prints the Dockerfile around the failing line (`3 | >>> RUN ...`, `Dockerfile:3`)
+_BUILD_LISTING_RE = re.compile(r'^(?:\d+\s*\||Dockerfile:\d+\s*$)')
 
 
 def _build_failure_text(output, limit=500, tail_lines=6):
@@ -2167,25 +2170,34 @@ def _build_failure_text(output, limit=500, tail_lines=6):
     of the output (`[:400]`) kept only "Image <name> Building" (Aust-TAK, ops #380): the TAK
     Portal Update record said the worker image "Building" and nothing about why it stopped.
 
-    Drops the progress lines and the `#NN 12.3 ` buildkit prefixes, keeps the last few lines
-    that are left (the reason: `ERROR: unable to select packages`, `Resolving github.com...
-    failed`, `npm error ...`), and appends the Dockerfile step that failed. One physical line,
-    so _update_error_line() and the Diagnostics summary both carry the cause. Never raises.
+    Drops the progress lines, the Dockerfile listing and the `#NN 12.3 ` buildkit prefixes,
+    keeps the last few distinct lines that are left (the reason: `ERROR: unable to select
+    packages`, `Resolving github.com... failed`, `failed to resolve source metadata ... no
+    such host`, `npm error ...`), and appends the Dockerfile step that failed. One physical
+    line, so _update_error_line() and the Diagnostics summary both carry the cause.
+    Pass stdout AND stderr: with a non-tty compose the step output is on stdout and only the
+    wrapper is on stderr. Never raises.
     """
     try:
         text = _ANSI_RE.sub('', str(output or '')).replace('\r', '\n')
         failed_step = ''
         kept = []
         for raw in text.splitlines():
+            raw = raw.strip()
             m = _BUILD_FAILED_STEP_RE.search(raw)
             if m:
-                failed_step = m.group(1).strip()
+                failed_step = m.group(1).strip() + (', exit code %s' % m.group(2) if m.group(2) else '')
                 continue            # the wrapper line says nothing the step doesn't
-            ln = _BUILD_STEP_PREFIX_RE.sub('', raw.strip()).strip()
-            if not ln or _BUILD_PROGRESS_RE.match(ln) or ln.lower().startswith('failed to solve'):
+            if _BUILD_LISTING_RE.match(raw):
                 continue
-            if not kept or kept[-1] != ln:
-                kept.append(ln)
+            ln = _BUILD_STEP_PREFIX_RE.sub('', raw).strip()
+            if 'failed to solve' in ln:
+                ln = ln.split('failed to solve', 1)[1].lstrip(': ').strip()   # keep a real reason, drop the label
+            if not ln or _BUILD_PROGRESS_RE.match(ln):
+                continue
+            if ln in kept:
+                kept.remove(ln)     # buildkit prints the failing step's output twice; keep the later one
+            kept.append(ln)
         cause = ' | '.join(kept[-tail_lines:])
         if failed_step:
             cause = (cause + ' ' if cause else '') + '(failed step: %s)' % failed_step[:200]
