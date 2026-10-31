@@ -2757,12 +2757,19 @@ TAKPORTAL_WRAPPED = ('cat', 'tee')
 TAKPORTAL_HELPER = '/usr/local/libexec/tak-portal/marketplace-helper'
 TAKPORTAL_LEFTOVER_SUDOERS = '/etc/sudoers.d/tak-portal-marketplace'
 TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
-# sha256 of host-helpers/marketplace-helper (version 1) in TAK Portal releases 2.0.19-2.0.22
+# sha256 of host-helpers/marketplace-helper in TAK Portal releases
 # (ValleyTacticalSolutions/TAK-Portal). The helper is granted as root, so we only
 # ever install bytes we have reviewed; a portal that ships a different helper gets
 # it granted after the new hash is added here (with a /module-scan), never before.
+#   c240a12a… version 1, 2.0.19-2.0.22
+#   4d093f4b… version 3, 2.0.29: adds apply-caddyfile (writes /etc/caddy/Caddyfile, the file
+#             Deploy To Caddy needs) and validates it as the `caddy` user (runuser/setpriv/su),
+#             so `import /etc/shadow` is refused and only a line number is echoed, never file
+#             contents (TAK Portal #81, ops #340). Versions 2 (2.0.23-2.0.24) and the 2.0.26/2.0.28
+#             build ran `caddy validate` as root on caller text; they stay unpinned.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
+    '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
@@ -3076,6 +3083,17 @@ def _takportal_helper_ok():
     return _root_file_ok(TAKPORTAL_HELPER, want_sha256=TAKPORTAL_HELPER_SHA256)
 
 
+def _takportal_helper_current(decision):
+    """The installed helper is exactly the pinned one this TAK Portal ships. With
+    more than one pinned hash, "some pinned helper is installed" is not enough: a box
+    holding the old one would never pick up the portal's newer reviewed helper
+    (ops #340: apply-caddyfile only exists in the newer one)."""
+    want = decision.get('helper_bytes')
+    if want is None:
+        return _takportal_helper_ok()
+    return _root_file_ok(TAKPORTAL_HELPER, want_bytes=want)
+
+
 def _takportal_remove_leftover():
     """Drop TAK Portal <2.0.19's `NOPASSWD: ALL` marketplace drop-in. True when
     a file was removed."""
@@ -3145,7 +3163,7 @@ def _do_takportal_sudoers(req):
         hardened = (variant == 'hardened')
         wrappers_ok = _takportal_wrappers_ok() if hardened else True
         # An install would still have to put the helper in place.
-        helper_pending = hardened and decision['helper_bytes'] is not None and not helper_ok
+        helper_pending = hardened and decision['helper_bytes'] is not None and not _takportal_helper_current(decision)
         if present:
             try:
                 with open(TAKPORTAL_SUDOERS_PATH) as f:
@@ -3196,7 +3214,7 @@ def _do_takportal_sudoers(req):
         try:
             _takportal_install_wrappers()
             if decision['helper_bytes'] is not None:
-                if not _takportal_helper_ok():
+                if not _takportal_helper_current(decision):
                     _write_root_file(TAKPORTAL_HELPER, decision['helper_bytes'], 0o755)
             helper_granted = _takportal_helper_ok()
         except (OSError, Denied) as e:
