@@ -2148,6 +2148,52 @@ def _update_error_line(text, limit=600):
     return pick[:limit]
 
 
+# Docker build/compose lines that only say "still going": the progress ledger, not the reason.
+_BUILD_PROGRESS_RE = re.compile(
+    r'^\s*(?:\[\+\]\s|(?:Image|Container|Network|Volume|Service)\s+\S+\s+(?:Building|Built|Creating|Created|'
+    r'Starting|Started|Pulling|Pulled|Recreate|Recreated|Running|Waiting|Healthy|Stopping|Stopped|Removing|'
+    r'Removed|Restarting|Restarted)\s*$|'
+    r'(?:DONE|CACHED|CANCELED|\[[\w.-]+\s+\d+/\d+\]|sha256:|transferring|resolve\s|exporting|writing image|'
+    r'naming to|load build|load metadata|load \.dockerignore|Building\s*$)|-{3,}\s*$|>\s*\[[\w.-]+\s+\d+/\d+\]|'
+    r'\d+(?:\.\d+)?\s*$)', re.I)
+_BUILD_STEP_PREFIX_RE = re.compile(r'^#\d+\s+(?:\d+(?:\.\d+)?\s+)?')
+_BUILD_FAILED_STEP_RE = re.compile(r'process "(?:/bin/sh -c )?(.+?)" did not complete successfully')
+
+
+def _build_failure_text(output, limit=500, tail_lines=6):
+    """What a failed `docker compose up --build` actually said, in one line.
+
+    compose/buildkit write the progress ledger first and the reason last. Keeping the HEAD
+    of the output (`[:400]`) kept only "Image <name> Building" (Aust-TAK, ops #380): the TAK
+    Portal Update record said the worker image "Building" and nothing about why it stopped.
+
+    Drops the progress lines and the `#NN 12.3 ` buildkit prefixes, keeps the last few lines
+    that are left (the reason: `ERROR: unable to select packages`, `Resolving github.com...
+    failed`, `npm error ...`), and appends the Dockerfile step that failed. One physical line,
+    so _update_error_line() and the Diagnostics summary both carry the cause. Never raises.
+    """
+    try:
+        text = _ANSI_RE.sub('', str(output or '')).replace('\r', '\n')
+        failed_step = ''
+        kept = []
+        for raw in text.splitlines():
+            m = _BUILD_FAILED_STEP_RE.search(raw)
+            if m:
+                failed_step = m.group(1).strip()
+                continue            # the wrapper line says nothing the step doesn't
+            ln = _BUILD_STEP_PREFIX_RE.sub('', raw.strip()).strip()
+            if not ln or _BUILD_PROGRESS_RE.match(ln) or ln.lower().startswith('failed to solve'):
+                continue
+            if not kept or kept[-1] != ln:
+                kept.append(ln)
+        cause = ' | '.join(kept[-tail_lines:])
+        if failed_step:
+            cause = (cause + ' ' if cause else '') + '(failed step: %s)' % failed_step[:200]
+        return _mod_result_scrub(cause)[-limit:].strip() if cause else ''
+    except Exception:
+        return ''
+
+
 def _mod_result_scrub(text):
     """Defense in depth before command output is stored and shown on a card (which, unlike the
     Diagnostics export, is not passed through _diag_redact): credentials embedded in a URL,
@@ -41565,7 +41611,10 @@ def _takportal_run_update(portal_dir):
     # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
     # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
     # hard 500 with the git error in it.
+    _mod_result_step('takportal', 'Step 1/2: fetching the release')
     gitr = _takportal_update_git(portal_dir)
+    # ops #380: the record said "2.0.25 -> ?" because only a success ever filled in the target.
+    _mod_result_versions('takportal', frm=gitr.get('from_version'), to=gitr.get('to_version'))
     if not gitr['ok']:
         # The git step discards local edits first, which reverts the loopback port patch. Put it
         # back so the next `compose up` (boot stagger, Guard Dog, Start) cannot publish 0.0.0.0.
@@ -41628,6 +41677,7 @@ def _takportal_run_update(portal_dir):
     # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
     # a Node security release when TAK Portal itself has not changed.
     _pull_base_images(portal_dir, wrap=_sudo_wrap)
+    _mod_result_step('takportal', 'Step 2/2: rebuilding the images (docker compose up --build)')
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
                                cwd=portal_dir, capture_output=True, text=True,
@@ -41645,7 +41695,10 @@ def _takportal_run_update(portal_dir):
         # logged, so the actual reason existed nowhere. On test12 the real message
         # was one line ("env file .env not found") and it took a manual re-run of
         # the build to see it. Report what the build actually said, and journal it.
-        err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+        # ops #380: `[:400]` kept the HEAD of compose's output, which is only the progress
+        # ledger ("Image tak-portal-tak-portal-worker Building"); the reason is at the end.
+        err = (_build_failure_text('\n'.join([build.stdout or '', build.stderr or '']))
+               or 'Build failed (docker compose printed no reason)')
         print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
         _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
         return {'success': False,
