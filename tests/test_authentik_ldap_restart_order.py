@@ -46,7 +46,9 @@ def _pos(block, pattern):
 
 
 def test_reconfigure_domain_sync_restarts_server_before_ldap():
-    block = _block('Syncing Authentik domain from Caddy/Domains', 'Domain sync:')
+    # ops #316: the restart now runs only when the domain really changed, after the sync's
+    # own "Domain sync:" error line, so the block ends at the restart's success line.
+    block = _block('Syncing Authentik domain from Caddy/Domains', 'to pick up new domain')
     server = _pos(block, r"'restart', 'server', 'worker'")
     wait = _pos(block, r'_wait_for_authentik_api\(')
     ldap = _pos(block, r"'--force-recreate', 'ldap'")
