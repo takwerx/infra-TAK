@@ -130,23 +130,6 @@ async function checkLdapDrift(){
         }else{banner.style.display='none';}
     }catch(e){banner.style.display='none';}
 }
-async function checkLdapUsernames(){
-    var banner=document.getElementById('ldap-username-banner');
-    var msg=document.getElementById('ldap-username-msg');
-    if(!banner||!msg)return;
-    try{
-        var r=await fetch('/api/takserver/ldap-username-check');
-        var d=await r.json();
-        var users=(d.available&&d.users)||[];
-        if(!users.length){banner.style.display='none';return;}
-        var parts=users.slice(0,10).map(function(u){
-            return u.username+(u.kind==='no_groups'?' (logs in but gets no groups)':' (cannot log in)');
-        });
-        if(users.length>10)parts.push('and '+(users.length-10)+' more');
-        msg.textContent='TAK Server cannot look up these usernames in LDAP: '+parts.join('; ')+'. Rename them without / \\ , + " < > ; and enroll again.';
-        banner.style.display='block';
-    }catch(e){banner.style.display='none';}
-}
 function _sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
 
 async function loadServices(){
@@ -204,7 +187,6 @@ if(document.getElementById('tak-remote-metrics-bar')){loadTakRemoteMetrics();set
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
 if(document.getElementById('tak-cert-password-inline')||document.getElementById('deploy-cert-password-inline')){loadTakCertPassword();}
 if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
-if(document.getElementById('ldap-username-banner')){checkLdapUsernames();}
 if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('tak-cert-row')){loadTakCertRow();}

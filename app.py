@@ -78037,64 +78037,6 @@ def takserver_ldap_drift_check():
     })
 
 
-# ops #352 — usernames TAK Server cannot look up in LDAP. TAK Server (LdapAuthenticator.java)
-# pastes the username into the userstring DN with a plain String.replace (no RFC 4514 escaping)
-# and then calls JNDI Context.lookup(String), which parses that string as a COMPOSITE name where
-# "/" separates components. Measured on test12 (TAK Server 5.8-RELEASE92, Authentik 2026.8.5):
-#   "/"                      bind works, group lookup is cut at the slash (cn=a) -> logged in, NO groups
-#   "\\" "," "+" '"' "<" ">" ";"  Authentik cannot parse the DN -> bind fails, login 401
-#   "=" "#" "*" "(" ")" "." "@" space, accents       all work
-_LDAP_SILENT_NOGROUP_CHARS = '/'
-_LDAP_LOGIN_FAIL_CHARS = '\\,+"<>;'
-
-
-def _ldap_username_problem(username):
-    """None when TAK Server can look this username up; else {'kind', 'chars'}.
-
-    kind 'no_groups': the user can log in but TAK Server finds no groups (silent no-access).
-    kind 'no_login':  the user cannot log in at all.
-    """
-    u = username or ''
-    bad_slash = sorted({c for c in u if c in _LDAP_SILENT_NOGROUP_CHARS})
-    bad_login = sorted({c for c in u if c in _LDAP_LOGIN_FAIL_CHARS})
-    if bad_login:
-        return {'kind': 'no_login', 'chars': bad_login + bad_slash}
-    if bad_slash:
-        return {'kind': 'no_groups', 'chars': bad_slash}
-    return None
-
-
-@app.route('/api/takserver/ldap-username-check')
-@login_required
-def takserver_ldap_username_check():
-    """List Authentik users whose username TAK Server cannot look up in LDAP (ops #352).
-
-    Read-only; returns only the flagged users, never the whole directory.
-    """
-    ak_url, ak_headers, _s = _w1_ak_ctx()
-    if not ak_url:
-        return jsonify({'available': False, 'users': []})
-    flagged = []
-    try:
-        page = 1
-        while page <= 50:
-            d = _w1_ak_get(ak_url, f'core/users/?page_size=200&page={page}', ak_headers)
-            for u in d.get('results', []):
-                if not u.get('is_active', True) or str(u.get('type') or '').endswith('service_account'):
-                    continue
-                name = u.get('username') or ''
-                prob = _ldap_username_problem(name)
-                if prob:
-                    flagged.append({'username': name, 'kind': prob['kind'], 'chars': prob['chars']})
-            if not (d.get('pagination') or {}).get('next'):
-                break
-            page += 1
-    except Exception as e:
-        return jsonify({'available': False, 'users': [], 'error': str(e)[:200]})
-    flagged.sort(key=lambda x: x['username'].lower())
-    return jsonify({'available': True, 'users': flagged})
-
-
 _vacuum_status = {'running': False, 'full': False, 'started': None, 'result': None, 'error': None}
 
 def _run_vacuum_background(use_full, tak_cfg):

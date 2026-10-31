@@ -21,7 +21,7 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 
 **Newer TAK Server versions:** not checked past 5.8 (no public source for 5.8 or later).
 
-**What infra-TAK does:** the TAK Server page shows a warning listing existing Authentik users whose names contain `/ \ , + " < > ;` (`/api/takserver/ldap-username-check`). Fix is to rename the user and enroll again. Reported upstream to TAK Portal as ValleyTacticalSolutions/TAK-Portal#82.
+**What infra-TAK does:** nothing. A warning on the TAK Server page was added and then removed (AJ, Fri Oct 30, 2026): these names come from TAK Portal, so the fix belongs there. Reported upstream as ValleyTacticalSolutions/TAK-Portal#82.
 
 ## TAK Portal: usernames
 
