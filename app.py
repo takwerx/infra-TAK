@@ -39265,20 +39265,52 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
                 _cloudtak_release_cache['ts'] = _time.time()
             return tag
     except Exception:
+        # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
+        # git over https isn't rate limited that way, so ask it for the newest tag first.
+        tag = _cloudtak_latest_tag_from_git()
+        if tag:
+            _cloudtak_release_cache['tag'] = tag
+            _cloudtak_release_cache['ts'] = _time.time()
+            return tag
         # Stale cache is better than nothing — return it regardless of use_cache so that
         # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _get_cloudtak_target_release_tag(settings=None, use_cache=True):
+def _cloudtak_latest_tag_from_git():
+    """Newest plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
+    Second source for the release lookup when api.github.com refuses us (gh #365)."""
+    try:
+        r = subprocess.run(['git', 'ls-remote', '--tags', '--refs', 'https://github.com/dfpc-coe/CloudTAK.git'],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    best = None
+    for line in (r.stdout or '').splitlines():
+        m = re.search(r'refs/tags/(v?(\d+)\.(\d+)\.(\d+))$', line.strip())
+        if m:
+            key = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
+            if best is None or key > best[0]:
+                best = (key, m.group(1))
+    return best[1] if best else None
+
+
+def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
     """Target CloudTAK release tag (e.g. 'v13.54.3') — upstream latest on EVERY
     channel (v10.1.17: version gate removed, operator decision 2026-08-02).
     Falls back to CLOUDTAK_VETTED_RELEASE only when the GitHub release lookup is
     unreachable, so offline deploys still work. Deploy AND update both install
-    this tag. `settings` kept for call-site signature compatibility."""
+    this tag. `settings` kept for call-site signature compatibility.
+    allow_fallback=False (Update): return None instead — the pin is old, so falling back
+    to it on a box that is already newer is a downgrade (gh #365)."""
     tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
     if tag:
         return tag
+    if not allow_fallback:
+        return None
     return 'v' + CLOUDTAK_VETTED_RELEASE
 
 
@@ -51164,7 +51196,15 @@ def run_cloudtak_update():
         # v10.1.17: version gate removed — every channel installs upstream latest
         # (offline fallback: CLOUDTAK_VETTED_RELEASE). The 13.45+ plugin floor is
         # enforced separately at plugin-install time.
-        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
+        # gh #365: no offline fallback on Update. When GitHub couldn't be asked, the pin
+        # (13.54.3) is older than what is running; the build of that old tag failed and the
+        # box looked broken. Stop, change nothing, say why.
+        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False, allow_fallback=False)
+        if not release_tag:
+            plog("✗ Could not look up the latest CloudTAK release (GitHub did not answer or refused the request).")
+            plog("  Nothing was changed and CloudTAK is still running as before. Check this box's DNS/internet and try again in a few minutes.")
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
@@ -51177,6 +51217,15 @@ def run_cloudtak_update():
             from_ver = ''
         if from_ver:
             plog(f"  Running now: {from_ver}")
+            try:
+                _have = tuple(int(x) for x in re.findall(r'\d+', from_ver)[:3])
+                _want = tuple(int(x) for x in re.findall(r'\d+', release_tag)[:3])
+            except Exception:
+                _have = _want = ()
+            if _have and _want and _want < _have:
+                plog(f"✗ {release_tag} is older than the {from_ver} already running; not downgrading. Nothing was changed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
         _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
