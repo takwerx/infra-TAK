@@ -1,0 +1,68 @@
+# Dependabot version updates (ops #241). Weekly, grouped into one PR per ecosystem,
+# at most 3 open PRs. Major versions are ignored here on purpose: a major bump
+# gets its own ops issue and a test instead of an automatic PR. Security
+# updates are a separate repo setting and are not limited by this file.
+#
+# The console runs on Python 3.9 (RHEL/Rocky 9), so gunicorn is held at 23.x.
+# That is a major bump away (24+ needs Python 3.10), which the major rule below
+# already ignores. Pins in requirements.txt
+# are exact on purpose (fleet uniformity): Dependabot proposes the bump, a test
+# on the fleet decides whether it merges.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    target-branch: dev
+    groups:
+      python-console:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "pip"
+    directory: "/.github/ci"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    target-branch: dev
+    groups:
+      python-ci:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "docker"
+    directory: "/simulator"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    target-branch: dev
+    groups:
+      docker:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    target-branch: dev
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
