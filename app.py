@@ -31916,6 +31916,51 @@ def _caddy_apt_repo_heal(log_fn=None):
     return state
 
 
+# GH #365 / ops #381: Caddy Update died at once with "Could not get lock" because another apt
+# run held the lock (Aust-TAK, Oct 25). The OS update path waits up to 5 minutes for the lock
+# (`-o DPkg::Lock::Timeout=300`); the console cannot do that here, because the non-root broker
+# denies every `-o` option (_check_pkgmgr), so the wait is done in Python and bounded.
+_APT_LOCK_FILES = ['/var/lib/dpkg/lock-frontend', '/var/lib/dpkg/lock', '/var/lib/apt/lists/lock']
+_APT_LOCK_MSGS = ('Could not get lock', 'Unable to acquire the dpkg frontend lock',
+                  'Unable to lock directory', 'is another process using it')
+
+
+def _apt_lock_held():
+    """True when some process has an apt/dpkg lock file open. Fails open (False) when lsof is
+    missing or errors, so the caller still tries apt and the retry-on-lock-message covers it."""
+    try:
+        r = subprocess.run(_sudo_wrap(['lsof'] + _APT_LOCK_FILES),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return False
+    return bool((r.stdout or '').strip())
+
+
+def _apt_wait_for_lock(max_wait=300, log_fn=None):
+    """Wait up to max_wait seconds for the apt/dpkg lock to clear. True when free."""
+    waited = 0
+    while _apt_lock_held():
+        if waited >= max_wait:
+            return False
+        if log_fn and waited % 30 == 0:
+            log_fn(f'⏳ Another apt run is using the package lock, waiting... {waited}s')
+        time.sleep(5)
+        waited += 5
+    return True
+
+
+def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None):
+    """Run one privileged apt argv, waiting (bounded) for the apt lock first and retrying once
+    if apt still lost the race for it. Returns the CompletedProcess."""
+    _apt_wait_for_lock(max_wait, log_fn)
+    r = _run_priv_chain([argv], 'and', timeout=timeout)
+    out = (r.stdout or '') + (r.stderr or '')
+    if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+        _apt_wait_for_lock(max_wait, log_fn)
+        r = _run_priv_chain([argv], 'and', timeout=timeout)
+    return r
+
+
 def _caddy_install_github_deb(log_fn=None):
     """Install the latest Caddy .deb from Caddy's GitHub release. Returns True on success.
 
@@ -31958,6 +32003,8 @@ def _caddy_install_github_deb(log_fn=None):
         with open(deb_path, 'wb') as f:
             f.write(data)
         os.chmod(deb_path, 0o644)
+        if _pkg_mgr() == 'apt':
+            _apt_wait_for_lock(log_fn=log_fn)
         ok, out = _pkg_install([deb_path], log_fn=log_fn, timeout=300)
         _caddy_version_cache['ver'] = None
         if ok:
@@ -32028,6 +32075,7 @@ def _caddy_ensure_apt_repo(log_fn=None):
                 _log(f'could not write the Caddy sources list: '
                      f'{(_src.stderr or _src.stdout).strip()[:200]}')
                 return False
+        _apt_wait_for_lock(log_fn=log_fn)
         subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
                        text=True, timeout=180, env=env)
         return True
@@ -32060,8 +32108,9 @@ def caddy_update():
                 # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
                 # different origin, and `install` is what moves it across. Already-current boxes
                 # are a no-op either way.
-                r = _run_priv_chain([['apt-get', 'update', '-qq'],
-                                     ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+                r = _apt_run_waiting(['apt-get', 'update', '-qq'])
+                if r.returncode == 0:
+                    r = _apt_run_waiting(['apt-get', 'install', '-y', 'caddy'])
             else:
                 # v10.2.10 (Cloudsmith 402): Cloudsmith not serving — take the same release from Caddy's GitHub.
                 _gh_log = []
