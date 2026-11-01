@@ -56,3 +56,9 @@ def test_portal_2_0_26_helper_stays_unpinned():
     spec.loader.exec_module(b)
     assert 'ba749885c92e9ea097012438a98cc0b45f3fabf4d46252d1bac54ef1720123cd' not in b.TAKPORTAL_HELPER_SHA256
     assert '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559' in b.TAKPORTAL_HELPER_SHA256
+
+
+def test_floor_ships_a_pinned_helper():
+    # ops #395: 2.0.29 and 2.0.30 carry the same marketplace-helper, the one the broker pins. A floor
+    # below 2.0.29 would put an offline-API deploy on the unpinned 2.0.23-2.0.28 helper.
+    assert _floor() >= (2, 0, 29)

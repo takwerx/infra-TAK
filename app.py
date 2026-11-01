@@ -1350,7 +1350,11 @@ TAKPORTAL_REPO = "https://github.com/ValleyTacticalSolutions/TAK-Portal.git"
 # and in settings, instead of an anonymous branch tip. Same shape as the CloudTAK
 # deploy's `remote_release_tag`. Freezing it to one version is a live product
 # decision (update cadence vs supply-chain strictness) — see ROADMAP.
-TAKPORTAL_REF_FALLBACK = "2.0.26"   # used only when the releases API is unreachable
+TAKPORTAL_REF_FALLBACK = "2.0.30"   # used only when the releases API is unreachable
+# ops #395: bumped 2.0.26 -> 2.0.30. 2.0.30 blocks usernames TAK Server cannot handle (TAK-Portal#82) and
+# ships the same marketplace-helper bytes as 2.0.29, which the broker already pins. An offline deploy
+# on 2.0.26 would have installed the unreviewed root helper. Box-tested as an update (test12) and as a
+# fresh deploy (fresh-install, Ubuntu 22.04).
 # ops #343: bumped 1.4.6 -> 2.0.26 (TAK Portal's reply to our dependency-refresh request,
 # TAK-Portal#77, ships in 2.0.26). The old 1.x floor would have put an offline-API deploy on
 # a Portal that predates the hardened sudo grant (2.0.19+). Box-tested fresh and as an
