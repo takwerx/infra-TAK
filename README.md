@@ -210,6 +210,7 @@ After deployment, create users in TAK Portal — they flow through Authentik →
 - **Disk:** At max deployment (all modules) you can sit around **26 GB** used. Plan for growth: CoT data, logs, and retention. **50 GB+** disk is recommended so you have headroom; TAK Server's own minimum is 40 GB per the official configuration guide. Apply Docker log limits (Guard Dog → Apply Docker log limits) to avoid containers filling the disk.
 - **Disk I/O:** SSD-backed storage strongly recommended. **Test your VPS before deploying** — slow disk I/O causes Docker build timeouts, service startup failures, and unreliable boots. See [VPS disk I/O check](#vps-disk-io-check) below.
 - **CPU:** Enough cores for all processes (TAK Server, PostgreSQL, Authentik, Caddy, Node-RED, etc.). TAK Server's minimum is 4 cores; more is better for the full stack.
+- **Running in a VM (TrueNAS, KVM, Proxmox, etc.):** set the VM's CPU mode to **host passthrough** or **host model**, not a generic or "basic" CPU. With a generic CPU, TAK Portal and CloudTAK won't start. The console now checks this before it deploys either one and tells you if the CPU is too basic.
 - **Internet** connection for initial setup.
 - **TAK Server .deb** package from [tak.gov](https://tak.gov).
 
