@@ -139,6 +139,15 @@ These are facts about the cloud tools, not about infra-TAK. 👁 observed 2026-1
 
 ---
 
+## Virtual machine CPU level (TAK Portal and CloudTAK)
+
+Official: [sharp, installation](https://sharp.pixelplumbing.com/install) (the image library both products load)
+
+- **TAK Portal and CloudTAK need an x86-64-v2 CPU or newer on Intel/AMD boxes.** Both use the `sharp` module, whose prebuilt Linux x64 binaries need those CPU features. Without them TAK Portal restarts in a loop with "Unsupported CPU: Prebuilt binaries for Linux x64 require v2 microarchitecture", and the CloudTAK build stops with "Could not load the sharp module". 👁 observed 2026-10-31 (reporter on TrueNAS, ops #341).
+  - The usual cause is a VM set to a generic or "basic" CPU type (TrueNAS, KVM and Proxmox defaults), which hides the features the real CPU has. The fix is in the hypervisor: set the VM's CPU mode to host passthrough (or host model). No reinstall; the reporter confirmed it fixed both. 👁 observed 2026-10-31.
+  - The flags the v2 level adds that we check: `popcnt`, `sse4_1`, `sse4_2` (in `/proc/cpuinfo`). ARM boxes are not affected.
+  - Official docs and what we saw differ on detail: the sharp install page lists only "CPU with SSE4.2" for Linux x64 and does not mention x86-64-v2 or POPCNT, while the error text above names v2. We check the whole v2 set to be safe. The error text was seen; whether sharp enforces every v2 flag was not tested.
+
 ## Adding to this file
 
 1. Put the fact under the product it belongs to. If the product has no section, add one with its official source.
