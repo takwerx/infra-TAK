@@ -64,7 +64,9 @@ drive it. Outbound it reaches only TAK Server (8089, and 8443 to switch its own 
 
 1. Pick a scenario card.
 2. Choose an **area of operations** (a city from the list, or type a center latitude/longitude).
-   Every preset is built from offsets around that center, so it runs anywhere.
+   Every preset is built from offsets around that center, so it runs anywhere. A scenario with a
+   saved location (a saved layout, or one written around a real place — see `center` below) hides
+   these fields and runs there; **Run it somewhere else** brings them back.
 3. Assign each lane the scenario uses to a channel. `simulation` is preselected.
 4. Pick a tempo (1×, 2×, 4×, 10×). Tempo scales both movement and the event timeline.
 5. Start. Pause/Resume freeze and release the simulated clock; Stop sends the deletes.
@@ -142,8 +144,10 @@ Reference:
   friendly ground unit, `a-f-G-E-V-C` vehicle, `a-f-A-M-H` helicopter, `a-f-A-M-H-Q` rotary
   drone, `a-f-G-E-S` sensor, `a-h-G` hostile, `a-n-G` neutral), `team` (ATAK team color name),
   `role`, `lane`, `path`, `interval_s` (0.5–600), `stale_s` (5–86400), `hae_m`, `spawn_at_s`,
-  `despawn_at_s`, optional `sensor` (`fov`, `range_m`, `vfov`, `elevation`, `sweep_deg_s`; azimuth
-  follows heading, and a sweep advances it that many degrees per simulated second for a radar),
+  `despawn_at_s`, optional `sensor` (`fov`, `range_m`, `vfov`, `elevation`, `sweep_deg_s`, `aim`;
+  azimuth follows heading, and a sweep advances it that many degrees per simulated second for a
+  radar; `"aim": "orbit_center"` keeps the cone on the orbit's center while the unit circles one,
+  for a helicopter holding its FLIR on a scene),
   optional `video` (`stream` name), optional `remarks`, plus the detection keys below (`silent`,
   `detected_type`, `detected_callsign`, `eud`).
 - **Paths** — `waypoints` (`points`, `speed_mps`, `loop`, `pause_s`), `random_walk` (inside a
@@ -161,8 +165,11 @@ Reference:
 - **Caps** — 2500 entities, 500 events, 500 points per path or shape, 50 sensors with detection
   enabled, 500 hidden targets, 1 MB per file, offsets within ±200 km, 400 m/s, 30 km altitude, and
   a per-lane rate governor of 200 messages per second (raised per run for the load preset only).
-- **`center`** — written by **Save layout**, so a saved picture reopens where it was made. Presets
-  carry none; they run wherever you center them.
+- **`center`** — `{"lat": …, "lon": …}`, the scenario's home location. **Save layout** writes it,
+  and you can write it yourself for a scenario built around a real place (a creek mouth, a stadium,
+  an airport). A scenario with one runs there from the console and from the CloudTAK panel, and the
+  panel brings the map to it — nobody types coordinates the file already holds. Presets carry none;
+  they run wherever you center them.
 
 ### Sensors that detect, and targets that hide
 
@@ -213,14 +220,17 @@ With CloudTAK on the same box, the Simulator page offers **Install CloudTAK pane
 the CloudTAK API image, 5–10 minutes; close every CloudTAK tab afterwards, its service worker
 caches the old bundle). CloudTAK then has a **TAK Simulator** tool in its menu:
 
-- **Session** — start an empty live session at the map center, **Run at map center** with a preset,
-  or **Open for editing**, which places a preset at the center as a live session you can move,
+- **Session** — start an empty live session at the map center, run a preset (**Run at map center**,
+  or **Run at its location** for a scenario with a saved location — the map flies there), or
+  **Open for editing**, which places a preset at the center (a saved layout where it was made) as a
+  live session you can move,
   add to, thin out and save again as a new layout. Tempo, pause, resume, and **Stop (clears
   everything)**. The panel warns when you are not in the channel the traffic goes to, because then
   you would see nothing.
 - **Add unit** — pick a type (ground, vehicle, hostile, helicopter, fixed wing, UAS, ADS-B
   aircraft, vessel, AIS vessel, radar site, fixed camera), callsign, team, altitude in feet, speed
-  in knots, an optional sensor cone (FOV, range, and a sweep for a radar) and video stream, then
+  in knots, an optional sensor cone (FOV, range, a sweep for a radar, and **Aim at orbit center**
+  for a unit you will put on an orbit) and video stream, then
   **Place on map** and click. Two checkboxes matter: **Hidden target** makes a unit that never
   reports itself (it appears only as the track of a sensor that sees it), and **Team marker (TAK
   user)** controls team-marker versus 2525 rendering — its default is right, see `eud` above.
