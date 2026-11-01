@@ -152,10 +152,26 @@
   {% endif %}
 
   {% if cloudtak.running and not deploying %}
-  <!-- Post-install first-time setup guide -->
+  <!-- v10.3.4 W9: one button connects CloudTAK to TAK Server (first-time setup) or
+       reconnects it with a current certificate after a CA rotation / revoke. -->
+  <div class="card" id="ct-connect-card" style="margin-bottom:20px">
+    <div class="card-title">Connect CloudTAK to TAK Server</div>
+    <div id="ct-connect-state" style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">Checking CloudTAK's TAK connection…</div>
+    <div id="ct-connect-creds" style="display:none;margin-bottom:10px">
+      <p style="margin:0 0 8px;font-size:12px;color:var(--text-secondary)">First-time setup: enter a TAK user (made in TAK Portal, a regular user, not an admin) who becomes CloudTAK's first system admin. TAK Portal adds an org suffix to usernames, so use the full name, e.g. <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-orgname</code>. The password goes to CloudTAK only; the console doesn't store or log it.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input type="text" id="ct-connect-user" placeholder="TAK username" autocomplete="off" style="flex:1;min-width:180px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px">
+        <input type="password" id="ct-connect-pass" placeholder="TAK password" autocomplete="new-password" style="flex:1;min-width:180px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px">
+      </div>
+    </div>
+    <button class="btn btn-primary" id="ct-connect-btn" onclick="ctConnectTak(this)" style="font-size:12px;display:none">Connect CloudTAK to TAK Server</button>
+    <div id="ct-connect-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
+  </div>
+
+  <!-- Post-install first-time setup guide (manual fallback for the button above) -->
   <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden" id="cloudtak-setup-guide">
     <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px" onclick="var a=this.parentElement.querySelector('.ct-guide-arrow');if(a)a.style.transform=this.parentElement.open?'rotate(0deg)':'rotate(180deg)'">
-      <span style="font-size:16px">🚀</span> First-Time Setup — Connect CloudTAK to TAK Server
+      <span style="font-size:16px">🚀</span> Manual First-Time Setup — if the Connect button above can't be used
       <span class="ct-guide-arrow" style="margin-left:auto;font-size:14px;color:var(--text-dim);transition:transform 0.2s;display:inline-block;transform:rotate(0deg)">▼</span>
     </summary>
     <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
@@ -181,7 +197,7 @@
           <p style="margin:0 0 10px;font-size:12px;color:var(--text-secondary)">CloudTAK 13.59+ (Core Events) reposts Events over this certificate and <strong style="color:var(--text-primary)">silently skips channels the cert can't reach</strong> — it needs a <em>channels-disabled admin</em> cert, not a regular user cert. This button creates <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> with exactly that shape (makeCert-issued + ROLE_ADMIN — an admin cert bypasses channel selection and resolves every group, including channels created later).</p>
           <button class="btn btn-primary" onclick="ctGenBootstrapCert(this)" style="font-size:12px">Generate CloudTAK Bootstrap Admin p12</button>
           <div id="ct-bootstrap-cert-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
-          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Generate + download here, then swap it once in <strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong> — no re-bootstrap needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
+          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Use <strong style="color:var(--text-primary)">Connect CloudTAK to TAK Server</strong> above: it installs this certificate for you, no CloudTAK login needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">

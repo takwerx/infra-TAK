@@ -566,8 +566,17 @@ TAK Server filter not yet installed — restart the console to complete setup.
 <div id="tak-enabled-section" style="display:none">
 <div style="margin-top:14px;font-size:12px;color:var(--text-dim);line-height:1.5">
   A TAK Server ban blocks only TAK's ports (8089, 8443, 8446, 9000, 9001). The console, Authentik and SSH keep working from that address, and these bans never count toward Repeat Offender Protection.
+  A device TAK refuses because of an old certificate is banned only if it floods (2 connections a second for 5 minutes), only for 10 minutes, and never from enrollment (8446), so it can always re-enroll with a fresh QR.
 </div>
 <div id="tak-badcert-note" style="display:none;margin-top:12px;padding:10px 12px;background:rgba(234,179,8,0.10);border:1px solid rgba(234,179,8,0.45);border-radius:8px;font-size:12px;color:var(--text-secondary);line-height:1.5"></div>
+<div id="tak-refused-panel" style="margin-top:14px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Devices TAK is refusing <span style="text-transform:none;font-weight:400">(last 30 min)</span></div>
+<input type="text" id="tak-refused-search" onkeydown="if(event.key==='Enter')loadTakRefused()" placeholder="Find a user or callsign…" style="flex:1;min-width:180px;max-width:280px;box-sizing:border-box;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:12px;outline:none">
+</div>
+<div style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:8px">A device whose certificate TAK no longer trusts can't connect until it re-enrolls. Have the user scan a fresh QR; enrollment is never blocked for these devices.</div>
+<div id="tak-refused-list" style="max-height:300px;overflow-y:auto"><div style="color:var(--text-dim);font-size:13px">Loading…</div></div>
+</div>
 <div class="stat-grid" style="margin-top:14px;margin-bottom:8px">
 <div class="stat-card" id="tak-banned-toggle" onclick="toggleTakBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
 <div class="stat-value red" id="tak-stat-banned">0</div>
@@ -1093,6 +1102,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         var ips = d.banned_ips || [];
         window._takBannedIps = ips;
         window._takBanDetails = d.ban_details || {};
+        window._takBanJail = d.ban_jail || {};
         // A device with an old certificate is usually one of ours, not an attacker: say so
         // up front instead of behind the "details" toggle.
         var bcNote = document.getElementById('tak-badcert-note');
@@ -1142,6 +1152,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   window._takBannedIps = [];
   window._takBanDetails = {};
+  window._takBanJail = {};
   window._takSortAsc = true;
   function _takIpToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
   function _takEsc(s){var d=document.createElement('div');d.textContent=(s===undefined||s===null)?'':String(s);return d.innerHTML;}
@@ -1151,7 +1162,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var sorted=ips.slice().sort(function(a,b){var d=_takIpToNum(a)-_takIpToNum(b);return window._takSortAsc?d:-d;});
     var arrow=window._takSortAsc?' ▲':' ▼';
     // Why it is banned, in plain words (bad certificate, scanner, ...) - from TAK's own log.
-    var rows=sorted.map(function(ip){var det=(window._takBanDetails||{})[ip];var why=det&&det.explain?'<div style="margin-top:3px;font-family:inherit;font-size:12px;color:var(--text-secondary);white-space:normal;line-height:1.4">'+_takEsc(det.explain)+'</div>':'';return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+_takEsc(ip)+why+'</td><td style="padding:5px 8px;text-align:right;vertical-align:top"><button class="btn-danger-sm" onclick="unbanTakIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
+    var rows=sorted.map(function(ip){var det=(window._takBanDetails||{})[ip];var why=det&&det.explain?'<div style="margin-top:3px;font-family:inherit;font-size:12px;color:var(--text-secondary);white-space:normal;line-height:1.4">'+_takEsc(det.explain)+'</div>':'';var tag=(window._takBanJail||{})[ip]==='takserver-badcert'?' <span class="badge badge-yellow" style="font-size:9px;padding:1px 6px;font-family:inherit">streaming only · can re-enroll</span>':'';return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+_takEsc(ip)+tag+why+'</td><td style="padding:5px 8px;text-align:right;vertical-align:top"><button class="btn-danger-sm" onclick="unbanTakIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakSort()">IP Address'+arrow+'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
   window.toggleTakSort = function(){window._takSortAsc=!window._takSortAsc;filterTakBanList();};
@@ -1164,16 +1175,54 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   };
 
   window.unbanTakIP = function(ip) {
-    if (!confirm('Unban ' + ip + ' from TAK Server jail?')) return;
+    if (!confirm('Unban ' + ip + ' from the TAK Server jails?')) return;
     fetch('/api/fail2ban/takserver/unban', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ip:ip})})
       .then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadTakStatus(); }
+        if (d.ok) { showToast(ip + ' unbanned.', 'success'); loadTakStatus(); loadTakRefused(); }
         else showToast(d.error || 'Unban failed', 'error');
       }).catch(function(){ showToast('Network error', 'error'); });
   };
 
+  // v10.3.4 W5 — who TAK is refusing, for the help desk. Device-set fields (callsign,
+  // UID, cert subject) are escaped like everything else here.
+  function _takWhen(t){ return t ? new Date(t * 1000).toLocaleString() : ''; }
+  window.loadTakRefused = function() {
+    var box = document.getElementById('tak-refused-list'); if (!box) return;
+    var q = ((document.getElementById('tak-refused-search') || {}).value || '').trim();
+    fetch('/api/fail2ban/takserver/refused' + (q ? '?q=' + encodeURIComponent(q) : ''))
+      .then(function(r){ return r.json(); }).then(function(d){
+        var rows = d.rows || [];
+        var shown = q ? rows : rows.filter(function(r){ return r.kind === 'bad_cert'; });
+        var others = rows.length - shown.length;
+        var html = '';
+        if (d.cert_error) html += '<div style="font-size:12px;color:var(--yellow);margin-bottom:6px">⚠ Could not read TAK\'s certificate list, so user and issuer are missing: ' + _takEsc(d.cert_error) + '</div>';
+        if (!shown.length) {
+          html += '<div style="color:var(--text-dim);font-size:13px">' + (q ? 'No device found for “' + _takEsc(q) + '” in TAK\'s recent log.' : 'No device is being refused.') + '</div>';
+        } else {
+          html += shown.map(function(r){
+            var who = r.identity === 'known'
+              ? '<b>' + _takEsc(r.callsign || r.uid) + '</b>' + (r.user ? ' · ' + _takEsc(r.user) : '')
+              : '<span style="color:var(--text-dim)">identity unknown</span>' + (r.subject ? ' · ' + _takEsc(r.subject) : '');
+            var iss = '';
+            if (r.issuer) iss = ' · ' + _takEsc(r.issuer) + (r.issuer_trusted === false ? ' <span style="color:var(--red)">(no longer trusted)</span>' : (r.issuer_trusted === true ? ' (trusted)' : ''));
+            if (r.cert_revoked) iss += ' <span style="color:var(--red)">(revoked)</span>';
+            var state = r.refused ? (r.refused + ' refusals since ' + _takWhen(r.first) + ', last ' + _takWhen(r.last)) : 'not refused in the last 30 min';
+            var ban = r.banned
+              ? ' · <span style="color:var(--red)">banned (' + (r.banned === 'takserver-badcert' ? 'streaming only, can re-enroll' : 'all TAK ports') + ')</span>' +
+                (/^[0-9a-fA-F:.]+$/.test(r.ip) ? ' <button class="btn-danger-sm" onclick="unbanTakIP(\'' + r.ip + '\')">Unban</button>' : '')
+              : '';
+            return '<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;line-height:1.5;color:var(--text-secondary)">' + who + iss +
+                   '<div style="font-family:JetBrains Mono,monospace;color:var(--text-dim)">' + _takEsc(r.ip || 'no recent address') + ' · ' + _takEsc(state) + ban + '</div></div>';
+          }).join('');
+        }
+        if (others > 0) html += '<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">' + others + ' other address(es) refused without a TAK certificate (scanners) are not listed.</div>';
+        box.innerHTML = html;
+      }).catch(function(){ box.innerHTML = '<div style="color:var(--text-dim);font-size:13px">Could not load the refused-device list.</div>'; });
+  };
+
   loadTakStatus();
-  setInterval(function(){ loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
+  loadTakRefused();
+  setInterval(function(){ loadTakStatus(); loadTakRefused(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
 })();
 
 // SSH Jail

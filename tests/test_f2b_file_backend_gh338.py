@@ -94,7 +94,8 @@ def test_takserver_jail_is_written_reading_its_file():
         exec(_func(f), ns)
     ns.update(_makedirs_priv=lambda *a, **k: None,
               _write_priv=lambda p, c, **k: written.__setitem__(p, c),
-              _f2b_trusted_ignoreip=lambda extra='': '127.0.0.1/8 ::1')
+              _f2b_trusted_ignoreip=lambda extra='': '127.0.0.1/8 ::1',
+              _f2b_write_tak_badcert_jail_config=lambda ignoreip='': None)   # its own test
     ns['_f2b_write_tak_jail_config'](20, 300, 3600, '')
     sec = _section(written['/etc/fail2ban/jail.d/infratak-takserver.conf'])
     assert sec['backend'] == 'auto'

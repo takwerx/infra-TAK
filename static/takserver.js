@@ -506,8 +506,10 @@ async function loadCAInfo(){
           var rh='';
           for(var i=0;i<d.old_cas_in_truststore.length;i++){
             var alias=d.old_cas_in_truststore[i];
+            var caCn=(d.old_ca_names||{})[alias]||'';
+            var caLabel=(caCn&&caCn.toLowerCase()!==alias.toLowerCase())?alias+' ('+caCn+')':alias;
             rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
-            rh+='<span style="color:var(--yellow)">'+alias+'</span>';
+            rh+='<span style="color:var(--yellow)">'+caLabel.replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];})+'</span>';
             rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
             rh+='</div>';
           }

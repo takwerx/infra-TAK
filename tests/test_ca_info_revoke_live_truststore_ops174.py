@@ -44,7 +44,8 @@ LIVE = 'INT-CA-100'
 STALE = ['INT-CA-98', 'INT-CA-99']
 
 FUNCS = ('_cert_file_bytes', '_rotate_coreconfig_truststore', '_pem_cn_and_expiry',
-         '_is_int_truststore', '_live_truststore', 'takserver_ca_info', 'takserver_revoke_old_ca')
+         '_is_int_truststore', '_live_truststore', '_tak_live_trust_entries', 'takserver_ca_info',
+         'takserver_revoke_old_ca')
 
 
 def _func(name):
@@ -69,9 +70,9 @@ def _coreconfig(truststore):
 
 @pytest.fixture(scope='module')
 def certs(tmp_path_factory):
-    """root-ca.pem and an INT-CA-100 ca.pem, the only real certs the routes read."""
+    """root-ca.pem, an INT-CA-100 ca.pem and the stale INT-CA-99 the truststore still holds."""
     d = tmp_path_factory.mktemp('certs')
-    for name in ('root-ca', LIVE):
+    for name in ('root-ca', LIVE, 'INT-CA-99'):
         _ssl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
              '-keyout', f'{name}.key', '-subj', f'/OU=TAK/CN={name}', '-days', '30', '-out', f'{name}.pem', cwd=d)
     return d
@@ -107,6 +108,11 @@ def box(certs, tmp_path):
             return real_run(cmd, *a, **kw)
         if isinstance(cmd, list) and cmd and cmd[0] == 'keytool':
             state['keytool'].append(cmd)
+            if '-rfc' in cmd:     # v10.3.4 W10: entries judged by the cert subject
+                out = ''.join(f'Alias name: {a}\nEntry type: trustedCertEntry\n\n'
+                              + (certs / f'{n}.pem').read_text() + '\n\n'
+                              for a, n in ((LIVE.lower(), LIVE), ('int-ca-99', 'INT-CA-99'), ('root-ca', 'root-ca')))
+                return subprocess.CompletedProcess(cmd, 0, out, '')
             out = (f'{LIVE.lower()}, Oct 1, 2026, trustedCertEntry,\n'
                    'int-ca-99, Sep 1, 2026, trustedCertEntry,\n'
                    'root-ca, Jan 1, 2026, trustedCertEntry,\n')
@@ -121,7 +127,8 @@ def box(certs, tmp_path):
           'TAK_CONTAINER': 'takserver', '_read_priv_bytes': lambda p: open(p, 'rb').read(),
           '_read_priv': read_priv, 'load_settings': lambda: {}, '_get_tak_cert_password': lambda s: PASSWORD,
           '_tak_is_container': lambda: False, '_rotate_tak_cert_cmd': lambda c: c, '_sudo_wrap': lambda a: a,
-          '_tak_server_cert_prepare': lambda s: None, '_takportal_sync_certs': lambda restart=False: None}
+          '_tak_server_cert_prepare': lambda s: None, '_takportal_sync_certs': lambda restart=False: None,
+          '_cloudtak_local_with_local_tak': lambda: False}
     for name in FUNCS:
         src = _func(name).replace("'/opt/tak/certs/files'", '_CERT_FILES_DIR')
         exec(compile(src, 'app.py', 'exec'), ns)
@@ -142,7 +149,7 @@ def test_ca_info_lists_the_truststore_coreconfig_points_at(box):
     c, d, state = box
     j = c.get('/api/takserver/ca-info').get_json()
     assert j['truststore_file'] == f'truststore-{LIVE}.jks'
-    assert [k[k.index('-keystore') + 1] for k in state['keytool']] == [str(d / f'truststore-{LIVE}.jks')]
+    assert {k[k.index('-keystore') + 1] for k in state['keytool']} == {str(d / f'truststore-{LIVE}.jks')}
     assert j['old_cas_in_truststore'] == ['int-ca-99']
 
 
