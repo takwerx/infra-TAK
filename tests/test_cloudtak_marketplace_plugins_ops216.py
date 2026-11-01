@@ -100,7 +100,7 @@ def _override(**kw):
 def test_override_services_are_read_from_the_real_override(tmp_path, kw):
     (tmp_path / 'docker-compose.override.yml').write_text(_override(**kw))
     ns = _load(['_cloudtak_override_services'])
-    assert ns['_cloudtak_override_services'](str(tmp_path)) == {'api', 'events', 'media', 'postgis'}
+    assert ns['_cloudtak_override_services'](str(tmp_path)) == {'api', 'events', 'media', 'postgis', 'tiles'}
 
 
 def test_override_services_unreadable_is_empty(tmp_path):

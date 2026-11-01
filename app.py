@@ -46793,6 +46793,11 @@ services:
 {hosts_block}
     environment:
 {tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
+  tiles:
+    # ops #392: CloudTAK 13.117.0's tile server loads each basemap from the API and defaults
+    # to localhost:5001, which does not exist in Docker, so every basemap tile came back 500.
+    environment:
+      API_URL: "http://api:5000"
   events:
     extra_hosts:
 {hosts_block}
@@ -99853,8 +99858,8 @@ def _ct_docker_out(args, timeout=20, stdin=None):
 
 
 def _cloudtak_override_services(ct_dir):
-    """Service names infra-TAK's docker-compose.override.yml configures (api, events, media,
-    postgis), read from the file itself. Empty set when it can't be read."""
+    """Service names infra-TAK's docker-compose.override.yml configures (api, tiles, events,
+    media, postgis), read from the file itself. Empty set when it can't be read."""
     try:
         with open(os.path.join(ct_dir, 'docker-compose.override.yml'), encoding='utf-8') as f:
             text = f.read()
