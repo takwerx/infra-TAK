@@ -49,10 +49,13 @@ def _load(names, ns):
 class _Box:
     """A fake local PostgreSQL that the vendor scripts change, like the real one."""
 
-    def __init__(self, major, role, db, sv=None, upgrade_rc=0, setup_rc=0, upgrade_builds=True):
+    def __init__(self, major, role, db, sv=None, upgrade_rc=0, setup_rc=0, upgrade_builds=True,
+                 prepare_ok=True):
         self.major, self.role, self.db, self.sv = major, role, db, sv
         self.upgrade_rc, self.setup_rc, self.upgrade_builds = upgrade_rc, setup_rc, upgrade_builds
+        self.prepare_ok = prepare_ok
         self.calls = []
+        self.prepare_who = None
 
     def pg_exec(self, args, timeout=30, **kw):
         self.calls.append(('psql', args[-1]))
@@ -79,6 +82,14 @@ class _Box:
         self.calls.append(('heal',))
         return True
 
+    def prepare_local_db(self, plog, who='rollback'):
+        """Stands in for _tak_rollback_prepare_local_db (v10.3.5 W16): creates martiuser and cot."""
+        self.calls.append(('prepare-local-db',))
+        self.prepare_who = who
+        if self.prepare_ok:
+            self.role = self.db = True
+        return self.prepare_ok
+
 
 def _run(box, pkg=PKG58):
     ns = _load({'_tak_deploy_local_db_state', '_tak_deploy_ensure_local_db', '_TAK_VER_RE',
@@ -88,6 +99,7 @@ def _run(box, pkg=PKG58):
         '_pg_exec': box.pg_exec, '_tak58_schema_version': box.schema_version,
         '_tak58_run_upgrade_db': box.run_upgrade_db, '_tak58_run_setup_db': box.run_setup_db,
         '_tak58_heal_md5_scram': box.heal,
+        '_tak_rollback_prepare_local_db': box.prepare_local_db,
     })
     said, log = [], []
     ok = ns['_tak_deploy_ensure_local_db'](pkg, said.append, log)
@@ -128,7 +140,16 @@ def test_healthy_fresh_install_is_left_alone():
 def test_pg18_cluster_without_cot_runs_setup_db():
     box = _Box(major=18, role=True, db=False)
     ok, calls, _, _ = _run(box)
-    assert ok and calls == ['takserver-setup-db.sh']
+    # The deploy makes martiuser and cot itself first (nuc, 2026-11-02: setup-db.sh skips
+    # them on a box that once moved 15 -> 18), and only then runs TAK's script.
+    assert ok and calls == ['prepare-local-db', 'takserver-setup-db.sh']
+    assert box.prepare_who == 'deploy'
+
+
+def test_pg18_cluster_where_the_database_prep_fails_stops_before_setup_db():
+    box = _Box(major=18, role=True, db=False, prepare_ok=False)
+    ok, calls, _, _ = _run(box)
+    assert not ok and calls == ['prepare-local-db']
 
 
 def test_schema_left_behind_gets_the_md5_scram_heal():
