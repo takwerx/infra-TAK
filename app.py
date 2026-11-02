@@ -81608,6 +81608,122 @@ def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
     return ok
 
 
+TAK_SERVER_CERT_SIGNERS = ('root', 'intermediate')
+# makeCert.sh signs with whatever sits in this slot; makeCert.sh ca moves each new intermediate into it.
+_TAK_WORKING_CA_FILES = (('ca.pem', 'root-ca.pem'),
+                         ('ca-do-not-share.key', 'root-ca-do-not-share.key'),
+                         ('ca-trusted.pem', 'root-ca-trusted.pem'))
+
+
+def _pem_dn(pem, which):
+    """'subject' or 'issuer' of the first certificate in `pem`, RFC 2253, or '' if unreadable."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', f'-{which}', '-nameopt', 'RFC2253'],
+                           input=pem or '', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ''
+    if r.returncode != 0:
+        return ''
+    return r.stdout.strip().split('=', 1)[-1].strip() if '=' in r.stdout else ''
+
+
+def _tak_server_cert_mode(cert_dir='/opt/tak/certs/files'):
+    """Who signed takserver.pem: 'root', 'intermediate' (the current working CA, ca.pem) or 'unknown'.
+
+    Read from the cert itself, never from settings: the box's certificate is the only source of
+    truth (fleet-uniform), and a settings key would drift the first time someone reissued by hand.
+    'unknown' covers a missing/unreadable file and a cert signed by an older intermediate."""
+    try:
+        issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+        root = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+        working = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        return 'unknown'
+    if not issuer:
+        return 'unknown'
+    if root and issuer == root:
+        return 'root'
+    if working and issuer == working and working != root:
+        return 'intermediate'
+    return 'unknown'
+
+
+def _tak_server_cert_signer_or_default(cert_dir='/opt/tak/certs/files'):
+    """The signer a reissue should keep: the box's current mode, and 'intermediate' (what every
+    reissue did before v10.3.5) when it cannot be told."""
+    return 'root' if _tak_server_cert_mode(cert_dir) == 'root' else 'intermediate'
+
+
+def _tak_server_cert_issue(settings, signer, log, run, cert_dir='/opt/tak/certs/files'):
+    """THE one writer of TAK Server's own 8089/8443 certificate (`makeCert.sh server takserver`).
+
+    signer='intermediate' signs with the working CA, as every reissue always has. signer='root'
+    signs with the root CA, which every enrolled device already trusts: ATAK checks 8089 against
+    its own truststore only and ignores the chain we send, so an intermediate-signed server cert
+    drops every phone the moment the intermediate rotates. A root-signed one does not.
+
+    Same key? No: makeCert.sh generates a new key on every run. That is fine — phones pin the CA,
+    not the server key.
+
+    For 'root' the root goes into the working slot (ca.pem / ca-do-not-share.key / ca-trusted.pem)
+    for this one run, and the intermediate that was there is ALWAYS put back (finally): left
+    behind, every client cert issued afterwards would be root-signed too.
+
+    `run(cmd) -> bool` is the caller's own container-aware shell runner (rotate, fix job,
+    deploy); it must log its own failures. `/redteam-selfaudit` fails on any
+    `makeCert.sh server takserver` outside this function — that is how the next rotation is kept
+    from silently going back to dropping everyone. Returns True only when the cert was reissued
+    AND (for 'root') the working CA is back."""
+    say = log or (lambda _m: None)
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        say(f"  ✗ Unknown server certificate signer {signer!r}")
+        return False
+    _tak_server_cert_prepare(settings, say)
+    if signer == 'intermediate':
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+        if ok:
+            say("  Server certificate signed by the intermediate CA")
+        return ok
+
+    missing = [src for _slot, src in _TAK_WORKING_CA_FILES
+               if not _exists_priv(os.path.join(cert_dir, src))]
+    if missing:
+        say(f"  ✗ Cannot sign with the root CA: {', '.join(missing)} not found")
+        return False
+    held, placed = [], []
+    ok = False
+    try:
+        for slot, _src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            if _exists_priv(p):
+                if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + ".w1hold")}'):
+                    say("  ✗ Could not set the working CA aside — nothing was changed")
+                    return False
+                held.append(p)
+        for slot, src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            placed.append(p)
+            if not run(f'cp -p {shlex.quote(os.path.join(cert_dir, src))} {shlex.quote(p)}'):
+                say("  ✗ Could not put the root CA in the working slot")
+                return False
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+    finally:
+        # Every slot is attempted (a list, not a short-circuiting all()). A slot that held
+        # nothing before is emptied again, never left holding the root.
+        results = [run(f'cp -p {shlex.quote(p + ".w1hold")} {shlex.quote(p)} && '
+                       f'rm -f {shlex.quote(p + ".w1hold")}') for p in held]
+        results += [run(f'rm -f {shlex.quote(p)}') for p in placed if p not in held]
+        back = all(results)
+        if not back:
+            say(f"  ✗ The intermediate CA was NOT put back in the working slot — restore "
+                f"{cert_dir}/ca*.w1hold over ca.pem / ca-do-not-share.key / ca-trusted.pem before "
+                "issuing any client certificate")
+            ok = False
+    if ok:
+        say("  Server certificate signed by the root CA")
+    return ok
+
+
 def _rotate_refresh_integrations(log):
     """After a rotation's TAK Server restart: integrations that cache a client cert in memory.
 
@@ -81942,6 +82058,10 @@ def takserver_rotate_intca():
                 run(f'cp {cert_dir}/ca.pem {old_pem}')
                 log(f"  Saved current CA to {old_ca_name}.pem for transition bundle")
 
+            # Read before Step 1 puts the root in the working slot: afterwards ca.pem no longer
+            # names the intermediate the server cert was signed by.
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
+
             log("Step 1/7: Restoring Root CA as working CA...")
             run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
             run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
@@ -81962,11 +82082,11 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            log("Step 3/7: Creating new server certificate...")
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create new server certificate')
-            log("✓ Server certificate regenerated (signed by new CA)")
+            log("✓ Server certificate regenerated (signed by "
+                + ("the root CA" if server_signer == 'root' else "the new CA") + ")")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -82092,12 +82212,22 @@ def takserver_revoke_old_ca():
         # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
-            _tak_server_cert_prepare(load_settings())  # v10.2.26: real names, not just `takserver`
-            r = subprocess.run(
-                _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
-                shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
+            _errs = []
+
+            # The rotations' own runner, for _tak_server_cert_issue()'s fixed cp/mv/makeCert strings.
+            def run(cmd):
+                cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+                try:
+                    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        _errs.append((r.stderr or r.stdout or '').strip()[:200])
+                    return r.returncode == 0
+                except Exception as e:
+                    _errs.append(str(e)[:200])
+                    return False
+            if not _tak_server_cert_issue(load_settings(), _tak_server_cert_signer_or_default(cert_dir),
+                                          _errs.append, run, cert_dir):
+                return jsonify({'error': f'Creating new server cert failed: {"; ".join(_errs)[:300]}'}), 500
             # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
             p12 = os.path.join(cert_dir, 'takserver.p12')
             jks = os.path.join(cert_dir, 'takserver.jks')
@@ -82240,6 +82370,8 @@ def takserver_rotate_rootca():
                 return False
 
         try:
+            # Read before Step 1 clears the cert dir: a root-signed box stays root-signed (by the new root).
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
             log("━━━ Rotating Root CA ━━━")
             log(f"  Old Root CA: {old_root_name}")
             log(f"  Old Intermediate CA: {old_int_name}")
@@ -82291,8 +82423,7 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 4/8: Creating new server certificate...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create server certificate')
             log("✓ Server certificate created")
 
@@ -82486,7 +82617,8 @@ def takserver_server_cert_fix():
                 raise Exception('Could not write the names — nothing was changed')
 
             log("Step 3/4: Reissuing the server certificate (same CA)...")
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            if not _tak_server_cert_issue(settings, _tak_server_cert_signer_or_default(cert_dir),
+                                          log, run, cert_dir):
                 restore()
                 raise Exception('makeCert.sh failed')
             got = _cert_san_entries(_read_priv(f'{cert_dir}/takserver.pem')) or []
@@ -91046,8 +91178,17 @@ def _deploy_takserver_container(config):
         if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
             return
         log_step("Creating server certificate...")
-        _tak_server_cert_prepare(load_settings(), log_step)  # v10.2.26: real names, not just `takserver`
-        if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
+
+        def _certrun_sh(cmd):
+            # _tak_server_cert_issue()'s runner: its cp/mv/makeCert strings in the same one-shot
+            # container as _certrun (runuser is native-only; the image user is already tak).
+            inner = cmd.replace('runuser -u tak -- ', '')
+            return run_cmd(f"docker run --rm -v {shlex.quote(tak_dir)}:/opt/tak:z "
+                           f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(inner)} 2>&1", quiet=True)
+        if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                      log_step, _certrun_sh):
+            log_step("✗ Certificate generation FAILED at: server cert — aborting (TAK is unusable without certs)")
+            deploy_status.update({'running': False, 'error': True})
             return
         log_step("Creating admin certificate...")
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh client admin', "admin cert"):
@@ -91891,17 +92032,25 @@ def run_takserver_deploy(config):
         # still reported all certificates created AND the truststore imported. A
         # TAK Server with no certificates cannot serve a single client, so this is
         # not a warning — it ends the deploy.
-        # v10.2.26: the server cert carries this box's real names, not just `takserver`.
-        _tak_server_cert_prepare(load_settings(), log_step)
-        _cert_steps = [
+        # The server cert is not in this list: it goes through _tak_server_cert_issue(), the one
+        # writer (which also writes this box's real names into config.cfg first, v10.2.26).
+        _ca_steps = [
             ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
             ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
-            ("server cert", ['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], None, "Creating server certificate..."),
+        ]
+        _client_steps = [
             ("admin cert", ['/opt/tak/certs/makeCert.sh', 'client', 'admin'], None, "Creating admin certificate..."),
             ("user cert", ['/opt/tak/certs/makeCert.sh', 'client', 'user'], None, "Creating user certificate..."),
         ]
-        _cert_failed = [name for name, argv, inp, desc in _cert_steps
+        _cert_failed = [name for name, argv, inp, desc in _ca_steps
                         if not _tak_cert(argv, inp=inp, desc=desc)]
+        if not _cert_failed:
+            log_step("Creating server certificate...")
+            if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                          log_step, lambda c: run_cmd(c, quiet=True)):
+                _cert_failed.append("server cert")
+        _cert_failed += [name for name, argv, inp, desc in _client_steps
+                         if not _tak_cert(argv, inp=inp, desc=desc)]
         if _cert_failed:
             log_step("✗ FATAL: certificate generation failed (%s). TAK Server cannot serve any "
                      "client without these, so the deploy stops here rather than reporting "
