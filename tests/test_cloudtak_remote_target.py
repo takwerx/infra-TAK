@@ -324,5 +324,7 @@ def test_remote_deploy_stops_the_old_stack_before_deleting_its_tree():
     helper = re.sub(r'#.*', '', helper)
     tagged = helper[helper.index('if release_tag:'):]
     tagged = tagged[:tagged.index('\n    return (')]     # up to the untagged (pull) branch
-    assert tagged.index('docker compose down --remove-orphans') < tagged.index('rm -rf ~/CloudTAK')
+    # ops #348: `stop`, not `down` — down orphans postgis' anonymous data volume (users reset)
+    assert tagged.index('docker compose stop') < tagged.index('rm -rf ~/CloudTAK')
+    assert 'compose down' not in tagged
     assert 'down -v' not in tagged          # the postgis volume (and its password) survives a redeploy

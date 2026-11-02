@@ -26,8 +26,75 @@ if [ -n "$_tak_started" ]; then
   [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
 fi
 
+# Daily restart cap — shared across all Guard Dog TAK scripts to prevent infinite loops.
+# 0 = a restart may run (count in $_daily), 1 = cap reached.
+DAILY_COUNT_FILE="/var/lib/takguard/tak_restart_count_24h"
+DAILY_WINDOW_FILE="/var/lib/takguard/tak_restart_window"
+MAX_DAILY_RESTARTS=3
+_daily_restart_ok() {
+  local _now _window_start
+  _now=$(date +%s)
+  _window_start=$(cat "$DAILY_WINDOW_FILE" 2>/dev/null || echo 0)
+  if [ $((_now - _window_start)) -ge 86400 ]; then
+    echo "$_now" > "$DAILY_WINDOW_FILE"
+    echo 0 > "$DAILY_COUNT_FILE"
+  fi
+  _daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
+  [ "$_daily" -lt "$MAX_DAILY_RESTARTS" ]
+}
+
 if ! gd_tak_running; then
   rm -f "$FAIL_COUNT_FILE"
+  # ops #413 (GH #373): a FAILED unit is not an operator stop. Field (v10.3.3, Ubuntu
+  # 22.04): the box rebooted after an OS patch, the boot start ran under heavy disk wait,
+  # hit takserver.service's 300s TimeoutStartSec and was marked failed(timeout). Every
+  # Guard Dog TAK watcher skipped a TAK that isn't active, so nothing ever started it
+  # again and clients stayed off 8089 until someone noticed. `systemctl stop` leaves the
+  # unit inactive, never failed, so an operator's stop is still left alone. Container
+  # TAK runs with --restart=always and has no such state.
+  if gd_is_container || ! systemctl is-failed --quiet takserver 2>/dev/null; then
+    exit 0
+  fi
+  type gd_dbserver_standdown >/dev/null 2>&1 && gd_dbserver_standdown tak-process-watch && exit 0
+  [ -f "$RESTART_LOCK" ] && exit 0
+  if [ -f "$LAST_RESTART_FILE" ] && [ $(( $(date +%s) - $(cat "$LAST_RESTART_FILE") )) -lt 900 ]; then
+    exit 0
+  fi
+  mkdir -p /var/log/takguard
+  if ! _daily_restart_ok; then
+    echo "$(date): TAK Server service failed to start — daily restart cap ($MAX_DAILY_RESTARTS) reached, skipping" >> /var/log/takguard/restarts.log
+    exit 0
+  fi
+  TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  _why=$(systemctl show takserver -p Result --value 2>/dev/null)
+  echo "$TS | restart | TAK Server service failed to start (result=${_why:-unknown}) — starting it again" >> /var/log/takguard/restarts.log
+  logger -t takguard "takserver.service failed (result=${_why:-unknown}); starting it again" 2>/dev/null
+  SUBJ="TAK Server Start Failed on $SERVER_IDENTIFIER"
+  BODY="TAK Server's service failed to start and was not running.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS
+systemd result: ${_why:-unknown}
+
+Action taken: Guard Dog is starting TAK Server again (clean restart).
+This often follows a reboot on a busy box, when the first start runs out of time.
+
+Check: journalctl -b -u takserver --no-pager | tail -50
+"
+  echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+  if [ -f /opt/tak-guarddog/sms_send.sh ]; then
+    TMPF="/tmp/gd-sms-$$.txt"
+    printf '%s' "$BODY" > "$TMPF"
+    /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
+    rm -f "$TMPF"
+  fi
+  touch "$RESTART_LOCK"
+  date +%s > "$LAST_RESTART_FILE"
+  echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
+  # Clean restart: stop, kill any JVM the timed-out start left behind, clear Ignite, start.
+  gd_tak_restart
+  sleep 30
+  rm -f "$RESTART_LOCK"
   exit 0
 fi
 
@@ -115,18 +182,7 @@ Check logs after restart:
       fi
       mkdir -p /var/log/takguard
 
-      # Daily restart cap — shared across all Guard Dog TAK scripts
-      DAILY_COUNT_FILE="/var/lib/takguard/tak_restart_count_24h"
-      DAILY_WINDOW_FILE="/var/lib/takguard/tak_restart_window"
-      MAX_DAILY_RESTARTS=3
-      _now=$(date +%s)
-      _window_start=$(cat "$DAILY_WINDOW_FILE" 2>/dev/null || echo 0)
-      if [ $((_now - _window_start)) -ge 86400 ]; then
-        echo "$_now" > "$DAILY_WINDOW_FILE"
-        echo 0 > "$DAILY_COUNT_FILE"
-      fi
-      _daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
-      if [ "$_daily" -ge "$MAX_DAILY_RESTARTS" ]; then
+      if ! _daily_restart_ok; then
         echo "$(date): TAK Server missing processes: $MISSING_LIST — daily restart cap ($MAX_DAILY_RESTARTS) reached, skipping" >> /var/log/takguard/restarts.log
         exit 0
       fi

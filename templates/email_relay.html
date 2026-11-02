@@ -58,6 +58,7 @@ select.input-field{cursor:pointer}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
+{% from '_relay_health_banner.html' import relay_health_banner %}{{ relay_health_banner() }}
 
 <!-- Status Banner -->
 <div class="status-banner">

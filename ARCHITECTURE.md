@@ -5,6 +5,9 @@ A map for reading (and contributing to) this codebase. If your first reaction to
 historical in another. This page explains which is which, how the code is
 actually organized, and where it's headed.
 
+For what infra-TAK depends on but does not control (TAK Server, Authentik, Caddy, apt/PGDG, Rocky, cloud CLIs),
+see [PLATFORM_REFERENCE.md](PLATFORM_REFERENCE.md).
+
 ## The monolith is the product
 
 infra-TAK is a **single-service appliance**: one clone, one systemd unit

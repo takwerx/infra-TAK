@@ -100,7 +100,7 @@ def _override(**kw):
 def test_override_services_are_read_from_the_real_override(tmp_path, kw):
     (tmp_path / 'docker-compose.override.yml').write_text(_override(**kw))
     ns = _load(['_cloudtak_override_services'])
-    assert ns['_cloudtak_override_services'](str(tmp_path)) == {'api', 'events', 'media', 'postgis'}
+    assert ns['_cloudtak_override_services'](str(tmp_path)) == {'api', 'events', 'media', 'postgis', 'tiles'}
 
 
 def test_override_services_unreadable_is_empty(tmp_path):
@@ -218,7 +218,8 @@ def test_deploy_build_retry_does_not_remove_orphans():
     src = _fn('run_cloudtak_deploy')
     seg = src[src.find('Cleaning up from previous build attempt'):]
     seg = seg[:seg.find('Cleaned up containers')]
-    assert "_sudo_wrap(['docker', 'compose', 'down'])" in seg
+    # ops #348: `stop`, not `down` — down orphans postgis' anonymous data volume
+    assert "_sudo_wrap(['docker', 'compose', 'stop'])" in seg
     assert '--remove-orphans' not in seg
 
 

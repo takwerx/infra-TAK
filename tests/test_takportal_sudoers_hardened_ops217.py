@@ -203,6 +203,33 @@ def test_portal_2_0_23_helper_stays_unpinned_until_reviewed(b):
     assert 'e05feed906832e649b5257caf840c19044aeac45352952b268e547117dc4c7f2' not in b.TAKPORTAL_HELPER_SHA256
 
 
+def test_portal_2_0_29_helper_is_pinned(b):
+    # Helper v3 (TAK Portal 2.0.29): apply-caddyfile validates as the caddy user (ops #340).
+    assert '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559' in b.TAKPORTAL_HELPER_SHA256
+
+
+def test_older_pinned_helper_is_replaced_by_the_portals_newer_pinned_one(b, monkeypatch):
+    # With two pinned hashes, "some pinned helper is installed" must not stop an upgrade.
+    old, new = b'#!/bin/bash\necho old\n', b'#!/bin/bash\necho new\n'
+    on_disk = {'data': old}
+
+    def fake_root_file_ok(path, want_sha256=None, want_bytes=None):
+        if want_bytes is not None:
+            return on_disk['data'] == want_bytes
+        return hashlib.sha256(on_disk['data']).hexdigest() in (want_sha256 or ())
+
+    monkeypatch.setattr(b, '_root_file_ok', fake_root_file_ok)
+    monkeypatch.setattr(b, 'TAKPORTAL_HELPER_SHA256',
+                        frozenset({hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest()}))
+    assert b._takportal_helper_ok()                                    # old one is still a pinned helper
+    assert not b._takportal_helper_current({'helper_bytes': new})      # ...but not the portal's
+    assert b._takportal_helper_current({'helper_bytes': old})
+    on_disk['data'] = new
+    assert b._takportal_helper_current({'helper_bytes': new})
+    # no helper shipped by the portal: any pinned helper counts
+    assert b._takportal_helper_current({'helper_bytes': None})
+
+
 # ------------------------------------------------------------- ownership refusals
 def test_root_file_check_refuses_non_root_owned(b, tmp_path):
     if os.getuid() == 0:

@@ -6,7 +6,7 @@
     {"id": "box", "label": "Worker box test"}
   ],
   "default_boxes": ["any free dev box"],
-  "ignore_content_paths": ["tests/**", "docs/**", "**/*.md", "static/**", "templates/**", "tools/test-tiers.json", "tools/pick-tests.py"],
+  "ignore_content_paths": ["tests/**", "docs/**", "**/*.md", "static/**", "templates/**", "tools/test-tiers.json", "tools/pick-tests.py", "tools/os-upgrade-histories/**"],
   "rules": [
     {
       "id": "install",
@@ -67,6 +67,24 @@
       ],
       "context": [
         "\\bdef \\w*(two_server|remote_?db|pgbouncer|retention|vacuum)\\w*\\("
+      ]
+    },
+    {
+      "id": "osupgrade",
+      "label": "Tier 6 OS-upgrade box-history matrix (#285): every real box history, from snapshots",
+      "why": "one-way, in-place upgrade code changed",
+      "boxes": ["lane Azure snapshots (tools/os-upgrade-histories/README.md)"],
+      "paths": [],
+      "content": [
+        "_OS_UPGRADE|\\binfratak-os-upgrade\\b|\\b_?os_upgrade_",
+        "\\bdo-release-upgrade\\b|release-upgrades(\\.d)?\\b",
+        "\\bpg_upgradecluster\\b",
+        "_DBSERVER_OS_STEPS|\\b_dbserver_(os_upgrade|start)\\b|\\b_os_upgrade_(dbserver|remotehost)_script\\b"
+      ],
+      "context": [
+        "\\bdef _?(startup_)?os_upgrade\\w*\\(",
+        "\\bdef \\w*(dbserver|remotehost)\\w*os_upgrade\\w*\\(",
+        "\\bdef (run_)?takserver_58\\w*\\(|\\bdef run_takserver_58_migration\\("
       ]
     },
     {

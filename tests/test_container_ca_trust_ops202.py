@@ -258,6 +258,7 @@ def test_compose_merges_cloudtak_media(tmp_path):
     (tmp_path / 'docker-compose.yml').write_text(
         'services:\n'
         '    api:\n        image: cloudtak-api\n'
+        '    tiles:\n        image: cloudtak-tiles\n'
         '    events:\n        image: cloudtak-events\n'
         '    media:\n        image: ghcr.io/dfpc-coe/media-infra:v9.10.0\n'
         '        environment:\n            - API_URL=${API_URL}\n            - SigningSecret=x\n'

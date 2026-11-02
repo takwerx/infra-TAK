@@ -110,7 +110,8 @@ def test_tak_jail_is_written_with_the_tak_only_action_on_both_families():
                  _distro_family=lambda f=family: f,
                  _makedirs_priv=lambda *a, **k: None,
                  _write_priv=lambda p, c, **k: written.__setitem__(p, c),
-                 _f2b_trusted_ignoreip=lambda extra='': '127.0.0.1/8 ::1 ' + extra)
+                 _f2b_trusted_ignoreip=lambda extra='': '127.0.0.1/8 ::1 ' + extra,
+                 _f2b_write_tak_badcert_jail_config=lambda ignoreip='': None)   # v10.3.4, own test
         ns['_f2b_write_tak_jail_config'](20, 300, 3600, '')
         conf = written['/etc/fail2ban/jail.d/infratak-takserver.conf']
         action = re.search(r'^action\s*=\s*(.*)$', conf, re.M).group(1)
@@ -235,7 +236,7 @@ def test_recidive_converge_adds_the_takserver_exemption_on_v10_1_30_boxes():
              _f2b_read_text=box.read,
              _f2b_read_recidive_config=lambda: {'maxretry': 4, 'findtime': 43200},
              _f2b_write_recidive_config=lambda m, f: (rewrites.append((m, f)),
-                                                      box.write(RECIDIVE, 'takserver')),
+                                                      box.write(RECIDIVE, 'takserver-badcert')),
              _sudo_wrap=lambda c: c,
              subprocess=types.SimpleNamespace(run=box.run))
     ns['_startup_converge_recidive_tak_exempt']()
@@ -289,7 +290,7 @@ def test_ban_details_cover_every_banned_ip_even_without_log_lines():
 
 def test_takserver_status_api_returns_the_explanations():
     src = _func('fail2ban_tak_status_api')
-    assert "status['ban_details'] = _f2b_tak_ban_details(" in src
+    assert "_f2b_tak_ban_details(tak_ips[:50]" in src and "status['ban_details'] = det" in src
 
 
 def test_ban_email_uses_the_same_words_as_the_console():

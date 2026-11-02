@@ -562,6 +562,31 @@ def test_same_pending_security_does_not_mail_again():
     assert len(sent) == 1
 
 
+def test_a_later_update_does_not_repeat_the_os_patches_already_mailed():
+    # ops #345: NUC, Tue Oct 27: every console update re-listed the same 8 OS patches and
+    # carried the "Security update pending" subject, so one set of patches arrived 4 times.
+    plain = dict(CONSOLE_SEC, identity='v10.2.28-alpha', security=[])
+    state = {'console': 'v10.2.27-alpha+security', 'os-security': 'abc123'}
+    r, sent, saved = _sweep([plain, OS_SEC], state)
+    assert r['emailed'] is True and len(sent) == 1
+    subj, body = sent[0]
+    assert subj == '⬆ Update pending on tak-prod-1'
+    assert 'infra-TAK console' in body
+    assert 'Operating system' not in body and 'SECURITY' not in body
+    assert saved[-1]['os-security'] == 'abc123'
+    # and a sweep after that mails nothing at all
+    r, sent, _ = _sweep([plain, OS_SEC], saved[-1])
+    assert sent == [] and r['emailed'] is False
+
+
+def test_new_os_patches_mail_alone_when_the_console_was_already_mailed():
+    state = {'console': 'v10.2.27-alpha+security', 'os-security': 'old000'}
+    _, sent, _ = _sweep([CONSOLE_SEC, OS_SEC], state)
+    assert len(sent) == 1
+    assert 'Operating system: 2 security patches pending' in sent[0][1]
+    assert 'v10.2.27-alpha' not in sent[0][1]
+
+
 def test_release_turning_out_security_mails_once_more():
     r, sent, _ = _sweep([CONSOLE_SEC], {'console': 'v10.2.27-alpha'})
     assert len(sent) == 1 and sent[0][0].startswith('🔒')

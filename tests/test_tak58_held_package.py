@@ -69,6 +69,7 @@ def _run(versions, install_rc, held=True):
         '_cotdb_fmt_bytes': str,
         '_tak_58_backup': lambda plog=None: {'ok': True, 'snapshot_path': '/opt/tak/snapshots/x'},
         '_tak_upgrade_apt_install_streamed': fake_install,
+        '_pgdg_gis_pin_ensure': lambda log_fn=None: True,
         '_get_tak_deployment_config': lambda s: {},
         'load_settings': dict,
         'TAK_PG_MAJOR': 18,

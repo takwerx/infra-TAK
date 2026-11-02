@@ -1,0 +1,46 @@
+{# ops #345 — red banner when this box's Email Relay cannot deliver (login rejected, mail piling
+   up, Postfix stopped), so nobody goes without Guard Dog's update and security emails without
+   knowing. Data: /api/system/email-relay-health (postqueue -p). Hidden when mail is flowing or
+   no relay is configured; clears by itself once the fix is in. #}
+{% macro relay_health_banner() %}
+<div id="relay-health-banner" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.45);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px">
+<div style="font-size:13px;font-weight:600;color:var(--red)">&#9888; <span id="relay-health-headline"></span></div>
+<div id="relay-health-detail" style="font-size:11px;color:var(--text-secondary);margin-top:5px;line-height:1.6;word-break:break-word"></div>
+<div id="relay-health-fix" style="font-size:11px;color:var(--text-primary);margin-top:5px;line-height:1.6"></div>
+<div id="relay-health-msg" style="font-size:11px;margin-top:5px"></div>
+</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<a href="/emailrelay" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border-radius:6px;font-size:11px;font-weight:600;text-decoration:none">Open Email Relay</a>
+<button type="button" id="relay-health-retry" onclick="relayHealthRetry()" style="padding:5px 12px;background:none;border:1px solid rgba(239,68,68,0.4);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Retry stuck mail</button>
+</div></div></div>
+<script>
+(function(){
+  var box=document.getElementById('relay-health-banner'); if(!box) return;
+  function set(id,t){document.getElementById(id).textContent=t||'';}
+  window.relayHealthCheck=async function(){
+    try{
+      var r=await fetch('/api/system/email-relay-health',{credentials:'same-origin',cache:'no-store'});
+      if(!r.ok) return;
+      var d=await r.json();
+      if(d.ok){box.style.display='none';return;}
+      set('relay-health-headline',d.headline); set('relay-health-detail',d.detail); set('relay-health-fix',d.fix);
+      document.getElementById('relay-health-retry').style.display=d.kind==='login'||d.kind==='stopped'?'none':'';
+      box.style.display='block';
+    }catch(e){}
+  };
+  window.relayHealthRetry=async function(){
+    var m=document.getElementById('relay-health-msg'); m.style.color='var(--text-dim)'; m.textContent='Retrying...';
+    try{
+      var r=await fetch('/api/emailrelay/retry-queue',{method:'POST',credentials:'same-origin'});
+      var d=await r.json();
+      m.style.color=d.success?'var(--green)':'var(--red)';
+      m.textContent=d.success?'Asked the mail service to retry. This clears in a minute if it worked.':(d.error||'Could not retry');
+      if(d.success) setTimeout(window.relayHealthCheck,20000);
+    }catch(e){m.style.color='var(--red)';m.textContent='Could not retry';}
+  };
+  window.relayHealthCheck(); setInterval(window.relayHealthCheck,120000);
+})();
+</script>
+{% endmacro %}
