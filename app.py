@@ -1417,8 +1417,14 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # starts clean on a 0.81-migrated store.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.81.4"  # UNDER TRIAL (ops #208)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.95.0"
+# ops #427: 0.82.0 / v2.96.0 UNDER TRIAL on dev (T&E only, not promoted; 0.81.4 passed its 24 h
+# soak, ops #208, but stays unpromoted until the lead moves the vetted pin). 0.82.0: relay
+# negotiates the protocol version, new DB indexes, reverse-proxy access logs move to their own
+# access_logs.db next to store.db (SQLite), MySQL store removed (we never configure an engine, so
+# the default sqlite store is used), SSH-server hardening we don't expose. Dashboard on Next.js 16.
+# Rollback: re-pin the dev pair to 0.81.4 / v2.95.0; the pin-restore heal converges boxes back.
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.0"  # UNDER TRIAL (ops #427)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
 
 
 def _get_netbird_target_images(settings=None):
