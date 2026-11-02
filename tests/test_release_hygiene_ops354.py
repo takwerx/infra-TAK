@@ -30,8 +30,13 @@ tag v10.3.3-alpha), so the rule is not "VERSION equals the newest tag". It is:
   * The newest section is written for users: it opens with a Headline and carries no commit hashes
     or branch names.
 
-CI checks out without tags, so its pytest job fetches them; with `CI` set and no tags the test fails
-instead of skipping, so a broken checkout cannot turn the check off.
+A PR into `dev` is only held to the newest release that `dev` itself already acknowledges (ops #435).
+Release tags land on `main`, so for a while after a release the tag is newer than anything `dev` knows
+about; a good PR must not turn red in that window. A PR into `main`, or a run with no base branch
+(a local run, a release branch), is held to the newest tag, so a release whose notes lag still fails.
+
+CI checks out without tags, so its pytest job fetches them (and the PR's base branch); with `CI` set
+and no tags the test fails instead of skipping, so a broken checkout cannot turn the check off.
 """
 
 import os
@@ -77,8 +82,8 @@ def _newest_section(readme):
     return first.group(1), first.group(2), first.group(3), readme[first.end():end]
 
 
-def _newest_tag():
-    """Newest `v*` tag by version number (not by date), or None when the checkout has no tags."""
+def _tags():
+    """Every `v*` tag as a version string (no leading v); empty when the checkout has no tags."""
     out = subprocess.run(
         ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/tags/v*'],
         cwd=REPO, capture_output=True, text=True, check=False,
@@ -90,7 +95,39 @@ def _newest_tag():
         except ValueError:
             continue
         versions.append(tag[1:])
+    return versions
+
+
+def _newest_tag():
+    """Newest `v*` tag by version number (not by date), or None when the checkout has no tags."""
+    versions = _tags()
     return max(versions, key=_key) if versions else None
+
+
+def _base_current_release(base_ref, repo=REPO):
+    """The "Current release" version in README.md on origin/<base_ref>, or None if it can't be read."""
+    out = subprocess.run(
+        ['git', 'show', f'origin/{base_ref}:README.md'],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        return None
+    m = _CURRENT_RE.search(out.stdout)
+    return m.group(1) if m else None
+
+
+def baseline_tag(newest, tags, base_ref, base_current):
+    """The tag a tree is held to. Strict (the newest tag) unless this is a PR into dev whose base README
+    names a release: then the newest tag that is not newer than that release, so a release tagged on
+    main after the PR's base was cut can't fail a good PR."""
+    if base_ref in (None, '', 'main') or base_current is None:
+        return newest
+    try:
+        limit = _key(base_current)
+    except ValueError:
+        return newest
+    older = [t for t in tags if _key(t) <= limit]
+    return max(older, key=_key) if older else newest
 
 
 def release_problems(version, tag, notes_version, current_release):
@@ -152,6 +189,62 @@ def test_malformed_version_is_reported():
     assert release_problems('ten', '10.3.3-alpha', '10.3.3-alpha', '10.3.3-alpha')
 
 
+# ---- a release tagged on main must not turn good PRs into dev red (ops #435) --------------------
+
+TAGS = ['10.3.2-alpha', '10.3.3-alpha', '10.3.4-alpha']
+
+
+def test_pr_into_dev_is_held_to_the_release_dev_already_has():
+    # 10.3.4-alpha was just tagged on main; dev's README still says 10.3.3-alpha. A PR branched from
+    # that dev (VERSION 10.3.4-alpha, notes not yet bumped) is fine.
+    tag = baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.3-alpha')
+    assert tag == '10.3.3-alpha'
+    assert release_problems('10.3.4-alpha', tag, '10.3.3-alpha', '10.3.3-alpha') == []
+    # Without the base rule, the same tree is red: this is the bug.
+    assert release_problems('10.3.4-alpha', '10.3.4-alpha', '10.3.3-alpha', '10.3.3-alpha')
+
+
+def test_release_branch_into_main_must_still_match_the_new_tag():
+    tag = baseline_tag('10.3.4-alpha', TAGS, 'main', '10.3.3-alpha')
+    assert tag == '10.3.4-alpha'
+    assert release_problems('10.3.4-alpha', tag, '10.3.3-alpha', '10.3.3-alpha')
+    assert release_problems('10.3.4-alpha', tag, '10.3.4-alpha', '10.3.4-alpha') == []
+
+
+def test_no_base_branch_means_strict():
+    assert baseline_tag('10.3.4-alpha', TAGS, None, None) == '10.3.4-alpha'
+    assert baseline_tag('10.3.4-alpha', TAGS, '', '10.3.3-alpha') == '10.3.4-alpha'
+
+
+def test_unreadable_base_falls_back_to_strict():
+    assert baseline_tag('10.3.4-alpha', TAGS, 'dev', None) == '10.3.4-alpha'
+    assert baseline_tag('10.3.4-alpha', TAGS, 'dev', 'garbage') == '10.3.4-alpha'
+
+
+def test_dev_ahead_of_every_tag_uses_the_newest_tag():
+    # dev already announced 10.3.5-alpha as current (tag not cut yet): newest tag it has is 10.3.4-alpha
+    assert baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.5-alpha') == '10.3.4-alpha'
+
+
+def test_a_pr_still_fails_when_it_is_behind_what_dev_has():
+    tag = baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.4-alpha')
+    assert tag == '10.3.4-alpha'
+    assert release_problems('10.3.3-alpha', tag, '10.3.3-alpha', '10.3.3-alpha')
+
+
+def test_base_current_release_is_read_from_origin_branch(tmp_path):
+    def git(*a):
+        subprocess.run(['git', *a], cwd=tmp_path, check=True, capture_output=True)
+    git('init', '-q')
+    (tmp_path / 'README.md').write_text(
+        '**Current release: [v10.3.3-alpha](https://github.com/x/y/releases/tag/v10.3.3-alpha)**\n')
+    git('add', 'README.md')
+    git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x')
+    git('update-ref', 'refs/remotes/origin/dev', 'HEAD')
+    assert _base_current_release('dev', tmp_path) == '10.3.3-alpha'
+    assert _base_current_release('nope', tmp_path) is None
+
+
 # ---- this tree -------------------------------------------------------------------------------
 
 def test_this_tree_is_consistent_with_the_newest_tag():
@@ -160,6 +253,8 @@ def test_this_tree_is_consistent_with_the_newest_tag():
         if os.environ.get('CI'):
             pytest.fail('CI checkout has no v* tags; the pytest job must fetch them (see pr-checks.yml)')
         pytest.skip('no v* tags in this checkout')
+    base_ref = os.environ.get('GITHUB_BASE_REF')
+    tag = baseline_tag(tag, _tags(), base_ref, _base_current_release(base_ref) if base_ref else None)
     readme = _readme()
     notes_version = _newest_section(readme)[0]
     current = _CURRENT_RE.search(readme)

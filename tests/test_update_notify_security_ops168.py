@@ -371,7 +371,7 @@ CT_ADVISORIES = [
 def _adv_ns(advs):
     import urllib as _u
     n = {'json': json, 're': re}
-    _exec(n, '_semver_tuple', '_version_in_range', '_gh_advisories_fixed_by')
+    _exec(n, '_semver_tuple', '_version_in_range', '_gh_advisories_fixed_by', '_gh_advisories')
     fake = _fake_urllib({'security-advisories': advs})
 
     def run(*a):
@@ -506,6 +506,9 @@ def _sweep(pending, state, unknown_keys=()):
         '_update_notify_state_save': lambda s: saved.append(s),
         '_guarddog_send_alert_email_via_relay': lambda to, subj, body: sent.append((subj, body)),
         'print': lambda *a, **k: None,
+        'time': time,
+        'PATCH_NOW_REPEAT_S': 24 * 3600,
+        '_collect_patch_now_items': lambda feed, unknown, now=None: ([], feed),   # ops #377
     }
 
     def collect(settings, seen=None, unknown=None):
@@ -513,7 +516,7 @@ def _sweep(pending, state, unknown_keys=()):
         seen['openssl=2'] = 1.0
         return json.loads(json.dumps(pending))
     n['_collect_pending_updates'] = collect
-    _exec(n, '_update_notify_check_once')
+    _exec(n, '_carried_by_unknown', '_update_notify_check_once')
     return n['_update_notify_check_once'](), sent, saved
 
 

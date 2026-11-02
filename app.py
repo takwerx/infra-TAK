@@ -2651,6 +2651,59 @@ def _host_arch():
         pass
     return a
 
+# ops #360: TAK Portal and CloudTAK ship the sharp image library, whose prebuilt Linux x64
+# binaries need an x86-64-v2 CPU. A VM whose hypervisor presents a basic CPU model (TrueNAS /
+# KVM / Proxmox defaults, VirtualBox with some settings) lacks these flags: TAK Portal then
+# restart-loops and the CloudTAK build dies with "Could not load the sharp module".
+# x86-64-v2 = cx16, lahf_lm, popcnt, sse4_1, sse4_2, ssse3 (the names /proc/cpuinfo uses).
+_CPU_V2_FLAGS = ('cx16', 'lahf_lm', 'popcnt', 'sse4_1', 'sse4_2', 'ssse3')
+_CPU_TOO_BASIC_FIX = ("In your hypervisor (TrueNAS, KVM, Proxmox, VirtualBox) set this VM's CPU type "
+                      "to host passthrough, restart the VM, then try again.")
+
+def _cpu_v2_missing(cpuinfo_text, machine=''):
+    """Flags from x86-64-v2 that this CPU lacks, from /proc/cpuinfo text.
+    Returns [] when nothing is missing OR when it can't be judged: an ARM machine, no 'flags'
+    line (non-x86), or empty text. Never blocks a deploy on a guess."""
+    if _arch_normalize(machine) == 'arm64':
+        return []
+    for line in (cpuinfo_text or '').splitlines():
+        if line.lower().startswith('flags') and ':' in line:
+            have = set(line.split(':', 1)[1].split())
+            return [f for f in _CPU_V2_FLAGS if f not in have]
+    return []
+
+def _cpu_too_basic_message(what):
+    return (f"This server's virtual CPU is too basic for {what}. {_CPU_TOO_BASIC_FIX}")
+
+def _cpu_preflight_local(what, plog):
+    """True to go on with the deploy; False (after telling the user why) to stop."""
+    try:
+        if _host_arch() == 'arm64':
+            return True
+        with open('/proc/cpuinfo') as f:
+            missing = _cpu_v2_missing(f.read(), os.uname().machine)
+    except Exception:
+        return True
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what)}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
+
+def _cpu_preflight_remote(remote_cfg, what, plog):
+    """Same check on the remote CloudTAK host over SSH. An unreadable answer goes on."""
+    ok, out = _ssh_probe(remote_cfg, "echo ARCH=$(uname -m); grep -m1 '^flags' /proc/cpuinfo 2>/dev/null; true",
+                         timeout=20)
+    if not ok:
+        return True
+    m = re.search(r'^ARCH=(\S+)', out or '', re.M)
+    missing = _cpu_v2_missing(out or '', m.group(1) if m else '')
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what + ' on the remote host')}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
+
 def _distro_family():
     """'debian' | 'rhel' — package-manager family, derived from settings.
 
@@ -8915,6 +8968,28 @@ def _diag_redact(text, settings):
     return text
 
 
+def _diag_cpu_line():
+    """ops #360: does this CPU have what TAK Portal and CloudTAK's image library needs (x86-64-v2)?"""
+    machine = os.uname().machine
+    try:
+        with open('/proc/cpuinfo') as f:
+            txt = f.read()
+    except Exception as e:
+        return f"cpu check: could not read /proc/cpuinfo ({type(e).__name__})"
+    model = next((l.split(':', 1)[1].strip() for l in txt.splitlines()
+                  if l.lower().startswith('model name') and ':' in l), '')
+    model = f"  model: {model[:80]}" if model else ''
+    if _arch_normalize(machine) == 'arm64':
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): not needed on ARM{model}"
+    if not any(l.lower().startswith('flags') for l in txt.splitlines()):
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): could not tell, no CPU flags listed{model}"
+    missing = _cpu_v2_missing(txt, machine)
+    if not missing:
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): OK{model}"
+    return (f"cpu check (TAK Portal / CloudTAK need x86-64-v2): TOO BASIC, missing {', '.join(missing)}{model}  "
+            f"-> set the VM's CPU type to host passthrough in the hypervisor")
+
+
 def _diag_section_box(settings):
     out = []
     git = lambda *a: _diag_cmd(['git', '-C', BASE_DIR] + list(a), priv=False)
@@ -8931,6 +9006,7 @@ def _diag_section_box(settings):
     except Exception:
         osname = '?'
     out.append(f"os: {osname}  kernel: {os.uname().release}  arch: {os.uname().machine}  cpus: {os.cpu_count()}")
+    out.append(_diag_cpu_line())
     vm, sw = psutil.virtual_memory(), psutil.swap_memory()
     out.append(f"ram: {vm.total // 2**30} GiB total, {vm.available // 2**30} GiB available ({vm.percent}% used)  "
                f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
@@ -27418,6 +27494,14 @@ def _gh_advisories_fixed_by(repo, installed, target):
     """Published GitHub security advisories of `repo` that `installed` is exposed to and
     `target` is not: ['GHSA-… (high): summary', …]. Raises when GitHub cannot be read.
     An advisory whose ranges do not parse is skipped — never claimed."""
+    return [f"{a['id']}{' (' + a['severity'] + ')' if a['severity'] else ''}: {a['summary']}"
+            for a in _gh_advisories(repo, installed, target)]
+
+
+def _gh_advisories(repo, installed, target, packages=None):
+    """_gh_advisories_fixed_by as [{id, severity, summary}]. `packages` (ops #377), when
+    given, limits the match to advisory rows for those package names — moby/moby also lists
+    Go-module rows whose versions do not follow Docker Engine releases."""
     import urllib.request
     req = urllib.request.Request(
         f'https://api.github.com/repos/{repo}/security-advisories?per_page=100',
@@ -27429,17 +27513,23 @@ def _gh_advisories_fixed_by(repo, installed, target):
         if a.get('state') not in (None, 'published') or a.get('withdrawn_at'):
             continue
         for v in a.get('vulnerabilities') or []:
+            if packages is not None and ((v.get('package') or {}).get('name') or '') not in packages:
+                continue
             rng = v.get('vulnerable_version_range') or ''
             if _version_in_range(installed, rng) is not True:
                 continue
             if _version_in_range(target, rng) is not False:
                 continue
             patched = (v.get('patched_versions') or '').strip()
+            # ops #377: GitHub writes the FIRST fixed version bare ("29.8.2", "v2.11.4"); read
+            # as an exact match it hid every advisory whose target was any later version.
+            if patched and ',' not in patched and not re.match(r'^[<>=]', patched):
+                patched = '>= ' + patched
             if patched and _version_in_range(target, patched) is not True:
                 continue
-            ident = a.get('cve_id') or a.get('ghsa_id') or 'advisory'
-            sev = (a.get('severity') or '').lower()
-            out.append(f"{ident}{' (' + sev + ')' if sev else ''}: {(a.get('summary') or '').strip()[:160]}")
+            out.append({'id': a.get('cve_id') or a.get('ghsa_id') or 'advisory',
+                        'severity': (a.get('severity') or '').lower(),
+                        'summary': (a.get('summary') or '').strip()[:160]})
             break
     return out
 
@@ -27713,6 +27803,412 @@ def _os_security_items(seen, unknown, now=None):
     return items
 
 
+# ── ops #377: patch-now security fixes ─────────────────────────────────────────
+# Some fixes cannot wait for the 36 h grace or the 6 h sweep (actively exploited, critical,
+# "patch now"). Three signals mark a fix patch-now, each from evidence, never a guess:
+#   1. PATCH_NOW_FEED_URL: a takwerx list every box reads hourly (package, fixed version per
+#      OS, what it fixes in plain words). Editing it on GitHub flags a CVE fleet-wide within
+#      the hour, without a release. Each box compares its OWN installed version (dpkg/rpm)
+#      with the fixed one, so "still exposed" and "fixed" come from the package manager.
+#      apt has no offline severity, so on Ubuntu this list is the only patch-now signal.
+#   2. A Rocky/RHEL security advisory that dnf rates Critical, for an available update.
+#   3. A critical GitHub advisory that a pending Docker / containerd / Caddy / NetBird update
+#      fixes. Those come from their own repos, which unattended-upgrades skips by design and
+#      neither the -security pocket nor dnf --security covers. A high/medium one still gets
+#      the ordinary security email (once per version), just not the urgent repeat.
+# A patch-now item mails on the next hourly check, skips the grace, and mails again every
+# 24 h until fixed. Ordinary security patches keep the grace and the one-email rule.
+PATCH_NOW_FEED_URL = 'https://raw.githubusercontent.com/takwerx/infra-TAK/main/security/patch-now.json'
+PATCH_NOW_CHECK_INTERVAL_S = 3600
+PATCH_NOW_REPEAT_S = 24 * 3600
+PATCH_NOW_FEED_MAX_AGE_S = 7 * 24 * 3600   # last good copy carries a GitHub outage this long
+# Same shape as a feed advisory, for a fix that must ride the code itself.
+PATCH_NOW_BUILTIN = ()
+
+_PN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$')
+_PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
+_PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
+# os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
+# flavour> (ubuntu-22.04/aws) for kernel rows, or '*' for every OS.
+_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?)$')
+
+# Third-party packages whose upstream publishes GitHub advisories: package (same name on
+# apt and dnf) -> (repo, advisory package names that follow its releases or None for all,
+# label). PostgreSQL (PGDG) publishes none, so it is patch-now only through the list.
+THIRD_PARTY_ADVISORY_REPOS = {
+    'docker-ce': ('moby/moby', ('Docker Engine',), 'Docker'),
+    'containerd.io': ('containerd/containerd',
+                      ('github.com/containerd/containerd', 'github.com/containerd/containerd/v2'),
+                      'containerd (Docker)'),
+    'caddy': ('caddyserver/caddy', None, 'Caddy (HTTPS)'),
+    'netbird': ('netbirdio/netbird', None, 'NetBird VPN'),
+}
+THIRD_PARTY_ADVISORY_CACHE_S = 6 * 3600   # the hourly check stays inside GitHub's 60/h
+_third_party_adv_cache = {}
+
+_OS_INSTALL_HOW = 'Console page → "Operating system updates available" → Install updates.'
+_OS_REBOOT_HOW = 'Console page → Reboot now (the box is back in 1-3 minutes).'
+
+
+def _vercmp_segment_deb(a, b):
+    """dpkg's verrevcmp for one part (upstream or revision): -1 / 0 / 1."""
+    def order(c):
+        if not c or c.isdigit():
+            return 0
+        if c.isalpha():
+            return ord(c)
+        return -1 if c == '~' else ord(c) + 256
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while (i < len(a) and not a[i].isdigit()) or (j < len(b) and not b[j].isdigit()):
+            ac, bc = order(a[i] if i < len(a) else ''), order(b[j] if j < len(b) else '')
+            if ac != bc:
+                return -1 if ac < bc else 1
+            i, j = i + 1, j + 1
+        da, db = re.match(r'\d*', a[i:]).group(0), re.match(r'\d*', b[j:]).group(0)
+        i, j = i + len(da), j + len(db)
+        if int(da or 0) != int(db or 0):
+            return -1 if int(da or 0) < int(db or 0) else 1
+    return 0
+
+
+def _vercmp_segment_rpm(a, b):
+    """rpm's rpmvercmp for one part (version or release): -1 / 0 / 1."""
+    if a == b:
+        return 0
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while i < len(a) and not a[i].isalnum() and a[i] not in '~^':
+            i += 1
+        while j < len(b) and not b[j].isalnum() and b[j] not in '~^':
+            j += 1
+        ta, tb = a[i:i + 1] == '~', b[j:j + 1] == '~'
+        if ta or tb:
+            if not ta:
+                return 1
+            if not tb:
+                return -1
+            i, j = i + 1, j + 1
+            continue
+        ca, cb = a[i:i + 1] == '^', b[j:j + 1] == '^'
+        if ca or cb:
+            if i >= len(a):
+                return -1
+            if j >= len(b):
+                return 1
+            if not ca:
+                return 1
+            if not cb:
+                return -1
+            i, j = i + 1, j + 1
+            continue
+        if i >= len(a) or j >= len(b):
+            break
+        rx = r'\d+' if a[i].isdigit() else r'[A-Za-z]+'
+        sa, sb = re.match(rx, a[i:]).group(0), re.match(rx, b[j:])
+        if not sb:
+            return 1 if a[i].isdigit() else -1   # a number is newer than letters
+        sb = sb.group(0)
+        i, j = i + len(sa), j + len(sb)
+        if a[i - 1].isdigit():
+            sa, sb = int(sa), int(sb)
+        if sa != sb:
+            return -1 if sa < sb else 1
+    if i >= len(a) and j >= len(b):
+        return 0
+    return -1 if i >= len(a) else 1
+
+
+def _pkg_vercmp(installed, fixed, pkg_mgr):
+    """Compare an installed package version with a patch-now `fixed` one: -1 / 0 / 1, by
+    dpkg rules on apt and rpm rules on dnf. A `fixed` without an epoch ignores the
+    installed epoch (docker-ce 5:28.5.2-1~ubuntu… vs "28.5.2"), and one without a
+    -revision/-release compares the upstream version only (any build of it counts)."""
+    seg = _vercmp_segment_rpm if pkg_mgr == 'dnf' else _vercmp_segment_deb
+
+    def split(v):
+        e, _, rest = v.partition(':')
+        if not rest or not e.isdigit():
+            e, rest = '', v
+        up, dash, rev = rest.rpartition('-')
+        return (e, up, rev) if dash else (e, rest, None)
+    ie, iu, ir = split(installed.strip())
+    fe, fu, fr = split(fixed.strip())
+    if fe:
+        e1, e2 = int(ie or 0), int(fe)
+        if e1 != e2:
+            return -1 if e1 < e2 else 1
+    c = seg(iu, fu)
+    if c or fr is None:
+        return c
+    return seg(ir or '', fr)
+
+
+def _upstream_version(v):
+    """'5:28.5.1-1~ubuntu.22.04~jammy' / '3:28.5.1-1.el9' / '2.10.2' -> '28.5.1' / '2.10.2';
+    None when it has no leading dotted number."""
+    m = re.match(r'^(?:\d+:)?(\d+(?:\.\d+)*)', (v or '').strip())
+    return m.group(1) if m else None
+
+
+def _pkg_restart_impact(name):
+    """What installing `name` restarts, from _MANAGED_PKG_IMPACT, or ''."""
+    for rx, service, impact, cls in _MANAGED_PKG_IMPACT:
+        if rx.match(name) and cls in ('restart', 'reboot'):
+            return f'Installing it {impact}.' if cls == 'restart' else f'{service}: {impact}.'
+    return ''
+
+
+def _patch_now_parse(doc):
+    """Validated advisories of a patch-now document. A malformed entry is dropped whole,
+    never half-used. Shape (security/patch-now.json):
+      {"advisories": [{"id": "CVE-2026-12345",
+                       "what": "plain words: what the flaw lets an attacker do",
+                       "why": "plain words: why it is urgent (optional)",
+                       "packages": {"docker-ce": "28.5.2",
+                                    "openssl": {"ubuntu-22.04": "3.0.2-0ubuntu1.20",
+                                                "rocky-9": "3.2.2-6.el9_5.1"},
+                                    "kernel": {"ubuntu-22.04": "5.15.0-198",
+                                               "ubuntu-22.04/aws": "6.8.0-1030"}}}]}
+    A version is the first one with the fix; "kernel" is compared with the RUNNING kernel."""
+    out = []
+    advs = doc.get('advisories') if isinstance(doc, dict) else None
+    for a in advs if isinstance(advs, list) else []:
+        if not isinstance(a, dict):
+            continue
+        aid, what, why, pk = a.get('id'), a.get('what'), a.get('why') or '', a.get('packages')
+        if not (isinstance(aid, str) and _PN_ID_RE.match(aid) and isinstance(what, str)
+                and what.strip() and isinstance(why, str) and isinstance(pk, dict) and pk):
+            continue
+        pkgs = {}
+        for name, fixed in pk.items():
+            per = fixed if isinstance(fixed, dict) else {'*': fixed}
+            if not (isinstance(name, str) and _PN_PKG_RE.match(name) and per and all(
+                    isinstance(k, str) and _PN_OS_RE.match(k) and isinstance(v, str)
+                    and _PN_VER_RE.match(v) for k, v in per.items())):
+                pkgs = None
+                break
+            pkgs[name] = dict(per)
+        if pkgs:
+            out.append({'id': aid, 'what': ' '.join(what.split())[:240],
+                        'why': ' '.join(why.split())[:160], 'packages': pkgs})
+    return out
+
+
+def _patch_now_advisories(feed, now):
+    """(advisories, feed, ok): PATCH_NOW_BUILTIN plus the fetched list. `feed` is the last
+    good copy ({'at', 'advisories'}, persisted by the caller): a GitHub blip falls back to it
+    for PATCH_NOW_FEED_MAX_AGE_S so reminders do not stop because GitHub did. A 404 is a
+    real "nothing listed". ok=False: no usable list, the caller must treat it as unknown."""
+    import urllib.request
+    import urllib.error
+    feed = feed if isinstance(feed, dict) else {}
+    try:
+        req = urllib.request.Request(PATCH_NOW_FEED_URL, headers={'User-Agent': 'infra-TAK'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            doc = json.loads(resp.read(256 * 1024).decode())
+        feed = {'at': now, 'advisories': _patch_now_parse(doc)}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            feed = {'at': now, 'advisories': []}
+        else:
+            print(f"[update-notify] patch-now list unreadable: HTTP {e.code}", flush=True)
+    except Exception as e:
+        print(f"[update-notify] patch-now list unreadable: {e}", flush=True)
+    try:
+        ok = now - float(feed.get('at') or 0) <= PATCH_NOW_FEED_MAX_AGE_S
+    except (TypeError, ValueError):
+        ok = False
+    listed = _patch_now_parse({'advisories': feed.get('advisories')}) if ok else []
+    return _patch_now_parse({'advisories': list(PATCH_NOW_BUILTIN)}) + listed, feed, ok
+
+
+def _installed_pkg_versions(names):
+    """{name: installed version} for the installed ones among `names`, read from the
+    package database (dpkg-query / rpm), highest when several are installed. Not installed
+    = absent. Raises when the database could not be read."""
+    names = sorted({n for n in names if _PN_PKG_RE.match(n)})
+    if not names:
+        return {}
+    dnf = _pkg_mgr() == 'dnf'
+    if dnf:
+        r = subprocess.run([_real_bin('rpm'), '-q', '--qf',
+                            '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\tinstalled\n'] + names,
+                           capture_output=True, text=True, timeout=30)
+        # rc = how many names are not installed; a database failure says `error:`
+        if r.returncode != 0 and 'error:' in (r.stderr or '').lower():
+            raise RuntimeError('rpm -q failed: ' + _dnf_error_tail(r.stderr))
+    else:
+        r = subprocess.run([_real_bin('dpkg-query'), '-W', '-f',
+                            '${Package}\t${Version}\t${db:Status-Status}\n'] + names,
+                           capture_output=True, text=True, timeout=30)
+        # rc 1 = some name is not known to dpkg; anything else is a failure
+        if r.returncode not in (0, 1):
+            raise RuntimeError('dpkg-query failed (rc=%s)' % r.returncode)
+    out = {}
+    for ln in (r.stdout or '').splitlines():
+        bits = ln.split('\t')
+        if len(bits) != 3 or bits[2].strip() != 'installed' or not bits[1].strip():
+            continue
+        name, ver = bits[0].split(':')[0], bits[1].strip()
+        if name not in out or _pkg_vercmp(ver, out[name], 'dnf' if dnf else 'apt') > 0:
+            out[name] = ver
+    return out
+
+
+def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
+    """Update-email items for the listed advisories this box is still exposed to: an
+    installed package below its fixed version, or a RUNNING kernel below it (a fixed kernel
+    that is staged but not running only needs the reboot). Pure."""
+    items = []
+    for a in advisories:
+        hits, kernel, staged_ok = [], False, True
+        for name, per in a['packages'].items():
+            if name == 'kernel':
+                run = rb.get('running') or ''
+                m = re.search(r'-([a-z][a-z0-9]*)$', run)
+                flavour = m.group(1) if m else ''
+                key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
+                fixed = per.get(key)
+                if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
+                    continue
+                kernel = True
+                staged = rb.get('staged') or ''
+                staged_ok = bool(staged and _kernel_version_key(staged) >= _kernel_version_key(fixed))
+                hits.append(f'Linux kernel {run} (fixed in {fixed})')
+                continue
+            fixed, have = per.get(os_type) or per.get('*'), installed.get(name)
+            if fixed and have and _pkg_vercmp(have, fixed, pkg_mgr) < 0:
+                hits.append(f'{name} {have} (fixed in {fixed})')
+        if not hits:
+            continue
+        pkg_hits = len(hits) - (1 if kernel else 0)
+        if kernel and staged_ok and not pkg_hits:
+            how = 'The fix is already installed; reboot to finish: ' + _OS_REBOOT_HOW
+        elif kernel:
+            how = _OS_INSTALL_HOW + ' Then reboot to finish: ' + _OS_REBOOT_HOW
+        else:
+            how = _OS_INSTALL_HOW
+        lines = [f"What it fixes: {a['what']}"]
+        if a['why']:
+            lines.append(f"Why it is urgent: {a['why']}")
+        lines.append('Still exposed here: ' + '; '.join(hits))
+        lines += [x for x in sorted({_pkg_restart_impact(h.split(' ')[0]) for h in hits
+                                     if not h.startswith('Linux kernel')}) if x]
+        items.append({'key': f"pn:feed:{a['id']}", 'label': f"Urgent security fix {a['id']}",
+                      'installed': hits[0].split(' (')[0], 'target': 'the fixed version',
+                      'summary': f"Urgent security fix {a['id']}", 'identity': a['id'],
+                      'patch_now': True, 'security': lines, 'how': how})
+    return items
+
+
+def _nevra_name(nevra):
+    """'openssl-libs-1:3.2.2-6.el9_5.1.x86_64' -> 'openssl-libs'."""
+    base = re.sub(r'\.(x86_64|noarch|aarch64|i686|armv7hl|ppc64le|s390x|src)$', '', nevra or '')
+    return base.rsplit('-', 2)[0]
+
+
+def _dnf_critical_items():
+    """ops #377 signal 2: one item per security advisory dnf rates Critical for an
+    available update. [] off dnf. Raises when dnf could not answer. Once the update is
+    installed dnf stops listing the advisory, which ends the reminders."""
+    if _pkg_mgr() != 'dnf':
+        return []
+    crit = {}
+    for a in _dnf_security_advisories():
+        if a['severity'].lower() == 'critical':
+            crit.setdefault(a['id'], set()).add(_nevra_name(a['nevra']))
+    items = []
+    for aid in sorted(crit):
+        names = sorted(crit[aid])
+        kernel = any(n.startswith('kernel') for n in names)
+        items.append({
+            'key': f'pn:os:{aid}', 'label': f'Operating system ({aid})',
+            'installed': ', '.join(names[:6]), 'target': aid,
+            'summary': f'Operating system: critical security update {aid}',
+            'identity': aid, 'patch_now': True,
+            'security': [f"Fixes: {', '.join(names[:10])}" + (f' (+{len(names) - 10} more)' if len(names) > 10 else ''),
+                         'Why it is urgent: the OS vendor rates it Critical, its highest rating, '
+                         'for flaws an attacker can use without logging in.'],
+            'how': _OS_INSTALL_HOW + (' Then reboot to finish: ' + _OS_REBOOT_HOW if kernel else '')})
+    return items
+
+
+def _third_party_security_items(pending, unknown, now=None):
+    """ops #377 signal 3: Docker / containerd / Caddy / NetBird updates that fix a published
+    GitHub advisory, from `pending` (_pending_os_updates() rows). patch_now when one of them
+    is critical. GitHub unreadable = unknown for that package, never "not security"."""
+    now = now or time.time()
+    items = []
+    for p in pending:
+        cfg = THIRD_PARTY_ADVISORY_REPOS.get(p.get('name'))
+        inst, tgt = _upstream_version(p.get('old')), _upstream_version(p.get('new'))
+        if not cfg or not inst or not tgt:
+            continue
+        repo, pkgs, label = cfg
+        ck = (repo, inst, tgt)
+        hit = _third_party_adv_cache.get(ck)
+        if hit and now - hit[0] < THIRD_PARTY_ADVISORY_CACHE_S:
+            advs = hit[1]
+        else:
+            try:
+                advs = _gh_advisories(repo, inst, tgt, packages=pkgs)
+                _third_party_adv_cache[ck] = (now, advs)
+            except Exception as e:
+                unknown.update({f"3p:{p['name']}", f"pn:3p:{p['name']}"})
+                print(f"[update-notify] {label} advisories unreadable: {e}", flush=True)
+                continue
+        if not advs:
+            continue
+        crit = any(a['severity'] == 'critical' for a in advs)
+        lines = ['Fixes ' + a['id'] + (f" ({a['severity']})" if a['severity'] else '') + ': '
+                 + a['summary'] for a in advs[:5]]
+        if len(advs) > 5:
+            lines.append(f'(+{len(advs) - 5} more advisories)')
+        if crit:
+            lines.append('Why it is urgent: at least one of these is rated critical.')
+        impact = _pkg_restart_impact(p['name'])
+        if impact:
+            lines.append(impact)
+        items.append({'key': ('pn:3p:' if crit else '3p:') + p['name'], 'label': label,
+                      'installed': p.get('old') or '?', 'target': p['new'],
+                      'summary': f"{label}: security update {inst} → {tgt}",
+                      'identity': tgt + '+security', 'patch_now': crit,
+                      'security': lines, 'how': _OS_INSTALL_HOW})
+    return items
+
+
+def _collect_patch_now_items(feed, unknown, now=None):
+    """ops #377: the three patch-now signals, plus the third-party security items (patch-now
+    only when critical). Returns (items, feed); `feed` is the patch-now list to persist.
+    Each source is shielded, and one that could not answer goes into `unknown` so its
+    reminder state is carried — never pruned, never re-mailed on a guess."""
+    now = now or time.time()
+    items = []
+    advs, feed, ok = _patch_now_advisories(feed, now)
+    if not ok:
+        unknown.add('pn:feed')
+    if advs:
+        try:
+            names = {n for a in advs for n in a['packages'] if n != 'kernel'}
+            items += _patch_now_feed_items(advs, _installed_pkg_versions(names),
+                                           _read_os_release()[0], _kernel_reboot_state(), _pkg_mgr())
+        except Exception as e:
+            unknown.add('pn:feed')
+            print(f"[update-notify] patch-now list check failed: {e}", flush=True)
+    try:
+        items += _dnf_critical_items()
+    except Exception as e:
+        unknown.add('pn:os')
+        print(f"[update-notify] critical advisory check failed: {e}", flush=True)
+    try:
+        items += _third_party_security_items(_pending_os_updates(), unknown, now)
+    except Exception as e:
+        unknown.update({'3p', 'pn:3p'})
+        print(f"[update-notify] third-party security check failed: {e}", flush=True)
+    return items, feed
+
+
 def _collect_pending_updates(settings, seen=None, unknown=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
@@ -27781,11 +28277,20 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
 _update_notify_lock = threading.Lock()
 
 
-def _update_notify_check_once():
+def _carried_by_unknown(key, unknown):
+    """True when `key`'s source could not be read this sweep (exact, or a `src:` prefix)."""
+    return any(key == u or key.startswith(u + ':') for u in unknown)
+
+
+def _update_notify_check_once(fast=False):
     """One pending-update sweep. Emails the Guard Dog alert address only when at least
     one pending item's identity has not been mailed before (one email per new SHA/tag,
     never per poll), and then only about the NEW items (ops #345). Returns
-    {'pending': [...], 'emailed': bool} for the trigger route."""
+    {'pending': [...], 'emailed': bool} for the trigger route.
+
+    ops #377: patch-now items are the exception — mailed at once and again every
+    PATCH_NOW_REPEAT_S until fixed. `fast=True` is the hourly check between full sweeps:
+    only the patch-now sources, only patch-now mail, every other dedup entry untouched."""
     settings = load_settings()
     to_addr = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     if not to_addr:
@@ -27799,24 +28304,60 @@ def _update_notify_check_once():
         return {'pending': [], 'emailed': False, 'skipped': f'quiet window ({_q_why})',
                 'quiet_until': _q_until}
     state = _update_notify_state_load()
+    now = time.time()
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
     unknown = set()
-    pending = _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    feed = state.get('_patch_now_feed')
+    try:
+        pn_found, feed = _collect_patch_now_items(feed, unknown, now)
+        pending += [p for p in pn_found if p.get('patch_now') or not fast]
+    except Exception as e:
+        unknown.update({'pn', '3p'})
+        print(f"[update-notify] patch-now check failed: {e}", flush=True)
+    sent_pn = state.get('_patch_now_sent')
+    sent_pn = {k: v for k, v in sent_pn.items() if isinstance(v, dict)} if isinstance(sent_pn, dict) else {}
 
     def _mailed(p):
         return state.get(p['key']) in (p.get('seen_ok') or [p['identity']])
 
-    new_items = [p for p in pending if not _mailed(p)]
+    def _pn_due(p):
+        rec = sent_pn.get(p['key'])
+        try:
+            return (not rec or rec.get('identity') != p['identity']
+                    or now - float(rec.get('last') or 0) >= PATCH_NOW_REPEAT_S)
+        except (TypeError, ValueError):
+            return True
+
+    new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]
     emailed = False
     if new_items:
         server_id = _guarddog_server_identifier(settings) or socket.gethostname()
         # ops #345: the email is about what is NEW. Updates mailed before are not listed
         # again: the same 8 OS patches used to ride along in every email a later console
         # update triggered (NUC, Tue Oct 27: four mails in seven hours).
-        sec_items = [p for p in new_items if p.get('security')]
-        other = [p for p in new_items if not p.get('security')]
+        pn_items = [p for p in new_items if p.get('patch_now')]
+        sec_items = [p for p in new_items if p.get('security') and not p.get('patch_now')]
+        other = [p for p in new_items if not p.get('security') and not p.get('patch_now')]
         lines = []
+        if pn_items:
+            # ops #377: urgent first, in plain words, with where to click.
+            lines += [f"URGENT SECURITY UPDATE: install this now on {server_id}.", '']
+            for p in pn_items:
+                lines.append(f"  • {p.get('summary') or p['label']}")
+                lines += [f"      {s}" for s in p.get('security') or []]
+                if p.get('how'):
+                    lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
+                rec = sent_pn.get(p['key'])
+                if rec and rec.get('identity') == p['identity']:
+                    try:
+                        days = max(1, int((now - float(rec.get('first') or now)) // 86400))
+                    except (TypeError, ValueError):
+                        days = 1
+                    lines.append(f"      Reminder: this is still not installed. We first emailed about it "
+                                 f"{days} day{'s' if days != 1 else ''} ago.")
+                lines.append('')
         if sec_items:
             # ops #168: say it plainly, say what it fixes, say where to click.
             lines += [f"SECURITY UPDATE: you should update this machine ({server_id}).", '']
@@ -27826,6 +28367,7 @@ def _update_notify_check_once():
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 lines.append('')
+        if sec_items or pn_items:
             if other:
                 lines.append('Other pending updates:')
         else:
@@ -27838,7 +28380,13 @@ def _update_notify_check_once():
                   f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
                   '', 'You get one email per new update, and only about what is new. '
                   'Updates you were already told about are not repeated.']
-        if sec_items:
+        if pn_items:
+            lines.append('Urgent security fixes are the exception: you get a reminder every '
+                         '24 hours until they are installed.')
+            reminder = all(sent_pn.get(p['key'], {}).get('identity') == p['identity'] for p in pn_items)
+            subj = (f"🔒 Security update pending on {server_id} — patch now"
+                    + (' (reminder)' if reminder else ''))
+        elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
         else:
             subj = (f"⬆ Update pending on {server_id}" if len(new_items) == 1
@@ -27852,13 +28400,38 @@ def _update_notify_check_once():
             print(f"[update-notify] email send failed: {e}", flush=True)
     # Persist ONLY what was successfully mailed (a failed send retries next sweep);
     # prune entries no longer pending so the same target re-mails if it reappears.
-    new_state = {p['key']: (state[p['key']] if _mailed(p) else p['identity']) for p in pending}
-    # ops #168: a source that could not be read this sweep is not "no longer pending".
-    for k in unknown:
-        if k in state and k not in new_state:
-            new_state[k] = state[k]
-    if seen:
-        new_state['_os_security_seen'] = seen
+    if fast:
+        new_state = {k: v for k, v in state.items() if k not in ('_patch_now_sent', '_patch_now_feed')}
+    else:
+        new_state = {p['key']: (state[p['key']] if _mailed(p) else p['identity'])
+                     for p in pending if not p.get('patch_now')}
+        # ops #168: a source that could not be read this sweep is not "no longer pending".
+        for k in state:
+            if not k.startswith('_') and k not in new_state and _carried_by_unknown(k, unknown):
+                new_state[k] = state[k]
+        if seen:
+            new_state['_os_security_seen'] = seen
+    # ops #377: patch-now reminders. Both modes run the same patch-now sources, so an item
+    # missing here was verified fixed and stops; an unreadable source carries its entry.
+    mailed_keys = {p['key'] for p in new_items} if emailed else set()
+    pn_new = {}
+    for p in pending:
+        if not p.get('patch_now'):
+            continue
+        rec = sent_pn.get(p['key'])
+        if p['key'] in mailed_keys:
+            same = bool(rec) and rec.get('identity') == p['identity']
+            pn_new[p['key']] = {'identity': p['identity'], 'first': rec.get('first', now) if same else now,
+                                'last': now, 'count': int(rec.get('count') or 1) + 1 if same else 1}
+        elif rec:
+            pn_new[p['key']] = rec
+    for k, rec in sent_pn.items():
+        if k not in pn_new and _carried_by_unknown(k, unknown):
+            pn_new[k] = rec
+    if pn_new:
+        new_state['_patch_now_sent'] = pn_new
+    if feed:
+        new_state['_patch_now_feed'] = feed
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
     return {'pending': pending, 'emailed': emailed}
@@ -27901,15 +28474,21 @@ def _startup_retire_updates_timer():
 
 def _update_notify_loop():
     time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
+    next_full = 0.0
     while True:
-        wait = UPDATE_NOTIFY_INTERVAL_S
+        # ops #377: a full sweep every 6 h, and between them an hourly patch-now check.
+        wait = PATCH_NOW_CHECK_INTERVAL_S
+        full = time.time() >= next_full
         try:
+            if full:
+                next_full = time.time() + UPDATE_NOTIFY_INTERVAL_S
             with _update_notify_lock:
-                r = _update_notify_check_once() or {}
+                r = _update_notify_check_once(fast=not full) or {}
             if r.get('quiet_until'):
                 # ops #228: deferred by a quiet window — look again once it has settled,
-                # not six hours later.
-                wait = min(UPDATE_NOTIFY_INTERVAL_S,
+                # not six hours later, and make that look the full sweep.
+                next_full = 0.0
+                wait = min(PATCH_NOW_CHECK_INTERVAL_S,
                            max(60, int(r['quiet_until'] - time.time()) + UPDATE_NOTIFY_FIRST_DELAY_S))
         except Exception as e:
             try:
@@ -42453,6 +43032,10 @@ def run_takportal_deploy():
     try:
         portal_dir = os.path.expanduser('~/TAK-Portal')
         settings = load_settings()
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('TAK Portal', plog):
+            takportal_deploy_status.update({'running': False, 'error': True})
+            return
         if settings.get('pkg_mgr', 'apt') == 'apt':
             wait_for_apt_lock(plog, takportal_deploy_log)
         # Step 1: Check Docker
@@ -49781,6 +50364,10 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog(f"✓ SSH connected to {remote_host}")
+            # ops #360: the remote host's CPU, before Docker or the build
+            if not _cpu_preflight_remote(remote_cfg, 'CloudTAK', plog):
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
             plog("")
             plog("━━━ Step 2/6: Ensuring Docker on remote ━━━")
@@ -49973,6 +50560,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            return
+
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('CloudTAK', plog):
+            cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
         # Step 1: Check Docker
@@ -80843,7 +81435,8 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0,
+                       'kind': 'fix'}  # v10.3.5 W3: 'fix' (names) or 'signer' (root <-> intermediate switch)
 
 
 def _tak_server_cert_names(settings):
@@ -81044,6 +81637,122 @@ def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
         else:
             run(f'mv -f {shlex.quote(p + ".reissue")} {shlex.quote(p)}')
             ok = False
+    return ok
+
+
+TAK_SERVER_CERT_SIGNERS = ('root', 'intermediate')
+# makeCert.sh signs with whatever sits in this slot; makeCert.sh ca moves each new intermediate into it.
+_TAK_WORKING_CA_FILES = (('ca.pem', 'root-ca.pem'),
+                         ('ca-do-not-share.key', 'root-ca-do-not-share.key'),
+                         ('ca-trusted.pem', 'root-ca-trusted.pem'))
+
+
+def _pem_dn(pem, which):
+    """'subject' or 'issuer' of the first certificate in `pem`, RFC 2253, or '' if unreadable."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', f'-{which}', '-nameopt', 'RFC2253'],
+                           input=pem or '', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ''
+    if r.returncode != 0:
+        return ''
+    return r.stdout.strip().split('=', 1)[-1].strip() if '=' in r.stdout else ''
+
+
+def _tak_server_cert_mode(cert_dir='/opt/tak/certs/files'):
+    """Who signed takserver.pem: 'root', 'intermediate' (the current working CA, ca.pem) or 'unknown'.
+
+    Read from the cert itself, never from settings: the box's certificate is the only source of
+    truth (fleet-uniform), and a settings key would drift the first time someone reissued by hand.
+    'unknown' covers a missing/unreadable file and a cert signed by an older intermediate."""
+    try:
+        issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+        root = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+        working = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        return 'unknown'
+    if not issuer:
+        return 'unknown'
+    if root and issuer == root:
+        return 'root'
+    if working and issuer == working and working != root:
+        return 'intermediate'
+    return 'unknown'
+
+
+def _tak_server_cert_signer_or_default(cert_dir='/opt/tak/certs/files'):
+    """The signer a reissue should keep: the box's current mode, and 'intermediate' (what every
+    reissue did before v10.3.5) when it cannot be told."""
+    return 'root' if _tak_server_cert_mode(cert_dir) == 'root' else 'intermediate'
+
+
+def _tak_server_cert_issue(settings, signer, log, run, cert_dir='/opt/tak/certs/files'):
+    """THE one writer of TAK Server's own 8089/8443 certificate (`makeCert.sh server takserver`).
+
+    signer='intermediate' signs with the working CA, as every reissue always has. signer='root'
+    signs with the root CA, which every enrolled device already trusts: ATAK checks 8089 against
+    its own truststore only and ignores the chain we send, so an intermediate-signed server cert
+    drops every phone the moment the intermediate rotates. A root-signed one does not.
+
+    Same key? No: makeCert.sh generates a new key on every run. That is fine — phones pin the CA,
+    not the server key.
+
+    For 'root' the root goes into the working slot (ca.pem / ca-do-not-share.key / ca-trusted.pem)
+    for this one run, and the intermediate that was there is ALWAYS put back (finally): left
+    behind, every client cert issued afterwards would be root-signed too.
+
+    `run(cmd) -> bool` is the caller's own container-aware shell runner (rotate, fix job,
+    deploy); it must log its own failures. `/redteam-selfaudit` fails on any
+    `makeCert.sh server takserver` outside this function — that is how the next rotation is kept
+    from silently going back to dropping everyone. Returns True only when the cert was reissued
+    AND (for 'root') the working CA is back."""
+    say = log or (lambda _m: None)
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        say(f"  ✗ Unknown server certificate signer {signer!r}")
+        return False
+    _tak_server_cert_prepare(settings, say)
+    if signer == 'intermediate':
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+        if ok:
+            say("  Server certificate signed by the intermediate CA")
+        return ok
+
+    missing = [src for _slot, src in _TAK_WORKING_CA_FILES
+               if not _exists_priv(os.path.join(cert_dir, src))]
+    if missing:
+        say(f"  ✗ Cannot sign with the root CA: {', '.join(missing)} not found")
+        return False
+    held, placed = [], []
+    ok = False
+    try:
+        for slot, _src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            if _exists_priv(p):
+                if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + ".w1hold")}'):
+                    say("  ✗ Could not set the working CA aside — nothing was changed")
+                    return False
+                held.append(p)
+        for slot, src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            placed.append(p)
+            if not run(f'cp -p {shlex.quote(os.path.join(cert_dir, src))} {shlex.quote(p)}'):
+                say("  ✗ Could not put the root CA in the working slot")
+                return False
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+    finally:
+        # Every slot is attempted (a list, not a short-circuiting all()). A slot that held
+        # nothing before is emptied again, never left holding the root.
+        results = [run(f'cp -p {shlex.quote(p + ".w1hold")} {shlex.quote(p)} && '
+                       f'rm -f {shlex.quote(p + ".w1hold")}') for p in held]
+        results += [run(f'rm -f {shlex.quote(p)}') for p in placed if p not in held]
+        back = all(results)
+        if not back:
+            say(f"  ✗ The intermediate CA was NOT put back in the working slot — restore "
+                f"{cert_dir}/ca*.w1hold over ca.pem / ca-do-not-share.key / ca-trusted.pem before "
+                "issuing any client certificate")
+            ok = False
+    if ok:
+        say("  Server certificate signed by the root CA")
     return ok
 
 
@@ -81381,6 +82090,10 @@ def takserver_rotate_intca():
                 run(f'cp {cert_dir}/ca.pem {old_pem}')
                 log(f"  Saved current CA to {old_ca_name}.pem for transition bundle")
 
+            # Read before Step 1 puts the root in the working slot: afterwards ca.pem no longer
+            # names the intermediate the server cert was signed by.
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
+
             log("Step 1/7: Restoring Root CA as working CA...")
             run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
             run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
@@ -81401,11 +82114,11 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            log("Step 3/7: Creating new server certificate...")
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create new server certificate')
-            log("✓ Server certificate regenerated (signed by new CA)")
+            log("✓ Server certificate regenerated (signed by "
+                + ("the root CA" if server_signer == 'root' else "the new CA") + ")")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -81531,12 +82244,22 @@ def takserver_revoke_old_ca():
         # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
         le_jks = os.path.join(cert_dir, 'takserver-le.jks')
         if not os.path.isfile(le_jks):
-            _tak_server_cert_prepare(load_settings())  # v10.2.26: real names, not just `takserver`
-            r = subprocess.run(
-                _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
-                shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
+            _errs = []
+
+            # The rotations' own runner, for _tak_server_cert_issue()'s fixed cp/mv/makeCert strings.
+            def run(cmd):
+                cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+                try:
+                    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        _errs.append((r.stderr or r.stdout or '').strip()[:200])
+                    return r.returncode == 0
+                except Exception as e:
+                    _errs.append(str(e)[:200])
+                    return False
+            if not _tak_server_cert_issue(load_settings(), _tak_server_cert_signer_or_default(cert_dir),
+                                          _errs.append, run, cert_dir):
+                return jsonify({'error': f'Creating new server cert failed: {"; ".join(_errs)[:300]}'}), 500
             # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
             p12 = os.path.join(cert_dir, 'takserver.p12')
             jks = os.path.join(cert_dir, 'takserver.jks')
@@ -81679,6 +82402,8 @@ def takserver_rotate_rootca():
                 return False
 
         try:
+            # Read before Step 1 clears the cert dir: a root-signed box stays root-signed (by the new root).
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
             log("━━━ Rotating Root CA ━━━")
             log(f"  Old Root CA: {old_root_name}")
             log(f"  Old Intermediate CA: {old_int_name}")
@@ -81730,8 +82455,7 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 4/8: Creating new server certificate...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create server certificate')
             log("✓ Server certificate created")
 
@@ -81837,7 +82561,7 @@ def takserver_rotate_rootca_status():
 def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
-    job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job = {k: tak_server_cert_job.get(k) for k in ('running', 'complete', 'error', 'kind')}
     job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
@@ -81868,7 +82592,8 @@ def takserver_server_cert_fix():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='fix')
 
     def do_fix():
         log = tak_server_cert_job['log'].append
@@ -81925,7 +82650,8 @@ def takserver_server_cert_fix():
                 raise Exception('Could not write the names — nothing was changed')
 
             log("Step 3/4: Reissuing the server certificate (same CA)...")
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            if not _tak_server_cert_issue(settings, _tak_server_cert_signer_or_default(cert_dir),
+                                          log, run, cert_dir):
                 restore()
                 raise Exception('makeCert.sh failed')
             got = _cert_san_entries(_read_priv(f'{cert_dir}/takserver.pem')) or []
@@ -81957,6 +82683,181 @@ def takserver_server_cert_fix():
             tak_server_cert_job.update(running=False, complete=True, error=True)
 
     threading.Thread(target=do_fix, daemon=True).start()
+    return jsonify({'success': True, 'started': True})
+
+
+def _tak_coreconfig_keystore(cc_text):
+    """Absolute keystoreFile of CoreConfig's <tls> under <security> (what 8089/8443 present), or ''."""
+    sec = re.search(r'<security\b.*?</security>', cc_text or '', re.S)
+    m = re.search(r'<tls\b[^>]*>', sec.group(0) if sec else (cc_text or ''))
+    f = re.search(r'\bkeystoreFile="([^"]*)"', m.group(0)) if m else None
+    path = (f.group(1) if f else '').strip()
+    return os.path.join('/opt/tak', path) if path and not path.startswith('/') else path
+
+
+def _tak_server_cert_live_issuer():
+    """Issuer DN (RFC 2253) of the cert TAK Server presents right now, or None if not answering.
+    8443, not 8089, for the reason in _tak_server_cert_live_names(): same keystore, no log spam."""
+    try:
+        r = subprocess.run(['openssl', 's_client', '-connect', '127.0.0.1:8443'],
+                           input='', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', r.stdout, re.S)
+    return (_pem_dn(m.group(0), 'issuer') or None) if m else None
+
+
+def _tak_server_cert_signer_info(cert_dir='/opt/tak/certs/files'):
+    """What the TAK Server page's "signed by" row shows, plus why a switch would be refused."""
+    def cn(dn):
+        m = re.search(r'(?:^|,)CN=([^,]+)', dn or '')
+        return m.group(1) if m else ''
+    try:
+        root_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+    except Exception:
+        root_dn = ''
+    try:
+        int_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        int_dn = ''
+    try:
+        srv_issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+    except Exception:
+        srv_issuer = ''
+    mode = _tak_server_cert_mode(cert_dir)
+    blockers = []
+    if not _exists_priv(os.path.join(cert_dir, 'root-ca-do-not-share.key')):
+        blockers.append("The root CA's private key isn't on this server, so the certificate can't be signed by it.")
+    try:
+        ks = _tak_coreconfig_keystore(_read_priv('/opt/tak/CoreConfig.xml'))
+    except Exception:
+        ks = ''
+    if ks and os.path.basename(ks) != 'takserver.jks':
+        blockers.append(f"TAK Server presents {os.path.basename(ks)} on 8089, not its own certificate "
+                        "(a custom or Let's Encrypt certificate). Switching does not apply.")
+    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+            or rotate_intca_status.get('running')):
+        blockers.append('A certificate operation is already running.')
+    return {'mode': mode, 'root_cn': cn(root_dn), 'intermediate_cn': cn(int_dn),
+            'issuer_cn': cn(srv_issuer), 'blockers': blockers}
+
+
+@app.route('/api/takserver/server-cert/signer', methods=['GET', 'POST'])
+@login_required
+def takserver_server_cert_signer():
+    """v10.3.5 W3 — who signs TAK Server's own certificate: GET the mode, POST {signer, password}
+    to switch it. Root-signed lets the intermediate rotate without every phone rescanning (ATAK
+    trusts the root it enrolled with and ignores the chain we send). Reversible both ways.
+
+    The job mirrors the names fix: back up takserver.*, reissue through
+    _tak_server_cert_issue(), restart, wait until the LIVE cert's issuer is the one asked for,
+    and put the old files back on any failure. TAK Portal's CA file is rebuilt afterwards."""
+    cert_dir = '/opt/tak/certs/files'
+    if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if request.method == 'GET':
+        return jsonify({'success': True, **_tak_server_cert_signer_info(cert_dir)})
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    signer = data.get('signer')
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'success': False, 'error': 'signer must be root or intermediate'}), 400
+    info = _tak_server_cert_signer_info(cert_dir)
+    if any('already running' in b for b in info['blockers']):
+        return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
+    if info['blockers']:
+        return jsonify({'success': False, 'error': ' '.join(info['blockers'])}), 400
+    if info['mode'] == signer:
+        return jsonify({'success': False, 'error': f'The certificate is already signed by the {signer} CA.'}), 400
+    settings = load_settings()
+    want = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem' if signer == 'root' else 'ca.pem')),
+                   'subject')
+    if not want:
+        return jsonify({'success': False, 'error': 'Could not read the CA certificate to sign with.'}), 500
+    label = 'the root CA' if signer == 'root' else f"the intermediate CA ({info['intermediate_cn']})"
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='signer')
+
+    def do_switch():
+        log = tak_server_cert_job['log'].append
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
+        backed = []
+
+        def run(cmd, check=True):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
+                return False
+
+        def restore():
+            ok = all([run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed])
+            log("  ✓ Previous certificate restored" if ok else "  ✗ Restore incomplete — backups are "
+                f"{cert_dir}/takserver.*.{stamp}")
+            return ok
+
+        try:
+            log(f"━━━ Switching TAK Server's certificate to {label} ━━━")
+            log("Step 1/4: Backing up the current server certificate...")
+            for p in files:
+                if _exists_priv(p):
+                    if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + "." + stamp)}'):
+                        raise Exception('Backup failed — nothing was changed')
+                    backed.append(p)
+            log(f"  ✓ Saved as {cert_dir}/takserver.*.{stamp}")
+
+            log(f"Step 2/4: Reissuing the server certificate, signed by {label}...")
+            if not _tak_server_cert_issue(settings, signer, log, run, cert_dir):
+                restore()
+                raise Exception('Reissuing the certificate failed')
+            got = _pem_dn(_read_priv(f'{cert_dir}/takserver.pem'), 'issuer')
+            if got != want:
+                restore()
+                raise Exception(f'The new certificate is signed by {got or "nobody"}, not {want}')
+            log("  ✓ New certificate written")
+
+            log("Step 3/4: Restarting TAK Server (devices reconnect on their own)...")
+            if not run('systemctl restart takserver 2>&1'):
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server restart failed')
+            live, end = None, time.time() + 300
+            while time.time() < end:
+                time.sleep(5)
+                live = _tak_server_cert_live_issuer()
+                if live == want:
+                    break
+            if live != want:
+                log("  ✗ TAK Server didn't come back presenting the new certificate within 5 minutes")
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server did not pick up the new certificate')
+            log(f"  ✓ TAK Server is presenting a certificate signed by {label}")
+
+            log("Step 4/4: Updating TAK Portal's copy of the server certificate...")
+            if _takportal_web_container() is None:
+                log("  TAK Portal isn't running here — nothing to update")
+            else:
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+                log(f"  {'✓' if _tp_ok else '⚠'} {_tp_msg}")
+            log("")
+            log("━━━ DONE ━━━")
+            tak_server_cert_job.update(running=False, complete=True, error=False)
+        except Exception as e:
+            log("")
+            log(f"✗ FAILED: {e}")
+            tak_server_cert_job.update(running=False, complete=True, error=True)
+
+    threading.Thread(target=do_switch, daemon=True).start()
     return jsonify({'success': True, 'started': True})
 
 
@@ -89529,6 +90430,10 @@ def deploy_takserver():
     # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
     # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
     # here and returns BEFORE the byte-identical .deb selection logic below.
+    # v10.3.5 W2: who signs TAK Server's own cert. An option, not forced: default intermediate.
+    server_cert_signer = data.get('server_cert_signer') or 'intermediate'
+    if server_cert_signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'error': 'server_cert_signer must be root or intermediate'}), 400
     _explicit_method = data.get('install_method') if data.get('install_method') in ('native', 'container') else None
     _method = _explicit_method or _tak_install_method()
     # Auto-correct an un-pinned method to match the uploaded artifact: if we'd take
@@ -89573,6 +90478,7 @@ def deploy_takserver():
             'enable_admin_ui': data.get('enable_admin_ui', False),
             'enable_webtak': data.get('enable_webtak', False),
             'webadmin_password': data.get('webadmin_password', ''),
+            'server_cert_signer': server_cert_signer,
         }
         cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
         if cert_password:
@@ -89633,6 +90539,7 @@ def deploy_takserver():
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
         'webadmin_password': data.get('webadmin_password', ''),
+        'server_cert_signer': server_cert_signer,
     }
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
         matches = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(ext)]
@@ -90485,8 +91392,17 @@ def _deploy_takserver_container(config):
         if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
             return
         log_step("Creating server certificate...")
-        _tak_server_cert_prepare(load_settings(), log_step)  # v10.2.26: real names, not just `takserver`
-        if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
+
+        def _certrun_sh(cmd):
+            # _tak_server_cert_issue()'s runner: its cp/mv/makeCert strings in the same one-shot
+            # container as _certrun (runuser is native-only; the image user is already tak).
+            inner = cmd.replace('runuser -u tak -- ', '')
+            return run_cmd(f"docker run --rm -v {shlex.quote(tak_dir)}:/opt/tak:z "
+                           f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(inner)} 2>&1", quiet=True)
+        if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                      log_step, _certrun_sh):
+            log_step("✗ Certificate generation FAILED at: server cert — aborting (TAK is unusable without certs)")
+            deploy_status.update({'running': False, 'error': True})
             return
         log_step("Creating admin certificate...")
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh client admin', "admin cert"):
@@ -91330,17 +92246,25 @@ def run_takserver_deploy(config):
         # still reported all certificates created AND the truststore imported. A
         # TAK Server with no certificates cannot serve a single client, so this is
         # not a warning — it ends the deploy.
-        # v10.2.26: the server cert carries this box's real names, not just `takserver`.
-        _tak_server_cert_prepare(load_settings(), log_step)
-        _cert_steps = [
+        # The server cert is not in this list: it goes through _tak_server_cert_issue(), the one
+        # writer (which also writes this box's real names into config.cfg first, v10.2.26).
+        _ca_steps = [
             ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
             ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
-            ("server cert", ['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], None, "Creating server certificate..."),
+        ]
+        _client_steps = [
             ("admin cert", ['/opt/tak/certs/makeCert.sh', 'client', 'admin'], None, "Creating admin certificate..."),
             ("user cert", ['/opt/tak/certs/makeCert.sh', 'client', 'user'], None, "Creating user certificate..."),
         ]
-        _cert_failed = [name for name, argv, inp, desc in _cert_steps
+        _cert_failed = [name for name, argv, inp, desc in _ca_steps
                         if not _tak_cert(argv, inp=inp, desc=desc)]
+        if not _cert_failed:
+            log_step("Creating server certificate...")
+            if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                          log_step, lambda c: run_cmd(c, quiet=True)):
+                _cert_failed.append("server cert")
+        _cert_failed += [name for name, argv, inp, desc in _client_steps
+                         if not _tak_cert(argv, inp=inp, desc=desc)]
         if _cert_failed:
             log_step("✗ FATAL: certificate generation failed (%s). TAK Server cannot serve any "
                      "client without these, so the deploy stops here rather than reporting "

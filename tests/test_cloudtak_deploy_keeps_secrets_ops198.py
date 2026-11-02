@@ -93,6 +93,8 @@ def _ns(settings, **stubs):
         '_cloudtak_release_cache': {'tag': None, 'ts': 0},
         '_REMOTE_DOCKER_GROUP_SH': 'true',   # row 5: remote step 2 joins the SSH user to docker
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
+        '_cpu_preflight_local': lambda what, plog: True,          # ops #360: not under test here
+        '_cpu_preflight_remote': lambda cfg, what, plog: True,
     }
     ns.update(stubs)
     exec(compile(_src(), 'app.py', 'exec'), ns)

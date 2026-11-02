@@ -115,6 +115,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if tak.installed and not deploying %}
 {# v10.2.26: does TAK Server's certificate carry this box's names? Filled by loadTakCertRow(). #}
 <div id="tak-cert-row" style="display:none;border-radius:12px;padding:14px 20px;margin-bottom:24px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.5"></div>
+{# v10.3.5 W3: who signs TAK Server's own certificate (root vs intermediate). Filled by loadTakSignerRow(). #}
+<div id="tak-signer-row" style="display:none;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:12px 20px;margin:-12px 0 24px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.5"></div>
 {% endif %}
 
 {% if tak.installed %}
