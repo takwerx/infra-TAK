@@ -95571,10 +95571,10 @@ def _startup_os_upgrade_verify():
             # Guard Dog's tak-post-start (oneshot, RemainAfterExit) restarts the containers the
             # boot sequencer stopped, after TAK answers. Until it has finished (active / failed)
             # a missing container means "not yet", not "lost".
-            # ops #438: an empty load state is systemctl not answering inside 5 s (a busy first
-            # boot on the new release), not "Guard Dog is not installed" ('not-found'). Ending
-            # the wait on it judged the box minutes early: PostgreSQL still starting, TAK Portal
-            # and CloudTAK not yet stopped and started again by the boot sequence.
+            # ops #438: an empty load state is systemctl not answering inside 5 s, not "Guard Dog
+            # is not installed" ('not-found'). Ending the wait on it would judge the box before
+            # the boot sequence has run. (Hardening found while tracing the field report; not
+            # its cause.)
             ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S
             while time.time() < ps_deadline:
                 _ld, _act, _sub, _res, _pid = _kernel_patch_unit_state('tak-post-start.service')
@@ -95590,7 +95590,8 @@ def _startup_os_upgrade_verify():
             pg_expect = baseline.get('pg_expect') or ''
             while True:
                 # ops #438: TAK's PostgreSQL gets the same wait as the containers and services.
-                # One read the moment those were back could catch it still starting.
+                # Field, Nov 2: Install updates, pressed 3 min after the reboot, moved PostgreSQL
+                # to the 24.04 build and restarted it (down 9 s); the one read landed in that gap.
                 clusters = _os_upgrade_pg_clusters() if pg_expect else []
                 pg_ok = (not pg_expect) or any(c[0] == pg_expect and c[2] == '5432' and c[3] == 'online'
                                                for c in clusters)

@@ -511,7 +511,8 @@ def test_verify_names_what_is_missing():
 
 def test_verify_waits_for_postgresql_still_starting_ops438():
     # ops #438 (field, Nov 2): everything else was back, PostgreSQL 18 read "down" once, and a
-    # box whose database was only still starting was marked failed. It gets the same wait.
+    # healthy box was marked failed. Install updates had restarted PostgreSQL (down 9 s) right as
+    # the one read ran. It gets the same wait as the containers and services.
     down = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down'))
     up = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'online'))
     b = Boot(clusters_seq=[down, down, up], wait_s=3600)
@@ -552,9 +553,9 @@ def test_verify_starts_portal_and_cloudtak_post_start_left_stopped_ops438():
 
 
 def test_verify_waits_out_a_slow_systemctl_at_boot_ops438():
-    # ops #438: on a busy first boot `systemctl show` can miss its 5 s timeout and come back
-    # empty. That is "ask again", not "Guard Dog is not installed": the old wait ended on it and
-    # judged PostgreSQL before the boot sequence had even started TAK.
+    # ops #438: `systemctl show` can miss its 5 s timeout and come back empty. That is "ask
+    # again", not "Guard Dog is not installed": the old wait ended on it and judged PostgreSQL
+    # before the boot sequence had even started TAK.
     states = [('', '', '', '', 0), ('loaded', 'activating', 'start', '', 1234),
               ('loaded', 'active', 'exited', 'success', 0)]
     asked = []
