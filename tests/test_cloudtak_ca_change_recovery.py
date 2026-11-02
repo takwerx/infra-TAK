@@ -363,3 +363,14 @@ def test_password_field_has_a_show_toggle_and_hides_again_after_connect():
     assert 'id="ct-connect-pass-eye"' in TEMPLATE and "i.type=show?'text':'password'" in TEMPLATE
     js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
     assert "p.value = ''; p.type = 'password';" in js
+
+
+def test_a_refresh_mid_deploy_shows_the_deploy_not_installed_but_stopped():
+    # nuc/test6 2026-11-01: refreshing mid-build showed "installed but stopped" and a Start button.
+    i = TEMPLATE.index('{% if deploying %}\n  <div class="status-banner stopped" id="ct-status-banner">')
+    assert TEMPLATE.index('CloudTAK is installed but stopped') > i               # deploying wins
+    assert "{% if deploying %}<span" in TEMPLATE and 'Controls come back when the deploy finishes.' in TEMPLATE
+    assert 'refresh the page to reconnect' not in TEMPLATE
+    js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
+    assert 'banner.innerHTML = \'<span class="uninstall-spinner"' in js           # in-page Deploy gets it too
+    assert 'CloudTAK deploy failed' in js                                         # and never spins forever

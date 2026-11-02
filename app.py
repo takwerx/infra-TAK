@@ -58490,6 +58490,13 @@ window.startCloudtakUpdate = function() {
 
 window.startDeploy = function() {
   document.getElementById("deploy-btn").disabled = true;
+  var banner = document.getElementById("ct-status-banner");
+  if (banner) {
+    banner.className = "status-banner stopped";
+    banner.innerHTML = '<span class="uninstall-spinner" style="width:14px;height:14px;margin-right:4px"></span>' +
+      "CloudTAK deploy in progress \u2014 building and starting the containers can take 10\u201345 minutes. " +
+      "The Deploy Log below updates live; it's safe to leave and come back.";
+  }
   document.getElementById("log-card").style.display = "block";
   document.getElementById("deploy-log-dyn").textContent = "Starting deployment...";
   window.logIndex = 0;
@@ -58543,6 +58550,11 @@ window.pollLog = function(redeployBtn) {
           if (redeployBtn) redeployBtn.disabled = false;
           if (d.error) {
             if (dyn) dyn.textContent = (dyn.textContent || "") + "\n\n\u2717 Deployment failed (see log above).";
+            var topBanner = document.getElementById("ct-status-banner");
+            if (topBanner && topBanner.querySelector(".uninstall-spinner")) {
+              topBanner.className = "status-banner stopped";
+              topBanner.innerHTML = '<div class="dot"></div>CloudTAK deploy failed \u2014 see the Deploy Log below.';
+            }
             var logCard = document.getElementById("log-card");
             if (logCard && !document.getElementById("deploy-fail-banner")) {
               var banner = document.createElement("div");
