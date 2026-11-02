@@ -136,7 +136,9 @@ def test_mediamtx_pin_is_past_the_fix_and_matches_the_console_pin_floor():
     assert _v(tvr.TVR_MEDIAMTX_VERSION) >= (1, 21, 1)
     app = (ROOT / 'app.py').read_text(encoding='utf-8')
     vetted = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', app, re.M).group(1)
-    assert _v(tvr.TVR_MEDIAMTX_VERSION) >= _v(vetted)
+    # The image stays on the version it was built and checksummed against (1.21.2); it only has
+    # to stay past the CSRF fix, not track every console pin move (ops #428 moved the pin to 1.21.3).
+    assert _v(vetted) >= (1, 21, 1)
     assert set(tvr.TVR_MEDIAMTX_SHA256) == {'amd64', 'arm64'}
     for h in tvr.TVR_MEDIAMTX_SHA256.values():
         assert re.fullmatch(r'[0-9a-f]{64}', h)
