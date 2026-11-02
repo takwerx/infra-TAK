@@ -107,12 +107,16 @@
   </div>
   {% endif %}
 
-  {% if cloudtak.running %}
-  <div class="status-banner running"><div class="dot"></div>CloudTAK is running</div>
+  {# v10.3.4: while a deploy / Update config / Update runs, say so. After a refresh mid-build the
+     folder already exists, and this used to read "installed but stopped" with a Start button. #}
+  {% if deploying %}
+  <div class="status-banner stopped" id="ct-status-banner"><span class="uninstall-spinner" style="width:14px;height:14px;margin-right:4px"></span>CloudTAK deploy in progress — building and starting the containers can take 10–45 minutes. The Deploy Log below updates live; it's safe to leave and come back.</div>
+  {% elif cloudtak.running %}
+  <div class="status-banner running" id="ct-status-banner"><div class="dot"></div>CloudTAK is running</div>
   {% elif cloudtak.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>CloudTAK is installed but stopped</div>
+  <div class="status-banner stopped" id="ct-status-banner"><div class="dot"></div>CloudTAK is installed but stopped</div>
   {% else %}
-  <div class="status-banner not-installed"><div class="dot"></div>CloudTAK is not installed</div>
+  <div class="status-banner not-installed" id="ct-status-banner"><div class="dot"></div>CloudTAK is not installed</div>
   {% endif %}
 
   {% if cloudtak.installed and not deploying %}
@@ -124,7 +128,7 @@
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if deploying %}<span style="font-size:12px;color:var(--text-dim)"><span class="uninstall-spinner" style="width:12px;height:12px;margin-right:6px"></span>Controls come back when the deploy finishes.</span>{% elif cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
 {% from '_module_result.html' import last_update_result %}{{ last_update_result('cloudtak') }}
@@ -152,15 +156,35 @@
   {% endif %}
 
   {% if cloudtak.running and not deploying %}
-  <!-- Post-install first-time setup guide -->
+  <!-- v10.3.4 W9: one button connects CloudTAK to TAK Server (first-time setup) or
+       reconnects it with a current certificate after a CA rotation / revoke. -->
+  <div class="card" id="ct-connect-card" style="margin-bottom:20px">
+    <div class="card-title">Connect CloudTAK to TAK Server</div>
+    <div id="ct-connect-state" style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">Checking CloudTAK's TAK connection…</div>
+    <div id="ct-connect-creds" style="display:none;margin-bottom:10px">
+      <p style="margin:0 0 8px;font-size:12px;color:var(--text-secondary)">First-time setup: enter a TAK user (made in TAK Portal, a regular user, not an admin) who becomes CloudTAK's first system admin. TAK Portal adds an org suffix to usernames, so use the full name, e.g. <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-orgname</code>. The password goes to CloudTAK only; the console doesn't store or log it.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input type="text" id="ct-connect-user" placeholder="TAK username" autocomplete="off" style="flex:1;min-width:180px;padding:8px 10px;background:rgba(6,182,212,0.08);border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);font-weight:600;font-size:13px">
+        <div style="flex:1;min-width:180px;position:relative;display:flex">
+          <input type="password" id="ct-connect-pass" placeholder="TAK password" autocomplete="new-password" style="flex:1;padding:8px 38px 8px 10px;background:rgba(6,182,212,0.08);border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);font-weight:600;font-size:13px">
+          <button type="button" id="ct-connect-pass-eye" title="Show password" aria-label="Show password" onclick="var i=document.getElementById('ct-connect-pass');var show=i.type==='password';i.type=show?'text':'password';this.textContent=show?'🙈':'👁';this.title=show?'Hide password':'Show password';this.setAttribute('aria-label',this.title)" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:2px;color:var(--text-dim)">👁</button>
+        </div>
+      </div>
+    </div>
+    <button class="btn btn-primary" id="ct-connect-btn" onclick="ctConnectTak(this)" style="font-size:12px;display:none">Connect CloudTAK to TAK Server</button>
+    <div id="ct-connect-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
+  </div>
+
+  <!-- Manual connection (bootstrap) guide: the by-hand fallback for the button above, for a first
+       install or after TAK Server's CA changed -->
   <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden" id="cloudtak-setup-guide">
     <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px" onclick="var a=this.parentElement.querySelector('.ct-guide-arrow');if(a)a.style.transform=this.parentElement.open?'rotate(0deg)':'rotate(180deg)'">
-      <span style="font-size:16px">🚀</span> First-Time Setup — Connect CloudTAK to TAK Server
+      <span style="font-size:16px">🚀</span> Manual Connection (Bootstrap) — if the Connect button above can't be used
       <span class="ct-guide-arrow" style="margin-left:auto;font-size:14px;color:var(--text-dim);transition:transform 0.2s;display:inline-block;transform:rotate(0deg)">▼</span>
     </summary>
     <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
 
-      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Follow these steps once after install:</p>
+      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Use these steps to connect it by hand, on a first install or after TAK Server's CA changed:</p>
 
       <div style="display:flex;flex-direction:column;gap:14px">
 
@@ -181,7 +205,7 @@
           <p style="margin:0 0 10px;font-size:12px;color:var(--text-secondary)">CloudTAK 13.59+ (Core Events) reposts Events over this certificate and <strong style="color:var(--text-primary)">silently skips channels the cert can't reach</strong> — it needs a <em>channels-disabled admin</em> cert, not a regular user cert. This button creates <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> with exactly that shape (makeCert-issued + ROLE_ADMIN — an admin cert bypasses channel selection and resolves every group, including channels created later).</p>
           <button class="btn btn-primary" onclick="ctGenBootstrapCert(this)" style="font-size:12px">Generate CloudTAK Bootstrap Admin p12</button>
           <div id="ct-bootstrap-cert-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
-          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Generate + download here, then swap it once in <strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong> — no re-bootstrap needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
+          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Use <strong style="color:var(--text-primary)">Connect CloudTAK to TAK Server</strong> above: it installs this certificate for you, no CloudTAK login needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
@@ -353,7 +377,7 @@
       Video streams from your standalone MediaMTX install will be used automatically.
     </p>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:20px">
-      First deploy builds Docker images and can take 10–15 minutes. Keep the tab open; if the log stops updating, refresh the page to reconnect.
+      First deploy builds Docker images and can take 10–45 minutes. It's safe to leave or refresh: the page shows the deploy and its log until it finishes.
     </p>
 
     {% if not settings.fqdn %}

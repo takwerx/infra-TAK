@@ -258,7 +258,7 @@ def test_post_update_heals_before_reasserting_mode_and_container_gets_group0_640
     body = body[:body.index('# Fix LDAP outpost AUTHENTIK_HOST')]
     assert body.index('_heal_cert_metadata_placeholders(') < body.index("_container_readable(_cm)")
     assert "if _tak_is_container():" in body and "['chown', 'tak:tak', _cm]" in body
-    assert "_cloudtak_tak_cert_heal(" in body and 'daemon=True' in body
+    assert "target=_cloudtak_heal_after_ca_change" in body and 'daemon=True' in body   # v10.3.4: shared with Revoke
 
 
 def test_makecert_sites_no_longer_chmod_500_on_the_container_path():
@@ -490,7 +490,8 @@ class _PG:
 def _reset_ns(pg, signed):
     logs = []
     ns = {'_sudo_wrap': lambda a: a, 'subprocess': types.SimpleNamespace(run=pg.run),
-          '_tak_ca_bundle': lambda: 'BUNDLE', '_cert_signed_by': lambda c, b: signed[c]}
+          '_tak_ca_bundle': lambda: 'BUNDLE', '_cert_signed_by': lambda c, b: signed[c],
+          '_tak_live_trust_bundle': lambda: ''}       # v10.3.4 W7: live truststore unreadable → disk bundle
     _load(['_cloudtak_reset_foreign_profile_certs'], ns)
     return ns, logs
 
@@ -547,7 +548,9 @@ def test_ca_bundle_signature_check_end_to_end(tmp_path):
 
 
 def test_post_update_runs_the_user_cert_reset_for_local_cloudtak_only():
-    body = APP[APP.index('def _ct_heal():'):]
-    body = body[:body.index("name='ct-cert-heal'")]
-    assert '_cloudtak_reset_foreign_profile_certs(_plog)' in body
-    assert "!= 'remote'" in body and "_cloudtak_bootstrap_cert_target(_s)[0] == 'local'" in body
+    # v10.3.4: the post-update thread and Revoke Old CA share _cloudtak_heal_after_ca_change().
+    body = _func('_cloudtak_heal_after_ca_change')
+    assert 'if _cloudtak_local_with_local_tak():' in body
+    assert body.index('_cloudtak_tak_cert_heal(') < body.index('_cloudtak_reset_foreign_profile_certs(_log)')
+    gate = _func('_cloudtak_local_with_local_tak')
+    assert "!= 'remote'" in gate and "_cloudtak_bootstrap_cert_target(settings)[0] == 'local'" in gate
