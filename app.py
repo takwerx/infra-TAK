@@ -19846,6 +19846,13 @@ _KNOWN_PUBLIC_PORTS = {
                                           # the UDP relay range 50000-50050 never shows in a TCP-only sweep.
 }
 
+# Processes that are known-good on a normal install and legitimately listen on a public
+# address (GH #315). ZeroTier's agent keeps a TCP control listener on 9993 beside the
+# 9993/udp it actually uses; the console doesn't manage it, so it is not in the catalog
+# above, but it is not a stranger either. Matched on the ss process name, not the port,
+# so an unrelated service that lands on 9993 is still flagged.
+_KNOWN_PUBLIC_PROCS = {'zerotier-one'}
+
 _exposure_cache = {'ts': 0.0, 'data': None}
 _EXPOSURE_TTL = 30  # seconds — cheap enough for the badge, fresh enough to trust
 
@@ -19916,13 +19923,19 @@ def _exposure_bind_of(port, listen_map):
 
 def _exposure_fw_states(fwstatus):
     """port -> {'open':bool,'deny':bool,'scoped':[sources]} parsed from the
-    normalized firewall rules (same line shape for ufw + firewalld)."""
+    normalized firewall rules (same line shape for ufw + firewalld).
+
+    TCP only: every listener the audit looks at comes from `ss -tln`, so a `9993/udp
+    ALLOW` rule says nothing about whether TCP 9993 is reachable. Counting it made a
+    firewall-blocked TCP listener look open and flagged it for review (GH #315)."""
     states = {}
     for ln in (fwstatus.get('rules') or []):
         parts = ln.split()
         if not parts:
             continue
         to = parts[0]
+        if to.lower().endswith('/udp'):
+            continue
         mm = re.match(r'^(\d{1,5})(?:/(?:tcp|udp|any))?$', to)
         if not mm:
             continue
@@ -20050,6 +20063,8 @@ def _exposure_report(force=False):
         if 'public' not in ent['scopes']:
             continue
         if p in known:
+            continue
+        if ent['procs'] and ent['procs'] <= _KNOWN_PUBLIC_PROCS:
             continue
         st = fw_states.get(p)
         reachable = (not fw_enabled) or bool(st and st.get('open'))
