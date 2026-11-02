@@ -9057,7 +9057,9 @@ def _diag_section_connectivity(settings):
     fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
     sip = str(settings.get('server_ip') or '').strip()
     if fqdn:
-        for host in (fqdn, f'tak.{fqdn}', f'infratak.{fqdn}', f'takportal.{fqdn}', f'authentik.{fqdn}'):
+        _tak_name = (_get_service_domain(settings, 'takserver') or '').strip()
+        for host in dict.fromkeys(h for h in (fqdn, f'tak.{fqdn}', f'infratak.{fqdn}', f'takportal.{fqdn}',
+                                              f'authentik.{fqdn}', _tak_name) if h):
             try:
                 ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
                 out.append(f"dns {host}: {', '.join(ips)}{'' if (not sip or sip in ips) else '   <-- not server_ip ' + sip}")
@@ -9119,8 +9121,24 @@ def _diag_section_connectivity(settings):
         argv = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}'] + (['-servername', sni] if sni else [])
         raw = _diag_cmd(argv, timeout=8, priv=False, stdin='')
         m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', raw, re.S)
-        out.append(f"tls {label}: {_diag_cert_enddate(m.group(0)) if m else 'no certificate presented'}")
+        out.append(f"tls {label}: {_diag_cert_enddate(m.group(0)) if m else 'no certificate presented'}"
+                   f"{_diag_chain_note(raw, enrollment=(port == 8446)) if m else ''}")
     return out
+
+
+def _diag_chain_note(raw, enrollment=False):
+    """One suffix for a `tls` line: does the certificate the box presents chain to a CA this box
+    trusts? Read from openssl s_client's own verdict, which verifies against the system store.
+    A Cloudflare Origin or private-CA certificate fails it, and on 8446 that is what makes phones
+    refuse QR enrollment and CloudTAK refuse to log in (ops #306)."""
+    m = re.search(r'Verify return code:\s*(\d+)\s*\(([^)]*)\)', raw or '')
+    if not m:
+        return ''
+    if m.group(1) == '0':
+        return '   [chain trusted]'
+    why = m.group(2).strip()[:80]
+    return (f"   <-- chain NOT trusted ({why})"
+            + ("; phones refuse this for QR enrollment and CloudTAK refuses it for login" if enrollment else ''))
 
 
 def _diag_section_containers(settings):

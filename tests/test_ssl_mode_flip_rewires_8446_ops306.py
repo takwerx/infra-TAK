@@ -98,3 +98,37 @@ def test_the_ssl_mode_route_calls_the_helper_after_reloading_caddy():
     route = _segment('caddy_set_ssl_mode')
     assert '_rewire_8446_after_acme_flip()' in route
     assert route.index('_caddy_reload_checked') < route.index('_rewire_8446_after_acme_flip()')
+
+
+# --- the diagnostics report says when 8446 presents a certificate nothing public trusts ------
+
+def _note():
+    ns = {'re': __import__('re')}
+    exec(_segment('_diag_chain_note'), ns)
+    return ns['_diag_chain_note']
+
+
+CF_RAW = ("---\nSSL-Session:\n    Verify return code: 20 (unable to get local issuer certificate)\n---\n")
+OK_RAW = "---\nSSL-Session:\n    Verify return code: 0 (ok)\n---\n"
+
+
+def test_untrusted_chain_on_8446_is_called_out_with_what_it_breaks():
+    note = _note()(CF_RAW, enrollment=True)
+    assert 'chain NOT trusted' in note and 'unable to get local issuer certificate' in note
+    assert 'QR enrollment' in note and 'CloudTAK' in note
+
+
+def test_untrusted_chain_elsewhere_has_no_enrollment_claim():
+    note = _note()(CF_RAW, enrollment=False)
+    assert 'chain NOT trusted' in note and 'QR enrollment' not in note
+
+
+def test_trusted_chain_and_missing_verdict():
+    assert _note()(OK_RAW, enrollment=True) == '   [chain trusted]'
+    assert _note()('no verdict here') == ''
+
+
+def test_the_tls_lines_use_the_note_and_the_tak_server_name_is_resolved():
+    conn = _segment('_diag_section_connectivity')
+    assert '_diag_chain_note(raw' in conn
+    assert "_get_service_domain(settings, 'takserver')" in conn
