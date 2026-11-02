@@ -58757,7 +58757,8 @@ window.ctConnectTak = function(btn) {
     body: JSON.stringify(body), credentials: 'same-origin'
   }).then(function(r) { return r.json(); }).then(function(d) {
     btn.disabled = false; btn.textContent = orig;
-    var p = document.getElementById('ct-connect-pass'); if (p) p.value = '';
+    var p = document.getElementById('ct-connect-pass'); if (p) { p.value = ''; p.type = 'password'; }
+    var eye = document.getElementById('ct-connect-pass-eye'); if (eye) { eye.textContent = '\ud83d\udc41'; eye.title = 'Show password'; }
     if (out) out.innerHTML = d && d.success
       ? '<span style="color:var(--green)">✓ ' + esc(d.message) + '</span>'
       : '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Connect failed') + '</span>';

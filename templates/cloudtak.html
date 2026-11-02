@@ -161,7 +161,10 @@
       <p style="margin:0 0 8px;font-size:12px;color:var(--text-secondary)">First-time setup: enter a TAK user (made in TAK Portal, a regular user, not an admin) who becomes CloudTAK's first system admin. TAK Portal adds an org suffix to usernames, so use the full name, e.g. <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-orgname</code>. The password goes to CloudTAK only; the console doesn't store or log it.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <input type="text" id="ct-connect-user" placeholder="TAK username" autocomplete="off" style="flex:1;min-width:180px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px">
-        <input type="password" id="ct-connect-pass" placeholder="TAK password" autocomplete="new-password" style="flex:1;min-width:180px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px">
+        <div style="flex:1;min-width:180px;position:relative;display:flex">
+          <input type="password" id="ct-connect-pass" placeholder="TAK password" autocomplete="new-password" style="flex:1;padding:8px 38px 8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:13px">
+          <button type="button" id="ct-connect-pass-eye" title="Show password" aria-label="Show password" onclick="var i=document.getElementById('ct-connect-pass');var show=i.type==='password';i.type=show?'text':'password';this.textContent=show?'🙈':'👁';this.title=show?'Hide password':'Show password';this.setAttribute('aria-label',this.title)" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:2px;color:var(--text-dim)">👁</button>
+        </div>
       </div>
     </div>
     <button class="btn btn-primary" id="ct-connect-btn" onclick="ctConnectTak(this)" style="font-size:12px;display:none">Connect CloudTAK to TAK Server</button>

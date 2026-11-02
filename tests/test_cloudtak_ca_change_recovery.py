@@ -357,3 +357,9 @@ def test_live_connection_with_trusted_or_unknown_user_certs_is_connected():
 def test_status_waits_out_the_api_restart_after_a_reconnect():
     js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
     assert "window.ctLoadConnectState(12);" in js and "d.status === 'unreachable' && (retries || 0) > 0" in js
+
+
+def test_password_field_has_a_show_toggle_and_hides_again_after_connect():
+    assert 'id="ct-connect-pass-eye"' in TEMPLATE and "i.type=show?'text':'password'" in TEMPLATE
+    js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
+    assert "p.value = ''; p.type = 'password';" in js
