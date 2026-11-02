@@ -38641,6 +38641,20 @@ def _tak_container_ids():
     return uid, gid
 
 
+# The 8446 connector as CoreConfig.xml has it. Attribute values hold slashes
+# (keystoreFile="certs/files/takserver-le.jks"), so the old `[^/]*/>` could not match the
+# connector this installer writes itself: every run after the first warned "pattern not
+# matched". Quoted values are skipped whole; the match ends at the first `/>` outside quotes.
+_TAK_8446_CONNECTOR_RE = re.compile(
+    r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"(?:"[^"]*"|[^">])*?/\s*>')
+
+
+def _tak_8446_connector_has_le(content):
+    """True iff the 8446 connector itself is already wired to the Let's Encrypt keystore."""
+    m = _TAK_8446_CONNECTOR_RE.search(content or '')
+    return bool(m and '_name="LetsEncrypt"' in m.group(0) and 'takserver-le.jks' in m.group(0))
+
+
 def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
     """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
     the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
@@ -38737,12 +38751,11 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
             f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
             'enableNonAdminUI="false"/>')
-        patched = re.sub(r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
-                         new_connector, content, count=1)
-        if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
+        patched = _TAK_8446_CONNECTOR_RE.sub(lambda _m: new_connector, content, count=1)
+        if patched != content and _tak_8446_connector_has_le(patched):
             _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
-        elif '_name="LetsEncrypt"' in content and 'takserver-le.jks' in content:
+        elif _tak_8446_connector_has_le(content):
             # Already wired to the LE keystore — re.sub was a no-op (patched==content).
             # This is the IDEMPOTENT re-run path (e.g. the LE-cert self-heal re-establishing
             # the renewal script after a container redeploy re-extracted /opt/tak and wiped
@@ -38944,10 +38957,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         # (or any other prefix). The (?:[A-Za-z][\w-]*:)? group accepts an optional
         # XML namespace prefix before the element name. Also accept `/ >` (with space)
         # which ElementTree emits with short_empty_elements=True on some Python versions.
-        patched = re.sub(
-            r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
-            new_connector, content, count=1
-        )
+        patched = _TAK_8446_CONNECTOR_RE.sub(lambda _m: new_connector, content, count=1)
         if patched != content:
             _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
@@ -38965,6 +38975,8 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
                     return False
             except Exception as _ve:
                 log_fn(f"  ⚠ Post-patch verify error: {_ve} (continuing — may need manual check)")
+        elif _tak_8446_connector_has_le(content):
+            log_fn("  ✓ CoreConfig.xml 8446 connector already set to the LE cert")
         else:
             log_fn("  ⚠ 8446 connector pattern not matched in CoreConfig.xml — check manually")
             log_fn(f"  ⚠ First 200 chars: {content[:200]!r}")
@@ -88827,7 +88839,8 @@ def takserver_rollback_log_api():
 
 
 def _verify_takserver_dpkg_ok(ulog):
-    """v0.9.44: return True iff `takserver` is fully configured (`install ok installed`).
+    """v0.9.44: return True iff `takserver` is fully configured (`<selection> ok installed`;
+    the selection can be `install` or `hold`).
 
     A .deb postinstall can fail and leave the package `half-configured` while the rest of
     the upgrade looked fine — field: test6 sat half-configured for 3 weeks while the update
@@ -88845,8 +88858,12 @@ def _verify_takserver_dpkg_ok(ulog):
     if r.returncode != 0 or not state:
         ulog("  ⚠ takserver not found in dpkg — skipping state verification")
         return True
-    if state == 'install ok installed':
-        ulog("✓ takserver dpkg state verified: install ok installed")
+    # Judge the 2nd and 3rd words (error flag + status), not the first (the apt selection).
+    # `hold ok installed` is a fully installed, fully configured package that someone pinned
+    # (apt-mark hold); failing the update on it was a false FAILED.
+    _parts = state.split()
+    if len(_parts) == 3 and _parts[1:] == ['ok', 'installed']:
+        ulog(f"✓ takserver dpkg state verified: {state}")
         return True
     ulog(f"✗ Upgrade left takserver dpkg state '{state}' — NOT fully configured.")
     ulog("  Reporting failure so it isn't missed. The console auto-repairs a half-configured")
