@@ -190,6 +190,7 @@ if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('tak-cert-row')){loadTakCertRow();}
+if(document.getElementById('tak-signer-row')){loadTakSignerRow();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
 function refreshTakServerCAState(){
   if(document.getElementById('cert-expiry-info'))loadCertExpiry();
@@ -373,13 +374,15 @@ async function loadTakCertRow(){
     var restarting=/^Step 4\/4/.test(step);
     el.innerHTML='<div style="display:flex;align-items:center;gap:12px">'
       +'<span style="width:18px;height:18px;flex:none;border:2px solid rgba(59,130,246,0.25);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite"></span>'
-      +'<div><div style="font-weight:600;color:var(--accent)">Fixing TAK Server\'s certificate… <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
+      +'<div><div style="font-weight:600;color:var(--accent)">'+(job.kind==='signer'?'Switching who signs TAK Server\'s certificate…':'Fixing TAK Server\'s certificate…')+' <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
       +'<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">'+escapeHtml(step)
       +(restarting?' TAK Server usually takes 1–3 minutes to come back; devices reconnect on their own.':'')+'</div></div></div>'
       +_takCertLog(job);
     var lg=el.lastChild;if(lg)lg.scrollTop=lg.scrollHeight;
+    var sr=document.getElementById('tak-signer-row');if(sr)sr.style.display='none';
     setTimeout(loadTakCertRow,2000);return;
   }
+  if(_takCertSawRun)loadTakSignerRow();
   // Never vanish: a busy box can miss one read (test12 under load, 2026-10-22). Say we're
   // checking, retry a few times, then say plainly that it couldn't be read, with a retry.
   if(!st||st.state==='unknown'){
@@ -404,7 +407,7 @@ async function loadTakCertRow(){
     _takCertStyle(el,'ok');
     el.style.padding=justFixed?'14px 20px':'8px 16px';
     el.innerHTML='<div title="Names on the certificate: '+escapeHtml((st.live||[]).join(', '))+'" style="font-weight:600;color:var(--green);font-size:12px">✓ TAK Server certificate covers '+escapeHtml(dom||st.expected[0]||'this server')+'</div>'
-      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Fixed. TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
+      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">'+(job.kind==='signer'?'Switched.':'Fixed.')+' TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
     return;
   }
   var miss=st.missing||[],head=(dom&&miss.indexOf(dom)>=0)?dom:miss[0];
@@ -416,6 +419,57 @@ async function loadTakCertRow(){
     +'Fixing keeps your CA, so enrolled devices don\'t re-enroll. TAK Server restarts and devices reconnect in about 1–2 minutes.</div>'
     +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Missing: '+miss.map(escapeHtml).join(', ')+(names?' · on the certificate now: '+names:'')+'</div>'
     +_takCertFixBtn+(failed?_takCertLog(job):'');
+}
+// v10.3.5 W3: who signs TAK Server's own certificate. ATAK trusts the root it enrolled with and
+// ignores the chain the server sends, so the signer decides whether rotating the intermediate
+// later drops every device (intermediate-signed) or not (root-signed).
+var _takSignerInfo=null;
+function _takSignerBtn(to,label){
+  return '<button type="button" class="tak-signer-btn" data-signer="'+to+'" onclick="switchTakSigner(this.dataset.signer)" style="padding:6px 14px;background:var(--bg-input,#0a0e1a);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:12px;font-weight:600;cursor:pointer">'+label+'</button>';
+}
+async function loadTakSignerRow(){
+  var el=document.getElementById('tak-signer-row');if(!el)return;
+  var d;
+  try{var r=await fetch('/api/takserver/server-cert/signer');d=await r.json();}catch(e){return;}
+  if(!d||!d.success){el.style.display='none';return;}
+  _takSignerInfo=d;
+  var root=escapeHtml(d.root_cn||'root CA'),inter=escapeHtml(d.intermediate_cn||'intermediate CA');
+  var who,sub,btns='';
+  if(d.mode==='root'){
+    who='<span style="color:var(--green)">Root CA</span> <span style="color:var(--text-dim)">('+root+')</span>';
+    sub='Rotating the intermediate CA won\'t disconnect devices: they keep connecting while users move to the new CA.';
+    btns=_takSignerBtn('intermediate','Switch to intermediate-signed');
+  }else if(d.mode==='intermediate'){
+    who='<span style="color:var(--yellow)">Intermediate CA</span> <span style="color:var(--text-dim)">('+inter+')</span>';
+    sub='Rotating the intermediate CA will disconnect every device until it scans a new QR code. Signing with the root CA avoids that.';
+    btns=_takSignerBtn('root','Switch to root-signed');
+  }else{
+    who='<span style="color:var(--yellow)">'+escapeHtml(d.issuer_cn||'unknown')+'</span> <span style="color:var(--text-dim)">(not this server\'s current CA)</span>';
+    sub='Reissue it with one of this server\'s CAs.';
+    btns=_takSignerBtn('root','Sign with the root CA')+' '+_takSignerBtn('intermediate','Sign with the intermediate CA');
+  }
+  var blocked=(d.blockers||[]);
+  el.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'
+    +'<div><div style="font-weight:600;color:var(--text-secondary)">Server certificate signed by: '+who+'</div>'
+    +'<div style="font-size:12px;color:var(--text-dim);margin-top:4px">'+sub+'</div>'
+    +(blocked.length?'<div style="font-size:12px;color:var(--yellow);margin-top:4px">'+blocked.map(escapeHtml).join(' ')+'</div>':'')
+    +'</div>'+(blocked.length?'':'<div style="display:flex;gap:8px;flex-wrap:wrap">'+btns+'</div>')+'</div>';
+  el.style.display='block';
+}
+async function switchTakSigner(to){
+  var d=_takSignerInfo||{},root=d.root_cn||'the root CA',inter=d.intermediate_cn||'the intermediate CA';
+  var msg=to==='root'
+    ?'Sign TAK Server\'s certificate with the root CA ('+root+')?\n\n• Enrolled devices keep working; TAK Server restarts and they reconnect in about 1–2 minutes\n• Afterwards, rotating the intermediate CA no longer disconnects every device\n• If this server federates, peers must trust this server\'s root CA, not only its intermediate\n• The current certificate is backed up first and restored if anything fails'
+    :'Sign TAK Server\'s certificate with the intermediate CA ('+inter+')?\n\n• Devices enrolled on '+inter+' keep working; TAK Server restarts and they reconnect in about 1–2 minutes\n• Devices still enrolled on an older intermediate CA will be disconnected\n• Afterwards, rotating the intermediate CA disconnects every device until it scans a new QR code\n• The current certificate is backed up first and restored if anything fails';
+  if(!confirm(msg))return;
+  var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
+  document.querySelectorAll('.tak-signer-btn').forEach(function(b){b.disabled=true;});
+  try{
+    var r=await fetch('/api/takserver/server-cert/signer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({signer:to,password:pw})});
+    var j=await r.json();
+    if(!j.success){alert(j.error||'Could not start the switch');loadTakSignerRow();return;}
+  }catch(e){alert('Error: '+e.message);loadTakSignerRow();return;}
+  _takCertSawRun=true;loadTakCertRow();
 }
 async function fixTakCert(){
   if(!confirm('Reissue TAK Server\'s certificate with this server\'s names?\n\n• Your CA stays the same, so enrolled devices keep working\n• TAK Server restarts; devices reconnect in about 1–2 minutes\n• The current certificate is backed up first and restored if anything fails'))return;
@@ -1165,6 +1219,7 @@ function showDeployConfig(){
       '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"></div>',
       '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"></div>',
       '</div>',
+      '<label style="display:flex;align-items:flex-start;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px;margin-top:4px"><input type="checkbox" id="server_cert_root_signed" style="width:18px;height:18px;margin-top:1px;accent-color:var(--accent)"><span>Sign the TAK Server certificate with the root CA <span style="color:var(--text-dim);font-size:12px">- recommended: lets you rotate the intermediate CA later without every device rescanning a QR code. You can switch either way later on the TAK Server page.</span></span></label>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate validity (days)</div>',
       '<div class="grid-2" style="margin-bottom:8px">',
       '<div class="form-field"><label>Intermediate CA validity (days)</label><input type="number" id="intermediate_ca_validity_days" placeholder="730" min="1" max="3652" value="730" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Default 730 (2 years)</span></div>',
@@ -1842,7 +1897,7 @@ async function startDeploy(){
     if(issVal!=null&&(isNaN(issVal)||issVal<1))issVal=null;
     var certPwEl=document.getElementById('cert_password');
     var certPw=certPwEl?(certPwEl.value||'').trim():'';
-    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
+    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode,server_cert_signer:document.getElementById('server_cert_root_signed').checked?'root':'intermediate'};
     document.getElementById('deploy-log-area').style.display='block';
     if(typeof initLogToolbar==='function')initLogToolbar('deploy-log');
     try{const r=await fetch('/api/deploy/takserver',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});const d=await r.json();if(d.success)pollDeployLog();else{document.getElementById('deploy-log').textContent='✗ '+d.error;btn.disabled=false;btn.textContent='🚀 Deploy TAK Server';btn.style.opacity='1';btn.style.cursor='pointer'}}

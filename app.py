@@ -81404,7 +81404,8 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0,
+                       'kind': 'fix'}  # v10.3.5 W3: 'fix' (names) or 'signer' (root <-> intermediate switch)
 
 
 def _tak_server_cert_names(settings):
@@ -82529,7 +82530,7 @@ def takserver_rotate_rootca_status():
 def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
-    job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job = {k: tak_server_cert_job.get(k) for k in ('running', 'complete', 'error', 'kind')}
     job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
@@ -82560,7 +82561,8 @@ def takserver_server_cert_fix():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='fix')
 
     def do_fix():
         log = tak_server_cert_job['log'].append
@@ -82650,6 +82652,181 @@ def takserver_server_cert_fix():
             tak_server_cert_job.update(running=False, complete=True, error=True)
 
     threading.Thread(target=do_fix, daemon=True).start()
+    return jsonify({'success': True, 'started': True})
+
+
+def _tak_coreconfig_keystore(cc_text):
+    """Absolute keystoreFile of CoreConfig's <tls> under <security> (what 8089/8443 present), or ''."""
+    sec = re.search(r'<security\b.*?</security>', cc_text or '', re.S)
+    m = re.search(r'<tls\b[^>]*>', sec.group(0) if sec else (cc_text or ''))
+    f = re.search(r'\bkeystoreFile="([^"]*)"', m.group(0)) if m else None
+    path = (f.group(1) if f else '').strip()
+    return os.path.join('/opt/tak', path) if path and not path.startswith('/') else path
+
+
+def _tak_server_cert_live_issuer():
+    """Issuer DN (RFC 2253) of the cert TAK Server presents right now, or None if not answering.
+    8443, not 8089, for the reason in _tak_server_cert_live_names(): same keystore, no log spam."""
+    try:
+        r = subprocess.run(['openssl', 's_client', '-connect', '127.0.0.1:8443'],
+                           input='', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', r.stdout, re.S)
+    return (_pem_dn(m.group(0), 'issuer') or None) if m else None
+
+
+def _tak_server_cert_signer_info(cert_dir='/opt/tak/certs/files'):
+    """What the TAK Server page's "signed by" row shows, plus why a switch would be refused."""
+    def cn(dn):
+        m = re.search(r'(?:^|,)CN=([^,]+)', dn or '')
+        return m.group(1) if m else ''
+    try:
+        root_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+    except Exception:
+        root_dn = ''
+    try:
+        int_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        int_dn = ''
+    try:
+        srv_issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+    except Exception:
+        srv_issuer = ''
+    mode = _tak_server_cert_mode(cert_dir)
+    blockers = []
+    if not _exists_priv(os.path.join(cert_dir, 'root-ca-do-not-share.key')):
+        blockers.append("The root CA's private key isn't on this server, so the certificate can't be signed by it.")
+    try:
+        ks = _tak_coreconfig_keystore(_read_priv('/opt/tak/CoreConfig.xml'))
+    except Exception:
+        ks = ''
+    if ks and os.path.basename(ks) != 'takserver.jks':
+        blockers.append(f"TAK Server presents {os.path.basename(ks)} on 8089, not its own certificate "
+                        "(a custom or Let's Encrypt certificate). Switching does not apply.")
+    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+            or rotate_intca_status.get('running')):
+        blockers.append('A certificate operation is already running.')
+    return {'mode': mode, 'root_cn': cn(root_dn), 'intermediate_cn': cn(int_dn),
+            'issuer_cn': cn(srv_issuer), 'blockers': blockers}
+
+
+@app.route('/api/takserver/server-cert/signer', methods=['GET', 'POST'])
+@login_required
+def takserver_server_cert_signer():
+    """v10.3.5 W3 — who signs TAK Server's own certificate: GET the mode, POST {signer, password}
+    to switch it. Root-signed lets the intermediate rotate without every phone rescanning (ATAK
+    trusts the root it enrolled with and ignores the chain we send). Reversible both ways.
+
+    The job mirrors the names fix: back up takserver.*, reissue through
+    _tak_server_cert_issue(), restart, wait until the LIVE cert's issuer is the one asked for,
+    and put the old files back on any failure. TAK Portal's CA file is rebuilt afterwards."""
+    cert_dir = '/opt/tak/certs/files'
+    if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if request.method == 'GET':
+        return jsonify({'success': True, **_tak_server_cert_signer_info(cert_dir)})
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    signer = data.get('signer')
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'success': False, 'error': 'signer must be root or intermediate'}), 400
+    info = _tak_server_cert_signer_info(cert_dir)
+    if any('already running' in b for b in info['blockers']):
+        return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
+    if info['blockers']:
+        return jsonify({'success': False, 'error': ' '.join(info['blockers'])}), 400
+    if info['mode'] == signer:
+        return jsonify({'success': False, 'error': f'The certificate is already signed by the {signer} CA.'}), 400
+    settings = load_settings()
+    want = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem' if signer == 'root' else 'ca.pem')),
+                   'subject')
+    if not want:
+        return jsonify({'success': False, 'error': 'Could not read the CA certificate to sign with.'}), 500
+    label = 'the root CA' if signer == 'root' else f"the intermediate CA ({info['intermediate_cn']})"
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='signer')
+
+    def do_switch():
+        log = tak_server_cert_job['log'].append
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
+        backed = []
+
+        def run(cmd, check=True):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
+                return False
+
+        def restore():
+            ok = all([run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed])
+            log("  ✓ Previous certificate restored" if ok else "  ✗ Restore incomplete — backups are "
+                f"{cert_dir}/takserver.*.{stamp}")
+            return ok
+
+        try:
+            log(f"━━━ Switching TAK Server's certificate to {label} ━━━")
+            log("Step 1/4: Backing up the current server certificate...")
+            for p in files:
+                if _exists_priv(p):
+                    if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + "." + stamp)}'):
+                        raise Exception('Backup failed — nothing was changed')
+                    backed.append(p)
+            log(f"  ✓ Saved as {cert_dir}/takserver.*.{stamp}")
+
+            log(f"Step 2/4: Reissuing the server certificate, signed by {label}...")
+            if not _tak_server_cert_issue(settings, signer, log, run, cert_dir):
+                restore()
+                raise Exception('Reissuing the certificate failed')
+            got = _pem_dn(_read_priv(f'{cert_dir}/takserver.pem'), 'issuer')
+            if got != want:
+                restore()
+                raise Exception(f'The new certificate is signed by {got or "nobody"}, not {want}')
+            log("  ✓ New certificate written")
+
+            log("Step 3/4: Restarting TAK Server (devices reconnect on their own)...")
+            if not run('systemctl restart takserver 2>&1'):
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server restart failed')
+            live, end = None, time.time() + 300
+            while time.time() < end:
+                time.sleep(5)
+                live = _tak_server_cert_live_issuer()
+                if live == want:
+                    break
+            if live != want:
+                log("  ✗ TAK Server didn't come back presenting the new certificate within 5 minutes")
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server did not pick up the new certificate')
+            log(f"  ✓ TAK Server is presenting a certificate signed by {label}")
+
+            log("Step 4/4: Updating TAK Portal's copy of the server certificate...")
+            if _takportal_web_container() is None:
+                log("  TAK Portal isn't running here — nothing to update")
+            else:
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+                log(f"  {'✓' if _tp_ok else '⚠'} {_tp_msg}")
+            log("")
+            log("━━━ DONE ━━━")
+            tak_server_cert_job.update(running=False, complete=True, error=False)
+        except Exception as e:
+            log("")
+            log(f"✗ FAILED: {e}")
+            tak_server_cert_job.update(running=False, complete=True, error=True)
+
+    threading.Thread(target=do_switch, daemon=True).start()
     return jsonify({'success': True, 'started': True})
 
 
@@ -90222,6 +90399,10 @@ def deploy_takserver():
     # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
     # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
     # here and returns BEFORE the byte-identical .deb selection logic below.
+    # v10.3.5 W2: who signs TAK Server's own cert. An option, not forced: default intermediate.
+    server_cert_signer = data.get('server_cert_signer') or 'intermediate'
+    if server_cert_signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'error': 'server_cert_signer must be root or intermediate'}), 400
     _explicit_method = data.get('install_method') if data.get('install_method') in ('native', 'container') else None
     _method = _explicit_method or _tak_install_method()
     # Auto-correct an un-pinned method to match the uploaded artifact: if we'd take
@@ -90266,6 +90447,7 @@ def deploy_takserver():
             'enable_admin_ui': data.get('enable_admin_ui', False),
             'enable_webtak': data.get('enable_webtak', False),
             'webadmin_password': data.get('webadmin_password', ''),
+            'server_cert_signer': server_cert_signer,
         }
         cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
         if cert_password:
@@ -90326,6 +90508,7 @@ def deploy_takserver():
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
         'webadmin_password': data.get('webadmin_password', ''),
+        'server_cert_signer': server_cert_signer,
     }
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
         matches = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(ext)]
