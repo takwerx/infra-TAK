@@ -31963,6 +31963,33 @@ def caddy_custom_cert():
     return jsonify({'success': True, 'message': msg, 'warnings': v['warnings'], 'not_after': v['not_after']})
 
 
+def _rewire_8446_after_acme_flip():
+    """Custom certificate -> automatic HTTPS: move TAK Server's 8446 enrollment connector onto
+    the Let's Encrypt certificate too (ops #306).
+
+    Uploading a custom certificate re-wires 8446 onto it, but switching back used to leave 8446
+    on the operator's certificate until the next daily console restart, and only then if Caddy
+    had issued the TAK Server name by that time. A Cloudflare Origin certificate is trusted by
+    nothing except Cloudflare, so for that long phones could not enroll by QR and CloudTAK could
+    not log in (both talk to 8446 and verify the certificate). Runs in the background: it waits
+    for Caddy's certificate, then keeps retrying for 30 min (one TAK restart when it lands).
+    Returns True when a re-wire was started, False when there is no TAK Server here or no TAK
+    Server name to wire."""
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return False
+    tak_host = _get_service_domain(load_settings(), 'takserver')
+    if not tak_host:
+        return False
+
+    def _rewire_8446():
+        try:
+            _install_le_cert_on_8446_at_deploy(tak_host, lambda m: print(f"[ssl-mode 8446] {m}", flush=True))
+        except Exception as e:
+            print(f"[ssl-mode 8446] re-wire error (non-fatal; the daily console heal retries): {e}", flush=True)
+    threading.Thread(target=_rewire_8446, daemon=True, name='ssl-mode-8446').start()
+    return True
+
+
 @app.route('/api/caddy/ssl-mode', methods=['POST'])
 @login_required
 def caddy_set_ssl_mode():
@@ -31996,7 +32023,10 @@ def caddy_set_ssl_mode():
                 if _reassert_mediamtx_cert_grant(lambda m: print(f"ssl-mode flip: {m}", flush=True)):
                     return
         threading.Thread(target=_delayed_mtx_grant, daemon=True).start()
-    return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
+    msg = "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."
+    if _rewire_8446_after_acme_flip():
+        msg += " TAK Server's enrollment certificate (port 8446) follows as soon as the TAK Server name has its certificate, and TAK Server restarts once when it does."
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/caddy/acme', methods=['GET'])
