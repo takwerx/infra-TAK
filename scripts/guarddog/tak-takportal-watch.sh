@@ -38,6 +38,21 @@ if [ -z "$PROJECT" ]; then
   PROJECT="$(basename "$PORTAL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[_-]*//')"
 fi
 
+# ops #416: a compose recreate that was cut off leaves `<hash>_tak-portal` (and its worker)
+# under the temporary name compose gives a container it is about to replace. The label check
+# below still sees them as running, so nothing noticed for as long as the box stayed up. Put
+# them back, unless a compose run is in flight (that is the same name for a few seconds).
+if type gd_compose_strays >/dev/null 2>&1 && [ -n "$(gd_compose_strays "$PROJECT")" ]; then
+  mkdir -p /var/log/takguard
+  if gd_compose_in_flight; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | takportal-watch | compose-strays | leftover TAK Portal container found, a compose run is in flight — next tick retries" >> /var/log/takguard/restarts.log
+  else
+    gd_heal_compose_strays "$PROJECT" | while IFS= read -r _l; do
+      echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | takportal-watch | $_l" >> /var/log/takguard/restarts.log
+    done
+  fi
+fi
+
 # Health: EVERY service in the project is running — web, worker, Postgres (v10.1.60 W3).
 # Upstream's main runs on Postgres now, and a dead Postgres or worker leaves the web
 # container "running" while the portal serves its stack-down page — the web-only check
