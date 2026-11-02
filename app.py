@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.4-alpha"
+VERSION = "10.3.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1307,13 +1307,16 @@ AUTHENTIK_DEV_RELEASE    = "2026.8.5"   # OFFLINE FALLBACK ONLY — dev channel 
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
 # contract; pre-13.45 plugin installs are still refused (compatibility floor — unchanged).
-CLOUDTAK_VETTED_RELEASE = "13.54.3"     # OFFLINE FALLBACK ONLY since v10.1.17 — the CloudTAK version
+CLOUDTAK_VETTED_RELEASE = "13.117.1"    # OFFLINE FALLBACK ONLY since v10.1.17 — the CloudTAK version
                                         # gate is REMOVED (operator decision 2026-08-02, reversing the
                                         # 2026-07-26 "the gate stays": dfpc-coe ships too fast to keep
                                         # bumping a pin by hand, and customers want the new builds).
                                         # BOTH channels now deploy and update to upstream latest; this
                                         # value is used only when the GitHub release lookup is
                                         # unreachable. Bump to current latest when convenient.
+                                        # ops #392: 13.54.3 -> 13.117.1. The old value built a MinIO image
+                                        # that is gone (quay.io 401) and lacks the SSRF fix in 13.117.0.
+                                        # tests/test_cloudtak_fallback_pin_ops392.py keeps it from going stale.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
@@ -1350,7 +1353,11 @@ TAKPORTAL_REPO = "https://github.com/ValleyTacticalSolutions/TAK-Portal.git"
 # and in settings, instead of an anonymous branch tip. Same shape as the CloudTAK
 # deploy's `remote_release_tag`. Freezing it to one version is a live product
 # decision (update cadence vs supply-chain strictness) — see ROADMAP.
-TAKPORTAL_REF_FALLBACK = "2.0.26"   # used only when the releases API is unreachable
+TAKPORTAL_REF_FALLBACK = "2.0.30"   # used only when the releases API is unreachable
+# ops #395: bumped 2.0.26 -> 2.0.30. 2.0.30 blocks usernames TAK Server cannot handle (TAK-Portal#82) and
+# ships the same marketplace-helper bytes as 2.0.29, which the broker already pins. An offline deploy
+# on 2.0.26 would have installed the unreviewed root helper. Box-tested as an update (test12) and as a
+# fresh deploy (fresh-install, Ubuntu 22.04).
 # ops #343: bumped 1.4.6 -> 2.0.26 (TAK Portal's reply to our dependency-refresh request,
 # TAK-Portal#77, ships in 2.0.26). The old 1.x floor would have put an offline-API deploy on
 # a Portal that predates the hardened sudo grant (2.0.19+). Box-tested fresh and as an
@@ -2146,6 +2153,64 @@ def _update_error_line(text, limit=600):
         return ''
     pick = next((l for l in reversed(lines) if _UPDATE_ERROR_RE.search(l)), lines[-1])
     return pick[:limit]
+
+
+# Docker build/compose lines that only say "still going": the progress ledger, not the reason.
+_BUILD_PROGRESS_RE = re.compile(
+    r'^\s*(?:\[\+\]\s|(?:Image|Container|Network|Volume|Service)\s+\S+\s+(?:Building|Built|Creating|Created|'
+    r'Starting|Started|Pulling|Pulled|Recreate|Recreated|Running|Waiting|Healthy|Stopping|Stopped|Removing|'
+    r'Removed|Restarting|Restarted)\s*$|'
+    r'(?:DONE|CACHED|CANCELED|\[[^\]]+\]\s|\.{3}\s*$|sha256:|transferring|resolve\s|exporting|reading\s|writing image|'
+    r'naming to|load build|load metadata|load \.dockerignore|Building\s*$)|-{3,}\s*$|>\s*\[[\w.-]+\s+\d+/\d+\]|'
+    r'\d+(?:\.\d+)?\s*$)', re.I)
+_BUILD_STEP_PREFIX_RE = re.compile(r'^(?:#\d+\s+)?(?:\d+(?:\.\d+)?\s+)?')
+_BUILD_FAILED_STEP_RE = re.compile(
+    r'process "(?:/bin/sh -c )?(.+?)" did not complete successfully(?::\s*exit code:\s*(\d+))?')
+# compose prints the Dockerfile around the failing line (`3 | >>> RUN ...`, `Dockerfile:3`)
+_BUILD_LISTING_RE = re.compile(r'^(?:\d+\s*\||Dockerfile:\d+\s*$)')
+
+
+def _build_failure_text(output, limit=500, tail_lines=6):
+    """What a failed `docker compose up --build` actually said, in one line.
+
+    compose/buildkit write the progress ledger first and the reason last. Keeping the HEAD
+    of the output (`[:400]`) kept only "Image <name> Building" (Aust-TAK, ops #380): the TAK
+    Portal Update record said the worker image "Building" and nothing about why it stopped.
+
+    Drops the progress lines, the Dockerfile listing and the `#NN 12.3 ` buildkit prefixes,
+    keeps the last few distinct lines that are left (the reason: `ERROR: unable to select
+    packages`, `Resolving github.com... failed`, `failed to resolve source metadata ... no
+    such host`, `npm error ...`), and appends the Dockerfile step that failed. One physical
+    line, so _update_error_line() and the Diagnostics summary both carry the cause.
+    Pass stdout AND stderr: with a non-tty compose the step output is on stdout and only the
+    wrapper is on stderr. Never raises.
+    """
+    try:
+        text = _ANSI_RE.sub('', str(output or '')).replace('\r', '\n')
+        failed_step = ''
+        kept = []
+        for raw in text.splitlines():
+            raw = raw.strip()
+            m = _BUILD_FAILED_STEP_RE.search(raw)
+            if m:
+                failed_step = m.group(1).strip() + (', exit code %s' % m.group(2) if m.group(2) else '')
+                continue            # the wrapper line says nothing the step doesn't
+            if _BUILD_LISTING_RE.match(raw):
+                continue
+            ln = _BUILD_STEP_PREFIX_RE.sub('', raw).strip()
+            if 'failed to solve' in ln:
+                ln = ln.split('failed to solve', 1)[1].lstrip(': ').strip()   # keep a real reason, drop the label
+            if not ln or _BUILD_PROGRESS_RE.match(ln):
+                continue
+            if ln in kept:
+                kept.remove(ln)     # buildkit prints the failing step's output twice; keep the later one
+            kept.append(ln)
+        cause = ' | '.join(kept[-tail_lines:])
+        if failed_step:
+            cause = (cause + ' ' if cause else '') + '(failed step: %s)' % failed_step[:200]
+        return _mod_result_scrub(cause)[-limit:].strip() if cause else ''
+    except Exception:
+        return ''
 
 
 def _mod_result_scrub(text):
@@ -21052,6 +21117,10 @@ def _f2b_banaction_media():
 # constant: the federation ports are listed whether or not federation is on, because
 # blocking a port nothing listens on costs nothing and keeps every box identical.
 _F2B_TAK_PORTS_TCP = '8089,8443,8446,9000,9001'
+# The takserver-badcert jail (v10.3.4) blocks the same ports MINUS enrollment (8446). A
+# device TAK refuses is cut off from streaming but can always reach 8446 to re-enroll;
+# banning 8446 is what made the fresh QR fail after a CA rotation (test6, 2026-11-01).
+_F2B_TAK_BADCERT_PORTS_TCP = '8089,8443,9000,9001'
 
 
 def _f2b_banaction_tak():
@@ -21071,6 +21140,11 @@ def _f2b_banaction_tak():
     iptables-multiport handles IPv4 and IPv6 and runs on both families (see the media
     action); TAK's listeners are all TCP, so one instance is enough."""
     return f'iptables-multiport[name=takserver, port="{_F2B_TAK_PORTS_TCP}", protocol=tcp]'
+
+
+def _f2b_banaction_tak_badcert():
+    """Ban action for the takserver-badcert jail: TAK's ports except enrollment (8446)."""
+    return f'iptables-multiport[name=takserver-badcert, port="{_F2B_TAK_BADCERT_PORTS_TCP}", protocol=tcp]'
 
 
 def _f2b_sshd_logpath():
@@ -21247,8 +21321,33 @@ _F2B_OWNED_FILTERS = {
         "# suspend. Counting them banned every phone behind one carrier NAT address (field\n"
         "# report 2026-10-01). Every other error on these lines, including kinds not seen\n"
         "# yet, still counts.\n"
+        "# v10.3.4: a REFUSED CLIENT CERTIFICATE is ignored here too and counted by the\n"
+        "# takserver-badcert jail instead, which never blocks enrollment (8446). That is a\n"
+        "# real phone holding a cert from a CA TAK no longer trusts (rotation, revoke,\n"
+        "# expiry); banning it here also banned 8446, so the fresh QR could not connect.\n"
+        "# TAK logs it as `SSLHandshakeException: General OpenSslEngine problem`, or names\n"
+        "# the cert (`Peer certificate Subject DN:`). Not `Certificate error: peer not\n"
+        "# verified`: TAK writes that on scanner lines too.\n"
         "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
         "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex = Cause: recvAddress\\(\\.\\.\\) failed with error\\(-\\d+\\)\n"
+        "              Cause: javax\\.net\\.ssl\\.SSLHandshakeException: General OpenSslEngine problem\\.\n"
+        "              Peer certificate Subject DN:\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n"
+    ),
+    'takserver-badcert': (
+        "[Definition]\n"
+        "# v10.3.4 — TAK Server REFUSED CLIENT CERTIFICATE lines only: a device presented a\n"
+        "# cert TAK no longer trusts (intermediate rotated or revoked, cert expired). These\n"
+        "# are real phones retrying (ATAK about 4/min, TAK Aware about 40/min), so the jail\n"
+        "# on this filter is a flood guard only and never blocks 8446, where the device goes\n"
+        "# to re-enroll. Everything else (no cert, not TLS, unknown) is the takserver jail's.\n"
+        "# The two alternatives can't both match one line (the lookahead), so no double count.\n"
+        "# Connection resets are ignored, the same as in the takserver filter.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error\\. Cause: javax\\.net\\.ssl\\.SSLHandshakeException: General OpenSslEngine problem\\. Additional info: Remote address: <HOST>;\n"
+        "            NioNettyServerHandler error\\. Cause: (?!javax\\.net\\.ssl\\.SSLHandshakeException: General OpenSslEngine problem\\.).*Remote address: <HOST>;.*Peer certificate Subject DN:\n"
         "ignoreregex = Cause: recvAddress\\(\\.\\.\\) failed with error\\(-\\d+\\)\n"
         "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
         "              {^LN-BEG}\n"
@@ -21325,6 +21424,24 @@ _F2B_LEGACY_FILTERS = {
         "ignoreregex =\n"
         "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
         "              {^LN-BEG}\n",
+        # v10.2.2–v10.3.3: resets ignored, but a REFUSED CERT still counted, so a real
+        # phone cut off by a CA rotation/revoke was banned on every TAK port INCLUDING
+        # enrollment (8446) and could not re-enroll for an hour (test6, 2026-11-01).
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# v10.2.2: network-level read errors are IGNORED. `recvAddress(..) failed with\n"
+        "# error(-104): Connection reset by peer` (and -103 abort, -110 timeout) is a client\n"
+        "# dropping its TCP connection, which phones do on every tower/network change or app\n"
+        "# suspend. Counting them banned every phone behind one carrier NAT address (field\n"
+        "# report 2026-10-01). Every other error on these lines, including kinds not seen\n"
+        "# yet, still counts.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex = Cause: recvAddress\\(\\.\\.\\) failed with error\\(-\\d+\\)\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n",
     ],
     'authentik': [
         # v0.9.0–v10.1.11: matched "action": "login_failed", a string Authentik never
@@ -21360,8 +21477,9 @@ _F2B_LEGACY_FILTERS = {
 _F2B_UPGRADE_WHY = {
     'authentik': 'authentik: the old pattern could never match a real log line, so the jail banned nobody',
     'mediamtx-rtsp': 'mediamtx-rtsp: the old pattern counted successful stream opens, banning legitimate viewers',
-    'takserver': 'takserver: the old pattern counted dropped connections (resets) as attacks, banning phones '
-                 'behind shared carrier addresses; handshake and non-TLS errors still count',
+    'takserver': 'takserver: the old pattern counted dropped connections (resets) and refused certificates '
+                 'as attacks, banning real phones, enrollment port included; refused certificates now go to '
+                 'the takserver-badcert flood guard, and scanner errors (no cert, not TLS) still count here',
 }
 
 
@@ -22737,6 +22855,67 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"action   = {_f2b_banaction_tak()}{guarddog_action}\n"
     )
     _write_priv(jail_path, jail_conf)
+    # The badcert jail lives and dies with this one, with the same whitelist, so every
+    # path that writes the takserver jail (toggle, whitelist change, converge) writes both.
+    _f2b_write_tak_badcert_jail_config(ignoreip)
+
+
+# takserver-badcert (v10.3.4): a refused client certificate is a real phone retrying, not
+# an attacker, so this is a flood guard only. 600 refusals in 5 min is 2 handshakes/s
+# sustained; ATAK retries about 4/min and TAK Aware about 40/min, so it takes ~15 iOS
+# devices behind one NAT address to reach it. Fleet constants, no knobs (operator, D1).
+_F2B_TAK_BADCERT_JAIL_PATH = '/etc/fail2ban/jail.d/infratak-takserver-badcert.conf'
+_F2B_TAK_BADCERT_FILTER_PATH = '/etc/fail2ban/filter.d/takserver-badcert.conf'
+_F2B_TAK_BADCERT_ACTION_PATH = '/etc/fail2ban/action.d/infratak-guarddog-takserver-badcert.conf'
+_F2B_TAK_BADCERT_MAXRETRY = 600
+_F2B_TAK_BADCERT_FINDTIME = 300
+_F2B_TAK_BADCERT_BANTIME = 600
+
+
+def _f2b_tak_badcert_jail_text(ignoreip=''):
+    """The takserver-badcert jail file for this whitelist. The Guard Dog action is listed
+    only when its file exists, the same as the takserver jail."""
+    guarddog_action = ""
+    if os.path.exists(_F2B_TAK_BADCERT_ACTION_PATH):
+        guarddog_action = "\n         infratak-guarddog-takserver-badcert"
+    return (
+        "[takserver-badcert]\n"
+        "enabled  = true\n"
+        "filter   = takserver-badcert\n"
+        "logpath  = /opt/tak/logs/takserver-messaging.log\n"
+        "backend  = auto\n"
+        f"maxretry = {_F2B_TAK_BADCERT_MAXRETRY}\n"
+        f"findtime = {_F2B_TAK_BADCERT_FINDTIME}\n"
+        f"bantime  = {_F2B_TAK_BADCERT_BANTIME}\n"
+        f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
+        f"action   = {_f2b_banaction_tak_badcert()}{guarddog_action}\n"
+    )
+
+
+def _f2b_tak_badcert_prereqs():
+    """Write the takserver-badcert filter (when missing) and Guard Dog action (when the
+    takserver jail has one and ours differs). True when anything was written.
+
+    The filter must exist before the jail: a jail whose filter is missing makes fail2ban
+    skip it and fail `fail2ban-client -t` for the whole daemon. An existing filter that
+    isn't ours is left alone (same rule as _f2b_selfheal_filters)."""
+    wrote = False
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+    if not os.path.exists(_F2B_TAK_BADCERT_FILTER_PATH):
+        _write_priv(_F2B_TAK_BADCERT_FILTER_PATH, _F2B_OWNED_FILTERS['takserver-badcert'])
+        wrote = True
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog-takserver.conf'):
+        if _f2b_read_text(_F2B_TAK_BADCERT_ACTION_PATH) != _F2B_TAK_BADCERT_GUARDDOG_ACTION:
+            _write_priv(_F2B_TAK_BADCERT_ACTION_PATH, _F2B_TAK_BADCERT_GUARDDOG_ACTION)
+            wrote = True
+    return wrote
+
+
+def _f2b_write_tak_badcert_jail_config(ignoreip=''):
+    """Write the takserver-badcert jail, its filter and Guard Dog action first."""
+    _f2b_tak_badcert_prereqs()
+    _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+    _write_priv(_F2B_TAK_BADCERT_JAIL_PATH, _f2b_tak_badcert_jail_text(ignoreip))
 
 
 # One TAK handshake failure, as TAK Server logs it (real line, address changed):
@@ -22752,14 +22931,19 @@ _F2B_TAK_SUBJECT_RE = re.compile(r'Peer certificate Subject DN: ([^;]+);')
 
 
 def _f2b_tak_failure_kind(cause, rest):
-    """Plain category of one TAK handshake failure: bad_cert, no_cert, not_tak or other."""
+    """Plain category of one TAK handshake failure: bad_cert, no_cert, not_tak or other.
+
+    bad_cert is exactly what the takserver-badcert filter counts and the takserver filter
+    ignores (a test holds the three together). `Certificate error: peer not verified` is
+    NOT a bad-cert sign: TAK writes it on scanner lines too."""
+    if (cause.startswith('javax.net.ssl.SSLHandshakeException: General OpenSslEngine problem')
+            or 'Peer certificate Subject DN:' in rest):
+        return 'bad_cert'
     if 'PEER_DID_NOT_RETURN_A_CERTIFICATE' in cause:
         return 'no_cert'
     if any(k in cause for k in ('NotSslRecordException', 'UNSUPPORTED_PROTOCOL',
                                 'NO_SHARED_CIPHER', 'NO_SHARED_GROUP', 'WRONG_VERSION')):
         return 'not_tak'
-    if 'SSLHandshakeException' in cause or 'Certificate error' in rest:
-        return 'bad_cert'
     return 'other'
 
 
@@ -22799,10 +22983,14 @@ def _f2b_duration_label(seconds):
     return f'{max(1, seconds // 60)} min'
 
 
-def _f2b_tak_ban_explain(ip, kind, subject, duration):
-    """What a takserver-jail ban means, in words an operator can act on. Kept in step with
-    the copy inside infratak-f2b-notify (the ban e-mail); a test holds them together."""
-    if kind == 'bad_cert':
+def _f2b_tak_ban_explain(ip, kind, subject, duration, jail='takserver'):
+    """What a takserver / takserver-badcert ban means, in words an operator can act on.
+    Kept in step with the copy inside infratak-f2b-notify (the ban e-mail); a test holds
+    them together."""
+    if jail == 'takserver-badcert':
+        msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
+               f"TAK streaming for {duration}. It can still re-enroll: scan a fresh QR.")
+    elif kind == 'bad_cert':
         msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
                f"TAK for {duration}. Usually that's an ATAK/iTAK profile with an old "
                f"certificate. Re-enroll it or remove that server from the device.")
@@ -22823,22 +23011,288 @@ _F2B_TAK_LOG = '/opt/tak/logs/takserver-messaging.log'
 _F2B_TAK_LOG_TAIL_BYTES = 16 * 1024 * 1024
 
 
-def _f2b_tak_ban_details(ips, bantime):
-    """{ip: {'kind', 'subject', 'count', 'explain'}} for the takserver jail's banned IPs.
+def _f2b_tak_ban_details(ips, bantime, jail='takserver', lines=None):
+    """{ip: {'kind', 'subject', 'count', 'explain', 'jail'}} for one TAK jail's banned IPs.
     Reads the tail of TAK's messaging log directly (it is world-readable; never through the
-    broker, see _diag_tail). An address with no lines left in the tail still gets a generic
-    explanation rather than none."""
+    broker, see _diag_tail) unless the caller already has it. An address with no lines left
+    in the tail still gets a generic explanation rather than none."""
     if not ips:
         return {}
-    lines = _diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or []
+    if lines is None:
+        lines = _diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or []
     found = _f2b_tak_failures(lines, ips)
     duration = _f2b_duration_label(bantime)
     out = {}
     for ip in ips:
         rec = found.get(ip) or {'kind': 'other', 'count': 0, 'subject': ''}
-        rec['explain'] = _f2b_tak_ban_explain(ip, rec['kind'], rec['subject'], duration)
+        rec['explain'] = _f2b_tak_ban_explain(ip, rec['kind'], rec['subject'], duration, jail)
+        rec['jail'] = jail
         out[ip] = rec
     return out
+
+
+# v10.3.4 W5 — "Devices TAK is refusing" (help-desk view). TAK names a device when it
+# subscribes, never when it's refused, so the refused address is tied back to the last
+# subscription seen from it:
+#   ... Set client for subscription: tls:9 to TAKWERX-S22 (ANDROID-54a5195bbd8830c2) source=98.97.143.175:48746
+# The callsign and UID are set by the DEVICE: they're shown escaped and never enter SQL.
+_F2B_TAK_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}-\d{2}:\d{2}:\d{2})')
+_F2B_TAK_SUB_RE = re.compile(r'Set client for subscription: \S+ to (?P<callsign>.*) \((?P<uid>[^()\s]+)\) '
+                             r'source=(?P<src>\S+)')
+_F2B_TAK_REFUSED_WINDOW = 1800
+_F2B_TAK_CERT_ROWS_TTL = 60
+_F2B_TAK_CERT_ROWS_CACHE = {'at': 0.0, 'rows': None, 'error': ''}
+
+
+def _f2b_tak_log_epoch(line):
+    """Epoch seconds of a TAK log line (TAK logs in the box's local time), or None."""
+    m = _F2B_TAK_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return time.mktime(time.strptime(m.group(1), '%Y-%m-%d-%H:%M:%S'))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _f2b_tak_refused(lines, now, window=_F2B_TAK_REFUSED_WINDOW):
+    """({ip: refusal record}, {ip: [(epoch, callsign, uid)]}, {uid: last ip}) from the
+    messaging-log tail. A record covers the refusals in the last `window` seconds (count,
+    first, last, most frequent kind, last Subject DN) plus who the address belongs to: the
+    last subscription from it before its FIRST refusal in the tail. Resets are skipped, the
+    same as both jails."""
+    subs, uid_ip, first_any, refused = {}, {}, {}, {}
+    for line in lines:
+        if 'Set client for subscription' in line:
+            m = _F2B_TAK_SUB_RE.search(line)
+            t = _f2b_tak_log_epoch(line)
+            if m and t is not None:
+                ip = m.group('src').rsplit(':', 1)[0].strip('[]')
+                subs.setdefault(ip, []).append((t, m.group('callsign').strip()[:80], m.group('uid')[:128]))
+                uid_ip[m.group('uid')[:128]] = ip
+            continue
+        if 'NioNettyServerHandler error' not in line:
+            continue
+        m = _F2B_TAK_FAIL_RE.search(line)
+        if not m or 'recvAddress(..) failed' in m.group('cause'):
+            continue
+        t = _f2b_tak_log_epoch(line)
+        if t is None:
+            continue
+        ip = m.group('ip')
+        first_any.setdefault(ip, t)
+        if t < now - window:
+            continue
+        rec = refused.setdefault(ip, {'count': 0, 'first': t, 'last': t, 'kinds': {}, 'subject': ''})
+        rec['count'] += 1
+        rec['last'] = t
+        kind = _f2b_tak_failure_kind(m.group('cause'), m.group('rest'))
+        rec['kinds'][kind] = rec['kinds'].get(kind, 0) + 1
+        s = _F2B_TAK_SUBJECT_RE.search(m.group('rest'))
+        if s:
+            rec['subject'] = s.group(1).strip()[:200]
+    for ip, rec in refused.items():
+        kinds = rec.pop('kinds')
+        rec['kind'] = max(kinds, key=kinds.get)
+        before = [s for s in subs.get(ip, []) if s[0] <= first_any[ip]]
+        rec['callsign'], rec['uid'] = (before[-1][1], before[-1][2]) if before else ('', '')
+    return refused, subs, uid_ip
+
+
+def _f2b_tak_cert_rows():
+    """({client_uid: {'user', 'pem', 'expires', 'revoked'}}, error) — each UID's NEWEST row
+    in TAK's certificate table, through the cot seam (works on a split / managed DB).
+    Fixed SQL only: the UIDs come from devices, so the match happens here, not in SQL.
+    Cached briefly; the page polls."""
+    c = _F2B_TAK_CERT_ROWS_CACHE
+    if c['rows'] is not None and time.time() - c['at'] < _F2B_TAK_CERT_ROWS_TTL:
+        return c['rows'], ''
+    sql = ("SELECT DISTINCT ON (client_uid) client_uid, coalesce(nullif(user_dn, ''), creator_dn, ''), "
+           "extract(epoch from expiration_date)::bigint, (revocation_date IS NOT NULL), "
+           "replace(replace(certificate, chr(13), ''), chr(10), '') FROM certificate "
+           "WHERE coalesce(client_uid, '') <> '' ORDER BY client_uid, issuance_date DESC")
+    r = _cot_pg_exec(['psql', 'cot', '-tAF', '\t', '-c', sql], timeout=30)
+    if r.returncode != 0:
+        err = ((r.stderr or '').strip().splitlines() or ['query failed'])[-1][:200]
+        return None, f'TAK certificate table: {err}'
+    rows = {}
+    for line in (r.stdout or '').splitlines():
+        parts = line.split('\t')
+        if len(parts) != 5:
+            continue
+        body = re.sub(r'-----(BEGIN|END) CERTIFICATE-----|\s', '', parts[4])
+        pem = ('-----BEGIN CERTIFICATE-----\n' + '\n'.join(body[i:i + 64] for i in range(0, len(body), 64))
+               + '\n-----END CERTIFICATE-----\n') if body else ''
+        try:
+            expires = int(parts[2])
+        except ValueError:
+            expires = None
+        rows[parts[0]] = {'user': parts[1][:200], 'pem': pem, 'expires': expires, 'revoked': parts[3] == 't'}
+    c.update(at=time.time(), rows=rows, error='')
+    return rows, ''
+
+
+def _pem_issuer_cn(pem):
+    """Issuer CN of a PEM cert, via openssl, or ''."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', '-issuer'], input=pem,
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ''
+    m = re.search(r'^issuer\s*=.*?CN\s*=\s*([^,/\n]+)', r.stdout or '', re.M)
+    return m.group(1).strip() if m else ''
+
+
+def _f2b_tak_banned_by_jail():
+    """{ip: jail} across the takserver and takserver-badcert jails (takserver wins: it
+    blocks 8446 too)."""
+    out = {}
+    for jail, path in (('takserver-badcert', _F2B_TAK_BADCERT_JAIL_PATH),
+                       ('takserver', '/etc/fail2ban/jail.d/infratak-takserver.conf')):
+        if not os.path.exists(path):
+            continue
+        try:
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', jail]),
+                               capture_output=True, text=True, timeout=10)
+            out.update({ip: jail for ip in _f2b_parse_status(r.stdout)['banned_ips']})
+        except Exception:
+            pass
+    return out
+
+
+_F2B_TAK_PREV_SUBS_CACHE = {'key': None, 'lines': []}
+_F2B_CONTAINER_IPS_CACHE = {'at': 0.0, 'map': {}}
+
+
+def _f2b_tak_prev_sub_lines():
+    """Subscription lines from TAK's newest ROTATED messaging log
+    (takserver-messaging.<YYYY-MM-DD>.log.gz, world-readable). TAK starts a new log at midnight
+    UTC, so a phone that last connected yesterday is named only there. Cached by file + mtime."""
+    import glob as _glob, gzip as _gzip
+    files = sorted(_glob.glob('/opt/tak/logs/takserver-messaging.*.log.gz'))
+    if not files:
+        return []
+    try:
+        key = (files[-1], os.path.getmtime(files[-1]))
+    except OSError:
+        return []
+    c = _F2B_TAK_PREV_SUBS_CACHE
+    if c['key'] != key:
+        try:
+            with _gzip.open(files[-1], 'rt', errors='replace') as f:
+                lines = [ln.rstrip('\n') for ln in f if 'Set client for subscription' in ln]
+        except Exception:
+            lines = []
+        c.update(key=key, lines=lines[-5000:])
+    return c['lines']
+
+
+def _f2b_container_ip_names():
+    """{ip: container name} for the containers on this box, briefly cached ({} if docker can't
+    be asked). Lets the refused list say "Node-RED container" instead of "identity unknown"."""
+    c = _F2B_CONTAINER_IPS_CACHE
+    if time.time() - c['at'] < 60:
+        return c['map']
+    out = {}
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
+                           capture_output=True, text=True, timeout=15)
+        names = (r.stdout or '').split()
+        if names:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                           '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}']
+                                          + names), capture_output=True, text=True, timeout=15)
+            for line in (r.stdout or '').splitlines():
+                parts = line.split()
+                for ip in parts[1:]:
+                    out[ip] = parts[0].lstrip('/')
+    except Exception:
+        pass
+    c.update(at=time.time(), map=out)
+    return out
+
+
+def _f2b_ip_in(ip, nets):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in nets)
+
+
+@app.route('/api/fail2ban/takserver/refused')
+@login_required
+def fail2ban_tak_refused_api():
+    """Read-only: addresses TAK refused in the last 30 min, with who they are (callsign,
+    user, the cert's issuer and whether TAK still trusts it) and whether they're banned.
+    `?q=` (user, callsign or UID) works the other way: UIDs → their last address → its
+    state, so a help desk can start from the name the caller gives."""
+    q = (request.args.get('q') or '').strip().lower()[:100]
+    now = time.time()
+    lines = _f2b_tak_prev_sub_lines() + (_diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or [])
+    refused, subs, uid_ip = _f2b_tak_refused(lines, now)
+    banned = _f2b_tak_banned_by_jail() if _f2b_is_available() else {}
+    certs, cert_error = (None, '')
+    if refused or q:
+        certs, cert_error = _f2b_tak_cert_rows()
+    certs = certs or {}
+
+    if q:
+        # Which UIDs the name points at: callsign or UID from subscriptions, user from certs.
+        uids = {uid for ip_subs in subs.values() for _t, cs, uid in ip_subs
+                if q in cs.lower() or q in uid.lower()}
+        uids |= {uid for uid, c in certs.items() if q in c['user'].lower()}
+        targets = []
+        for uid in sorted(uids):
+            ip = uid_ip.get(uid, '')
+            cs = next((s[1] for s in reversed(subs.get(ip, [])) if s[2] == uid), '')
+            rec = dict(refused.get(ip) or {'count': 0, 'first': None, 'last': None, 'kind': '', 'subject': ''})
+            rec.update(ip=ip, uid=uid, callsign=cs)
+            targets.append(rec)
+        # A refused address whose Subject DN names the user, with no subscription to go on.
+        for ip, rec in refused.items():
+            if q in rec['subject'].lower() and not any(t['ip'] == ip for t in targets):
+                targets.append(dict(rec, ip=ip))
+    else:
+        targets = [dict(rec, ip=ip) for ip, rec in refused.items()]
+
+    # Addresses that can never be banned, said as such: the jail whitelist, and this box's
+    # own containers (Node-RED's flows talk to 8089 too).
+    nets = []
+    for tok in (_f2b_read_tak_jail_config().get('ignoreip') or '').split():
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+    def _private(ip):
+        try:
+            return ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+    containers = _f2b_container_ip_names() if any(_private(t['ip']) for t in targets) else {}
+    trust = None
+    rows = []
+    for rec in targets[:200]:
+        cert = certs.get(rec.get('uid') or '')
+        row = {'ip': rec['ip'], 'refused': rec.get('count', 0), 'first': rec.get('first'),
+               'last': rec.get('last'), 'kind': rec.get('kind', ''), 'subject': rec.get('subject', ''),
+               'callsign': rec.get('callsign', ''), 'uid': rec.get('uid', ''),
+               'banned': banned.get(rec['ip']) or '', 'user': '', 'issuer': '',
+               'issuer_trusted': None, 'cert_expires': None, 'cert_revoked': False,
+               'identity': 'known' if rec.get('uid') else 'unknown',
+               'container': containers.get(rec['ip'], ''),
+               'whitelisted': _f2b_ip_in(rec['ip'], nets)}
+        if cert and cert['pem']:
+            if trust is None:
+                trust = _tak_live_trust_bundle()
+            row.update(user=cert['user'], issuer=_pem_issuer_cn(cert['pem']),
+                       cert_expires=cert['expires'], cert_revoked=cert['revoked'],
+                       issuer_trusted=_cert_signed_by(cert['pem'], trust) if trust else None)
+        rows.append(row)
+    # Devices (refused certs) first, then the most recent.
+    rows.sort(key=lambda r: (r['kind'] != 'bad_cert', -(r['last'] or 0)))
+    return jsonify({'ok': True, 'window_s': _F2B_TAK_REFUSED_WINDOW, 'q': q, 'rows': rows,
+                    'cert_error': cert_error})
 
 def _f2b_ssh_jail_enabled():
     """Return True if the infratak-sshd jail config file exists."""
@@ -23107,11 +23561,31 @@ def fail2ban_tak_status_api():
             status.update(_f2b_parse_status(r.stdout))
         except Exception as e:
             status['error'] = str(e)[:200]
+        # v10.3.4: the takserver-badcert jail is part of this card. Its counts add in, its
+        # bans join the list, and each ban says which jail holds it (`ban_jail`).
+        bc = {'banned_ips': []}
+        if os.path.exists(_F2B_TAK_BADCERT_JAIL_PATH):
+            try:
+                r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'takserver-badcert']),
+                                   capture_output=True, text=True, timeout=10)
+                bc = _f2b_parse_status(r.stdout)
+            except Exception:
+                pass
+        for k in ('currently_banned', 'currently_failed', 'total_banned', 'total_failed'):
+            status[k] = status.get(k, 0) + bc.get(k, 0)
+        tak_ips = list(status['banned_ips'])
+        status['banned_ips'] = tak_ips + [ip for ip in bc['banned_ips'] if ip not in tak_ips]
+        status['ban_jail'] = {ip: 'takserver-badcert' for ip in bc['banned_ips']}
+        status['ban_jail'].update({ip: 'takserver' for ip in tak_ips})   # 8446 too: the stricter
         # Why each address is banned, in plain words. Capped so a scanner flood can't
         # make every page refresh parse the log for hundreds of addresses.
         try:
-            status['ban_details'] = _f2b_tak_ban_details(status['banned_ips'][:50],
-                                                         cfg.get('bantime', 3600))
+            lines = _diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or []
+            det = _f2b_tak_ban_details([ip for ip in bc['banned_ips'] if ip not in tak_ips][:50],
+                                       _F2B_TAK_BADCERT_BANTIME, 'takserver-badcert', lines)
+            det.update(_f2b_tak_ban_details(tak_ips[:50], cfg.get('bantime', 3600),
+                                            'takserver', lines))
+            status['ban_details'] = det
         except Exception:
             status['ban_details'] = {}
     return jsonify(status)
@@ -23125,9 +23599,9 @@ def fail2ban_tak_config_api():
     data    = request.get_json(force=True) or {}
     enabled = bool(data.get('enabled', False))
     if not enabled:
-        jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
-        if os.path.exists(jail_path):
-            subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
+        for jail_path in ('/etc/fail2ban/jail.d/infratak-takserver.conf', _F2B_TAK_BADCERT_JAIL_PATH):
+            if os.path.exists(jail_path):
+                subprocess.run(_sudo_wrap(['rm', '-f', jail_path]), capture_output=True)  # v10.0.5 non-root: /etc/fail2ban is root-owned
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     if not os.path.exists('/etc/fail2ban/filter.d/takserver.conf'):
@@ -23158,19 +23632,29 @@ def fail2ban_tak_config_api():
 @app.route('/api/fail2ban/takserver/unban', methods=['POST'])
 @login_required
 def fail2ban_tak_unban_api():
-    """Unban a specific IP from the takserver jail."""
+    """Unban a specific IP from the takserver jail and, when it exists, takserver-badcert.
+    One button on the page releases the address from both (v10.3.4)."""
     if not _f2b_is_available():
         return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
     data = request.get_json(force=True) or {}
     ip   = str(data.get('ip', '')).strip()
     if not ip or not _VALID_IP_RE.match(ip):
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    jails = ['takserver']
+    if os.path.exists(_F2B_TAK_BADCERT_JAIL_PATH):
+        jails.append('takserver-badcert')
     try:
-        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', 'takserver', 'unbanip', ip]),
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            return jsonify({'ok': True, 'ip': ip})
-        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+        done, err = [], ''
+        for jail in jails:
+            r = subprocess.run(_sudo_wrap(['fail2ban-client', 'set', jail, 'unbanip', ip]),
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                done.append(jail)
+            else:
+                err = err or r.stderr.strip()[:200]
+        if done:
+            return jsonify({'ok': True, 'ip': ip, 'jails': done})
+        return jsonify({'ok': False, 'error': err or 'Unban failed'}), 500
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
@@ -23211,9 +23695,10 @@ def fail2ban_tak_watching_api():
     try:
         # Found: fail2ban.filter  — "2026-05-02 21:36:29,811 fail2ban.filter         [PID]: INFO    [takserver] Found 1.2.3.4 - ..."
         # Ban/Unban: fail2ban.actions
-        found_re = _re_watch.compile(r'\[takserver\] Found (\d[\d.:a-fA-F]+)')
-        ban_re   = _re_watch.compile(r'\[takserver\] Ban (\d[\d.:a-fA-F]+)')
-        unban_re = _re_watch.compile(r'\[takserver\] Unban (\d[\d.:a-fA-F]+)')
+        # v10.3.4: both TAK jails (takserver and takserver-badcert), as the counts are.
+        found_re = _re_watch.compile(r'\[takserver(?:-badcert)?\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[takserver(?:-badcert)?\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[takserver(?:-badcert)?\] Unban (\d[\d.:a-fA-F]+)')
         ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
 
         found_data  = {}  # ip -> {'count': N, 'last_seen': str}
@@ -24219,7 +24704,9 @@ def _f2b_write_recidive_config(maxretry, findtime):
         # 2026-10-21: the same for takserver bans, now TAK-ports-only. Its commonest
         # repeat offender is an operator's own phone with an old certificate, which
         # re-trips every hour; escalating that cost the admin the console for 7 days.
-        "ignoreregex = \\[(?:mediamtx-rtsp|takserver|infratak-manual)\\] Ban\n"
+        # v10.3.4: and takserver-badcert, whose 10-minute bans are real phones; three
+        # in a day would otherwise become a 7-day all-ports ban.
+        "ignoreregex = \\[(?:mediamtx-rtsp|takserver|takserver-badcert|infratak-manual)\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -24957,8 +25444,11 @@ def fail2ban_uninstall_api():
         for path in [
             '/etc/fail2ban/jail.d/infratak-authentik.conf',
             '/etc/fail2ban/jail.d/infratak-takserver.conf',
+            _F2B_TAK_BADCERT_JAIL_PATH,
             '/etc/fail2ban/filter.d/authentik.conf',
             '/etc/fail2ban/filter.d/takserver.conf',
+            _F2B_TAK_BADCERT_FILTER_PATH,
+            _F2B_TAK_BADCERT_ACTION_PATH,
             _F2B_MANUAL_JAIL_PATH,
             _F2B_MANUAL_FILTER_PATH,
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
@@ -31992,6 +32482,51 @@ def _caddy_apt_repo_heal(log_fn=None):
     return state
 
 
+# GH #365 / ops #381: Caddy Update died at once with "Could not get lock" because another apt
+# run held the lock (Aust-TAK, Oct 25). The OS update path waits up to 5 minutes for the lock
+# (`-o DPkg::Lock::Timeout=300`); the console cannot do that here, because the non-root broker
+# denies every `-o` option (_check_pkgmgr), so the wait is done in Python and bounded.
+_APT_LOCK_FILES = ['/var/lib/dpkg/lock-frontend', '/var/lib/dpkg/lock', '/var/lib/apt/lists/lock']
+_APT_LOCK_MSGS = ('Could not get lock', 'Unable to acquire the dpkg frontend lock',
+                  'Unable to lock directory', 'is another process using it')
+
+
+def _apt_lock_held():
+    """True when some process has an apt/dpkg lock file open. Fails open (False) when lsof is
+    missing or errors, so the caller still tries apt and the retry-on-lock-message covers it."""
+    try:
+        r = subprocess.run(_sudo_wrap(['lsof'] + _APT_LOCK_FILES),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return False
+    return bool((r.stdout or '').strip())
+
+
+def _apt_wait_for_lock(max_wait=300, log_fn=None):
+    """Wait up to max_wait seconds for the apt/dpkg lock to clear. True when free."""
+    waited = 0
+    while _apt_lock_held():
+        if waited >= max_wait:
+            return False
+        if log_fn and waited % 30 == 0:
+            log_fn(f'⏳ Another apt run is using the package lock, waiting... {waited}s')
+        time.sleep(5)
+        waited += 5
+    return True
+
+
+def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None):
+    """Run one privileged apt argv, waiting (bounded) for the apt lock first and retrying once
+    if apt still lost the race for it. Returns the CompletedProcess."""
+    _apt_wait_for_lock(max_wait, log_fn)
+    r = _run_priv_chain([argv], 'and', timeout=timeout)
+    out = (r.stdout or '') + (r.stderr or '')
+    if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+        _apt_wait_for_lock(max_wait, log_fn)
+        r = _run_priv_chain([argv], 'and', timeout=timeout)
+    return r
+
+
 def _caddy_install_github_deb(log_fn=None):
     """Install the latest Caddy .deb from Caddy's GitHub release. Returns True on success.
 
@@ -32034,6 +32569,8 @@ def _caddy_install_github_deb(log_fn=None):
         with open(deb_path, 'wb') as f:
             f.write(data)
         os.chmod(deb_path, 0o644)
+        if _pkg_mgr() == 'apt':
+            _apt_wait_for_lock(log_fn=log_fn)
         ok, out = _pkg_install([deb_path], log_fn=log_fn, timeout=300)
         _caddy_version_cache['ver'] = None
         if ok:
@@ -32104,6 +32641,7 @@ def _caddy_ensure_apt_repo(log_fn=None):
                 _log(f'could not write the Caddy sources list: '
                      f'{(_src.stderr or _src.stdout).strip()[:200]}')
                 return False
+        _apt_wait_for_lock(log_fn=log_fn)
         subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
                        text=True, timeout=180, env=env)
         return True
@@ -32136,8 +32674,9 @@ def caddy_update():
                 # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
                 # different origin, and `install` is what moves it across. Already-current boxes
                 # are a no-op either way.
-                r = _run_priv_chain([['apt-get', 'update', '-qq'],
-                                     ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
+                r = _apt_run_waiting(['apt-get', 'update', '-qq'])
+                if r.returncode == 0:
+                    r = _apt_run_waiting(['apt-get', 'install', '-y', 'caddy'])
             else:
                 # v10.2.10 (Cloudsmith 402): Cloudsmith not serving — take the same release from Caddy's GitHub.
                 _gh_log = []
@@ -33637,38 +34176,6 @@ def _suggest_tak_core_host(settings):
     return (settings.get('server_ip') or '').strip()
 
 
-def _is_ipv4_host(value):
-    try:
-        parts = (value or '').strip().split('.')
-        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-    except Exception:
-        return False
-
-
-def _cloudtak_api_base_urls(settings, cfg):
-    """Candidate base URLs for CloudTAK API from infra-TAK host."""
-    urls = []
-    if cfg.get('target_mode') == 'remote':
-        h = (cfg.get('remote', {}).get('host') or '').strip()
-        if h:
-            urls.append(f'http://{h}:5000')
-    else:
-        urls.append('http://127.0.0.1:5000')
-    if settings.get('fqdn'):
-        try:
-            sd = _get_all_service_domains(settings)
-            ct_host = (sd.get('cloudtak_map') or '').strip()
-            if ct_host:
-                urls.append(f'https://{_pub_hostport(ct_host)}')
-        except Exception:
-            pass
-    out = []
-    for u in urls:
-        if u not in out:
-            out.append(u)
-    return out
-
-
 def _cloudtak_request_json(method, url, payload=None, timeout=25, headers=None):
     import urllib.error as _uerr
     data = None
@@ -33722,114 +34229,6 @@ def _p12_bytes_to_pem(p12_bytes, password=''):
         return cert_pem.strip() + '\n', key_pem.strip() + '\n'
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _ensure_cloudtak_container_connectivity(settings, rcfg, tak_host, marti_port):
-    """Ensure the remote CloudTAK Docker container can reach TAK Server.
-
-    Host-level preflight passes but containers may fail due to:
-    1) Docker DNS can't resolve the FQDN — fixed by pushing updated override with extra_hosts
-    2) iptables FORWARD chain drops outbound Docker traffic — fixed by adding ACCEPT rule
-    """
-    container_test_cmd = (
-        f'docker exec $(docker ps -qf name=api 2>/dev/null | head -1) '
-        f'node -e "'
-        f"const s=require('net').connect({marti_port},'{tak_host}',()=>{{console.log('OK');s.end();process.exit(0)}});"
-        f"s.on('error',e=>{{console.log('FAIL:'+e.code);process.exit(1)}});"
-        f"s.setTimeout(4000,()=>{{console.log('TIMEOUT');s.destroy();process.exit(1)}});"
-        f'"'
-    )
-    ok, out = _ssh_probe(rcfg, container_test_cmd, timeout=20)
-    result = (out or '').strip().splitlines()[-1] if out else ''
-    if ok and result == 'OK':
-        return
-
-    # Container can't reach TAK Server. Push updated override with extra_hosts and fix iptables.
-    override_yml = _cloudtak_build_override_yml(settings)
-    tmp_dir = tempfile.mkdtemp(prefix='cloudtak-fixconn-')
-    try:
-        ov_tmp = os.path.join(tmp_dir, 'docker-compose.override.yml')
-        with open(ov_tmp, 'w') as f:
-            f.write(override_yml)
-        _scp_to_host(rcfg, ov_tmp, '~/CloudTAK/docker-compose.override.yml')
-    finally:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    # Ensure iptables FORWARD allows Docker outbound traffic
-    _ssh_probe(rcfg, (
-        'sudo iptables -C FORWARD -j ACCEPT 2>/dev/null || '
-        'sudo iptables -I FORWARD 1 -j ACCEPT 2>/dev/null || true'
-    ), timeout=10)
-
-    # Restart containers to pick up new override
-    _ssh_probe(rcfg, (
-        'cd ~/CloudTAK && '
-        '(docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null || true)'
-    ), timeout=60)
-
-    # Brief wait for containers to be ready
-    import time
-    time.sleep(5)
-
-    # Re-test connectivity from inside container
-    ok2, out2 = _ssh_probe(rcfg, container_test_cmd, timeout=20)
-    result2 = (out2 or '').strip().splitlines()[-1] if out2 else ''
-    if not ok2 or result2 != 'OK':
-        app.logger.warning(
-            'CloudTAK container still cannot reach TAK Server after fix attempt: %s', result2
-        )
-
-
-def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port):
-    """Connectivity check to TAK ports from CloudTAK target host perspective."""
-    import socket
-    ports = [int(cot_port), int(marti_port), int(webtak_port)]
-    if cfg.get('target_mode') == 'remote':
-        rcfg = cfg.get('remote', {})
-        cmd = (
-            "python3 - <<'PY'\n"
-            "import socket, json\n"
-            f"host={json.dumps(tak_host)}\n"
-            f"ports={json.dumps(ports)}\n"
-            "out={}\n"
-            "for p in ports:\n"
-            "  s=socket.socket(); s.settimeout(3)\n"
-            "  try:\n"
-            "    s.connect((host,int(p))); out[str(p)]='ok'\n"
-            "  except Exception as e:\n"
-            "    out[str(p)]='fail:'+str(e)\n"
-            "  finally:\n"
-            "    try: s.close()\n"
-            "    except Exception: pass\n"
-            "print(json.dumps(out))\n"
-            "PY"
-        )
-        ok, out = _ssh_probe(rcfg, cmd, timeout=25)
-        if not ok:
-            return False, {'error': f'Could not run preflight on remote CloudTAK host: {(out or "")[:220]}'}
-        try:
-            result = json.loads((out or '').strip().splitlines()[-1])
-        except Exception:
-            return False, {'error': f'Unexpected preflight output: {(out or "")[:220]}'}
-    else:
-        result = {}
-        for p in ports:
-            s = socket.socket()
-            s.settimeout(3)
-            try:
-                s.connect((tak_host, int(p)))
-                result[str(p)] = 'ok'
-            except Exception as e:
-                result[str(p)] = f'fail:{e}'
-            finally:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-    required = [str(int(marti_port)), str(int(webtak_port))]
-    healthy = all(str(result.get(p, '')).startswith('ok') for p in required)
-    return healthy, result
 
 
 _CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
@@ -39341,20 +39740,52 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
                 _cloudtak_release_cache['ts'] = _time.time()
             return tag
     except Exception:
+        # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
+        # git over https isn't rate limited that way, so ask it for the newest tag first.
+        tag = _cloudtak_latest_tag_from_git()
+        if tag:
+            _cloudtak_release_cache['tag'] = tag
+            _cloudtak_release_cache['ts'] = _time.time()
+            return tag
         # Stale cache is better than nothing — return it regardless of use_cache so that
         # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _get_cloudtak_target_release_tag(settings=None, use_cache=True):
+def _cloudtak_latest_tag_from_git():
+    """Newest plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
+    Second source for the release lookup when api.github.com refuses us (gh #365)."""
+    try:
+        r = subprocess.run(['git', 'ls-remote', '--tags', '--refs', 'https://github.com/dfpc-coe/CloudTAK.git'],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    best = None
+    for line in (r.stdout or '').splitlines():
+        m = re.search(r'refs/tags/(v?(\d+)\.(\d+)\.(\d+))$', line.strip())
+        if m:
+            key = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
+            if best is None or key > best[0]:
+                best = (key, m.group(1))
+    return best[1] if best else None
+
+
+def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
     """Target CloudTAK release tag (e.g. 'v13.54.3') — upstream latest on EVERY
     channel (v10.1.17: version gate removed, operator decision 2026-08-02).
     Falls back to CLOUDTAK_VETTED_RELEASE only when the GitHub release lookup is
     unreachable, so offline deploys still work. Deploy AND update both install
-    this tag. `settings` kept for call-site signature compatibility."""
+    this tag. `settings` kept for call-site signature compatibility.
+    allow_fallback=False (Update): return None instead — the pin is old, so falling back
+    to it on a box that is already newer is a downgrade (gh #365)."""
     tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
     if tag:
         return tag
+    if not allow_fallback:
+        return None
     return 'v' + CLOUDTAK_VETTED_RELEASE
 
 
@@ -41609,7 +42040,10 @@ def _takportal_run_update(portal_dir):
     # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
     # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
     # hard 500 with the git error in it.
+    _mod_result_step('takportal', 'Step 1/2: fetching the release')
     gitr = _takportal_update_git(portal_dir)
+    # ops #380: the record said "2.0.25 -> ?" because only a success ever filled in the target.
+    _mod_result_versions('takportal', frm=gitr.get('from_version'), to=gitr.get('to_version'))
     if not gitr['ok']:
         # The git step discards local edits first, which reverts the loopback port patch. Put it
         # back so the next `compose up` (boot stagger, Guard Dog, Start) cannot publish 0.0.0.0.
@@ -41672,6 +42106,7 @@ def _takportal_run_update(portal_dir):
     # ops #135: pull the node:22-alpine base first, so Update is also how a box picks up
     # a Node security release when TAK Portal itself has not changed.
     _pull_base_images(portal_dir, wrap=_sudo_wrap)
+    _mod_result_step('takportal', 'Step 2/2: rebuilding the images (docker compose up --build)')
     try:
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']),
                                cwd=portal_dir, capture_output=True, text=True,
@@ -41689,7 +42124,10 @@ def _takportal_run_update(portal_dir):
         # logged, so the actual reason existed nowhere. On test12 the real message
         # was one line ("env file .env not found") and it took a manual re-run of
         # the build to see it. Report what the build actually said, and journal it.
-        err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+        # ops #380: `[:400]` kept the HEAD of compose's output, which is only the progress
+        # ledger ("Image tak-portal-tak-portal-worker Building"); the reason is at the end.
+        err = (_build_failure_text('\n'.join([build.stdout or '', build.stderr or '']))
+               or 'Build failed (docker compose printed no reason)')
         print(f'[takportal] update: build failed (rc={build.returncode}): {err}', flush=True)
         _gd_maintenance_begin('takportal', 30)  # W4: outcome known — let Guard Dog look again
         return {'success': False,
@@ -44743,263 +45181,186 @@ def cloudtak_remote_test_ssh():
     return jsonify({'success': True, 'message': f'SSH OK to {host}', 'output': (out or '')[:800]})
 
 
-@app.route('/api/cloudtak/bootstrap-server', methods=['POST'])
+# v10.3.4 W9 — "Connect CloudTAK to TAK Server": one button for both states. Configured but
+# refused after a CA rotation/revoke: a current-CA admin cert, the API restart, and the user
+# certs TAK no longer trusts emptied (W7). Unconfigured: the same cert plus the first system
+# admin's TAK username/password, the payload CloudTAK's own wizard sends (CloudTAK
+# api/stateless/routes/server.ts, v13.116.1: no auth while unconfigured, the cert is checked
+# against TAK, username+password make that user system_admin). Replaces the orphaned
+# /api/cloudtak/bootstrap-server, which needed an uploaded p12 and the webadmin password.
+# This reverses the 2026-08-03 "no auto-bootstrap" decision ONLY as a button the operator
+# clicks (operator, 2026-11-01): nothing bootstraps on its own.
+_CLOUDTAK_CONNECT_LOCK = threading.Lock()
+_CLOUDTAK_USERNAME_RE = re.compile(r'^[A-Za-z0-9._@+-]{1,150}$')
+
+
+def _cloudtak_connect_urls(settings):
+    """CloudTAK's TAK endpoints from the console's own view of TAK: (url, api, webtak)."""
+    host = _suggest_tak_core_host(settings)
+    return f'ssl://{host}:8089', f'https://{host}:8443', f'https://{host}:8446'
+
+
+def _cloudtak_postgis_json(sql):
+    """One console-authored query against CloudTAK's database, parsed as JSON, or None."""
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker', '-d', 'gis',
+                                   '-v', 'ON_ERROR_STOP=1', '-tAc', sql]),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads((r.stdout or '').strip() or 'null')
+    except ValueError:
+        return None
+
+
+def _cloudtak_untrusted_user_certs(limit=100):
+    """How many CloudTAK user certs (first `limit`) TAK's live truststore doesn't vouch for.
+    0 when that can't be told: the status line never cries wolf."""
+    certs = _cloudtak_postgis_json("select coalesce(json_agg(auth->>'cert'), '[]') from profile "
+                                   "where coalesce(auth->>'cert', '') <> ''") or []
+    bundle = _tak_live_trust_bundle() if certs else ''
+    if not bundle:
+        return 0
+    return sum(1 for c in certs[:limit] if _cert_signed_by(c or '', bundle) is False)
+
+
+def _cloudtak_connect_state(settings):
+    """{'supported', 'status', 'connection_status', 'message'} for the CloudTAK page's line.
+    status: unsupported / unreachable / unconfigured / connected / users_untrusted /
+    refused_untrusted / down."""
+    if not _cloudtak_local_with_local_tak(settings):
+        return {'supported': False, 'status': 'unsupported',
+                'message': 'Not supported on a remote CloudTAK yet: use the manual steps below.'}
+    ok, code, srv = _cloudtak_request_json(
+        'GET', 'http://127.0.0.1:5000/api/server', timeout=20,
+        headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(_cloudtak_signing_secret())})
+    if not ok or not isinstance(srv, dict):
+        return {'supported': True, 'status': 'unreachable', 'message': f'CloudTAK API not answering (HTTP {code}).'}
+    if srv.get('status') != 'configured':
+        return {'supported': True, 'status': 'unconfigured', 'message': 'CloudTAK is not connected to TAK Server yet.'}
+    cs = srv.get('connection_status')
+    if cs == 'live':
+        # CloudTAK's own connection can stay live after a Revoke (it sends the chain up to a root
+        # TAK still trusts) while every user cert is refused and nobody can log in (test6,
+        # 2026-11-01). So "connected" also checks the users' certs.
+        stale = _cloudtak_untrusted_user_certs()
+        if stale:
+            return {'supported': True, 'status': 'users_untrusted', 'connection_status': cs,
+                    'message': f'CloudTAK is connected, but {stale} user certificate(s) are from a CA TAK '
+                               "Server no longer trusts, so those users can't log in. Reconnect to fix."}
+        return {'supported': True, 'status': 'connected', 'connection_status': cs,
+                'message': 'CloudTAK is connected to TAK Server.'}
+    cert = _cloudtak_postgis_json("select to_json(coalesce(auth->>'cert','')) from server where id = 1") or ''
+    bundle = _tak_live_trust_bundle() or _tak_ca_bundle()
+    if bundle and _cert_signed_by(cert, bundle) is False:
+        return {'supported': True, 'status': 'refused_untrusted', 'connection_status': cs,
+                'message': 'Connection refused: its certificate is from a CA TAK Server no longer trusts.'}
+    return {'supported': True, 'status': 'down', 'connection_status': cs,
+            'message': f'CloudTAK reports its TAK connection as {cs or "unknown"}.'}
+
+
+@app.route('/api/cloudtak/connect-tak', methods=['GET'])
 @login_required
-def cloudtak_bootstrap_server_api():
-    """Bootstrap CloudTAK initial TAK server configuration via CloudTAK API."""
-    data = request.get_json() or {}
+def cloudtak_connect_tak_status_api():
+    return jsonify(_cloudtak_connect_state(load_settings()))
+
+
+@app.route('/api/cloudtak/connect-tak', methods=['POST'])
+@login_required
+def cloudtak_connect_tak_api():
+    """Connect (or reconnect) the local CloudTAK to the local TAK Server. The TAK password,
+    first-time setup only, goes to CloudTAK and nowhere else: never logged, never stored."""
     settings = load_settings()
-    cfg = _get_cloudtak_deployment_config(settings)
-
-    tak_host = (data.get('tak_host') or '').strip() or _suggest_tak_core_host(settings)
-    server_name = (data.get('server_name') or 'TAK Core').strip() or 'TAK Core'
-    default_user, default_pass = _get_webadmin_defaults(settings)
-    username = (data.get('tak_username') or '').strip() or default_user
-    password = (data.get('tak_password') or '').strip() or default_pass
-    p12_data = (data.get('p12_data') or '').strip()
-    p12_password = str(data.get('p12_password') or _get_tak_cert_password(settings) or '')
-
-    if not tak_host:
-        return jsonify({'success': False, 'error': 'TAK core host/IP is required'}), 400
-    if not username or not password:
-        return jsonify({'success': False, 'error': 'Initial TAK admin username/password are required'}), 400
-    p12_source = 'upload'
-
+    if not _cloudtak_local_with_local_tak(settings):
+        return jsonify({'success': False,
+                        'error': 'Not supported on a remote CloudTAK yet: use the manual steps on this page.'}), 400
+    if not _CLOUDTAK_CONNECT_LOCK.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'Already connecting CloudTAK, wait for it to finish.'}), 409
     try:
-        cot_port = int(data.get('cot_port') or 8089)
-        marti_port = int(data.get('marti_port') or 8443)
-        webtak_port = int(data.get('webtak_port') or 8446)
-    except Exception:
-        return jsonify({'success': False, 'error': 'Ports must be valid numbers'}), 400
+        return _cloudtak_connect_tak(settings, request.get_json(silent=True) or {})
+    finally:
+        _CLOUDTAK_CONNECT_LOCK.release()
 
-    if p12_data:
-        # Support plain base64 or data URL payload
-        if p12_data.startswith('data:') and ',' in p12_data:
-            p12_data = p12_data.split(',', 1)[1]
-        try:
-            import base64
-            p12_bytes = base64.b64decode(p12_data)
-        except Exception:
-            return jsonify({'success': False, 'error': 'Could not decode .p12 upload data'}), 400
-    else:
-        p12_bytes, p12_loc, p12_err = _load_admin_p12_bytes_from_tak_core(settings)
-        p12_source = p12_loc
-        if not p12_bytes:
-            return jsonify({'success': False, 'error': f'Admin .p12 not uploaded and auto-load failed: {p12_err}'}), 400
 
+def _cloudtak_connect_tak(settings, data):
+    base = 'http://127.0.0.1:5000'
+    secret = _cloudtak_signing_secret()
+
+    def _hdr():
+        return {'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)}
+    ok, code, srv = _cloudtak_request_json('GET', base + '/api/server', timeout=20, headers=_hdr())
+    if not ok or not isinstance(srv, dict):
+        return jsonify({'success': False, 'error': f'CloudTAK API not answering (HTTP {code}). Is CloudTAK running?'}), 502
+    configured = srv.get('status') == 'configured'
+    username = password = ''
+    if not configured:
+        username = str(data.get('username') or '').strip()
+        password = str(data.get('password') or '')
+        if not username or not password:
+            return jsonify({'success': False, 'needs_credentials': True,
+                            'error': "First-time setup: enter the TAK username and password of CloudTAK's "
+                                     'first system admin.'}), 400
+        if not _CLOUDTAK_USERNAME_RE.match(username) or len(password) > 512:
+            return jsonify({'success': False, 'needs_credentials': True,
+                            'error': 'That username has characters TAK usernames do not use.'}), 400
+        # A profile row for this user means an earlier attempt half-finished: CloudTAK made the
+        # user, then failed, and it will refuse the same user every time after (memory
+        # cloudtak-login-400-unconfigured-bootstrap-wizard). Compared here, so the name never
+        # enters SQL; can't read the table = can't tell = don't start.
+        names = _cloudtak_postgis_json("select coalesce(json_agg(username), '[]') from profile")
+        if names is None:
+            return jsonify({'success': False, 'error': "Could not read CloudTAK's user list, so nothing was "
+                                                       'changed. Is cloudtak-postgis-1 running?'}), 502
+        if username.lower() in {str(n).lower() for n in names}:
+            return jsonify({'success': False, 'needs_credentials': True,
+                            'error': f'CloudTAK already has a user named {username}, left by an earlier setup '
+                                     'attempt, so it would refuse this one. Use a different TAK user, or reset '
+                                     "CloudTAK's TAK connection (below) and try again."}), 409
+
+    res = _local_bootstrap_cert_ensure(settings)
+    if not res.get('success'):
+        return jsonify({'success': False, 'error': f"Could not issue CloudTAK's TAK certificate: {res.get('error')}"}), 500
     try:
-        cert_pem, key_pem = _p12_bytes_to_pem(p12_bytes, p12_password)
+        cert_pem, key_pem = _p12_bytes_to_pem(
+            _read_priv_bytes(f'/opt/tak/certs/files/{CLOUDTAK_BOOTSTRAP_CERT_CN}.p12'),
+            _get_tak_cert_password(settings))
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Could not read .p12: {str(e)[:220]}'}), 400
+        return jsonify({'success': False, 'error': f'Could not read the new certificate: {str(e)[:160]}'}), 500
 
-    # If user entered raw IP and a TAK hostname is known, prefer hostname for TLS/cert compatibility.
-    preferred_host = (_get_takserver_host(settings) or '').strip()
-    host_auto_rewritten = False
-    if _is_ipv4_host(tak_host) and preferred_host:
-        tak_host = preferred_host
-        host_auto_rewritten = True
-
-    preflight_ok, preflight = _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port)
-    marti_fallback_to_webtak = False
-    if not preflight_ok:
-        p_marti = preflight.get(str(marti_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
-        p_webtak = preflight.get(str(webtak_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
-        marti_ok = str(p_marti).strip().lower().startswith('ok')
-        webtak_ok = str(p_webtak).strip().lower().startswith('ok')
-        # Some VPS/network paths expose 8446 but block 8443. In that case, use 8446
-        # for both webtak and API path so bootstrap can proceed.
-        if (not marti_ok) and webtak_ok and marti_port != webtak_port:
-            marti_port = webtak_port
-            marti_fallback_to_webtak = True
-        else:
-            return jsonify({
-                'success': False,
-                'error': (
-                    f'Preflight failed from CloudTAK target to TAK host {tak_host}. '
-                    f'marti({marti_port})={p_marti}; webtak({webtak_port})={p_webtak}. '
-                    'Use TAK cert hostname/FQDN and ensure firewall/routes allow access.'
-                ),
-                'preflight': preflight,
-            }), 400
-
-    # For remote deployments, ensure the Docker container can also reach the TAK server.
-    # Host-level preflight passes but Docker containers may be blocked by iptables FORWARD.
-    if cfg.get('target_mode') == 'remote':
-        rcfg = cfg.get('remote', {})
-        _ensure_cloudtak_container_connectivity(settings, rcfg, tak_host, int(marti_port))
-
-    payload = {
-        'name': server_name,
-        'url': f'ssl://{tak_host}:{cot_port}',
-        'api': f'https://{tak_host}:{marti_port}',
-        'webtak': f'https://{tak_host}:{webtak_port}',
-        'username': username,
-        'password': password,
-    }
-
-    # For remote targets, hit the CloudTAK API directly via SSH+curl on localhost:5000.
-    # This bypasses Caddy/Authentik forward-auth which can block PATCH requests.
-    if cfg.get('target_mode') == 'remote':
-        rcfg = cfg.get('remote', {})
-        payload_json = json.dumps(payload)
-        import shlex
-        ssh_curl_cmd = (
-            "curl -s -w '\\n%{http_code}' -X PATCH http://localhost:5000/api/server "
-            "-H 'Content-Type: application/json' "
-            f"-d {shlex.quote(payload_json)} "
-            "--max-time 30"
-        )
-        ssh_ok, ssh_out = _ssh_probe(rcfg, ssh_curl_cmd, timeout=45)
-        raw_lines = (ssh_out or '').strip().splitlines()
-        http_code = 0
-        resp_body = ''
-        if raw_lines:
-            try:
-                http_code = int(raw_lines[-1].strip())
-                resp_body = '\n'.join(raw_lines[:-1]).strip()
-            except ValueError:
-                resp_body = '\n'.join(raw_lines).strip()
-        resp_json = {}
-        try:
-            resp_json = json.loads(resp_body) if resp_body else {}
-        except Exception:
-            pass
-        if ssh_ok and 200 <= http_code < 300:
-            # Verify the config actually persisted before reporting success.
-            verify_ok, verify_out = _ssh_probe(
-                rcfg,
-                "curl -s --max-time 15 http://localhost:5000/api/server",
-                timeout=25
-            )
-            verify_body = {}
-            if verify_ok:
-                try:
-                    verify_body = json.loads((verify_out or '').strip())
-                except Exception:
-                    verify_body = {}
-            if str((verify_body or {}).get('status') or '').strip().lower() != 'configured':
-                return jsonify({
-                    'success': False,
-                    'error': (
-                        'CloudTAK bootstrap did not persist configuration '
-                        f'(post-check status={(verify_body or {}).get("status") or "unknown"}).'
-                    ),
-                    'api_base': 'localhost:5000 (via SSH)'
-                }), 400
-            return jsonify({
-                'success': True,
-                'message': (
-                    'CloudTAK initial server configuration applied.'
-                    + (' Marti preflight failed; API endpoint auto-switched to WebTAK port.' if marti_fallback_to_webtak else '')
-                    + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
-                ),
-                'p12_source': p12_source,
-                'api_base': 'http://localhost:5000 (via SSH)',
-            })
-        err_msg = (resp_json.get('message') if isinstance(resp_json, dict) else '') or resp_body or (ssh_out or 'SSH curl failed')
-        return jsonify({
-            'success': False,
-            'error': f'CloudTAK bootstrap failed (HTTP {http_code}): {str(err_msg)[:300]}',
-            'api_base': 'localhost:5000 (via SSH)'
-        }), 400
-
-    # Local target — hit API directly from this host.
-    last_err = ''
-    selected_base = ''
-    server_info = {}
-    for base in _cloudtak_api_base_urls(settings, cfg):
-        ok, code, body = _cloudtak_request_json('GET', f'{base}/api/server', timeout=20)
-        if ok:
-            selected_base = base
-            server_info = body if isinstance(body, dict) else {}
-            break
-        if code in (401, 403):
-            selected_base = base
-            server_info = {}
-            break
-        last_err = f'{base}: {(body.get("message") if isinstance(body, dict) else body) or code}'
-    if not selected_base:
-        return jsonify({'success': False, 'error': f'Could not reach CloudTAK API. {last_err[:220]}'}), 400
-
-    if (server_info.get('status') or '').strip().lower() == 'configured':
-        return jsonify({
-            'success': False,
-            'error': 'CloudTAK is already configured. Use CloudTAK Admin > Server to modify the TAK connection.',
-            'api_base': selected_base
-        }), 409
-
-    ok, code, body = _cloudtak_request_json('PATCH', f'{selected_base}/api/server', payload=payload, timeout=35)
-    body_msg = (body.get('message') if isinstance(body, dict) else '') if body is not None else ''
-    body_msg_l = str(body_msg or '').strip().lower()
-    needs_auth_retry = (not ok) and (
-        code in (401, 403)
-        or 'no auth present' in body_msg_l
-        or 'invalid token' in body_msg_l
-        or 'unauthorized' in body_msg_l
-    )
-    if needs_auth_retry:
-        l_ok, l_code, l_body = _cloudtak_request_json(
-            'POST',
-            f'{selected_base}/api/login',
-            payload={'username': username, 'password': password},
-            timeout=20,
-        )
-        token = ''
-        if l_ok and isinstance(l_body, dict):
-            token = str(l_body.get('token') or '').strip()
-        if token:
-            ok, code, body = _cloudtak_request_json(
-                'PATCH',
-                f'{selected_base}/api/server',
-                payload=payload,
-                timeout=35,
-                headers={'Authorization': f'Bearer {token}'},
-            )
-        else:
-            login_msg = (l_body.get('message') if isinstance(l_body, dict) else '') or f'HTTP {l_code}'
-            return jsonify({
-                'success': False,
-                'error': (
-                    f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
-                    'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
-                ),
-                'api_base': selected_base
-            }), 400
+    url, api, webtak = _cloudtak_connect_urls(settings)
+    if configured:
+        # The endpoints are CloudTAK's own settings: kept as they are, filled only when empty.
+        payload = {'url': srv.get('url') or url, 'api': srv.get('api') or api,
+                   'webtak': srv.get('webtak') or webtak, 'auth': {'cert': cert_pem, 'key': key_pem}}
+    else:
+        payload = {'url': url, 'api': api, 'webtak': webtak, 'auth': {'cert': cert_pem, 'key': key_pem},
+                   'username': username, 'password': password}
+    ok, code, out = _cloudtak_request_json('PATCH', base + '/api/server', payload=payload, timeout=90,
+                                           headers=_hdr())
     if not ok:
-        msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
-        return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
+        msg = (out or {}).get('message') if isinstance(out, dict) else ''
+        return jsonify({'success': False, 'error': f'CloudTAK refused (HTTP {code}): {str(msg)[:300]}'}), 400
+    note = '' if res.get('admin_flip_ok') else ' The ROLE_ADMIN flip did not verify, so Events may not deliver.'
 
-    # Verify persisted state (prevents false-positive success responses).
-    v_ok, v_code, v_body = _cloudtak_request_json('GET', f'{selected_base}/api/server', timeout=20)
-    if not v_ok or str((v_body or {}).get('status') or '').strip().lower() != 'configured':
-        return jsonify({
-            'success': False,
-            'error': (
-                'CloudTAK bootstrap write returned success but post-check is not configured. '
-                f'GET /api/server status={(v_body or {}).get("status") if isinstance(v_body, dict) else "unknown"}'
-            ),
-            'api_base': selected_base
-        }), 400
+    if not configured:
+        v_ok, _c, v = _cloudtak_request_json('GET', base + '/api/server', timeout=20, headers=_hdr())
+        if not v_ok or not isinstance(v, dict) or v.get('status') != 'configured':
+            return jsonify({'success': False, 'error': 'CloudTAK accepted the setup but does not report it as '
+                                                       'configured. Reload the CloudTAK page and check.'}), 500
+        return jsonify({'success': True, 'mode': 'configured',
+                        'message': f'CloudTAK is connected to TAK Server. Log in to CloudTAK as {username}.' + note})
 
-    return jsonify({
-        'success': True,
-        'message': (
-            'CloudTAK initial server configuration applied.'
-                    + (' Marti preflight failed; API endpoint auto-switched to WebTAK port.' if marti_fallback_to_webtak else '')
-            + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
-        ),
-        'api_base': selected_base,
-        'defaults_used': {
-            'tak_username': username,
-            'tak_password_from_settings': bool((data.get('tak_password') or '').strip() == '' and default_pass),
-            'p12_source': p12_source,
-            'cert_password': p12_password,
-        },
-        'server': {
-            'host': tak_host, 'cot_port': cot_port, 'marti_port': marti_port, 'webtak_port': webtak_port
-        },
-        'host_auto_rewritten': host_auto_rewritten,
-    })
+    # Same as the heal: CloudTAK keeps the old connection's retry timer running with the old
+    # cert until the API restarts (aws-arm 2026-10-09), and the connection was refused anyway.
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']), capture_output=True, timeout=120)
+    except Exception:
+        pass
+    reset = _cloudtak_reset_foreign_profile_certs(lambda m: print(f'CloudTAK connect:{m}', flush=True))
+    users = (f' {len(reset)} user certificate(s) from a CA TAK no longer trusts were cleared; each user gets a '
+             'new one at their next login.') if reset else ''
+    return jsonify({'success': True, 'mode': 'reconnected', 'users_reset': len(reset or []),
+                    'message': 'CloudTAK reconnected to TAK Server with a current certificate.' + users + note})
 
 
 @app.route('/api/cloudtak/bootstrap-admin-p12-status')
@@ -45199,6 +45560,45 @@ def _tak_ca_bundle(cert_dir='/opt/tak/certs/files'):
     return '\n'.join(out) + '\n' if out else ''
 
 
+def _tak_live_trust_entries(cert_dir='/opt/tak/certs/files'):
+    """[(alias, pem)] for every trusted CA in the truststore TAK Server enforces NOW, or None
+    when it can't be read. v10.3.4 W7: after Revoke Old CA the old intermediate's .pem stays
+    on disk, so `_tak_ca_bundle()` still vouched for its certs and nothing was ever reset; what
+    TAK actually trusts is this truststore (`_live_truststore`, as Revoke and the CA panel use).
+    `keytool -list -rfc` prints each entry's cert as PEM; key entries are skipped."""
+    ts_name = _live_truststore(cert_dir, '.jks')
+    if not ts_name:
+        return None
+    ts_path = os.path.join(cert_dir, ts_name)
+    cert_pass = _get_tak_cert_password(load_settings())
+    try:
+        argv = ['keytool', '-list', '-rfc', '-keystore', ts_path, '-storepass', cert_pass]
+        if _tak_is_container():
+            # No host keytool on a container box: run it in the TAK container. An argv, no shell.
+            argv = _sudo_wrap(['docker', 'exec', TAK_CONTAINER] + argv)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    entries = []
+    for block in (r.stdout or '').split('Alias name:')[1:]:
+        if 'trustedCertEntry' not in block:
+            continue
+        pem = re.search(r'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----', block, re.S)
+        if pem:
+            entries.append((block.split('\n', 1)[0].strip(), pem.group(0)))
+    return entries or None
+
+
+def _tak_live_trust_bundle():
+    """The CAs TAK Server trusts right now, as one PEM bundle, or '' when that can't be read.
+    Callers fall back to `_tak_ca_bundle()` (a superset: fewer certs judged foreign), so
+    "can't tell" never resets anything that might still work."""
+    entries = _tak_live_trust_entries()
+    return '\n'.join(p for _a, p in entries) + '\n' if entries else ''
+
+
 def _cloudtak_reset_foreign_profile_certs(log=None):
     """v10.2.8 W11g — each CloudTAK user holds its OWN TAK client cert (profile.auth). After the
     CA was replaced, every one of them is from a CA TAK no longer has: TAK closes the socket, and
@@ -45223,7 +45623,9 @@ def _cloudtak_reset_foreign_profile_certs(log=None):
                                   "'[]') from connections where coalesce(auth->>'cert', '') <> ''").stdout or '').strip() or '[]')
     except Exception:
         return None
-    bundle = _tak_ca_bundle()
+    # v10.3.4 W7: judged by what TAK trusts now (the live truststore), not by every .pem on
+    # disk: a revoked intermediate's file stays there, and its users were never reset.
+    bundle = _tak_live_trust_bundle() or _tak_ca_bundle()
     if not bundle:
         return None
     reset = []
@@ -45329,6 +45731,35 @@ def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
     except Exception as e:
         _log(f"  ⚠ CloudTAK API restart skipped ({str(e)[:100]}) — the old connection keeps retrying until its next restart")
     return True
+
+
+def _cloudtak_local_with_local_tak(settings=None):
+    """True when CloudTAK and the TAK cert store are both on this box (and CloudTAK is
+    installed): the only shape the console can repair CloudTAK's TAK certs on."""
+    settings = settings or load_settings()
+    try:
+        return ((_get_cloudtak_deployment_config(settings).get('target_mode') or 'local').strip().lower() != 'remote'
+                and _cloudtak_bootstrap_cert_target(settings)[0] == 'local'
+                and bool(_cloudtak_signing_secret()))
+    except Exception:
+        return False
+
+
+def _cloudtak_heal_after_ca_change(log=None):
+    """After TAK's CA changed (Update Now's container/CA heal, Revoke Old CA): give CloudTAK's
+    own connection a current cert when it's dead for that reason (_cloudtak_tak_cert_heal, ~2
+    min of waits), then empty the user certs TAK no longer trusts so each is re-issued at that
+    user's next login (W7). Local CloudTAK + local TAK only. Run it in a thread."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        _cloudtak_tak_cert_heal(log=_log)
+    except Exception as e:
+        _log(f"  CloudTAK cert check skipped: {e}")
+    try:
+        if _cloudtak_local_with_local_tak():
+            _cloudtak_reset_foreign_profile_certs(_log)
+    except Exception as e:
+        _log(f"  CloudTAK user cert check skipped: {e}")
 
 
 @app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
@@ -46727,6 +47158,11 @@ services:
 {hosts_block}
     environment:
 {tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
+  tiles:
+    # ops #392: CloudTAK 13.117.0's tile server loads each basemap from the API and defaults
+    # to localhost:5001, which does not exist in Docker, so every basemap tile came back 500.
+    environment:
+      API_URL: "http://api:5000"
   events:
     extra_hosts:
 {hosts_block}
@@ -51253,7 +51689,15 @@ def run_cloudtak_update():
         # v10.1.17: version gate removed — every channel installs upstream latest
         # (offline fallback: CLOUDTAK_VETTED_RELEASE). The 13.45+ plugin floor is
         # enforced separately at plugin-install time.
-        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
+        # gh #365: no offline fallback on Update. When GitHub couldn't be asked, the pin
+        # (13.54.3) is older than what is running; the build of that old tag failed and the
+        # box looked broken. Stop, change nothing, say why.
+        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False, allow_fallback=False)
+        if not release_tag:
+            plog("✗ Could not look up the latest CloudTAK release (GitHub did not answer or refused the request).")
+            plog("  Nothing was changed and CloudTAK is still running as before. Check this box's DNS/internet and try again in a few minutes.")
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
@@ -51266,6 +51710,15 @@ def run_cloudtak_update():
             from_ver = ''
         if from_ver:
             plog(f"  Running now: {from_ver}")
+            try:
+                _have = tuple(int(x) for x in re.findall(r'\d+', from_ver)[:3])
+                _want = tuple(int(x) for x in re.findall(r'\d+', release_tag)[:3])
+            except Exception:
+                _have = _want = ()
+            if _have and _want and _want < _have:
+                plog(f"✗ {release_tag} is older than the {from_ver} already running; not downgrading. Nothing was changed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
         _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
@@ -58129,6 +58582,13 @@ window.startCloudtakUpdate = function() {
 
 window.startDeploy = function() {
   document.getElementById("deploy-btn").disabled = true;
+  var banner = document.getElementById("ct-status-banner");
+  if (banner) {
+    banner.className = "status-banner stopped";
+    banner.innerHTML = '<span class="uninstall-spinner" style="width:14px;height:14px;margin-right:4px"></span>' +
+      "CloudTAK deploy in progress \u2014 building and starting the containers can take 10\u201345 minutes. " +
+      "The Deploy Log below updates live; it's safe to leave and come back.";
+  }
   document.getElementById("log-card").style.display = "block";
   document.getElementById("deploy-log-dyn").textContent = "Starting deployment...";
   window.logIndex = 0;
@@ -58182,6 +58642,11 @@ window.pollLog = function(redeployBtn) {
           if (redeployBtn) redeployBtn.disabled = false;
           if (d.error) {
             if (dyn) dyn.textContent = (dyn.textContent || "") + "\n\n\u2717 Deployment failed (see log above).";
+            var topBanner = document.getElementById("ct-status-banner");
+            if (topBanner && topBanner.querySelector(".uninstall-spinner")) {
+              topBanner.className = "status-banner stopped";
+              topBanner.innerHTML = '<div class="dot"></div>CloudTAK deploy failed \u2014 see the Deploy Log below.';
+            }
             var logCard = document.getElementById("log-card");
             if (logCard && !document.getElementById("deploy-fail-banner")) {
               var banner = document.createElement("div");
@@ -58419,6 +58884,72 @@ window.ctGenBootstrapCert = function(btn) {
     if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + (e && e.message ? e.message : String(e)) + '</span>';
   });
 };
+
+// v10.3.4 W9: the Connect CloudTAK to TAK Server card. GET says which state CloudTAK is
+// in; POST connects (first-time setup, with a TAK username + password) or reconnects with a
+// current certificate (after a CA rotation / revoke). The password is sent once, never kept.
+window.ctLoadConnectState = function(retries) {
+  var st = document.getElementById('ct-connect-state');
+  if (!st) return;
+  var btn = document.getElementById('ct-connect-btn');
+  var creds = document.getElementById('ct-connect-creds');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  fetch('/api/cloudtak/connect-tak', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      // Right after a reconnect the API is restarting: keep checking quietly instead of
+      // flashing "not answering" under a success message.
+      // ...and a just-made connection reads "dead" for a few seconds (nuc, 2026-11-01).
+      if ((d.status === 'unreachable' || d.status === 'down') && (retries || 0) > 0) {
+        st.innerHTML = '<span style="color:var(--text-dim)">● Waiting for CloudTAK to connect to TAK Server…</span>';
+        setTimeout(function() { window.ctLoadConnectState(retries - 1); }, 5000);
+        return;
+      }
+      var color = { connected: 'var(--green)', refused_untrusted: 'var(--red)', users_untrusted: 'var(--yellow)',
+                    down: 'var(--yellow)', unconfigured: 'var(--yellow)', unreachable: 'var(--red)' }[d.status] || 'var(--text-dim)';
+      st.innerHTML = '<span style="color:' + color + '">● ' + esc(d.message || d.status) + '</span>';
+      if (btn) {
+        btn.style.display = d.supported ? '' : 'none';
+        btn.textContent = d.status === 'connected' ? 'Reconnect with a new certificate' : 'Connect CloudTAK to TAK Server';
+      }
+      if (creds) creds.style.display = d.status === 'unconfigured' ? '' : 'none';
+      window._ctConnectNeedsCreds = d.status === 'unconfigured';
+    })
+    .catch(function() { st.textContent = "Could not read CloudTAK's TAK connection state."; });
+};
+
+window.ctConnectTak = function(btn) {
+  var out = document.getElementById('ct-connect-result');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var body = {};
+  if (window._ctConnectNeedsCreds) {
+    body.username = (document.getElementById('ct-connect-user').value || '').trim();
+    body.password = document.getElementById('ct-connect-pass').value || '';
+    if (!body.username || !body.password) {
+      if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--yellow)">Enter the TAK username and password first.</span>'; }
+      return;
+    }
+  }
+  var orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--text-dim)">Issuing a certificate from the current CA and connecting CloudTAK (up to a couple of minutes)…</span>'; }
+  fetch('/api/cloudtak/connect-tak', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false; btn.textContent = orig;
+    var p = document.getElementById('ct-connect-pass'); if (p) { p.value = ''; p.type = 'password'; }
+    var eye = document.getElementById('ct-connect-pass-eye'); if (eye) { eye.textContent = '\ud83d\udc41'; eye.title = 'Show password'; }
+    if (out) out.innerHTML = d && d.success
+      ? '<span style="color:var(--green)">✓ ' + esc(d.message) + '</span>'
+      : '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Connect failed') + '</span>';
+    window.ctLoadConnectState(12);
+  }).catch(function(e) {
+    btn.disabled = false; btn.textContent = orig;
+    if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>';
+  });
+};
+document.addEventListener('DOMContentLoaded', function() { window.ctLoadConnectState(); });
 
 // v10.1.43 W2: surface which cert identity CloudTAK's TAK connection uses, so
 // pre-10.1.18 boxes still on a legacy cert (user.p12/admin.p12) get told to run
@@ -67374,6 +67905,23 @@ def _docker_started_epoch(container):
     return _epoch_from_rfc3339(parts[1])
 
 
+def _ak_container_env_value(container, key):
+    """`key`'s value in `container`'s environment ('' if it isn't set), or None when the
+    container can't be inspected (missing, remote Authentik, docker error)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{json .Config.Env}}', container]),
+                           capture_output=True, text=True, timeout=10)
+        env = json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+    if not isinstance(env, list):
+        return None
+    for item in env:
+        if isinstance(item, str) and item.startswith(f'{key}='):
+            return item.split('=', 1)[1]
+    return ''
+
+
 # GH #207: Guard Dog's tak-authentik-watch.sh restarts Authentik on its own (HTTP down, or
 # an LDAP flow herd) and appends the epoch of each restart here (_record_restart, root,
 # 0644). Its first restart in 6 h touches only server+worker, so the outpost's start time
@@ -68295,9 +68843,16 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             except Exception as e:
                 verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
         if verdict in ('ok', 'healed'):
+            # ops #316: a restart drops every connected client to fix the HTTPS side alone, and
+            # on test6 that side came back by itself 75-204 s after an outpost restart (the
+            # 2026-10-30 update restart came 182 s in, with all 8 clients holding their groups).
+            # So with clients connected and grouped TAK is never restarted for it; only a TAK
+            # with nobody to drop (or none we can see) still is, after the stuck shortcut.
+            sessions = _tak_client_sessions()
+            grouped = None if sessions is None else sum(1 for x in sessions if x['groups'])
             # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=True)
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=grouped == 0)
             except Exception as e:
                 api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
             outcome ='clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
@@ -68309,9 +68864,19 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
                 _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
+            if grouped != 0:
+                who = (f"{grouped} connected client(s) have their groups" if grouped
+                       else "TAK's client list can't be read")
+                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
+                     f"TAK Server NOT restarted: {who}, and a restart would drop them all. ATAK Data Sync and "
+                     f"CloudTAK may show empty mission lists until it recovers; if they still do, restart TAK "
+                     f"Server at a quiet moment")
+                _finish(outcome + ' (HTTPS still broken, clients kept)',
+                        healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                return False
             plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
                  f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
-            summary = f"HTTPS/API side gives users no groups ({api_summary})"
+            summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
@@ -68349,7 +68914,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         return True
 
 
-def _authentik_reconfigure_heal_tak_clients(plog):
+def _ak_ldap_path_starts():
+    """Start times of the containers TAK's LDAP lookups go through (outpost, server)."""
+    return tuple(_docker_started_epoch(c) for c in ('authentik-ldap-1', 'authentik-server-1'))
+
+
+def _authentik_reconfigure_heal_tak_clients(plog, before=None):
     """End of an Authentik Reconfigure (ops #184): heal TAK's clients that connected while it
     had LDAP down. Every Reconfigure takes the LDAP path down under TAK: the LDAP flow fix
     recreates the outpost, and with an FQDN the domain sync restarts server/worker and then
@@ -68360,8 +68930,14 @@ def _authentik_reconfigure_heal_tak_clients(plog):
     reboot) left such a client on __ANON__ for good. An explicit request has no such gate:
     TAK just has to have been running before it. Inside a console update this only records
     it, and the update's final step carries it out after its other Authentik steps; a
-    Reconfigure from the Authentik page heals right here, in its own log."""
-    _tak_ldap_recycle_request('Authentik Reconfigure recreated the LDAP outpost')
+    Reconfigure from the Authentik page heals right here, in its own log.
+    ops #316: `before` = _ak_ldap_path_starts() taken when the Reconfigure began. When the
+    outpost and the server both still run from then (nothing changed, so nothing was
+    restarted), LDAP never went down and there is nothing to heal or check."""
+    if before is not None and None not in before and _ak_ldap_path_starts() == before:
+        plog("  LDAP outpost and Authentik server not restarted by this Reconfigure — TAK clients unaffected")
+    else:
+        _tak_ldap_recycle_request('Authentik Reconfigure recreated the LDAP outpost')
     try:
         _tak_recycle_after_ldap_outage(plog, 'end of Authentik Reconfigure', check_outpost=True)
     except Exception as e:
@@ -72500,6 +73076,7 @@ def run_authentik_deploy(reconfigure=False):
                         ldap_svc_pass = line.strip().split('=', 1)[1].strip()
                         break
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
+            ldap_path_before = _ak_ldap_path_starts()   # ops #316: did this Reconfigure take LDAP down?
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             _patch_authentik_compose_network()
             _ensure_authentik_compose_patches(compose_path, plog)
@@ -72549,7 +73126,7 @@ def run_authentik_deploy(reconfigure=False):
                     plog("  Waiting for Authentik API...")
                     if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=60, plog=plog):
                         plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
-                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none(recreate='if_changed')
                         if ok_flow:
                             plog("  ✓ LDAP flow & provider verified")
                         else:
@@ -72583,6 +73160,12 @@ def run_authentik_deploy(reconfigure=False):
                         if ak_host and ak_base:
                             plog("  Syncing Authentik domain from Caddy/Domains...")
                             try:
+                                # ops #316: write, and restart for, only what differs. This ran
+                                # on every post-update Reconfigure and restarted server/worker
+                                # and recreated the LDAP outpost under TAK with the domain
+                                # unchanged, and TAK's HTTPS side then gave cert logins no
+                                # groups for minutes (the update's TAK restarts on test6).
+                                restart_why = []
                                 with open(env_path) as f:
                                     env_lines = f.readlines()
                                 new_env = []
@@ -72595,12 +73178,16 @@ def run_authentik_deploy(reconfigure=False):
                                         new_env.append(line)
                                 if not seen:
                                     new_env.append(f'AUTHENTIK_HOST={ak_base}\n')
-                                with open(env_path, 'w') as f:
-                                    f.writelines(new_env)
+                                if new_env != env_lines:
+                                    with open(env_path, 'w') as f:
+                                        f.writelines(new_env)
+                                    restart_why.append('AUTHENTIK_HOST in .env')
+                                elif _ak_container_env_value('authentik-server-1', 'AUTHENTIK_HOST') not in (None, '', ak_base):
+                                    restart_why.append('server still running with the old AUTHENTIK_HOST')
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
                                 brands = json.loads(resp.read().decode())['results']
-                                if brands:
+                                if brands and brands[0].get('domain') != ak_host:
                                     bid = brands[0]['brand_uuid']
                                     urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/core/brands/{bid}/',
                                         data=json.dumps({'domain': ak_host}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
@@ -72610,34 +73197,44 @@ def run_authentik_deploy(reconfigure=False):
                                 for op in outposts:
                                     if 'embed' in op.get('name', '').lower() or op.get('type') == 'proxy':
                                         cfg = dict(op.get('config', {}))
-                                        cfg['authentik_host'] = ak_base
-                                        cfg['authentik_host_insecure'] = False
-                                        put_payload = {'name': op.get('name', 'authentik Embedded Outpost'), 'type': op.get('type', 'proxy'), 'providers': list(op.get('providers', [])), 'config': cfg}
-                                        urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{op["pk"]}/',
-                                            data=json.dumps(put_payload).encode(), headers=ak_headers, method='PUT'), timeout=10)
+                                        if cfg.get('authentik_host') != ak_base or cfg.get('authentik_host_insecure') is not False:
+                                            cfg['authentik_host'] = ak_base
+                                            cfg['authentik_host_insecure'] = False
+                                            put_payload = {'name': op.get('name', 'authentik Embedded Outpost'), 'type': op.get('type', 'proxy'), 'providers': list(op.get('providers', [])), 'config': cfg}
+                                            urllib.request.urlopen(urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{op["pk"]}/',
+                                                data=json.dumps(put_payload).encode(), headers=ak_headers, method='PUT'), timeout=10)
+                                            restart_why.append('embedded outpost host')
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
-                                # Server/worker FIRST, LDAP only after the API answers. The old order
-                                # (LDAP recreate, then server restart) started a fresh outpost against
-                                # the server that was about to go down: it fetched its config, got a
-                                # 502 on the provider list as the server stopped, and panicked
-                                # ("Failed to run server"), once per update on every box (v10.2.11
-                                # T&E). An outpost that starts while the server is still coming up
-                                # just retries its config fetch, so LDAP last is always safe.
-                                plog("  Restarting Authentik server/worker, then LDAP (no log output for up to ~2 min)...")
-                                _ak_compose_run_locked(['restart', 'server', 'worker'], 'reconfigure-domain-restart',
-                                                       plog, ak_dir, timeout=90, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
-                                plog("  Waiting for Authentik to come back online...")
-                                if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
-                                    plog("  \u2713 Authentik is online and ready")
-                                else:
-                                    plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
-                                _ak_compose_run_locked(['up', '-d', '--force-recreate', 'ldap'], 'reconfigure-ldap-recreate',
-                                                       plog, ak_dir, timeout=60, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
-                                plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
                             except Exception as e:
                                 plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
+                                restart_why = None
+                            if restart_why == []:
+                                plog("  \u2713 Authentik domain unchanged \u2014 no Authentik or LDAP restart")
+                            elif restart_why:
+                                try:
+                                    # Server/worker FIRST, LDAP only after the API answers. The old order
+                                    # (LDAP recreate, then server restart) started a fresh outpost against
+                                    # the server that was about to go down: it fetched its config, got a
+                                    # 502 on the provider list as the server stopped, and panicked
+                                    # ("Failed to run server"), once per update on every box (v10.2.11
+                                    # T&E). An outpost that starts while the server is still coming up
+                                    # just retries its config fetch, so LDAP last is always safe.
+                                    plog(f"  Domain changed ({', '.join(restart_why)}): restarting Authentik "
+                                         f"server/worker, then LDAP (no log output for up to ~2 min)...")
+                                    _ak_compose_run_locked(['restart', 'server', 'worker'], 'reconfigure-domain-restart',
+                                                           plog, ak_dir, timeout=90, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
+                                    plog("  Waiting for Authentik to come back online...")
+                                    if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True):
+                                        plog("  \u2713 Authentik is online and ready")
+                                    else:
+                                        plog("  \u26a0 Authentik API not ready after 180s \u2014 recreating LDAP anyway (it retries until the server answers)")
+                                    _ak_compose_run_locked(['up', '-d', '--force-recreate', 'ldap'], 'reconfigure-ldap-recreate',
+                                                           plog, ak_dir, timeout=60, wait=_AK_COMPOSE_LOCK_WAIT_LONG_S)
+                                    plog("  \u2713 Restarted Authentik (server/worker, then LDAP, to pick up new domain)")
+                                except Exception as e:
+                                    plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
                     else:
                         plog("  \u26a0 API not ready in time — run Update config & reconnect again to apply app access policies")
                 else:
@@ -72664,7 +73261,7 @@ def run_authentik_deploy(reconfigure=False):
                         plog("  Waiting for Authentik API (no-FQDN reconfigure)...")
                         if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=60, plog=plog):
                             plog("  Fixing LDAP flow & provider...")
-                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none()
+                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none(recreate='if_changed')
                             plog("  \u2713 LDAP flow OK" if ok_nf else f"  \u26a0 LDAP flow: {err_nf}")
                         else:
                             plog("  \u26a0 API not ready — run Update config again after Authentik is up")
@@ -72678,7 +73275,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_recovery_flow_standalone(env_path, plog)
             _sync_webadmin_after_authentik_reconfigure(plog)
             # ops #184: last, after every step above that takes LDAP down under TAK
-            _authentik_reconfigure_heal_tak_clients(plog)
+            _authentik_reconfigure_heal_tak_clients(plog, before=ldap_path_before)
             plog("")
             _authentik_reconfigure_finish(plog, issues, "Reconfigure", notes)
             return
@@ -74994,12 +75591,15 @@ def _wait_ldap_outpost_ready(timeout_secs=180):
         time.sleep(3)
     return False, (last_status or 'unknown')
 
-def _ensure_ldap_flow_authentication_none():
+def _ensure_ldap_flow_authentication_none(recreate='always'):
     """Ensure ldap-authentication-flow exists with authentication:none and 3 stage bindings, restart LDAP outpost.
     If flow missing (blueprint never ran), create it by cloning default-authentication-flow.
     If flow exists but has no stage bindings (deleted during debugging), recreate them from blueprint stages.
     Fixes 'Flow does not apply to current user' — require_outpost blocks user binds.
     Fixes 'Access denied for user' / Insufficient access (50) — missing bindings cause auth to fail.
+    recreate='if_changed' (ops #316, the Authentik Reconfigure every console update runs):
+    recreate the outpost only when this wrote something. A recreate under a running TAK
+    Server leaves TAK's HTTPS side giving cert logins no groups for minutes.
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -75017,6 +75617,7 @@ def _ensure_ldap_flow_authentication_none():
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     # Authentik API can be slow after worker restart or under load; use 60s per request
     _api_timeout = 60
+    changed = []
 
     def _get(path):
         r = _req.Request(f'{url}/api/v3/{path}', headers=headers)
@@ -75041,7 +75642,9 @@ def _ensure_ldap_flow_authentication_none():
         default_flow = default_flow_results[0] if default_flow_results else None
 
         if ldap_flow:
-            _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
+            if ldap_flow.get('authentication') != 'none':
+                _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
+                changed.append('flow authentication')
             # Ensure 3 stage bindings are our ldap-* stages (not default/MFA — those break LDAP bind)
             ldap_flow_pk = ldap_flow['pk']
             all_bindings = []
@@ -75076,8 +75679,11 @@ def _ensure_ldap_flow_authentication_none():
             _id_stage_needs_recreation = False
             if id_stage_pk:
                 try:
-                    # Include user_fields so PATCH does not trigger "no user fields selected" validation
-                    _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
+                    _cur_id = _get(f'stages/identification/{id_stage_pk}/')
+                    if _cur_id.get('password_stage') is not None or _cur_id.get('user_fields') != ['username']:
+                        # Include user_fields so PATCH does not trigger "no user fields selected" validation
+                        _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
+                        changed.append('identification stage')
                 except Exception:
                     pass
                 # Verify the PATCH actually cleared password_stage.  On Authentik 2026.x some
@@ -75101,6 +75707,7 @@ def _ensure_ldap_flow_authentication_none():
                     pass
             wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names or _id_stage_needs_recreation
             if wrong_bindings:
+                changed.append('stage bindings')
                 for b in ldap_bindings:
                     try:
                         _delete(f'flows/bindings/{b["pk"]}/')
@@ -75134,6 +75741,7 @@ def _ensure_ldap_flow_authentication_none():
                     binding_specs = [(10, id_stage), (15, pw_stage), (20, login_stage)]
                     for order, stage_pk in binding_specs:
                         if order not in existing_orders:
+                            changed.append('stage bindings')
                             try:
                                 _post('flows/bindings/', {
                                     'target': ldap_flow_pk, 'stage': stage_pk, 'order': order,
@@ -75155,18 +75763,18 @@ def _ensure_ldap_flow_authentication_none():
                     if _live_sd != AK_LDAP_SESSION_DURATION:
                         _patch(f'stages/user_login/{_login_stage_pk}/',
                                {'session_duration': AK_LDAP_SESSION_DURATION})
+                        changed.append('bind-cache session_duration')
                         print(f'  LDAP bind-cache session_duration {_live_sd} → {AK_LDAP_SESSION_DURATION} (v10.1.17 W3)', flush=True)
                 except urllib.error.HTTPError:
                     pass
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
-            if ldap_prov:
+            want_prov = {'authentication_flow': ldap_flow_pk, 'authorization_flow': ldap_flow_pk,
+                         'bind_mode': 'cached', 'search_mode': 'cached'}
+            if ldap_prov and any(str(ldap_prov.get(k)) != str(v) for k, v in want_prov.items()):
+                changed.append('LDAP provider')
                 try:
-                    _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
-                        'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_flow_pk,
-                        'bind_mode': 'cached',
-                        'search_mode': 'cached'})
+                    _patch(f'providers/ldap/{ldap_prov["pk"]}/', want_prov)
                 except urllib.error.HTTPError as e:
                     body = ''
                     try: body = e.read().decode()[:200]
@@ -75176,6 +75784,7 @@ def _ensure_ldap_flow_authentication_none():
             if not default_flow:
                 return False, 'Default authentication flow not found. Authentik may not be fully initialized.'
             default_pk = default_flow['pk']
+            changed.append('flow created')
             all_bindings = []
             page = 1
             while True:
@@ -75223,6 +75832,9 @@ def _ensure_ldap_flow_authentication_none():
     except Exception as e:
         return False, str(e)[:120]
     # LDAP outpost caches flow results — force-recreate required after flow/binding changes
+    if recreate == 'if_changed' and not changed:
+        print('  LDAP flow & provider already correct — outpost left running (no recreate)', flush=True)
+        return True, None
     if is_remote:
         _ak_module_compose(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', 'ldap-flow-recreate', timeout=90)
     else:
@@ -80211,12 +80823,27 @@ def takserver_ca_info():
             current_cn = (info['intermediate_ca'] or {}).get('name', '').lower()
             root_cn = (info['root_ca'] or {}).get('name', '').lower()
             old_cas = []
-            skip_aliases = {'mykey'}  # legacy default alias, not a CA to revoke
-            for a in trusted_aliases:
-                if a.lower() in skip_aliases:
-                    continue
-                if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
-                    old_cas.append(a)
+            # v10.3.4 W10: judge each trusted entry by the CERT's subject, not its alias. The
+            # first intermediate on a box sits under keytool's default alias `mykey`, which used
+            # to be skipped outright, so after one rotation the ORIGINAL intermediate could never
+            # be revoked from the UI (test6, 2026-11-01). An entry whose subject is the current
+            # intermediate or the root is never offered, whatever its alias.
+            entries = _tak_live_trust_entries(cert_dir)
+            if entries:
+                names = {}
+                for a, pem in entries:
+                    cn = (_pem_cn_and_expiry(pem)[0] or '').strip()
+                    if cn and cn.lower() not in (current_cn, root_cn):
+                        old_cas.append(a)
+                        names[a] = cn
+                info['old_ca_names'] = names
+            else:
+                # Subjects unreadable: the alias rule, which can't tell what `mykey` is.
+                for a in trusted_aliases:
+                    if a.lower() == 'mykey':
+                        continue
+                    if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
+                        old_cas.append(a)
             info['old_cas_in_truststore'] = old_cas
         except Exception:
             pass
@@ -81005,12 +81632,26 @@ def takserver_revoke_old_ca():
         # client cert + CA; restart so the portal picks up the new chain).
         _takportal_sync_certs(restart=True)
 
+        # v10.3.4 W8: CloudTAK's own connection and every user cert came from the CA just
+        # revoked, so nobody could log in (UND_ERR_SOCKET), and the only documented fix needed
+        # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
+        ct_note = ''
+        if _cloudtak_local_with_local_tak():
+            threading.Thread(target=_cloudtak_heal_after_ca_change,
+                             args=(lambda m: print(f"Revoke Old CA:{m}", flush=True),),
+                             daemon=True, name='ct-cert-heal-revoke').start()
+            ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
+                       'CloudTAK users whose certificate came from the revoked CA get a new one at their '
+                       'next login: anyone signed in to CloudTAK right now must log out and back in once.')
+
         msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
-               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.')
+               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.'
+               + ct_note)
         if os.path.isfile(le_jks):
             msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.')
+                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.'
+                   + ct_note)
         return jsonify({'success': True, 'message': msg})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -99535,23 +100176,70 @@ def _startup_converge_tak_banaction():
         print('Startup migration: takserver banaction converge warning (non-fatal): %s' % _e)
 
 
+def _startup_converge_tak_badcert():
+    """v10.3.4 W6: every box with the takserver jail on gets the takserver-badcert jail, and
+    the takserver filter that stops counting refused certs, on its next console start.
+
+    Without this, the fix reaches only boxes where someone re-saves the TAK jail: every other
+    box keeps banning re-enrolling phones on 8446. Writes only what differs: the badcert
+    filter/action/jail (whitelist taken from the takserver jail, so both match), then the
+    owned-filter self-heal, which upgrades the shipped takserver filter and leaves an
+    operator-edited one alone. A new jail loads on a plain reload; an existing one whose file
+    changed needs `reload --restart` (fail2ban 0.11.2 drops a new action on reload, see
+    _startup_converge_tak_banaction)."""
+    try:
+        if not _f2b_tak_jail_enabled():
+            return
+        existed = os.path.exists(_F2B_TAK_BADCERT_JAIL_PATH)
+        changed = _f2b_tak_badcert_prereqs()
+        c = _f2b_read_tak_jail_config()
+        want = _f2b_tak_badcert_jail_text(_f2b_operator_extra(c.get('ignoreip', '')))
+        jail_changed = _f2b_read_text(_F2B_TAK_BADCERT_JAIL_PATH) != want
+        if jail_changed:
+            _write_priv(_F2B_TAK_BADCERT_JAIL_PATH, want)
+        _f2b_selfheal_filters(lambda m: print(f"Startup migration: {m}", flush=True))
+        # The banaction converge just before this may have written the file (it writes both
+        # jails) but restarted only `takserver`, so the new jail can be on disk and not loaded.
+        loaded = _f2b_loaded_jails()
+        if loaded and 'takserver-badcert' not in loaded:
+            changed = True
+        if jail_changed and existed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload', '--restart', 'takserver-badcert']),
+                           capture_output=True, timeout=30)
+        elif jail_changed or changed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
+        if jail_changed and not existed:
+            print('Startup migration: ✓ takserver-badcert jail added — a phone TAK refuses for an old '
+                  'certificate is no longer banned from enrollment (8446), so a fresh QR works; only a '
+                  'flood (2/s for 5 min) blocks TAK streaming, for 10 min', flush=True)
+        elif jail_changed:
+            print('Startup migration: ✓ takserver-badcert jail brought up to date', flush=True)
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: takserver-badcert converge warning (non-fatal): %s' % _e)
+
+
 def _startup_converge_recidive_tak_exempt():
     """2026-10-21: recidive no longer escalates takserver bans. Separate from
     `_startup_converge_recidive_media_exempt()` because that one returns as soon as
     `mediamtx-rtsp` is in the file, which is every box since v10.1.30 (the same trap
-    `_startup_converge_recidive_bantime()` documents)."""
+    `_startup_converge_recidive_bantime()` documents).
+
+    v10.3.4: keyed on `takserver-badcert`, not `takserver`. Every box already has
+    `takserver` in the file since 10-21, so the old test would never add the new jail."""
     try:
         if not _f2b_recidive_enabled():
             return
         cur = _f2b_read_text('/etc/fail2ban/jail.d/infratak-recidive.conf')
-        if cur is None or 'takserver' in cur:
+        if cur is None or 'takserver-badcert' in cur:
             return
         c = _f2b_read_recidive_config()
         _f2b_write_recidive_config(c['maxretry'], c['findtime'])
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
                        capture_output=True, timeout=15)
-        print('Startup migration: ✓ recidive now ignores takserver bans — three bans of a '
-              'phone with an old certificate escalated to a 7-day ALL-ports ban')
+        print('Startup migration: ✓ recidive now ignores takserver and takserver-badcert bans — '
+              'three bans of a phone with an old certificate escalated to a 7-day ALL-ports ban')
     except PermissionError:
         pass
     except Exception as _e:
@@ -99698,8 +100386,8 @@ def _ct_docker_out(args, timeout=20, stdin=None):
 
 
 def _cloudtak_override_services(ct_dir):
-    """Service names infra-TAK's docker-compose.override.yml configures (api, events, media,
-    postgis), read from the file itself. Empty set when it can't be read."""
+    """Service names infra-TAK's docker-compose.override.yml configures (api, tiles, events,
+    media, postgis), read from the file itself. Empty set when it can't be read."""
     try:
         with open(os.path.join(ct_dir, 'docker-compose.override.yml'), encoding='utf-8') as f:
             text = f.read()
@@ -101195,6 +101883,7 @@ def _find_settings():
 # _f2b_tak_failure_kind() / _f2b_tak_ban_explain(); a test holds the two copies together.
 TAK_LOG = '/opt/tak/logs/takserver-messaging.log'
 TAK_JAIL = '/etc/fail2ban/jail.d/infratak-takserver.conf'
+TAK_BADCERT_JAIL = '/etc/fail2ban/jail.d/infratak-takserver-badcert.conf'
 _TAK_FAIL_RE = re.compile(
     r'NioNettyServerHandler error\. Cause: (?P<cause>.*?)\. Additional info: '
     r'Remote address: (?P<ip>[^;\s]+);(?P<rest>.*)$')
@@ -101202,18 +101891,22 @@ _TAK_SUBJECT_RE = re.compile(r'Peer certificate Subject DN: ([^;]+);')
 
 
 def _tak_failure_kind(cause, rest):
+    if (cause.startswith('javax.net.ssl.SSLHandshakeException: General OpenSslEngine problem')
+            or 'Peer certificate Subject DN:' in rest):
+        return 'bad_cert'
     if 'PEER_DID_NOT_RETURN_A_CERTIFICATE' in cause:
         return 'no_cert'
     if any(k in cause for k in ('NotSslRecordException', 'UNSUPPORTED_PROTOCOL',
                                 'NO_SHARED_CIPHER', 'NO_SHARED_GROUP', 'WRONG_VERSION')):
         return 'not_tak'
-    if 'SSLHandshakeException' in cause or 'Certificate error' in rest:
-        return 'bad_cert'
     return 'other'
 
 
-def _tak_explain(ip, kind, subject, duration):
-    if kind == 'bad_cert':
+def _tak_explain(ip, kind, subject, duration, jail='takserver'):
+    if jail == 'takserver-badcert':
+        msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
+               f"TAK streaming for {duration}. It can still re-enroll: scan a fresh QR.")
+    elif kind == 'bad_cert':
         msg = (f"A device at {ip} kept failing TAK's certificate check, so it's blocked from "
                f"TAK for {duration}. Usually that's an ATAK/iTAK profile with an old "
                f"certificate. Re-enroll it or remove that server from the device.")
@@ -101239,10 +101932,11 @@ def _duration_label(seconds):
     return f'{max(1, seconds // 60)} min'
 
 
-def _tak_reason(ip):
-    bantime = 3600
+def _tak_reason(ip, jail='takserver'):
+    badcert = jail == 'takserver-badcert'
+    bantime = 600 if badcert else 3600
     try:
-        with open(TAK_JAIL) as f:
+        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
             m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
         if m:
             bantime = int(m.group(1))
@@ -101265,6 +101959,10 @@ def _tak_reason(ip):
     except Exception:
         pass
     kind = max(kinds, key=kinds.get) if kinds else 'other'
+    if badcert:
+        return (_tak_explain(ip, kind, subject, _duration_label(bantime), jail) +
+                "\n\nOnly TAK streaming is blocked (8089, 8443, federation). Enrollment (8446), "
+                "the console, Authentik and SSH still work from that address.")
     return (_tak_explain(ip, kind, subject, _duration_label(bantime)) +
             "\n\nOnly TAK's ports are blocked. The console, Authentik and SSH still work "
             "from that address.")
@@ -101324,11 +102022,14 @@ def main():
 
     _reasons = {
         'authentik':  'Too many failed Authentik login attempts',
-        'takserver':  'Too many failed TAK Server connection attempts (bad certificate or scanner)',
+        'takserver':  'Too many failed TAK Server connection attempts (scanner or bad certificate)',
+        'takserver-badcert': 'A flood of TAK Server connections with a refused certificate',
     }
     reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
-    jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server'}.get(jail.lower(), jail)
-    explain    = _tak_reason(ip) + '\n\n' if jail.lower() == 'takserver' else ''
+    jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server',
+                  'takserver-badcert': 'TAK Server, refused certificate'}.get(jail.lower(), jail)
+    explain    = (_tak_reason(ip, jail.lower()) + '\n\n'
+                  if jail.lower() in ('takserver', 'takserver-badcert') else '')
 
     subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
     body = (
@@ -101439,6 +102140,16 @@ _F2B_TAK_GUARDDOG_ACTION = (
     " | fail2ban: Banned <ip> (TAK Server: failed TLS handshakes, blocked from TAK ports only)\""
     " >> /var/log/takguard/restarts.log"
     " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
+    "actionunban =\n"
+)
+_F2B_TAK_BADCERT_GUARDDOG_ACTION = (
+    "[Definition]\n"
+    "actionban  = mkdir -p /var/log/takguard"
+    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Banned <ip> (TAK Server: refused-certificate flood, blocked from TAK streaming"
+    " for 10 min, enrollment 8446 still open)\""
+    " >> /var/log/takguard/restarts.log"
+    " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver-badcert\n"
     "actionunban =\n"
 )
 
@@ -102630,6 +103341,12 @@ def _startup_migrations():
             _startup_converge_tak_banaction()
         except Exception as _f2b_e3e:
             print(f"Startup migration: takserver banaction converge error (non-fatal): {_f2b_e3e}", flush=True)
+        # v10.3.4 — refused-cert phones move to the takserver-badcert jail, which never
+        # blocks enrollment (8446). Before recidive's exemption so both land in one start.
+        try:
+            _startup_converge_tak_badcert()
+        except Exception as _f2b_e3g:
+            print(f"Startup migration: takserver-badcert converge error (non-fatal): {_f2b_e3g}", flush=True)
         try:
             _startup_converge_recidive_tak_exempt()
         except Exception as _f2b_e3f:
@@ -104761,20 +105478,9 @@ def _post_update_auto_deploy():
             # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
             # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
-            def _ct_heal():
-                _plog = lambda m: print(f"Post-update:{m}", flush=True)
-                try:
-                    _cloudtak_tak_cert_heal(log=_plog)
-                except Exception as e:
-                    print(f"Post-update: CloudTAK cert check skipped: {e}", flush=True)
-                try:
-                    _s = load_settings()
-                    if ((_get_cloudtak_deployment_config(_s).get('target_mode') or 'local').strip().lower() != 'remote'
-                            and _cloudtak_bootstrap_cert_target(_s)[0] == 'local'):
-                        _cloudtak_reset_foreign_profile_certs(_plog)
-                except Exception as e:
-                    print(f"Post-update: CloudTAK user cert check skipped: {e}", flush=True)
-            threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal').start()
+            threading.Thread(target=_cloudtak_heal_after_ca_change,
+                             args=(lambda m: print(f"Post-update:{m}", flush=True),),
+                             daemon=True, name='ct-cert-heal').start()
 
             # Fix LDAP outpost AUTHENTIK_HOST if it was set to external HTTPS URL AND the outpost is
             # confirmed broken with `tls: internal error` (the original v0.8.0 use case — Caddy ACME
