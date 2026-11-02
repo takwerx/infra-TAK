@@ -95494,6 +95494,46 @@ def _ubuntu_pro_security_covered(raw=None):
         return False
 
 
+def _os_upgrade_boot_apps_down(start=False):
+    """['TAK-Portal', 'CloudTAK']: the installed, local apps that Guard Dog's boot sequencer
+    stops at boot and only tak-post-start starts again, that are not running now.
+    start=True also starts each one, as its page's Start button does.
+
+    ops #438 (field, Nov 2): after the 24.04 reboot both stayed Stopped while TAK, Authentik
+    and Caddy ran, and nothing on the box would ever start them: the sequencer's `docker stop`
+    keeps `restart: unless-stopped` from doing it, and tak-post-start runs once per boot.
+    Every normal boot starts both, so starting them here changes nothing an operator chose."""
+    down = []
+    try:
+        tp = _takportal_web_container(all_states=True)
+    except Exception:
+        tp = None
+    if tp is not None and not tp.get('running'):
+        down.append('TAK-Portal')
+        if start:
+            try:
+                _takportal_up(timeout=180)
+            except Exception as e:
+                print(f"[os-upgrade] TAK Portal start failed: {e}", flush=True)
+    try:
+        ct_remote = _get_cloudtak_deployment_config(load_settings()).get('target_mode') == 'remote'
+    except Exception:
+        ct_remote = False
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    if not ct_remote and any(os.path.exists(os.path.join(ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
+        running, _p, _e = _os_upgrade_containers()
+        if running is not None and not any(n.startswith('cloudtak-api') for n in running):
+            down.append('CloudTAK')
+            if start:
+                try:
+                    _cloudtak_ensure_custom_compose(ct_dir)   # GH #261: before compose, every time
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ct_dir,
+                                   capture_output=True, text=True, timeout=120)
+                except Exception as e:
+                    print(f"[os-upgrade] CloudTAK start failed: {e}", flush=True)
+    return down
+
+
 def _startup_os_upgrade_verify():
     """Post-reboot half of step 8: the console that boots after the flip sees status
     `rebooting`, marks `verifying`, waits for the baseline containers/services to come
@@ -95527,6 +95567,11 @@ def _startup_os_upgrade_verify():
                 if _ld != 'loaded' or _act in ('active', 'failed'):
                     break
                 time.sleep(15)
+            # ops #438: whatever tak-post-start left stopped (it timed out, was killed, or its
+            # start failed), start it once now and give it the same wait as the rest.
+            apps_down = _os_upgrade_boot_apps_down(start=True)
+            if apps_down:
+                print(f"[os-upgrade] after post-start still stopped: {', '.join(apps_down)} — starting them", flush=True)
             deadline = time.time() + _OS_UPGRADE_VERIFY_WAIT_S
             pg_expect = baseline.get('pg_expect') or ''
             while True:
@@ -95545,15 +95590,21 @@ def _startup_os_upgrade_verify():
                             missing_s.append(svc)
                     except Exception:
                         missing_s.append(svc)
-                if (not missing_c and not missing_s and pg_ok) or time.time() >= deadline:
+                apps_down = _os_upgrade_boot_apps_down() if apps_down else []
+                if (not missing_c and not missing_s and pg_ok and not apps_down) or time.time() >= deadline:
                     break
                 time.sleep(10)
             if missing_c:
                 problems.append('containers=' + ','.join(missing_c))
             if missing_s:
                 problems.append('services=' + ','.join(missing_s))
+            if apps_down:
+                problems.append('stopped=' + ','.join(apps_down))
             if not pg_ok:
-                problems.append('postgresql=' + (';'.join('/'.join(c) for c in clusters) or 'none'))
+                # ops #438: name TAK's cluster only. Others (the 5.8 migration's rollback copy,
+                # kept stopped on purpose) are not missing, and listing them read as if they were.
+                tak_pg = [c for c in clusters if c[0] == pg_expect or c[2] == '5432']
+                problems.append('postgresql=' + (';'.join('/'.join(c) for c in tak_pg) or f'{pg_expect}/none'))
             if problems:
                 _os_upgrade_write_status('failed:verify:' + ' '.join(problems))
                 print(f"[os-upgrade] ✗ post-reboot verify FAILED: {' '.join(problems)}", flush=True)
