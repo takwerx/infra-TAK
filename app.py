@@ -56282,8 +56282,8 @@ def _netbird_idp_cert_refusal(err_body):
     """True when a NetBird identity-provider error body says it can't validate the issuer's
     TLS certificate (ops #433)."""
     low = (err_body or '').lower()
-    return any(k in low for k in ('x509', 'unknown authority', 'issuer is unreachable',
-                                  'certificate verify', 'tls:'))
+    return any(k in low for k in ('x509', 'unknown authority', 'failed to verify certificate',
+                                  'certificate verify'))
 
 
 def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
@@ -56671,6 +56671,14 @@ def _run_netbird_deploy(settings):
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        # netbird-server reads the host CA bundle through a single-file bind mount, and
+        # update-ca-certificates swaps that file, so a container started before a CA was installed
+        # keeps the old bundle. Recreate it so the Authentik registration in Step 5 sees the
+        # current one (ops #433: "install the CA, press Deploy again" did nothing without this).
+        r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'netbird-server']),
+                    capture_output=True, text=True, cwd=nb_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose recreate netbird-server failed: {r.stderr[:300]}')
         plog('✓ Containers running')
 
         plog('')

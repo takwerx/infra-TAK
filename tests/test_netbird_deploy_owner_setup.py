@@ -271,3 +271,25 @@ def test_deploy_writes_the_ca_override_before_registering():
     fn = next(n for n in ast.parse(APP).body
               if isinstance(n, ast.FunctionDef) and n.name == '_netbird_write_compose')
     assert '_netbird_write_ca_override(nb_dir)' in ast.get_source_segment(APP, fn)
+
+
+def test_unreachable_issuer_is_not_reported_as_an_untrusted_certificate():
+    """ops #433 box test: a timeout also says "issuer is unreachable"; only a certificate error
+    gets the "install the CA" message."""
+    timeout_422 = ('{"message":"identity provider issuer is unreachable: get \\"https://ak/.well-known/'
+                   'openid-configuration\\": context deadline exceeded (client.timeout exceeded while awaiting headers)"}')
+    ok, _ = _register([], post_error=(422, timeout_422))
+    assert ok is False
+    assert "can't trust" not in '\n'.join(_register.logs)
+
+
+def test_deploy_recreates_netbird_server_before_registering():
+    """ops #433 box test: netbird-server keeps the CA bundle it started with, so a CA installed
+    after the first deploy was ignored on "Deploy again". Step 3 recreates it, ahead of the
+    Authentik registration in Step 5."""
+    fn = next(n for n in ast.parse(APP).body
+              if isinstance(n, ast.FunctionDef) and n.name == '_run_netbird_deploy')
+    src = ast.get_source_segment(APP, fn)
+    recreate = src.index("'--force-recreate', 'netbird-server'")
+    assert recreate < src.index('_netbird_register_authentik_idp(')
+
