@@ -38677,13 +38677,18 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # /opt/tak/certs/files, so write the p12 to a host-writable /tmp path, then broker-cp it
     # onto the shared mount where the container's keytool (Step B) reads it. (Raw -out into
     # /opt/tak EPERM'd with an empty error -> "PKCS12 conversion failed" -> no 8446 LE cert.)
-    _tmp_p12 = '/tmp/takserver-le.p12'
+    # Per-run console-owned dir, not a fixed /tmp name: the root-run renewal script leaves a
+    # root-owned 0600 /tmp/takserver-le.p12 behind, which takwerx cannot overwrite (nuc
+    # 2026-11-02: "PKCS12 conversion failed:" every minute, 8446 never got the LE cert).
+    _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
+    _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
     r = subprocess.run(
         f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
         f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}"); return False
+        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True); return False
     subprocess.run(_sudo_wrap(['cp', _tmp_p12, p12]), capture_output=True)
     # The hardened 5.8 images run as tak:0, NOT root, so a root-owned 0600 p12 is
     # unreadable by the keytool in Step B:
@@ -38694,10 +38699,7 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # _container_own_tree() cannot cover this file: it runs during the deploy, and this
     # cert is installed afterwards. The ownership is set from the container's real ids
     # just below, which supersedes the group-0 model this lane originally used.
-    try:
-        os.remove(_tmp_p12)
-    except Exception:
-        pass
+    shutil.rmtree(_tmp_dir, ignore_errors=True)
     # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
     # The container must be able to READ the p12, so set ownership from the container's real
     # uid FIRST — 1000 is only correct for the stock image; the hardened one runs as 1001.
@@ -38867,24 +38869,30 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
 
-    # Step A: LE cert → PKCS12
+    # Step A: LE cert → PKCS12, in a per-run console-owned dir (see the container path above
+    # for why a fixed /tmp name fails on non-root boxes).
+    _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
+    _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
+    _tmp_jks = os.path.join(_tmp_dir, 'takserver-le.jks')
     r = subprocess.run(
         f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out /tmp/takserver-le.p12 -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
+        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}")
+        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
         return False
     log_fn("  ✓ PKCS12 created")
 
     # Step B: PKCS12 → JKS
     r = subprocess.run(
         f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} '
-        f'-destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 '
+        f'-destkeystore {shlex.quote(_tmp_jks)} -srckeystore {shlex.quote(_tmp_p12)} '
         f'-srcstoretype pkcs12 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ JKS conversion failed: {r.stderr.strip()[:200]}")
+        log_fn(f"  ⚠ JKS conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
         return False
 
     # install(1) reads the /tmp source (broker source-permissive) and writes the
@@ -38894,13 +38902,9 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     # 0644 and is now 0640 too.)
     subprocess.run(_sudo_wrap([
         'install', '-o', 'tak', '-g', 'tak', '-m', '640',
-        '/tmp/takserver-le.jks', '/opt/tak/certs/files/takserver-le.jks']),
+        _tmp_jks, '/opt/tak/certs/files/takserver-le.jks']),
         capture_output=True, text=True)
-    for _scratch in ('/tmp/takserver-le.jks', '/tmp/takserver-le.p12'):
-        try:
-            os.remove(_scratch)  # console-owned /tmp scratch; direct
-        except OSError:
-            pass
+    shutil.rmtree(_tmp_dir, ignore_errors=True)  # console-owned scratch; direct
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
@@ -39008,17 +39012,18 @@ if [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ]; then
 fi
 
 log "TAK keystore differs from Caddy's current cert (Caddy renewed) — refreshing keystore..."
-rm -f /tmp/takserver-le.p12 /tmp/takserver-le.jks
+WORK=$(mktemp -d /tmp/le8446-renew-XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
-  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
+  -out "$WORK/takserver-le.p12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
 
 keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} \\
-  -destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 \\
+  -destkeystore "$WORK/takserver-le.jks" -srckeystore "$WORK/takserver-le.p12" \\
   -srcstoretype pkcs12
 
 rm -f /opt/tak/certs/files/takserver-le.jks
-mv /tmp/takserver-le.jks /opt/tak/certs/files/
+mv "$WORK/takserver-le.jks" /opt/tak/certs/files/
 chown tak:tak /opt/tak/certs/files/takserver-le.jks
 
 systemctl restart takserver
