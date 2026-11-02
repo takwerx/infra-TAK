@@ -150,18 +150,20 @@ def test_kb_per_sec_probe_is_recorded_not_dropped(box):
 
 
 def test_slow_commits_alert(box):
-    box.seed([100.0] * 11, lat=[(45, 14.0), (30, 16.0), (15, 15.0)])
-    alerts, body, _ = box(lat='271 kB/s')
+    # ops #429: "slow" now means a real stall (each of the last 3 readings over 30 ms),
+    # not a 1h average just over 10 ms.
+    box.seed([100.0] * 11, lat=[(45, 80.0), (30, 90.0), (15, 85.0)])
+    alerts, body, _ = box(lat='50 kB/s')
     assert alerts.count('Disk I/O Degradation') == 1
-    assert 'exceeds 10 ms ceiling' in body and 'Last-hour average (' not in body
+    assert 'Disk commit latency is stalling' in body and 'Last-hour average (' not in body
 
 
 def test_slow_commits_and_low_hour_give_both_reasons(box):
-    box.seed([100.0] * 8 + [30.0] * 3, lat=[(45, 14.0), (30, 16.0), (15, 15.0)])
-    alerts, body, _ = box(tp='30 MB/s', lat='271 kB/s')
+    box.seed([100.0] * 8 + [30.0] * 3, lat=[(45, 80.0), (30, 90.0), (15, 85.0)])
+    alerts, body, _ = box(tp='30 MB/s', lat='50 kB/s')
     assert alerts.count('Disk I/O Degradation') == 1
     assert 'Last-hour average (30.0 MB/s) is below 50 MB/s' in body
-    assert 'exceeds 10 ms ceiling' in body
+    assert 'Disk commit latency is stalling' in body
 
 
 def test_three_low_hours_alert_with_fast_commits(box):
