@@ -49988,6 +49988,43 @@ def _patch_cloudtak_tiles_arm64(cloudtak_dir=None):
     return True
 
 
+# GH #384 (ops #439): the tiles image runs its unit tests inside the build, and since 13.117.0
+# a few of them, named "... (live network)", fetch real tiles from maps.six.nsw.gov.au and
+# sampleserver6.arcgisonline.com. A box whose network can't reach those (firewall, geo-block,
+# their outage) fails every Update at `npm run test` with "actual: 400, expected: 200" and
+# rolls back. Skip only those tests in the image build; every offline test still runs.
+# NODE_OPTIONS, not `npm run test -- --test-skip-pattern`: tsx --test ignores the trailing flag
+# (✅ verified 2026-11-02 in node:26-alpine3.24 on test6). Tracked file: re-apply after every
+# checkout, like the arm64 base patch.
+_CLOUDTAK_TILES_LIVE_SKIP = 'NODE_OPTIONS=--test-skip-pattern=live.network '
+_CLOUDTAK_TILES_TEST_RE = re.compile(r'(?m)(^RUN[ \t]+|&&[ \t]*)(npm run test\b)')
+_CLOUDTAK_REMOTE_TILES_LIVE_PERL = (
+    "cd ~/CloudTAK && f=" + _CLOUDTAK_TILES_DOCKERFILE + " && [ -f \"$f\" ] && "
+    "perl -i -pe 's/(^RUN[ \\t]+|&&[ \\t]*)(npm run test\\b)/${1}" + _CLOUDTAK_TILES_LIVE_SKIP + "$2/ "
+    "unless /test-skip-pattern/' \"$f\"; true"
+)
+
+
+def _patch_cloudtak_tiles_live_tests(cloudtak_dir=None):
+    """Make CloudTAK's tiles image build skip its live-network tests (GH #384).
+    Idempotent; returns True if the file changed."""
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    path = os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        cur = f.read()
+    if 'test-skip-pattern' in cur:
+        return False
+    new = _CLOUDTAK_TILES_TEST_RE.sub(r'\1' + _CLOUDTAK_TILES_LIVE_SKIP + r'\2', cur, count=1)
+    if new == cur:
+        return False
+    with open(path, 'w') as f:
+        f.write(new)
+    return True
+
+
 def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
     """arm64 only: build media-infra from source and tag it as the exact image
     CloudTAK's compose pins, so `docker compose up` uses the local arm64 build
@@ -50490,6 +50527,9 @@ def run_cloudtak_deploy(cfg=None):
             # ops #216: a Deploy over a remote CloudTAK keeps TAK Portal's plugins (in-place
             # checkout) but reset its build edits — put them back before the build.
             _cloudtak_remote_shield(remote_cfg, plog)
+            # GH #384: the tiles build must not need outside map servers.
+            if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
+                plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -50832,6 +50872,11 @@ def run_cloudtak_deploy(cfg=None):
                     plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
             except Exception as _te:
                 plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
+            try:
+                if _patch_cloudtak_tiles_live_tests(cloudtak_dir):
+                    plog("  tiles build: skipping CloudTAK's live-network tests (they need outside map servers)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles live-test skip not applied (non-fatal): {str(_te)[:100]}")
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -52399,6 +52444,9 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
+            # GH #384: and put back the tiles build's live-network test skip.
+            if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
+                plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
             if os.path.isdir(_cloudtak_hooks_dir()):
                 plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
@@ -52407,6 +52455,11 @@ def run_cloudtak_update():
                     plog("  arm64: re-applied tiles Dockerfile base alpine→bookworm-slim after checkout")
             except Exception as _te:
                 plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
+            try:
+                if _patch_cloudtak_tiles_live_tests(cloudtak_dir):
+                    plog("  tiles build: skipping CloudTAK's live-network tests (they need outside map servers)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles live-test skip not applied (non-fatal): {str(_te)[:100]}")
             try:
                 _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
