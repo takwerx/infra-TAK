@@ -356,7 +356,7 @@ def test_live_connection_with_trusted_or_unknown_user_certs_is_connected():
 
 def test_status_waits_out_the_api_restart_after_a_reconnect():
     js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
-    assert "window.ctLoadConnectState(12);" in js and "d.status === 'unreachable' && (retries || 0) > 0" in js
+    assert "window.ctLoadConnectState(12);" in js and "d.status === 'unreachable' || d.status === 'down'" in js
 
 
 def test_password_field_has_a_show_toggle_and_hides_again_after_connect():
@@ -374,3 +374,12 @@ def test_a_refresh_mid_deploy_shows_the_deploy_not_installed_but_stopped():
     js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
     assert 'banner.innerHTML = \'<span class="uninstall-spinner"' in js           # in-page Deploy gets it too
     assert 'CloudTAK deploy failed' in js                                         # and never spins forever
+
+
+def test_connect_inputs_are_cyan_and_status_waits_for_the_new_connection():
+    for fid in ('ct-connect-user', 'ct-connect-pass'):
+        i = TEMPLATE.index(f'id="{fid}"')
+        tag = TEMPLATE[i:TEMPLATE.index('>', i)]
+        assert 'border:1px solid var(--cyan)' in tag and 'color:var(--cyan)' in tag, fid
+    js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
+    assert "(d.status === 'unreachable' || d.status === 'down') && (retries || 0) > 0" in js

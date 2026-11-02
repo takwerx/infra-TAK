@@ -58807,8 +58807,9 @@ window.ctLoadConnectState = function(retries) {
     .then(function(d) {
       // Right after a reconnect the API is restarting: keep checking quietly instead of
       // flashing "not answering" under a success message.
-      if (d.status === 'unreachable' && (retries || 0) > 0) {
-        st.innerHTML = '<span style="color:var(--text-dim)">● Waiting for CloudTAK to come back up…</span>';
+      // ...and a just-made connection reads "dead" for a few seconds (nuc, 2026-11-01).
+      if ((d.status === 'unreachable' || d.status === 'down') && (retries || 0) > 0) {
+        st.innerHTML = '<span style="color:var(--text-dim)">● Waiting for CloudTAK to connect to TAK Server…</span>';
         setTimeout(function() { window.ctLoadConnectState(retries - 1); }, 5000);
         return;
       }
