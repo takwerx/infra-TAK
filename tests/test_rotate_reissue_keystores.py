@@ -136,11 +136,47 @@ def test_a_cert_name_is_shell_quoted(tmp_path):
 
 
 def test_rotate_reissues_server_and_clients_through_the_helper():
+    """The server cert goes through THE one writer (_tak_server_cert_issue), which reissues it with
+    _rotate_reissue_cert (next test); clients go through the helper directly. Never makeCert.sh."""
     body = _func('takserver_rotate_intca')
-    assert "_rotate_reissue_cert('server', 'takserver', run, cert_dir)" in body
+    assert '_tak_server_cert_issue(' in body, 'rotate no longer issues the server cert through its one writer'
     assert "_rotate_reissue_cert('client', name, run, cert_dir)" in body
     assert 'makeCert.sh client' not in body, 'rotate calls makeCert directly again'
     assert 'makeCert.sh server' not in body, 'rotate calls makeCert directly again'
+
+
+@pytest.mark.parametrize('signer', ['intermediate', 'root'])
+def test_the_server_cert_writer_reissues_through_the_helper(signer):
+    """_tak_server_cert_issue must reach _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+    for either signer, and never run makeCert.sh itself (that skips the keystore move-aside)."""
+    body = _func('_tak_server_cert_issue')
+    calls = []
+
+    def spy(kind, name, run, cert_dir):
+        calls.append((kind, name, run, cert_dir))
+        return True
+
+    cmds = []
+
+    def run(cmd):
+        cmds.append(cmd)
+        return True
+
+    ns = {'os': os, 'shlex': shlex, '_exists_priv': lambda _p: True, '_rotate_reissue_cert': spy,
+          '_tak_server_cert_prepare': lambda *_a: None, 'TAK_SERVER_CERT_SIGNERS': ('root', 'intermediate'),
+          '_TAK_WORKING_CA_FILES': (('ca.pem', 'root-ca.pem'),)}
+    exec(compile(body, 'app.py', 'exec'), ns)
+    assert ns['_tak_server_cert_issue']({}, signer, None, run, '/certs') is True
+    assert calls == [('server', 'takserver', run, '/certs')]
+    assert not [c for c in cmds if 'makeCert.sh' in c], 'the writer calls makeCert directly again'
+
+
+def test_the_server_cert_writer_gives_up_when_the_helper_fails():
+    ns = {'os': os, 'shlex': shlex, '_exists_priv': lambda _p: True,
+          '_rotate_reissue_cert': lambda *_a: False, '_tak_server_cert_prepare': lambda *_a: None,
+          'TAK_SERVER_CERT_SIGNERS': ('root', 'intermediate'), '_TAK_WORKING_CA_FILES': ()}
+    exec(compile(_func('_tak_server_cert_issue'), 'app.py', 'exec'), ns)
+    assert ns['_tak_server_cert_issue']({}, 'intermediate', None, lambda _c: True, '/certs') is False
 
 
 def test_rotate_refreshes_integrations_after_the_tak_restart():
