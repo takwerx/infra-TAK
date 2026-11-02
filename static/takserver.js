@@ -1216,8 +1216,8 @@ function showDeployConfig(){
       '</div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate Authority Names</div>',
       '<div class="grid-2">',
-      '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"></div>',
-      '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"></div>',
+      '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"><div id="root_ca_name-check" style="font-family:\'JetBrains Mono\',monospace;font-size:12px;margin-top:8px"></div></div>',
+      '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"><div id="intermediate_ca_name-check" style="font-family:\'JetBrains Mono\',monospace;font-size:12px;margin-top:8px"></div></div>',
       '</div>',
       '<div id="server-cert-signer-box" style="margin-top:20px;padding:16px 18px;border:2px solid var(--cyan);border-radius:10px;background:rgba(34,211,238,0.06)">',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--cyan);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:6px">Sign the TAK Server certificate with — choose one</div>',
@@ -1274,7 +1274,7 @@ function showDeployConfig(){
       updateUploadHint();
       updateDeployModeFirstHint();
     });
-    const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
+    ['root_ca_name','intermediate_ca_name'].forEach(function(id){const ci=document.getElementById(id);if(ci)ci.addEventListener('input',function(){validateCaName(id)})});const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
 }
 
 function toggleWebadminPassword(){const a=document.getElementById('webadmin-password-area');if(a)a.style.display=document.getElementById('enable_admin_ui').checked?'block':'none'}
@@ -1289,6 +1289,15 @@ function toggleShowPassword(){const p=document.getElementById('webadmin_password
 
 function checkPasswordMatch(){const p=document.getElementById('webadmin_password').value;const c=document.getElementById('webadmin_password_confirm').value;const el=document.getElementById('password-match');if(!c){el.innerHTML='';return}if(p===c)el.innerHTML='<span style="color:var(--green)">\u2713 Passwords match</span>';else el.innerHTML='<span style="color:var(--red)">\u2717 Passwords do not match</span>'}
 
+// GH #128: same rule as _CA_NAME_RE in app.py — an underscore makes TAK reject every enrolled device.
+function validateCaName(id){
+    const v=document.getElementById(id).value.trim();const el=document.getElementById(id+'-check');
+    if(!v){el.innerHTML='';return false}
+    const c=[{t:!/_/.test(v),l:'no underscores'},{t:!/\s/.test(v),l:'no spaces'},{t:/^[A-Za-z0-9.\-\s_]*$/.test(v),l:'letters, numbers, - and . only'},{t:/^[A-Za-z0-9]/.test(v),l:'starts with letter/number'},{t:v.length<=64,l:'64 chars max'}];
+    var h='';c.forEach(function(x){h+='<span style="color:'+(x.t?'var(--green)':'var(--red)')+';">'+(x.t?'\u2713':'\u2717')+' '+x.l+'</span> &nbsp; '});
+    el.innerHTML=h;
+    return c.every(function(x){return x.t});
+}
 function validatePassword(){
     const p=document.getElementById('webadmin_password').value;const el=document.getElementById('password-validation');
     if(!p){el.innerHTML='';return false}
