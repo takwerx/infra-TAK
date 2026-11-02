@@ -81548,8 +81548,9 @@ def takserver_revoke_old_ca():
             threading.Thread(target=_cloudtak_heal_after_ca_change,
                              args=(lambda m: print(f"Revoke Old CA:{m}", flush=True),),
                              daemon=True, name='ct-cert-heal-revoke').start()
-            ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes); '
-                       'its users get a new certificate at their next login.')
+            ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
+                       'CloudTAK users whose certificate came from the revoked CA get a new one at their '
+                       'next login: anyone signed in to CloudTAK right now must log out and back in once.')
 
         msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '

@@ -143,7 +143,7 @@ def test_revoke_starts_the_cloudtak_repair_after_tak_and_portal_are_back():
     i_gate = src.index('if _cloudtak_local_with_local_tak():')
     i_thread = src.index('target=_cloudtak_heal_after_ca_change')
     assert i_portal < i_gate < i_thread
-    assert 'its users get a new certificate at their next login' in src
+    assert 'must log out and back in once' in src            # nuc A10: a live session kept the red dot
 
 
 def test_heal_after_ca_change_heals_the_connection_then_resets_users():
