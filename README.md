@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.3-alpha)**
+**Current release: [v10.3.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.4-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -210,6 +210,7 @@ After deployment, create users in TAK Portal — they flow through Authentik →
 - **Disk:** At max deployment (all modules) you can sit around **26 GB** used. Plan for growth: CoT data, logs, and retention. **50 GB+** disk is recommended so you have headroom; TAK Server's own minimum is 40 GB per the official configuration guide. Apply Docker log limits (Guard Dog → Apply Docker log limits) to avoid containers filling the disk.
 - **Disk I/O:** SSD-backed storage strongly recommended. **Test your VPS before deploying** — slow disk I/O causes Docker build timeouts, service startup failures, and unreliable boots. See [VPS disk I/O check](#vps-disk-io-check) below.
 - **CPU:** Enough cores for all processes (TAK Server, PostgreSQL, Authentik, Caddy, Node-RED, etc.). TAK Server's minimum is 4 cores; more is better for the full stack.
+- **Running in a VM (TrueNAS, KVM, Proxmox, etc.):** set the VM's CPU mode to **host passthrough** or **host model**, not a generic or "basic" CPU. With a generic CPU, TAK Portal and CloudTAK won't start. The console now checks this before it deploys either one and tells you if the CPU is too basic.
 - **Internet** connection for initial setup.
 - **TAK Server .deb** package from [tak.gov](https://tak.gov).
 
@@ -441,6 +442,35 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.4-alpha — 2026-11-02 — TAK Server comes back after a slow reboot; phones and CloudTAK recover after a CA rotation; Ubuntu Pro installs; CloudTAK 13.117.1
+
+**Headline: Guard Dog starts TAK Server again when its start fails after a slow reboot, and puts back containers a reboot left under a temporary name. After an intermediate-CA rotation, a cut-off phone can always reach enrollment and re-enroll, and CloudTAK reconnects from the console with one button. TAK Server installs again on Ubuntu 24.04 with Ubuntu Pro. CloudTAK moves to 13.117.1 and its map tiles load again.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.4-alpha))
+
+**After a reboot (GH #373).**
+- Guard Dog starts TAK Server again when its service failed to start (at most 3 times a day); a deliberate stop is still left alone.
+- Authentik and TAK Portal containers left under compose's temporary name by a cut-off recreate get their real names back.
+- Guard Dog stops restarting a missing or disabled MediaMTX forever: 3 tries, one alert, then it waits.
+
+**Certificates and phones.**
+- Fail2ban splits TAK Server failures in two: scanners are banned as before; a phone whose certificate TAK no longer trusts is only banned for a flood, for 10 minutes, and never from the enrollment port (8446), so a fresh QR works the first time.
+- The Fail2ban page lists the devices TAK is refusing, with callsign, user and certificate issuer, and labels containers and whitelisted addresses. Jail cards collapse.
+- Revoke Old CA can see the original intermediate, and reconnects CloudTAK itself afterwards.
+- CloudTAK page: **Connect CloudTAK to TAK Server** (Manual Connection (Bootstrap)) gives CloudTAK a current certificate, or does its first-time setup, and says when users can't log in yet.
+
+**Installs and updates.**
+- TAK Server installs on Ubuntu 24.04 with Ubuntu Pro: the PostGIS map libraries come from the PostgreSQL repository (GH #352).
+- CloudTAK 13.117.1: the tiles service gets the internal API address, so the map shows again (GH #372). CloudTAK Update no longer falls back to an old version (GH #365).
+- Caddy Update waits for another package update to finish instead of failing; TAK Portal Update failures keep the real error line (GH #365).
+- A console update no longer recreates the LDAP outpost when nothing changed, and never restarts TAK Server while connected clients have their groups.
+- Moving infra-TAK out of `/root` rewrites the paths in CloudTAK's `.env` and compose files and keeps its database volume (GH #346).
+- TAK Portal deploys at least 2.0.30; Deploy To Caddy from the TAK Portal marketplace works again.
+
+**Smaller fixes.**
+- Guard Dog update emails list only what is new, and the console shows a red banner when the mail relay can't deliver.
+- Caddy page: a Rotate button for the console's proxy-auth secret.
+- Diagnostics report Ubuntu Pro, package sources and pins, and the last failed install.
+- Werkzeug 3.1.9 (security fix release).
 
 ### v10.3.3-alpha — 2026-10-29 — Fail2ban bans again on Ubuntu 24.04; MediaMTX web editor and no-Caddy fixes; LDAP logins on custom-cert boxes
 

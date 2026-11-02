@@ -42,6 +42,22 @@ def test_mediamtx_fresh_install_pin_has_the_csrf_fix():
     assert _v(pin) >= (1, 21, 1)
 
 
+def test_mediamtx_fresh_install_pin_is_1_21_3_ops428():
+    # ops #428: 1.21.3 carries the recording/JWT/camera fixes and the Go net/quic-go advisory bumps.
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    assert _v(pin) >= (1, 21, 3)
+
+
+def test_mediamtx_checksum_grep_matches_upstream_line_format_ops428():
+    # The remote deploy greps checksums.sha256 for `<64 hex> [ *]<tarball>` and fails closed;
+    # upstream writes the binary-mode `<hash> *<file>` form (seen in the real 1.21.3 file).
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    tarball = f'mediamtx_v{pin}_linux_amd64.tar.gz'
+    line = '0' * 64 + f' *{tarball}'
+    assert re.search(rf'^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$', line)
+    assert '"^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$"' in APP
+
+
 def test_no_deploy_template_allows_every_api_origin():
     templates = re.findall(r'mediamtx_yml = f"""(.*?)"""', APP, re.S)
     assert len(templates) == 2
