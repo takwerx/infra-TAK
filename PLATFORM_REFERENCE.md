@@ -89,6 +89,7 @@ Official: [dfpc-coe/CloudTAK](https://github.com/dfpc-coe/CloudTAK), [dfpc-coe/n
 - Plugins reach CloudTAK only when the plugin install action in the console copies their source in and CloudTAK's API is rebuilt. Editing a plugin repo alone changes nothing. Plugins are a catalog entry (`CLOUDTAK_PLUGINS`) pointing at a repo with `plugin/` and optionally `server/`.
 - Cert login needs the TAK Server certificate in the browser's trust store. API calls to TAK Server use `TAKAPI.init()` with `APIAuthCertificate`. 📖 node-tak.
 - `docker-compose.custom.yml` is the supported place for the operator's own CloudTAK services.
+- **The `tiles` container loads every basemap from the API at `API_URL`** (`tasks/pmtiles/lib/basemap.ts`: `process.env.API_URL || 'http://localhost:5001'`), so a wrong `API_URL` makes every tile 500. 13.117.0's compose never passed it to `tiles`; 13.117.1 passes `API_URL=${API_URL}` from `.env`. infra-TAK writes that `.env` value as the public address (`https://map.<domain>`), or `http://172.20.0.1:5000` on an install with no domain. ✅ verified 2026-11-01 on test12 (Ubuntu 22.04, 13.117.1): with no override, tiles are 200 because the container can reach the public name; the same container cannot reach the Docker gateway on port 5000, because the API is published on `127.0.0.1:5000` only. So an install with no domain still needs infra-TAK's `API_URL: "http://api:5000"` override for `tiles`. Check after any update: fetch one tile from `/tiles/basemap/<id>/tiles/1/0/0?token=...` on the tiles container (200, not 500).
 
 ## MediaMTX
 
