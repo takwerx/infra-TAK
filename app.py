@@ -45054,9 +45054,21 @@ def _cloudtak_postgis_json(sql):
         return None
 
 
+def _cloudtak_untrusted_user_certs(limit=100):
+    """How many CloudTAK user certs (first `limit`) TAK's live truststore doesn't vouch for.
+    0 when that can't be told: the status line never cries wolf."""
+    certs = _cloudtak_postgis_json("select coalesce(json_agg(auth->>'cert'), '[]') from profile "
+                                   "where coalesce(auth->>'cert', '') <> ''") or []
+    bundle = _tak_live_trust_bundle() if certs else ''
+    if not bundle:
+        return 0
+    return sum(1 for c in certs[:limit] if _cert_signed_by(c or '', bundle) is False)
+
+
 def _cloudtak_connect_state(settings):
     """{'supported', 'status', 'connection_status', 'message'} for the CloudTAK page's line.
-    status: unsupported / unreachable / unconfigured / connected / refused_untrusted / down."""
+    status: unsupported / unreachable / unconfigured / connected / users_untrusted /
+    refused_untrusted / down."""
     if not _cloudtak_local_with_local_tak(settings):
         return {'supported': False, 'status': 'unsupported',
                 'message': 'Not supported on a remote CloudTAK yet: use the manual steps below.'}
@@ -45069,6 +45081,14 @@ def _cloudtak_connect_state(settings):
         return {'supported': True, 'status': 'unconfigured', 'message': 'CloudTAK is not connected to TAK Server yet.'}
     cs = srv.get('connection_status')
     if cs == 'live':
+        # CloudTAK's own connection can stay live after a Revoke (it sends the chain up to a root
+        # TAK still trusts) while every user cert is refused and nobody can log in (test6,
+        # 2026-11-01). So "connected" also checks the users' certs.
+        stale = _cloudtak_untrusted_user_certs()
+        if stale:
+            return {'supported': True, 'status': 'users_untrusted', 'connection_status': cs,
+                    'message': f'CloudTAK is connected, but {stale} user certificate(s) are from a CA TAK '
+                               "Server no longer trusts, so those users can't log in. Reconnect to fix."}
         return {'supported': True, 'status': 'connected', 'connection_status': cs,
                 'message': 'CloudTAK is connected to TAK Server.'}
     cert = _cloudtak_postgis_json("select to_json(coalesce(auth->>'cert','')) from server where id = 1") or ''
@@ -58688,7 +58708,7 @@ window.ctGenBootstrapCert = function(btn) {
 // v10.3.4 W9: the Connect CloudTAK to TAK Server card. GET says which state CloudTAK is
 // in; POST connects (first-time setup, with a TAK username + password) or reconnects with a
 // current certificate (after a CA rotation / revoke). The password is sent once, never kept.
-window.ctLoadConnectState = function() {
+window.ctLoadConnectState = function(retries) {
   var st = document.getElementById('ct-connect-state');
   if (!st) return;
   var btn = document.getElementById('ct-connect-btn');
@@ -58697,8 +58717,15 @@ window.ctLoadConnectState = function() {
   fetch('/api/cloudtak/connect-tak', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      var color = { connected: 'var(--green)', refused_untrusted: 'var(--red)', down: 'var(--yellow)',
-                    unconfigured: 'var(--yellow)', unreachable: 'var(--red)' }[d.status] || 'var(--text-dim)';
+      // Right after a reconnect the API is restarting: keep checking quietly instead of
+      // flashing "not answering" under a success message.
+      if (d.status === 'unreachable' && (retries || 0) > 0) {
+        st.innerHTML = '<span style="color:var(--text-dim)">● Waiting for CloudTAK to come back up…</span>';
+        setTimeout(function() { window.ctLoadConnectState(retries - 1); }, 5000);
+        return;
+      }
+      var color = { connected: 'var(--green)', refused_untrusted: 'var(--red)', users_untrusted: 'var(--yellow)',
+                    down: 'var(--yellow)', unconfigured: 'var(--yellow)', unreachable: 'var(--red)' }[d.status] || 'var(--text-dim)';
       st.innerHTML = '<span style="color:' + color + '">● ' + esc(d.message || d.status) + '</span>';
       if (btn) {
         btn.style.display = d.supported ? '' : 'none';
@@ -58734,7 +58761,7 @@ window.ctConnectTak = function(btn) {
     if (out) out.innerHTML = d && d.success
       ? '<span style="color:var(--green)">✓ ' + esc(d.message) + '</span>'
       : '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Connect failed') + '</span>';
-    window.ctLoadConnectState();
+    window.ctLoadConnectState(12);
   }).catch(function(e) {
     btn.disabled = false; btn.textContent = orig;
     if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>';

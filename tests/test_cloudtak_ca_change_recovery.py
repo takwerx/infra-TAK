@@ -285,7 +285,7 @@ def test_the_old_bootstrap_route_and_its_helpers_are_gone():
 def test_page_has_the_button_and_keeps_the_manual_steps_as_fallback():
     assert 'id="ct-connect-btn"' in TEMPLATE and 'onclick="ctConnectTak(this)"' in TEMPLATE
     assert 'id="ct-connect-pass"' in TEMPLATE and 'type="password"' in TEMPLATE
-    assert 'Manual First-Time Setup' in TEMPLATE and 'ctGenBootstrapCert(this)' in TEMPLATE
+    assert 'Manual Connection (Bootstrap)' in TEMPLATE and 'ctGenBootstrapCert(this)' in TEMPLATE
     js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
     assert 'window.ctConnectTak = function' in js and "fetch('/api/cloudtak/connect-tak'" in js
 
@@ -323,3 +323,37 @@ def test_mykey_holding_the_current_intermediate_is_never_offered():
 def test_unreadable_subjects_fall_back_to_the_alias_rule():
     info = _ca_info(None)
     assert info['old_cas_in_truststore'] == []
+
+
+# ── Status line: "connected" can still mean nobody can log in ────────────────────────
+
+def _state_ns(srv, user_certs, signed, bundle='B'):
+    return _ns(funcs=('_cloudtak_untrusted_user_certs', '_cloudtak_connect_state'),
+               _cloudtak_local_with_local_tak=lambda s: True, _cloudtak_signing_secret=lambda: 's',
+               _cloudtak_admin_token=lambda s: 'jwt',
+               _cloudtak_request_json=lambda *a, **k: (True, 200, srv),
+               _cloudtak_postgis_json=lambda sql: user_certs if 'from profile' in sql else '',
+               _tak_live_trust_bundle=lambda: bundle, _tak_ca_bundle=lambda: bundle,
+               _cert_signed_by=lambda c, b: signed[c])
+
+
+def test_live_connection_with_revoked_user_certs_is_not_reported_as_fine():
+    # test6 2026-11-01: CloudTAK's chain got its own connection through after Revoke while
+    # every user cert was refused and logins failed UND_ERR_SOCKET.
+    st = _state_ns({'status': 'configured', 'connection_status': 'live'}, ['U1', 'U2', 'U3'],
+                   {'U1': False, 'U2': False, 'U3': True})['_cloudtak_connect_state']({})
+    assert st['status'] == 'users_untrusted' and '2 user certificate(s)' in st['message']
+
+
+def test_live_connection_with_trusted_or_unknown_user_certs_is_connected():
+    for signed in ({'U1': True}, {'U1': None}):
+        st = _state_ns({'status': 'configured', 'connection_status': 'live'}, ['U1'], signed)['_cloudtak_connect_state']({})
+        assert st['status'] == 'connected'
+    st = _state_ns({'status': 'configured', 'connection_status': 'live'}, ['U1'], {'U1': False},
+                   bundle='')['_cloudtak_connect_state']({})
+    assert st['status'] == 'connected'          # truststore unreadable: never cry wolf
+
+
+def test_status_waits_out_the_api_restart_after_a_reconnect():
+    js = APP[APP.index("CLOUDTAK_PAGE_JS = r'''"):]
+    assert "window.ctLoadConnectState(12);" in js and "d.status === 'unreachable' && (retries || 0) > 0" in js

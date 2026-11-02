@@ -168,15 +168,16 @@
     <div id="ct-connect-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
   </div>
 
-  <!-- Post-install first-time setup guide (manual fallback for the button above) -->
+  <!-- Manual connection (bootstrap) guide: the by-hand fallback for the button above, for a first
+       install or after TAK Server's CA changed -->
   <details style="margin-bottom:20px;border:1px solid rgba(16,185,129,0.25);border-radius:12px;overflow:hidden" id="cloudtak-setup-guide">
     <summary style="padding:14px 20px;background:rgba(16,185,129,0.07);cursor:pointer;font-size:13px;font-weight:600;color:var(--green);list-style:none;display:flex;align-items:center;gap:10px" onclick="var a=this.parentElement.querySelector('.ct-guide-arrow');if(a)a.style.transform=this.parentElement.open?'rotate(0deg)':'rotate(180deg)'">
-      <span style="font-size:16px">🚀</span> Manual First-Time Setup — if the Connect button above can't be used
+      <span style="font-size:16px">🚀</span> Manual Connection (Bootstrap) — if the Connect button above can't be used
       <span class="ct-guide-arrow" style="margin-left:auto;font-size:14px;color:var(--text-dim);transition:transform 0.2s;display:inline-block;transform:rotate(0deg)">▼</span>
     </summary>
     <div style="padding:20px 24px;font-size:13px;color:var(--text-secondary);line-height:1.75;background:var(--bg-card)">
 
-      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Follow these steps once after install:</p>
+      <p style="margin:0 0 14px;color:var(--text-primary);font-weight:600">CloudTAK needs its own TAK Server user + certificate to connect. Use these steps to connect it by hand, on a first install or after TAK Server's CA changed:</p>
 
       <div style="display:flex;flex-direction:column;gap:14px">
 
