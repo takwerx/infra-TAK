@@ -426,8 +426,10 @@ def test_job_state_transitions(raw, unit, state, step):
 class Boot:
     def __init__(self, status='rebooting', os_release=('ubuntu-24.04', 'Ubuntu 24.04.1 LTS'),
                  baseline=None, running=('authentik-server', 'tak-portal'), active=('takserver', 'docker'),
-                 clusters=(('18', 'main', '5432', 'online'),), poststart=None):
+                 clusters=(('18', 'main', '5432', 'online'),), poststart=None, clusters_seq=None, wait_s=0):
         self.writes = []
+        # clusters_seq: successive pg_lsclusters answers (the last one repeats) — a cluster still starting
+        self.clusters_seq = [list(c) for c in (clusters_seq or [clusters])]
         self.poststart = list(poststart or [('not-found', 'inactive', 'dead', '', 0)])
         baseline = baseline if baseline is not None else {
             'containers': ['authentik-server', 'tak-portal'], 'services': {'takserver': 'active', 'docker': 'active'},
@@ -454,12 +456,12 @@ class Boot:
             _read_os_release=lambda: os_release,
             _read_priv=lambda p: json.dumps(baseline),
             _os_upgrade_containers=lambda: (list(running), [], ''),
-            _os_upgrade_pg_clusters=lambda: list(clusters),
+            _os_upgrade_pg_clusters=lambda: (self.clusters_seq.pop(0) if len(self.clusters_seq) > 1 else self.clusters_seq[0]),
             audit=lambda *a: self.audits.append(a),
             print=lambda *a, **k: None,
             _kernel_patch_unit_state=lambda unit: (self.poststart.pop(0) if len(self.poststart) > 1 else self.poststart[0]),
         )
-        self.ns['_OS_UPGRADE_VERIFY_WAIT_S'] = 0
+        self.ns['_OS_UPGRADE_VERIFY_WAIT_S'] = wait_s
         self.ns['_OS_UPGRADE_POSTSTART_WAIT_S'] = 3600
         exec(compile(_fn('_startup_os_upgrade_verify'), 'app.py:_startup_os_upgrade_verify', 'exec'), self.ns)
 
@@ -494,6 +496,24 @@ def test_verify_names_what_is_missing():
     b = Boot(os_release=('ubuntu-22.04', 'Ubuntu 22.04.5 LTS'))
     b.go()
     assert b.writes[-1].startswith('failed:verify:os-release=ubuntu-22.04')
+
+
+def test_verify_waits_for_postgresql_still_starting_ops438():
+    # ops #438 (field, Nov 2): everything else was back, PostgreSQL 18 read "down" once, and a
+    # box whose database was only still starting was marked failed. It gets the same wait.
+    down = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down'))
+    up = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'online'))
+    b = Boot(clusters_seq=[down, down, up], wait_s=3600)
+    b.go()
+    assert b.writes == ['verifying', 'done']
+    assert b.clusters_seq == [list(up)]
+
+
+def test_verify_still_fails_when_postgresql_never_comes_up_ops438():
+    down = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down'))
+    b = Boot(clusters=down)
+    b.go()
+    assert b.writes == ['verifying', 'failed:verify:postgresql=15/main/5434/down;18/main/5432/down']
 
 
 def test_verify_tolerates_an_empty_baseline():

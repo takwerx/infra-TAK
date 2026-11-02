@@ -95190,7 +95190,13 @@ def _startup_os_upgrade_verify():
                     break
                 time.sleep(15)
             deadline = time.time() + _OS_UPGRADE_VERIFY_WAIT_S
+            pg_expect = baseline.get('pg_expect') or ''
             while True:
+                # ops #438: TAK's PostgreSQL gets the same wait as the containers and services.
+                # One read the moment those were back could catch it still starting.
+                clusters = _os_upgrade_pg_clusters() if pg_expect else []
+                pg_ok = (not pg_expect) or any(c[0] == pg_expect and c[2] == '5432' and c[3] == 'online'
+                                               for c in clusters)
                 running, _p, _e = _os_upgrade_containers()
                 missing_c = sorted(want_c - set(running or []))
                 missing_s = []
@@ -95201,17 +95207,15 @@ def _startup_os_upgrade_verify():
                             missing_s.append(svc)
                     except Exception:
                         missing_s.append(svc)
-                if (not missing_c and not missing_s) or time.time() >= deadline:
+                if (not missing_c and not missing_s and pg_ok) or time.time() >= deadline:
                     break
                 time.sleep(10)
             if missing_c:
                 problems.append('containers=' + ','.join(missing_c))
             if missing_s:
                 problems.append('services=' + ','.join(missing_s))
-            if baseline.get('pg_expect'):
-                clusters = _os_upgrade_pg_clusters()
-                if not any(c[0] == baseline['pg_expect'] and c[2] == '5432' and c[3] == 'online' for c in clusters):
-                    problems.append('postgresql=' + (';'.join('/'.join(c) for c in clusters) or 'none'))
+            if not pg_ok:
+                problems.append('postgresql=' + (';'.join('/'.join(c) for c in clusters) or 'none'))
             if problems:
                 _os_upgrade_write_status('failed:verify:' + ' '.join(problems))
                 print(f"[os-upgrade] ✗ post-reboot verify FAILED: {' '.join(problems)}", flush=True)
