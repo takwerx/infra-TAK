@@ -384,3 +384,54 @@ def test_converge_runs_after_the_broker_gate_before_recidive():
     body = APP[APP.index('def _startup_migrations('):]
     assert body.index('_startup_converge_tak_banaction()') < body.index('_startup_converge_tak_badcert()') \
         < body.index('_startup_converge_recidive_tak_exempt()')
+
+
+# ── Added in T&E (operator, 2026-11-01) ──────────────────────────────────────────────
+
+def test_callsigns_also_come_from_yesterdays_rotated_log(tmp_path):
+    import gzip
+    logs = tmp_path / 'logs'
+    logs.mkdir()
+    for day, cs in (('2026-10-31', 'OLDER'), ('2026-11-01', 'CA-COR-E5-P')):
+        with gzip.open(logs / f'takserver-messaging.{day}.log.gz', 'wt') as f:
+            f.write('2026-11-01-17:00:00.000 [x] INFO y - unrelated line\n')
+            f.write(SUB % ('17:21:58', cs, 'ANDROID-e41b59dc273cb019', '172.56.182.200') + '\n')
+    src = _func('_f2b_tak_prev_sub_lines').replace("'/opt/tak/logs/", repr(str(logs) + '/')[:-1])
+    ns = _ns(consts=('_F2B_TAK_PREV_SUBS_CACHE',))
+    exec(src, ns)
+    lines = ns['_f2b_tak_prev_sub_lines']()
+    assert len(lines) == 1 and 'CA-COR-E5-P' in lines[0]          # newest file, sub lines only
+    assert 'lines = _f2b_tak_prev_sub_lines() + (_diag_tail(' in _func('fail2ban_tak_refused_api')
+
+
+def test_containers_and_whitelisted_addresses_are_named_not_unknown():
+    src = _func('fail2ban_tak_refused_api')
+    assert "'container': containers.get(rec['ip'], '')" in src and "'whitelisted': _f2b_ip_in(rec['ip'], nets)" in src
+    runs = []
+
+    def run(cmd, **k):
+        runs.append(cmd)
+        out = 'nodered\ncloudtak-api-1\n' if cmd[1] == 'ps' else '/nodered 172.21.0.2 \n/cloudtak-api-1 172.20.0.7 172.22.0.6 \n'
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr='')
+    ns = _ns(consts=('_F2B_CONTAINER_IPS_CACHE',), funcs=('_f2b_container_ip_names',),
+             _sudo_wrap=lambda c: c, subprocess=types.SimpleNamespace(run=run))
+    m = ns['_f2b_container_ip_names']()
+    assert m == {'172.21.0.2': 'nodered', '172.20.0.7': 'cloudtak-api-1', '172.22.0.6': 'cloudtak-api-1'}
+    ns['_f2b_container_ip_names']()
+    assert len(runs) == 2                                   # cached
+    assert "(a container on this box)" in TEMPLATE and "whitelisted, never banned" in TEMPLATE
+
+
+def test_refused_search_box_is_cyan_so_it_is_seen():
+    i = TEMPLATE.index('id="tak-refused-search"')
+    tag = TEMPLATE[i:TEMPLATE.index('>', i)]
+    assert 'border:1px solid var(--cyan)' in tag and 'color:var(--cyan)' in tag
+
+
+def test_jail_cards_collapse_to_their_header():
+    for card in ('recidive-card', 'f2b-manual-card', 'auth-jail-card', 'ssh-jail-card',
+                 'mediamtx-jail-card', 'takportal-jail-card', 'tak-jail-card'):
+        assert f'id="{card}"' in TEMPLATE and f"'{card}'" in TEMPLATE, card
+    assert '.f2b-collapsed > :not(.card-title){display:none !important}' in TEMPLATE
+    assert "ev.target.closest('label, button, input, a, select, .toggle-wrap')" in TEMPLATE   # toggle still works
+    assert "localStorage.setItem(k, open ? '1' : '0')" in TEMPLATE

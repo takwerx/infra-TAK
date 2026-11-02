@@ -23081,6 +23081,66 @@ def _f2b_tak_banned_by_jail():
     return out
 
 
+_F2B_TAK_PREV_SUBS_CACHE = {'key': None, 'lines': []}
+_F2B_CONTAINER_IPS_CACHE = {'at': 0.0, 'map': {}}
+
+
+def _f2b_tak_prev_sub_lines():
+    """Subscription lines from TAK's newest ROTATED messaging log
+    (takserver-messaging.<YYYY-MM-DD>.log.gz, world-readable). TAK starts a new log at midnight
+    UTC, so a phone that last connected yesterday is named only there. Cached by file + mtime."""
+    import glob as _glob, gzip as _gzip
+    files = sorted(_glob.glob('/opt/tak/logs/takserver-messaging.*.log.gz'))
+    if not files:
+        return []
+    try:
+        key = (files[-1], os.path.getmtime(files[-1]))
+    except OSError:
+        return []
+    c = _F2B_TAK_PREV_SUBS_CACHE
+    if c['key'] != key:
+        try:
+            with _gzip.open(files[-1], 'rt', errors='replace') as f:
+                lines = [ln.rstrip('\n') for ln in f if 'Set client for subscription' in ln]
+        except Exception:
+            lines = []
+        c.update(key=key, lines=lines[-5000:])
+    return c['lines']
+
+
+def _f2b_container_ip_names():
+    """{ip: container name} for the containers on this box, briefly cached ({} if docker can't
+    be asked). Lets the refused list say "Node-RED container" instead of "identity unknown"."""
+    c = _F2B_CONTAINER_IPS_CACHE
+    if time.time() - c['at'] < 60:
+        return c['map']
+    out = {}
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
+                           capture_output=True, text=True, timeout=15)
+        names = (r.stdout or '').split()
+        if names:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                           '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}']
+                                          + names), capture_output=True, text=True, timeout=15)
+            for line in (r.stdout or '').splitlines():
+                parts = line.split()
+                for ip in parts[1:]:
+                    out[ip] = parts[0].lstrip('/')
+    except Exception:
+        pass
+    c.update(at=time.time(), map=out)
+    return out
+
+
+def _f2b_ip_in(ip, nets):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in nets)
+
+
 @app.route('/api/fail2ban/takserver/refused')
 @login_required
 def fail2ban_tak_refused_api():
@@ -23090,7 +23150,7 @@ def fail2ban_tak_refused_api():
     state, so a help desk can start from the name the caller gives."""
     q = (request.args.get('q') or '').strip().lower()[:100]
     now = time.time()
-    lines = _diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or []
+    lines = _f2b_tak_prev_sub_lines() + (_diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or [])
     refused, subs, uid_ip = _f2b_tak_refused(lines, now)
     banned = _f2b_tak_banned_by_jail() if _f2b_is_available() else {}
     certs, cert_error = (None, '')
@@ -23117,6 +23177,20 @@ def fail2ban_tak_refused_api():
     else:
         targets = [dict(rec, ip=ip) for ip, rec in refused.items()]
 
+    # Addresses that can never be banned, said as such: the jail whitelist, and this box's
+    # own containers (Node-RED's flows talk to 8089 too).
+    nets = []
+    for tok in (_f2b_read_tak_jail_config().get('ignoreip') or '').split():
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+    def _private(ip):
+        try:
+            return ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+    containers = _f2b_container_ip_names() if any(_private(t['ip']) for t in targets) else {}
     trust = None
     rows = []
     for rec in targets[:200]:
@@ -23126,7 +23200,9 @@ def fail2ban_tak_refused_api():
                'callsign': rec.get('callsign', ''), 'uid': rec.get('uid', ''),
                'banned': banned.get(rec['ip']) or '', 'user': '', 'issuer': '',
                'issuer_trusted': None, 'cert_expires': None, 'cert_revoked': False,
-               'identity': 'known' if rec.get('uid') else 'unknown'}
+               'identity': 'known' if rec.get('uid') else 'unknown',
+               'container': containers.get(rec['ip'], ''),
+               'whitelisted': _f2b_ip_in(rec['ip'], nets)}
         if cert and cert['pem']:
             if trust is None:
                 trust = _tak_live_trust_bundle()

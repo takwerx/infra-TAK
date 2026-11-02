@@ -53,6 +53,11 @@
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;z-index:9999;display:none}
 .toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
 .toast.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+/* v10.3.4: jail cards collapse to their header (name, status badge, Enable toggle). */
+.f2b-collapsed > :not(.card-title){display:none !important}
+.f2b-collapsed > .card-title{margin-bottom:0 !important}
+.f2b-caret{display:inline-block;width:14px;color:var(--text-dim);font-size:11px;transition:transform .15s}
+.f2b-collapsible > .card-title{cursor:pointer;user-select:none}
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
@@ -224,7 +229,7 @@ Block an IPv4 address or a whole range yourself, for good or for a set number of
 </div>
 
 <!-- Authentik Jail card -->
-<div class="card" style="margin-bottom:20px">
+<div class="card" id="auth-jail-card" style="margin-bottom:20px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
 <div style="display:flex;align-items:center;gap:10px">
 <span>Authentik Jail</span>
@@ -572,7 +577,7 @@ TAK Server filter not yet installed — restart the console to complete setup.
 <div id="tak-refused-panel" style="margin-top:14px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px">
 <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
 <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Devices TAK is refusing <span style="text-transform:none;font-weight:400">(last 30 min)</span></div>
-<input type="text" id="tak-refused-search" onkeydown="if(event.key==='Enter')loadTakRefused()" placeholder="Find a user or callsign…" style="flex:1;min-width:180px;max-width:280px;box-sizing:border-box;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:12px;outline:none">
+<input type="text" id="tak-refused-search" onkeydown="if(event.key==='Enter')loadTakRefused()" placeholder="Find a user or callsign, press Enter" style="flex:1;min-width:200px;max-width:300px;box-sizing:border-box;padding:7px 10px;background:rgba(6,182,212,0.08);border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);font-size:12px;font-weight:600;outline:none">
 </div>
 <div style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:8px">A device whose certificate TAK no longer trusts can't connect until it re-enrolls. Have the user scan a fresh QR; enrollment is never blocked for these devices.</div>
 <div id="tak-refused-list" style="max-height:300px;overflow-y:auto"><div style="color:var(--text-dim);font-size:13px">Loading…</div></div>
@@ -1200,9 +1205,11 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
           html += '<div style="color:var(--text-dim);font-size:13px">' + (q ? 'No device found for “' + _takEsc(q) + '” in TAK\'s recent log.' : 'No device is being refused.') + '</div>';
         } else {
           html += shown.map(function(r){
+            var tags = (r.container ? '<b>' + _takEsc(r.container) + '</b> <span style="color:var(--text-dim)">(a container on this box)</span>' : '') +
+                       (r.whitelisted ? (r.container ? ' · ' : '') + '<span style="color:var(--green)">whitelisted, never banned</span>' : '');
             var who = r.identity === 'known'
-              ? '<b>' + _takEsc(r.callsign || r.uid) + '</b>' + (r.user ? ' · ' + _takEsc(r.user) : '')
-              : '<span style="color:var(--text-dim)">identity unknown</span>' + (r.subject ? ' · ' + _takEsc(r.subject) : '');
+              ? '<b>' + _takEsc(r.callsign || r.uid) + '</b>' + (r.user ? ' · ' + _takEsc(r.user) : '') + (tags ? ' · ' + tags : '')
+              : (tags || '<span style="color:var(--text-dim)">identity unknown</span>') + (r.subject ? ' · ' + _takEsc(r.subject) : '');
             var iss = '';
             if (r.issuer) iss = ' · ' + _takEsc(r.issuer) + (r.issuer_trusted === false ? ' <span style="color:var(--red)">(no longer trusted)</span>' : (r.issuer_trusted === true ? ' (trusted)' : ''));
             if (r.cert_revoked) iss += ' <span style="color:var(--red)">(revoked)</span>';
@@ -2100,5 +2107,32 @@ async function fail2banUninstall(){
     st.textContent='Network error';btn.disabled=false;btn.textContent='🗑 Remove fail2ban';
   }
 }
+
+// v10.3.4: collapse each jail card to its header. Click the header (not its toggle or
+// buttons) to open or close it; the choice is remembered in this browser, per card.
+(function(){
+  var ids = ['recidive-card', 'f2b-manual-card', 'auth-jail-card', 'ssh-jail-card',
+             'mediamtx-jail-card', 'takportal-jail-card', 'tak-jail-card'];
+  ids.forEach(function(id){
+    var card = document.getElementById(id);
+    var title = card && card.querySelector(':scope > .card-title');
+    if (!title) return;
+    var k = 'f2b-card-open:' + id, open = false;
+    try { open = localStorage.getItem(k) === '1'; } catch (e) {}
+    var caret = document.createElement('span');
+    caret.className = 'f2b-caret';
+    var host = title.firstElementChild || title;
+    host.insertBefore(caret, host.firstChild);
+    card.classList.add('f2b-collapsible');
+    function apply(){ card.classList.toggle('f2b-collapsed', !open); caret.textContent = open ? '\u25be' : '\u25b8'; }
+    title.addEventListener('click', function(ev){
+      if (ev.target.closest('label, button, input, a, select, .toggle-wrap')) return;
+      open = !open;
+      try { localStorage.setItem(k, open ? '1' : '0'); } catch (e) {}
+      apply();
+    });
+    apply();
+  });
+})();
 </script>
 {% endblock %}
