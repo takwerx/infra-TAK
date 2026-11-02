@@ -87153,7 +87153,7 @@ def _tak_snapshot(label, plog=None):
     return True, meta
 
 
-def _tak_rollback_prepare_local_db(plog):
+def _tak_rollback_prepare_local_db(plog, who='rollback'):
     """Make sure the local cluster has a `martiuser` that can log in with the password in
     CoreConfig.xml, and a `cot` database to restore into. Returns True when both hold.
 
@@ -87166,13 +87166,17 @@ def _tak_rollback_prepare_local_db(plog):
     Same statements TAK's own takserver-setup-db.sh uses, with the password re-set even
     when the role exists. TAK logs in with whatever CoreConfig says, so the role must match
     it; this is the same re-encode _tak58_heal_md5_scram does. The password is never logged.
+
+    The deploy calls it too (who='deploy'): TAK's takserver-setup-db.sh treats any box with
+    /usr/pgsql-15/bin/postgresql-15-setup as a 15 -> 18 upgrade and then never creates
+    martiuser or cot (nuc, 2026-11-02: Remove then Deploy on a box that once moved 15 -> 18).
     """
     r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
                   "select (select count(*) from pg_roles where rolname='martiuser')"
                   " || ',' || (select count(*) from pg_database where datname='cot')"],
                  timeout=60)
     if not r or r.returncode != 0 or ',' not in (r.stdout or ''):
-        plog("  rollback: cannot reach the local PostgreSQL as postgres: "
+        plog(f"  {who}: cannot reach the local PostgreSQL as postgres: "
              f"{((getattr(r, 'stderr', '') or '').strip())[:200]}")
         return False
     has_role, has_db = [p.strip() == '1' for p in r.stdout.strip().split(',', 1)]
@@ -87180,10 +87184,10 @@ def _tak_rollback_prepare_local_db(plog):
     pw = _tak58_db_password()
     tag = '$takrbpw$'
     if not pw:
-        plog("  rollback: no database password in CoreConfig.xml — cannot set up martiuser")
+        plog(f"  {who}: no database password in CoreConfig.xml — cannot set up martiuser")
         return False
     if tag.strip('$') in pw:
-        plog("  rollback: database password contains the quoting tag — refusing to build the statement")
+        plog(f"  {who}: database password contains the quoting tag — refusing to build the statement")
         return False
     verb = 'ALTER ROLE martiuser' if has_role else \
         'CREATE ROLE martiuser LOGIN INHERIT CREATEDB NOCREATEROLE'
@@ -87191,17 +87195,17 @@ def _tak_rollback_prepare_local_db(plog):
                   "SET password_encryption = 'scram-sha-256'; "
                   "%s PASSWORD %s%s%s;" % (verb, tag, pw, tag)], timeout=60)
     if not r or r.returncode != 0:
-        plog(f"  rollback: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        plog(f"  {who}: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
         return False
-    plog("  rollback: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
+    plog(f"  {who}: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
                                      else "was missing — recreated with the CoreConfig.xml password"))
 
     if not has_db:
         r = _pg_exec(['createdb', '--owner=martiuser', 'cot'], timeout=120)
         if not r or r.returncode != 0:
-            plog(f"  rollback: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
+            plog(f"  {who}: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
             return False
-        plog("  rollback: cot database was missing — recreated, empty, owned by martiuser")
+        plog(f"  {who}: cot database was missing — recreated, empty, owned by martiuser")
     return True
 
 
@@ -91720,6 +91724,12 @@ def _tak_deploy_ensure_local_db(pkg_path, say, log):
             say("✗ upgrade-db.sh failed (exit %d). See the output above." % rc)
             return False
     elif major == want_major:
+        if not (has_role and has_db):
+            # TAK's script skips the role and database on a box that still carries the
+            # PostgreSQL 15 binaries (it takes that as an upgrade); create them first, the
+            # same way it would. With them present it only runs SchemaManager.
+            if not _tak_rollback_prepare_local_db(say, who='deploy'):
+                return False
         say("  Running TAK's takserver-setup-db.sh to create what is missing...")
         rc = _tak58_run_setup_db()
         if rc != 0:
