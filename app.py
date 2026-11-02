@@ -71889,6 +71889,10 @@ def _authentik_ldap_sa_bind_watchdog_loop():
     """
     import time as _wt
     _wt.sleep(120)  # Let console finish _startup_migrations before first tick
+    # ops #438: the boot heal now waits for Authentik (up to 10 min); don't heal alongside it.
+    _boot_heal = globals().get('_startup_ldap_resync_done')
+    if _boot_heal is not None:
+        _boot_heal.wait(timeout=900)
 
     _ok_log_interval = 10  # ~50 minutes between liveness lines
     _ok_counter = 0
@@ -102027,6 +102031,12 @@ _v0_9_12_rep_patched = _startup_fix_reputation_policy_drift()
 # doesn't have LDAP configured. If LDAP IS configured, attempts a probe bind
 # with the .env password; only triggers the full resync flow (set Authentik
 # user password from .env + force-recreate LDAP outpost) when the probe fails.
+_STARTUP_LDAP_AK_WAIT_S = 600   # ops #438: how long the boot heal waits for Authentik to answer
+_STARTUP_LDAP_TRANSIENT = ('Connection reset', 'Connection refused', '502', '503', 'timed out')
+# Set when the boot heal is finished; the 5-min watchdog waits for it so the two never heal at once.
+_startup_ldap_resync_done = threading.Event()
+
+
 def _startup_resync_ldap_service_account():
     try:
         if not os.path.isdir(os.path.expanduser('~/authentik')):
@@ -102037,6 +102047,19 @@ def _startup_resync_ldap_service_account():
         env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         if not env_pass:
             return
+
+        # ops #438 (field, Nov 2, 24.04 reboot): this ran 34 s into the boot, while Authentik
+        # still answered its outpost with 502/503, and the heal died on "Connection reset by
+        # peer". At boot the bind fails because Authentik is starting, not because of drift, so
+        # wait for it first (the same check the ops #214 watchdogs use). Background thread.
+        if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+            ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+            while (_authentik_busy_reason() or not _local_authentik_http_ok()) and time.time() < ak_deadline:
+                time.sleep(10)
+            if _authentik_busy_reason() or not _local_authentik_http_ok():
+                print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
 
         # Probe: does the bind work today? If yes, idempotent no-op (unless the
         # reputation policy was just patched — in that case TAK Server has been
@@ -102060,6 +102083,16 @@ def _startup_resync_ldap_service_account():
             print("Startup migration: LDAP service account bind FAILED — auto-resyncing")
             try:
                 ok, msg = _ensure_authentik_ldap_service_account()
+                # ops #438: Authentik can still drop a request just after it first answers.
+                # Retry once when it does, after it answers again.
+                if not ok and any(s in (msg or '') for s in _STARTUP_LDAP_TRANSIENT):
+                    print(f"Startup migration: LDAP service account resync hit a transient Authentik "
+                          f"error ({(msg or '')[:80]}) — retrying once Authentik answers")
+                    time.sleep(30)
+                    ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+                    while not _local_authentik_http_ok() and time.time() < ak_deadline:
+                        time.sleep(10)
+                    ok, msg = _ensure_authentik_ldap_service_account()
                 if ok:
                     print(f"Startup migration: LDAP service account resync OK ({msg})")
                     healing_performed = True
@@ -102125,6 +102158,8 @@ def _startup_resync_ldap_service_account():
                   f"NOT restarting takserver (would restart into broken state)")
     except Exception as _e:
         print(f"Startup migration: LDAP service account resync skipped: {_e}")
+    finally:
+        _startup_ldap_resync_done.set()
 
 # v10.0.3: run the boot-time LDAP SA bind heal in the BACKGROUND so an unhealthy LDAP
 # outpost can never wedge the worker boot. 2026-06-23: a misconfigured outpost made this
