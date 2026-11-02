@@ -95561,10 +95561,14 @@ def _startup_os_upgrade_verify():
             # Guard Dog's tak-post-start (oneshot, RemainAfterExit) restarts the containers the
             # boot sequencer stopped, after TAK answers. Until it has finished (active / failed)
             # a missing container means "not yet", not "lost".
+            # ops #438: an empty load state is systemctl not answering inside 5 s (a busy first
+            # boot on the new release), not "Guard Dog is not installed" ('not-found'). Ending
+            # the wait on it judged the box minutes early: PostgreSQL still starting, TAK Portal
+            # and CloudTAK not yet stopped and started again by the boot sequence.
             ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S
             while time.time() < ps_deadline:
                 _ld, _act, _sub, _res, _pid = _kernel_patch_unit_state('tak-post-start.service')
-                if _ld != 'loaded' or _act in ('active', 'failed'):
+                if (_ld and _ld != 'loaded') or _act in ('active', 'failed'):
                     break
                 time.sleep(15)
             # ops #438: whatever tak-post-start left stopped (it timed out, was killed, or its

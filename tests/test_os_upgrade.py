@@ -551,6 +551,27 @@ def test_verify_starts_portal_and_cloudtak_post_start_left_stopped_ops438():
     assert b.writes == ['verifying', 'done']
 
 
+def test_verify_waits_out_a_slow_systemctl_at_boot_ops438():
+    # ops #438: on a busy first boot `systemctl show` can miss its 5 s timeout and come back
+    # empty. That is "ask again", not "Guard Dog is not installed": the old wait ended on it and
+    # judged PostgreSQL before the boot sequence had even started TAK.
+    states = [('', '', '', '', 0), ('loaded', 'activating', 'start', '', 1234),
+              ('loaded', 'active', 'exited', 'success', 0)]
+    asked = []
+
+    def unit_state(unit):
+        asked.append(unit)
+        return states[min(len(asked), len(states)) - 1]
+
+    b = Boot()
+    b.ns['_kernel_patch_unit_state'] = unit_state
+    b.ns['_os_upgrade_pg_clusters'] = lambda: [('15', 'main', '5434', 'down'), (
+        '18', 'main', '5432', 'online' if len(asked) >= len(states) else 'down')]
+    b.go()
+    assert asked == ['tak-post-start.service'] * 3
+    assert b.writes == ['verifying', 'done']
+
+
 def test_verify_says_which_apps_stayed_stopped_ops438():
     b = Boot(apps_seq=[('TAK-Portal', 'CloudTAK')])
     b.go()
