@@ -420,6 +420,21 @@ if _update_in_progress; then
   exit 0
 fi
 
+# ops #416: a compose recreate that was cut off leaves `<hash>_authentik-server-1` running and
+# nothing under the real name; the ports still answer, so nothing below notices. Put it back
+# under the compose lock (a tick is free to skip, the next one retries). Update marker and
+# boot grace above already kept this out of an Update and out of the first 10 minutes.
+if type gd_compose_strays >/dev/null 2>&1 && \
+   [ -n "$(gd_compose_strays "$(gd_compose_project_name "$AK_DIR")")" ]; then
+  gd_ak_lock_take 5; _lk=$?
+  if [ "$_lk" -eq 0 ]; then
+    gd_heal_compose_strays "$(gd_compose_project_name "$AK_DIR")" | while IFS= read -r _l; do _log "$_l"; done
+    gd_ak_lock_drop
+  else
+    _log "compose-strays | leftover Authentik container found, compose lock not taken (${GD_AK_LOCK_WHY:-busy}) — next tick retries"
+  fi
+fi
+
 HTTP_OK=0
 if ak_http_ok; then
   HTTP_OK=1

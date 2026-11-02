@@ -516,3 +516,100 @@ gd_ak_lock_drop() {
   flock -u 9 2>/dev/null || true
   exec 9<&- 2>/dev/null || true
 }
+
+# ---------------------------------------------------------------------------
+# ops #416: finish a compose recreate that was cut off.
+#
+# `docker compose up` swaps a changed container under a temporary name
+# `<first 12 id digits of the container being replaced>_<real name>`. Older Compose (v2.x)
+# stops the old container, RENAMES it to that name, creates + starts the new one under the
+# real name, then removes the old. Current Compose (v5, pkg/compose/reconcile.go) creates the
+# NEW container under the temporary name, stops and removes the old one, then renames the new
+# one to the real name. A compose client that dies part-way (a subprocess timeout on a box
+# that is busy booting TAK Server, a killed unit) leaves a container under the temporary
+# name, and either nothing or a stopped/unstarted twin under the real one. Field: v10.3.3,
+# 15 minutes after an OS-patch reboot, `d843390e3870_authentik-server-1` and
+# `9f90bd08cfd9_tak-portal` were running while every lookup of `authentik-server-1` failed
+# ("no such object"); nothing noticed, because health checks go by port or by compose
+# label and both still answered. Same leftovers as ops #173/#180, a different way to get
+# them, so the lock alone does not close it. (Assumed, not seen: which Compose the box ran
+# and where the client died; the repair is the same for both orders.)
+#
+# Only a container of the project named exactly `<12 hex>_<name>` is matched. The caller
+# must make sure no compose run is in flight (Authentik: hold the compose lock; TAK Portal:
+# the `gd_compose_in_flight` check), or it would catch a recreate in its few-second middle.
+
+# gd_compose_project_name <stack dir>: COMPOSE_PROJECT_NAME from the project's .env, else
+# the directory name the way Compose normalises it (TAK-Portal -> tak-portal).
+gd_compose_project_name() {
+  local _dir="$1" _p
+  _p="$(grep -m1 '^COMPOSE_PROJECT_NAME=' "$_dir/.env" 2>/dev/null | cut -d= -f2- | tr -d '"'"'")"
+  if [ -z "$_p" ]; then
+    _p="$(basename "$_dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[_-]*//')"
+  fi
+  printf '%s' "$_p"
+}
+
+# gd_compose_in_flight: true while any `docker compose` / `docker-compose` client runs.
+gd_compose_in_flight() { pgrep -f 'docker[ -]compose' >/dev/null 2>&1; }
+
+# gd_compose_strays <project>: one `ID|||STRAY NAME|||STATE|||REAL NAME` line per container
+# of the project that carries compose's temporary name. Prints nothing when clean.
+gd_compose_strays() {
+  local _project="$1" _line _id _name _state _rest
+  [ -n "$_project" ] || return 0
+  docker ps -a --filter "label=com.docker.compose.project=${_project}" \
+        --filter "label=com.docker.compose.oneoff=False" \
+        --format '{{.ID}}|||{{.Names}}|||{{.State}}' 2>/dev/null | while IFS= read -r _line; do
+    _id="${_line%%|||*}"; _line="${_line#*|||}"; _name="${_line%%|||*}"; _state="${_line#*|||}"
+    [[ "$_id" =~ ^[0-9a-f]{12}$ ]] || continue
+    [[ "$_name" =~ ^[0-9a-f]{12}_(.+)$ ]] || continue
+    _rest="${BASH_REMATCH[1]}"
+    printf '%s|||%s|||%s|||%s\n' "$_id" "$_name" "$_state" "$_rest"
+  done
+}
+
+# gd_heal_compose_strays <project>: put each stray back. Prints one line per decision.
+#   real name free            -> rename it back, start it if it is not running
+#   real name running         -> the stray is the replaced old one (or the unfinished new
+#                                one; the next compose run redoes it): remove it
+#   real name only `created`  -> the new container never started: remove that shell,
+#                                then rename the stray back (as the first case)
+#   anything else             -> leave both alone and say so (needs a person or the next tick)
+# Volumes are never touched (no `rm -v`).
+gd_heal_compose_strays() {
+  local _project="$1" _row _id _name _state _rest _cur _cid _cstate
+  [ -n "$_project" ] || return 0
+  while IFS= read -r _row; do
+    [ -n "$_row" ] || continue
+    _id="${_row%%|||*}"; _row="${_row#*|||}"; _name="${_row%%|||*}"; _row="${_row#*|||}"
+    _state="${_row%%|||*}"; _rest="${_row#*|||}"
+    _cur="$(docker ps -a --filter "name=^${_rest}\$" --format '{{.ID}}|||{{.State}}' 2>/dev/null | head -n 1)"
+    _cid="${_cur%%|||*}"; _cstate="${_cur#*|||}"; [ -n "$_cur" ] || _cstate=""
+    if [ "$_cstate" = "running" ]; then
+      if docker rm -f "$_id" >/dev/null 2>&1; then
+        echo "compose-strays | removed leftover ${_name} (replaced by the running ${_rest})"
+      else
+        echo "compose-strays | could not remove leftover ${_name}"
+      fi
+      continue
+    fi
+    if [ -n "$_cstate" ] && [ "$_cstate" != "created" ]; then
+      echo "compose-strays | left ${_name} (${_state}) alone: ${_rest} exists and is ${_cstate}"
+      continue
+    fi
+    if [ "$_cstate" = "created" ] && ! docker rm -f "$_cid" >/dev/null 2>&1; then
+      echo "compose-strays | could not clear the never-started ${_rest}; left ${_name} alone"
+      continue
+    fi
+    if docker rename "$_id" "$_rest" >/dev/null 2>&1; then
+      if [ "$_state" = "running" ] || docker start "$_rest" >/dev/null 2>&1; then
+        echo "compose-strays | renamed leftover ${_name} back to ${_rest} (cut-off compose recreate)"
+      else
+        echo "compose-strays | renamed leftover ${_name} back to ${_rest}, but could not start it"
+      fi
+    else
+      echo "compose-strays | could not rename leftover ${_name} back to ${_rest}"
+    fi
+  done < <(gd_compose_strays "$_project")
+}
