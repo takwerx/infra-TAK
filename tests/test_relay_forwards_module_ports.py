@@ -269,3 +269,26 @@ def test_pinned_bootstrap_is_the_one_in_this_tree():
     if pinned.returncode != 0:
         pytest.skip('pinned commit %s is not in this clone' % commit[:7])
     assert hashlib.sha256(pinned.stdout).hexdigest() == digest
+
+
+def _extra_port_section():
+    return RELAY_DOC.split('### Opening one more port', 1)[1].split('\n### ', 1)[0]
+
+
+def test_relay_doc_explains_opening_one_more_port():
+    """GH #389: a user following the Oracle guide could not tell how to open one more port.
+    The section has to give the dialog steps, warn about the Source/Destination trap, and
+    say that the relay only carries the listed ports (opening Oracle's end is not enough)."""
+    assert '### Opening one more port' in RELAY_DOC
+    sec = _extra_port_section()
+    assert 'Add Ingress Rules' in sec
+    assert '**Destination** Port Range' in sec
+    assert 'only the ports in that table' in sec
+
+
+def test_relay_doc_extra_port_section_leaves_the_parsed_blocks_alone():
+    """The port table and the ingress.json block are what the tests above read. The new
+    section must not add a table row or a second ingress block that would change them."""
+    sec = _extra_port_section()
+    assert not any(line.startswith('|') for line in sec.splitlines())
+    assert 'cat > ingress.json' not in sec
