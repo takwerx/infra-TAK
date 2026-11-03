@@ -608,6 +608,7 @@ async function loadCAInfo(){
     }
     // W11: during a rotation window the list loads by itself; otherwise it's one click.
     _takOldCaNames=d.old_ca_names||{};
+    loadCaRotation();
     if((d.old_cas_in_truststore||[]).length||_caMig)loadCaMigration();
     // Current cert password (masked) for rotate cards
     try{
@@ -672,7 +673,9 @@ async function rotateIntCA(){
   if(isNaN(validityDays)||validityDays<1)validityDays=730;
   var newPwEl=document.getElementById('rotate-ca-new-password');
   var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
-  var payload={new_ca_name:newName,intermediate_validity_days:validityDays,password:adminPw};
+  var noticeEl=document.getElementById('rotate-ca-notice'),emailEl=document.getElementById('rotate-ca-email-users');
+  var payload={new_ca_name:newName,intermediate_validity_days:validityDays,password:adminPw,
+    notice:noticeEl?noticeEl.value.trim():'',email_users:!!(emailEl&&emailEl.checked&&!emailEl.disabled)};
   if(newPw)payload.new_cert_password=newPw;
   var btn=document.getElementById('rotate-ca-btn');
   var msg=document.getElementById('rotate-ca-msg');
@@ -707,6 +710,7 @@ function pollRotateLog(){
         if(msg){msg.textContent='Rotation failed';msg.style.color='var(--red)';}
       }else{
         if(msg){msg.textContent='Rotation complete!';msg.style.color='var(--green)';}
+        _caRotShowNotice(d.notice);
       }
       if(btn)btn.disabled=false;
       loadCAInfo();
@@ -716,6 +720,57 @@ function pollRotateLog(){
       setTimeout(pollRotateLog,1500);
     }
   }).catch(function(){setTimeout(pollRotateLog,2000);});
+}
+
+// v10.3.5 W10: the rotation window (30 days, fleet constant) and the Day-0 notice.
+var _caRotNoticeEdited=false;
+async function loadCaRotation(){
+  var d;
+  try{d=await (await fetch('/api/takserver/ca-rotation')).json();}catch(e){return;}
+  var esc=escapeHtml;
+  var ta=document.getElementById('rotate-ca-notice');
+  if(ta){
+    if(!_caRotNoticeEdited)ta.value=d.day0_text||'';
+    ta.oninput=function(){_caRotNoticeEdited=true;};
+  }
+  var cnt=document.getElementById('rotate-ca-email-count'),cb=document.getElementById('rotate-ca-email-users');
+  if(cnt)cnt.textContent=d.users_with_email==null?'no Authentik, so no user addresses':d.users_with_email+' with an email on file';
+  if(cb)cb.disabled=!d.users_with_email;
+  var note=document.getElementById('rotate-ca-notice-note');
+  if(note){
+    var n=[];
+    if(!d.relay_ready)n.push('Email Relay isn\'t set up, so nothing will be emailed: the notice is shown here to copy.');
+    else if(!d.admin_email_set)n.push('No Guard Dog alert email is set, so there is no admin copy.');
+    n.push('The admin gets every account still to move, now and on day 23 and 29 of the '+d.window_days+'-day window.');
+    note.textContent=n.join(' ');
+  }
+  var w=document.getElementById('ca-rotation-window');
+  if(!w)return;
+  if(!d.active){w.style.display='none';return;}
+  w.style.display='block';
+  w.innerHTML='<div><strong style="color:var(--yellow)">Rotation window: '+esc(d.old_ca_cn)+' → '+esc(d.new_ca_cn)+'</strong></div>'
+    +'<div>'+d.days_left+' day'+(d.days_left===1?'':'s')+' left (until '+esc(d.cutoff_date)+'). Notices sent: '+esc((d.notices_sent||[]).join(', ')||'none')
+    +(d.relay_ready?'':' · Email Relay isn\'t set up, so reminders are not emailed')+'</div>'
+    +'<label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer"><input type="checkbox" id="ca-rotation-opt-in"'+(d.user_email_opt_in?' checked':'')+'> Also email each affected user their own reminder</label>';
+  document.getElementById('ca-rotation-opt-in').onchange=async function(){
+    var on=this.checked;
+    try{
+      var r=await fetch('/api/takserver/ca-rotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_email_opt_in:on})});
+      if(!r.ok)throw new Error((await r.json()).error||('HTTP '+r.status));
+    }catch(e){alert('Could not change it: '+e.message);this.checked=!on;}
+  };
+}
+function _caRotShowNotice(n){
+  var el=document.getElementById('rotate-ca-notice-result');if(!el||!n)return;
+  el.style.display='block';
+  var h='<div style="color:'+(n.sent?'var(--green)':'var(--yellow)')+';margin-bottom:6px">'+escapeHtml(n.message||'')+'</div>';
+  if(!n.sent){
+    h+='<pre id="rotate-ca-notice-text" style="white-space:pre-wrap;margin:0 0 8px 0;font-family:\'JetBrains Mono\',monospace;color:var(--text-primary)">'+escapeHtml(n.text||'')+'</pre>';
+    h+='<button type="button" id="rotate-ca-notice-copy" style="padding:6px 14px;background:rgba(6,182,212,0.12);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Copy</button>';
+  }
+  el.innerHTML=h;
+  var b=document.getElementById('rotate-ca-notice-copy');
+  if(b)b.onclick=function(){navigator.clipboard.writeText(n.text||'').then(function(){b.textContent='Copied';},function(){b.textContent='Select the text and copy it';});};
 }
 
 // v10.3.5 W11: who is still on the old CA — per account, devices and CloudTAK login.

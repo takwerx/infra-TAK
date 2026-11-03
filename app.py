@@ -81741,6 +81741,189 @@ def takserver_ca_migration():
     return jsonify(_tak_ca_migration())
 
 
+# v10.3.5 W10 — the overlap window. A Rotate on a root-signed box leaves every device connected
+# on the old intermediate; the window is how long people have to move before Revoke cuts them
+# off. Written by a successful Rotate, cleared by the Revoke of that old CA.
+CA_ROTATION_WINDOW_DAYS = 30   # fleet constant (PLAN W10): no per-box tuning
+
+
+def _ca_rotation_state_path():
+    return os.path.join(CONFIG_DIR, 'ca_rotation_state.json')
+
+
+def _ca_rotation_state_load():
+    """{old_ca_cn, old_ca_alias, new_ca_cn, rotated_at, cutoff_at, server_signer, notices_sent,
+    user_email_opt_in}, or {} when no rotation window is open."""
+    try:
+        with open(_ca_rotation_state_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get('old_ca_cn') else {}
+    except Exception:
+        return {}
+
+
+def _ca_rotation_state_save(state):
+    """Atomic write (same as _update_notify_state_save); an empty state removes the file."""
+    if not state:
+        try:
+            os.remove(_ca_rotation_state_path())
+        except OSError:
+            pass
+        return
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.ca-rotation-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _ca_rotation_state_path())
+    except Exception:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _email_relay_ready(settings=None):
+    """Email Relay is configured (the test every Email Relay card uses)."""
+    relay = (settings or load_settings()).get('email_relay') or {}
+    return bool(relay.get('relay_host') and relay.get('smtp_user'))
+
+
+def _ca_rotation_date(ts):
+    d = datetime.utcfromtimestamp(int(ts))
+    return f'{d:%B} {d.day}, {d.year}'
+
+
+def _ca_rotation_day0_text(cutoff_at, signer):
+    """The Day-0 notice. Root-signed: devices still connect and people have the window.
+    Intermediate-signed: they've already dropped (W4)."""
+    how = ('on mobile (ATAK, iTAK, TAK Aware) scan a new QR code from TAK Portal; in CloudTAK log '
+           'out and back in to get a new certificate.')
+    if signer == 'root':
+        return f'You have {CA_ROTATION_WINDOW_DAYS} days (until {_ca_rotation_date(cutoff_at)}): {how}'
+    return ("TAK Server's certificates were replaced and devices are disconnected until they move: "
+            f"{how} Old certificates stop working for good by {_ca_rotation_date(cutoff_at)}.")
+
+
+def _ca_rotation_user_emails():
+    """{username lower: email} for every active Authentik user with a valid address, or None
+    when there is no Authentik (or it didn't answer). One paged listing, not a call per user."""
+    try:
+        ak_url, hdr, _s = _w1_ak_ctx()
+        if not ak_url:
+            return None
+        out, page = {}, 1
+        while page and page <= 50:
+            d = _w1_ak_get(ak_url, f'core/users/?is_active=true&page_size=500&page={int(page)}', hdr)
+            for u in d.get('results') or []:
+                em = _safe_alert_email((u.get('email') or '').strip())
+                if u.get('username') and em:
+                    out[str(u['username']).lower()] = em
+            page = (d.get('pagination') or {}).get('next') or 0
+        return out
+    except Exception as e:
+        print(f"[ca-rotation] Authentik user lookup failed: {str(e)[:160]}", flush=True)
+        return None
+
+
+def _ca_rotation_send(kind, state, notice, log=None):
+    """Send one notice of the window: `kind` 'day0' (the Rotate's notice) or a reminder
+    ('day23' / 'day29', W12). The admin (guarddog_alert_email) gets the notice and every account
+    still to move; with the D2 opt-in each such user gets the notice and their own lines only,
+    one message per user (never one envelope: users would see each other's addresses).
+    Logs counts, never addresses (C3). Returns {'sent', 'admin', 'users', 'no_email', 'message'}."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = load_settings()
+    res = {'sent': False, 'admin': 0, 'users': 0, 'no_email': [], 'message': ''}
+    if not _email_relay_ready(settings):
+        res['message'] = "Email Relay isn't set up, so nothing was sent."
+        return res
+    mig = _tak_ca_migration()
+    todo = [r for r in mig.get('rows') or [] if r['status'] != 'moved']
+    old, new = state.get('old_ca_cn') or 'the old CA', state.get('new_ca_cn') or mig.get('current_ca') or 'the new CA'
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    left = max(0, int(((state.get('cutoff_at') or 0) - time.time()) // 86400))
+    emails = _ca_rotation_user_emails() if state.get('user_email_opt_in') else None
+    if state.get('user_email_opt_in'):
+        res['no_email'] = [r['user'] for r in todo if not (emails or {}).get(r['user'].lower())]
+    subj = (f'TAK certificate change on {ident}: action needed' if kind == 'day0'
+            else f'TAK certificate change on {ident}: {left} day{"" if left == 1 else "s"} left')
+    lines = [notice, '', f'{len(todo)} of {len(mig.get("rows") or [])} accounts still need to move from {old} to {new}'
+             + ('.' if mig.get('ok') else f' (the account list could not be read: {mig.get("error")}).'), '']
+    for r in todo[:300]:
+        lines.append(f'  {r["user"]}: ' + '; '.join(r['todo']))
+    if len(todo) > 300:
+        lines.append(f'  … and {len(todo) - 300} more (Accounts by CA on the TAK Server page has the full list)')
+    if res['no_email']:
+        lines += ['', f'No email on file ({len(res["no_email"])}), so they were not emailed: '
+                  + ', '.join(res['no_email'][:100]) + (' …' if len(res['no_email']) > 100 else '')]
+    lines += ['', f'Revoke {old} on the TAK Server page once everyone has moved.', '', f'Server: {ident}']
+    admin = _safe_alert_email_list(settings.get('guarddog_alert_email'))
+    errors = []
+    if admin:
+        try:
+            if _guarddog_send_alert_email_via_relay(admin, subj, '\n'.join(lines), force=True):
+                res['admin'] = len(admin.split(','))
+        except Exception as e:
+            errors.append(f'admin copy: {str(e)[:120]}')
+    for r in todo if emails else []:
+        to = emails.get(r['user'].lower())
+        if not to:
+            continue
+        body = '\n'.join([f'Hello {r["user"]},', '', notice, '', 'What is left for you:']
+                         + [f'  • {t}' for t in r['todo']] + ['', f'Server: {ident}'])
+        try:
+            if _guarddog_send_alert_email_via_relay(to, subj, body, force=True):
+                res['users'] += 1
+        except Exception as e:
+            errors.append(str(e)[:120])
+    res['sent'] = bool(res['admin'] or res['users'])
+    parts = [f"admin ({res['admin']})" if res['admin'] else 'no admin address set (Guard Dog alert email)']
+    if state.get('user_email_opt_in'):
+        parts.append(f"{res['users']} user(s)" + (f", {len(res['no_email'])} with no email on file" if res['no_email'] else '')
+                     + ('' if emails is not None else ' — Authentik not reachable, users not emailed'))
+    res['message'] = 'Emailed ' + ', '.join(parts) + '.' + (f' {len(errors)} send(s) failed.' if errors else '')
+    _log(f"[ca-rotation] {kind} notice: {res['message']}")
+    if errors:
+        _log(f"[ca-rotation] first send error: {errors[0]}")
+    return res
+
+
+@app.route('/api/takserver/ca-rotation', methods=['GET', 'POST'])
+@login_required
+def takserver_ca_rotation():
+    """GET: the open rotation window (if any) and what a Rotate now would send. POST
+    {user_email_opt_in}: change the D2 choice during the window."""
+    st = _ca_rotation_state_load()
+    if request.method == 'POST':
+        if not st:
+            return jsonify({'error': 'No rotation window is open.'}), 400
+        st['user_email_opt_in'] = bool((request.json or {}).get('user_email_opt_in'))
+        _ca_rotation_state_save(st)
+        print(f"[ca-rotation] user emails {'on' if st['user_email_opt_in'] else 'off'} for this window", flush=True)
+    settings = load_settings()
+    signer = _tak_server_cert_signer_or_default('/opt/tak/certs/files')
+    out = {'active': bool(st), 'window_days': CA_ROTATION_WINDOW_DAYS,
+           'relay_ready': _email_relay_ready(settings),
+           'admin_email_set': bool(_safe_alert_email_list(settings.get('guarddog_alert_email'))),
+           'day0_text': _ca_rotation_day0_text(time.time() + CA_ROTATION_WINDOW_DAYS * 86400, signer)}
+    if st:
+        out.update(st, days_left=max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400)),
+                   cutoff_date=_ca_rotation_date(st.get('cutoff_at') or 0))
+    # "N with an email on file" for the D2 checkbox: accounts holding a TAK cert that Authentik
+    # has an address for.
+    emails = _ca_rotation_user_emails()
+    if emails is not None:
+        mig = _tak_ca_migration()
+        out['users_with_email'] = sum(1 for r in mig.get('rows') or [] if emails.get(r['user'].lower()))
+    return jsonify(out)
+
+
 rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
@@ -82453,8 +82636,13 @@ def takserver_rotate_intca():
     if root_days_left is not None and requested_validity > root_days_left:
         pass  # already capped to root_days_left in int_validity_days
 
+    # v10.3.5 W10: the Day-0 notice as the admin edited it in the card (not stored), and the D2
+    # choice (stored per rotation in ca_rotation_state.json).
+    notice = str(data.get('notice') or '').strip()[:4000]
+    email_users = bool(data.get('email_users'))
+
     rotate_intca_log.clear()
-    rotate_intca_status.update({'running': True, 'complete': False, 'error': False})
+    rotate_intca_status.update({'running': True, 'complete': False, 'error': False, 'notice': None})
 
     def do_rotate():
         def log(msg):
@@ -82620,6 +82808,21 @@ def takserver_rotate_intca():
                 log(f"  Every device is disconnected until it scans a new QR: none of them trusts "
                     f"{new_ca_name} yet")
             log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
+            # v10.3.5 W10: open the window and send the Day-0 notice.
+            log("")
+            now = time.time()
+            state = {'old_ca_cn': old_ca_name, 'old_ca_alias': old_ca_name.lower(), 'new_ca_cn': new_ca_name,
+                     'rotated_at': int(now), 'cutoff_at': int(now + CA_ROTATION_WINDOW_DAYS * 86400),
+                     'server_signer': server_signer, 'notices_sent': ['day0'], 'user_email_opt_in': email_users}
+            _ca_rotation_state_save(state)
+            text = notice or _ca_rotation_day0_text(state['cutoff_at'], server_signer)
+            log(f"Rotation window: {CA_ROTATION_WINDOW_DAYS} days, until {_ca_rotation_date(state['cutoff_at'])} (UTC)")
+            try:
+                sent = _ca_rotation_send('day0', state, text, log)
+            except Exception as e:
+                sent = {'sent': False, 'message': f'The notice could not be sent: {str(e)[:160]}'}
+            log(f"  {'✓' if sent.get('sent') else '⚠'} Notice: {sent.get('message')}")
+            rotate_intca_status['notice'] = {'text': text, 'sent': bool(sent.get('sent')), 'message': sent.get('message', '')}
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
             log(f"")
@@ -82890,6 +83093,11 @@ def takserver_revoke_old_ca():
                    f'Clients still using certs signed by {old_ca_alias} must re-enroll.' + ct_note)
             if problems:
                 msg += ' ⚠ ' + ' ⚠ '.join(p[0].upper() + p[1:] + '.' for p in problems)
+            # v10.3.5 W10: revoking the window's old CA closes the window (and its reminders).
+            st = _ca_rotation_state_load()
+            if st and (_pem_cn_and_expiry(target[0])[0] or old_ca_alias).lower() == str(st.get('old_ca_cn')).lower():
+                _ca_rotation_state_save({})
+                log(f"  Rotation window for {st.get('old_ca_cn')} closed; no more reminders")
             log("")
             log("━━━ REVOKE COMPLETE ━━━" if not problems else "━━━ REVOKE DONE WITH WARNINGS ━━━")
             revoke_ca_status.update({'running': False, 'complete': True, 'error': bool(problems), 'message': msg})
