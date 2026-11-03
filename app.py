@@ -82141,6 +82141,10 @@ def takserver_rotate_intca():
     if _tak_cert_job_busy():
         return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
+    # v10.3.5 W8 (D3): rotating a CA restarts TAK and can drop every device; same gate as Revoke.
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     new_ca_name = (data.get('new_ca_name') or '').strip()
     if not new_ca_name:
         return jsonify({'error': 'New CA name is required'}), 400
@@ -82658,6 +82662,10 @@ def takserver_rotate_rootca():
     if _tak_cert_job_busy():
         return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
+    # v10.3.5 W8 (D3): a full PKI rebuild disconnects every device.
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     new_root_name = (data.get('new_root_name') or '').strip()
     new_int_name = (data.get('new_int_name') or '').strip()
     if not new_root_name or not new_int_name:

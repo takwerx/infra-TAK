@@ -547,9 +547,12 @@ async function loadCAInfo(){
     if(d.trust_list_roots){
       h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
       h+='<span style="color:var(--text-secondary);min-width:140px">Server trust list</span>';
-      h+=d.trust_list_roots.length
-        ?'<span style="color:var(--yellow)">includes root CA ('+d.trust_list_roots.map(escapeHtml).join(', ')+'): old intermediates\' chains accepted. Revoke Old CA removes it.</span>'
-        :'<span style="color:var(--green)">intermediate CAs only ✓</span>';
+      var tlr=d.trust_list_roots.map(escapeHtml).join(', ');
+      h+=!d.trust_list_roots.length
+        ?'<span style="color:var(--green)">intermediate CAs only ✓</span>'
+        :(d.old_cas_in_truststore&&d.old_cas_in_truststore.length)
+          ?'<span style="color:var(--yellow)">includes root CA ('+tlr+'). Revoke Old CA removes it along with the old CA.</span>'
+          :'<span style="color:var(--text-dim)">includes root CA ('+tlr+'). Taken out the first time you revoke an old CA.</span>';
       h+='</div>';
     }
     infoEl.innerHTML=h||'No CA information available.';
@@ -653,12 +656,13 @@ async function rotateIntCA(){
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
   if(!validateCaName('rotate-ca-name')){alert('Fix the CA name first (see the checklist under it).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
   if(!confirm(_takRotateConfirmText(newName)))return;
+  var adminPw=prompt('Enter the infra-TAK admin password to continue:');if(!adminPw)return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
   if(isNaN(validityDays)||validityDays<1)validityDays=730;
   var newPwEl=document.getElementById('rotate-ca-new-password');
   var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
-  var payload={new_ca_name:newName,intermediate_validity_days:validityDays};
+  var payload={new_ca_name:newName,intermediate_validity_days:validityDays,password:adminPw};
   if(newPw)payload.new_cert_password=newPw;
   var btn=document.getElementById('rotate-ca-btn');
   var msg=document.getElementById('rotate-ca-msg');
@@ -746,12 +750,13 @@ async function rotateRootCA(){
   if(!rootOk||!intOk){alert('Fix the CA names first (see the checklist under each).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
   if(!confirm('⚠ FULL ROOT CA ROTATION ⚠\n\nThis will:\n• Create new Root CA: '+newRoot+'\n• Create new Intermediate CA: '+newInt+'\n• Regenerate ALL certificates\n• Restart TAK Server\n• Update TAK Portal\n\nALL existing client connections will be DISCONNECTED.\nUsers must re-enroll via TAK Portal QR code.\n\nAre you sure?'))return;
   if(!confirm('FINAL CONFIRMATION\n\nThis is a destructive operation. The old PKI will be removed.\n\nType your maintenance window: 0900 it goes dark, 0915 scan new QR.\n\nProceed?'))return;
+  var adminPw=prompt('Enter the infra-TAK admin password to continue:');if(!adminPw)return;
   var btn=document.getElementById('rotate-root-btn');
   var msg=document.getElementById('rotate-root-msg');
   var logEl=document.getElementById('rotate-root-log');
   var newPwEl=document.getElementById('rotate-root-new-password');
   var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
-  var payload={new_root_name:newRoot,new_int_name:newInt};
+  var payload={new_root_name:newRoot,new_int_name:newInt,password:adminPw};
   if(newPw)payload.new_cert_password=newPw;
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Starting Root CA rotation...';msg.style.color='var(--text-dim)';}
