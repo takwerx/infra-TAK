@@ -81768,31 +81768,36 @@ def _tak_ca_migration():
                 acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
                 acct['cloudtak'] = j
 
+    # `moving`: what's left on a cert TAK still trusts — the window's work. `gone`: certs an
+    # earlier Revoke already cut off (retired phones, old feeds). A device that's still in use
+    # re-enrolls the same way, but these are not "still to move" and stay out of the counts and
+    # the mails (test6 2026-11-03: 23 of 23 accounts "to move", nearly all INT-01 leftovers).
     rows, cas = [], {}
     for acct in sorted(accounts.values(), key=lambda a: a['user'].lower()):
-        todo, gone = [], False
+        moving, gone = [], []
         for d in acct['devices']:
             name = d['callsign'] or d['uid']
             if d['current']:
                 continue
             if d['trusted'] is False:
-                gone = True
-                todo.append(f'{name}: no longer trusted — scan a new QR code')
+                gone.append(f'{name}: no longer trusted — '
+                            + ('issue it a new cert' if d['kind'] == 'integration' else 'scan a new QR code if still in use'))
             elif d['kind'] == 'integration':
-                todo.append(f'{name}: server/integration client — issue it a new cert')
+                moving.append(f'{name}: server/integration client — issue it a new cert')
             else:
-                todo.append(f'scan a new QR on {name}')
+                moving.append(f'scan a new QR on {name}')
         c = acct['cloudtak']
         if c and not c['current']:
-            gone = gone or c['trusted'] is False
-            todo.append('log out and back in to CloudTAK')
-        status = 'moved' if not todo else ('untrusted' if gone else 'needs_move')
+            # Actionable either way: the next login re-issues the cert from the current CA.
+            moving.append('log out and back in to CloudTAK')
+        todo = moving + gone
+        status = 'needs_move' if moving else ('untrusted' if gone else 'moved')
         on = sorted({d['issuer'] for d in acct['devices'] if d['issuer']}
                     | ({c['issuer']} if c and c['issuer'] else set()))
         for cn in on:
             e = cas.setdefault(cn, {'cn': cn, 'accounts': 0, 'current': cn == current_ca})
             e['accounts'] += 1
-        rows.append(dict(acct, status=status, todo=todo, cas=on))
+        rows.append(dict(acct, status=status, todo=todo, moving=moving, gone=gone, cas=on))
     return {'ok': True, 'current_ca': current_ca, 'rows': rows,
             'cas': sorted(cas.values(), key=lambda e: (not e['current'], e['cn'])),
             'cloudtak': ct, 'error': '' if bundle else "TAK Server's trust list couldn't be read"}
@@ -81909,7 +81914,8 @@ def _ca_rotation_send(kind, state, notice, log=None):
         res['message'] = "Email Relay isn't set up, so nothing was sent."
         return res
     mig = _tak_ca_migration()
-    todo = [r for r in mig.get('rows') or [] if r['status'] != 'moved']
+    todo = [r for r in mig.get('rows') or [] if r['moving']]
+    n_gone = sum(len(r['gone']) for r in mig.get('rows') or [])
     old, new = state.get('old_ca_cn') or 'the old CA', state.get('new_ca_cn') or mig.get('current_ca') or 'the new CA'
     ident = _guarddog_server_identifier(settings) or socket.gethostname()
     left = max(0, int(((state.get('cutoff_at') or 0) - time.time()) // 86400))
@@ -81921,9 +81927,12 @@ def _ca_rotation_send(kind, state, notice, log=None):
     lines = [notice, '', f'{len(todo)} of {len(mig.get("rows") or [])} accounts still need to move from {old} to {new}'
              + ('.' if mig.get('ok') else f' (the account list could not be read: {mig.get("error")}).'), '']
     for r in todo[:300]:
-        lines.append(f'  {r["user"]}: ' + '; '.join(r['todo']))
+        lines.append(f'  {r["user"]}: ' + '; '.join(r['moving']))
     if len(todo) > 300:
         lines.append(f'  … and {len(todo) - 300} more (Accounts by CA on the TAK Server page has the full list)')
+    if n_gone:
+        lines += ['', f'Not listed: {n_gone} device cert(s) an earlier Revoke already cut off (retired phones, old '
+                  'feeds). Accounts by CA on the TAK Server page lists them.']
     if res['no_email']:
         lines += ['', f'No email on file ({len(res["no_email"])}), so they were not emailed: '
                   + ', '.join(res['no_email'][:100]) + (' …' if len(res['no_email']) > 100 else '')]
@@ -81941,7 +81950,7 @@ def _ca_rotation_send(kind, state, notice, log=None):
         if not to:
             continue
         body = '\n'.join([f'Hello {r["user"]},', '', notice, '', 'What is left for you:']
-                         + [f'  • {t}' for t in r['todo']] + ['', f'Server: {ident}'])
+                         + [f'  • {t}' for t in r['moving']] + ['', f'Server: {ident}'])
         try:
             if _guarddog_send_alert_email_via_relay(to, subj, body, force=True):
                 res['users'] += 1
@@ -81988,7 +81997,7 @@ def takserver_ca_rotation():
         out['users_with_email'] = sum(1 for r in mig.get('rows') or [] if emails.get(r['user'].lower()))
     if st:
         out['accounts'] = len(mig.get('rows') or [])
-        out['todo_count'] = sum(1 for r in mig.get('rows') or [] if r['status'] != 'moved')
+        out['todo_count'] = sum(1 for r in mig.get('rows') or [] if r['moving'])
     return jsonify(out)
 
 

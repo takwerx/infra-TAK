@@ -811,7 +811,7 @@ async function loadCaMigration(){
   if(btn){btn.disabled=false;btn.textContent='Refresh';}
 }
 function _caMigMatches(row,q){
-  if(_caMigFilter==='todo'&&row.status==='moved')return false;
+  if(_caMigFilter==='todo'&&row.status!=='needs_move')return false;
   if(_caMigFilter&&_caMigFilter!=='todo'&&row.cas.indexOf(_caMigFilter)<0)return false;
   if(!q)return true;
   if(row.user.toLowerCase().indexOf(q)>=0)return true;
@@ -820,15 +820,17 @@ function _caMigMatches(row,q){
 function renderCaMigration(){
   var d=_caMig;if(!d)return;
   var esc=escapeHtml;
-  var total=d.rows.length,todo=d.rows.filter(function(r){return r.status!=='moved';}).length;
+  var total=d.rows.length,todo=d.rows.filter(function(r){return r.status==='needs_move';}).length;
+  var gone=d.rows.filter(function(r){return r.status==='untrusted';}).length;
   var old=d.cas.filter(function(c){return !c.current;});
   var s='';
   if(!total)s='No live client certificates in TAK Server\'s certificate table.';
-  else if(!todo)s='<span style="color:var(--green)">All '+total+' accounts are on '+esc(d.current_ca)+' ✓</span>';
+  else if(!todo)s='<span style="color:var(--green)">Nothing left to move: every account still in use is on '+esc(d.current_ca)+' ✓</span>';
   else{
     var on=old.map(function(c){return esc(c.cn);}).join(', ')||'an old CA';
     s='<span style="color:var(--yellow);font-weight:600">'+todo+' of '+total+' accounts still on '+on+'</span>';
   }
+  if(gone)s+='<div style="color:var(--text-dim)">'+gone+' account'+(gone===1?'':'s')+' only hold certs an earlier Revoke already cut off (retired devices, old feeds): not counted.</div>';
   if(d.cloudtak&&d.cloudtak.note)s+='<div style="color:var(--text-dim)">'+esc(d.cloudtak.note)+'</div>';
   if(d.error)s+='<div style="color:var(--yellow)">'+esc(d.error)+' — "trusted" is not shown.</div>';
   document.getElementById('ca-mig-summary').innerHTML=s;
