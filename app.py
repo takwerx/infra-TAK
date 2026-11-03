@@ -72053,6 +72053,10 @@ def _authentik_ldap_sa_bind_watchdog_loop():
     """
     import time as _wt
     _wt.sleep(120)  # Let console finish _startup_migrations before first tick
+    # ops #438: the boot heal now waits for Authentik (up to 10 min); don't heal alongside it.
+    _boot_heal = globals().get('_startup_ldap_resync_done')
+    if _boot_heal is not None:
+        _boot_heal.wait(timeout=900)
 
     _ok_log_interval = 10  # ~50 minutes between liveness lines
     _ok_counter = 0
@@ -95691,6 +95695,46 @@ def _ubuntu_pro_security_covered(raw=None):
         return False
 
 
+def _os_upgrade_boot_apps_down(start=False):
+    """['TAK-Portal', 'CloudTAK']: the installed, local apps that Guard Dog's boot sequencer
+    stops at boot and only tak-post-start starts again, that are not running now.
+    start=True also starts each one, as its page's Start button does.
+
+    ops #438 (field, Nov 2): after the 24.04 reboot both stayed Stopped while TAK, Authentik
+    and Caddy ran, and nothing on the box would ever start them: the sequencer's `docker stop`
+    keeps `restart: unless-stopped` from doing it, and tak-post-start runs once per boot.
+    Every normal boot starts both, so starting them here changes nothing an operator chose."""
+    down = []
+    try:
+        tp = _takportal_web_container(all_states=True)
+    except Exception:
+        tp = None
+    if tp is not None and not tp.get('running'):
+        down.append('TAK-Portal')
+        if start:
+            try:
+                _takportal_up(timeout=180)
+            except Exception as e:
+                print(f"[os-upgrade] TAK Portal start failed: {e}", flush=True)
+    try:
+        ct_remote = _get_cloudtak_deployment_config(load_settings()).get('target_mode') == 'remote'
+    except Exception:
+        ct_remote = False
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    if not ct_remote and any(os.path.exists(os.path.join(ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
+        running, _p, _e = _os_upgrade_containers()
+        if running is not None and not any(n.startswith('cloudtak-api') for n in running):
+            down.append('CloudTAK')
+            if start:
+                try:
+                    _cloudtak_ensure_custom_compose(ct_dir)   # GH #261: before compose, every time
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ct_dir,
+                                   capture_output=True, text=True, timeout=120)
+                except Exception as e:
+                    print(f"[os-upgrade] CloudTAK start failed: {e}", flush=True)
+    return down
+
+
 def _startup_os_upgrade_verify():
     """Post-reboot half of step 8: the console that boots after the flip sees status
     `rebooting`, marks `verifying`, waits for the baseline containers/services to come
@@ -95718,14 +95762,30 @@ def _startup_os_upgrade_verify():
             # Guard Dog's tak-post-start (oneshot, RemainAfterExit) restarts the containers the
             # boot sequencer stopped, after TAK answers. Until it has finished (active / failed)
             # a missing container means "not yet", not "lost".
+            # ops #438: an empty load state is systemctl not answering inside 5 s, not "Guard Dog
+            # is not installed" ('not-found'). Ending the wait on it would judge the box before
+            # the boot sequence has run. (Hardening found while tracing the field report; not
+            # its cause.)
             ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S
             while time.time() < ps_deadline:
                 _ld, _act, _sub, _res, _pid = _kernel_patch_unit_state('tak-post-start.service')
-                if _ld != 'loaded' or _act in ('active', 'failed'):
+                if (_ld and _ld != 'loaded') or _act in ('active', 'failed'):
                     break
                 time.sleep(15)
+            # ops #438: whatever tak-post-start left stopped (it timed out, was killed, or its
+            # start failed), start it once now and give it the same wait as the rest.
+            apps_down = _os_upgrade_boot_apps_down(start=True)
+            if apps_down:
+                print(f"[os-upgrade] after post-start still stopped: {', '.join(apps_down)} — starting them", flush=True)
             deadline = time.time() + _OS_UPGRADE_VERIFY_WAIT_S
+            pg_expect = baseline.get('pg_expect') or ''
             while True:
+                # ops #438: TAK's PostgreSQL gets the same wait as the containers and services.
+                # Field, Nov 2: Install updates, pressed 3 min after the reboot, moved PostgreSQL
+                # to the 24.04 build and restarted it (down 9 s); the one read landed in that gap.
+                clusters = _os_upgrade_pg_clusters() if pg_expect else []
+                pg_ok = (not pg_expect) or any(c[0] == pg_expect and c[2] == '5432' and c[3] == 'online'
+                                               for c in clusters)
                 running, _p, _e = _os_upgrade_containers()
                 missing_c = sorted(want_c - set(running or []))
                 missing_s = []
@@ -95736,17 +95796,21 @@ def _startup_os_upgrade_verify():
                             missing_s.append(svc)
                     except Exception:
                         missing_s.append(svc)
-                if (not missing_c and not missing_s) or time.time() >= deadline:
+                apps_down = _os_upgrade_boot_apps_down() if apps_down else []
+                if (not missing_c and not missing_s and pg_ok and not apps_down) or time.time() >= deadline:
                     break
                 time.sleep(10)
             if missing_c:
                 problems.append('containers=' + ','.join(missing_c))
             if missing_s:
                 problems.append('services=' + ','.join(missing_s))
-            if baseline.get('pg_expect'):
-                clusters = _os_upgrade_pg_clusters()
-                if not any(c[0] == baseline['pg_expect'] and c[2] == '5432' and c[3] == 'online' for c in clusters):
-                    problems.append('postgresql=' + (';'.join('/'.join(c) for c in clusters) or 'none'))
+            if apps_down:
+                problems.append('stopped=' + ','.join(apps_down))
+            if not pg_ok:
+                # ops #438: name TAK's cluster only. Others (the 5.8 migration's rollback copy,
+                # kept stopped on purpose) are not missing, and listing them read as if they were.
+                tak_pg = [c for c in clusters if c[0] == pg_expect or c[2] == '5432']
+                problems.append('postgresql=' + (';'.join('/'.join(c) for c in tak_pg) or f'{pg_expect}/none'))
             if problems:
                 _os_upgrade_write_status('failed:verify:' + ' '.join(problems))
                 print(f"[os-upgrade] ✗ post-reboot verify FAILED: {' '.join(problems)}", flush=True)
@@ -102154,6 +102218,12 @@ _v0_9_12_rep_patched = _startup_fix_reputation_policy_drift()
 # doesn't have LDAP configured. If LDAP IS configured, attempts a probe bind
 # with the .env password; only triggers the full resync flow (set Authentik
 # user password from .env + force-recreate LDAP outpost) when the probe fails.
+_STARTUP_LDAP_AK_WAIT_S = 600   # ops #438: how long the boot heal waits for Authentik to answer
+_STARTUP_LDAP_TRANSIENT = ('Connection reset', 'Connection refused', '502', '503', 'timed out')
+# Set when the boot heal is finished; the 5-min watchdog waits for it so the two never heal at once.
+_startup_ldap_resync_done = threading.Event()
+
+
 def _startup_resync_ldap_service_account():
     try:
         if not os.path.isdir(os.path.expanduser('~/authentik')):
@@ -102164,6 +102234,19 @@ def _startup_resync_ldap_service_account():
         env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         if not env_pass:
             return
+
+        # ops #438 (field, Nov 2, 24.04 reboot): this ran 34 s into the boot, while Authentik
+        # still answered its outpost with 502/503, and the heal died on "Connection reset by
+        # peer". At boot the bind fails because Authentik is starting, not because of drift, so
+        # wait for it first (the same check the ops #214 watchdogs use). Background thread.
+        if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+            ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+            while (_authentik_busy_reason() or not _local_authentik_http_ok()) and time.time() < ak_deadline:
+                time.sleep(10)
+            if _authentik_busy_reason() or not _local_authentik_http_ok():
+                print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
 
         # Probe: does the bind work today? If yes, idempotent no-op (unless the
         # reputation policy was just patched — in that case TAK Server has been
@@ -102187,6 +102270,16 @@ def _startup_resync_ldap_service_account():
             print("Startup migration: LDAP service account bind FAILED — auto-resyncing")
             try:
                 ok, msg = _ensure_authentik_ldap_service_account()
+                # ops #438: Authentik can still drop a request just after it first answers.
+                # Retry once when it does, after it answers again.
+                if not ok and any(s in (msg or '') for s in _STARTUP_LDAP_TRANSIENT):
+                    print(f"Startup migration: LDAP service account resync hit a transient Authentik "
+                          f"error ({(msg or '')[:80]}) — retrying once Authentik answers")
+                    time.sleep(30)
+                    ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+                    while not _local_authentik_http_ok() and time.time() < ak_deadline:
+                        time.sleep(10)
+                    ok, msg = _ensure_authentik_ldap_service_account()
                 if ok:
                     print(f"Startup migration: LDAP service account resync OK ({msg})")
                     healing_performed = True
@@ -102252,6 +102345,8 @@ def _startup_resync_ldap_service_account():
                   f"NOT restarting takserver (would restart into broken state)")
     except Exception as _e:
         print(f"Startup migration: LDAP service account resync skipped: {_e}")
+    finally:
+        _startup_ldap_resync_done.set()
 
 # v10.0.3: run the boot-time LDAP SA bind heal in the BACKGROUND so an unhealthy LDAP
 # outpost can never wedge the worker boot. 2026-06-23: a misconfigured outpost made this

@@ -426,8 +426,14 @@ def test_job_state_transitions(raw, unit, state, step):
 class Boot:
     def __init__(self, status='rebooting', os_release=('ubuntu-24.04', 'Ubuntu 24.04.1 LTS'),
                  baseline=None, running=('authentik-server', 'tak-portal'), active=('takserver', 'docker'),
-                 clusters=(('18', 'main', '5432', 'online'),), poststart=None):
+                 clusters=(('18', 'main', '5432', 'online'),), poststart=None, clusters_seq=None, wait_s=0,
+                 apps_seq=None):
         self.writes = []
+        # apps_seq: successive _os_upgrade_boot_apps_down answers (the last one repeats)
+        self.apps_seq = [list(a) for a in (apps_seq or [()])]
+        self.app_starts = []
+        # clusters_seq: successive pg_lsclusters answers (the last one repeats) — a cluster still starting
+        self.clusters_seq = [list(c) for c in (clusters_seq or [clusters])]
         self.poststart = list(poststart or [('not-found', 'inactive', 'dead', '', 0)])
         baseline = baseline if baseline is not None else {
             'containers': ['authentik-server', 'tak-portal'], 'services': {'takserver': 'active', 'docker': 'active'},
@@ -454,14 +460,21 @@ class Boot:
             _read_os_release=lambda: os_release,
             _read_priv=lambda p: json.dumps(baseline),
             _os_upgrade_containers=lambda: (list(running), [], ''),
-            _os_upgrade_pg_clusters=lambda: list(clusters),
+            _os_upgrade_pg_clusters=lambda: (self.clusters_seq.pop(0) if len(self.clusters_seq) > 1 else self.clusters_seq[0]),
             audit=lambda *a: self.audits.append(a),
             print=lambda *a, **k: None,
             _kernel_patch_unit_state=lambda unit: (self.poststart.pop(0) if len(self.poststart) > 1 else self.poststart[0]),
+            _os_upgrade_boot_apps_down=self._apps,
         )
-        self.ns['_OS_UPGRADE_VERIFY_WAIT_S'] = 0
+        self.ns['_OS_UPGRADE_VERIFY_WAIT_S'] = wait_s
         self.ns['_OS_UPGRADE_POSTSTART_WAIT_S'] = 3600
         exec(compile(_fn('_startup_os_upgrade_verify'), 'app.py:_startup_os_upgrade_verify', 'exec'), self.ns)
+
+    def _apps(self, start=False):
+        down = self.apps_seq.pop(0) if len(self.apps_seq) > 1 else self.apps_seq[0]
+        if start:
+            self.app_starts.append(list(down))
+        return list(down)
 
     def go(self):
         return self.ns['_startup_os_upgrade_verify']()
@@ -494,6 +507,121 @@ def test_verify_names_what_is_missing():
     b = Boot(os_release=('ubuntu-22.04', 'Ubuntu 22.04.5 LTS'))
     b.go()
     assert b.writes[-1].startswith('failed:verify:os-release=ubuntu-22.04')
+
+
+def test_verify_waits_for_postgresql_still_starting_ops438():
+    # ops #438 (field, Nov 2): everything else was back, PostgreSQL 18 read "down" once, and a
+    # healthy box was marked failed. Install updates had restarted PostgreSQL (down 9 s) right as
+    # the one read ran. It gets the same wait as the containers and services.
+    down = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down'))
+    up = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'online'))
+    b = Boot(clusters_seq=[down, down, up], wait_s=3600)
+    b.go()
+    assert b.writes == ['verifying', 'done']
+    assert b.clusters_seq == [list(up)]
+
+
+def test_verify_still_fails_when_postgresql_never_comes_up_ops438():
+    down = (('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down'))
+    b = Boot(clusters=down)
+    b.go()
+    assert b.writes == ['verifying', 'failed:verify:postgresql=18/main/5432/down']
+
+
+def test_verify_does_not_call_the_kept_rollback_cluster_missing_ops438():
+    # ops #438: the field card read `postgresql=15/main/5434/down;18/main/5432/down`. 15 on 5434 is
+    # the 5.8 migration's rollback copy, stopped on purpose; only TAK's own cluster is named.
+    b = Boot(clusters=(('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'down')))
+    b.go()
+    assert '15/main/5434' not in b.writes[-1]
+    b = Boot(clusters=(('15', 'main', '5434', 'down'),))
+    b.go()
+    assert b.writes[-1] == 'failed:verify:postgresql=18/none'
+    b = Boot(clusters=(('15', 'main', '5434', 'down'), ('18', 'main', '5432', 'online')))
+    b.go()
+    assert b.writes == ['verifying', 'done']
+
+
+def test_verify_starts_portal_and_cloudtak_post_start_left_stopped_ops438():
+    # ops #438 (field, Nov 2): after the 24.04 reboot TAK Portal and CloudTAK stayed Stopped and
+    # nothing would ever start them. The verify starts them once, then waits for them.
+    b = Boot(poststart=[('loaded', 'failed', 'failed', 'timeout', 0)],
+             apps_seq=[('TAK-Portal', 'CloudTAK'), ('CloudTAK',), ()], wait_s=3600)
+    b.go()
+    assert b.app_starts == [['TAK-Portal', 'CloudTAK']]
+    assert b.writes == ['verifying', 'done']
+
+
+def test_verify_waits_out_a_slow_systemctl_at_boot_ops438():
+    # ops #438: `systemctl show` can miss its 5 s timeout and come back empty. That is "ask
+    # again", not "Guard Dog is not installed": the old wait ended on it and judged PostgreSQL
+    # before the boot sequence had even started TAK.
+    states = [('', '', '', '', 0), ('loaded', 'activating', 'start', '', 1234),
+              ('loaded', 'active', 'exited', 'success', 0)]
+    asked = []
+
+    def unit_state(unit):
+        asked.append(unit)
+        return states[min(len(asked), len(states)) - 1]
+
+    b = Boot()
+    b.ns['_kernel_patch_unit_state'] = unit_state
+    b.ns['_os_upgrade_pg_clusters'] = lambda: [('15', 'main', '5434', 'down'), (
+        '18', 'main', '5432', 'online' if len(asked) >= len(states) else 'down')]
+    b.go()
+    assert asked == ['tak-post-start.service'] * 3
+    assert b.writes == ['verifying', 'done']
+
+
+def test_verify_says_which_apps_stayed_stopped_ops438():
+    b = Boot(apps_seq=[('TAK-Portal', 'CloudTAK')])
+    b.go()
+    assert b.writes == ['verifying', 'failed:verify:stopped=TAK-Portal,CloudTAK']
+
+
+def _apps_ns(tmp_path, portal=None, ct_files=('docker-compose.yml',), running=('authentik-server-1',),
+             remote=False):
+    home = tmp_path / 'home'
+    (home / 'CloudTAK').mkdir(parents=True)
+    for f in ct_files:
+        (home / 'CloudTAK' / f).write_text('services: {}\n')
+    calls = []
+    import os as _os
+    os_ns = types.SimpleNamespace(path=types.SimpleNamespace(
+        expanduser=lambda p: p.replace('~', str(home)), exists=_os.path.exists, join=_os.path.join))
+    ns = {'os': os_ns, 'print': lambda *a, **k: None,
+          '_takportal_web_container': lambda all_states=False: portal,
+          '_takportal_up': lambda timeout=180: calls.append(('portal-up', timeout)),
+          '_get_cloudtak_deployment_config': lambda s: {'target_mode': 'remote' if remote else 'local'},
+          'load_settings': lambda: {},
+          '_os_upgrade_containers': lambda: (list(running), [], ''),
+          '_cloudtak_ensure_custom_compose': lambda d: calls.append(('ct-custom', d)),
+          '_sudo_wrap': lambda argv: argv,
+          'subprocess': types.SimpleNamespace(run=lambda argv, **kw: calls.append((argv, kw.get('cwd'))))}
+    exec(compile(_fn('_os_upgrade_boot_apps_down'), 'app.py:_os_upgrade_boot_apps_down', 'exec'), ns)
+    return ns['_os_upgrade_boot_apps_down'], calls, str(home / 'CloudTAK')
+
+
+def test_boot_apps_starts_a_stopped_portal_and_cloudtak_like_their_start_buttons_ops438(tmp_path):
+    fn, calls, ct = _apps_ns(tmp_path, portal={'running': False})
+    assert fn() == ['TAK-Portal', 'CloudTAK'] and calls == []
+    assert fn(start=True) == ['TAK-Portal', 'CloudTAK']
+    assert calls == [('portal-up', 180), ('ct-custom', ct), (['docker', 'compose', 'up', '-d'], ct)]
+
+
+def test_boot_apps_leaves_running_absent_and_remote_apps_alone_ops438(tmp_path):
+    fn, calls, _ = _apps_ns(tmp_path, portal={'running': True}, running=('cloudtak-api-1',))
+    assert fn(start=True) == [] and calls == []
+    fn, calls, _ = _apps_ns(tmp_path / 'b', portal=None, ct_files=())
+    assert fn(start=True) == [] and calls == []
+    fn, calls, _ = _apps_ns(tmp_path / 'c', portal=None, remote=True)
+    assert fn(start=True) == [] and calls == []
+
+
+def test_verify_starts_nothing_when_every_app_is_up_ops438():
+    b = Boot()
+    b.go()
+    assert b.app_starts == [[]] and b.writes == ['verifying', 'done']
 
 
 def test_verify_tolerates_an_empty_baseline():
