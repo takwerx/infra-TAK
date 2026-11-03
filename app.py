@@ -82969,6 +82969,18 @@ def takserver_server_cert_signer():
                 run('systemctl restart takserver 2>&1')
                 raise Exception('TAK Server did not pick up the new certificate')
             log(f"  ✓ TAK Server is presenting a certificate signed by {label}")
+            # Keep only this switch's backup: every switch saves a private-key copy, and
+            # older sets are superseded once the new cert is live (switching back reissues).
+            try:
+                _old = [n for n in os.listdir(cert_dir)
+                        if re.fullmatch(r'takserver\.(pem|key|p12|jks|csr)\.\d{8}-\d{6}', n)
+                        and not n.endswith('.' + stamp)]
+            except OSError:
+                _old = []
+            for n in _old:
+                run(f'rm -f {shlex.quote(os.path.join(cert_dir, n))}', check=False)
+            if _old:
+                log(f"  Removed {len(_old)} file(s) from earlier switches")
 
             log("Step 4/4: Updating TAK Portal's copy of the server certificate...")
             if _takportal_web_container() is None:
