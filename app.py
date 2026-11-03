@@ -81916,12 +81916,90 @@ def takserver_ca_rotation():
         out.update(st, days_left=max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400)),
                    cutoff_date=_ca_rotation_date(st.get('cutoff_at') or 0))
     # "N with an email on file" for the D2 checkbox: accounts holding a TAK cert that Authentik
-    # has an address for.
+    # has an address for. During a window, how many still have to move (W12's banner).
     emails = _ca_rotation_user_emails()
+    mig = _tak_ca_migration() if (st or emails is not None) else {}
     if emails is not None:
-        mig = _tak_ca_migration()
         out['users_with_email'] = sum(1 for r in mig.get('rows') or [] if emails.get(r['user'].lower()))
+    if st:
+        out['accounts'] = len(mig.get('rows') or [])
+        out['todo_count'] = sum(1 for r in mig.get('rows') or [] if r['status'] != 'moved')
     return jsonify(out)
+
+
+# v10.3.5 W12 — countdown reminders on day 23 and day 29 of the window, each once. Same loop
+# shape as _update_notify_loop: a daemon started at module load, every 6 h, a lock, catch all.
+CA_ROTATION_REMINDER_DAYS = (23, 29)
+CA_ROTATION_REMINDER_FIRST_DELAY_S = 900
+CA_ROTATION_REMINDER_INTERVAL_S = 21600
+_ca_rotation_lock = threading.Lock()
+
+
+def _ca_rotation_reminder_text(st):
+    left = max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400))
+    return (f'{left} day{"" if left == 1 else "s"} left (until {_ca_rotation_date(st.get("cutoff_at") or 0)}) '
+            f'to move to the new TAK certificates: on mobile (ATAK, iTAK, TAK Aware) scan a new QR code '
+            f'from TAK Portal; in CloudTAK log out and back in to get a new certificate. After that date '
+            f'{st.get("old_ca_cn") or "the old certificate authority"} can be revoked at any time, and certificates '
+            f'from it then stop working.')
+
+
+def _ca_rotation_reminder_once(kind=None):
+    """Send the reminder that is due (or `kind`, forced: T&E / support). Only the LATEST due one
+    goes out — a box that was down from day 22 to day 30 sends day 29 and marks day 23 done.
+    With no Email Relay nothing is marked, so a relay set up mid-window still reminds; the TAK
+    Server page shows the banner meanwhile. Returns {'sent': kind or None, ...}."""
+    st = _ca_rotation_state_load()
+    if not st:
+        return {'sent': None, 'reason': 'no rotation window'}
+    day = int((time.time() - (st.get('rotated_at') or 0)) // 86400)
+    done = set(st.get('notices_sent') or [])
+    due = [d for d in CA_ROTATION_REMINDER_DAYS if day >= d and f'day{d}' not in done]
+    if kind is None:
+        if not due:
+            return {'sent': None, 'reason': f'day {day}: nothing due'}
+        kind = f'day{due[-1]}'
+    if not _email_relay_ready():
+        return {'sent': None, 'reason': "Email Relay isn't set up"}
+    res = _ca_rotation_send(kind, st, _ca_rotation_reminder_text(st))
+    st = _ca_rotation_state_load()
+    if st:   # a Revoke may have closed the window meanwhile
+        st['notices_sent'] = sorted(set(st.get('notices_sent') or []) | {kind} | {f'day{d}' for d in due},
+                                    key=lambda k: int(k[3:]) if k[3:].isdigit() else 0)
+        _ca_rotation_state_save(st)
+    return dict(res, sent=kind)
+
+
+def _ca_rotation_reminder_loop():
+    time.sleep(CA_ROTATION_REMINDER_FIRST_DELAY_S)
+    while True:
+        try:
+            with _ca_rotation_lock:
+                _ca_rotation_reminder_once()
+        except Exception as e:
+            try:
+                print(f"[ca-rotation] reminder check failed: {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(CA_ROTATION_REMINDER_INTERVAL_S)
+
+
+try:
+    threading.Thread(target=_ca_rotation_reminder_loop, daemon=True, name='ca-rotation-reminders').start()
+except Exception:
+    pass
+
+
+@app.route('/api/takserver/ca-rotation/remind', methods=['POST'])
+@login_required
+def takserver_ca_rotation_remind():
+    """Send a window reminder now (T&E / support — nobody waits 23 days). {kind: 'day23' |
+    'day29'}; it is marked sent like the scheduled one."""
+    kind = str((request.json or {}).get('kind') or '')
+    if kind not in {f'day{d}' for d in CA_ROTATION_REMINDER_DAYS}:
+        return jsonify({'error': 'kind must be ' + ' or '.join(f'day{d}' for d in CA_ROTATION_REMINDER_DAYS)}), 400
+    with _ca_rotation_lock:
+        return jsonify(_ca_rotation_reminder_once(kind))
 
 
 rotate_intca_log = []

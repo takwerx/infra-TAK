@@ -744,6 +744,23 @@ async function loadCaRotation(){
     n.push('The admin gets every account still to move, now and on day 23 and 29 of the '+d.window_days+'-day window.');
     note.textContent=n.join(' ');
   }
+  // W12: with no Email Relay nobody gets reminded, so the page says it instead.
+  var bn=document.getElementById('ca-rotation-banner');
+  if(bn){
+    if(d.active&&!d.relay_ready&&d.todo_count){
+      bn.style.display='block';
+      bn.innerHTML='<strong style="color:var(--yellow)">Certificate rotation: '+d.days_left+' day'+(d.days_left===1?'':'s')+' left</strong> (until '+esc(d.cutoff_date)+'). '
+        +d.todo_count+' of '+d.accounts+' accounts are still on '+esc(d.old_ca_cn)+'. Email Relay isn\'t set up, so nobody is being reminded. '
+        +'<a href="#" id="ca-rotation-banner-show" style="color:var(--cyan)">Show the list</a>';
+      document.getElementById('ca-rotation-banner-show').onclick=function(e){
+        e.preventDefault();
+        var body=document.getElementById('rotate-ca-body');
+        if(body&&body.style.display==='none')takToggleSection('rotate-ca');
+        loadCaMigration();
+        document.getElementById('ca-mig-section').scrollIntoView({behavior:'smooth'});
+      };
+    }else bn.style.display='none';
+  }
   var w=document.getElementById('ca-rotation-window');
   if(!w)return;
   if(!d.active){w.style.display='none';return;}
