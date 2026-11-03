@@ -577,3 +577,27 @@ def test_when_nothing_works_it_says_failed_and_no_users_or_secret_means_none():
     assert ns['_cloudtak_signout_users']([], lambda m: None)['signout'] == 'none' and calls == []
     ns['_cloudtak_signing_secret'] = lambda: ''
     assert ns['_cloudtak_signout_users'](['alice'], lambda m: None)['signout'] == 'none'
+
+
+def _rootca_body():
+    start = APP.index('def takserver_rotate_rootca():')
+    return APP[start:APP.index('def takserver_rotate_rootca_status():', start)]
+
+
+def test_root_rotate_keeps_the_8446_lets_encrypt_keystore_through_the_wipe():
+    # T&E, nuc: Step 1's rm -rf took takserver-le.jks with it and TAK's API would not start.
+    body = _rootca_body()
+    step1 = body[body.index('Step 1/8'):body.index('Old cert files cleared')]
+    native = step1[step1.index('else:'):]
+    assert native.index("mv /opt/tak/certs/files/{_f} {_le_keep}") < native.index("run('rm -rf /opt/tak/certs/files')")
+    assert native.index("run('mkdir -p /opt/tak/certs/files')") < native.index("mv {_le_keep}/{_f} /opt/tak/certs/files/")
+    container = step1[:step1.index('else:')]
+    assert container.index('takserver-le.* /opt/tak/certs/.le-keep/') < container.index('rm -rf /opt/tak/certs/files')
+    assert container.index('mkdir -p /opt/tak/certs/files') < container.index('.le-keep/* /opt/tak/certs/files/')
+
+
+def test_root_rotate_checks_8446_after_the_restart():
+    body = _rootca_body()
+    tail = body[body.index('Waiting for TAK Server to come back up'):body.index('ROOT CA ROTATION COMPLETE')]
+    assert '_selfheal_takserver_le_cert(plog=log)' in tail
+    assert '_tak_8446_connector_has_le(' in tail

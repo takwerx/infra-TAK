@@ -83421,13 +83421,35 @@ def takserver_rotate_rootca():
                 # rotation starts from a clean slate, exactly like the native rm does. The native
                 # branch below is byte-identical to before — Ubuntu/Rocky are untouched.
                 _tak_real = os.path.realpath('/opt/tak')
+                # v10.3.5: keep the 8446 Let's Encrypt keystore (see the native branch).
                 run(f"docker run --rm -v {shlex.quote(_tak_real)}:/opt/tak:z --entrypoint bash "
-                    f"{TAK_CONTAINER} -c 'rm -rf /opt/tak/certs/files && mkdir -p /opt/tak/certs/files' 2>&1")
+                    f"{TAK_CONTAINER} -c 'rm -rf /opt/tak/certs/.le-keep && mkdir -p /opt/tak/certs/.le-keep && "
+                    f"(mv /opt/tak/certs/files/takserver-le.* /opt/tak/certs/.le-keep/ 2>/dev/null; true) && "
+                    f"rm -rf /opt/tak/certs/files && mkdir -p /opt/tak/certs/files && "
+                    f"(mv /opt/tak/certs/.le-keep/* /opt/tak/certs/files/ 2>/dev/null; true) && "
+                    f"rm -rf /opt/tak/certs/.le-keep' 2>&1")
             else:
+                # v10.3.5: CoreConfig's 8446 connector points at certs/files/takserver-le.jks.
+                # Wiping it took TAK's whole API down (8443 + 8446) until the console's next
+                # LE self-heal (T&E, nuc). It isn't signed by our CA, so it survives the rotate.
+                _le_keep = '/opt/tak/certs/.le-keep'
+                _le_files = [f for f in ('takserver-le.jks', 'takserver-le.p12')
+                             if os.path.exists(f'/opt/tak/certs/files/{f}')]
+                if _le_files:
+                    run(f'rm -rf {_le_keep}', check=False)
+                    run(f'mkdir -p {_le_keep}')
+                    for _f in _le_files:
+                        run(f'mv /opt/tak/certs/files/{_f} {_le_keep}/{_f}')
                 run('rm -rf /opt/tak/certs/files')
                 run('mkdir -p /opt/tak/certs/files')
+                for _f in _le_files:
+                    run(f'mv {_le_keep}/{_f} /opt/tak/certs/files/{_f}')
+                if _le_files:
+                    run(f'rm -rf {_le_keep}', check=False)
                 run('chown -R tak:tak /opt/tak/certs/')
             log("✓ Old cert files cleared")
+            if _tak_8446_connector_has_le(_read_priv('/opt/tak/CoreConfig.xml')):
+                log("  Kept the Let's Encrypt cert TAK serves on 8446")
 
             _patch_openssl_string_mask()
 
@@ -83529,6 +83551,15 @@ def takserver_rotate_rootca():
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
             log("✓ TAK Server restarted")
+            # v10.3.5: confirm 8446 still serves Caddy's Let's Encrypt cert; repairs it if not.
+            if _tak_8446_connector_has_le(_read_priv('/opt/tak/CoreConfig.xml')):
+                try:
+                    if _selfheal_takserver_le_cert(plog=log):
+                        log("✓ 8446 serves the Let's Encrypt cert")
+                    else:
+                        log("  ⚠ 8446 Let's Encrypt cert not confirmed; the console repairs it daily")
+                except Exception as e:
+                    log(f"  ⚠ 8446 Let's Encrypt check failed: {e}")
 
             log("")
             log("━━━ ROOT CA ROTATION COMPLETE ━━━")
