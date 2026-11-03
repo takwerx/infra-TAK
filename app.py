@@ -82494,9 +82494,13 @@ def takserver_rotate_rootca():
     if not new_root_name or not new_int_name:
         return jsonify({'error': 'Both new Root CA and Intermediate CA names are required'}), 400
     import re
-    for name in [new_root_name, new_int_name]:
-        if not re.match(r'^[a-zA-Z0-9._-]+$', name):
-            return jsonify({'error': f'CA name "{name}" can only contain letters, numbers, dots, hyphens, underscores'}), 400
+    # GH #128: the same rule as deploy and intermediate rotate. This route used its own regex,
+    # which allowed underscores, and an underscore makes TAK reject every enrolled device.
+    try:
+        _validate_ca_name(new_root_name, 'New Root CA name')
+        _validate_ca_name(new_int_name, 'New Intermediate CA name')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     # Optional new cert password (save so thread uses it for new keystores)
     new_cert_password = (data.get('new_cert_password') or '').strip()

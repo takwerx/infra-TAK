@@ -192,6 +192,9 @@ if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('tak-cert-row')){loadTakCertRow();}
 if(document.getElementById('tak-signer-row')){loadTakSignerRow();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
+// GH #128 checklist on the rotate dialogs too: same rule as deploy, same rule the server enforces.
+var _TAK_ROTATE_CA_NAME_IDS=['rotate-ca-name','rotate-root-name','rotate-root-int-name'];
+_TAK_ROTATE_CA_NAME_IDS.forEach(function(id){var ci=document.getElementById(id);if(ci)ci.addEventListener('input',function(){validateCaName(id)});});
 function refreshTakServerCAState(){
   if(document.getElementById('cert-expiry-info'))loadCertExpiry();
   if(document.getElementById('rotate-ca-info'))loadCAInfo();
@@ -560,6 +563,8 @@ async function loadCAInfo(){
     if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
     var rootIntInput=document.getElementById('rotate-root-int-name');
     if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
+    if(rootNameInput&&rootNameInput.value)validateCaName('rotate-root-name');
+    if(rootIntInput&&rootIntInput.value)validateCaName('rotate-root-int-name');
     var rotValInput=document.getElementById('rotate-ca-validity-days');
     var rotValHint=document.getElementById('rotate-ca-validity-hint');
     if(rotValInput&&d.root_ca&&d.root_ca.days_left!=null){
@@ -637,7 +642,7 @@ async function rotateIntCA(){
   var nameInput=document.getElementById('rotate-ca-name');
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
-  if(!/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/.test(newName)){alert('CA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-02).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
+  if(!validateCaName('rotate-ca-name')){alert('Fix the CA name first (see the checklist under it).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
   if(!confirm(_takRotateConfirmText(newName)))return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
@@ -714,6 +719,8 @@ async function rotateRootCA(){
   var newRoot=(rootInput?rootInput.value:'').trim();
   var newInt=(intInput?intInput.value:'').trim();
   if(!newRoot||!newInt){alert('Enter names for both the new Root CA and new Intermediate CA');return;}
+  var rootOk=validateCaName('rotate-root-name'),intOk=validateCaName('rotate-root-int-name');
+  if(!rootOk||!intOk){alert('Fix the CA names first (see the checklist under each).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
   if(!confirm('⚠ FULL ROOT CA ROTATION ⚠\n\nThis will:\n• Create new Root CA: '+newRoot+'\n• Create new Intermediate CA: '+newInt+'\n• Regenerate ALL certificates\n• Restart TAK Server\n• Update TAK Portal\n\nALL existing client connections will be DISCONNECTED.\nUsers must re-enroll via TAK Portal QR code.\n\nAre you sure?'))return;
   if(!confirm('FINAL CONFIRMATION\n\nThis is a destructive operation. The old PKI will be removed.\n\nType your maintenance window: 0900 it goes dark, 0915 scan new QR.\n\nProceed?'))return;
   var btn=document.getElementById('rotate-root-btn');
