@@ -46353,6 +46353,16 @@ def _cloudtak_signout_users(usernames, log=None, dry_run=False):
     if not users or not secret:
         return out
     base = 'http://127.0.0.1:5000'
+    # The CA heal that runs just before this restarts the CloudTAK API. test6 2026-11-03: the
+    # sign-out hit it while it booted (HTTP 502) and fell back to SQL, so no logout was pushed
+    # to the open tab. Wait (up to 2 min) until the API answers.
+    for _ in range(24):
+        ok, code, _srv = _cloudtak_request_json(
+            'GET', base + '/api/server', timeout=10,
+            headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+        if ok or code not in (0, 502, 503, 504):
+            break
+        time.sleep(5)
     failed = []
     for i, u in enumerate(users):
         hdr = {'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)}

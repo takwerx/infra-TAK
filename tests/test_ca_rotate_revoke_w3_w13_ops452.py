@@ -509,16 +509,24 @@ def test_any_running_certificate_job_blocks_a_new_one(busy):
 
 # ── W13: sign out exactly the users who were reset ──────────────────────────────────
 
-def _signout_ns(sessions, delete_code=200, list_code=200, sql_result=2):
-    calls = []
+def _signout_ns(sessions, delete_code=200, list_code=200, sql_result=2, boot=()):
+    """`calls`: the session API + SQL calls. `probes`: the API readiness probes (GET /api/server),
+    answered with the codes in `boot` first, then 200."""
+    calls, probes, boot = [], [], list(boot)
 
     def req(method, url, headers=None, timeout=0):
+        if url.endswith('/api/server'):
+            code = boot.pop(0) if boot else 200
+            probes.append(code)
+            return code == 200, code, {}
         calls.append((method, url))
         if method == 'GET':
             return (list_code == 200), list_code, ({'items': sessions} if list_code == 200 else None)
         return (delete_code == 200), delete_code, None
     ns = _load(('_cloudtak_signout_users',), _cloudtak_signing_secret=lambda: 's', _cloudtak_admin_token=lambda s: 'jwt',
                _cloudtak_request_json=req, _cloudtak_postgis_json=lambda sql: calls.append(('SQL', sql)) or sql_result)
+    ns['time'] = type('T', (), {'sleep': staticmethod(lambda s: probes.append(('slept', s)))})
+    ns['_probes'] = probes
     return ns, calls
 
 
@@ -535,6 +543,17 @@ def test_usernames_are_url_quoted_and_the_dry_run_deletes_nothing():
     ns, calls = _signout_ns([{'id': 'a/b'}])
     ns['_cloudtak_signout_users'](['a b/c'], lambda m: None, dry_run=True)
     assert calls == [('GET', 'http://127.0.0.1:5000/api/user/a%20b%2Fc/session?limit=100')]
+
+
+def test_signout_waits_for_a_restarting_cloudtak_api_instead_of_falling_back_to_sql():
+    # T&E 2026-11-03 (test6 Revoke): the CA heal had just restarted cloudtak-api; the session call
+    # got HTTP 502 and the SQL fallback ran, so no logout reached the open tab.
+    ns, calls = _signout_ns([{'id': 's1'}], boot=(502, 0, 503))
+    out = ns['_cloudtak_signout_users'](['alice'], lambda m: None)
+    assert out == {'signout': 'ok', 'users': 1, 'sessions': 1}
+    assert [p for p in ns['_probes'] if not isinstance(p, tuple)] == [502, 0, 503, 200]
+    assert sum(1 for p in ns['_probes'] if isinstance(p, tuple)) == 3          # slept between probes
+    assert not any(m == 'SQL' for m, _ in calls) and ('DELETE', 'http://127.0.0.1:5000/api/user/alice/session/s1') in calls
 
 
 def test_an_old_cloudtak_without_the_session_api_is_reported_not_forced():
