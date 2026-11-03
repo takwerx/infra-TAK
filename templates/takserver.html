@@ -514,7 +514,7 @@ function takPurgeFailed(){
 <div id="rotate-ca-log" style="display:none;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-bottom:16px"></div>
 <div id="revoke-ca-section" style="display:none;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:16px">
 <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:8px">Revoke Old CA</div>
-<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Final step: create new server cert (signed by new CA), remove the old CA from the truststore, restart. After this, only clients who re-enrolled (e.g. new CloudTAK QR) can connect. Do this when everyone has re-enrolled.</p>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Final step: remove the old CA from the truststore and restart TAK Server. A server cert signed by the intermediate is reissued by the new CA first; a root-signed one is left as it is. After this, only clients who re-enrolled (e.g. new CloudTAK QR) can connect. Do this when everyone has re-enrolled.</p>
 <div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
 <div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
 </div>

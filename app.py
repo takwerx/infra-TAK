@@ -82389,10 +82389,20 @@ def takserver_revoke_old_ca():
                                  '(CoreConfig.xml and ca.pem name none here). Nothing was changed.'}), 500
     ts_path = os.path.join(cert_dir, ts_name)
 
+    # v10.3.5 W5: whether 8089 needs a new cert is decided by what 8089 serves. The old test
+    # (does takserver-le.jks exist?) is the 8446 connector's file, so every box with LE on 8446
+    # skipped the reissue and said "Server TLS is Let's Encrypt" about 8089. A root-signed
+    # server cert does not chain through the CA being revoked, so it needs no reissue at all.
     try:
-        # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
-        le_jks = os.path.join(cert_dir, 'takserver-le.jks')
-        if not os.path.isfile(le_jks):
+        ks_8089 = os.path.basename(_tak_coreconfig_keystore(_read_priv('/opt/tak/CoreConfig.xml')) or '')
+    except Exception:
+        ks_8089 = ''
+    own_cert = ks_8089 in ('', 'takserver.jks')
+    server_signer = _tak_server_cert_mode(cert_dir) if own_cert else 'custom'
+
+    try:
+        # 1) 8089 on its own intermediate-signed cert: reissue through W1 so it is signed by the current CA.
+        if server_signer not in ('root', 'custom'):
             _errs = []
 
             # The rotations' own runner, for _tak_server_cert_issue()'s fixed cp/mv/makeCert strings.
@@ -82406,8 +82416,7 @@ def takserver_revoke_old_ca():
                 except Exception as e:
                     _errs.append(str(e)[:200])
                     return False
-            if not _tak_server_cert_issue(load_settings(), _tak_server_cert_signer_or_default(cert_dir),
-                                          _errs.append, run, cert_dir):
+            if not _tak_server_cert_issue(load_settings(), 'intermediate', _errs.append, run, cert_dir):
                 return jsonify({'error': f'Creating new server cert failed: {"; ".join(_errs)[:300]}'}), 500
             # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
             p12 = os.path.join(cert_dir, 'takserver.p12')
@@ -82458,14 +82467,13 @@ def takserver_revoke_old_ca():
                        'CloudTAK users whose certificate came from the revoked CA get a new one at their '
                        'next login: anyone signed in to CloudTAK right now must log out and back in once.')
 
-        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-               f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
+        server_note = {
+            'root': 'Server cert is signed by the root CA and was not changed.',
+            'custom': f'Port 8089 presents {ks_8089} (a custom or Let\'s Encrypt certificate); unchanged.',
+        }.get(server_signer, 'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect).')
+        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. {server_note} '
                f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.'
                + ct_note)
-        if os.path.isfile(le_jks):
-            msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.'
-                   + ct_note)
         return jsonify({'success': True, 'message': msg})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
@@ -82606,7 +82614,8 @@ def takserver_rotate_rootca():
             log("Step 4/8: Creating new server certificate...")
             if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create server certificate')
-            log("✓ Server certificate created")
+            log("✓ Server certificate created (signed by "
+                + (f"the new root CA {new_root_name}" if server_signer == 'root' else f"{new_int_name}") + ")")
 
             log("")
             log("Step 5/8: Regenerating all client certificates...")
