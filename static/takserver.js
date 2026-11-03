@@ -853,7 +853,7 @@ function renderCaMigration(){
     h+='<div><span style="color:var(--text-primary);font-weight:600">'+esc(r.user)+'</span> <span style="color:'+colors[r.status]+'">'+labels[r.status]+'</span></div>';
     r.devices.forEach(function(dv){
       h+='<div style="color:var(--text-dim);padding-left:12px">'+esc(dv.callsign||'(no callsign seen)')+' <span style="opacity:.7">'+esc(dv.uid)+'</span> · '+esc(dv.issuer||'?')
-        +(dv.kind==='integration'?' · <span style="color:var(--cyan)">server/integration</span>':'')
+        +(dv.kind==='integration'?' · <span style="color:var(--cyan)">server/integration</span>':(dv.kind==='cloudtak'?' · <span style="color:var(--cyan)">CloudTAK login</span>':''))
         +(dv.current?' <span style="color:var(--green)">✓</span>':(dv.trusted===false?' <span style="color:var(--red)">not trusted</span>':''))+'</div>';
     });
     if(r.cloudtak)h+='<div style="color:var(--text-dim);padding-left:12px">CloudTAK login · '+esc(r.cloudtak.issuer||'?')+(r.cloudtak.current?' <span style="color:var(--green)">✓</span>':'')+'</div>';

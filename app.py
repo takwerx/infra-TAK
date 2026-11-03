@@ -81598,11 +81598,14 @@ def takserver_ca_info():
 # intermediate; this says which, per device and per CloudTAK login, so Revoke is a decision made
 # from a list and not a guess. W10's Day-0 mail and W12's reminders use the same rows.
 _CA_MIG_CLASS_CACHE = {}
-# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows or Entra SID),
-# CloudTAK. Anything else is a server or integration (a Node-RED flow, a gateway, a bridge).
+# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows or Entra SID).
+# CloudTAK enrolls its login certs as '<username> (ETL)' (@tak-ps/node-tak credentials.ts), so
+# those move by logging out and back in. Anything else is a server or integration (a Node-RED
+# flow, a gateway, a bridge).
 _CA_MIG_EUD_UID_RE = re.compile(
     r'^(ANDROID-[0-9A-Za-z]+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
-    r'|S-1-[0-9]+-[0-9-]+|.*cloudtak.*)$', re.I)
+    r'|S-1-[0-9]+-[0-9-]+)$', re.I)
+_CA_MIG_CLOUDTAK_UID_RE = re.compile(r' \(ETL\)$')
 
 
 def _ca_mig_issuers(pems):
@@ -81743,7 +81746,8 @@ def _tak_ca_migration():
         acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
         acct['devices'].append(dict(j, uid=uid, callsign=callsign.get(uid, (0, ''))[1],
                                     expires=c['expires'],
-                                    kind='eud' if _CA_MIG_EUD_UID_RE.match(uid) else 'integration'))
+                                    kind=('cloudtak' if _CA_MIG_CLOUDTAK_UID_RE.search(uid)
+                                          else 'eud' if _CA_MIG_EUD_UID_RE.match(uid) else 'integration')))
 
     # CloudTAK: each user holds their own TAK client cert (profile.auth). An empty one means
     # CloudTAK issues a fresh cert (from the current CA) at that user's next login.
@@ -81780,8 +81784,11 @@ def _tak_ca_migration():
             if d['current']:
                 continue
             if d['trusted'] is False:
-                gone.append(f'{name}: no longer trusted — '
-                            + ('issue it a new cert' if d['kind'] == 'integration' else 'scan a new QR code if still in use'))
+                gone.append(f'{name}: no longer trusted — ' + {
+                    'integration': 'issue it a new cert', 'cloudtak': 'log out and back in to CloudTAK if still used',
+                }.get(d['kind'], 'scan a new QR code if still in use'))
+            elif d['kind'] == 'cloudtak':
+                moving.append('log out and back in to CloudTAK')
             elif d['kind'] == 'integration':
                 moving.append(f'{name}: server/integration client — issue it a new cert')
             else:
@@ -81790,6 +81797,7 @@ def _tak_ca_migration():
         if c and not c['current']:
             # Actionable either way: the next login re-issues the cert from the current CA.
             moving.append('log out and back in to CloudTAK')
+        moving, gone = list(dict.fromkeys(moving)), list(dict.fromkeys(gone))
         todo = moving + gone
         status = 'needs_move' if moving else ('untrusted' if gone else 'moved')
         on = sorted({d['issuer'] for d in acct['devices'] if d['issuer']}
