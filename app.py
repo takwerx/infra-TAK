@@ -72296,6 +72296,13 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             except Exception as _re:
                 print(f"[ldap-sa-watchdog] webadmin role check error: {str(_re)[:120]}", flush=True)
 
+            # v10.3.5 W19: does TAK itself treat webadmin as admin? (once per TAK start)
+            try:
+                _tak_webadmin_admin_check(lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True),
+                                          ldap_ok=(_verdict == 'ok'))
+            except Exception as _we:
+                print(f"[ldap-sa-watchdog] webadmin admin check error: {str(_we)[:120]}", flush=True)
+
             # v0.9.23 Phase 1: forensic audit-log scrape AFTER any heal. This
             # captures both (a) external writers that triggered the heal AND
             # (b) our own password_set from _ensure_authentik_ldap_service_account
@@ -72319,6 +72326,244 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             print(f"[ldap-sa-watchdog] tick error (non-fatal): {str(_le)[:120]}", flush=True)
 
         _wt.sleep(300)
+
+
+# v10.3.5 W19: TAK Server can come up from a box reboot handing webadmin no admin role.
+# test8, 2026-11-03: TAK booted while the LDAP service-account bind was still failing (the
+# console's boot heal fixed it two minutes later), and from then on every webadmin login on
+# 8446 got ROLE_ANONYMOUS and landed on WebTAK — fresh sessions included — while Authentik,
+# LDAP, CoreConfig and UserAuthenticationFile.xml were all correct. A TAK restart cleared it.
+# The boot heal can't just restart TAK whenever it healed the bind: that is GH #83 (the bind
+# fails routinely while Authentik starts, so every reboot restarted TAK). So check the
+# symptom itself: once per TAK start, after it has settled, log in as webadmin the way the
+# browser does and ask TAK whether the session is admin. Restart only when TAK says no.
+_TAK_WEBADMIN_CHECK_MIN_UPTIME_S = 300
+_TAK_WEBADMIN_RESTART_MIN_GAP_S = 6 * 3600
+_tak_webadmin_fix_lock = threading.Lock()
+tak_webadmin_fix_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _tak_webadmin_login_is_admin(password):
+    """Log in on 8446 as webadmin (TAK's OAuth password grant, as its login page does) and
+    ask TAK whether that session is admin. True / False, or None when it can't tell
+    (8446 not answering, the login refused, an unexpected reply)."""
+    if not password or not _tcp_accepts(8446):
+        return None
+    d = tempfile.mkdtemp(prefix='tak-webadmin-check-')
+    try:
+        pw_file, jar = os.path.join(d, 'pw'), os.path.join(d, 'jar')
+        # The password goes to curl in a 0600 file, never on its command line.
+        fd = os.open(pw_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(password)
+        base = ['curl', '-sk', '--max-time', '20', '-c', jar, '-b', jar]
+        r = subprocess.run(base + ['-o', '/dev/null', '-w', '%{http_code}',
+                                   '--data-urlencode', 'grant_type=password',
+                                   '--data-urlencode', 'username=webadmin',
+                                   '--data-urlencode', f'password@{pw_file}',
+                                   'https://127.0.0.1:8446/oauth/token'],
+                           capture_output=True, text=True, timeout=30)
+        if (r.stdout or '').strip() != '200':
+            return None
+        r = subprocess.run(base + ['https://127.0.0.1:8446/Marti/api/util/isAdmin'],
+                           capture_output=True, text=True, timeout=30)
+        v = (r.stdout or '').strip().lower()
+        return True if v == 'true' else (False if v == 'false' else None)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _tak_webadmin_probe_after_restart(password, wait_s=240):
+    """TAK's login API answers a while after 8443 opens; retry until it gives a verdict."""
+    t0 = time.time()
+    while True:
+        v = _tak_webadmin_login_is_admin(password)
+        if v is not None or time.time() - t0 >= wait_s:
+            return v
+        time.sleep(20)
+
+
+def _tak_restart_and_wait(plog, tag):
+    """Restart TAK Server (native or container) and wait for 8089, 8443 and 8446."""
+    cmd = ['systemctl', 'restart', 'takserver'] if not _tak_is_container() else ['docker', 'restart', TAK_CONTAINER]
+    try:
+        # Native `systemctl restart` blocks until ExecStart returns (100 s+ observed).
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
+        if r.returncode != 0:
+            plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+            return False
+    except subprocess.TimeoutExpired:
+        plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
+    if not _tak_wait_ready(plog, tag):
+        return False
+    t0 = time.time()
+    while not _tcp_accepts(8446):
+        if time.time() - t0 >= 180:
+            plog(f"  ✗ {tag}: 8446 not up 180s after the API — check journalctl -u takserver")
+            return False
+        time.sleep(5)
+    plog(f"  {tag}: 8446 accepting connections")
+    return True
+
+
+def _tak_webadmin_admin_check(plog, ldap_ok):
+    """Watchdog tick: once per TAK start, confirm TAK treats webadmin as admin; restart TAK
+    once (at most every 6 h) when it doesn't and LDAP is healthy. Needs the webadmin password
+    in settings — without it the TAK Server page's "Fix webadmin admin access" button is the way."""
+    tag = 'webadmin admin check'
+    if not ldap_ok or not os.path.exists('/opt/tak/CoreConfig.xml') or _tak_cert_job_busy():
+        return
+    started = _tak_started_epoch()
+    if not started or time.time() - started < _TAK_WEBADMIN_CHECK_MIN_UPTIME_S:
+        return
+    s = load_settings()
+    password = (s.get('webadmin_password') or '').strip()
+    if not password:
+        return
+    if not _tak_webadmin_fix_lock.acquire(blocking=False):
+        return
+    try:
+        st = dict(s.get('tak_webadmin_check') or {})
+        if abs(float(st.get('tak_started') or 0) - started) >= 30:
+            st = {'tak_started': started, 'tries': 0, 'last_restart': st.get('last_restart', 0)}
+        if st.get('done'):
+            return
+        st['tries'] = int(st.get('tries') or 0) + 1
+
+        def _save():
+            s2 = load_settings()
+            s2['tak_webadmin_check'] = st
+            save_settings(s2)
+
+        verdict = _tak_webadmin_login_is_admin(password)
+        if verdict is None:
+            if st['tries'] >= 3:
+                st['done'] = True
+                st['outcome'] = 'unknown'
+                plog(f"{tag}: couldn't log in as webadmin on 8446 to check — giving up until TAK next restarts")
+            _save()
+            return
+        st['done'] = True
+        if verdict:
+            st['outcome'] = 'admin'
+            _save()
+            return
+        if time.time() - float(st.get('last_restart') or 0) < _TAK_WEBADMIN_RESTART_MIN_GAP_S:
+            st['outcome'] = 'not admin, restart skipped (one in the last 6 h)'
+            _save()
+            plog(f"{tag}: TAK Server still gives webadmin no admin role after a restart in the last 6 h — "
+                 f"not restarting again; needs a look (TAK Server page → Fix webadmin admin access)")
+            return
+        st['last_restart'] = time.time()
+        st['outcome'] = 'not admin, restarting'
+        _save()
+        plog(f"{tag}: TAK Server gives webadmin no admin role (8446 login lands on WebTAK) while LDAP "
+             f"is healthy — restarting TAK Server once")
+        if _tak_restart_and_wait(plog, tag):
+            after = _tak_webadmin_probe_after_restart(password)
+            plog(f"  {'✓' if after else '⚠'} {tag}: after the restart webadmin is "
+                 f"{'admin again' if after else ('still not admin' if after is False else 'not checkable yet')}")
+            # The restart is a new TAK start; record its verdict so the next tick doesn't re-check.
+            st2 = {'tak_started': _tak_started_epoch() or 0, 'tries': 1, 'done': after is not None,
+                   'last_restart': st['last_restart'],
+                   'outcome': 'admin' if after else ('not admin after restart' if after is False else 'unknown')}
+            st.clear()
+            st.update(st2)
+            _save()
+    except Exception as e:
+        plog(f"{tag}: error (non-fatal): {str(e)[:160]}")
+    finally:
+        _tak_webadmin_fix_lock.release()
+
+
+def _tak_webadmin_fix_job():
+    """The TAK Server page's "Fix webadmin admin access" button."""
+    st = tak_webadmin_fix_status
+
+    def log(m):
+        st['log'].append(m)
+        print(f"[webadmin-fix] {m}", flush=True)
+    try:
+        log("Checking webadmin in Authentik (active, tak_ROLE_ADMIN, authentik Admins)...")
+        try:
+            _authentik_webadmin_role_check_and_heal(plog_fn=lambda m: log(f"  {m}"))
+        except Exception as e:
+            log(f"  ⚠ Authentik check error: {str(e)[:160]}")
+        s = load_settings()
+        sa_pass = _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', sa_pass) if sa_pass else 'inconclusive'
+        if verdict != 'ok':
+            log(f"✗ The LDAP service account can't sign in ({verdict}). Use Resync LDAP to TAK Server first; "
+                f"restarting TAK now would come up without groups again.")
+            st.update({'running': False, 'complete': True, 'error': True})
+            return
+        log("✓ LDAP service account signs in")
+        password = (s.get('webadmin_password') or '').strip()
+        if password:
+            before = _tak_webadmin_login_is_admin(password)
+            if before:
+                log("✓ TAK Server already treats webadmin as admin — nothing to fix. If a browser still lands "
+                    "on WebTAK, sign out of TAK there and log in again.")
+                st.update({'running': False, 'complete': True, 'error': False})
+                return
+            log("TAK Server gives webadmin no admin role" if before is False
+                else "Couldn't log in as webadmin on 8446 to check")
+        else:
+            log("No webadmin password stored on this box, so the console can't log in to check — restarting anyway")
+        log("Restarting TAK Server (clients reconnect on their own; about 2 minutes)...")
+        if not _tak_restart_and_wait(log, 'restart'):
+            st.update({'running': False, 'complete': True, 'error': True})
+            return
+        try:
+            cur = load_settings()
+            cur['tak_webadmin_check'] = {'tak_started': _tak_started_epoch() or 0, 'tries': 1, 'done': True,
+                                         'last_restart': time.time(), 'outcome': 'restarted by button'}
+            save_settings(cur)
+        except Exception:
+            pass
+        if password:
+            after = _tak_webadmin_probe_after_restart(password)
+            if after:
+                log("✓ webadmin is admin again — log in at 8446")
+            elif after is False:
+                log("⚠ TAK Server still gives webadmin no admin role after the restart — this needs a look")
+                st.update({'running': False, 'complete': True, 'error': True})
+                return
+            else:
+                log("⚠ TAK Server is up but its login didn't answer in time — log in at 8446 to check")
+        else:
+            log("✓ TAK Server restarted — log in at 8446 as webadmin to check")
+        st.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        log(f"✗ {str(e)[:200]}")
+        st.update({'running': False, 'complete': True, 'error': True})
+    finally:
+        try:
+            _tak_webadmin_fix_lock.release()
+        except RuntimeError:
+            pass
+
+
+@app.route('/api/takserver/webadmin-fix-admin', methods=['POST'])
+@login_required
+def takserver_webadmin_fix_admin():
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return jsonify({'error': 'TAK Server is not installed on this box.'}), 400
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is running; try again when it finishes.'}), 409
+    if not _tak_webadmin_fix_lock.acquire(blocking=False):
+        return jsonify({'error': 'A webadmin check is already running.'}), 409
+    tak_webadmin_fix_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    threading.Thread(target=_tak_webadmin_fix_job, daemon=True, name='webadmin-fix').start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/takserver/webadmin-fix-admin/status')
+@login_required
+def takserver_webadmin_fix_admin_status():
+    return jsonify(tak_webadmin_fix_status)
 
 
 def _start_ldap_sa_bind_watchdog():

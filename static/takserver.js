@@ -43,6 +43,29 @@ async function syncWebadmin(){
     }
     catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';} if(btn){btn.disabled=false;btn.style.opacity='1';}}
 }
+async function fixWebadminAdmin(){
+    var btn=document.getElementById('fix-webadmin-admin-btn');
+    var out=document.getElementById('fix-webadmin-admin-log');
+    if(!confirm('Check webadmin and restart TAK Server if it does not treat webadmin as admin?\n\nA restart takes about 2 minutes; connected clients reconnect on their own.'))return;
+    if(btn){btn.disabled=true;btn.style.opacity='0.7';}
+    if(out){out.style.display='block';out.style.color='var(--text-secondary)';out.textContent='Starting...';}
+    var done=function(){if(btn){btn.disabled=false;btn.style.opacity='1';}};
+    try{
+        var r=await fetch('/api/takserver/webadmin-fix-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        var d=await r.json();
+        if(!r.ok||!d.started){if(out){out.textContent=d.error||'Failed to start';out.style.color='var(--red)';}done();return;}
+    }catch(e){if(out){out.textContent='Error: '+e.message;out.style.color='var(--red)';}done();return;}
+    var poll=async function(){
+        try{
+            var r=await fetch('/api/takserver/webadmin-fix-admin/status');
+            var d=await r.json();
+            if(out){out.textContent=(d.log||[]).join('\n')||'Working...';out.scrollTop=out.scrollHeight;}
+            if(d.complete&&!d.running){if(out)out.style.color=d.error?'var(--red)':'var(--green)';done();return;}
+        }catch(e){}
+        setTimeout(poll,3000);
+    };
+    setTimeout(poll,1500);
+}
 async function setWebadminPassword(){
     var pwEl=document.getElementById('set-webadmin-pw');
     var confirmEl=document.getElementById('set-webadmin-pw-confirm');
