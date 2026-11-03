@@ -543,6 +543,15 @@ async function loadCAInfo(){
       }
       h+='</div>';
     }
+    // v10.3.5 W6: a root in TAK Server's own trust list accepts any intermediate the root signed.
+    if(d.trust_list_roots){
+      h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      h+='<span style="color:var(--text-secondary);min-width:140px">Server trust list</span>';
+      h+=d.trust_list_roots.length
+        ?'<span style="color:var(--yellow)">includes root CA ('+d.trust_list_roots.map(escapeHtml).join(', ')+'): old intermediates\' chains accepted. Revoke Old CA removes it.</span>'
+        :'<span style="color:var(--green)">intermediate CAs only ✓</span>';
+      h+='</div>';
+    }
     infoEl.innerHTML=h||'No CA information available.';
     if(ctrlEl)ctrlEl.style.display='block';
     var nameInput=document.getElementById('rotate-ca-name');
@@ -696,21 +705,35 @@ function pollRotateLog(){
 }
 
 async function revokeOldCA(alias){
-  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThis cannot be undone.'))return;
+  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThe root CA also leaves TAK Server\'s trust list, so nothing can get back in through '+alias+'.\n\nThis cannot be undone.'))return;
+  var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
   var msgEl=document.getElementById('revoke-ca-msg');
   if(msgEl){msgEl.textContent='Revoking '+alias+'...';msgEl.style.color='var(--text-dim)';}
   try{
-    var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias})});
+    var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias,password:pw})});
     var d=await r.json();
     if(d.success){
-      if(msgEl){msgEl.innerHTML='<span style="color:var(--green)">'+d.message+'</span>';}
-      loadCAInfo();
+      pollRevokeLog();
     }else{
-      if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+(d.error||'Failed')+'</span>';}
+      if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Failed')+'</span>';}
     }
   }catch(e){
-    if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+e.message+'</span>';}
+    if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+escapeHtml(e.message)+'</span>';}
   }
+}
+// v10.3.5 W7: Revoke is a job; its log shares the Rotate log box.
+function pollRevokeLog(){
+  var logEl=document.getElementById('rotate-ca-log');
+  var msgEl=document.getElementById('revoke-ca-msg');
+  fetch('/api/takserver/revoke-old-ca/status').then(function(r){return r.json();}).then(function(d){
+    if(logEl&&d.log&&d.log.length){logEl.style.display='block';logEl.textContent=d.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
+    if(!d.running&&d.complete){
+      if(msgEl){msgEl.innerHTML='<span style="color:'+(d.error?'var(--yellow)':'var(--green)')+'">'+escapeHtml(d.message||'')+'</span>';}
+      loadCAInfo();loadCertExpiry();loadTakSignerRow();
+    }else{
+      setTimeout(pollRevokeLog,1500);
+    }
+  }).catch(function(){setTimeout(pollRevokeLog,2000);});
 }
 
 async function rotateRootCA(){

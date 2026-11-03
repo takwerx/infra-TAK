@@ -81514,6 +81514,8 @@ def takserver_ca_info():
                         old_cas.append(a)
                         names[a] = cn
                 info['old_ca_names'] = names
+                # v10.3.5 W6: a root in TAK Server's trust list accepts any intermediate it signed.
+                info['trust_list_roots'] = [a for a, pem in entries if _pem_self_signed(pem)]
             else:
                 # Subjects unreadable: the alias rule, which can't tell what `mykey` is.
                 for a in trusted_aliases:
@@ -82075,7 +82077,7 @@ def _rotate_carry_forward_truststore(new_ts, prev_ts, prev_pass, cert_pass, old_
     kept, dropped = [], []
     for alias, pem in prev:
         key = _pem_key(pem)
-        if key in have_keys:
+        if key in have_keys or _pem_self_signed(pem):  # v10.3.5 W6: never carry a root forward
             continue
         cn, not_after = _pem_cn_and_expiry(pem)
         if not_after and not_after < now:
@@ -82136,8 +82138,8 @@ def _rotate_log_dropped_cas(ts_path, storepass, live, sh, log):
 @login_required
 def takserver_rotate_intca():
     """Rotate the intermediate CA: create new CA, server cert, admin cert, import old CA into truststore."""
-    if rotate_intca_status.get('running'):
-        return jsonify({'error': 'Rotation already in progress'}), 409
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
     new_ca_name = (data.get('new_ca_name') or '').strip()
     if not new_ca_name:
@@ -82281,11 +82283,6 @@ def takserver_rotate_intca():
             log("")
             log("Step 5/7: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
-            # v10.0.5 non-root: bare keytool writes JKS into tak-owned /opt/tak/certs/files
-            # and fails as takwerx — route via the broker-allowed `runuser -u tak -- keytool`.
-            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
-            log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             try:
                 prev_ts, prev_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
@@ -82298,6 +82295,16 @@ def takserver_rotate_intca():
                 log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
             _rotate_carry_forward_truststore(ts_jks, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
                                              live, run, _rotate_sh, log)
+            # v10.3.5 W6: makeCert.sh `ca` put the root in the new truststore; TAK Server's trust
+            # list holds intermediates only. A client cert signed by the root itself would be cut
+            # off, so then the root stays (with a warning) instead of failing a half-done rotation.
+            deps, n_live = _tak_root_signed_dependents(cert_dir, live)
+            if deps or n_live:
+                log(f"  ⚠ Root CA kept in the trust list: signed directly by it: "
+                    f"{', '.join(deps[:10]) or ''}{'; ' if deps and n_live else ''}"
+                    f"{str(n_live) + ' live client cert(s)' if n_live else ''}. Revoke Old CA will refuse until they are reissued")
+            else:
+                _tak_truststore_drop_roots(ts_jks, cert_pass, _rotate_sh, log, cert_dir)
             log("✓ Truststore updated")
 
             log("")
@@ -82370,14 +82377,124 @@ def takserver_rotate_intca_status():
     return jsonify({'log': rotate_intca_log, **rotate_intca_status})
 
 
+def _pem_self_signed(pem):
+    """True for a self-signed certificate (a root CA): subject == issuer."""
+    subj = _pem_dn(pem, 'subject')
+    return bool(subj) and subj == _pem_dn(pem, 'issuer')
+
+
+def _tak_root_signed_dependents(cert_dir, live):
+    """v10.3.5 W6: what TAK Server would refuse once the root leaves its trust list — client
+    certs signed by the root itself rather than by an intermediate. Returns ([cert names in the
+    cert dir], live count in TAK's certificate table, or None when that can't be read). The
+    8089 server cert is not checked against TAK's own truststore, so a root-signed one (W1)
+    doesn't count."""
+    try:
+        root_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+    except Exception:
+        return [], None
+    names = []
+    for n in _rotate_client_cert_names(cert_dir):
+        try:
+            if _pem_dn(_read_priv(os.path.join(cert_dir, f'{n}.pem')), 'issuer') == root_dn:
+                names.append(n)
+        except Exception:
+            pass
+    m = re.search(r'(?:^|,)CN=([^,]+)', root_dn or '')
+    n_live = None if live is None else live.get((m.group(1) if m else '').lower(), 0)
+    return names, n_live
+
+
+def _tak_truststore_drop_roots(ts_path, storepass, sh, log, cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W6 (D1): TAK Server's own trust list — the .jks CoreConfig's <tls> names — holds
+    intermediates only, never a self-signed root.
+
+    Java PKIX treats every truststore entry as a trust anchor. With the root in it, a client
+    that sends leaf + any root-signed intermediate (including one Revoke just removed) is
+    accepted, so Revoke was never airtight (test6, 2026-11-01; gate on test12 and aws-arm,
+    2026-11-02). TAK 5.8's makeCert.sh `ca` imports the root itself under its CN, and
+    infra-TAK used to add it again as `root-ca`, so entries are matched by subject == issuer,
+    never by alias. The .p12 handed to clients is a different file and keeps the root.
+    sh(argv) -> (ok, output), argv run as `tak`. Returns (ok, removed aliases)."""
+    name = os.path.basename(ts_path)
+    entries = _rotate_truststore_entries(ts_path, storepass, sh)
+    if entries is None:
+        log(f"  ✗ Could not read {name}")
+        return False, []
+    roots = [(a, p) for a, p in entries if _pem_self_signed(p)]
+    if roots and len(roots) == len(entries):
+        log(f"  ✗ {name} holds only root CAs; removing them would leave TAK Server trusting nothing. Not changed.")
+        return False, []
+    try:
+        root_key = _pem_key(_read_priv(os.path.join(cert_dir, 'root-ca.pem')))
+    except Exception:
+        root_key = ''
+    ok, removed = True, []
+    for alias, pem in roots:
+        good, out = sh(['keytool', '-delete', '-alias', alias, '-keystore', ts_path, '-storepass', storepass])
+        if not good:
+            ok = False
+            log(f"  ✗ Could not remove {alias} from {name}: {out.strip()[:200]}")
+            continue
+        removed.append(alias)
+        src = os.path.join(cert_dir, 'root-ca.pem') if _pem_key(pem) == root_key else f'<the {alias} certificate>'
+        log(f"  Removed root CA {alias} from {name}. Undo: runuser -u tak -- keytool -importcert -noprompt "
+            f"-alias {alias} -file {src} -keystore {ts_path} -storepass <certificate password>, "
+            "then restart TAK Server")
+    return ok, removed
+
+
+def _tak_client_truststore_rebuild(ts_jks, storepass, run, cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W6: the truststore handed to clients (truststore-<INT>.p12: /api/download/truststore,
+    integration packages) = TAK Server's trust list + the root. It needs the root because a
+    root-signed server cert (W1) chains to nothing else. Built fresh beside the old one and
+    moved over it: importing into the existing .p12 merged, so a revoked CA stayed in it.
+    run(cmd) -> bool, the rotations' container-aware runner. Returns True on success."""
+    p12 = ts_jks[:-4] + '.p12'
+    new = p12 + '.new'
+    q = shlex.quote
+    run(f'rm -f {q(new)}')
+    ok = (run(f'runuser -u tak -- keytool -importkeystore -srckeystore {q(ts_jks)} -srcstoretype JKS '
+              f'-srcstorepass {q(storepass)} -destkeystore {q(new)} -deststoretype PKCS12 '
+              f'-deststorepass {q(storepass)} -noprompt 2>&1')
+          and run(f'runuser -u tak -- keytool -importcert -noprompt -alias root-ca '
+                  f'-file {q(os.path.join(cert_dir, "root-ca.pem"))} -keystore {q(new)} '
+                  f'-storetype PKCS12 -storepass {q(storepass)} 2>&1')
+          and run(f'mv -f {q(new)} {q(p12)}'))
+    if not ok:
+        run(f'rm -f {q(new)}')
+    return ok
+
+
+revoke_ca_log = []
+revoke_ca_status = {'running': False, 'complete': False, 'error': False, 'message': ''}
+
+
+def _tak_cert_job_busy():
+    """v10.3.5 W7: one running flag across every job that rewrites TAK Server's certificates."""
+    return bool(tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+                or rotate_intca_status.get('running') or revoke_ca_status.get('running'))
+
+
 @app.route('/api/takserver/revoke-old-ca', methods=['POST'])
 @login_required
 def takserver_revoke_old_ca():
-    """Create new server cert (signed by current/new CA), remove old CA from truststore, restart. Cuts off clients with old certs."""
-    data = request.json or {}
+    """Revoke an old intermediate CA: TAK Server stops accepting every client cert it signed.
+
+    v10.3.5: a job with a log, behind the console password (W7, D3), and airtight (W6): the
+    old intermediate AND every self-signed root leave TAK Server's trust list, so a client
+    can't get back in by sending the revoked intermediate in its own chain. Refused when a
+    client cert is signed by the root directly, since that would cut it off too. The 8089
+    reissue is decided by what 8089 serves (W5)."""
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     old_ca_alias = (data.get('old_ca_alias') or '').strip()
     if not old_ca_alias:
         return jsonify({'error': 'Old CA alias is required'}), 400
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
 
     cert_dir = '/opt/tak/certs/files'
     cert_pass = _get_tak_cert_password(load_settings())
@@ -82388,6 +82505,31 @@ def takserver_revoke_old_ca():
         return jsonify({'error': 'Could not tell which truststore TAK Server is using '
                                  '(CoreConfig.xml and ca.pem name none here). Nothing was changed.'}), 500
     ts_path = os.path.join(cert_dir, ts_name)
+    entries = _rotate_truststore_entries(ts_path, cert_pass, _rotate_sh)
+    if entries is None:
+        return jsonify({'error': f'Could not read {ts_name}. Nothing was changed.'}), 500
+    target = [p for a, p in entries if a.lower() == old_ca_alias.lower()]
+    if not target:
+        return jsonify({'error': f'{old_ca_alias} is not in {ts_name}. Nothing was changed.'}), 400
+    try:
+        current_key = _pem_key(_read_priv(os.path.join(cert_dir, 'ca.pem')))
+    except Exception:
+        current_key = ''
+    if _pem_key(target[0]) == current_key:
+        return jsonify({'error': f'{old_ca_alias} is the current intermediate CA: revoking it would cut off '
+                                 'every device. Nothing was changed.'}), 400
+    if _pem_self_signed(target[0]):
+        return jsonify({'error': f'{old_ca_alias} is a root CA. Revoke removes root CAs from the trust list '
+                                 'on its own; pick an old intermediate. Nothing was changed.'}), 400
+    live = _rotate_tak_live_certs_by_issuer()
+    deps, n_live = _tak_root_signed_dependents(cert_dir, live)
+    if deps or n_live:
+        what = ', '.join(deps[:10]) + (' …' if len(deps) > 10 else '')
+        if n_live:
+            what = (what + '; ' if what else '') + f"{n_live} live client cert{'' if n_live == 1 else 's'}"
+        return jsonify({'error': f'Signed directly by the root CA: {what}. Revoke takes the root out of '
+                                 "TAK Server's trust list, which would cut these off too. Reissue them from "
+                                 'the current intermediate first. Nothing was changed.'}), 409
 
     # v10.3.5 W5: whether 8089 needs a new cert is decided by what 8089 serves. The old test
     # (does takserver-le.jks exist?) is the 8446 connector's file, so every box with LE on 8446
@@ -82400,83 +82542,110 @@ def takserver_revoke_old_ca():
     own_cert = ks_8089 in ('', 'takserver.jks')
     server_signer = _tak_server_cert_mode(cert_dir) if own_cert else 'custom'
 
-    try:
-        # 1) 8089 on its own intermediate-signed cert: reissue through W1 so it is signed by the current CA.
-        if server_signer not in ('root', 'custom'):
-            _errs = []
+    revoke_ca_log.clear()
+    revoke_ca_status.update({'running': True, 'complete': False, 'error': False, 'message': ''})
 
-            # The rotations' own runner, for _tak_server_cert_issue()'s fixed cp/mv/makeCert strings.
-            def run(cmd):
-                cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
-                try:
-                    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-                    if r.returncode != 0:
-                        _errs.append((r.stderr or r.stdout or '').strip()[:200])
-                    return r.returncode == 0
-                except Exception as e:
-                    _errs.append(str(e)[:200])
+    def do_revoke():
+        log = revoke_ca_log.append
+        problems = []
+
+        def run(cmd):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    log(f"  ✗ Failed (exit {r.returncode}): {(r.stderr or r.stdout or '').strip()[:200]}")
                     return False
-            if not _tak_server_cert_issue(load_settings(), 'intermediate', _errs.append, run, cert_dir):
-                return jsonify({'error': f'Creating new server cert failed: {"; ".join(_errs)[:300]}'}), 500
-            # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
-            p12 = os.path.join(cert_dir, 'takserver.p12')
-            jks = os.path.join(cert_dir, 'takserver.jks')
-            if os.path.isfile(p12):
-                subprocess.run(
-                    _rotate_tak_cert_cmd(
-                        f'runuser -u tak -- keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
-                        f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
-                    shell=True, capture_output=True, text=True, timeout=30)
+                return True
+            except Exception as e:
+                log(f"  ✗ Exception: {e}")
+                return False
 
-        # 2) Remove old CA from truststore
-        r = subprocess.run(
-            _rotate_tak_cert_cmd(
-                f'runuser -u tak -- keytool -delete -alias {shlex.quote(old_ca_alias)} '
-                f'-keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)} 2>&1'),
-            shell=True, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
+        try:
+            log(f"━━━ Revoking {old_ca_alias} ━━━")
+            log("")
+            log("Step 1/5: Server certificate (8089)...")
+            if server_signer == 'root':
+                log("  Signed by the root CA: it doesn't depend on the CA being revoked, left as it is")
+            elif server_signer == 'custom':
+                log(f"  Port 8089 presents {ks_8089} (a custom or Let's Encrypt certificate), left as it is")
+            else:
+                if not _tak_server_cert_issue(load_settings(), 'intermediate', log, run, cert_dir):
+                    raise Exception('Creating the new server certificate failed; nothing was revoked')
+                log("✓ Server certificate reissued by the current intermediate CA")
 
-        # 3) Regenerate .p12 truststore
-        ts_p12 = ts_path.replace('.jks', '.p12')
-        subprocess.run(
-            _rotate_tak_cert_cmd(
-                f'runuser -u tak -- keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
-                f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
-            shell=True, capture_output=True, text=True, timeout=15)
+            log("")
+            log(f"Step 2/5: Removing {old_ca_alias} from {ts_name}...")
+            if not run(f'runuser -u tak -- keytool -delete -alias {shlex.quote(old_ca_alias)} '
+                       f'-keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)} 2>&1'):
+                raise Exception(f'keytool could not remove {old_ca_alias}; nothing was revoked')
+            log(f"✓ {old_ca_alias} removed")
 
-        if _tak_is_container():
-            subprocess.run(_sudo_wrap(['docker', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-        else:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            log("")
+            log("Step 3/5: Removing root CAs from TAK Server's trust list...")
+            ok, removed = _tak_truststore_drop_roots(ts_path, cert_pass, _rotate_sh, log, cert_dir)
+            if not ok:
+                problems.append('a root CA could not be removed from the trust list, so a client can still '
+                                f'get in by sending {old_ca_alias} in its own chain')
+            log(f"✓ Trust list: {'root removed (' + ', '.join(removed) + ')' if removed else 'no root CA in it'}"
+                if ok else "  ⚠ Trust list still holds a root CA")
 
-        # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
-        # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
-        # client cert + CA; restart so the portal picks up the new chain).
-        _takportal_sync_certs(restart=True)
+            log("")
+            log("Step 4/5: Rebuilding the truststore given to clients (current CAs + root)...")
+            if _tak_client_truststore_rebuild(ts_path, cert_pass, run, cert_dir):
+                log(f"✓ {ts_name[:-4]}.p12 rebuilt")
+            else:
+                problems.append(f'{ts_name[:-4]}.p12 was not rebuilt and may still list {old_ca_alias}')
+                log(f"  ⚠ {ts_name[:-4]}.p12 not rebuilt")
 
-        # v10.3.4 W8: CloudTAK's own connection and every user cert came from the CA just
-        # revoked, so nobody could log in (UND_ERR_SOCKET), and the only documented fix needed
-        # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
-        ct_note = ''
-        if _cloudtak_local_with_local_tak():
-            threading.Thread(target=_cloudtak_heal_after_ca_change,
-                             args=(lambda m: print(f"Revoke Old CA:{m}", flush=True),),
-                             daemon=True, name='ct-cert-heal-revoke').start()
-            ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
-                       'CloudTAK users whose certificate came from the revoked CA get a new one at their '
-                       'next login: anyone signed in to CloudTAK right now must log out and back in once.')
+            log("")
+            log("Step 5/5: Restarting TAK Server...")
+            run('systemctl restart takserver 2>&1')
+            log("✓ TAK Server restarting; devices reconnect in about 1–2 minutes")
 
-        server_note = {
-            'root': 'Server cert is signed by the root CA and was not changed.',
-            'custom': f'Port 8089 presents {ks_8089} (a custom or Let\'s Encrypt certificate); unchanged.',
-        }.get(server_signer, 'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect).')
-        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. {server_note} '
-               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.'
-               + ct_note)
-        return jsonify({'success': True, 'message': msg})
-    except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+            log("")
+            log("Updating TAK Portal certificates...")
+            # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
+            # client cert + CA; restart so the portal picks up the new chain).
+            _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+            log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+
+            # v10.3.4 W8: CloudTAK's own connection and every user cert came from the CA just
+            # revoked, so nobody could log in (UND_ERR_SOCKET), and the only documented fix needed
+            # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
+            ct_note = ''
+            if _cloudtak_local_with_local_tak():
+                threading.Thread(target=_cloudtak_heal_after_ca_change,
+                                 args=(lambda m: log(f"  CloudTAK:{m}"),),
+                                 daemon=True, name='ct-cert-heal-revoke').start()
+                ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
+                           'CloudTAK users whose certificate came from the revoked CA get a new one at their '
+                           'next login: anyone signed in to CloudTAK right now must log out and back in once.')
+
+            server_note = {
+                'root': 'Server cert is signed by the root CA and was not changed.',
+                'custom': f'Port 8089 presents {ks_8089} (a custom or Let\'s Encrypt certificate); unchanged.',
+            }.get(server_signer, 'Server cert is now signed by the current CA.')
+            msg = (f'Removed {old_ca_alias} from the trust list and restarted TAK Server. {server_note} '
+                   f'Clients still using certs signed by {old_ca_alias} must re-enroll.' + ct_note)
+            if problems:
+                msg += ' ⚠ ' + ' ⚠ '.join(p[0].upper() + p[1:] + '.' for p in problems)
+            log("")
+            log("━━━ REVOKE COMPLETE ━━━" if not problems else "━━━ REVOKE DONE WITH WARNINGS ━━━")
+            revoke_ca_status.update({'running': False, 'complete': True, 'error': bool(problems), 'message': msg})
+        except Exception as e:
+            log("")
+            log(f"✗ REVOKE FAILED: {e}")
+            revoke_ca_status.update({'running': False, 'complete': True, 'error': True, 'message': str(e)[:300]})
+
+    threading.Thread(target=do_revoke, daemon=True, name='tak-revoke-ca').start()
+    return jsonify({'success': True, 'started': True})
+
+
+@app.route('/api/takserver/revoke-old-ca/status')
+@login_required
+def takserver_revoke_old_ca_status():
+    return jsonify({**revoke_ca_status, 'log': list(revoke_ca_log)})
 
 
 rotate_rootca_log = []
@@ -82486,8 +82655,8 @@ rotate_rootca_status = {'running': False, 'complete': False, 'error': False}
 @login_required
 def takserver_rotate_rootca():
     """Full Root CA rotation: new root, new intermediate, new server cert, all client certs, update TAK Portal, restart."""
-    if rotate_rootca_status.get('running'):
-        return jsonify({'error': 'Root CA rotation already in progress'}), 409
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
     new_root_name = (data.get('new_root_name') or '').strip()
     new_int_name = (data.get('new_int_name') or '').strip()
@@ -82638,10 +82807,9 @@ def takserver_rotate_rootca():
             log("")
             log("Step 6/8: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
-            # v10.0.5 non-root: route keytool via broker-allowed `runuser -u tak -- keytool`.
-            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
-            log("  Root CA imported into truststore")
+            # v10.3.5 W6: TAK Server's trust list holds the intermediate only. makeCert.sh `ca`
+            # put the new root in it; the client .p12 it built keeps the root.
+            _tak_truststore_drop_roots(ts_jks, cert_pass, _rotate_sh, log, cert_dir)
             log("✓ Truststore updated")
 
             log("")
@@ -82749,8 +82917,7 @@ def takserver_server_cert_fix():
                                            'verify_password': verify_password}, data):
         return jsonify({'success': False, 'error': 'Incorrect console password.',
                         'need_password': True}), 403
-    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
-            or rotate_intca_status.get('running')):
+    if _tak_cert_job_busy():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
@@ -82897,8 +83064,7 @@ def _tak_server_cert_signer_info(cert_dir='/opt/tak/certs/files'):
     if ks and os.path.basename(ks) != 'takserver.jks':
         blockers.append(f"TAK Server presents {os.path.basename(ks)} on 8089, not its own certificate "
                         "(a custom or Let's Encrypt certificate). Switching does not apply.")
-    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
-            or rotate_intca_status.get('running')):
+    if _tak_cert_job_busy():
         blockers.append('A certificate operation is already running.')
     return {'mode': mode, 'root_cn': cn(root_dn), 'intermediate_cn': cn(int_dn),
             'issuer_cn': cn(srv_issuer), 'blockers': blockers}
@@ -91593,7 +91759,19 @@ def _deploy_takserver_container(config):
         log_step("Creating user certificate...")
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh client user', "user cert"):
             return
-        _certrun(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt', "truststore")
+        # v10.3.5 W6: same as the native deploy — TAK Server's trust list holds the intermediate
+        # only; the client truststore-<INT>.p12 keeps the root. Same one-shot container as _certrun.
+        def _certsh(argv):
+            try:
+                r = subprocess.run(['docker', 'run', '--rm', '-v', f'{tak_dir}:/opt/tak:z', '--entrypoint', 'bash',
+                                    TAK_CONTAINER, '-c', shlex.join(argv) + ' 2>&1'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                return r.returncode == 0, r.stdout or ''
+            except Exception as e:
+                return False, str(e)
+        if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
+                                          _certsh, log_step)[0]:
+            log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
         log_step("✓ Certificates created and truststore built")
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
@@ -92462,15 +92640,15 @@ def run_takserver_deploy(config):
             run_cmd('systemctl stop takserver', check=False)
             deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
-        log_step("Importing root CA into TAK clients truststore...")
-        if not _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
-                          '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
-                          '-storepass', cert_pass, '-noprompt']):
-            log_step("✗ FATAL: could not import the root CA into the clients truststore — enrolled "
-                     "clients would not trust this server. See the errors above.")
-            run_cmd('systemctl stop takserver', check=False)
-            deploy_status.update({'error': True, 'running': False}); return
-        log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
+        # v10.3.5 W6: TAK Server's own trust list holds the intermediate only (a root in it
+        # accepts any root-signed intermediate a client sends). makeCert.sh `ca` put the root
+        # there; the truststore-<INT>.p12 it built for clients keeps it. The old "enrolled
+        # clients would not trust this server" premise was wrong: enrollment hands out the
+        # signing chain, not this file (gate on test12 + aws-arm, 2026-11-02).
+        log_step("Trimming TAK Server's trust list to the intermediate CA...")
+        if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
+                                          _rotate_sh, log_step)[0]:
+            log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
