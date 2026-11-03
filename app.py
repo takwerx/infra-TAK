@@ -35095,7 +35095,7 @@ def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config
     cacfg.set('keystore', 'JKS')
     cacfg.set('keystoreFile', f'certs/files/{int_ca}-signing.jks')
     cacfg.set('keystorePass', cert_pass)
-    cacfg.set('validityDays', issued_days)
+    cacfg.set('validityDays', str(_tak_issued_validity(issued_days)))  # v10.3.5 W9
     cacfg.set('signatureAlg', 'SHA256WithRSA')
     changed.append('certificateSigning')
 
@@ -81785,6 +81785,42 @@ def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
     return ok
 
 
+def _tak_issued_validity_cap(cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W9: the longest an enrolled cert can usefully live: the current intermediate's
+    remaining days minus one. TAK stamps validityDays as given, so with the old 3650 default an
+    enrolled cert claimed to outlive the CA that signed it by years (bug 6). None when ca.pem
+    can't be read (the caller then keeps its value)."""
+    try:
+        not_after = _pem_cn_and_expiry(_read_priv(os.path.join(cert_dir, 'ca.pem')))[1]
+    except Exception:
+        return None
+    if not not_after:
+        return None
+    return max(1, (not_after - datetime.utcnow()).days - 1)
+
+
+def _tak_issued_validity(days, cert_dir='/opt/tak/certs/files'):
+    """validityDays for TAKServerCAConfig: `days`, capped by _tak_issued_validity_cap()."""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 730
+    cap = _tak_issued_validity_cap(cert_dir)
+    return max(1, min(days, cap) if cap else days)
+
+
+def _coreconfig_clamp_issued_validity(text, cert_dir='/opt/tak/certs/files'):
+    """(text, (old, new) or None): CoreConfig with TAKServerCAConfig's validityDays capped to the
+    current intermediate (W9). Rotate runs it after the new intermediate is in place."""
+    m = re.search(r'(<TAKServerCAConfig\b[^>]*\bvalidityDays=")(\d+)(")', text or '')
+    if not m:
+        return text, None
+    new = _tak_issued_validity(m.group(2), cert_dir)
+    if str(new) == m.group(2):
+        return text, None
+    return text[:m.start(2)] + str(new) + text[m.end(2):], (int(m.group(2)), new)
+
+
 TAK_SERVER_CERT_SIGNERS = ('root', 'intermediate')
 # makeCert.sh signs with whatever sits in this slot; makeCert.sh ca moves each new intermediate into it.
 _TAK_WORKING_CA_FILES = (('ca.pem', 'root-ca.pem'),
@@ -82322,6 +82358,14 @@ def takserver_rotate_intca():
                         _write_priv(_cc, _t.replace(old_ca_name, new_ca_name))
                 except Exception:
                     pass
+            # v10.3.5 W9: issued certs can't outlive the new intermediate.
+            try:
+                _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)
+                if _cl:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t)
+                    log(f"  Issued cert validity {_cl[0]} → {_cl[1]} days (the new intermediate's remaining life)")
+            except Exception as e:
+                log(f"  ⚠ Could not check issued cert validity: {e}")
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -82838,6 +82882,14 @@ def takserver_rotate_rootca():
                         _write_priv(_cc, _t)
                 except Exception:
                     pass
+            # v10.3.5 W9: issued certs can't outlive the new intermediate.
+            try:
+                _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)
+                if _cl:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t)
+                    log(f"  Issued cert validity {_cl[0]} → {_cl[1]} days (the new intermediate's remaining life)")
+            except Exception as e:
+                log(f"  ⚠ Could not check issued cert validity: {e}")
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -84565,7 +84617,7 @@ def takserver_security_config_get():
     import re
     m = re.search(r'<TAKServerCAConfig[^>]*validityDays="(\d+)"', content)
     validity_days = int(m.group(1)) if m else 3650
-    return jsonify({'validity_days': validity_days})
+    return jsonify({'validity_days': validity_days, 'cap_days': _tak_issued_validity_cap()})
 
 
 @app.route('/api/takserver/security-config', methods=['POST'])
@@ -84592,6 +84644,9 @@ def takserver_security_config_post():
     import re
     if not re.search(r'<TAKServerCAConfig[^>]*validityDays="\d+"', content):
         return jsonify({'error': 'TAKServerCAConfig / validityDays not found in CoreConfig (certificate enrollment may not be enabled)'}), 400
+    # v10.3.5 W9: a cert can't usefully outlive the intermediate that signed it.
+    asked = validity_days
+    validity_days = _tak_issued_validity(validity_days)
     new_content = re.sub(r'(<TAKServerCAConfig[^>]*validityDays=")\d+(")', rf'\g<1>{validity_days}\g<2>', content, count=1)
     if new_content == content:
         return jsonify({'error': 'No change applied'}), 400
@@ -84600,7 +84655,10 @@ def takserver_security_config_post():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=90)  # v10.0.1: container-aware
-    return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
+    capped = (f' ({asked} asked; capped to the {validity_days} days the intermediate CA has left)'
+              if validity_days < asked else '')
+    return jsonify({'success': True, 'validity_days': validity_days, 'cap_days': _tak_issued_validity_cap(),
+                    'message': f'Issued cert validity set to {validity_days} days{capped}. TAK Server restarted.'})
 
 
 # ── TAK 5.8 pre-flight (v10.2.0 W2) ─────────────────────────────────────────
@@ -92677,7 +92735,9 @@ def run_takserver_deploy(config):
         # broker-denied AND CoreConfig is tak-owned (0640), so every edit failed
         # exit 4 and X.509 auth / truststore / cert-enrollment / WebTAK were never
         # applied (TAK installs but is misconfigured). Do ONE broker read-modify-write.
-        issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
+        # v10.3.5 W9: never longer than the intermediate that signs them has left.
+        issued_days = _tak_issued_validity(config.get('issued_cert_validity_days')
+                                           or config.get('intermediate_ca_validity_days', 730))
         ca_cfg_line = ('<TAKServerCAConfig keystore="JKS" '
             f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
             f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />')
@@ -103934,7 +103994,7 @@ def _heal_takserver_coreconfig_step8():
                               f'<nameEntry name="OU" value="{subj.get("OU", "TAK")}"/>\n</nameEntries>\n'
                               '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
                               f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-                              'validityDays="730" signatureAlg="SHA256WithRSA" />\n'
+                              f'validityDays="{_tak_issued_validity(730)}" signatureAlg="SHA256WithRSA" />\n'
                               '</certificateSigning>\n<vbm enabled="false"/>')
                 new_cc = new_cc.replace('<vbm enabled="false"/>', cert_block, 1)
                 fixes.append('certificateSigning enrollment block restored')

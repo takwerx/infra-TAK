@@ -628,7 +628,14 @@ async function loadSecurityConfig(){
     var r=await fetch('/api/takserver/security-config');
     var d=await r.json();
     if(d.validity_days!=null){input.value=d.validity_days;}
-    if(msg)msg.textContent='';
+    // v10.3.5 W9: an enrolled cert can't outlive the intermediate that signs it.
+    if(d.cap_days!=null){input.max=d.cap_days;}
+    if(msg){
+      msg.style.color=(d.cap_days!=null&&d.validity_days>d.cap_days)?'var(--yellow)':'var(--text-dim)';
+      msg.textContent=d.cap_days==null?'':(d.validity_days>d.cap_days
+        ?'Max '+d.cap_days+' (what the intermediate CA has left). New certs still get '+d.validity_days+' until you Save.'
+        :'Max '+d.cap_days+' (what the intermediate CA has left).');
+    }
   }catch(e){if(msg)msg.textContent='Could not load';}
 }
 
@@ -644,7 +651,7 @@ async function saveSecurityConfig(){
   try{
     var r=await fetch('/api/takserver/security-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({validity_days:v})});
     var d=await r.json();
-    if(d.success){msg.textContent=d.message||'Saved. TAK Server restarted.';msg.style.color='var(--green)';}
+    if(d.success){msg.textContent=d.message||'Saved. TAK Server restarted.';msg.style.color='var(--green)';if(d.validity_days!=null)input.value=d.validity_days;}
     else{msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}
   }catch(e){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
   if(btn)btn.disabled=false;
