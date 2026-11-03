@@ -81533,17 +81533,17 @@ def takserver_ca_info():
 # intermediate; this says which, per device and per CloudTAK login, so Revoke is a decision made
 # from a list and not a guess. W10's Day-0 mail and W12's reminders use the same rows.
 _CA_MIG_CLASS_CACHE = {}
-# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows SID),
+# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows or Entra SID),
 # CloudTAK. Anything else is a server or integration (a Node-RED flow, a gateway, a bridge).
 _CA_MIG_EUD_UID_RE = re.compile(
     r'^(ANDROID-[0-9A-Za-z]+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
-    r'|S-1-5-[0-9-]+|.*cloudtak.*)$', re.I)
+    r'|S-1-[0-9]+-[0-9-]+|.*cloudtak.*)$', re.I)
 
 
-def _ca_mig_cert_facts(pems):
-    """[(issuer CN, authority key id or '')] for each PEM, in order — ONE openssl call for the
-    lot (a box can hold hundreds of device certs), via a PKCS#7 bundle. None when openssl
-    can't read the bundle (one bad cert fails the whole call); callers then go one by one."""
+def _ca_mig_issuers(pems):
+    """Issuer CN of each PEM, in order — ONE openssl call for the lot (a box can hold hundreds
+    of device certs), via a PKCS#7 bundle. None when openssl can't read the bundle (one bad
+    cert fails the whole call); callers then go one by one."""
     if not pems:
         return []
     try:
@@ -81552,47 +81552,85 @@ def _ca_mig_cert_facts(pems):
                             capture_output=True, text=True, timeout=60)
         if p7.returncode != 0:
             return None
-        r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-text', '-noout'], input=p7.stdout,
+        r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-noout'], input=p7.stdout,
                            capture_output=True, text=True, timeout=60)
     except Exception:
         return None
-    if r.returncode != 0:
-        return None
-    blocks = re.split(r'^Certificate:\s*$', r.stdout or '', flags=re.M)[1:]
-    if len(blocks) != len(pems):
+    issuers = re.findall(r'^issuer\s*=(.*)$', r.stdout or '', re.M) if r.returncode == 0 else []
+    if len(issuers) != len(pems):
         return None
     out = []
-    for b in blocks:
-        iss = re.search(r'^\s*Issuer:.*?CN\s*=\s*([^,/\n]+)', b, re.M)
-        aki = re.search(r'X509v3 Authority Key Identifier:\s*\n\s*(?:keyid:)?([0-9A-Fa-f:]+)', b)
-        out.append(((iss.group(1).strip() if iss else ''), (aki.group(1).upper() if aki else '')))
+    for line in issuers:
+        m = re.search(r'CN\s*=\s*([^,/\n]+)', line)
+        out.append(m.group(1).strip() if m else '')
     return out
+
+
+def _ca_mig_signed_by_many(pems, ca_pem):
+    """_cert_signed_by for many leaves against one CA bundle in ONE `openssl verify` (TAK's
+    makeCert certs carry no authority key id, so there is no shortcut by key: test6, 31 certs,
+    57 calls one by one). Same answers: True signed, False not (issuer/signature failure),
+    None can't tell. openssl prints `<file>: OK` on stdout; a failure is its reason lines then
+    `error <file>: verification failed` on stderr, so each verdict is tied to its own file."""
+    if not pems:
+        return []
+    if not re.search(r'-----BEGIN CERTIFICATE-----', ca_pem or ''):
+        return [None] * len(pems)
+    d = tempfile.mkdtemp(prefix='infratak-camig-')
+    try:
+        files = []
+        for i, p in enumerate(pems):
+            leaf = re.search(r'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----', p or '', re.S)
+            f = os.path.join(d, f'c{i:05d}.pem')
+            with open(f, 'w') as fh:
+                fh.write((leaf.group(0) + '\n') if leaf else '')
+            files.append(f)
+        ca_file = os.path.join(d, 'ca.pem')
+        with open(ca_file, 'w') as fh:
+            fh.write(ca_pem)
+        r = subprocess.run(['openssl', 'verify', '-no_check_time', '-partial_chain', '-CAfile', ca_file] + files,
+                           capture_output=True, text=True, timeout=120)
+    except Exception:
+        return [None] * len(pems)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    verdict = {}
+    for line in (r.stdout or '').splitlines():
+        if line.endswith(': OK'):
+            verdict[line[:-4]] = True
+    reasons = ''
+    for line in (r.stderr or '').splitlines():
+        m = re.match(r'^error (.+): verification failed$', line)
+        if not m:
+            reasons += line.lower() + '\n'
+            continue
+        if 'unable to get local issuer' in reasons or 'unable to get issuer' in reasons or 'signature failure' in reasons:
+            verdict.setdefault(m.group(1), False)
+        reasons = ''
+    return [verdict.get(f) for f in files]
 
 
 def _ca_mig_classify(pems, ca_pem, bundle):
     """[{'issuer', 'current', 'trusted'}] per PEM: signed by the current intermediate (ca.pem)?
     trusted by TAK Server's live trust list? (True / False / None = can't tell). Signature checks,
-    not name compares — a re-made CA can carry the same CN. One check per signing KEY (certs
-    with the same authority key id were signed by the same key), per cert when a cert has none.
+    not name compares — a re-made CA can carry the same CN. Two openssl verify calls in all.
     Cached by digest: issued certs never change."""
     key = hashlib.md5((ca_pem + bundle).encode()).hexdigest()
     if len(_CA_MIG_CLASS_CACHE) > 20000:
         _CA_MIG_CLASS_CACHE.clear()
     digests = [hashlib.md5((p or '').encode()).hexdigest() for p in pems]
     todo = [i for i, d in enumerate(digests) if (key, d) not in _CA_MIG_CLASS_CACHE]
-    facts = _ca_mig_cert_facts([pems[i] for i in todo]) if todo else []
-    if facts is None:
-        facts = [(_pem_issuer_cn(pems[i]), '') for i in todo]
-    by_aki = {}
-    for i, (issuer, aki) in zip(todo, facts):
-        if aki and aki in by_aki:
-            cur, tru = by_aki[aki]
-        else:
-            cur = _cert_signed_by(pems[i], ca_pem) if ca_pem else None
-            tru = True if cur else (_cert_signed_by(pems[i], bundle) if bundle else None)
-            if aki and cur is not None and tru is not None:
-                by_aki[aki] = (cur, tru)
-        _CA_MIG_CLASS_CACHE[(key, digests[i])] = {'issuer': issuer, 'current': cur, 'trusted': tru}
+    if todo:
+        tp = [pems[i] for i in todo]
+        issuers = _ca_mig_issuers(tp)
+        if issuers is None:
+            issuers = [_pem_issuer_cn(p) for p in tp]
+        cur = _ca_mig_signed_by_many(tp, ca_pem) if ca_pem else [None] * len(tp)
+        rest = [k for k, c in enumerate(cur) if not c]
+        tru = dict(zip(rest, _ca_mig_signed_by_many([tp[k] for k in rest], bundle) if bundle else [None] * len(rest)))
+        for k, i in enumerate(todo):
+            _CA_MIG_CLASS_CACHE[(key, digests[i])] = {'issuer': issuers[k], 'current': cur[k],
+                                                      'trusted': True if cur[k] else tru.get(k)}
     return [dict(_CA_MIG_CLASS_CACHE[(key, d)]) for d in digests]
 
 
