@@ -139,10 +139,12 @@ def test_user_cert_reset_judges_by_the_live_truststore_with_the_disk_as_fallback
 
 def test_revoke_starts_the_cloudtak_repair_after_tak_and_portal_are_back():
     src = _func('takserver_revoke_old_ca')
-    i_portal = src.index('_takportal_sync_certs(restart=True)')
+    # v10.3.5 W13: the heal runs in the job's own thread (_ct_heal), which calls the shared repair.
+    i_portal = src.index('_takportal_sync_certs(plog=log, restart=True)')
     i_gate = src.index('if _cloudtak_local_with_local_tak():')
-    i_thread = src.index('target=_cloudtak_heal_after_ca_change')
-    assert i_portal < i_gate < i_thread
+    i_heal = src.index('_cloudtak_heal_after_ca_change(')
+    i_thread = src.index("threading.Thread(target=_ct_heal")
+    assert i_portal < i_gate < i_heal < i_thread
     assert 'must log out and back in once' in src            # nuc A10: a live session kept the red dot
 
 
@@ -304,7 +306,8 @@ def _ca_info(entries):
     ns = _ns(funcs=('takserver_ca_info',), os=fake_os, jsonify=lambda d: d, load_settings=lambda: {},
              _get_tak_cert_password=lambda s: 'atakatak', _live_truststore=lambda d, ext: 'truststore-CA-PS-INT-CA-02.jks',
              _tak_is_container=lambda: False, subprocess=types.SimpleNamespace(run=run),
-             _tak_live_trust_entries=lambda d: entries, _pem_cn_and_expiry=lambda p: (cns[p], None))
+             _tak_live_trust_entries=lambda d: entries, _pem_cn_and_expiry=lambda p: (cns[p], None),
+             _pem_self_signed=lambda p: p == PEM % 'ROOT')
     return ns['takserver_ca_info']()
 
 
