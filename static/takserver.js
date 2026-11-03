@@ -455,6 +455,22 @@ async function loadTakSignerRow(){
     +(blocked.length?'<div style="font-size:12px;color:var(--yellow);margin-top:4px">'+blocked.map(escapeHtml).join(' ')+'</div>':'')
     +'</div>'+(blocked.length?'':'<div style="display:flex;gap:8px;flex-wrap:wrap">'+btns+'</div>')+'</div>';
   el.style.display='block';
+  _takRotateCardText();
+}
+// v10.3.5 W4: what Rotate does to devices depends on who signs the server cert. Rotate keeps
+// the mode, and anything not root-signed is reissued with the new intermediate.
+function _takRotateCardText(){
+  var el=document.getElementById('rotate-ca-desc'),d=_takSignerInfo;if(!el||!d)return;
+  var base='Create a new Intermediate CA signed by your Root CA. New client certs are signed by the new CA; the old CA stays trusted until you use Revoke Old CA. ';
+  el.innerHTML=d.mode==='root'
+    ?base+'<strong style="color:var(--green)">Devices keep connecting. Users have 30 days to move.</strong>'
+    :base+'<strong style="color:var(--red)">Every device disconnects</strong> until it scans a new QR code. <a href="#tak-signer-row" style="color:var(--cyan)">Switch to root-signed</a> first to avoid this.';
+}
+function _takRotateConfirmText(newName){
+  var head='This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server.\n\n';
+  if(_takSignerInfo&&_takSignerInfo.mode==='root')
+    return head+'The server certificate stays signed by the root CA, so devices keep connecting. Users then have 30 days to scan a new QR code (mobile) or log out and back in (CloudTAK).\n\nContinue?';
+  return head+'⚠ EVERY DEVICE WILL DISCONNECT until it scans a new QR code: the server certificate is signed by the intermediate CA, and no device trusts the new one yet.\n\nTo avoid this, cancel and use "Switch to root-signed" at the top of this page first.\n\nRotate anyway?';
 }
 async function switchTakSigner(to){
   var d=_takSignerInfo||{},root=d.root_cn||'the root CA',inter=d.intermediate_cn||'the intermediate CA';
@@ -622,7 +638,7 @@ async function rotateIntCA(){
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
   if(!/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/.test(newName)){alert('CA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-02).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
-  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected: the old CA and every earlier CA in the truststore stay trusted.\n\nContinue?'))return;
+  if(!confirm(_takRotateConfirmText(newName)))return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
   if(isNaN(validityDays)||validityDays<1)validityDays=730;
@@ -667,6 +683,7 @@ function pollRotateLog(){
       if(btn)btn.disabled=false;
       loadCAInfo();
       loadCertExpiry();
+      loadTakSignerRow();
     }else{
       setTimeout(pollRotateLog,1500);
     }
@@ -740,6 +757,7 @@ function pollRootRotateLog(){
       if(btn)btn.disabled=false;
       loadCAInfo();
       loadCertExpiry();
+      loadTakSignerRow();
     }else{
       setTimeout(pollRootRotateLog,1500);
     }

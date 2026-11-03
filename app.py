@@ -82327,9 +82327,15 @@ def takserver_rotate_intca():
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
             log(f"  New CA: {new_ca_name}")
-            log(f"  Server cert + all client certs signed by new CA")
             log(f"  Old CA ({old_ca_name}) and earlier CAs kept in truststore — server still accepts their client certs")
-            log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
+            if server_signer == 'root':
+                log(f"  Server cert signed by the root CA, client certs by {new_ca_name}")
+                log(f"  Devices keep connecting; users move to {new_ca_name} by scanning a new QR "
+                    "(mobile) or logging out and back in (CloudTAK)")
+            else:
+                log(f"  Server cert + all client certs signed by {new_ca_name}")
+                log(f"  Every device is disconnected until it scans a new QR: none of them trusts "
+                    f"{new_ca_name} yet")
             log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
