@@ -335,9 +335,11 @@ def test_admin_token_is_hs256_server_minted_and_short_lived():
 class _CT:
     """CloudTAK API + docker + TAK seams for _cloudtak_tak_cert_heal."""
 
-    def __init__(self, statuses, signed=False, configured=True, ensure_ok=True):
+    def __init__(self, statuses, signed=False, configured=True, ensure_ok=True, trusted=None):
         self.statuses = list(statuses)
         self.signed, self.configured, self.ensure_ok = signed, configured, ensure_ok
+        # TAK's live trust list as (alias, pem); the cert counts as signed by an entry whose pem is 'OLD'
+        self.trusted = [('ca-new', 'CA')] if trusted is None else trusted
         self.calls, self.ensured, self.logs, self.runs = [], 0, [], []
 
     def ns(self):
@@ -364,7 +366,8 @@ class _CT:
             'subprocess': types.SimpleNamespace(run=lambda argv, **k: self.runs.append(list(argv)) or types.SimpleNamespace(
                 returncode=0, stdout='-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----', stderr='')),
             '_read_priv': lambda p: 'CA',
-            '_cert_signed_by': lambda cert, ca: self.signed,
+            '_cert_signed_by': lambda cert, ca: True if ca == 'OLD' else self.signed,
+            '_tak_live_trust_entries': lambda: self.trusted,
             '_local_bootstrap_cert_ensure': ensure,
             '_read_priv_bytes': lambda p: b'p12',
             '_p12_bytes_to_pem': lambda b, pw: ('CERT', 'KEY'),
@@ -393,6 +396,21 @@ def test_heal_reissues_and_patches_when_dead_and_from_another_ca():
     assert not any('TOKEN' in m or 'sekret' in m or 'KEY' == m for m in ct.logs)
     assert ['docker', 'restart', 'cloudtak-api-1'] in ct.runs, \
         "the old connection's retry loop survives the PATCH until the API restarts"
+
+
+def test_heal_leaves_a_cert_from_a_still_trusted_old_ca_alone():
+    # test6 2026-11-03: a Rotate's TAK restart read 'dead' past the waits; the old CA is still
+    # trusted for 30 days, so CloudTAK's cert was fine and must not be re-issued mid-rotate.
+    ct = _CT(['dead'] * 4, signed=False, trusted=[('ca-new', 'CA'), ('ca-old', 'OLD')])
+    assert ct.run() is None
+    assert ct.ensured == 0 and not ct.patches
+    assert any('from a CA TAK trusts' in m for m in ct.logs)
+
+
+def test_heal_does_nothing_when_the_trust_list_cannot_be_read():
+    ct = _CT(['dead'] * 4, signed=False, trusted=None)
+    ct.trusted = None
+    assert ct.run() is None and ct.ensured == 0
 
 
 def test_heal_does_not_restart_cloudtak_when_the_patch_is_refused():

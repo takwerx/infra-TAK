@@ -46281,11 +46281,22 @@ def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
                            capture_output=True, text=True, timeout=20)
         ct_cert = (r.stdout or '').strip()
         signed = _cert_signed_by(ct_cert, _read_priv('/opt/tak/certs/files/ca.pem'))
+        if signed is False:
+            # v10.3.5: during an intermediate Rotate the old CA is still on TAK's trust list for
+            # 30 days, so a cert from it is fine — and a TAK restart that takes longer than the
+            # waits above reads 'dead' (test6, 2026-11-03: this re-issued the bootstrap cert
+            # mid-rotate and certmod -A timed out against a TAK still starting). A CA problem
+            # means NO CA that TAK trusts signed it.
+            trusted = _tak_live_trust_entries()
+            if trusted is None:
+                signed = None
+            elif any(_cert_signed_by(ct_cert, pem) for _alias, pem in trusted):
+                signed = True
     except Exception:
         signed = None
     if signed is not False:
         if signed is True:
-            _log("  CloudTAK's TAK connection is down, but its cert is from the current CA — not a CA problem; left alone")
+            _log("  CloudTAK's TAK connection is down, but its cert is from a CA TAK trusts — not a CA problem; left alone")
         return None
     _log("  CloudTAK's TAK connection is down: its cert was issued by a CA this TAK Server no longer has. "
          "Re-issuing the CloudTAK bootstrap admin cert from the current CA...")
