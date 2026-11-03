@@ -110,6 +110,17 @@ def test_admin_session_means_no_restart_and_no_recheck():
     assert restarts == [] and store['s']['tak_webadmin_check']['outcome'] == 'admin'
 
 
+def test_admin_session_logs_a_line_so_the_console_log_shows_it_ran():
+    # ops #465: the "all fine" path used to log nothing; only the saved state showed it ran.
+    check, restarts, logs, store = _check_ns([True], {'webadmin_password': 's3cret-pw'})
+    check(logs.append, ldap_ok=True)
+    assert len(logs) == 1
+    assert 'webadmin admin check' in logs[0] and 'TAK says admin' in logs[0] and 'no restart' in logs[0]
+    assert 's3cret-pw' not in logs[0]
+    check(logs.append, ldap_ok=True)          # already done for this TAK start: no second line
+    assert len(logs) == 1 and restarts == []
+
+
 def test_not_admin_restarts_tak_once():
     check, restarts, logs, store = _check_ns([False, True], {'webadmin_password': 'pw'})
     check(logs.append, ldap_ok=True)
