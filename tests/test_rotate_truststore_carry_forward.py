@@ -52,7 +52,7 @@ def _func(name):
 
 HELPERS = ('_rotate_coreconfig_truststore', '_pem_key', '_rotate_truststore_entries', '_pem_cn_and_expiry',
            '_tak_live_certs_by_issuer', '_live_count_text', '_rotate_carry_forward_truststore',
-           '_rotate_log_dropped_cas')
+           '_rotate_log_dropped_cas', '_pem_dn', '_pem_self_signed')
 
 
 @pytest.fixture(scope='module')
@@ -210,6 +210,19 @@ def test_two_rotations_later_the_oldest_ca_is_still_trusted(ns, pki, tmp_path):
     assert kt.aliases(NEW_TS) == ['int-ca-08', 'int-ca-09', 'int-ca-10', 'int-ca-11', 'root-ca']
     assert {'int-ca-08', 'int-ca-09', 'int-ca-10', 'int-ca-11', 'root-ca'} <= trusted
     assert not any('⚠' in m for m in logs), logs
+
+
+def test_a_root_in_the_old_store_is_never_carried_forward(ns, pki, tmp_path):
+    """v10.3.5 W6: TAK Server's trust list holds intermediates only. A root the old store held
+    under another name (and the new one doesn't have) used to be carried over, and with it back
+    came every intermediate that root signed, including ones Revoke had removed."""
+    other_root = pki._mk('root-ca-old', None, 3650, ca=True)         # self-signed, not the new store's root
+    kt = Keytool()
+    kt.store(PREV_TS, 'atakatak', {'root-ca': pki.pem['root-ca'], 'ca-ps-root-ca-00': other_root,
+                                   'INT-CA-10': pki.pem['INT-CA-10'], 'INT-CA-09': pki.pem['INT-CA-09']})
+    _new_store(kt, pki)
+    _carry(ns, kt, pki, tmp_path)
+    assert kt.aliases(NEW_TS) == ['int-ca-09', 'int-ca-10', 'int-ca-11', 'root-ca']   # intermediates yes, the stray root no
 
 
 def test_the_root_already_in_the_new_store_is_not_copied_twice(ns, pki, tmp_path):

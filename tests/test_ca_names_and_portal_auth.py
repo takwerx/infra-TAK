@@ -87,7 +87,14 @@ def test_deploy_and_rotate_both_enforce_it():
 
 def test_browser_uses_the_same_rule():
     server = re.search(r"_CA_NAME_RE = _re_module\.compile\(r'(.+?)'\)", APP).group(1)
-    assert JS.count(server) == 2, 'rotateIntCA() and startDeploy() must match _CA_NAME_RE'
+    # The deploy form carries the whole pattern; both rotate dialogs show the same rule as a
+    # checklist (validateCaName), one line per clause of the pattern (v10.3.5 W: checklist).
+    assert JS.count(server) == 1, 'startDeploy() must match _CA_NAME_RE'
+    check = JS[JS.index('function validateCaName'):JS.index('function validatePassword')]
+    assert 'A-Za-z0-9.\\-\\s_' in check and '!/_/.test(v)' in check and '!/\\s/.test(v)' in check
+    assert '/^[A-Za-z0-9]/.test(v)' in check and 'v.length<=64' in check
+    assert "validateCaName('rotate-ca-name')" in JS[JS.index('async function rotateIntCA'):]
+    assert JS[JS.index('async function rotateRootCA'):].count('validateCaName(') >= 2
 
 
 # ── W2: TAK Portal login off ────────────────────────────────────────────────────────────
