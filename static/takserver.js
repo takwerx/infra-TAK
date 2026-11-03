@@ -606,6 +606,9 @@ async function loadCAInfo(){
         revokeEl.style.display='none';
       }
     }
+    // W11: during a rotation window the list loads by itself; otherwise it's one click.
+    _takOldCaNames=d.old_ca_names||{};
+    if((d.old_cas_in_truststore||[]).length||_caMig)loadCaMigration();
     // Current cert password (masked) for rotate cards
     try{
       var pwR=await fetch('/api/takserver/cert-password');
@@ -715,8 +718,120 @@ function pollRotateLog(){
   }).catch(function(){setTimeout(pollRotateLog,2000);});
 }
 
+// v10.3.5 W11: who is still on the old CA — per account, devices and CloudTAK login.
+var _caMig=null,_caMigFilter='todo',_takOldCaNames={};
+async function loadCaMigration(){
+  var btn=document.getElementById('ca-mig-load-btn');
+  if(btn){btn.disabled=true;btn.textContent='Loading...';}
+  try{
+    var r=await fetch('/api/takserver/ca-migration');
+    var d=await r.json();
+    if(!d.ok){
+      document.getElementById('ca-mig-summary').innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Could not read the certificate table')+'</span>';
+    }else{
+      _caMig=d;
+      if(_caMigFilter!=='todo'&&_caMigFilter!==''&&!d.cas.some(function(c){return c.cn===_caMigFilter;}))_caMigFilter='todo';
+      document.getElementById('ca-mig-controls').style.display='block';
+      document.getElementById('ca-mig-csv-btn').style.display='inline-block';
+      renderCaMigration();
+    }
+  }catch(e){document.getElementById('ca-mig-summary').textContent='Could not load: '+e.message;}
+  if(btn){btn.disabled=false;btn.textContent='Refresh';}
+}
+function _caMigMatches(row,q){
+  if(_caMigFilter==='todo'&&row.status==='moved')return false;
+  if(_caMigFilter&&_caMigFilter!=='todo'&&row.cas.indexOf(_caMigFilter)<0)return false;
+  if(!q)return true;
+  if(row.user.toLowerCase().indexOf(q)>=0)return true;
+  return row.devices.some(function(dv){return (dv.callsign||'').toLowerCase().indexOf(q)>=0||dv.uid.toLowerCase().indexOf(q)>=0;});
+}
+function renderCaMigration(){
+  var d=_caMig;if(!d)return;
+  var esc=escapeHtml;
+  var total=d.rows.length,todo=d.rows.filter(function(r){return r.status!=='moved';}).length;
+  var old=d.cas.filter(function(c){return !c.current;});
+  var s='';
+  if(!total)s='No live client certificates in TAK Server\'s certificate table.';
+  else if(!todo)s='<span style="color:var(--green)">All '+total+' accounts are on '+esc(d.current_ca)+' ✓</span>';
+  else{
+    var on=old.map(function(c){return esc(c.cn);}).join(', ')||'an old CA';
+    s='<span style="color:var(--yellow);font-weight:600">'+todo+' of '+total+' accounts still on '+on+'</span>';
+  }
+  if(d.cloudtak&&d.cloudtak.note)s+='<div style="color:var(--text-dim)">'+esc(d.cloudtak.note)+'</div>';
+  if(d.error)s+='<div style="color:var(--yellow)">'+esc(d.error)+' — "trusted" is not shown.</div>';
+  document.getElementById('ca-mig-summary').innerHTML=s;
+  var chips=[['todo','Still to move ('+todo+')'],['','All ('+total+')']].concat(d.cas.map(function(c){return [c.cn,c.cn+(c.current?' (current)':'')+' · '+c.accounts];}));
+  var ch='';
+  chips.forEach(function(c,i){
+    var on=_caMigFilter===c[0];
+    ch+='<button type="button" data-i="'+i+'" style="padding:4px 10px;border-radius:999px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer;border:1px solid '+(on?'var(--cyan)':'var(--border)')+';background:'+(on?'rgba(6,182,212,0.15)':'transparent')+';color:'+(on?'var(--cyan)':'var(--text-secondary)')+'">'+esc(c[1])+'</button>';
+  });
+  var chipsEl=document.getElementById('ca-mig-chips');
+  chipsEl.innerHTML=ch;
+  Array.prototype.forEach.call(chipsEl.querySelectorAll('button'),function(b){b.onclick=function(){_caMigFilter=chips[+b.getAttribute('data-i')][0];renderCaMigration();};});
+  var q=(document.getElementById('ca-mig-search').value||'').trim().toLowerCase();
+  var rows=d.rows.filter(function(r){return _caMigMatches(r,q);});
+  var colors={moved:'var(--green)',needs_move:'var(--yellow)',untrusted:'var(--red)'};
+  var labels={moved:'moved',needs_move:'needs to move',untrusted:'no longer trusted'};
+  var h='';
+  rows.slice(0,500).forEach(function(r){
+    h+='<div style="padding:8px 0;border-top:1px solid var(--border)">';
+    h+='<div><span style="color:var(--text-primary);font-weight:600">'+esc(r.user)+'</span> <span style="color:'+colors[r.status]+'">'+labels[r.status]+'</span></div>';
+    r.devices.forEach(function(dv){
+      h+='<div style="color:var(--text-dim);padding-left:12px">'+esc(dv.callsign||'(no callsign seen)')+' <span style="opacity:.7">'+esc(dv.uid)+'</span> · '+esc(dv.issuer||'?')
+        +(dv.kind==='integration'?' · <span style="color:var(--cyan)">server/integration</span>':'')
+        +(dv.current?' <span style="color:var(--green)">✓</span>':(dv.trusted===false?' <span style="color:var(--red)">not trusted</span>':''))+'</div>';
+    });
+    if(r.cloudtak)h+='<div style="color:var(--text-dim);padding-left:12px">CloudTAK login · '+esc(r.cloudtak.issuer||'?')+(r.cloudtak.current?' <span style="color:var(--green)">✓</span>':'')+'</div>';
+    r.todo.forEach(function(t){h+='<div style="color:var(--yellow);padding-left:12px">→ '+esc(t)+'</div>';});
+    h+='</div>';
+  });
+  if(rows.length>500)h+='<div style="color:var(--text-dim);padding-top:8px">Showing 500 of '+rows.length+'. Search or use CSV for the rest.</div>';
+  if(!rows.length&&total)h='<div style="color:var(--text-dim)">Nothing matches.</div>';
+  document.getElementById('ca-mig-list').innerHTML=h;
+}
+function caMigCsv(){
+  var d=_caMig;if(!d)return;
+  // A leading = + - @ makes a spreadsheet run the cell as a formula; callsigns are set by devices.
+  var cell=function(v){v=v==null?'':String(v);if(/^[=+\-@\t\r]/.test(v))v="'"+v;return '"'+v.replace(/"/g,'""')+'"';};
+  var out=[['user','status','what','uid','callsign','issuer','on_current_ca','trusted','todo'].join(',')];
+  d.rows.forEach(function(r){
+    var todo=r.todo.join('; ');
+    r.devices.forEach(function(dv){out.push([r.user,r.status,dv.kind,dv.uid,dv.callsign,dv.issuer,dv.current,dv.trusted,todo].map(cell).join(','));});
+    if(r.cloudtak)out.push([r.user,r.status,'cloudtak','','',r.cloudtak.issuer,r.cloudtak.current,r.cloudtak.trusted,todo].map(cell).join(','));
+  });
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([out.join('\r\n')+'\r\n'],{type:'text/csv'}));
+  a.download='accounts-by-ca-'+new Date().toISOString().slice(0,10)+'.csv';
+  document.body.appendChild(a);a.click();a.remove();
+}
+// What Revoke cuts off, by name: server/integration clients can't scan a QR, so they're listed.
+async function _caMigRevokeWarning(alias){
+  var cn=(_takOldCaNames[alias]||alias).toLowerCase();
+  try{
+    var d=await (await fetch('/api/takserver/ca-migration')).json();
+    if(!d.ok)return '';
+    var accts=0,integ=[];
+    d.rows.forEach(function(r){
+      var hit=false;
+      r.devices.forEach(function(dv){
+        if(dv.current||(dv.issuer||'').toLowerCase()!==cn)return;
+        hit=true;
+        if(dv.kind==='integration')integ.push(dv.callsign||dv.uid);
+      });
+      if(r.cloudtak&&!r.cloudtak.current&&(r.cloudtak.issuer||'').toLowerCase()===cn)hit=true;
+      if(hit)accts++;
+    });
+    var w='';
+    if(accts)w+='\n\n'+accts+' account'+(accts===1?' is':'s are')+' still on '+(_takOldCaNames[alias]||alias)+' (see Accounts by CA).';
+    if(integ.length)w+='\n\n'+integ.length+' server/integration client'+(integ.length===1?' is':'s are')+' still on '+(_takOldCaNames[alias]||alias)+' and will be cut off: '+integ.slice(0,10).join(', ')+(integ.length>10?' …':'');
+    return w;
+  }catch(e){return '';}
+}
+
 async function revokeOldCA(alias){
-  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThe root CA also leaves TAK Server\'s trust list, so nothing can get back in through '+alias+'.\n\nThis cannot be undone.'))return;
+  var mig=await _caMigRevokeWarning(alias);
+  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThe root CA also leaves TAK Server\'s trust list, so nothing can get back in through '+alias+'.'+mig+'\n\nThis cannot be undone.'))return;
   var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
   var msgEl=document.getElementById('revoke-ca-msg');
   if(msgEl){msgEl.textContent='Revoking '+alias+'...';msgEl.style.color='var(--text-dim)';}

@@ -518,6 +518,18 @@ function takPurgeFailed(){
 <div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
 <div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
 </div>
+<div id="ca-mig-section" style="margin-top:16px;background:#0c0f1a;border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+<span style="font-size:13px;font-weight:600;color:var(--text-primary)">Accounts by CA</span>
+<span style="display:flex;gap:8px"><button type="button" id="ca-mig-load-btn" onclick="loadCaMigration()" style="padding:6px 14px;background:rgba(6,182,212,0.12);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Show</button><button type="button" id="ca-mig-csv-btn" onclick="caMigCsv()" style="display:none;padding:6px 14px;background:transparent;color:var(--text-secondary);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">CSV</button></span>
+</div>
+<div id="ca-mig-summary" style="font-size:12px;color:var(--text-secondary);line-height:1.5">Which CA each account's devices and CloudTAK login are on, and what each still has to do before you revoke the old CA.</div>
+<div id="ca-mig-controls" style="display:none;margin-top:10px">
+<div id="ca-mig-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
+<input type="text" id="ca-mig-search" oninput="renderCaMigration()" placeholder="Search user, callsign or UID" maxlength="100" style="width:100%;max-width:320px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px;box-sizing:border-box">
+</div>
+<div id="ca-mig-list" style="margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;max-height:360px;overflow-y:auto"></div>
+</div>
 </div>
 </div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">

@@ -81529,6 +81529,180 @@ def takserver_ca_info():
     return jsonify(info)
 
 
+# v10.3.5 W11 — "Who still needs to move". After Rotate, every account is on the old or the new
+# intermediate; this says which, per device and per CloudTAK login, so Revoke is a decision made
+# from a list and not a guess. W10's Day-0 mail and W12's reminders use the same rows.
+_CA_MIG_CLASS_CACHE = {}
+# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows SID),
+# CloudTAK. Anything else is a server or integration (a Node-RED flow, a gateway, a bridge).
+_CA_MIG_EUD_UID_RE = re.compile(
+    r'^(ANDROID-[0-9A-Za-z]+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+    r'|S-1-5-[0-9-]+|.*cloudtak.*)$', re.I)
+
+
+def _ca_mig_cert_facts(pems):
+    """[(issuer CN, authority key id or '')] for each PEM, in order — ONE openssl call for the
+    lot (a box can hold hundreds of device certs), via a PKCS#7 bundle. None when openssl
+    can't read the bundle (one bad cert fails the whole call); callers then go one by one."""
+    if not pems:
+        return []
+    try:
+        p7 = subprocess.run(['openssl', 'crl2pkcs7', '-nocrl', '-certfile', '/dev/stdin'],
+                            input=''.join(p if p.endswith('\n') else p + '\n' for p in pems),
+                            capture_output=True, text=True, timeout=60)
+        if p7.returncode != 0:
+            return None
+        r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-text', '-noout'], input=p7.stdout,
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    blocks = re.split(r'^Certificate:\s*$', r.stdout or '', flags=re.M)[1:]
+    if len(blocks) != len(pems):
+        return None
+    out = []
+    for b in blocks:
+        iss = re.search(r'^\s*Issuer:.*?CN\s*=\s*([^,/\n]+)', b, re.M)
+        aki = re.search(r'X509v3 Authority Key Identifier:\s*\n\s*(?:keyid:)?([0-9A-Fa-f:]+)', b)
+        out.append(((iss.group(1).strip() if iss else ''), (aki.group(1).upper() if aki else '')))
+    return out
+
+
+def _ca_mig_classify(pems, ca_pem, bundle):
+    """[{'issuer', 'current', 'trusted'}] per PEM: signed by the current intermediate (ca.pem)?
+    trusted by TAK Server's live trust list? (True / False / None = can't tell). Signature checks,
+    not name compares — a re-made CA can carry the same CN. One check per signing KEY (certs
+    with the same authority key id were signed by the same key), per cert when a cert has none.
+    Cached by digest: issued certs never change."""
+    key = hashlib.md5((ca_pem + bundle).encode()).hexdigest()
+    if len(_CA_MIG_CLASS_CACHE) > 20000:
+        _CA_MIG_CLASS_CACHE.clear()
+    digests = [hashlib.md5((p or '').encode()).hexdigest() for p in pems]
+    todo = [i for i, d in enumerate(digests) if (key, d) not in _CA_MIG_CLASS_CACHE]
+    facts = _ca_mig_cert_facts([pems[i] for i in todo]) if todo else []
+    if facts is None:
+        facts = [(_pem_issuer_cn(pems[i]), '') for i in todo]
+    by_aki = {}
+    for i, (issuer, aki) in zip(todo, facts):
+        if aki and aki in by_aki:
+            cur, tru = by_aki[aki]
+        else:
+            cur = _cert_signed_by(pems[i], ca_pem) if ca_pem else None
+            tru = True if cur else (_cert_signed_by(pems[i], bundle) if bundle else None)
+            if aki and cur is not None and tru is not None:
+                by_aki[aki] = (cur, tru)
+        _CA_MIG_CLASS_CACHE[(key, digests[i])] = {'issuer': issuer, 'current': cur, 'trusted': tru}
+    return [dict(_CA_MIG_CLASS_CACHE[(key, d)]) for d in digests]
+
+
+def _tak_cert_username(dn):
+    """The account name in a TAK certificate row's user_dn / creator_dn: the value itself, or
+    its CN when it's a DN ('CN=jdoe,OU=...' -> 'jdoe')."""
+    s = (dn or '').strip()
+    m = re.search(r'(?:^|[,/]\s*)CN\s*=\s*([^,/]+)', s, re.I)
+    return (m.group(1).strip() if m else s)[:200]
+
+
+def _tak_ca_migration():
+    """W11 rows, one per account: its devices (TAK's certificate table, newest cert per client
+    UID, through the cot seam: works on a remote-DB box) and its CloudTAK login cert (local
+    CloudTAK only), each judged against the current intermediate and the live trust list.
+    Revoked and expired certs are skipped: they connect to nothing either way.
+    Returns {'ok', 'current_ca', 'rows', 'cas', 'cloudtak', 'error'}."""
+    certs, err = _f2b_tak_cert_rows()
+    if certs is None:
+        return {'ok': False, 'error': err, 'rows': [], 'cas': [], 'current_ca': '', 'cloudtak': {}}
+    cert_dir = '/opt/tak/certs/files'
+    ca_pem = _read_priv(os.path.join(cert_dir, 'ca.pem')) or ''
+    current_ca = _pem_cn_and_expiry(ca_pem)[0] if ca_pem else ''
+    bundle = _tak_live_trust_bundle()
+    now = time.time()
+
+    # Callsigns: the last subscription seen from each UID (today's log + yesterday's).
+    callsign = {}
+    try:
+        lines = _f2b_tak_prev_sub_lines() + (_diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or [])
+        _r, subs, _u = _f2b_tak_refused(lines, now)
+        for ip_subs in subs.values():
+            for t, cs, uid in ip_subs:
+                if t >= callsign.get(uid, (0, ''))[0]:
+                    callsign[uid] = (t, cs)
+    except Exception:
+        pass
+
+    live = [(uid, c) for uid, c in sorted(certs.items())
+            if c['pem'] and not c['revoked'] and not (c['expires'] and c['expires'] < now)]
+    judged = _ca_mig_classify([c['pem'] for _uid, c in live], ca_pem, bundle)
+    accounts = {}
+    for (uid, c), j in zip(live, judged):
+        user = _tak_cert_username(c['user']) or '(no user)'
+        acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
+        acct['devices'].append(dict(j, uid=uid, callsign=callsign.get(uid, (0, ''))[1],
+                                    expires=c['expires'],
+                                    kind='eud' if _CA_MIG_EUD_UID_RE.match(uid) else 'integration'))
+
+    # CloudTAK: each user holds their own TAK client cert (profile.auth). An empty one means
+    # CloudTAK issues a fresh cert (from the current CA) at that user's next login.
+    settings = load_settings()
+    ct = {'checked': False, 'note': ''}
+    try:
+        remote = (_get_cloudtak_deployment_config(settings).get('target_mode') or 'local').strip().lower() == 'remote'
+    except Exception:
+        remote = False
+    if remote:
+        ct['note'] = 'CloudTAK is remote — not checked'
+    elif _cloudtak_local_with_local_tak(settings):
+        prof = _cloudtak_postgis_json("select coalesce(json_agg(json_build_object('u', username, "
+                                      "'c', coalesce(auth->>'cert', ''))), '[]') from profile")
+        if prof is None:
+            ct['note'] = "CloudTAK's database didn't answer — CloudTAK logins not checked"
+        else:
+            ct['checked'] = True
+            with_cert = [p for p in prof if isinstance(p, dict) and p.get('c')]
+            for p, j in zip(with_cert, _ca_mig_classify([p['c'] for p in with_cert], ca_pem, bundle)):
+                user = str(p.get('u') or '')[:200]
+                acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
+                acct['cloudtak'] = j
+
+    rows, cas = [], {}
+    for acct in sorted(accounts.values(), key=lambda a: a['user'].lower()):
+        todo, gone = [], False
+        for d in acct['devices']:
+            name = d['callsign'] or d['uid']
+            if d['current']:
+                continue
+            if d['trusted'] is False:
+                gone = True
+                todo.append(f'{name}: no longer trusted — scan a new QR code')
+            elif d['kind'] == 'integration':
+                todo.append(f'{name}: server/integration client — issue it a new cert')
+            else:
+                todo.append(f'scan a new QR on {name}')
+        c = acct['cloudtak']
+        if c and not c['current']:
+            gone = gone or c['trusted'] is False
+            todo.append('log out and back in to CloudTAK')
+        status = 'moved' if not todo else ('untrusted' if gone else 'needs_move')
+        on = sorted({d['issuer'] for d in acct['devices'] if d['issuer']}
+                    | ({c['issuer']} if c and c['issuer'] else set()))
+        for cn in on:
+            e = cas.setdefault(cn, {'cn': cn, 'accounts': 0, 'current': cn == current_ca})
+            e['accounts'] += 1
+        rows.append(dict(acct, status=status, todo=todo, cas=on))
+    return {'ok': True, 'current_ca': current_ca, 'rows': rows,
+            'cas': sorted(cas.values(), key=lambda e: (not e['current'], e['cn'])),
+            'cloudtak': ct, 'error': '' if bundle else "TAK Server's trust list couldn't be read"}
+
+
+@app.route('/api/takserver/ca-migration')
+@login_required
+def takserver_ca_migration():
+    """Read-only: every account by the CA its certs come from, and what each still has to do to
+    be on the current intermediate (W11)."""
+    return jsonify(_tak_ca_migration())
+
+
 rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
