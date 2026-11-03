@@ -56733,14 +56733,15 @@ def _heal_netbird_pinned_image(plog=None):
         _srv_img, _dash_img = _get_netbird_target_images()
         if _srv_img in txt and _dash_img in txt:
             return False  # already on this channel's target — healthy, no-op
-        _log(f"  netbird: compose off the {('dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted')} pin — restoring {_srv_img} + recreating")
+        _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
+        _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
         _netbird_sync_compose_image_tags(nb_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                            capture_output=True, text=True, cwd=nb_dir, timeout=180)
         if r.returncode == 0:
-            _log("  ✓ netbird: restored to vetted pin + recreated")
+            _log(f"  ✓ netbird: restored to {_pin_kind} pin + recreated")
             return True
         _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
         return False
@@ -56933,6 +56934,14 @@ def _netbird_complete_setup(settings, plog):
         return None
 
 
+def _netbird_idp_cert_refusal(err_body):
+    """True when a NetBird identity-provider error body says it can't validate the issuer's
+    TLS certificate (ops #433)."""
+    low = (err_body or '').lower()
+    return any(k in low for k in ('x509', 'unknown authority', 'failed to verify certificate',
+                                  'certificate verify'))
+
+
 def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
     """Register Authentik as external OIDC IDP (Management Setup — embedded dashboard)."""
     import urllib.error
@@ -56976,7 +56985,7 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
     except urllib.error.HTTPError as e:
         err_body = ''
         try:
-            err_body = e.read().decode()[:300]
+            err_body = e.read().decode()[:600]
         except Exception:
             pass
         if existing:
@@ -56984,17 +56993,31 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
             plog(f'  ⚠ Authentik IDP already registered; update failed HTTP {e.code}: {err_body[:200]}')
             idp_redirect = existing.get('redirect_uri') or existing.get('redirectURL')
         elif e.code in (400, 409, 422):
-            plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+            # NetBird answers 422 when it cannot check the issuer ("identity provider issuer is
+            # unreachable ... x509: certificate signed by unknown authority"). That is a refusal,
+            # not "already registered" (ops #433): the box does not trust Authentik's certificate.
+            if _netbird_idp_cert_refusal(err_body):
+                plog("  ✗ NetBird can't trust Authentik's certificate, so the Authentik login button "
+                     "can't be added. Install the CA that signed it on this box (or use a trusted "
+                     f"certificate), then press Deploy again. NetBird said: {err_body[:200]}")
+                return False
+            found = None
             try:
                 resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
                 idps = json.loads(resp.read().decode())
                 items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
-                for item in items:
-                    if 'authentik' in (item.get('name') or '').lower():
-                        idp_redirect = item.get('redirect_uri') or item.get('redirectURL')
-                        break
+                found = next((i for i in items if 'authentik' in (i.get('name') or '').lower()), None)
             except Exception:
                 pass
+            if found:
+                plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+                idp_redirect = found.get('redirect_uri') or found.get('redirectURL')
+            elif e.code == 409:
+                plog('  ✓ Authentik IDP already registered (HTTP 409)')
+            else:
+                plog(f'  ✗ NetBird refused the Authentik registration (HTTP {e.code}) and no Authentik '
+                     f'entry exists: {err_body[:200]}')
+                return False
         else:
             plog(f'  ⚠ IDP registration failed HTTP {e.code}: {err_body[:200]}')
             return False
@@ -57304,6 +57327,14 @@ def _run_netbird_deploy(settings):
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        # netbird-server reads the host CA bundle through a single-file bind mount, and
+        # update-ca-certificates swaps that file, so a container started before a CA was installed
+        # keeps the old bundle. Recreate it so the Authentik registration in Step 5 sees the
+        # current one (ops #433: "install the CA, press Deploy again" did nothing without this).
+        r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'netbird-server']),
+                    capture_output=True, text=True, cwd=nb_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose recreate netbird-server failed: {r.stderr[:300]}')
         plog('✓ Containers running')
 
         plog('')

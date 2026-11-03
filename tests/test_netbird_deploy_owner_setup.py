@@ -175,17 +175,23 @@ def test_already_set_up_box_with_valid_pat_redeploys(tmp_path, monkeypatch):
     assert status['complete'] and not status['error'], status['log']
 
 
-def _register(idps, put_error=None):
-    src = next(ast.get_source_segment(APP, n) for n in ast.parse(APP).body
-               if isinstance(n, ast.FunctionDef) and n.name == '_netbird_register_authentik_idp')
+def _register(idps, put_error=None, post_error=None, relist=None):
+    src = '\n\n'.join(ast.get_source_segment(APP, n) for n in ast.parse(APP).body
+                       if isinstance(n, ast.FunctionDef)
+                       and n.name in ('_netbird_register_authentik_idp', '_netbird_idp_cert_refusal'))
     calls = []
+    logs = []
 
     def mgmt(path, method='GET', data=None, token=None, timeout=15):
         calls.append((method, path))
         if method == 'GET':
-            return io.BytesIO(json.dumps(idps).encode())
+            first = not any(c[0] == 'GET' for c in calls[:-1])
+            return io.BytesIO(json.dumps(idps if first or relist is None else relist).encode())
         if method == 'PUT' and put_error:
             raise urllib.error.HTTPError(path, put_error, 'boom', {}, io.BytesIO(b'{}'))
+        if method == 'POST' and post_error:
+            code, body = post_error
+            raise urllib.error.HTTPError(path, code, 'refused', {}, io.BytesIO(body.encode()))
         return io.BytesIO(json.dumps({'id': 'new', 'name': 'Authentik'}).encode())
 
     ns = {'json': json, '_netbird_mgmt_request': mgmt,
@@ -193,7 +199,8 @@ def _register(idps, put_error=None):
           '_pub_hostport': lambda h, s=None: h,
           '_netbird_patch_authentik_idp_redirect': lambda *a, **k: None}
     exec(compile(src, 'app.py', 'exec'), ns)
-    ok = ns['_netbird_register_authentik_idp']('pat', 'https://ak/application/o/netbird/', 'cid', 'sec', {}, lambda m: None)
+    ok = ns['_netbird_register_authentik_idp']('pat', 'https://ak/application/o/netbird/', 'cid', 'sec', {}, logs.append)
+    _register.logs = logs
     return ok, [c for c in calls if c[0] != 'GET']
 
 
@@ -222,3 +229,67 @@ def test_already_set_up_box_with_lost_pat_still_redeploys(tmp_path, monkeypatch)
     assert 'netbird_pat' not in settings
     assert registered == []
     assert status['complete'] and not status['error'], status['log']
+
+
+UNTRUSTED_422 = ('{"message":"identity provider issuer is unreachable: Get '
+                 '\\"https://ak.example.com/application/o/netbird/.well-known/openid-configuration\\": '
+                 'tls: failed to verify certificate: x509: certificate signed by unknown authority"}')
+
+
+def test_untrusted_authentik_certificate_fails_the_step_with_a_plain_message():
+    """ops #433: NetBird's 422 for an untrusted issuer certificate was logged as "already
+    registered" and the deploy finished green with no Authentik button."""
+    ok, writes = _register([], post_error=(422, UNTRUSTED_422))
+    assert ok is False
+    log = '\n'.join(_register.logs)
+    assert "can't trust Authentik's certificate" in log and 'press Deploy again' in log
+    assert 'already registered' not in log
+
+
+def test_422_without_an_authentik_entry_is_not_already_registered():
+    ok, _ = _register([], post_error=(422, '{"message":"invalid issuer"}'))
+    assert ok is False
+    assert 'already registered' not in '\n'.join(_register.logs)
+
+
+def test_409_still_counts_as_already_registered():
+    ok, _ = _register([], post_error=(409, '{"message":"exists"}'))
+    assert ok is True
+
+
+def test_422_with_an_existing_authentik_entry_is_still_already_registered():
+    # the first listing missed it; the re-list after the refusal finds it
+    ok, _ = _register([], post_error=(422, '{"message":"duplicate"}'),
+                      relist=[{'id': 'idp1', 'name': 'Authentik'}])
+    assert ok is True
+    assert 'already registered' in '\n'.join(_register.logs)
+
+
+def test_deploy_writes_the_ca_override_before_registering():
+    """ops #433: the override that gives netbird-server the host CA bundle is written with the
+    compose in Step 3, ahead of the Authentik registration in Step 5."""
+    fn = next(n for n in ast.parse(APP).body
+              if isinstance(n, ast.FunctionDef) and n.name == '_netbird_write_compose')
+    assert '_netbird_write_ca_override(nb_dir)' in ast.get_source_segment(APP, fn)
+
+
+def test_unreachable_issuer_is_not_reported_as_an_untrusted_certificate():
+    """ops #433 box test: a timeout also says "issuer is unreachable"; only a certificate error
+    gets the "install the CA" message."""
+    timeout_422 = ('{"message":"identity provider issuer is unreachable: get \\"https://ak/.well-known/'
+                   'openid-configuration\\": context deadline exceeded (client.timeout exceeded while awaiting headers)"}')
+    ok, _ = _register([], post_error=(422, timeout_422))
+    assert ok is False
+    assert "can't trust" not in '\n'.join(_register.logs)
+
+
+def test_deploy_recreates_netbird_server_before_registering():
+    """ops #433 box test: netbird-server keeps the CA bundle it started with, so a CA installed
+    after the first deploy was ignored on "Deploy again". Step 3 recreates it, ahead of the
+    Authentik registration in Step 5."""
+    fn = next(n for n in ast.parse(APP).body
+              if isinstance(n, ast.FunctionDef) and n.name == '_run_netbird_deploy')
+    src = ast.get_source_segment(APP, fn)
+    recreate = src.index("'--force-recreate', 'netbird-server'")
+    assert recreate < src.index('_netbird_register_authentik_idp(')
+
