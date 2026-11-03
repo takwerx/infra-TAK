@@ -911,6 +911,7 @@ async function revokeOldCA(alias){
     var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias,password:pw})});
     var d=await r.json();
     if(d.success){
+      pollRevokeLog._refreshed=false;
       pollRevokeLog();
     }else{
       if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Failed')+'</span>';}
@@ -926,8 +927,12 @@ function pollRevokeLog(){
   fetch('/api/takserver/revoke-old-ca/status').then(function(r){return r.json();}).then(function(d){
     if(logEl&&d.log&&d.log.length){logEl.style.display='block';logEl.textContent=d.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
     if(!d.running&&d.complete){
-      if(msgEl){msgEl.innerHTML='<span style="color:'+(d.error?'var(--yellow)':'var(--green)')+'">'+escapeHtml(d.message||'')+'</span>';}
-      loadCAInfo();loadCertExpiry();loadTakSignerRow();
+      if(msgEl){msgEl.innerHTML='<span style="color:'+(d.error?'var(--yellow)':'var(--green)')+'">'+escapeHtml(d.message||'')+'</span>'
+        +(d.ct_running?' <span style="color:var(--text-dim)">(CloudTAK step still running…)</span>':'');}
+      // W13: CloudTAK's reconnect + sign-out finishes after the job; keep its lines coming.
+      if(!pollRevokeLog._refreshed){pollRevokeLog._refreshed=true;loadCAInfo();loadCertExpiry();loadTakSignerRow();}
+      if(d.ct_running){setTimeout(pollRevokeLog,3000);return;}
+      pollRevokeLog._refreshed=false;
     }else{
       setTimeout(pollRevokeLog,1500);
     }

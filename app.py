@@ -46334,21 +46334,86 @@ def _cloudtak_local_with_local_tak(settings=None):
         return False
 
 
+def _cloudtak_signout_users(usernames, log=None, dry_run=False):
+    """v10.3.5 W13 — sign out of CloudTAK exactly the users whose TAK cert was just emptied
+    (_cloudtak_reset_foreign_profile_certs): each one's browser goes straight to the login page,
+    which re-issues the cert from the current CA. Users who moved during the window hold a
+    new-CA cert, aren't on the list, and stay signed in.
+    CloudTAK >= 13.117 (api/stateless/routes/users.ts): GET /api/user/<u>/session lists the
+    sessions, DELETE /api/user/<u>/session/<id> -> revokeSessions() deletes the profile_sessions
+    row, kills the refresh token and pushes {type:'logout'} down the user's websocket.
+    Never rotate SigningSecret and never PATCH disabled:true (that disables the account).
+    Fallback when the API errors: delete the user's profile_sessions rows in SQL (matched by
+    md5, no username in the SQL); the socket then stays open until its next API call.
+    Returns {'signout': ok/partial/old/failed/none, 'users', 'sessions'}."""
+    _log = log or (lambda m: print(m, flush=True))
+    users = [u for u in dict.fromkeys(usernames or []) if u and u != '?']
+    out = {'signout': 'none', 'users': 0, 'sessions': 0}
+    secret = _cloudtak_signing_secret()
+    if not users or not secret:
+        return out
+    base = 'http://127.0.0.1:5000'
+    failed = []
+    for i, u in enumerate(users):
+        hdr = {'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)}
+        q = urllib.parse.quote(u, safe='')
+        ok, code, lst = _cloudtak_request_json('GET', f'{base}/api/user/{q}/session?limit=100', headers=hdr, timeout=20)
+        if not ok and code == 404 and i == 0:
+            _log("  CloudTAK too old for targeted sign-out — users log out/in once")
+            return dict(out, signout='old')
+        ids = [str(s.get('id')) for s in (lst or {}).get('items') or [] if isinstance(s, dict) and s.get('id')] if ok else None
+        if dry_run:
+            _log(f"  (dry run) {u}: HTTP {code}, {len(ids or [])} session(s)")
+            continue
+        done = 0
+        for sid in ids or []:
+            dok, dcode, _r = _cloudtak_request_json(
+                'DELETE', f"{base}/api/user/{q}/session/{urllib.parse.quote(sid, safe='')}", headers=hdr, timeout=20)
+            if dok:
+                done += 1
+            elif dcode != 404:   # 404: already gone (it expired, or the user logged out meanwhile)
+                ids = None
+                break
+        if ids is None:
+            digest = hashlib.md5(u.encode()).hexdigest()
+            n = _cloudtak_postgis_json("with d as (delete from profile_sessions "
+                                       f"where md5(username) = '{digest}' returning 1) select count(*) from d")
+            if n is None:
+                failed.append(u)
+                continue
+            done += int(n)
+            _log(f"  ⚠ {u}: CloudTAK's API refused the sign-out (HTTP {code}); session rows deleted in the "
+                 "database instead — an open browser tab notices at its next request")
+        out['sessions'] += done
+        out['users'] += 1 if done else 0
+    out['signout'] = 'failed' if len(failed) == len(users) else ('partial' if failed else 'ok')
+    if not dry_run:
+        _log(f"  ✓ CloudTAK: signed out {out['sessions']} session(s) of {out['users']} user(s) still on the revoked CA"
+             + (f"; could not sign out {len(failed)}: {', '.join(failed[:10])}" if failed else ''))
+    return out
+
+
 def _cloudtak_heal_after_ca_change(log=None):
     """After TAK's CA changed (Update Now's container/CA heal, Revoke Old CA): give CloudTAK's
     own connection a current cert when it's dead for that reason (_cloudtak_tak_cert_heal, ~2
     min of waits), then empty the user certs TAK no longer trusts so each is re-issued at that
-    user's next login (W7). Local CloudTAK + local TAK only. Run it in a thread."""
+    user's next login (W7), and sign exactly those users out (W13) so the login comes now, not
+    at a confusing error later. Local CloudTAK + local TAK only. Run it in a thread.
+    Returns {'reset': [usernames] or None, 'signout': ...} (see _cloudtak_signout_users)."""
     _log = log or (lambda m: print(m, flush=True))
+    res = {'reset': None, 'signout': 'none', 'users': 0, 'sessions': 0}
     try:
         _cloudtak_tak_cert_heal(log=_log)
     except Exception as e:
         _log(f"  CloudTAK cert check skipped: {e}")
     try:
         if _cloudtak_local_with_local_tak():
-            _cloudtak_reset_foreign_profile_certs(_log)
+            res['reset'] = _cloudtak_reset_foreign_profile_certs(_log)
+            if res['reset']:
+                res.update(_cloudtak_signout_users(res['reset'], _log))
     except Exception as e:
         _log(f"  CloudTAK user cert check skipped: {e}")
+    return res
 
 
 @app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
@@ -83084,7 +83149,7 @@ def takserver_revoke_old_ca():
     server_signer = _tak_server_cert_mode(cert_dir) if own_cert else 'custom'
 
     revoke_ca_log.clear()
-    revoke_ca_status.update({'running': True, 'complete': False, 'error': False, 'message': ''})
+    revoke_ca_status.update({'running': True, 'complete': False, 'error': False, 'message': '', 'ct_running': False})
 
     def do_revoke():
         log = revoke_ca_log.append
@@ -83156,12 +83221,32 @@ def takserver_revoke_old_ca():
             # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
             ct_note = ''
             if _cloudtak_local_with_local_tak():
-                threading.Thread(target=_cloudtak_heal_after_ca_change,
-                                 args=(lambda m: log(f"  CloudTAK:{m}"),),
-                                 daemon=True, name='ct-cert-heal-revoke').start()
+                ct_stopgap = ('anyone signed in to CloudTAK right now must log out and back in once.')
+
+                def _ct_heal():
+                    try:
+                        _ct_heal_run()
+                    finally:
+                        revoke_ca_status['ct_running'] = False
+
+                def _ct_heal_run():
+                    r = _cloudtak_heal_after_ca_change(lambda m: log(f"  CloudTAK:{m}"))
+                    # v10.3.5 W13: the stopgap line stands only when the targeted sign-out didn't
+                    # happen. The heal outlives the job, so wait for its final message first.
+                    for _ in range(120):
+                        if revoke_ca_status.get('complete'):
+                            break
+                        time.sleep(1)
+                    if (r or {}).get('signout') == 'ok' or (r or {}).get('reset') == []:
+                        done = (f"the {r['users']} signed in on it were signed out and land on the login page."
+                                if r.get('users') else 'none of them was signed in.')
+                        revoke_ca_status['message'] = revoke_ca_status.get('message', '').replace(ct_stopgap, done)
+
+                revoke_ca_status['ct_running'] = True
+                threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal-revoke').start()
                 ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
                            'CloudTAK users whose certificate came from the revoked CA get a new one at their '
-                           'next login: anyone signed in to CloudTAK right now must log out and back in once.')
+                           'next login: ' + ct_stopgap)
 
             server_note = {
                 'root': 'Server cert is signed by the root CA and was not changed.',
