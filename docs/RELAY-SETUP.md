@@ -239,6 +239,11 @@ Refresh the **Security rules** page and you should see 25 ingress rules.
 > `"protocol"` is the IP protocol number: **6** = TCP, **17** = UDP, **1** = ICMP. The port lives
 > inside `tcpOptions`/`udpOptions`, which is why this route can't hit the port-field trap below.
 
+> **Set your relay up before Nov 2026?** Video from a map marker in CloudTAK needs **TCP 9997**, and
+> older versions of this guide didn't list it. Re-run **Paste 2** above: it replaces the list, so it
+> adds 9997 and keeps every other rule. Or add that one rule by hand
+> ([Opening one more port](#opening-one-more-port)). Then press **Update Relay** in the console.
+
 ### The manual way — Oracle's dialog
 
 **☰ menu → Networking → Virtual Cloud Networks → TAK-RELAY-VCN → Security tab → Default Security

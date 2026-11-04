@@ -343,3 +343,29 @@ def test_relay_doc_extra_port_section_leaves_the_parsed_blocks_alone():
     sec = _extra_port_section()
     assert not any(line.startswith('|') for line in sec.splitlines())
     assert 'cat > ingress.json' not in sec
+
+
+def test_relay_doc_tells_existing_relays_to_add_9997():
+    """ops #442: relays set up before 9997 joined the list have no way to know they need it,
+    and videos opened from a map marker fail with "Failed to generate proxy stream". The
+    note sits next to Paste 2, says what to do (re-run Paste 2 or add one rule), and says to
+    press Update Relay afterwards."""
+    start = RELAY_DOC.index('**Set your relay up before Nov 2026?**')
+    note = RELAY_DOC[start:].split('\n### ', 1)[0].split('\n\n', 1)[0]
+    assert '9997' in note
+    assert 'Paste 2' in note
+    assert '(#opening-one-more-port)' in note
+    assert 'Update Relay' in note
+    # It belongs to the Cloud Shell paste, not further down the page.
+    assert start > RELAY_DOC.index('**Paste 2')
+    assert start < RELAY_DOC.index('### The manual way')
+
+
+def test_9997_is_on_every_port_list_the_note_points_at():
+    """The note says Paste 2 adds 9997 and the rest of the docs agree: the guide's table, the
+    paste-in rules, the README's Tier 1 table and the router guide all carry TCP 9997."""
+    assert 9997 in _table_ports(RELAY_DOC)
+    assert 9997 in _ingress_ports('tcp')
+    assert 9997 in _table_ports(README)
+    assert 9997 in _table_ports(DDNS_DOC)
+    assert 'Opening one more port' in RELAY_DOC
