@@ -217,7 +217,8 @@ def _verify_ports(settings, **overrides):
     parts = []
     for n in ast.parse(APP).body:
         if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in (
-                '_CONN_VERIFY_PORTS', 'ATLAS_DEVICE_PORT', 'REMOTE_ASSIST_DEVICE_PORT')
+                '_CONN_VERIFY_PORTS', 'ATLAS_DEVICE_PORT', 'REMOTE_ASSIST_DEVICE_PORT',
+                'CLOUDTAK_VIDEO_CONTROL_PORT')
                 for t in n.targets):
             parts.append(ast.get_source_segment(APP, n))
         if isinstance(n, ast.FunctionDef) and n.name == '_conn_verify_ports':
