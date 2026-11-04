@@ -77,8 +77,21 @@ def test_three_timeouts_give_a_plain_message_not_python_text():
     r = n['_git_fetch_retry'](run, ['fetch', 'origin'], sleep=lambda s: None)
     assert calls == [90, 120, 150]
     assert r.returncode != 0
-    assert 'GitHub did not answer in time' in r.stderr and 'Click Update Now again' in r.stderr
+    assert 'GitHub did not answer' in r.stderr and 'Click Update Now again' in r.stderr
     assert 'Command' not in r.stderr and 'timed out after' not in r.stderr
+
+
+def test_mixed_timeout_and_connect_failures_still_end_in_the_plain_message():
+    # test12 box test, Nov 4 2026: try 1 connect failure, try 2 timeout, try 3 connect failure.
+    # The customer was left with git's raw "fatal: unable to access ... Couldn't connect to server".
+    n = _git_ns()
+    raw = "fatal: unable to access 'https://x/': Failed to connect to x port 443 after 134779 ms: Couldn't connect to server"
+    run, calls = _runner([_r(128, raw), 'timeout', _r(128, raw)])
+    r = n['_git_fetch_retry'](run, ['fetch', 'origin'], sleep=lambda s: None)
+    assert calls == [90, 120, 150]
+    assert r.returncode != 0
+    assert 'GitHub did not answer' in r.stderr and 'Click Update Now again' in r.stderr
+    assert 'fatal:' not in r.stderr and "Couldn't connect" not in r.stderr
 
 
 def test_network_error_is_retried_but_other_errors_are_not():

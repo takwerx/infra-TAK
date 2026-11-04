@@ -10698,32 +10698,27 @@ def _git_fetch_retry(run_git, args, timeouts=None, pause_s=None, sleep=None):
     timeouts = timeouts or _GIT_FETCH_TIMEOUTS_S
     pause_s = _GIT_FETCH_PAUSE_S if pause_s is None else pause_s
     sleep = sleep or time.sleep
-    last = None
-    timed_out = False
     for i, limit in enumerate(timeouts):
         if i:
             sleep(pause_s)
         try:
             r = run_git(args, timeout=limit, isolated_fetch=True)
         except subprocess.TimeoutExpired:
-            timed_out = True
             print(f"Update Now: git fetch timed out after {limit}s (try {i + 1}/{len(timeouts)})", flush=True)
             continue
         if r.returncode == 0:
             return r
-        timed_out = False
-        last = r
         if not _GIT_TRANSIENT_RE.search((r.stderr or '') + ' ' + (r.stdout or '')):
             return r
         print(f"Update Now: git fetch failed, will retry (try {i + 1}/{len(timeouts)}): "
               f"{((r.stderr or r.stdout or '').strip().splitlines() or [''])[-1][:200]}", flush=True)
-    if timed_out or last is None:
-        return subprocess.CompletedProcess(
-            args, 124, '',
-            f'GitHub did not answer in time (tried {len(timeouts)} times, up to {max(timeouts)} seconds each). '
-            "This server's internet connection to github.com is slow or blocked (shared link, proxy or "
-            'firewall). Nothing was changed. Click Update Now again in a minute or two.')
-    return last
+    # Every try timed out or failed the way a bad link does (test12 box test, Nov 4: timeout, then
+    # connect failures): say so in plain words. The git text of each try is already in the journal.
+    return subprocess.CompletedProcess(
+        args, 124, '',
+        f'GitHub did not answer (tried {len(timeouts)} times, up to {max(timeouts)} seconds each). '
+        "This server's internet connection to github.com is slow or blocked (shared link, proxy or "
+        'firewall). Nothing was changed. Click Update Now again in a minute or two.')
 
 
 @app.route('/api/update/apply', methods=['POST'])
