@@ -147,38 +147,36 @@ if [ -n "$CUTOFF" ]; then
 fi
 
 # ── 4. Compute averages ──
+# One pass over each CSV. Every timestamp is written above as fixed-format UTC
+# ISO-8601 (date -u '+%Y-%m-%dT%H:%M:%SZ'), which sorts as text, so the 1 h and 24 h
+# windows are plain string compares against two cutoffs, the way the trim step and
+# the sustain checks below already work. This used to start a `date` process for every
+# row, three times a run: about 3 minutes on a 31-day history (ops #467).
 NOW_EPOCH=$(date -u '+%s')
-HOUR_AGO=$((NOW_EPOCH - 3600))
-DAY_AGO=$((NOW_EPOCH - 86400))
+iso_ago() {
+  date -u -d "@$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
+    date -u -r "$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo ""
+}
+HOUR_AGO_ISO=$(iso_ago 3600)
+DAY_AGO_ISO=$(iso_ago 86400)
 
-AVG_1H=$(tail -n +2 "$HISTORY" | awk -F, -v ha="$HOUR_AGO" '
-  {
-    cmd = "date -u -d \"" $1 "\" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ \"" $1 "\" +%s 2>/dev/null"
-    cmd | getline ep; close(cmd)
-    if (ep >= ha) { sum += $2; n++ }
+# 1 h average, 24 h average and the row count of the throughput history ("0" = no rows in the window).
+read -r AVG_1H AVG_24H SAMPLES_24H <<<"$(awk -F, -v ha="$HOUR_AGO_ISO" -v da="$DAY_AGO_ISO" '
+  NR > 1 {
+    rows++
+    if (ha != "" && $1 >= ha) { s1 += $2; n1++ }
+    if (da != "" && $1 >= da) { s24 += $2; n24++ }
   }
-  END { if (n > 0) printf "%.1f", sum/n; else print "0" }')
-
-AVG_24H=$(tail -n +2 "$HISTORY" | awk -F, -v da="$DAY_AGO" '
-  {
-    cmd = "date -u -d \"" $1 "\" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ \"" $1 "\" +%s 2>/dev/null"
-    cmd | getline ep; close(cmd)
-    if (ep >= da) { sum += $2; n++ }
-  }
-  END { if (n > 0) printf "%.1f", sum/n; else print "0" }')
-
-SAMPLES_24H=$(tail -n +2 "$HISTORY" | wc -l | tr -d ' ')
+  END {
+    printf "%s %s %d\n", (n1 > 0 ? sprintf("%.1f", s1 / n1) : "0"), (n24 > 0 ? sprintf("%.1f", s24 / n24) : "0"), rows
+  }' "$HISTORY")"
 
 # Latency 1h average (ms/commit, column 3) — only when the latency series exists
 LAT_AVG_1H=""
 if [ -f "$LAT_HISTORY" ]; then
-  LAT_AVG_1H=$(tail -n +2 "$LAT_HISTORY" | awk -F, -v ha="$HOUR_AGO" '
-    {
-      cmd = "date -u -d \"" $1 "\" +%s 2>/dev/null || date -u -j -f %Y-%m-%dT%H:%M:%SZ \"" $1 "\" +%s 2>/dev/null"
-      cmd | getline ep; close(cmd)
-      if (ep >= ha) { sum += $3; n++ }
-    }
-    END { if (n > 0) printf "%.2f", sum/n; else print "" }')
+  LAT_AVG_1H=$(awk -F, -v ha="$HOUR_AGO_ISO" '
+    NR > 1 && ha != "" && $1 >= ha { sum += $3; n++ }
+    END { if (n > 0) printf "%.2f", sum / n; else print "" }' "$LAT_HISTORY")
 fi
 
 # Best (highest) of the last SUSTAIN_SAMPLES readings, or empty unless there are
@@ -197,10 +195,6 @@ lat_lowest() {
   tail -n +2 "$LAT_HISTORY" | tail -n "$1" | awk -F, -v c="$2" -v want="$1" '
     c != "" && $1 >= c { if (n == 0 || $3 + 0 < m) m = $3 + 0; n++ }
     END { if (n == want) printf "%.2f", m }'
-}
-iso_ago() {
-  date -u -d "@$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
-    date -u -r "$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo ""
 }
 LAT_LOWEST_SUSTAIN=$(lat_lowest "$LAT_SUSTAIN_SAMPLES" "$SUSTAIN_CUTOFF")
 LAT_LOWEST_SEVERE=$(lat_lowest "$SEVERE_SAMPLES" "$(iso_ago "$SEVERE_MAX_AGE_S")")
