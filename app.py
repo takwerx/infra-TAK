@@ -15421,6 +15421,22 @@ _CONN_ANCHOR_WG_IP = '172.31.99.1'
 _CONN_WG_KEY_RE = re.compile(r'^[A-Za-z0-9+/]{43}=$')  # 32-byte base64 WireGuard key
 
 
+def _ct_video_bind_addrs(settings, lan_ip):
+    """Addresses Caddy's CloudTAK video listener (:9997) binds, as one `bind` argument.
+
+    ops #473: the relay DNATs a client's :9997 to this box's tunnel address
+    (_CONN_BOX_WG_IP), but the listener was bound to the LAN address only, so a relayed
+    box answered 9997 from the LAN and nowhere else. With a relay configured the tunnel
+    address is bound as well. Never 0.0.0.0: 127.0.0.1:9997 is the cloudtak-media
+    container's own publish, and a wildcard bind would collide with it.
+    net.ipv4.ip_nonlocal_bind=1 (set at deploy) lets Caddy bind it before wg0 is up."""
+    addrs = [lan_ip]
+    if ((settings or {}).get('connectivity_anchor') or {}).get('anchor_ip') \
+            and _CONN_BOX_WG_IP != lan_ip:
+        addrs.append(_CONN_BOX_WG_IP)
+    return ' '.join(addrs)
+
+
 def _conn_wg_conf_path():
     return '/etc/wireguard/%s.conf' % _CONN_WG_IF
 
@@ -15865,6 +15881,15 @@ _CONN_VERIFY_PORTS = [
 # Mirrors modules/atlas.py DEVICE_PORT (the module is loaded by the marketplace, not
 # imported here); tests/test_relay_forwards_module_ports.py keeps the two equal.
 ATLAS_DEVICE_PORT = 8449
+# ops #473: Caddy's CloudTAK video listener. CloudTAK hardcodes it onto every media URL.
+CLOUDTAK_VIDEO_CONTROL_PORT = 9997
+# Plain-words hints that replace the generic "path blocked" one when the service is listening
+# on the box but the probe from outside fails.
+_CONN_BLOCKED_HINTS = {
+    9997: ('CloudTAK cannot start any video from a map marker while this is blocked '
+           '("Failed to generate proxy stream"). Open TCP 9997 in the relay\'s cloud firewall, '
+           'then press Update Relay so it forwards 9997'),
+}
 
 
 def _conn_verify_ports(settings):
@@ -15944,6 +15969,11 @@ def _conn_verify_ports(settings):
                 os.path.exists(os.path.join(_ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
             ports.append((18554, 'CloudTAK video RTSP', True))
             ports.append((11935, 'CloudTAK video RTMP', True))
+            # ops #473: CloudTAK's API calls https://<video name>:9997 for every video lease
+            # (it forces that port onto each media URL). Blocked, opening a video from a CoT
+            # marker fails with "Failed to generate proxy stream" while the stream itself is fine.
+            ports.append((CLOUDTAK_VIDEO_CONTROL_PORT,
+                          'CloudTAK video control (opening a video from a map marker)', True))
     except Exception:
         pass
     return ports
@@ -16000,8 +16030,9 @@ def _run_connectivity_verify(settings):
                 elif result['mode'] == 'relay':
                     # Relay vantage is a REAL outside path (box -> relay public -> tunnel
                     # -> back); a red here is trustworthy.
-                    probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
-                                     'relay cloud firewall/NSG ingress + forwarded ports')
+                    probe['hint'] = _CONN_BLOCKED_HINTS.get(port) or (
+                        'service reachable locally but NOT from outside — check the path: '
+                        'relay cloud firewall/NSG ingress + forwarded ports')
                 else:
                     # Direct mode probes the box's OWN public address — a self-probe that
                     # fails on any network without NAT hairpin (home routers, 1:1-NAT
@@ -38028,7 +38059,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs.")
             lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
-            lines.append(f"    bind {ct_bind_ip}")
+            lines.append(f"    bind {_ct_video_bind_addrs(settings, ct_bind_ip)}")
             lines += _caddy_drop_request_encoding_lines()
             lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
