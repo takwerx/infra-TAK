@@ -48239,6 +48239,98 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         return False
 
 
+# ops #470 (infra-TAK #398): CloudTAK's own nginx caps every request body at 5G, so a hosted PMTiles
+# file bigger than that (Admin > Public Tiles posts it to /api/server/tileset) is refused with a 413.
+# The API itself streams the file straight into the object store and has no size cap (verified on
+# test12: 6 GiB through the raised limit, 200 in 141 s). Raise the cap for that ONE URL only; nginx
+# buffers a request body to disk before forwarding it, so every other URL keeps the 5G cap, and this
+# one is streamed (proxy_request_buffering off): the API checks the login before it reads the body, so
+# an anonymous POST costs no disk. The container writes /etc/nginx/nginx.conf from nginx.conf.js on
+# each start, so a recreate drops this; _cloudtak_upload_limit_heal re-applies it (check-before-apply,
+# reload only, no restart).
+CLOUDTAK_TILESET_UPLOAD_MAX = '25G'
+_CT_NGINX_UPLOAD_SH = r'''f=/etc/nginx/nginx.conf
+grep -q 'location = /api/server/tileset' "$f" && { echo OK; exit 0; }
+grep -q 'location ~ ^/api' "$f" || { echo NOCONF; exit 0; }
+cp "$f" "$f.ops470.bak"
+awk '/location ~ \^\/api/ && !done {
+  print "        # ops #470: hosted PMTiles uploads can be tens of GB; every other URL keeps the 5G cap"
+  print "        location = /api/server/tileset {"
+  print "            client_max_body_size __MAX__;"
+  print "            proxy_pass http://127.0.0.1:5001;"
+  print "            proxy_http_version 1.1;"
+  print "            proxy_request_buffering off;"
+  print "            proxy_set_header Host $host;"
+  print "            proxy_set_header X-Real-IP $remote_addr;"
+  print "            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+  print "            proxy_read_timeout 3600s;"
+  print "            proxy_send_timeout 3600s;"
+  print "            client_body_timeout 3600s;"
+  print "        }"
+  print ""
+  done=1
+}
+{ print }' "$f.ops470.bak" > "$f" \
+  && nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 && echo HEALED \
+  || { cp "$f.ops470.bak" "$f"; echo FAIL; }
+rm -f "$f.ops470.bak"
+'''
+
+
+def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
+    """ops #470: give /api/server/tileset a bigger body limit in the CloudTAK api container's nginx.
+    Convergence like _cloudtak_media_hls_heal: reads the live nginx.conf first and only edits it
+    (then reloads nginx, no restart) when the block is missing, so a converged box is a no-op.
+    `wait=True` also waits for the container and for nginx.conf.js to write the real config (the
+    stock nginx.conf is there for a moment first) - use it right after `up -d`.
+    Returns True if converged (already there or applied), False on error or no container."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    tries = 30 if wait else 1
+    script = _CT_NGINX_UPLOAD_SH.replace('__MAX__', CLOUDTAK_TILESET_UPLOAD_MAX)
+    try:
+        if remote_cfg:
+            import base64
+            b64 = base64.b64encode(script.encode()).decode()
+            cmd = (
+                "for i in $(seq 1 %d); do "
+                "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
+                "[ -n \"$m\" ] && out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null) "
+                "&& [ \"$out\" != NOCONF ] && break; sleep 2; done; "
+                "echo \"${out:-NOCONTAINER}\""
+            ) % (tries, b64)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=30 + 2 * tries)
+            out = (out or '').strip().splitlines()[-1:] or ['']
+            out = out[0]
+        else:
+            out = 'NOCONTAINER'
+            for _ in range(tries):
+                r = subprocess.run(
+                    _sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api-', '--format', '{{.Names}}']),
+                    capture_output=True, text=True, timeout=15)
+                names = [n for n in (r.stdout or '').split() if n.strip()]
+                if names:
+                    ap = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', '-i', names[0], 'sh']),
+                        input=script, capture_output=True, text=True, timeout=30)
+                    out = (ap.stdout or '').strip().splitlines()[-1:] or ['']
+                    out = out[0]
+                    if out != 'NOCONF':
+                        break
+                time.sleep(2)
+        if out == 'HEALED':
+            _log(f"  ✓ CloudTAK upload limit: /api/server/tileset now takes up to {CLOUDTAK_TILESET_UPLOAD_MAX} (other URLs stay 5G)")
+            return True
+        if out == 'OK':
+            return True  # already converged - silent
+        if wait or out == 'FAIL':
+            _log(f"  ⚠ CloudTAK upload limit not applied ({out or 'no answer'}); large tileset uploads stay capped at 5G")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK upload limit error (non-fatal): {e}")
+        return False
+
+
 def _compose_cmd(remote_cfg=None):
     """Return the working Docker Compose invocation ('docker compose' or
     'docker-compose'), preferring v2, or None if neither is present.
@@ -50838,6 +50930,7 @@ def run_cloudtak_deploy(cfg=None):
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
@@ -51580,6 +51673,7 @@ def run_cloudtak_deploy(cfg=None):
 
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
+        _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
 
@@ -51713,6 +51807,7 @@ def run_cloudtak_redeploy(cfg=None):
                 except subprocess.TimeoutExpired:
                     plog("⚠ Caddy reload timed out — reload manually if needed")
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ Update config & restart done (remote)")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -51834,6 +51929,7 @@ def run_cloudtak_redeploy(cfg=None):
                 plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         try:
@@ -52924,6 +53020,7 @@ def run_cloudtak_update():
         _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_upload_limit_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -102819,6 +102916,7 @@ def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
     log("CloudTAK recreated with hardened port bindings")
     # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
     # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+    _cloudtak_upload_limit_heal(plog=log, wait=True)   # ops #470: the recreate rewrote nginx.conf
     if not _cloudtak_media_hls_heal(wait=True):
         return 'heal'
     return 'ok'
@@ -102919,6 +103017,7 @@ def _startup_heal_cloudtak_media_hls():
         if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
                 or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
             return  # CloudTAK not installed locally (or split/remote) — nothing to heal here
+        _cloudtak_upload_limit_heal()   # ops #470: nginx.conf is rewritten on every container start
         if _cloudtak_media_hls_heal():
             return
     except Exception as _e:

@@ -162,6 +162,7 @@ class Box:
             '_patch_cloudtak_compose_ports': lambda d: self.calls.append((['PORTS'], d)) or False,
             '_docker_compose_pull': lambda *a, **k: self.calls.append((['PULL'], k.get('services'))) or True,
             '_cloudtak_media_hls_heal': self.heal,
+            '_cloudtak_upload_limit_heal': lambda *a, **k: True,   # ops #470
             '_write_priv': lambda path, content, mode='w', perm=None: self.guard_log.append((path, content, mode)),
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
