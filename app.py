@@ -34155,6 +34155,44 @@ _register_module_remote_routes('webodm', 'webodm_deployment')
 _register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get_fedhub_deployment_config)
 
 
+def _cloudtak_caddy_bind_ip(settings):
+    """The local IPv4 Caddy binds the CloudTAK video listener (:9997) to, or '' when none.
+
+    settings.server_ip when it is assigned to a NIC here; otherwise the box's primary local
+    address (server_ip may be a public/NAT address that is not on any interface). Shared by
+    the Caddyfile and by _cloudtak_video_host_pin so the two always agree."""
+    ip = (settings.get('server_ip') or '').strip()
+    if ip and ip not in _list_local_ipv4s():
+        ip = _primary_local_ipv4()
+    return ip
+
+
+def _cloudtak_video_host_pin(settings):
+    """extra_hosts entry `video.<fqdn>:<this box's Caddy address>` for CloudTAK's api container.
+
+    ops #471. CloudTAK's api reaches its media server at `https://<video host>:9997` for every
+    lease (video-service.ts forces port 9997; same in 13.54.3 through 13.119.0). The api container
+    resolves that name through public DNS, so the call leaves the box and comes back through
+    whatever fronts it. Behind a relay the relay never carried 9997, and on a home or office
+    network the router has no NAT hairpin, so the connect times out after 10 s and every proxy
+    lease fails with "Failed to generate proxy stream" (nuc; test12 with the name pointed at the
+    relay: ConnectTimeoutError video.<fqdn>:9997). Pinning the name to the address Caddy's :9997
+    listener is bound to keeps that hop on the box; TLS still validates because the URL keeps
+    its hostname. '' when there is nothing to pin (no domain, remote CloudTAK, no bind IP).
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return ''
+    except Exception:
+        return ''
+    video = (_get_service_domain(settings, 'cloudtak_video') or '').strip()
+    if not video or not (settings.get('fqdn') or '').strip():
+        return ''
+    host = video.split()[0].strip()
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return f'{host}:{ip}' if host and ip else ''
+
+
 def _get_cloudtak_upstreams(settings):
     """Return CloudTAK upstream endpoints for Caddy and readiness checks.
 
@@ -38020,9 +38058,7 @@ def generate_caddyfile(settings=None):
         # a locally-assigned IP: keep server_ip when it's on the NIC, else fall back to the
         # box's primary local IP (NAT forwards the public :9997 to it). If neither resolves,
         # skip the listener rather than crash Caddy.
-        ct_bind_ip = (settings.get('server_ip') or '').strip()
-        if ct_bind_ip and ct_bind_ip not in _list_local_ipv4s():
-            ct_bind_ip = _primary_local_ipv4()
+        ct_bind_ip = _cloudtak_caddy_bind_ip(settings)
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
             lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs.")
@@ -47691,6 +47727,9 @@ def _cloudtak_build_override_yml(settings):
             if server_ip:
                 extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
+    # ops #471: only the api container calls the media server by its public name.
+    video_pin = _cloudtak_video_host_pin(settings)
+    api_hosts_block = hosts_block + (f'\n      - "{video_pin}"' if video_pin else '')
     # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
     # CloudTAK's api container runs both nginx and Node in the same image;
     # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
@@ -47830,7 +47869,7 @@ def _cloudtak_build_override_yml(settings):
 services:
   api:
     extra_hosts:
-{hosts_block}
+{api_hosts_block}
     environment:
 {tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
   tiles:
