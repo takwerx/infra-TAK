@@ -141,13 +141,13 @@ def test_recovery_writes_one_healthy_again_line_and_rearms(watch):
     watch('up', 1, 1, times=3)
     log, _, _ = watch('up', 0, 0, times=3)
     assert log.count('checks healthy again') == 1
-    log, _, alerts = watch('up', 1, 1, times=2)               # a new episode logs and alerts again
+    log, _, alerts = watch('up', 1, 1, times=3)               # a new episode logs and alerts again (ops #488: after 3 in a row)
     assert log.count('— no restart') == 2 and alerts == 2
 
 
 def test_a_different_failing_leg_is_logged(watch):
-    log, _, _ = watch('up', 1, 1, times=2)
-    log, _, _ = watch('up', 2, 2, times=2)
+    log, _, _ = watch('up', 1, 1, times=3)                    # ops #488: logged once 3 probes in a row have failed
+    log, _, _ = watch('up', 2, 2, times=3)
     assert 'rc=1' in log and 'rc=2' in log
     assert log.count('mgmt channel degraded') == 2
 
