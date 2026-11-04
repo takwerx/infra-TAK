@@ -72460,6 +72460,8 @@ def _tak_webadmin_admin_check(plog, ldap_ok):
         if verdict:
             st['outcome'] = 'admin'
             _save()
+            plog(f"{tag}: logged in as webadmin on 8446 and asked TAK isAdmin — TAK says admin "
+                 f"(try {st['tries']}); no restart needed")
             return
         if time.time() - float(st.get('last_restart') or 0) < _TAK_WEBADMIN_RESTART_MIN_GAP_S:
             st['outcome'] = 'not admin, restart skipped (one in the last 6 h)'
