@@ -59,7 +59,7 @@ PN_CONSTS = ('PATCH_NOW_FEED_URL', 'PATCH_NOW_CHECK_INTERVAL_S', 'PATCH_NOW_REPE
              'PATCH_NOW_FEED_MAX_AGE_S', 'PATCH_NOW_BUILTIN', '_PN_ID_RE', '_PN_PKG_RE',
              '_PN_VER_RE', '_PN_OS_RE', 'THIRD_PARTY_ADVISORY_REPOS',
              'THIRD_PARTY_ADVISORY_CACHE_S', '_third_party_adv_cache', '_OS_INSTALL_HOW',
-             '_OS_REBOOT_HOW')
+             '_THIRD_PARTY_HOW', '_OS_REBOOT_HOW')
 PN_FUNCS = ('_vercmp_segment_deb', '_vercmp_segment_rpm', '_pkg_vercmp', '_upstream_version',
             '_pkg_restart_impact', '_patch_now_parse', '_patch_now_advisories',
             '_installed_pkg_versions', '_patch_now_feed_items', '_nevra_name',
@@ -359,6 +359,17 @@ def test_third_party_critical_is_patch_now_high_is_security():
     # second call inside the cache window does not ask GitHub again
     n['_third_party_security_items'](PENDING, set(), now=200.0)
     assert len(calls) == 3
+
+
+def test_caddy_security_mail_points_at_the_caddy_button_ops487():
+    """The email says the exact step: Caddy has its own Update, the others use OS updates."""
+    n, _ = _tp({
+        'moby/moby': [{'id': 'CVE-2026-1', 'severity': 'high', 'summary': 'x'}],
+        'caddyserver/caddy': [{'id': 'GHSA-x', 'severity': 'high', 'summary': 'y'}],
+        'netbirdio/netbird': []})
+    items = {i['key']: i for i in n['_third_party_security_items'](PENDING, set(), now=100.0)}
+    assert items['3p:caddy']['how'] == 'Caddy page → Update.'
+    assert items['3p:docker-ce']['how'] == n['_OS_INSTALL_HOW']
 
 
 def test_third_party_github_down_is_unknown_not_safe():
