@@ -123,6 +123,7 @@ def _override(tmp_path, mode='local', bundle=HOST):
     ns.update({
         'os': __import__('os'), 'CONFIG_DIR': str(tmp_path),
         '_get_takserver_host': lambda s: '',
+        '_cloudtak_video_host_pin': lambda s: '',        # ops #471: the pin has its own tests
         '_get_cloudtak_deployment_config': lambda s: {'target_mode': mode},
         '_host_arch': lambda: 'amd64', '_ensure_infratak_docker_network': lambda: None,
         'INFRATAK_DOCKER_NETWORK': 'infratak',
