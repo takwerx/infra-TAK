@@ -210,8 +210,12 @@ def _sweep(node_by_container, state, ps_rc=0, settings=None):
         '_os_security_items': lambda seen, unknown, now=None: [],
         '_detect_cloudtak_plugins': lambda: [],
         '_apply_security_identity': lambda i: i,
+        'time': time,
+        'PATCH_NOW_REPEAT_S': 24 * 3600,
+        '_collect_patch_now_items': lambda feed, unknown, now=None: ([], feed),   # ops #377
     })
-    src = '\n'.join(_cut(f) for f in ('_collect_pending_updates', '_update_notify_check_once'))
+    src = '\n'.join(_cut(f) for f in ('_collect_pending_updates', '_carried_by_unknown',
+                                       '_update_notify_check_once'))
     exec(compile(src, 'app.py', 'exec'), n)
     return n['_update_notify_check_once'](), sent, saved
 

@@ -42,6 +42,22 @@ def test_mediamtx_fresh_install_pin_has_the_csrf_fix():
     assert _v(pin) >= (1, 21, 1)
 
 
+def test_mediamtx_fresh_install_pin_is_1_21_3_ops428():
+    # ops #428: 1.21.3 carries the recording/JWT/camera fixes and the Go net/quic-go advisory bumps.
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    assert _v(pin) >= (1, 21, 3)
+
+
+def test_mediamtx_checksum_grep_matches_upstream_line_format_ops428():
+    # The remote deploy greps checksums.sha256 for `<64 hex> [ *]<tarball>` and fails closed;
+    # upstream writes the binary-mode `<hash> *<file>` form (seen in the real 1.21.3 file).
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    tarball = f'mediamtx_v{pin}_linux_amd64.tar.gz'
+    line = '0' * 64 + f' *{tarball}'
+    assert re.search(rf'^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$', line)
+    assert '"^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$"' in APP
+
+
 def test_no_deploy_template_allows_every_api_origin():
     templates = re.findall(r'mediamtx_yml = f"""(.*?)"""', APP, re.S)
     assert len(templates) == 2
@@ -78,3 +94,22 @@ def test_netbird_vetted_and_dev_pins_are_past_the_relay_fix():
                  'NETBIRD_SERVER_DEV_IMAGE', 'NETBIRD_DASHBOARD_DEV_IMAGE'):
         val = re.search(rf'^{name} = "([^"]+)"', APP, re.M).group(1)
         assert ':latest' not in val and re.search(r':v?\d+\.\d+\.\d+$', val), name
+
+
+def test_netbird_dev_trial_pair_is_0_82_and_vetted_pair_is_unchanged():
+    # ops #427: 0.82.0 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
+    # the gated T&E is green and the lead promotes it, so main boxes stay on 0.80.0 / v2.94.0.
+    def pin(name):
+        return re.search(rf'^{name} = "[^:"]+:v?([^"]+)"', APP, re.M).group(1)
+    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.0'
+    assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.96.0'
+    assert pin('NETBIRD_SERVER_IMAGE') == '0.80.0'
+    assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.94.0'
+    assert _v(pin('NETBIRD_SERVER_DEV_IMAGE')) >= _v(pin('NETBIRD_SERVER_IMAGE'))
+
+
+def test_netbird_never_configures_a_mysql_store():
+    # ops #427: NetBird 0.82.0 removed the MySQL store. infra-TAK must keep relying on the
+    # default (sqlite) store, so no NetBird config it writes may name another engine.
+    assert not re.search(r'engine:\s*["\']?mysql', APP, re.I)
+    assert not re.search(r'NB_STORE_ENGINE|NETBIRD_STORE_ENGINE', APP)

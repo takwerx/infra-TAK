@@ -4,10 +4,16 @@
 # detects sustained degradation, and sends an email alert.
 #
 # Log: /var/lib/takguard/diskio_history.csv  (timestamp,mb_per_sec)
-# Alert: fires when 4 KB commit latency (1h avg) exceeds WARN_MS_PER_COMMIT, or
-#        when throughput is below WARN_MBPS / under 30% of the 24-hour average —
-#        over the last hour if latency is degraded or unknown, but for EVERY
-#        reading of the last 3 hours if latency is healthy (ops #229).
+# Alert: fires on a problem a user would notice or that puts data at risk:
+#        - 4 KB commit latency above WARN_MS_PER_COMMIT on EVERY reading of the
+#          last 3 hours (sustained), or above SEVERE_MS_PER_COMMIT on each of the
+#          last 3 readings (a real stall, alerts within the hour) — ops #429;
+#        - or throughput below WARN_MBPS / under 30% of the 24-hour average —
+#          over the last hour if latency is degraded or unknown; but with commit
+#          latency measured and healthy, only a COLLAPSE counts: EVERY reading of
+#          the last 3 hours under TP_COLLAPSE_MBPS (ops #229, ops #429 round 2).
+#        At most one email per box per 7 days (per 24 h for a stall), plus one
+#        "recovered" email when an alert that was sent clears.
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 HISTORY="/var/lib/takguard/diskio_history.csv"
@@ -33,6 +39,30 @@ LAT_OPS=256
 # constants, replayed against a month of test6/test8/test12/nuc history.
 SUSTAIN_SAMPLES=12
 SUSTAIN_MAX_AGE_S=14400
+# ops #429: a 1-hour latency average just over WARN_MS_PER_COMMIT (10.2 to 13.5 ms)
+# is not a problem anyone notices: test6 sent 7 emails in 2.5 days and garesponder
+# 1, all with single probes swinging between 2 and 46 ms and nothing down. Latency
+# now counts as degraded only when it is (a) over the ceiling on EVERY one of the
+# last LAT_SUSTAIN_SAMPLES readings, all taken in the last SUSTAIN_MAX_AGE_S, or
+# (b) over SEVERE_MS_PER_COMMIT on each of the last SEVERE_SAMPLES readings, all
+# in the last SEVERE_MAX_AGE_S (3 readings at the 15-min timer = a real stall,
+# flagged inside the hour). Fleet constants. One email per ALERT_EVERY_MIN, and
+# a "recovered" email follows an alert that was sent (DEGRADED_FILE).
+LAT_SUSTAIN_SAMPLES=12
+SEVERE_MS_PER_COMMIT=30
+SEVERE_SAMPLES=3
+SEVERE_MAX_AGE_S=4500
+ALERT_EVERY_MIN=1440
+# ops #429 round 2: test6's normal 10 MB dsync throughput is 40 to 50 MB/s (median
+# 44.6 over Oct 28 to Nov 3), so a 50 MB/s floor sat inside normal and a busy 3 h
+# (all 12 readings 8 to 46 MB/s, commits 5 to 34 ms) still sent the email. While
+# commit latency is measured and healthy, throughput alone alerts only on a collapse
+# (every reading of the last 3 h under TP_COLLAPSE_MBPS), the way a throttled disk
+# looks. WARN_MBPS still applies to the 1-hour average when latency is degraded or
+# unmeasured. Anything short of a stall repeats at most weekly; a stall daily.
+TP_COLLAPSE_MBPS=25
+ALERT_REPEAT_MIN=10080
+DEGRADED_FILE="/var/lib/takguard/diskio_degraded"
 
 mkdir -p /var/lib/takguard
 
@@ -160,6 +190,21 @@ MAX_SUSTAIN=$(tail -n +2 "$HISTORY" | tail -n "$SUSTAIN_SAMPLES" | awk -F, -v c=
   c != "" && $1 >= c { if (n == 0 || $2 + 0 > m) m = $2 + 0; n++ }
   END { if (n == want) printf "%.1f", m; else print "" }')
 
+# Lowest of the last N latency readings, or empty unless there are N and all are
+# newer than the cutoff. Lowest > threshold means every reading is over it.
+lat_lowest() {
+  [ -f "$LAT_HISTORY" ] || return 0
+  tail -n +2 "$LAT_HISTORY" | tail -n "$1" | awk -F, -v c="$2" -v want="$1" '
+    c != "" && $1 >= c { if (n == 0 || $3 + 0 < m) m = $3 + 0; n++ }
+    END { if (n == want) printf "%.2f", m }'
+}
+iso_ago() {
+  date -u -d "@$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || \
+    date -u -r "$((NOW_EPOCH - $1))" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo ""
+}
+LAT_LOWEST_SUSTAIN=$(lat_lowest "$LAT_SUSTAIN_SAMPLES" "$SUSTAIN_CUTOFF")
+LAT_LOWEST_SEVERE=$(lat_lowest "$SEVERE_SAMPLES" "$(iso_ago "$SEVERE_MAX_AGE_S")")
+
 logger -t takguard-diskio "Benchmark: ${MB_S} MB/s | 1h avg: ${AVG_1H} MB/s | 24h avg: ${AVG_24H} MB/s (${SAMPLES_24H} samples)"
 if [ -n "$MS_PER_COMMIT" ]; then
   logger -t takguard-diskio "Latency: ${MS_PER_COMMIT} ms/commit (${LAT_KB_S} kB/s 4k) | 1h avg: ${LAT_AVG_1H:-n/a} ms/commit (ceiling ${WARN_MS_PER_COMMIT} ms)"
@@ -171,20 +216,30 @@ fi
 
 NEED_ALERT=false
 ALERT_REASON=""
+ALERT_STALL=false
 
-# Latency-ceiling gate — the signal the throughput gates miss. A chronically-slow
+# Latency gate — the signal the throughput gates miss. A chronically-slow
 # disk reads fine sequentially while small-block fsync latency — where Postgres
-# commits live — climbs into the seconds. Fleet constant.
+# commits live — climbs into the seconds. Fleet constants; sustained or severe only
+# (ops #429), never one busy hour hovering just over the ceiling.
 LAT_BAD=false
-if [ -n "$LAT_AVG_1H" ] && [ "$(echo "$LAT_AVG_1H > $WARN_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
+LAT_DESC=""
+if [ -n "$LAT_LOWEST_SEVERE" ] && [ "$(echo "$LAT_LOWEST_SEVERE > $SEVERE_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
   LAT_BAD=true
+  ALERT_STALL=true
+  LAT_DESC="Disk commit latency is stalling: each of the last ${SEVERE_SAMPLES} readings is over ${SEVERE_MS_PER_COMMIT} ms/commit (lowest ${LAT_LOWEST_SEVERE} ms; 1h avg ${LAT_AVG_1H} ms) — Postgres commits affected"
+elif [ -n "$LAT_LOWEST_SUSTAIN" ] && [ "$(echo "$LAT_LOWEST_SUSTAIN > $WARN_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
+  LAT_BAD=true
+  LAT_DESC="Disk commit latency has been over the ${WARN_MS_PER_COMMIT} ms ceiling on every reading for the last 3 hours (lowest ${LAT_LOWEST_SUSTAIN} ms; 1h avg ${LAT_AVG_1H} ms) — small-block fsync stall (Postgres commits affected)"
 fi
 
 # Throughput gates. With commit latency measured and healthy, a low hour is the box's
 # own I/O, not the disk (ops #229): only the best of the last 3 h counts, so every
 # reading must be low. Latency degraded or not measured: the last-hour average, as before.
+TP_FLOOR="$WARN_MBPS"
 if [ -n "$LAT_AVG_1H" ] && ! $LAT_BAD; then
   TP_VAL="$MAX_SUSTAIN"
+  TP_FLOOR="$TP_COLLAPSE_MBPS"
   TP_DESC="Every reading for the last 3 hours (best ${MAX_SUSTAIN} MB/s)"
 else
   TP_VAL="$AVG_1H"
@@ -192,9 +247,9 @@ else
 fi
 
 if [ -n "$TP_VAL" ]; then
-  if [ "$(echo "$TP_VAL < $WARN_MBPS" | bc -l 2>/dev/null)" = "1" ]; then
+  if [ "$(echo "$TP_VAL < $TP_FLOOR" | bc -l 2>/dev/null)" = "1" ]; then
     NEED_ALERT=true
-    ALERT_REASON="${TP_DESC} is below ${WARN_MBPS} MB/s threshold"
+    ALERT_REASON="${TP_DESC} is below ${TP_FLOOR} MB/s threshold"
   fi
 
   # Use scale>=2 for the division — scale=0 truncates TP_VAL/AVG_24H to 0 whenever it is <1,
@@ -210,17 +265,19 @@ fi
 
 if $LAT_BAD; then
   NEED_ALERT=true
-  ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}Disk commit latency (${LAT_AVG_1H} ms/commit 1h avg) exceeds ${WARN_MS_PER_COMMIT} ms ceiling — small-block fsync stall (Postgres commits affected)"
+  ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}${LAT_DESC}"
 fi
 
-# ── 6. Send alert (max once per 6 hours) ──
+# ── 6. Send alert (once a week, once a day for a stall, then a "recovered" email) ──
 # Skip email/SMS only when /opt/tak-guarddog/diskio_email_off exists (set from Guard Dog UI).
 # Benchmark + CSV + syslog above still run.
 if $NEED_ALERT; then
+  REPEAT_MIN="$ALERT_REPEAT_MIN"
+  $ALERT_STALL && REPEAT_MIN="$ALERT_EVERY_MIN"
   if [ -f /opt/tak-guarddog/diskio_email_off ]; then
     logger -t takguard-diskio "Alert condition met — email/SMS disabled for disk I/O (UI); not sending."
-  elif [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +360 2>/dev/null)" ]; then
-    touch "$ALERT_SENT_FILE"
+  elif [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +"$REPEAT_MIN" 2>/dev/null)" ]; then
+    touch "$ALERT_SENT_FILE" "$DEGRADED_FILE"
 
     RECENT=$(tail -n 8 "$HISTORY" | tail -n +1)
     SUBJ="⚠ Disk I/O Degradation on $SERVER_IDENTIFIER"
@@ -259,6 +316,37 @@ VPS provider.
     fi
   fi
 fi
+
+# ── 7. Recovered (ops #429): one short email after an alert that was actually sent ──
+# DEGRADED_FILE exists only after an alert email went out. It is cleared the first
+# run the alert condition is gone and the 1-hour latency average is back under the
+# ceiling (or not measured), so a flapping disk can't produce "recovered" mails
+# without a matching alert. Honors diskio_email_off like the alert does.
+if ! $NEED_ALERT && [ -f "$DEGRADED_FILE" ]; then
+  LAT_OK=true
+  if [ -n "$LAT_AVG_1H" ] && [ "$(echo "$LAT_AVG_1H > $WARN_MS_PER_COMMIT" | bc -l 2>/dev/null)" = "1" ]; then
+    LAT_OK=false
+  fi
+  if $LAT_OK; then
+    rm -f "$DEGRADED_FILE"
+    if [ ! -f /opt/tak-guarddog/diskio_email_off ]; then
+      SUBJ="✅ Disk I/O recovered on $SERVER_IDENTIFIER"
+      BODY="Guard Dog: disk I/O is back to normal.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS
+
+Throughput (1 MB sequential): ${MB_S} MB/s now, ${AVG_1H} MB/s last-hour average
+Commit latency (4 KB sync): ${MS_PER_COMMIT:-n/a} ms/commit now, ${LAT_AVG_1H:-n/a} ms/commit last-hour average (ceiling ${WARN_MS_PER_COMMIT} ms)
+
+No action needed.
+
+— Guard Dog"
+      echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+    fi
+  fi
+fi
+
 # NOTE: there is deliberately NO `else rm -f "$ALERT_SENT_FILE"` here.
 # Clearing the sentinel on a single good reading defeats the 6h debounce entirely:
 # this timer fires every 15 minutes, so a disk that flaps degraded -> OK -> degraded
@@ -266,9 +354,9 @@ fi
 # three alerts for one server in 6h31m against a documented 6h floor.
 # That is worst precisely when the alert matters most -- noisy-neighbor VPS
 # contention, the condition this check exists to detect, is intermittent by nature.
-# The `-mmin +360` age gate above is the whole debounce: the sentinel is touched only
-# when an alert is actually sent, so a sustained problem re-alerts every 6h and a
-# genuinely new incident alerts at most 6h later. Do not "fix" this by resetting on
-# recovery. (v10.1.70 W2)
+# The `-mmin +ALERT_EVERY_MIN` age gate above is the whole debounce: the sentinel is
+# touched only when an alert is actually sent, so a sustained problem re-alerts
+# every 7 days, or every 24h while it is a stall (was 6h until ops #429), and a
+# genuinely new incident alerts at most that long later. Do not "fix" this by resetting on recovery. (v10.1.70 W2)
 
 exit 0

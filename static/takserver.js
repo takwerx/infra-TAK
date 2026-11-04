@@ -43,6 +43,29 @@ async function syncWebadmin(){
     }
     catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';} if(btn){btn.disabled=false;btn.style.opacity='1';}}
 }
+async function fixWebadminAdmin(){
+    var btn=document.getElementById('fix-webadmin-admin-btn');
+    var out=document.getElementById('fix-webadmin-admin-log');
+    if(!confirm('Check webadmin and restart TAK Server if it does not treat webadmin as admin?\n\nA restart takes about 2 minutes; connected clients reconnect on their own.'))return;
+    if(btn){btn.disabled=true;btn.style.opacity='0.7';}
+    if(out){out.style.display='block';out.style.color='var(--text-secondary)';out.textContent='Starting...';}
+    var done=function(){if(btn){btn.disabled=false;btn.style.opacity='1';}};
+    try{
+        var r=await fetch('/api/takserver/webadmin-fix-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        var d=await r.json();
+        if(!r.ok||!d.started){if(out){out.textContent=d.error||'Failed to start';out.style.color='var(--red)';}done();return;}
+    }catch(e){if(out){out.textContent='Error: '+e.message;out.style.color='var(--red)';}done();return;}
+    var poll=async function(){
+        try{
+            var r=await fetch('/api/takserver/webadmin-fix-admin/status');
+            var d=await r.json();
+            if(out){out.textContent=(d.log||[]).join('\n')||'Working...';out.scrollTop=out.scrollHeight;}
+            if(d.complete&&!d.running){if(out)out.style.color=d.error?'var(--red)':'var(--green)';done();return;}
+        }catch(e){}
+        setTimeout(poll,3000);
+    };
+    setTimeout(poll,1500);
+}
 async function setWebadminPassword(){
     var pwEl=document.getElementById('set-webadmin-pw');
     var confirmEl=document.getElementById('set-webadmin-pw-confirm');
@@ -190,7 +213,11 @@ if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('tak-cert-row')){loadTakCertRow();}
+if(document.getElementById('tak-signer-row')){loadTakSignerRow();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
+// GH #128 checklist on the rotate dialogs too: same rule as deploy, same rule the server enforces.
+var _TAK_ROTATE_CA_NAME_IDS=['rotate-ca-name','rotate-root-name','rotate-root-int-name'];
+_TAK_ROTATE_CA_NAME_IDS.forEach(function(id){var ci=document.getElementById(id);if(ci)ci.addEventListener('input',function(){validateCaName(id)});});
 function refreshTakServerCAState(){
   if(document.getElementById('cert-expiry-info'))loadCertExpiry();
   if(document.getElementById('rotate-ca-info'))loadCAInfo();
@@ -373,13 +400,15 @@ async function loadTakCertRow(){
     var restarting=/^Step 4\/4/.test(step);
     el.innerHTML='<div style="display:flex;align-items:center;gap:12px">'
       +'<span style="width:18px;height:18px;flex:none;border:2px solid rgba(59,130,246,0.25);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite"></span>'
-      +'<div><div style="font-weight:600;color:var(--accent)">Fixing TAK Server\'s certificate… <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
+      +'<div><div style="font-weight:600;color:var(--accent)">'+(job.kind==='signer'?'Switching who signs TAK Server\'s certificate…':'Fixing TAK Server\'s certificate…')+' <span style="color:var(--text-dim);font-weight:400">'+el_t+'</span></div>'
       +'<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">'+escapeHtml(step)
       +(restarting?' TAK Server usually takes 1–3 minutes to come back; devices reconnect on their own.':'')+'</div></div></div>'
       +_takCertLog(job);
     var lg=el.lastChild;if(lg)lg.scrollTop=lg.scrollHeight;
+    var sr=document.getElementById('tak-signer-row');if(sr)sr.style.display='none';
     setTimeout(loadTakCertRow,2000);return;
   }
+  if(_takCertSawRun)loadTakSignerRow();
   // Never vanish: a busy box can miss one read (test12 under load, 2026-10-22). Say we're
   // checking, retry a few times, then say plainly that it couldn't be read, with a retry.
   if(!st||st.state==='unknown'){
@@ -404,7 +433,7 @@ async function loadTakCertRow(){
     _takCertStyle(el,'ok');
     el.style.padding=justFixed?'14px 20px':'8px 16px';
     el.innerHTML='<div title="Names on the certificate: '+escapeHtml((st.live||[]).join(', '))+'" style="font-weight:600;color:var(--green);font-size:12px">✓ TAK Server certificate covers '+escapeHtml(dom||st.expected[0]||'this server')+'</div>'
-      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Fixed. TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
+      +(justFixed?'<div style="font-size:12px;color:var(--text-secondary);margin-top:6px">'+(job.kind==='signer'?'Switched.':'Fixed.')+' TAK Server is presenting the new certificate and devices kept their enrollment.</div>':'');
     return;
   }
   var miss=st.missing||[],head=(dom&&miss.indexOf(dom)>=0)?dom:miss[0];
@@ -416,6 +445,73 @@ async function loadTakCertRow(){
     +'Fixing keeps your CA, so enrolled devices don\'t re-enroll. TAK Server restarts and devices reconnect in about 1–2 minutes.</div>'
     +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Missing: '+miss.map(escapeHtml).join(', ')+(names?' · on the certificate now: '+names:'')+'</div>'
     +_takCertFixBtn+(failed?_takCertLog(job):'');
+}
+// v10.3.5 W3: who signs TAK Server's own certificate. ATAK trusts the root it enrolled with and
+// ignores the chain the server sends, so the signer decides whether rotating the intermediate
+// later drops every device (intermediate-signed) or not (root-signed).
+var _takSignerInfo=null;
+function _takSignerBtn(to,label){
+  return '<button type="button" class="tak-signer-btn" data-signer="'+to+'" onclick="switchTakSigner(this.dataset.signer)" style="padding:6px 14px;background:var(--bg-input,#0a0e1a);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:12px;font-weight:600;cursor:pointer">'+label+'</button>';
+}
+async function loadTakSignerRow(){
+  var el=document.getElementById('tak-signer-row');if(!el)return;
+  var d;
+  try{var r=await fetch('/api/takserver/server-cert/signer');d=await r.json();}catch(e){return;}
+  if(!d||!d.success){el.style.display='none';return;}
+  _takSignerInfo=d;
+  var root=escapeHtml(d.root_cn||'root CA'),inter=escapeHtml(d.intermediate_cn||'intermediate CA');
+  var who,sub,btns='';
+  if(d.mode==='root'){
+    who='<span style="color:var(--green)">Root CA</span> <span style="color:var(--text-dim)">('+root+')</span>';
+    sub='Rotating the intermediate CA won\'t disconnect devices: they keep connecting while users move to the new CA.';
+    btns=_takSignerBtn('intermediate','Switch to intermediate-signed');
+  }else if(d.mode==='intermediate'){
+    who='<span style="color:var(--yellow)">Intermediate CA</span> <span style="color:var(--text-dim)">('+inter+')</span>';
+    sub='Rotating the intermediate CA will disconnect every device until it scans a new QR code. Signing with the root CA avoids that.';
+    btns=_takSignerBtn('root','Switch to root-signed');
+  }else{
+    who='<span style="color:var(--yellow)">'+escapeHtml(d.issuer_cn||'unknown')+'</span> <span style="color:var(--text-dim)">(not this server\'s current CA)</span>';
+    sub='Reissue it with one of this server\'s CAs.';
+    btns=_takSignerBtn('root','Sign with the root CA')+' '+_takSignerBtn('intermediate','Sign with the intermediate CA');
+  }
+  var blocked=(d.blockers||[]);
+  el.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'
+    +'<div><div style="font-weight:600;color:var(--text-secondary)">Server certificate signed by: '+who+'</div>'
+    +'<div style="font-size:12px;color:var(--text-dim);margin-top:4px">'+sub+'</div>'
+    +(blocked.length?'<div style="font-size:12px;color:var(--yellow);margin-top:4px">'+blocked.map(escapeHtml).join(' ')+'</div>':'')
+    +'</div>'+(blocked.length?'':'<div style="display:flex;gap:8px;flex-wrap:wrap">'+btns+'</div>')+'</div>';
+  el.style.display='block';
+  _takRotateCardText();
+}
+// v10.3.5 W4: what Rotate does to devices depends on who signs the server cert. Rotate keeps
+// the mode, and anything not root-signed is reissued with the new intermediate.
+function _takRotateCardText(){
+  var el=document.getElementById('rotate-ca-desc'),d=_takSignerInfo;if(!el||!d)return;
+  var base='Create a new Intermediate CA signed by your Root CA. New client certs are signed by the new CA; the old CA stays trusted until you use Revoke Old CA. ';
+  el.innerHTML=d.mode==='root'
+    ?base+'<strong style="color:var(--green)">Devices keep connecting. Users have 30 days to move.</strong>'
+    :base+'<strong style="color:var(--red)">Every device disconnects</strong> until it scans a new QR code. <a href="#tak-signer-row" style="color:var(--cyan)">Switch to root-signed</a> first to avoid this.';
+}
+function _takRotateConfirmText(newName){
+  var head='This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server.\n\n';
+  if(_takSignerInfo&&_takSignerInfo.mode==='root')
+    return head+'The server certificate stays signed by the root CA, so devices keep connecting. Users then have 30 days to scan a new QR code (mobile); CloudTAK users have nothing to do.\n\nContinue?';
+  return head+'⚠ EVERY DEVICE WILL DISCONNECT until it scans a new QR code: the server certificate is signed by the intermediate CA, and no device trusts the new one yet.\n\nTo avoid this, cancel and use "Switch to root-signed" at the top of this page first.\n\nRotate anyway?';
+}
+async function switchTakSigner(to){
+  var d=_takSignerInfo||{},root=d.root_cn||'the root CA',inter=d.intermediate_cn||'the intermediate CA';
+  var msg=to==='root'
+    ?'Sign TAK Server\'s certificate with the root CA ('+root+')?\n\n• Enrolled devices keep working; TAK Server restarts and they reconnect in about 1–2 minutes\n• Afterwards, rotating the intermediate CA no longer disconnects every device\n• If this server federates, peers must trust this server\'s root CA, not only its intermediate\n• The current certificate is backed up first and restored if anything fails'
+    :'Sign TAK Server\'s certificate with the intermediate CA ('+inter+')?\n\n• Devices enrolled on '+inter+' keep working; TAK Server restarts and they reconnect in about 1–2 minutes\n• Devices still enrolled on an older intermediate CA will be disconnected\n• Afterwards, rotating the intermediate CA disconnects every device until it scans a new QR code\n• The current certificate is backed up first and restored if anything fails';
+  if(!confirm(msg))return;
+  var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
+  document.querySelectorAll('.tak-signer-btn').forEach(function(b){b.disabled=true;});
+  try{
+    var r=await fetch('/api/takserver/server-cert/signer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({signer:to,password:pw})});
+    var j=await r.json();
+    if(!j.success){alert(j.error||'Could not start the switch');loadTakSignerRow();return;}
+  }catch(e){alert('Error: '+e.message);loadTakSignerRow();return;}
+  _takCertSawRun=true;loadTakCertRow();
 }
 async function fixTakCert(){
   if(!confirm('Reissue TAK Server\'s certificate with this server\'s names?\n\n• Your CA stays the same, so enrolled devices keep working\n• TAK Server restarts; devices reconnect in about 1–2 minutes\n• The current certificate is backed up first and restored if anything fails'))return;
@@ -470,6 +566,18 @@ async function loadCAInfo(){
       }
       h+='</div>';
     }
+    // v10.3.5 W6: a root in TAK Server's own trust list accepts any intermediate the root signed.
+    if(d.trust_list_roots){
+      h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      h+='<span style="color:var(--text-secondary);min-width:140px">Server trust list</span>';
+      var tlr=d.trust_list_roots.map(escapeHtml).join(', ');
+      h+=!d.trust_list_roots.length
+        ?'<span style="color:var(--green)">intermediate CAs only ✓</span>'
+        :(d.old_cas_in_truststore&&d.old_cas_in_truststore.length)
+          ?'<span style="color:var(--yellow)">includes root CA ('+tlr+'). Revoke Old CA removes it along with the old CA.</span>'
+          :'<span style="color:var(--text-dim)">includes root CA ('+tlr+'). Taken out the first time you revoke an old CA.</span>';
+      h+='</div>';
+    }
     infoEl.innerHTML=h||'No CA information available.';
     if(ctrlEl)ctrlEl.style.display='block';
     var nameInput=document.getElementById('rotate-ca-name');
@@ -490,6 +598,8 @@ async function loadCAInfo(){
     if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
     var rootIntInput=document.getElementById('rotate-root-int-name');
     if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
+    if(rootNameInput&&rootNameInput.value)validateCaName('rotate-root-name');
+    if(rootIntInput&&rootIntInput.value)validateCaName('rotate-root-int-name');
     var rotValInput=document.getElementById('rotate-ca-validity-days');
     var rotValHint=document.getElementById('rotate-ca-validity-hint');
     if(rotValInput&&d.root_ca&&d.root_ca.days_left!=null){
@@ -519,6 +629,10 @@ async function loadCAInfo(){
         revokeEl.style.display='none';
       }
     }
+    // W11: during a rotation window the list loads by itself; otherwise it's one click.
+    _takOldCaNames=d.old_ca_names||{};
+    loadCaRotation();
+    if((d.old_cas_in_truststore||[]).length||_caMig)loadCaMigration();
     // Current cert password (masked) for rotate cards
     try{
       var pwR=await fetch('/api/takserver/cert-password');
@@ -541,7 +655,14 @@ async function loadSecurityConfig(){
     var r=await fetch('/api/takserver/security-config');
     var d=await r.json();
     if(d.validity_days!=null){input.value=d.validity_days;}
-    if(msg)msg.textContent='';
+    // v10.3.5 W9: an enrolled cert can't outlive the intermediate that signs it.
+    if(d.cap_days!=null){input.max=d.cap_days;}
+    if(msg){
+      msg.style.color=(d.cap_days!=null&&d.validity_days>d.cap_days)?'var(--yellow)':'var(--text-dim)';
+      msg.textContent=d.cap_days==null?'':(d.validity_days>d.cap_days
+        ?'Max '+d.cap_days+' (what the intermediate CA has left). New certs still get '+d.validity_days+' until you Save.'
+        :'Max '+d.cap_days+' (what the intermediate CA has left).');
+    }
   }catch(e){if(msg)msg.textContent='Could not load';}
 }
 
@@ -557,7 +678,7 @@ async function saveSecurityConfig(){
   try{
     var r=await fetch('/api/takserver/security-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({validity_days:v})});
     var d=await r.json();
-    if(d.success){msg.textContent=d.message||'Saved. TAK Server restarted.';msg.style.color='var(--green)';}
+    if(d.success){msg.textContent=d.message||'Saved. TAK Server restarted.';msg.style.color='var(--green)';if(d.validity_days!=null)input.value=d.validity_days;}
     else{msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}
   }catch(e){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
   if(btn)btn.disabled=false;
@@ -567,14 +688,17 @@ async function rotateIntCA(){
   var nameInput=document.getElementById('rotate-ca-name');
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
-  if(!/^[A-Za-z0-9][A-Za-z0-9.-]{0,63}$/.test(newName)){alert('CA names only allow letters, numbers, hyphens and dots (e.g. INTERMEDIATE-CA-02).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
-  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected: the old CA and every earlier CA in the truststore stay trusted.\n\nContinue?'))return;
+  if(!validateCaName('rotate-ca-name')){alert('Fix the CA name first (see the checklist under it).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
+  if(!confirm(_takRotateConfirmText(newName)))return;
+  var adminPw=prompt('Enter the infra-TAK admin password to continue:');if(!adminPw)return;
   var validityEl=document.getElementById('rotate-ca-validity-days');
   var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
   if(isNaN(validityDays)||validityDays<1)validityDays=730;
   var newPwEl=document.getElementById('rotate-ca-new-password');
   var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
-  var payload={new_ca_name:newName,intermediate_validity_days:validityDays};
+  var noticeEl=document.getElementById('rotate-ca-notice'),emailEl=document.getElementById('rotate-ca-email-users');
+  var payload={new_ca_name:newName,intermediate_validity_days:validityDays,password:adminPw,
+    notice:noticeEl?noticeEl.value.trim():'',email_users:!!(emailEl&&emailEl.checked&&!emailEl.disabled)};
   if(newPw)payload.new_cert_password=newPw;
   var btn=document.getElementById('rotate-ca-btn');
   var msg=document.getElementById('rotate-ca-msg');
@@ -609,32 +733,236 @@ function pollRotateLog(){
         if(msg){msg.textContent='Rotation failed';msg.style.color='var(--red)';}
       }else{
         if(msg){msg.textContent='Rotation complete!';msg.style.color='var(--green)';}
+        _caRotShowNotice(d.notice);
       }
       if(btn)btn.disabled=false;
       loadCAInfo();
       loadCertExpiry();
+      loadTakSignerRow();
     }else{
       setTimeout(pollRotateLog,1500);
     }
   }).catch(function(){setTimeout(pollRotateLog,2000);});
 }
 
+// v10.3.5 W10: the rotation window (30 days, fleet constant) and the Day-0 notice.
+var _caRotNoticeEdited=false;
+async function loadCaRotation(){
+  var d;
+  try{d=await (await fetch('/api/takserver/ca-rotation')).json();}catch(e){return;}
+  var esc=escapeHtml;
+  var ta=document.getElementById('rotate-ca-notice');
+  if(ta){
+    if(!_caRotNoticeEdited)ta.value=d.day0_text||'';
+    ta.oninput=function(){_caRotNoticeEdited=true;};
+  }
+  var cnt=document.getElementById('rotate-ca-email-count'),cb=document.getElementById('rotate-ca-email-users');
+  if(cnt)cnt.textContent=d.users_with_email==null?'no Authentik, so no user addresses':d.users_with_email+' with an email on file';
+  if(cb)cb.disabled=!d.users_with_email;
+  var note=document.getElementById('rotate-ca-notice-note');
+  if(note){
+    var n=[];
+    if(!d.relay_ready)n.push('Email Relay isn\'t set up, so nothing will be emailed: the notice is shown here to copy.');
+    else if(!d.admin_email_set)n.push('No Guard Dog alert email is set, so there is no admin copy.');
+    n.push('The admin gets every account still to move, now and on day 23 and 29 of the '+d.window_days+'-day window.');
+    note.textContent=n.join(' ');
+  }
+  // W12: with no Email Relay nobody gets reminded, so the page says it instead.
+  var bn=document.getElementById('ca-rotation-banner');
+  if(bn){
+    if(d.active&&!d.relay_ready&&d.todo_count){
+      bn.style.display='block';
+      bn.innerHTML='<strong style="color:var(--yellow)">Certificate rotation: '+d.days_left+' day'+(d.days_left===1?'':'s')+' left</strong> (until '+esc(d.cutoff_date)+'). '
+        +d.todo_count+' of '+d.accounts+' accounts are still on '+esc(d.old_ca_cn)+'. Email Relay isn\'t set up, so nobody is being reminded. '
+        +'<a href="#" id="ca-rotation-banner-show" style="color:var(--cyan)">Show the list</a>';
+      document.getElementById('ca-rotation-banner-show').onclick=function(e){
+        e.preventDefault();
+        var body=document.getElementById('rotate-ca-body');
+        if(body&&body.style.display==='none')takToggleSection('rotate-ca');
+        loadCaMigration();
+        document.getElementById('ca-mig-section').scrollIntoView({behavior:'smooth'});
+      };
+    }else bn.style.display='none';
+  }
+  var w=document.getElementById('ca-rotation-window');
+  if(!w)return;
+  if(!d.active){w.style.display='none';return;}
+  w.style.display='block';
+  w.innerHTML='<div><strong style="color:var(--yellow)">Rotation window: '+esc(d.old_ca_cn)+' → '+esc(d.new_ca_cn)+'</strong></div>'
+    +'<div>'+d.days_left+' day'+(d.days_left===1?'':'s')+' left (until '+esc(d.cutoff_date)+'). Notices sent: '+esc((d.notices_sent||[]).join(', ')||'none')
+    +(d.relay_ready?'':' · Email Relay isn\'t set up, so reminders are not emailed')+'</div>'
+    +'<label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer"><input type="checkbox" id="ca-rotation-opt-in"'+(d.user_email_opt_in?' checked':'')+'> Also email each affected user their own reminder</label>';
+  document.getElementById('ca-rotation-opt-in').onchange=async function(){
+    var on=this.checked;
+    try{
+      var r=await fetch('/api/takserver/ca-rotation',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_email_opt_in:on})});
+      if(!r.ok)throw new Error((await r.json()).error||('HTTP '+r.status));
+    }catch(e){alert('Could not change it: '+e.message);this.checked=!on;}
+  };
+}
+function _caRotShowNotice(n){
+  var el=document.getElementById('rotate-ca-notice-result');if(!el||!n)return;
+  el.style.display='block';
+  var h='<div style="color:'+(n.sent?'var(--green)':'var(--yellow)')+';margin-bottom:6px">'+escapeHtml(n.message||'')+'</div>';
+  if(!n.sent){
+    h+='<pre id="rotate-ca-notice-text" style="white-space:pre-wrap;margin:0 0 8px 0;font-family:\'JetBrains Mono\',monospace;color:var(--text-primary)">'+escapeHtml(n.text||'')+'</pre>';
+    h+='<button type="button" id="rotate-ca-notice-copy" style="padding:6px 14px;background:rgba(6,182,212,0.12);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Copy</button>';
+  }
+  el.innerHTML=h;
+  var b=document.getElementById('rotate-ca-notice-copy');
+  if(b)b.onclick=function(){navigator.clipboard.writeText(n.text||'').then(function(){b.textContent='Copied';},function(){b.textContent='Select the text and copy it';});};
+}
+
+// v10.3.5 W11: who is still on the old CA — per account, devices and CloudTAK login.
+var _caMig=null,_caMigFilter='todo',_takOldCaNames={};
+async function loadCaMigration(){
+  var btn=document.getElementById('ca-mig-load-btn');
+  if(btn){btn.disabled=true;btn.textContent='Loading...';}
+  try{
+    var r=await fetch('/api/takserver/ca-migration');
+    var d=await r.json();
+    if(!d.ok){
+      document.getElementById('ca-mig-summary').innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Could not read the certificate table')+'</span>';
+    }else{
+      _caMig=d;
+      if(_caMigFilter!=='todo'&&_caMigFilter!==''&&!d.cas.some(function(c){return c.cn===_caMigFilter;}))_caMigFilter='todo';
+      document.getElementById('ca-mig-controls').style.display='block';
+      document.getElementById('ca-mig-csv-btn').style.display='inline-block';
+      renderCaMigration();
+    }
+  }catch(e){document.getElementById('ca-mig-summary').textContent='Could not load: '+e.message;}
+  if(btn){btn.disabled=false;btn.textContent='Refresh';}
+}
+function _caMigMatches(row,q){
+  if(_caMigFilter==='todo'&&row.status!=='needs_move')return false;
+  if(_caMigFilter&&_caMigFilter!=='todo'&&row.cas.indexOf(_caMigFilter)<0)return false;
+  if(!q)return true;
+  if(row.user.toLowerCase().indexOf(q)>=0)return true;
+  return row.devices.some(function(dv){return (dv.callsign||'').toLowerCase().indexOf(q)>=0||dv.uid.toLowerCase().indexOf(q)>=0;});
+}
+function renderCaMigration(){
+  var d=_caMig;if(!d)return;
+  var esc=escapeHtml;
+  var total=d.rows.length,todo=d.rows.filter(function(r){return r.status==='needs_move';}).length;
+  var gone=d.rows.filter(function(r){return r.status==='untrusted';}).length;
+  var old=d.cas.filter(function(c){return !c.current;});
+  var s='';
+  if(!total)s='No live client certificates in TAK Server\'s certificate table.';
+  else if(!todo)s='<span style="color:var(--green)">Nothing left to move: every account still in use is on '+esc(d.current_ca)+' ✓</span>';
+  else{
+    var on=old.map(function(c){return esc(c.cn);}).join(', ')||'an old CA';
+    s='<span style="color:var(--yellow);font-weight:600">'+todo+' of '+total+' accounts still on '+on+'</span>';
+  }
+  if(gone)s+='<div style="color:var(--text-dim)">'+gone+' account'+(gone===1?'':'s')+' only hold certs an earlier Revoke already cut off (retired devices, old feeds): not counted.</div>';
+  if(d.cloudtak&&d.cloudtak.note)s+='<div style="color:var(--text-dim)">'+esc(d.cloudtak.note)+'</div>';
+  if(d.error)s+='<div style="color:var(--yellow)">'+esc(d.error)+' — "trusted" is not shown.</div>';
+  document.getElementById('ca-mig-summary').innerHTML=s;
+  var chips=[['todo','Still to move ('+todo+')'],['','All ('+total+')']].concat(d.cas.map(function(c){return [c.cn,c.cn+(c.current?' (current)':'')+' · '+c.accounts];}));
+  var ch='';
+  chips.forEach(function(c,i){
+    var on=_caMigFilter===c[0];
+    ch+='<button type="button" data-i="'+i+'" style="padding:4px 10px;border-radius:999px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer;border:1px solid '+(on?'var(--cyan)':'var(--border)')+';background:'+(on?'rgba(6,182,212,0.15)':'transparent')+';color:'+(on?'var(--cyan)':'var(--text-secondary)')+'">'+esc(c[1])+'</button>';
+  });
+  var chipsEl=document.getElementById('ca-mig-chips');
+  chipsEl.innerHTML=ch;
+  Array.prototype.forEach.call(chipsEl.querySelectorAll('button'),function(b){b.onclick=function(){_caMigFilter=chips[+b.getAttribute('data-i')][0];renderCaMigration();};});
+  var q=(document.getElementById('ca-mig-search').value||'').trim().toLowerCase();
+  var rows=d.rows.filter(function(r){return _caMigMatches(r,q);});
+  var colors={moved:'var(--green)',needs_move:'var(--yellow)',untrusted:'var(--red)'};
+  var labels={moved:'moved',needs_move:'needs to move',untrusted:'no longer trusted'};
+  var h='';
+  rows.slice(0,500).forEach(function(r){
+    h+='<div style="padding:8px 0;border-top:1px solid var(--border)">';
+    h+='<div><span style="color:var(--text-primary);font-weight:600">'+esc(r.user)+'</span> <span style="color:'+colors[r.status]+'">'+labels[r.status]+'</span></div>';
+    r.devices.forEach(function(dv){
+      h+='<div style="color:var(--text-dim);padding-left:12px">'+esc(dv.callsign||'(no callsign seen)')+' <span style="opacity:.7">'+esc(dv.uid)+'</span> · '+esc(dv.issuer||'?')
+        +(dv.kind==='integration'?' · <span style="color:var(--cyan)">server/integration</span>':(dv.kind==='cloudtak'?' · <span style="color:var(--cyan)">CloudTAK login</span>':''))
+        +(dv.current?' <span style="color:var(--green)">✓</span>':(dv.trusted===false?' <span style="color:var(--red)">not trusted</span>':''))+'</div>';
+    });
+    if(r.cloudtak)h+='<div style="color:var(--text-dim);padding-left:12px">CloudTAK login · '+esc(r.cloudtak.issuer||'?')+(r.cloudtak.current?' <span style="color:var(--green)">✓</span>':'')+'</div>';
+    r.todo.forEach(function(t){h+='<div style="color:var(--yellow);padding-left:12px">→ '+esc(t)+'</div>';});
+    (r.auto||[]).forEach(function(t){h+='<div style="color:var(--text-dim);padding-left:12px">· '+esc(t)+'</div>';});
+    h+='</div>';
+  });
+  if(rows.length>500)h+='<div style="color:var(--text-dim);padding-top:8px">Showing 500 of '+rows.length+'. Search or use CSV for the rest.</div>';
+  if(!rows.length&&total)h='<div style="color:var(--text-dim)">Nothing matches.</div>';
+  document.getElementById('ca-mig-list').innerHTML=h;
+}
+function caMigCsv(){
+  var d=_caMig;if(!d)return;
+  // A leading = + - @ makes a spreadsheet run the cell as a formula; callsigns are set by devices.
+  var cell=function(v){v=v==null?'':String(v);if(/^[=+\-@\t\r]/.test(v))v="'"+v;return '"'+v.replace(/"/g,'""')+'"';};
+  var out=[['user','status','what','uid','callsign','issuer','on_current_ca','trusted','todo'].join(',')];
+  d.rows.forEach(function(r){
+    var todo=r.todo.join('; ');
+    r.devices.forEach(function(dv){out.push([r.user,r.status,dv.kind,dv.uid,dv.callsign,dv.issuer,dv.current,dv.trusted,todo].map(cell).join(','));});
+    if(r.cloudtak)out.push([r.user,r.status,'cloudtak','','',r.cloudtak.issuer,r.cloudtak.current,r.cloudtak.trusted,todo].map(cell).join(','));
+  });
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([out.join('\r\n')+'\r\n'],{type:'text/csv'}));
+  a.download='accounts-by-ca-'+new Date().toISOString().slice(0,10)+'.csv';
+  document.body.appendChild(a);a.click();a.remove();
+}
+// What Revoke cuts off, by name: server/integration clients can't scan a QR, so they're listed.
+async function _caMigRevokeWarning(alias){
+  var cn=(_takOldCaNames[alias]||alias).toLowerCase();
+  try{
+    var d=await (await fetch('/api/takserver/ca-migration')).json();
+    if(!d.ok)return '';
+    var accts=0,integ=[];
+    d.rows.forEach(function(r){
+      var hit=false;
+      r.devices.forEach(function(dv){
+        if(dv.current||(dv.issuer||'').toLowerCase()!==cn)return;
+        hit=true;
+        if(dv.kind==='integration')integ.push(dv.callsign||dv.uid);
+      });
+      if(r.cloudtak&&!r.cloudtak.current&&(r.cloudtak.issuer||'').toLowerCase()===cn)hit=true;
+      if(hit)accts++;
+    });
+    var w='';
+    if(accts)w+='\n\n'+accts+' account'+(accts===1?' is':'s are')+' still on '+(_takOldCaNames[alias]||alias)+' (see Accounts by CA).';
+    if(integ.length)w+='\n\n'+integ.length+' server/integration client'+(integ.length===1?' is':'s are')+' still on '+(_takOldCaNames[alias]||alias)+' and will be cut off: '+integ.slice(0,10).join(', ')+(integ.length>10?' …':'');
+    return w;
+  }catch(e){return '';}
+}
+
 async function revokeOldCA(alias){
-  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThis cannot be undone.'))return;
+  var mig=await _caMigRevokeWarning(alias);
+  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThe root CA also leaves TAK Server\'s trust list, so nothing can get back in through '+alias+'.'+mig+'\n\nThis cannot be undone.'))return;
+  var pw=prompt('Enter the infra-TAK admin password to continue:');if(!pw)return;
   var msgEl=document.getElementById('revoke-ca-msg');
   if(msgEl){msgEl.textContent='Revoking '+alias+'...';msgEl.style.color='var(--text-dim)';}
   try{
-    var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias})});
+    var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias,password:pw})});
     var d=await r.json();
     if(d.success){
-      if(msgEl){msgEl.innerHTML='<span style="color:var(--green)">'+d.message+'</span>';}
-      loadCAInfo();
+      pollRevokeLog._refreshed=false;
+      pollRevokeLog();
     }else{
-      if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+(d.error||'Failed')+'</span>';}
+      if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error||'Failed')+'</span>';}
     }
   }catch(e){
-    if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+e.message+'</span>';}
+    if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+escapeHtml(e.message)+'</span>';}
   }
+}
+// v10.3.5 W7: Revoke is a job; its log shares the Rotate log box.
+function pollRevokeLog(){
+  var logEl=document.getElementById('rotate-ca-log');
+  var msgEl=document.getElementById('revoke-ca-msg');
+  fetch('/api/takserver/revoke-old-ca/status').then(function(r){return r.json();}).then(function(d){
+    if(logEl&&d.log&&d.log.length){logEl.style.display='block';logEl.textContent=d.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
+    if(!d.running&&d.complete){
+      if(msgEl){msgEl.innerHTML='<span style="color:'+(d.error?'var(--yellow)':'var(--green)')+'">'+escapeHtml(d.message||'')+'</span>'
+        +(d.ct_running?' <span style="color:var(--text-dim)">(CloudTAK step still running…)</span>':'');}
+      // W13: CloudTAK's reconnect + sign-out finishes after the job; keep its lines coming.
+      if(!pollRevokeLog._refreshed){pollRevokeLog._refreshed=true;loadCAInfo();loadCertExpiry();loadTakSignerRow();}
+      if(d.ct_running){setTimeout(pollRevokeLog,3000);return;}
+      pollRevokeLog._refreshed=false;
+    }else{
+      setTimeout(pollRevokeLog,1500);
+    }
+  }).catch(function(){setTimeout(pollRevokeLog,2000);});
 }
 
 async function rotateRootCA(){
@@ -643,14 +971,17 @@ async function rotateRootCA(){
   var newRoot=(rootInput?rootInput.value:'').trim();
   var newInt=(intInput?intInput.value:'').trim();
   if(!newRoot||!newInt){alert('Enter names for both the new Root CA and new Intermediate CA');return;}
+  var rootOk=validateCaName('rotate-root-name'),intOk=validateCaName('rotate-root-int-name');
+  if(!rootOk||!intOk){alert('Fix the CA names first (see the checklist under each).\n\nNo underscores or spaces: an underscore makes TAK Server reject every enrolled device.');return;}
   if(!confirm('⚠ FULL ROOT CA ROTATION ⚠\n\nThis will:\n• Create new Root CA: '+newRoot+'\n• Create new Intermediate CA: '+newInt+'\n• Regenerate ALL certificates\n• Restart TAK Server\n• Update TAK Portal\n\nALL existing client connections will be DISCONNECTED.\nUsers must re-enroll via TAK Portal QR code.\n\nAre you sure?'))return;
   if(!confirm('FINAL CONFIRMATION\n\nThis is a destructive operation. The old PKI will be removed.\n\nType your maintenance window: 0900 it goes dark, 0915 scan new QR.\n\nProceed?'))return;
+  var adminPw=prompt('Enter the infra-TAK admin password to continue:');if(!adminPw)return;
   var btn=document.getElementById('rotate-root-btn');
   var msg=document.getElementById('rotate-root-msg');
   var logEl=document.getElementById('rotate-root-log');
   var newPwEl=document.getElementById('rotate-root-new-password');
   var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
-  var payload={new_root_name:newRoot,new_int_name:newInt};
+  var payload={new_root_name:newRoot,new_int_name:newInt,password:adminPw};
   if(newPw)payload.new_cert_password=newPw;
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Starting Root CA rotation...';msg.style.color='var(--text-dim)';}
@@ -686,6 +1017,7 @@ function pollRootRotateLog(){
       if(btn)btn.disabled=false;
       loadCAInfo();
       loadCertExpiry();
+      loadTakSignerRow();
     }else{
       setTimeout(pollRootRotateLog,1500);
     }
@@ -1162,9 +1494,16 @@ function showDeployConfig(){
       '</div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate Authority Names</div>',
       '<div class="grid-2">',
-      '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"></div>',
-      '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"></div>',
+      '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"><div id="root_ca_name-check" style="font-family:\'JetBrains Mono\',monospace;font-size:12px;margin-top:8px"></div></div>',
+      '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"><div id="intermediate_ca_name-check" style="font-family:\'JetBrains Mono\',monospace;font-size:12px;margin-top:8px"></div></div>',
       '</div>',
+      '<div id="server-cert-signer-box" style="margin-top:20px;padding:16px 18px;border:2px solid var(--cyan);border-radius:10px;background:rgba(34,211,238,0.06)">',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--cyan);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:6px">Sign the TAK Server certificate with — choose one</div>',
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">This decides what happens to devices when you rotate the intermediate CA later. You can switch either way afterwards on the TAK Server page.</div>',
+      '<div style="display:flex;flex-direction:column;gap:8px">',
+      '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;color:var(--text-secondary);font-size:14px"><input type="radio" name="server_cert_signer" value="root" style="width:18px;height:18px;margin-top:1px;accent-color:var(--cyan)"><span><span style="color:var(--text-primary);font-weight:600">Root CA (recommended)</span><br><span style="color:var(--text-dim);font-size:12px">Rotating the intermediate CA later does not disconnect devices: they keep connecting while users move to the new CA over 30 days.</span></span></label>',
+      '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;color:var(--text-secondary);font-size:14px"><input type="radio" name="server_cert_signer" value="intermediate" style="width:18px;height:18px;margin-top:1px;accent-color:var(--cyan)"><span><span style="color:var(--text-primary);font-weight:600">Intermediate CA (TAK Server default)</span><br><span style="color:var(--text-dim);font-size:12px">Rotating the intermediate CA later disconnects every device until it scans a new QR code.</span></span></label>',
+      '</div></div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate validity (days)</div>',
       '<div class="grid-2" style="margin-bottom:8px">',
       '<div class="form-field"><label>Intermediate CA validity (days)</label><input type="number" id="intermediate_ca_validity_days" placeholder="730" min="1" max="3652" value="730" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Default 730 (2 years)</span></div>',
@@ -1213,7 +1552,7 @@ function showDeployConfig(){
       updateUploadHint();
       updateDeployModeFirstHint();
     });
-    const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
+    ['root_ca_name','intermediate_ca_name'].forEach(function(id){const ci=document.getElementById(id);if(ci)ci.addEventListener('input',function(){validateCaName(id)})});const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
 }
 
 function toggleWebadminPassword(){const a=document.getElementById('webadmin-password-area');if(a)a.style.display=document.getElementById('enable_admin_ui').checked?'block':'none'}
@@ -1228,6 +1567,15 @@ function toggleShowPassword(){const p=document.getElementById('webadmin_password
 
 function checkPasswordMatch(){const p=document.getElementById('webadmin_password').value;const c=document.getElementById('webadmin_password_confirm').value;const el=document.getElementById('password-match');if(!c){el.innerHTML='';return}if(p===c)el.innerHTML='<span style="color:var(--green)">\u2713 Passwords match</span>';else el.innerHTML='<span style="color:var(--red)">\u2717 Passwords do not match</span>'}
 
+// GH #128: same rule as _CA_NAME_RE in app.py — an underscore makes TAK reject every enrolled device.
+function validateCaName(id){
+    const v=document.getElementById(id).value.trim();const el=document.getElementById(id+'-check');
+    if(!v){el.innerHTML='';return false}
+    const c=[{t:!/_/.test(v),l:'no underscores'},{t:!/\s/.test(v),l:'no spaces'},{t:/^[A-Za-z0-9.\-\s_]*$/.test(v),l:'letters, numbers, - and . only'},{t:/^[A-Za-z0-9]/.test(v),l:'starts with letter/number'},{t:v.length<=64,l:'64 chars max'}];
+    var h='';c.forEach(function(x){h+='<span style="color:'+(x.t?'var(--green)':'var(--red)')+';">'+(x.t?'\u2713':'\u2717')+' '+x.l+'</span> &nbsp; '});
+    el.innerHTML=h;
+    return c.every(function(x){return x.t});
+}
 function validatePassword(){
     const p=document.getElementById('webadmin_password').value;const el=document.getElementById('password-validation');
     if(!p){el.innerHTML='';return false}
@@ -1842,7 +2190,10 @@ async function startDeploy(){
     if(issVal!=null&&(isNaN(issVal)||issVal<1))issVal=null;
     var certPwEl=document.getElementById('cert_password');
     var certPw=certPwEl?(certPwEl.value||'').trim():'';
-    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
+    // v10.3.5 W2: no default — the operator has to pick who signs the server certificate.
+    const signerPick=document.querySelector('input[name="server_cert_signer"]:checked');
+    if(!signerPick){var sb=document.getElementById('server-cert-signer-box');if(sb)sb.scrollIntoView({behavior:'smooth',block:'center'});alert('Choose who signs the TAK Server certificate: Root CA or Intermediate CA.');return;}
+    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode,server_cert_signer:signerPick.value};
     document.getElementById('deploy-log-area').style.display='block';
     if(typeof initLogToolbar==='function')initLogToolbar('deploy-log');
     try{const r=await fetch('/api/deploy/takserver',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});const d=await r.json();if(d.success)pollDeployLog();else{document.getElementById('deploy-log').textContent='✗ '+d.error;btn.disabled=false;btn.textContent='🚀 Deploy TAK Server';btn.style.opacity='1';btn.style.cursor='pointer'}}

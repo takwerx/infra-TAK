@@ -217,7 +217,8 @@ def _verify_ports(settings, **overrides):
     parts = []
     for n in ast.parse(APP).body:
         if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in (
-                '_CONN_VERIFY_PORTS', 'ATLAS_DEVICE_PORT', 'REMOTE_ASSIST_DEVICE_PORT')
+                '_CONN_VERIFY_PORTS', 'ATLAS_DEVICE_PORT', 'REMOTE_ASSIST_DEVICE_PORT',
+                'CLOUDTAK_VIDEO_CONTROL_PORT')
                 for t in n.targets):
             parts.append(ast.get_source_segment(APP, n))
         if isinstance(n, ast.FunctionDef) and n.name == '_conn_verify_ports':
@@ -254,6 +255,56 @@ def test_verify_probes_cloudtak_video_only_for_a_local_cloudtak():
     assert not {18554, 11935} & set(_verify_ports(remote, os=local))
 
 
+def test_verify_probes_cloudtak_video_control_port_9997_for_a_local_cloudtak():
+    """ops #473: CloudTAK forces :9997 onto every media URL, so opening a video from a CoT
+    marker calls https://<video name>:9997. Nothing probed it, and the relay did not carry
+    it, so nuc said "Failed to generate proxy stream" with the stream itself healthy."""
+    local = _fake_os(existing={'/home/takwerx/CloudTAK/docker-compose.yml'})
+    assert 9997 not in _verify_ports({})
+    label, required = _verify_ports({}, os=local)[9997]
+    assert required and 'video control' in label
+    remote = {'cloudtak_deployment': {'target_mode': 'remote'}}
+    assert 9997 not in _verify_ports(remote, os=local)
+
+
+def test_relay_forwards_and_documents_cloudtak_video_control_port():
+    assert _app_const('CLOUDTAK_VIDEO_CONTROL_PORT') == 9997
+    assert 9997 in _relay_tcp_forwards()
+    assert 9997 in _table_ports(RELAY_DOC) and 9997 in _ingress_ports('tcp')
+    assert 9997 in _table_ports(_readme_tier1()) and 9997 in _table_ports(DDNS_DOC)
+
+
+def test_blocked_9997_says_what_breaks_in_plain_words():
+    hints = _app_const('_CONN_BLOCKED_HINTS')
+    assert 'Failed to generate proxy stream' in hints[9997]
+    assert 'Update Relay' in hints[9997] and '9997' in hints[9997]
+    assert 'probe[\'hint\'] = _CONN_BLOCKED_HINTS.get(port)' in APP
+
+
+def _bind_addrs(settings, lan_ip):
+    src = ''
+    for n in ast.parse(APP).body:
+        if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == '_CONN_BOX_WG_IP' for t in n.targets):
+            src += ast.get_source_segment(APP, n) + '\n'
+        if isinstance(n, ast.FunctionDef) and n.name == '_ct_video_bind_addrs':
+            src += ast.get_source_segment(APP, n) + '\n'
+    ns = {}
+    exec(compile(src, 'app.py', 'exec'), ns)
+    return ns['_ct_video_bind_addrs'](settings, lan_ip)
+
+
+def test_caddy_video_listener_also_binds_the_tunnel_address_when_a_relay_is_set():
+    """The relay DNATs :9997 to the box's tunnel address; a listener bound to the LAN
+    address alone never sees it."""
+    assert _bind_addrs({}, '10.10.10.51') == '10.10.10.51'
+    assert _bind_addrs({'connectivity_anchor': {}}, '10.10.10.51') == '10.10.10.51'
+    relayed = {'connectivity_anchor': {'anchor_ip': '203.0.113.9'}}
+    assert _bind_addrs(relayed, '10.10.10.51') == '10.10.10.51 172.31.99.2'
+    assert _bind_addrs(relayed, '172.31.99.2') == '172.31.99.2'
+    assert "bind {_ct_video_bind_addrs(settings, ct_bind_ip)}" in APP
+    assert '0.0.0.0' not in _bind_addrs(relayed, '10.10.10.51')
+
+
 def test_pinned_bootstrap_is_the_one_in_this_tree():
     """app.py fetches the bootstrap from a pinned commit and checks its SHA-256. Editing
     the script without bumping both means relays never get the edit (the 8448 fix needed
@@ -269,3 +320,26 @@ def test_pinned_bootstrap_is_the_one_in_this_tree():
     if pinned.returncode != 0:
         pytest.skip('pinned commit %s is not in this clone' % commit[:7])
     assert hashlib.sha256(pinned.stdout).hexdigest() == digest
+
+
+def _extra_port_section():
+    return RELAY_DOC.split('### Opening one more port', 1)[1].split('\n### ', 1)[0]
+
+
+def test_relay_doc_explains_opening_one_more_port():
+    """GH #389: a user following the Oracle guide could not tell how to open one more port.
+    The section has to give the dialog steps, warn about the Source/Destination trap, and
+    say that the relay only carries the listed ports (opening Oracle's end is not enough)."""
+    assert '### Opening one more port' in RELAY_DOC
+    sec = _extra_port_section()
+    assert 'Add Ingress Rules' in sec
+    assert '**Destination** Port Range' in sec
+    assert 'only the ports in that table' in sec
+
+
+def test_relay_doc_extra_port_section_leaves_the_parsed_blocks_alone():
+    """The port table and the ingress.json block are what the tests above read. The new
+    section must not add a table row or a second ingress block that would change them."""
+    sec = _extra_port_section()
+    assert not any(line.startswith('|') for line in sec.splitlines())
+    assert 'cat > ingress.json' not in sec

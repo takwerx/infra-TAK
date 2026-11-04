@@ -81,6 +81,11 @@ jobs:
           persist-credentials: false
       # tests/test_release_hygiene_ops354.py compares app.py's VERSION with the newest release tag.
       - run: git fetch --depth=1 origin 'refs/tags/v*:refs/tags/v*'
+      # ...and, for a PR, its base branch: the test holds a PR into dev only to the release dev itself
+      # has, so a release tagged on main after the PR branched can't turn it red (ops #435).
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --depth=1 origin "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'

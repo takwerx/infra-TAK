@@ -141,6 +141,7 @@ the only part you do by hand.
 | TCP | 18554 | CloudTAK video **RTSP** |
 | TCP | 11935 | CloudTAK video **RTMP** |
 | UDP | 18890 | CloudTAK video **SRT** |
+| TCP | 9997 | CloudTAK video **control** — CloudTAK calls this to start every video opened from a map marker |
 | TCP | 8448 | **EUD Remote Assist device API — the enrolment QR points here** |
 | TCP | 8449 | **ATLAS MDM device channel — enrolled tablets connect here** |
 | TCP + UDP | 3479 | CoTURN control channel — EUD Remote Assist |
@@ -208,6 +209,7 @@ cat > ingress.json <<'EOF'
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTSP","tcpOptions":{"destinationPortRange":{"min":18554,"max":18554}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTMP","tcpOptions":{"destinationPortRange":{"min":11935,"max":11935}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CloudTAK video SRT","udpOptions":{"destinationPortRange":{"min":18890,"max":18890}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video control","tcpOptions":{"destinationPortRange":{"min":9997,"max":9997}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"EUD Remote Assist device API (QR target)","tcpOptions":{"destinationPortRange":{"min":8448,"max":8448}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"ATLAS MDM device channel","tcpOptions":{"destinationPortRange":{"min":8449,"max":8449}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CoTURN control (Remote Assist)","tcpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
@@ -223,7 +225,7 @@ oci network security-list update \
   --force
 ```
 
-Refresh the **Security rules** page and you should see 24 ingress rules.
+Refresh the **Security rules** page and you should see 25 ingress rules.
 
 > **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
 > through command history instead of moving the cursor, so a mis-paste is easier to start over than
@@ -275,6 +277,41 @@ Guard Dog — and it's fair to expect a long list here. There isn't one, because
 them on TCP 443.** Authentik (9000/9443), TAK Portal (3000), Node-RED (1880), CloudTAK (5000/5002),
 the MediaMTX HLS player and web editor (8888/5080) never listen to the public internet even on a
 normal box — they're reached through 443 with SSO in front. One rule covers the lot.
+
+### Opening one more port
+
+Say a port you need is on the list in step 3 but you skipped it (video on 8554, say), or you used
+the manual dialog and want to add a row later. This is the whole job, and it doesn't touch the rest
+of the rules:
+
+1. Sign in to the [Oracle Cloud console](https://cloud.oracle.com).
+2. **☰ menu → Networking → Virtual Cloud Networks → TAK-RELAY-VCN → Security tab → Default Security
+   List for TAK-RELAY-VCN → Security rules tab → Add Ingress Rules.**
+3. Fill in one rule:
+   - **Stateless:** leave unchecked.
+   - **Source Type:** CIDR.
+   - **Source CIDR:** `0.0.0.0/0` (anywhere). To let in only one site or one person, put their
+     address here instead, like `203.0.113.7/32`.
+   - **IP Protocol:** TCP or UDP, as the table in step 3 says for that port.
+   - **Source Port Range:** leave **blank**.
+   - **Destination Port Range:** the port number, like `8554`.
+   - **Description:** what it's for, so you remember in six months.
+4. Click **Add Ingress Rules**. It takes effect straight away; there is nothing to restart.
+
+> ⚠️ The same trap as in the manual way above: the port goes in **Destination** Port Range, never
+> Source. A rule with the port in Source looks right and drops everything.
+
+Prefer Cloud Shell? Add one line to the `ingress.json` block from the fast way, then run the
+`oci network security-list update` command again. It replaces the whole list with what's in the
+file, so keep every line that's already there. If Cloud Shell has lost `ingress.json`, paste the
+block again first.
+
+**One thing to know before you open a port that is not in the step 3 table.** The relay carries
+only the ports in that table. Oracle's rule opens the door at Oracle's end, but the relay itself
+won't pass the traffic on to your box, because the console has no setting yet for extra forwards.
+If you need one that isn't on the list, open an issue at
+[takwerx/infra-TAK](https://github.com/takwerx/infra-TAK/issues) with the port, TCP or UDP, and what
+it's for, and we'll look at adding it to the list for everyone.
 
 ### Adding a second relay
 

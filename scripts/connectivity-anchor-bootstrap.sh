@@ -80,7 +80,12 @@ MDM_PORTS="${MDM_PORTS:-8449}"             # ATLAS MDM device channel (mutual TL
 # every publisher and player on those ports. RTSP crosses the relay over TCP, as for
 # MediaMTX. tests/test_relay_forwards_module_ports.py now checks every port a module
 # declares against these lists, so the next module can't miss them.
-VIDEO_PORTS="${VIDEO_PORTS:-8555 1935 18554 11935}"   # TVR RTSPS · TVR RTMP · CloudTAK RTSP · CloudTAK RTMP
+# ops #473: and once more for 9997. CloudTAK puts :9997 on EVERY media URL it builds
+# (video-service.ts), so opening a video from a CoT marker makes CloudTAK's API call
+# https://<video name>:9997 to create the stream. The box's Caddy answers there, but no
+# forward list here named it, so on a relayed box the call timed out and CloudTAK said
+# "Failed to generate proxy stream" (nuc, Nov 3). 9997 is TLS-only behind Caddy, same as 443.
+VIDEO_PORTS="${VIDEO_PORTS:-8555 1935 18554 11935 9997}"   # TVR RTSPS · TVR RTMP · CloudTAK RTSP · CloudTAK RTMP · CloudTAK video control (Caddy)
 # v10.1.28: the console's own port, so a relayed box has the SAME direct-IP
 # backdoor every other box has (README "Recovery / backdoor"). Not forwarding it
 # gave relayed boxes a quietly different security posture from the rest of the

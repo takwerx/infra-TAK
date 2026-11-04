@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.4-alpha"
+VERSION = "10.3.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1294,7 +1294,7 @@ AUTHENTIK_VETTED_RELEASE = "2026.8.5"   # v10.2.29: same-minor bugfix release, n
 # 2026-08-14).  There is deliberately NO startup converge that moves existing boxes:
 # MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
 # streaming box is a crash-loop, not a warning.
-MEDIAMTX_VETTED_RELEASE = "1.21.1"      # v10.2.8 W7: SECURITY — GHSA-w334-5mp5-h897 (CRITICAL, 2026-10-08): CSRF on the Control API → runOnInit command execution, fixed in 1.21.1 (plus RTMP publisher panics GHSA-7498/-5jgv, fixed 1.21.0). FRESH installs only — existing boxes are told by the upstream badge and update in the web editor. Previous 1.20.0 — v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
+MEDIAMTX_VETTED_RELEASE = "1.21.3"      # ops #428: 1.21.1 → 1.21.3 (recording/JWT/camera fixes, Go net/quic-go advisories; now exits on a fatal listen error such as a taken port). Previous 1.21.1 — v10.2.8 W7: SECURITY — GHSA-w334-5mp5-h897 (CRITICAL, 2026-10-08): CSRF on the Control API → runOnInit command execution, fixed in 1.21.1 (plus RTMP publisher panics GHSA-7498/-5jgv, fixed 1.21.0). FRESH installs only — existing boxes are told by the upstream badge and update in the web editor. Previous 1.20.0 — v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
 # Authentik 2026.8+ refuses to start on a database more than one release family behind it
 # (upstream lifecycle/migrate.py ensure_allowed_version: "Major version skips are not
 # allowed") — server and worker crash-loop before migrations, and TAK's LDAP goes with
@@ -1417,8 +1417,14 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # starts clean on a 0.81-migrated store.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.81.4"  # UNDER TRIAL (ops #208)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.95.0"
+# ops #427: 0.82.0 / v2.96.0 UNDER TRIAL on dev (T&E only, not promoted; 0.81.4 passed its 24 h
+# soak, ops #208, but stays unpromoted until the lead moves the vetted pin). 0.82.0: relay
+# negotiates the protocol version, new DB indexes, reverse-proxy access logs move to their own
+# access_logs.db next to store.db (SQLite), MySQL store removed (we never configure an engine, so
+# the default sqlite store is used), SSH-server hardening we don't expose. Dashboard on Next.js 16.
+# Rollback: re-pin the dev pair to 0.81.4 / v2.95.0; the pin-restore heal converges boxes back.
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.0"  # UNDER TRIAL (ops #427)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -2650,6 +2656,59 @@ def _host_arch():
     except Exception:
         pass
     return a
+
+# ops #360: TAK Portal and CloudTAK ship the sharp image library, whose prebuilt Linux x64
+# binaries need an x86-64-v2 CPU. A VM whose hypervisor presents a basic CPU model (TrueNAS /
+# KVM / Proxmox defaults, VirtualBox with some settings) lacks these flags: TAK Portal then
+# restart-loops and the CloudTAK build dies with "Could not load the sharp module".
+# x86-64-v2 = cx16, lahf_lm, popcnt, sse4_1, sse4_2, ssse3 (the names /proc/cpuinfo uses).
+_CPU_V2_FLAGS = ('cx16', 'lahf_lm', 'popcnt', 'sse4_1', 'sse4_2', 'ssse3')
+_CPU_TOO_BASIC_FIX = ("In your hypervisor (TrueNAS, KVM, Proxmox, VirtualBox) set this VM's CPU type "
+                      "to host passthrough, restart the VM, then try again.")
+
+def _cpu_v2_missing(cpuinfo_text, machine=''):
+    """Flags from x86-64-v2 that this CPU lacks, from /proc/cpuinfo text.
+    Returns [] when nothing is missing OR when it can't be judged: an ARM machine, no 'flags'
+    line (non-x86), or empty text. Never blocks a deploy on a guess."""
+    if _arch_normalize(machine) == 'arm64':
+        return []
+    for line in (cpuinfo_text or '').splitlines():
+        if line.lower().startswith('flags') and ':' in line:
+            have = set(line.split(':', 1)[1].split())
+            return [f for f in _CPU_V2_FLAGS if f not in have]
+    return []
+
+def _cpu_too_basic_message(what):
+    return (f"This server's virtual CPU is too basic for {what}. {_CPU_TOO_BASIC_FIX}")
+
+def _cpu_preflight_local(what, plog):
+    """True to go on with the deploy; False (after telling the user why) to stop."""
+    try:
+        if _host_arch() == 'arm64':
+            return True
+        with open('/proc/cpuinfo') as f:
+            missing = _cpu_v2_missing(f.read(), os.uname().machine)
+    except Exception:
+        return True
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what)}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
+
+def _cpu_preflight_remote(remote_cfg, what, plog):
+    """Same check on the remote CloudTAK host over SSH. An unreadable answer goes on."""
+    ok, out = _ssh_probe(remote_cfg, "echo ARCH=$(uname -m); grep -m1 '^flags' /proc/cpuinfo 2>/dev/null; true",
+                         timeout=20)
+    if not ok:
+        return True
+    m = re.search(r'^ARCH=(\S+)', out or '', re.M)
+    missing = _cpu_v2_missing(out or '', m.group(1) if m else '')
+    if not missing:
+        return True
+    plog(f"\u2717 {_cpu_too_basic_message(what + ' on the remote host')}")
+    plog(f"  (missing CPU features: {', '.join(missing)})")
+    return False
 
 def _distro_family():
     """'debian' | 'rhel' — package-manager family, derived from settings.
@@ -8915,6 +8974,28 @@ def _diag_redact(text, settings):
     return text
 
 
+def _diag_cpu_line():
+    """ops #360: does this CPU have what TAK Portal and CloudTAK's image library needs (x86-64-v2)?"""
+    machine = os.uname().machine
+    try:
+        with open('/proc/cpuinfo') as f:
+            txt = f.read()
+    except Exception as e:
+        return f"cpu check: could not read /proc/cpuinfo ({type(e).__name__})"
+    model = next((l.split(':', 1)[1].strip() for l in txt.splitlines()
+                  if l.lower().startswith('model name') and ':' in l), '')
+    model = f"  model: {model[:80]}" if model else ''
+    if _arch_normalize(machine) == 'arm64':
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): not needed on ARM{model}"
+    if not any(l.lower().startswith('flags') for l in txt.splitlines()):
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): could not tell, no CPU flags listed{model}"
+    missing = _cpu_v2_missing(txt, machine)
+    if not missing:
+        return f"cpu check (TAK Portal / CloudTAK need x86-64-v2): OK{model}"
+    return (f"cpu check (TAK Portal / CloudTAK need x86-64-v2): TOO BASIC, missing {', '.join(missing)}{model}  "
+            f"-> set the VM's CPU type to host passthrough in the hypervisor")
+
+
 def _diag_section_box(settings):
     out = []
     git = lambda *a: _diag_cmd(['git', '-C', BASE_DIR] + list(a), priv=False)
@@ -8931,6 +9012,7 @@ def _diag_section_box(settings):
     except Exception:
         osname = '?'
     out.append(f"os: {osname}  kernel: {os.uname().release}  arch: {os.uname().machine}  cpus: {os.cpu_count()}")
+    out.append(_diag_cpu_line())
     vm, sw = psutil.virtual_memory(), psutil.swap_memory()
     out.append(f"ram: {vm.total // 2**30} GiB total, {vm.available // 2**30} GiB available ({vm.percent}% used)  "
                f"swap: {sw.total // 2**30} GiB ({sw.percent}% used)")
@@ -8975,7 +9057,9 @@ def _diag_section_connectivity(settings):
     fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
     sip = str(settings.get('server_ip') or '').strip()
     if fqdn:
-        for host in (fqdn, f'tak.{fqdn}', f'infratak.{fqdn}', f'takportal.{fqdn}', f'authentik.{fqdn}'):
+        _tak_name = (_get_service_domain(settings, 'takserver') or '').strip()
+        for host in dict.fromkeys(h for h in (fqdn, f'tak.{fqdn}', f'infratak.{fqdn}', f'takportal.{fqdn}',
+                                              f'authentik.{fqdn}', _tak_name) if h):
             try:
                 ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
                 out.append(f"dns {host}: {', '.join(ips)}{'' if (not sip or sip in ips) else '   <-- not server_ip ' + sip}")
@@ -9037,8 +9121,24 @@ def _diag_section_connectivity(settings):
         argv = ['openssl', 's_client', '-connect', f'127.0.0.1:{port}'] + (['-servername', sni] if sni else [])
         raw = _diag_cmd(argv, timeout=8, priv=False, stdin='')
         m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', raw, re.S)
-        out.append(f"tls {label}: {_diag_cert_enddate(m.group(0)) if m else 'no certificate presented'}")
+        out.append(f"tls {label}: {_diag_cert_enddate(m.group(0)) if m else 'no certificate presented'}"
+                   f"{_diag_chain_note(raw, enrollment=(port == 8446)) if m else ''}")
     return out
+
+
+def _diag_chain_note(raw, enrollment=False):
+    """One suffix for a `tls` line: does the certificate the box presents chain to a CA this box
+    trusts? Read from openssl s_client's own verdict, which verifies against the system store.
+    A Cloudflare Origin or private-CA certificate fails it, and on 8446 that is what makes phones
+    refuse QR enrollment and CloudTAK refuse to log in (ops #306)."""
+    m = re.search(r'Verify return code:\s*(\d+)\s*\(([^)]*)\)', raw or '')
+    if not m:
+        return ''
+    if m.group(1) == '0':
+        return '   [chain trusted]'
+    why = m.group(2).strip()[:80]
+    return (f"   <-- chain NOT trusted ({why})"
+            + ("; phones refuse this for QR enrollment and CloudTAK refuses it for login" if enrollment else ''))
 
 
 def _diag_section_containers(settings):
@@ -15321,6 +15421,22 @@ _CONN_ANCHOR_WG_IP = '172.31.99.1'
 _CONN_WG_KEY_RE = re.compile(r'^[A-Za-z0-9+/]{43}=$')  # 32-byte base64 WireGuard key
 
 
+def _ct_video_bind_addrs(settings, lan_ip):
+    """Addresses Caddy's CloudTAK video listener (:9997) binds, as one `bind` argument.
+
+    ops #473: the relay DNATs a client's :9997 to this box's tunnel address
+    (_CONN_BOX_WG_IP), but the listener was bound to the LAN address only, so a relayed
+    box answered 9997 from the LAN and nowhere else. With a relay configured the tunnel
+    address is bound as well. Never 0.0.0.0: 127.0.0.1:9997 is the cloudtak-media
+    container's own publish, and a wildcard bind would collide with it.
+    net.ipv4.ip_nonlocal_bind=1 (set at deploy) lets Caddy bind it before wg0 is up."""
+    addrs = [lan_ip]
+    if ((settings or {}).get('connectivity_anchor') or {}).get('anchor_ip') \
+            and _CONN_BOX_WG_IP != lan_ip:
+        addrs.append(_CONN_BOX_WG_IP)
+    return ' '.join(addrs)
+
+
 def _conn_wg_conf_path():
     return '/etc/wireguard/%s.conf' % _CONN_WG_IF
 
@@ -15504,8 +15620,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '44d6a17132f3e3c2a424c3bb3278b7bc5630ff2b'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'e86c99bcb1f76ef4e8059e281aff186c4e04120a3dccb226ac14045d7a628212'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '1e2d5e85f65dd7ca0b9891e9daab650353ad7304'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '32a5b17458f0a8bcd97141464c9754ef05b9afb2d0d03f59577f738b9db61142'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -15765,6 +15881,15 @@ _CONN_VERIFY_PORTS = [
 # Mirrors modules/atlas.py DEVICE_PORT (the module is loaded by the marketplace, not
 # imported here); tests/test_relay_forwards_module_ports.py keeps the two equal.
 ATLAS_DEVICE_PORT = 8449
+# ops #473: Caddy's CloudTAK video listener. CloudTAK hardcodes it onto every media URL.
+CLOUDTAK_VIDEO_CONTROL_PORT = 9997
+# Plain-words hints that replace the generic "path blocked" one when the service is listening
+# on the box but the probe from outside fails.
+_CONN_BLOCKED_HINTS = {
+    9997: ('CloudTAK cannot start any video from a map marker while this is blocked '
+           '("Failed to generate proxy stream"). Open TCP 9997 in the relay\'s cloud firewall, '
+           'then press Update Relay so it forwards 9997'),
+}
 
 
 def _conn_verify_ports(settings):
@@ -15844,6 +15969,11 @@ def _conn_verify_ports(settings):
                 os.path.exists(os.path.join(_ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
             ports.append((18554, 'CloudTAK video RTSP', True))
             ports.append((11935, 'CloudTAK video RTMP', True))
+            # ops #473: CloudTAK's API calls https://<video name>:9997 for every video lease
+            # (it forces that port onto each media URL). Blocked, opening a video from a CoT
+            # marker fails with "Failed to generate proxy stream" while the stream itself is fine.
+            ports.append((CLOUDTAK_VIDEO_CONTROL_PORT,
+                          'CloudTAK video control (opening a video from a map marker)', True))
     except Exception:
         pass
     return ports
@@ -15900,8 +16030,9 @@ def _run_connectivity_verify(settings):
                 elif result['mode'] == 'relay':
                     # Relay vantage is a REAL outside path (box -> relay public -> tunnel
                     # -> back); a red here is trustworthy.
-                    probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
-                                     'relay cloud firewall/NSG ingress + forwarded ports')
+                    probe['hint'] = _CONN_BLOCKED_HINTS.get(port) or (
+                        'service reachable locally but NOT from outside — check the path: '
+                        'relay cloud firewall/NSG ingress + forwarded ports')
                 else:
                     # Direct mode probes the box's OWN public address — a self-probe that
                     # fails on any network without NAT hairpin (home routers, 1:1-NAT
@@ -19764,6 +19895,13 @@ _KNOWN_PUBLIC_PORTS = {
                                           # the UDP relay range 50000-50050 never shows in a TCP-only sweep.
 }
 
+# Processes that are known-good on a normal install and legitimately listen on a public
+# address (GH #315). ZeroTier's agent keeps a TCP control listener on 9993 beside the
+# 9993/udp it actually uses; the console doesn't manage it, so it is not in the catalog
+# above, but it is not a stranger either. Matched on the ss process name, not the port,
+# so an unrelated service that lands on 9993 is still flagged.
+_KNOWN_PUBLIC_PROCS = {'zerotier-one'}
+
 _exposure_cache = {'ts': 0.0, 'data': None}
 _EXPOSURE_TTL = 30  # seconds — cheap enough for the badge, fresh enough to trust
 
@@ -19834,13 +19972,19 @@ def _exposure_bind_of(port, listen_map):
 
 def _exposure_fw_states(fwstatus):
     """port -> {'open':bool,'deny':bool,'scoped':[sources]} parsed from the
-    normalized firewall rules (same line shape for ufw + firewalld)."""
+    normalized firewall rules (same line shape for ufw + firewalld).
+
+    TCP only: every listener the audit looks at comes from `ss -tln`, so a `9993/udp
+    ALLOW` rule says nothing about whether TCP 9993 is reachable. Counting it made a
+    firewall-blocked TCP listener look open and flagged it for review (GH #315)."""
     states = {}
     for ln in (fwstatus.get('rules') or []):
         parts = ln.split()
         if not parts:
             continue
         to = parts[0]
+        if to.lower().endswith('/udp'):
+            continue
         mm = re.match(r'^(\d{1,5})(?:/(?:tcp|udp|any))?$', to)
         if not mm:
             continue
@@ -19968,6 +20112,8 @@ def _exposure_report(force=False):
         if 'public' not in ent['scopes']:
             continue
         if p in known:
+            continue
+        if ent['procs'] and ent['procs'] <= _KNOWN_PUBLIC_PROCS:
             continue
         st = fw_states.get(p)
         reachable = (not fw_enabled) or bool(st and st.get('open'))
@@ -27418,6 +27564,14 @@ def _gh_advisories_fixed_by(repo, installed, target):
     """Published GitHub security advisories of `repo` that `installed` is exposed to and
     `target` is not: ['GHSA-… (high): summary', …]. Raises when GitHub cannot be read.
     An advisory whose ranges do not parse is skipped — never claimed."""
+    return [f"{a['id']}{' (' + a['severity'] + ')' if a['severity'] else ''}: {a['summary']}"
+            for a in _gh_advisories(repo, installed, target)]
+
+
+def _gh_advisories(repo, installed, target, packages=None):
+    """_gh_advisories_fixed_by as [{id, severity, summary}]. `packages` (ops #377), when
+    given, limits the match to advisory rows for those package names — moby/moby also lists
+    Go-module rows whose versions do not follow Docker Engine releases."""
     import urllib.request
     req = urllib.request.Request(
         f'https://api.github.com/repos/{repo}/security-advisories?per_page=100',
@@ -27429,17 +27583,23 @@ def _gh_advisories_fixed_by(repo, installed, target):
         if a.get('state') not in (None, 'published') or a.get('withdrawn_at'):
             continue
         for v in a.get('vulnerabilities') or []:
+            if packages is not None and ((v.get('package') or {}).get('name') or '') not in packages:
+                continue
             rng = v.get('vulnerable_version_range') or ''
             if _version_in_range(installed, rng) is not True:
                 continue
             if _version_in_range(target, rng) is not False:
                 continue
             patched = (v.get('patched_versions') or '').strip()
+            # ops #377: GitHub writes the FIRST fixed version bare ("29.8.2", "v2.11.4"); read
+            # as an exact match it hid every advisory whose target was any later version.
+            if patched and ',' not in patched and not re.match(r'^[<>=]', patched):
+                patched = '>= ' + patched
             if patched and _version_in_range(target, patched) is not True:
                 continue
-            ident = a.get('cve_id') or a.get('ghsa_id') or 'advisory'
-            sev = (a.get('severity') or '').lower()
-            out.append(f"{ident}{' (' + sev + ')' if sev else ''}: {(a.get('summary') or '').strip()[:160]}")
+            out.append({'id': a.get('cve_id') or a.get('ghsa_id') or 'advisory',
+                        'severity': (a.get('severity') or '').lower(),
+                        'summary': (a.get('summary') or '').strip()[:160]})
             break
     return out
 
@@ -27713,6 +27873,412 @@ def _os_security_items(seen, unknown, now=None):
     return items
 
 
+# ── ops #377: patch-now security fixes ─────────────────────────────────────────
+# Some fixes cannot wait for the 36 h grace or the 6 h sweep (actively exploited, critical,
+# "patch now"). Three signals mark a fix patch-now, each from evidence, never a guess:
+#   1. PATCH_NOW_FEED_URL: a takwerx list every box reads hourly (package, fixed version per
+#      OS, what it fixes in plain words). Editing it on GitHub flags a CVE fleet-wide within
+#      the hour, without a release. Each box compares its OWN installed version (dpkg/rpm)
+#      with the fixed one, so "still exposed" and "fixed" come from the package manager.
+#      apt has no offline severity, so on Ubuntu this list is the only patch-now signal.
+#   2. A Rocky/RHEL security advisory that dnf rates Critical, for an available update.
+#   3. A critical GitHub advisory that a pending Docker / containerd / Caddy / NetBird update
+#      fixes. Those come from their own repos, which unattended-upgrades skips by design and
+#      neither the -security pocket nor dnf --security covers. A high/medium one still gets
+#      the ordinary security email (once per version), just not the urgent repeat.
+# A patch-now item mails on the next hourly check, skips the grace, and mails again every
+# 24 h until fixed. Ordinary security patches keep the grace and the one-email rule.
+PATCH_NOW_FEED_URL = 'https://raw.githubusercontent.com/takwerx/infra-TAK/main/security/patch-now.json'
+PATCH_NOW_CHECK_INTERVAL_S = 3600
+PATCH_NOW_REPEAT_S = 24 * 3600
+PATCH_NOW_FEED_MAX_AGE_S = 7 * 24 * 3600   # last good copy carries a GitHub outage this long
+# Same shape as a feed advisory, for a fix that must ride the code itself.
+PATCH_NOW_BUILTIN = ()
+
+_PN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$')
+_PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
+_PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
+# os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
+# flavour> (ubuntu-22.04/aws) for kernel rows, or '*' for every OS.
+_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?)$')
+
+# Third-party packages whose upstream publishes GitHub advisories: package (same name on
+# apt and dnf) -> (repo, advisory package names that follow its releases or None for all,
+# label). PostgreSQL (PGDG) publishes none, so it is patch-now only through the list.
+THIRD_PARTY_ADVISORY_REPOS = {
+    'docker-ce': ('moby/moby', ('Docker Engine',), 'Docker'),
+    'containerd.io': ('containerd/containerd',
+                      ('github.com/containerd/containerd', 'github.com/containerd/containerd/v2'),
+                      'containerd (Docker)'),
+    'caddy': ('caddyserver/caddy', None, 'Caddy (HTTPS)'),
+    'netbird': ('netbirdio/netbird', None, 'NetBird VPN'),
+}
+THIRD_PARTY_ADVISORY_CACHE_S = 6 * 3600   # the hourly check stays inside GitHub's 60/h
+_third_party_adv_cache = {}
+
+_OS_INSTALL_HOW = 'Console page → "Operating system updates available" → Install updates.'
+_OS_REBOOT_HOW = 'Console page → Reboot now (the box is back in 1-3 minutes).'
+
+
+def _vercmp_segment_deb(a, b):
+    """dpkg's verrevcmp for one part (upstream or revision): -1 / 0 / 1."""
+    def order(c):
+        if not c or c.isdigit():
+            return 0
+        if c.isalpha():
+            return ord(c)
+        return -1 if c == '~' else ord(c) + 256
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while (i < len(a) and not a[i].isdigit()) or (j < len(b) and not b[j].isdigit()):
+            ac, bc = order(a[i] if i < len(a) else ''), order(b[j] if j < len(b) else '')
+            if ac != bc:
+                return -1 if ac < bc else 1
+            i, j = i + 1, j + 1
+        da, db = re.match(r'\d*', a[i:]).group(0), re.match(r'\d*', b[j:]).group(0)
+        i, j = i + len(da), j + len(db)
+        if int(da or 0) != int(db or 0):
+            return -1 if int(da or 0) < int(db or 0) else 1
+    return 0
+
+
+def _vercmp_segment_rpm(a, b):
+    """rpm's rpmvercmp for one part (version or release): -1 / 0 / 1."""
+    if a == b:
+        return 0
+    i = j = 0
+    while i < len(a) or j < len(b):
+        while i < len(a) and not a[i].isalnum() and a[i] not in '~^':
+            i += 1
+        while j < len(b) and not b[j].isalnum() and b[j] not in '~^':
+            j += 1
+        ta, tb = a[i:i + 1] == '~', b[j:j + 1] == '~'
+        if ta or tb:
+            if not ta:
+                return 1
+            if not tb:
+                return -1
+            i, j = i + 1, j + 1
+            continue
+        ca, cb = a[i:i + 1] == '^', b[j:j + 1] == '^'
+        if ca or cb:
+            if i >= len(a):
+                return -1
+            if j >= len(b):
+                return 1
+            if not ca:
+                return 1
+            if not cb:
+                return -1
+            i, j = i + 1, j + 1
+            continue
+        if i >= len(a) or j >= len(b):
+            break
+        rx = r'\d+' if a[i].isdigit() else r'[A-Za-z]+'
+        sa, sb = re.match(rx, a[i:]).group(0), re.match(rx, b[j:])
+        if not sb:
+            return 1 if a[i].isdigit() else -1   # a number is newer than letters
+        sb = sb.group(0)
+        i, j = i + len(sa), j + len(sb)
+        if a[i - 1].isdigit():
+            sa, sb = int(sa), int(sb)
+        if sa != sb:
+            return -1 if sa < sb else 1
+    if i >= len(a) and j >= len(b):
+        return 0
+    return -1 if i >= len(a) else 1
+
+
+def _pkg_vercmp(installed, fixed, pkg_mgr):
+    """Compare an installed package version with a patch-now `fixed` one: -1 / 0 / 1, by
+    dpkg rules on apt and rpm rules on dnf. A `fixed` without an epoch ignores the
+    installed epoch (docker-ce 5:28.5.2-1~ubuntu… vs "28.5.2"), and one without a
+    -revision/-release compares the upstream version only (any build of it counts)."""
+    seg = _vercmp_segment_rpm if pkg_mgr == 'dnf' else _vercmp_segment_deb
+
+    def split(v):
+        e, _, rest = v.partition(':')
+        if not rest or not e.isdigit():
+            e, rest = '', v
+        up, dash, rev = rest.rpartition('-')
+        return (e, up, rev) if dash else (e, rest, None)
+    ie, iu, ir = split(installed.strip())
+    fe, fu, fr = split(fixed.strip())
+    if fe:
+        e1, e2 = int(ie or 0), int(fe)
+        if e1 != e2:
+            return -1 if e1 < e2 else 1
+    c = seg(iu, fu)
+    if c or fr is None:
+        return c
+    return seg(ir or '', fr)
+
+
+def _upstream_version(v):
+    """'5:28.5.1-1~ubuntu.22.04~jammy' / '3:28.5.1-1.el9' / '2.10.2' -> '28.5.1' / '2.10.2';
+    None when it has no leading dotted number."""
+    m = re.match(r'^(?:\d+:)?(\d+(?:\.\d+)*)', (v or '').strip())
+    return m.group(1) if m else None
+
+
+def _pkg_restart_impact(name):
+    """What installing `name` restarts, from _MANAGED_PKG_IMPACT, or ''."""
+    for rx, service, impact, cls in _MANAGED_PKG_IMPACT:
+        if rx.match(name) and cls in ('restart', 'reboot'):
+            return f'Installing it {impact}.' if cls == 'restart' else f'{service}: {impact}.'
+    return ''
+
+
+def _patch_now_parse(doc):
+    """Validated advisories of a patch-now document. A malformed entry is dropped whole,
+    never half-used. Shape (security/patch-now.json):
+      {"advisories": [{"id": "CVE-2026-12345",
+                       "what": "plain words: what the flaw lets an attacker do",
+                       "why": "plain words: why it is urgent (optional)",
+                       "packages": {"docker-ce": "28.5.2",
+                                    "openssl": {"ubuntu-22.04": "3.0.2-0ubuntu1.20",
+                                                "rocky-9": "3.2.2-6.el9_5.1"},
+                                    "kernel": {"ubuntu-22.04": "5.15.0-198",
+                                               "ubuntu-22.04/aws": "6.8.0-1030"}}}]}
+    A version is the first one with the fix; "kernel" is compared with the RUNNING kernel."""
+    out = []
+    advs = doc.get('advisories') if isinstance(doc, dict) else None
+    for a in advs if isinstance(advs, list) else []:
+        if not isinstance(a, dict):
+            continue
+        aid, what, why, pk = a.get('id'), a.get('what'), a.get('why') or '', a.get('packages')
+        if not (isinstance(aid, str) and _PN_ID_RE.match(aid) and isinstance(what, str)
+                and what.strip() and isinstance(why, str) and isinstance(pk, dict) and pk):
+            continue
+        pkgs = {}
+        for name, fixed in pk.items():
+            per = fixed if isinstance(fixed, dict) else {'*': fixed}
+            if not (isinstance(name, str) and _PN_PKG_RE.match(name) and per and all(
+                    isinstance(k, str) and _PN_OS_RE.match(k) and isinstance(v, str)
+                    and _PN_VER_RE.match(v) for k, v in per.items())):
+                pkgs = None
+                break
+            pkgs[name] = dict(per)
+        if pkgs:
+            out.append({'id': aid, 'what': ' '.join(what.split())[:240],
+                        'why': ' '.join(why.split())[:160], 'packages': pkgs})
+    return out
+
+
+def _patch_now_advisories(feed, now):
+    """(advisories, feed, ok): PATCH_NOW_BUILTIN plus the fetched list. `feed` is the last
+    good copy ({'at', 'advisories'}, persisted by the caller): a GitHub blip falls back to it
+    for PATCH_NOW_FEED_MAX_AGE_S so reminders do not stop because GitHub did. A 404 is a
+    real "nothing listed". ok=False: no usable list, the caller must treat it as unknown."""
+    import urllib.request
+    import urllib.error
+    feed = feed if isinstance(feed, dict) else {}
+    try:
+        req = urllib.request.Request(PATCH_NOW_FEED_URL, headers={'User-Agent': 'infra-TAK'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            doc = json.loads(resp.read(256 * 1024).decode())
+        feed = {'at': now, 'advisories': _patch_now_parse(doc)}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            feed = {'at': now, 'advisories': []}
+        else:
+            print(f"[update-notify] patch-now list unreadable: HTTP {e.code}", flush=True)
+    except Exception as e:
+        print(f"[update-notify] patch-now list unreadable: {e}", flush=True)
+    try:
+        ok = now - float(feed.get('at') or 0) <= PATCH_NOW_FEED_MAX_AGE_S
+    except (TypeError, ValueError):
+        ok = False
+    listed = _patch_now_parse({'advisories': feed.get('advisories')}) if ok else []
+    return _patch_now_parse({'advisories': list(PATCH_NOW_BUILTIN)}) + listed, feed, ok
+
+
+def _installed_pkg_versions(names):
+    """{name: installed version} for the installed ones among `names`, read from the
+    package database (dpkg-query / rpm), highest when several are installed. Not installed
+    = absent. Raises when the database could not be read."""
+    names = sorted({n for n in names if _PN_PKG_RE.match(n)})
+    if not names:
+        return {}
+    dnf = _pkg_mgr() == 'dnf'
+    if dnf:
+        r = subprocess.run([_real_bin('rpm'), '-q', '--qf',
+                            '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\tinstalled\n'] + names,
+                           capture_output=True, text=True, timeout=30)
+        # rc = how many names are not installed; a database failure says `error:`
+        if r.returncode != 0 and 'error:' in (r.stderr or '').lower():
+            raise RuntimeError('rpm -q failed: ' + _dnf_error_tail(r.stderr))
+    else:
+        r = subprocess.run([_real_bin('dpkg-query'), '-W', '-f',
+                            '${Package}\t${Version}\t${db:Status-Status}\n'] + names,
+                           capture_output=True, text=True, timeout=30)
+        # rc 1 = some name is not known to dpkg; anything else is a failure
+        if r.returncode not in (0, 1):
+            raise RuntimeError('dpkg-query failed (rc=%s)' % r.returncode)
+    out = {}
+    for ln in (r.stdout or '').splitlines():
+        bits = ln.split('\t')
+        if len(bits) != 3 or bits[2].strip() != 'installed' or not bits[1].strip():
+            continue
+        name, ver = bits[0].split(':')[0], bits[1].strip()
+        if name not in out or _pkg_vercmp(ver, out[name], 'dnf' if dnf else 'apt') > 0:
+            out[name] = ver
+    return out
+
+
+def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
+    """Update-email items for the listed advisories this box is still exposed to: an
+    installed package below its fixed version, or a RUNNING kernel below it (a fixed kernel
+    that is staged but not running only needs the reboot). Pure."""
+    items = []
+    for a in advisories:
+        hits, kernel, staged_ok = [], False, True
+        for name, per in a['packages'].items():
+            if name == 'kernel':
+                run = rb.get('running') or ''
+                m = re.search(r'-([a-z][a-z0-9]*)$', run)
+                flavour = m.group(1) if m else ''
+                key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
+                fixed = per.get(key)
+                if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
+                    continue
+                kernel = True
+                staged = rb.get('staged') or ''
+                staged_ok = bool(staged and _kernel_version_key(staged) >= _kernel_version_key(fixed))
+                hits.append(f'Linux kernel {run} (fixed in {fixed})')
+                continue
+            fixed, have = per.get(os_type) or per.get('*'), installed.get(name)
+            if fixed and have and _pkg_vercmp(have, fixed, pkg_mgr) < 0:
+                hits.append(f'{name} {have} (fixed in {fixed})')
+        if not hits:
+            continue
+        pkg_hits = len(hits) - (1 if kernel else 0)
+        if kernel and staged_ok and not pkg_hits:
+            how = 'The fix is already installed; reboot to finish: ' + _OS_REBOOT_HOW
+        elif kernel:
+            how = _OS_INSTALL_HOW + ' Then reboot to finish: ' + _OS_REBOOT_HOW
+        else:
+            how = _OS_INSTALL_HOW
+        lines = [f"What it fixes: {a['what']}"]
+        if a['why']:
+            lines.append(f"Why it is urgent: {a['why']}")
+        lines.append('Still exposed here: ' + '; '.join(hits))
+        lines += [x for x in sorted({_pkg_restart_impact(h.split(' ')[0]) for h in hits
+                                     if not h.startswith('Linux kernel')}) if x]
+        items.append({'key': f"pn:feed:{a['id']}", 'label': f"Urgent security fix {a['id']}",
+                      'installed': hits[0].split(' (')[0], 'target': 'the fixed version',
+                      'summary': f"Urgent security fix {a['id']}", 'identity': a['id'],
+                      'patch_now': True, 'security': lines, 'how': how})
+    return items
+
+
+def _nevra_name(nevra):
+    """'openssl-libs-1:3.2.2-6.el9_5.1.x86_64' -> 'openssl-libs'."""
+    base = re.sub(r'\.(x86_64|noarch|aarch64|i686|armv7hl|ppc64le|s390x|src)$', '', nevra or '')
+    return base.rsplit('-', 2)[0]
+
+
+def _dnf_critical_items():
+    """ops #377 signal 2: one item per security advisory dnf rates Critical for an
+    available update. [] off dnf. Raises when dnf could not answer. Once the update is
+    installed dnf stops listing the advisory, which ends the reminders."""
+    if _pkg_mgr() != 'dnf':
+        return []
+    crit = {}
+    for a in _dnf_security_advisories():
+        if a['severity'].lower() == 'critical':
+            crit.setdefault(a['id'], set()).add(_nevra_name(a['nevra']))
+    items = []
+    for aid in sorted(crit):
+        names = sorted(crit[aid])
+        kernel = any(n.startswith('kernel') for n in names)
+        items.append({
+            'key': f'pn:os:{aid}', 'label': f'Operating system ({aid})',
+            'installed': ', '.join(names[:6]), 'target': aid,
+            'summary': f'Operating system: critical security update {aid}',
+            'identity': aid, 'patch_now': True,
+            'security': [f"Fixes: {', '.join(names[:10])}" + (f' (+{len(names) - 10} more)' if len(names) > 10 else ''),
+                         'Why it is urgent: the OS vendor rates it Critical, its highest rating, '
+                         'for flaws an attacker can use without logging in.'],
+            'how': _OS_INSTALL_HOW + (' Then reboot to finish: ' + _OS_REBOOT_HOW if kernel else '')})
+    return items
+
+
+def _third_party_security_items(pending, unknown, now=None):
+    """ops #377 signal 3: Docker / containerd / Caddy / NetBird updates that fix a published
+    GitHub advisory, from `pending` (_pending_os_updates() rows). patch_now when one of them
+    is critical. GitHub unreadable = unknown for that package, never "not security"."""
+    now = now or time.time()
+    items = []
+    for p in pending:
+        cfg = THIRD_PARTY_ADVISORY_REPOS.get(p.get('name'))
+        inst, tgt = _upstream_version(p.get('old')), _upstream_version(p.get('new'))
+        if not cfg or not inst or not tgt:
+            continue
+        repo, pkgs, label = cfg
+        ck = (repo, inst, tgt)
+        hit = _third_party_adv_cache.get(ck)
+        if hit and now - hit[0] < THIRD_PARTY_ADVISORY_CACHE_S:
+            advs = hit[1]
+        else:
+            try:
+                advs = _gh_advisories(repo, inst, tgt, packages=pkgs)
+                _third_party_adv_cache[ck] = (now, advs)
+            except Exception as e:
+                unknown.update({f"3p:{p['name']}", f"pn:3p:{p['name']}"})
+                print(f"[update-notify] {label} advisories unreadable: {e}", flush=True)
+                continue
+        if not advs:
+            continue
+        crit = any(a['severity'] == 'critical' for a in advs)
+        lines = ['Fixes ' + a['id'] + (f" ({a['severity']})" if a['severity'] else '') + ': '
+                 + a['summary'] for a in advs[:5]]
+        if len(advs) > 5:
+            lines.append(f'(+{len(advs) - 5} more advisories)')
+        if crit:
+            lines.append('Why it is urgent: at least one of these is rated critical.')
+        impact = _pkg_restart_impact(p['name'])
+        if impact:
+            lines.append(impact)
+        items.append({'key': ('pn:3p:' if crit else '3p:') + p['name'], 'label': label,
+                      'installed': p.get('old') or '?', 'target': p['new'],
+                      'summary': f"{label}: security update {inst} → {tgt}",
+                      'identity': tgt + '+security', 'patch_now': crit,
+                      'security': lines, 'how': _OS_INSTALL_HOW})
+    return items
+
+
+def _collect_patch_now_items(feed, unknown, now=None):
+    """ops #377: the three patch-now signals, plus the third-party security items (patch-now
+    only when critical). Returns (items, feed); `feed` is the patch-now list to persist.
+    Each source is shielded, and one that could not answer goes into `unknown` so its
+    reminder state is carried — never pruned, never re-mailed on a guess."""
+    now = now or time.time()
+    items = []
+    advs, feed, ok = _patch_now_advisories(feed, now)
+    if not ok:
+        unknown.add('pn:feed')
+    if advs:
+        try:
+            names = {n for a in advs for n in a['packages'] if n != 'kernel'}
+            items += _patch_now_feed_items(advs, _installed_pkg_versions(names),
+                                           _read_os_release()[0], _kernel_reboot_state(), _pkg_mgr())
+        except Exception as e:
+            unknown.add('pn:feed')
+            print(f"[update-notify] patch-now list check failed: {e}", flush=True)
+    try:
+        items += _dnf_critical_items()
+    except Exception as e:
+        unknown.add('pn:os')
+        print(f"[update-notify] critical advisory check failed: {e}", flush=True)
+    try:
+        items += _third_party_security_items(_pending_os_updates(), unknown, now)
+    except Exception as e:
+        unknown.update({'3p', 'pn:3p'})
+        print(f"[update-notify] third-party security check failed: {e}", flush=True)
+    return items, feed
+
+
 def _collect_pending_updates(settings, seen=None, unknown=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
@@ -27781,11 +28347,20 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
 _update_notify_lock = threading.Lock()
 
 
-def _update_notify_check_once():
+def _carried_by_unknown(key, unknown):
+    """True when `key`'s source could not be read this sweep (exact, or a `src:` prefix)."""
+    return any(key == u or key.startswith(u + ':') for u in unknown)
+
+
+def _update_notify_check_once(fast=False):
     """One pending-update sweep. Emails the Guard Dog alert address only when at least
     one pending item's identity has not been mailed before (one email per new SHA/tag,
     never per poll), and then only about the NEW items (ops #345). Returns
-    {'pending': [...], 'emailed': bool} for the trigger route."""
+    {'pending': [...], 'emailed': bool} for the trigger route.
+
+    ops #377: patch-now items are the exception — mailed at once and again every
+    PATCH_NOW_REPEAT_S until fixed. `fast=True` is the hourly check between full sweeps:
+    only the patch-now sources, only patch-now mail, every other dedup entry untouched."""
     settings = load_settings()
     to_addr = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     if not to_addr:
@@ -27799,24 +28374,60 @@ def _update_notify_check_once():
         return {'pending': [], 'emailed': False, 'skipped': f'quiet window ({_q_why})',
                 'quiet_until': _q_until}
     state = _update_notify_state_load()
+    now = time.time()
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
     unknown = set()
-    pending = _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    feed = state.get('_patch_now_feed')
+    try:
+        pn_found, feed = _collect_patch_now_items(feed, unknown, now)
+        pending += [p for p in pn_found if p.get('patch_now') or not fast]
+    except Exception as e:
+        unknown.update({'pn', '3p'})
+        print(f"[update-notify] patch-now check failed: {e}", flush=True)
+    sent_pn = state.get('_patch_now_sent')
+    sent_pn = {k: v for k, v in sent_pn.items() if isinstance(v, dict)} if isinstance(sent_pn, dict) else {}
 
     def _mailed(p):
         return state.get(p['key']) in (p.get('seen_ok') or [p['identity']])
 
-    new_items = [p for p in pending if not _mailed(p)]
+    def _pn_due(p):
+        rec = sent_pn.get(p['key'])
+        try:
+            return (not rec or rec.get('identity') != p['identity']
+                    or now - float(rec.get('last') or 0) >= PATCH_NOW_REPEAT_S)
+        except (TypeError, ValueError):
+            return True
+
+    new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]
     emailed = False
     if new_items:
         server_id = _guarddog_server_identifier(settings) or socket.gethostname()
         # ops #345: the email is about what is NEW. Updates mailed before are not listed
         # again: the same 8 OS patches used to ride along in every email a later console
         # update triggered (NUC, Tue Oct 27: four mails in seven hours).
-        sec_items = [p for p in new_items if p.get('security')]
-        other = [p for p in new_items if not p.get('security')]
+        pn_items = [p for p in new_items if p.get('patch_now')]
+        sec_items = [p for p in new_items if p.get('security') and not p.get('patch_now')]
+        other = [p for p in new_items if not p.get('security') and not p.get('patch_now')]
         lines = []
+        if pn_items:
+            # ops #377: urgent first, in plain words, with where to click.
+            lines += [f"URGENT SECURITY UPDATE: install this now on {server_id}.", '']
+            for p in pn_items:
+                lines.append(f"  • {p.get('summary') or p['label']}")
+                lines += [f"      {s}" for s in p.get('security') or []]
+                if p.get('how'):
+                    lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
+                rec = sent_pn.get(p['key'])
+                if rec and rec.get('identity') == p['identity']:
+                    try:
+                        days = max(1, int((now - float(rec.get('first') or now)) // 86400))
+                    except (TypeError, ValueError):
+                        days = 1
+                    lines.append(f"      Reminder: this is still not installed. We first emailed about it "
+                                 f"{days} day{'s' if days != 1 else ''} ago.")
+                lines.append('')
         if sec_items:
             # ops #168: say it plainly, say what it fixes, say where to click.
             lines += [f"SECURITY UPDATE: you should update this machine ({server_id}).", '']
@@ -27826,6 +28437,7 @@ def _update_notify_check_once():
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 lines.append('')
+        if sec_items or pn_items:
             if other:
                 lines.append('Other pending updates:')
         else:
@@ -27838,7 +28450,13 @@ def _update_notify_check_once():
                   f"Update channel: {(settings.get('update_channel') or 'main').strip().lower()}",
                   '', 'You get one email per new update, and only about what is new. '
                   'Updates you were already told about are not repeated.']
-        if sec_items:
+        if pn_items:
+            lines.append('Urgent security fixes are the exception: you get a reminder every '
+                         '24 hours until they are installed.')
+            reminder = all(sent_pn.get(p['key'], {}).get('identity') == p['identity'] for p in pn_items)
+            subj = (f"🔒 Security update pending on {server_id} — patch now"
+                    + (' (reminder)' if reminder else ''))
+        elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
         else:
             subj = (f"⬆ Update pending on {server_id}" if len(new_items) == 1
@@ -27852,13 +28470,38 @@ def _update_notify_check_once():
             print(f"[update-notify] email send failed: {e}", flush=True)
     # Persist ONLY what was successfully mailed (a failed send retries next sweep);
     # prune entries no longer pending so the same target re-mails if it reappears.
-    new_state = {p['key']: (state[p['key']] if _mailed(p) else p['identity']) for p in pending}
-    # ops #168: a source that could not be read this sweep is not "no longer pending".
-    for k in unknown:
-        if k in state and k not in new_state:
-            new_state[k] = state[k]
-    if seen:
-        new_state['_os_security_seen'] = seen
+    if fast:
+        new_state = {k: v for k, v in state.items() if k not in ('_patch_now_sent', '_patch_now_feed')}
+    else:
+        new_state = {p['key']: (state[p['key']] if _mailed(p) else p['identity'])
+                     for p in pending if not p.get('patch_now')}
+        # ops #168: a source that could not be read this sweep is not "no longer pending".
+        for k in state:
+            if not k.startswith('_') and k not in new_state and _carried_by_unknown(k, unknown):
+                new_state[k] = state[k]
+        if seen:
+            new_state['_os_security_seen'] = seen
+    # ops #377: patch-now reminders. Both modes run the same patch-now sources, so an item
+    # missing here was verified fixed and stops; an unreadable source carries its entry.
+    mailed_keys = {p['key'] for p in new_items} if emailed else set()
+    pn_new = {}
+    for p in pending:
+        if not p.get('patch_now'):
+            continue
+        rec = sent_pn.get(p['key'])
+        if p['key'] in mailed_keys:
+            same = bool(rec) and rec.get('identity') == p['identity']
+            pn_new[p['key']] = {'identity': p['identity'], 'first': rec.get('first', now) if same else now,
+                                'last': now, 'count': int(rec.get('count') or 1) + 1 if same else 1}
+        elif rec:
+            pn_new[p['key']] = rec
+    for k, rec in sent_pn.items():
+        if k not in pn_new and _carried_by_unknown(k, unknown):
+            pn_new[k] = rec
+    if pn_new:
+        new_state['_patch_now_sent'] = pn_new
+    if feed:
+        new_state['_patch_now_feed'] = feed
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
     return {'pending': pending, 'emailed': emailed}
@@ -27901,15 +28544,21 @@ def _startup_retire_updates_timer():
 
 def _update_notify_loop():
     time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
+    next_full = 0.0
     while True:
-        wait = UPDATE_NOTIFY_INTERVAL_S
+        # ops #377: a full sweep every 6 h, and between them an hourly patch-now check.
+        wait = PATCH_NOW_CHECK_INTERVAL_S
+        full = time.time() >= next_full
         try:
+            if full:
+                next_full = time.time() + UPDATE_NOTIFY_INTERVAL_S
             with _update_notify_lock:
-                r = _update_notify_check_once() or {}
+                r = _update_notify_check_once(fast=not full) or {}
             if r.get('quiet_until'):
                 # ops #228: deferred by a quiet window — look again once it has settled,
-                # not six hours later.
-                wait = min(UPDATE_NOTIFY_INTERVAL_S,
+                # not six hours later, and make that look the full sweep.
+                next_full = 0.0
+                wait = min(PATCH_NOW_CHECK_INTERVAL_S,
                            max(60, int(r['quiet_until'] - time.time()) + UPDATE_NOTIFY_FIRST_DELAY_S))
         except Exception as e:
             try:
@@ -31378,6 +32027,33 @@ def caddy_custom_cert():
     return jsonify({'success': True, 'message': msg, 'warnings': v['warnings'], 'not_after': v['not_after']})
 
 
+def _rewire_8446_after_acme_flip():
+    """Custom certificate -> automatic HTTPS: move TAK Server's 8446 enrollment connector onto
+    the Let's Encrypt certificate too (ops #306).
+
+    Uploading a custom certificate re-wires 8446 onto it, but switching back used to leave 8446
+    on the operator's certificate until the next daily console restart, and only then if Caddy
+    had issued the TAK Server name by that time. A Cloudflare Origin certificate is trusted by
+    nothing except Cloudflare, so for that long phones could not enroll by QR and CloudTAK could
+    not log in (both talk to 8446 and verify the certificate). Runs in the background: it waits
+    for Caddy's certificate, then keeps retrying for 30 min (one TAK restart when it lands).
+    Returns True when a re-wire was started, False when there is no TAK Server here or no TAK
+    Server name to wire."""
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return False
+    tak_host = _get_service_domain(load_settings(), 'takserver')
+    if not tak_host:
+        return False
+
+    def _rewire_8446():
+        try:
+            _install_le_cert_on_8446_at_deploy(tak_host, lambda m: print(f"[ssl-mode 8446] {m}", flush=True))
+        except Exception as e:
+            print(f"[ssl-mode 8446] re-wire error (non-fatal; the daily console heal retries): {e}", flush=True)
+    threading.Thread(target=_rewire_8446, daemon=True, name='ssl-mode-8446').start()
+    return True
+
+
 @app.route('/api/caddy/ssl-mode', methods=['POST'])
 @login_required
 def caddy_set_ssl_mode():
@@ -31411,7 +32087,10 @@ def caddy_set_ssl_mode():
                 if _reassert_mediamtx_cert_grant(lambda m: print(f"ssl-mode flip: {m}", flush=True)):
                     return
         threading.Thread(target=_delayed_mtx_grant, daemon=True).start()
-    return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
+    msg = "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."
+    if _rewire_8446_after_acme_flip():
+        msg += " TAK Server's enrollment certificate (port 8446) follows as soon as the TAK Server name has its certificate, and TAK Server restarts once when it does."
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/caddy/acme', methods=['GET'])
@@ -33507,6 +34186,44 @@ _register_module_remote_routes('webodm', 'webodm_deployment')
 _register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get_fedhub_deployment_config)
 
 
+def _cloudtak_caddy_bind_ip(settings):
+    """The local IPv4 Caddy binds the CloudTAK video listener (:9997) to, or '' when none.
+
+    settings.server_ip when it is assigned to a NIC here; otherwise the box's primary local
+    address (server_ip may be a public/NAT address that is not on any interface). Shared by
+    the Caddyfile and by _cloudtak_video_host_pin so the two always agree."""
+    ip = (settings.get('server_ip') or '').strip()
+    if ip and ip not in _list_local_ipv4s():
+        ip = _primary_local_ipv4()
+    return ip
+
+
+def _cloudtak_video_host_pin(settings):
+    """extra_hosts entry `video.<fqdn>:<this box's Caddy address>` for CloudTAK's api container.
+
+    ops #471. CloudTAK's api reaches its media server at `https://<video host>:9997` for every
+    lease (video-service.ts forces port 9997; same in 13.54.3 through 13.119.0). The api container
+    resolves that name through public DNS, so the call leaves the box and comes back through
+    whatever fronts it. Behind a relay the relay never carried 9997, and on a home or office
+    network the router has no NAT hairpin, so the connect times out after 10 s and every proxy
+    lease fails with "Failed to generate proxy stream" (nuc; test12 with the name pointed at the
+    relay: ConnectTimeoutError video.<fqdn>:9997). Pinning the name to the address Caddy's :9997
+    listener is bound to keeps that hop on the box; TLS still validates because the URL keeps
+    its hostname. '' when there is nothing to pin (no domain, remote CloudTAK, no bind IP).
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return ''
+    except Exception:
+        return ''
+    video = (_get_service_domain(settings, 'cloudtak_video') or '').strip()
+    if not video or not (settings.get('fqdn') or '').strip():
+        return ''
+    host = video.split()[0].strip()
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return f'{host}:{ip}' if host and ip else ''
+
+
 def _get_cloudtak_upstreams(settings):
     """Return CloudTAK upstream endpoints for Caddy and readiness checks.
 
@@ -34447,7 +35164,7 @@ def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config
     cacfg.set('keystore', 'JKS')
     cacfg.set('keystoreFile', f'certs/files/{int_ca}-signing.jks')
     cacfg.set('keystorePass', cert_pass)
-    cacfg.set('validityDays', issued_days)
+    cacfg.set('validityDays', str(_tak_issued_validity(issued_days)))  # v10.3.5 W9
     cacfg.set('signatureAlg', 'SHA256WithRSA')
     changed.append('certificateSigning')
 
@@ -36845,6 +37562,11 @@ def _caddy_registry_loaded():
         print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
 
 
+# ops #470: how long Caddy lets one CloudTAK request run before it gives up on a read or write
+# to the upstream (see generate_caddyfile).
+_CLOUDTAK_MAP_TIMEOUT = '6h'
+
+
 # ops #222: /print-api on the CloudTAK map site, while infra-TAK has TAK Portal's Print set up on
 # loopback (its overlay exists, _cloudtak_print_converge). It is TAK Portal's own snippet — same
 # name, same matcher — with the one upstream host Caddy can reach. That is deliberate: TAK
@@ -37318,8 +38040,14 @@ def generate_caddyfile(settings=None):
         # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
         lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
-        lines.append(f"            read_timeout 120s")
-        lines.append(f"            write_timeout 120s")
+        # ops #470 (infra-TAK #398): Caddy's read_timeout is a deadline on the first read from
+        # the upstream, and that read starts as soon as the request does. A hosted-tileset
+        # upload sends nothing back until the whole file is in, so anything over 120 s (a
+        # multi-GB pmtiles on a home uplink) died with a 502. write_timeout has the same
+        # trap: the body copy to the upstream is one write, so it died with a 504. Long
+        # enough for the 5G upload cap.
+        lines.append(f"            read_timeout {_CLOUDTAK_MAP_TIMEOUT}")
+        lines.append(f"            write_timeout {_CLOUDTAK_MAP_TIMEOUT}")
         lines.append(f"        }}")
         lines.append(f"    }}")
         lines.append(f"    # CloudTAK's image ships no Cache-Control on the PWA entry points, so")
@@ -37372,15 +38100,13 @@ def generate_caddyfile(settings=None):
         # a locally-assigned IP: keep server_ip when it's on the NIC, else fall back to the
         # box's primary local IP (NAT forwards the public :9997 to it). If neither resolves,
         # skip the listener rather than crash Caddy.
-        ct_bind_ip = (settings.get('server_ip') or '').strip()
-        if ct_bind_ip and ct_bind_ip not in _list_local_ipv4s():
-            ct_bind_ip = _primary_local_ipv4()
+        ct_bind_ip = _cloudtak_caddy_bind_ip(settings)
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
             lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs.")
             lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
-            lines.append(f"    bind {ct_bind_ip}")
+            lines.append(f"    bind {_ct_video_bind_addrs(settings, ct_bind_ip)}")
             lines += _caddy_drop_request_encoding_lines()
             lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
@@ -38056,6 +38782,20 @@ def _tak_container_ids():
     return uid, gid
 
 
+# The 8446 connector as CoreConfig.xml has it. Attribute values hold slashes
+# (keystoreFile="certs/files/takserver-le.jks"), so the old `[^/]*/>` could not match the
+# connector this installer writes itself: every run after the first warned "pattern not
+# matched". Quoted values are skipped whole; the match ends at the first `/>` outside quotes.
+_TAK_8446_CONNECTOR_RE = re.compile(
+    r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"(?:"[^"]*"|[^">])*?/\s*>')
+
+
+def _tak_8446_connector_has_le(content):
+    """True iff the 8446 connector itself is already wired to the Let's Encrypt keystore."""
+    m = _TAK_8446_CONNECTOR_RE.search(content or '')
+    return bool(m and '_name="LetsEncrypt"' in m.group(0) and 'takserver-le.jks' in m.group(0))
+
+
 def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
     """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
     the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
@@ -38092,13 +38832,18 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # /opt/tak/certs/files, so write the p12 to a host-writable /tmp path, then broker-cp it
     # onto the shared mount where the container's keytool (Step B) reads it. (Raw -out into
     # /opt/tak EPERM'd with an empty error -> "PKCS12 conversion failed" -> no 8446 LE cert.)
-    _tmp_p12 = '/tmp/takserver-le.p12'
+    # Per-run console-owned dir, not a fixed /tmp name: the root-run renewal script leaves a
+    # root-owned 0600 /tmp/takserver-le.p12 behind, which takwerx cannot overwrite (nuc
+    # 2026-11-02: "PKCS12 conversion failed:" every minute, 8446 never got the LE cert).
+    _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
+    _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
     r = subprocess.run(
         f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
         f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}"); return False
+        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True); return False
     subprocess.run(_sudo_wrap(['cp', _tmp_p12, p12]), capture_output=True)
     # The hardened 5.8 images run as tak:0, NOT root, so a root-owned 0600 p12 is
     # unreadable by the keytool in Step B:
@@ -38109,10 +38854,7 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # _container_own_tree() cannot cover this file: it runs during the deploy, and this
     # cert is installed afterwards. The ownership is set from the container's real ids
     # just below, which supersedes the group-0 model this lane originally used.
-    try:
-        os.remove(_tmp_p12)
-    except Exception:
-        pass
+    shutil.rmtree(_tmp_dir, ignore_errors=True)
     # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
     # The container must be able to READ the p12, so set ownership from the container's real
     # uid FIRST — 1000 is only correct for the stock image; the hardened one runs as 1001.
@@ -38152,12 +38894,11 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
             f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
             'enableNonAdminUI="false"/>')
-        patched = re.sub(r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
-                         new_connector, content, count=1)
-        if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
+        patched = _TAK_8446_CONNECTOR_RE.sub(lambda _m: new_connector, content, count=1)
+        if patched != content and _tak_8446_connector_has_le(patched):
             _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
-        elif '_name="LetsEncrypt"' in content and 'takserver-le.jks' in content:
+        elif _tak_8446_connector_has_le(content):
             # Already wired to the LE keystore — re.sub was a no-op (patched==content).
             # This is the IDEMPOTENT re-run path (e.g. the LE-cert self-heal re-establishing
             # the renewal script after a container redeploy re-extracted /opt/tak and wiped
@@ -38282,24 +39023,30 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
 
-    # Step A: LE cert → PKCS12
+    # Step A: LE cert → PKCS12, in a per-run console-owned dir (see the container path above
+    # for why a fixed /tmp name fails on non-root boxes).
+    _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
+    _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
+    _tmp_jks = os.path.join(_tmp_dir, 'takserver-le.jks')
     r = subprocess.run(
         f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out /tmp/takserver-le.p12 -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
+        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}")
+        log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
         return False
     log_fn("  ✓ PKCS12 created")
 
     # Step B: PKCS12 → JKS
     r = subprocess.run(
         f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} '
-        f'-destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 '
+        f'-destkeystore {shlex.quote(_tmp_jks)} -srckeystore {shlex.quote(_tmp_p12)} '
         f'-srcstoretype pkcs12 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log_fn(f"  ⚠ JKS conversion failed: {r.stderr.strip()[:200]}")
+        log_fn(f"  ⚠ JKS conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
         return False
 
     # install(1) reads the /tmp source (broker source-permissive) and writes the
@@ -38309,13 +39056,9 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     # 0644 and is now 0640 too.)
     subprocess.run(_sudo_wrap([
         'install', '-o', 'tak', '-g', 'tak', '-m', '640',
-        '/tmp/takserver-le.jks', '/opt/tak/certs/files/takserver-le.jks']),
+        _tmp_jks, '/opt/tak/certs/files/takserver-le.jks']),
         capture_output=True, text=True)
-    for _scratch in ('/tmp/takserver-le.jks', '/tmp/takserver-le.p12'):
-        try:
-            os.remove(_scratch)  # console-owned /tmp scratch; direct
-        except OSError:
-            pass
+    shutil.rmtree(_tmp_dir, ignore_errors=True)  # console-owned scratch; direct
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
     # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
@@ -38359,10 +39102,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         # (or any other prefix). The (?:[A-Za-z][\w-]*:)? group accepts an optional
         # XML namespace prefix before the element name. Also accept `/ >` (with space)
         # which ElementTree emits with short_empty_elements=True on some Python versions.
-        patched = re.sub(
-            r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
-            new_connector, content, count=1
-        )
+        patched = _TAK_8446_CONNECTOR_RE.sub(lambda _m: new_connector, content, count=1)
         if patched != content:
             _write_priv(core_config, patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
@@ -38380,6 +39120,8 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
                     return False
             except Exception as _ve:
                 log_fn(f"  ⚠ Post-patch verify error: {_ve} (continuing — may need manual check)")
+        elif _tak_8446_connector_has_le(content):
+            log_fn("  ✓ CoreConfig.xml 8446 connector already set to the LE cert")
         else:
             log_fn("  ⚠ 8446 connector pattern not matched in CoreConfig.xml — check manually")
             log_fn(f"  ⚠ First 200 chars: {content[:200]!r}")
@@ -38423,17 +39165,18 @@ if [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ]; then
 fi
 
 log "TAK keystore differs from Caddy's current cert (Caddy renewed) — refreshing keystore..."
-rm -f /tmp/takserver-le.p12 /tmp/takserver-le.jks
+WORK=$(mktemp -d /tmp/le8446-renew-XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
-  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
+  -out "$WORK/takserver-le.p12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
 
 keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} \\
-  -destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 \\
+  -destkeystore "$WORK/takserver-le.jks" -srckeystore "$WORK/takserver-le.p12" \\
   -srcstoretype pkcs12
 
 rm -f /opt/tak/certs/files/takserver-le.jks
-mv /tmp/takserver-le.jks /opt/tak/certs/files/
+mv "$WORK/takserver-le.jks" /opt/tak/certs/files/
 chown tak:tak /opt/tak/certs/files/takserver-le.jks
 
 systemctl restart takserver
@@ -42453,6 +43196,10 @@ def run_takportal_deploy():
     try:
         portal_dir = os.path.expanduser('~/TAK-Portal')
         settings = load_settings()
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('TAK Portal', plog):
+            takportal_deploy_status.update({'running': False, 'error': True})
+            return
         if settings.get('pkg_mgr', 'apt') == 'apt':
             wait_for_apt_lock(plog, takportal_deploy_log)
         # Step 1: Check Docker
@@ -45612,11 +46359,22 @@ def _cloudtak_tak_cert_heal(settings=None, log=None, waits=(0, 45, 45, 45)):
                            capture_output=True, text=True, timeout=20)
         ct_cert = (r.stdout or '').strip()
         signed = _cert_signed_by(ct_cert, _read_priv('/opt/tak/certs/files/ca.pem'))
+        if signed is False:
+            # v10.3.5: during an intermediate Rotate the old CA is still on TAK's trust list for
+            # 30 days, so a cert from it is fine — and a TAK restart that takes longer than the
+            # waits above reads 'dead' (test6, 2026-11-03: this re-issued the bootstrap cert
+            # mid-rotate and certmod -A timed out against a TAK still starting). A CA problem
+            # means NO CA that TAK trusts signed it.
+            trusted = _tak_live_trust_entries()
+            if trusted is None:
+                signed = None
+            elif any(_cert_signed_by(ct_cert, pem) for _alias, pem in trusted):
+                signed = True
     except Exception:
         signed = None
     if signed is not False:
         if signed is True:
-            _log("  CloudTAK's TAK connection is down, but its cert is from the current CA — not a CA problem; left alone")
+            _log("  CloudTAK's TAK connection is down, but its cert is from a CA TAK trusts — not a CA problem; left alone")
         return None
     _log("  CloudTAK's TAK connection is down: its cert was issued by a CA this TAK Server no longer has. "
          "Re-issuing the CloudTAK bootstrap admin cert from the current CA...")
@@ -45665,21 +46423,96 @@ def _cloudtak_local_with_local_tak(settings=None):
         return False
 
 
+def _cloudtak_signout_users(usernames, log=None, dry_run=False):
+    """v10.3.5 W13 — sign out of CloudTAK exactly the users whose TAK cert was just emptied
+    (_cloudtak_reset_foreign_profile_certs): each one's browser goes straight to the login page,
+    which re-issues the cert from the current CA. Users who moved during the window hold a
+    new-CA cert, aren't on the list, and stay signed in.
+    CloudTAK >= 13.117 (api/stateless/routes/users.ts): GET /api/user/<u>/session lists the
+    sessions, DELETE /api/user/<u>/session/<id> -> revokeSessions() deletes the profile_sessions
+    row, kills the refresh token and pushes {type:'logout'} down the user's websocket.
+    Never rotate SigningSecret and never PATCH disabled:true (that disables the account).
+    Fallback when the API errors: delete the user's profile_sessions rows in SQL (matched by
+    md5, no username in the SQL); the socket then stays open until its next API call.
+    Returns {'signout': ok/partial/old/failed/none, 'users', 'sessions'}."""
+    _log = log or (lambda m: print(m, flush=True))
+    users = [u for u in dict.fromkeys(usernames or []) if u and u != '?']
+    out = {'signout': 'none', 'users': 0, 'sessions': 0}
+    secret = _cloudtak_signing_secret()
+    if not users or not secret:
+        return out
+    base = 'http://127.0.0.1:5000'
+    # The CA heal that runs just before this restarts the CloudTAK API. test6 2026-11-03: the
+    # sign-out hit it while it booted (HTTP 502) and fell back to SQL, so no logout was pushed
+    # to the open tab. Wait (up to 2 min) until the API answers.
+    for _ in range(24):
+        ok, code, _srv = _cloudtak_request_json(
+            'GET', base + '/api/server', timeout=10,
+            headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+        if ok or code not in (0, 502, 503, 504):
+            break
+        time.sleep(5)
+    failed = []
+    for i, u in enumerate(users):
+        hdr = {'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)}
+        q = urllib.parse.quote(u, safe='')
+        ok, code, lst = _cloudtak_request_json('GET', f'{base}/api/user/{q}/session?limit=100', headers=hdr, timeout=20)
+        if not ok and code == 404 and i == 0:
+            _log("  CloudTAK too old for targeted sign-out — users log out/in once")
+            return dict(out, signout='old')
+        ids = [str(s.get('id')) for s in (lst or {}).get('items') or [] if isinstance(s, dict) and s.get('id')] if ok else None
+        if dry_run:
+            _log(f"  (dry run) {u}: HTTP {code}, {len(ids or [])} session(s)")
+            continue
+        done = 0
+        for sid in ids or []:
+            dok, dcode, _r = _cloudtak_request_json(
+                'DELETE', f"{base}/api/user/{q}/session/{urllib.parse.quote(sid, safe='')}", headers=hdr, timeout=20)
+            if dok:
+                done += 1
+            elif dcode != 404:   # 404: already gone (it expired, or the user logged out meanwhile)
+                ids = None
+                break
+        if ids is None:
+            digest = hashlib.md5(u.encode()).hexdigest()
+            n = _cloudtak_postgis_json("with d as (delete from profile_sessions "
+                                       f"where md5(username) = '{digest}' returning 1) select count(*) from d")
+            if n is None:
+                failed.append(u)
+                continue
+            done += int(n)
+            _log(f"  ⚠ {u}: CloudTAK's API refused the sign-out (HTTP {code}); session rows deleted in the "
+                 "database instead — an open browser tab notices at its next request")
+        out['sessions'] += done
+        out['users'] += 1 if done else 0
+    out['signout'] = 'failed' if len(failed) == len(users) else ('partial' if failed else 'ok')
+    if not dry_run:
+        _log(f"  ✓ CloudTAK: signed out {out['sessions']} session(s) of {out['users']} user(s) still on the revoked CA"
+             + (f"; could not sign out {len(failed)}: {', '.join(failed[:10])}" if failed else ''))
+    return out
+
+
 def _cloudtak_heal_after_ca_change(log=None):
     """After TAK's CA changed (Update Now's container/CA heal, Revoke Old CA): give CloudTAK's
     own connection a current cert when it's dead for that reason (_cloudtak_tak_cert_heal, ~2
     min of waits), then empty the user certs TAK no longer trusts so each is re-issued at that
-    user's next login (W7). Local CloudTAK + local TAK only. Run it in a thread."""
+    user's next login (W7), and sign exactly those users out (W13) so the login comes now, not
+    at a confusing error later. Local CloudTAK + local TAK only. Run it in a thread.
+    Returns {'reset': [usernames] or None, 'signout': ...} (see _cloudtak_signout_users)."""
     _log = log or (lambda m: print(m, flush=True))
+    res = {'reset': None, 'signout': 'none', 'users': 0, 'sessions': 0}
     try:
         _cloudtak_tak_cert_heal(log=_log)
     except Exception as e:
         _log(f"  CloudTAK cert check skipped: {e}")
     try:
         if _cloudtak_local_with_local_tak():
-            _cloudtak_reset_foreign_profile_certs(_log)
+            res['reset'] = _cloudtak_reset_foreign_profile_certs(_log)
+            if res['reset']:
+                res.update(_cloudtak_signout_users(res['reset'], _log))
     except Exception as e:
         _log(f"  CloudTAK user cert check skipped: {e}")
+    return res
 
 
 @app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
@@ -46936,6 +47769,9 @@ def _cloudtak_build_override_yml(settings):
             if server_ip:
                 extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
+    # ops #471: only the api container calls the media server by its public name.
+    video_pin = _cloudtak_video_host_pin(settings)
+    api_hosts_block = hosts_block + (f'\n      - "{video_pin}"' if video_pin else '')
     # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
     # CloudTAK's api container runs both nginx and Node in the same image;
     # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
@@ -47075,7 +47911,7 @@ def _cloudtak_build_override_yml(settings):
 services:
   api:
     extra_hosts:
-{hosts_block}
+{api_hosts_block}
     environment:
 {tls_env_block}{_sim_env_block}{cert_vol_block}{_sim_net_block}
   tiles:
@@ -49399,6 +50235,43 @@ def _patch_cloudtak_tiles_arm64(cloudtak_dir=None):
     return True
 
 
+# GH #384 (ops #439): the tiles image runs its unit tests inside the build, and since 13.117.0
+# a few of them, named "... (live network)", fetch real tiles from maps.six.nsw.gov.au and
+# sampleserver6.arcgisonline.com. A box whose network can't reach those (firewall, geo-block,
+# their outage) fails every Update at `npm run test` with "actual: 400, expected: 200" and
+# rolls back. Skip only those tests in the image build; every offline test still runs.
+# NODE_OPTIONS, not `npm run test -- --test-skip-pattern`: tsx --test ignores the trailing flag
+# (✅ verified 2026-11-02 in node:26-alpine3.24 on test6). Tracked file: re-apply after every
+# checkout, like the arm64 base patch.
+_CLOUDTAK_TILES_LIVE_SKIP = 'NODE_OPTIONS=--test-skip-pattern=live.network '
+_CLOUDTAK_TILES_TEST_RE = re.compile(r'(?m)(^RUN[ \t]+|&&[ \t]*)(npm run test\b)')
+_CLOUDTAK_REMOTE_TILES_LIVE_PERL = (
+    "cd ~/CloudTAK && f=" + _CLOUDTAK_TILES_DOCKERFILE + " && [ -f \"$f\" ] && "
+    "perl -i -pe 's/(^RUN[ \\t]+|&&[ \\t]*)(npm run test\\b)/${1}" + _CLOUDTAK_TILES_LIVE_SKIP + "$2/ "
+    "unless /test-skip-pattern/' \"$f\"; true"
+)
+
+
+def _patch_cloudtak_tiles_live_tests(cloudtak_dir=None):
+    """Make CloudTAK's tiles image build skip its live-network tests (GH #384).
+    Idempotent; returns True if the file changed."""
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    path = os.path.join(cloudtak_dir, _CLOUDTAK_TILES_DOCKERFILE)
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        cur = f.read()
+    if 'test-skip-pattern' in cur:
+        return False
+    new = _CLOUDTAK_TILES_TEST_RE.sub(r'\1' + _CLOUDTAK_TILES_LIVE_SKIP + r'\2', cur, count=1)
+    if new == cur:
+        return False
+    with open(path, 'w') as f:
+        f.write(new)
+    return True
+
+
 def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
     """arm64 only: build media-infra from source and tag it as the exact image
     CloudTAK's compose pins, so `docker compose up` uses the local arm64 build
@@ -49781,6 +50654,10 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             plog(f"✓ SSH connected to {remote_host}")
+            # ops #360: the remote host's CPU, before Docker or the build
+            if not _cpu_preflight_remote(remote_cfg, 'CloudTAK', plog):
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
             plog("")
             plog("━━━ Step 2/6: Ensuring Docker on remote ━━━")
@@ -49897,6 +50774,9 @@ def run_cloudtak_deploy(cfg=None):
             # ops #216: a Deploy over a remote CloudTAK keeps TAK Portal's plugins (in-place
             # checkout) but reset its build edits — put them back before the build.
             _cloudtak_remote_shield(remote_cfg, plog)
+            # GH #384: the tiles build must not need outside map servers.
+            if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
+                plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -49973,6 +50853,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            return
+
+        # ops #360: stop before installing anything on a CPU the image library can't run on
+        if not _cpu_preflight_local('CloudTAK', plog):
+            cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
         # Step 1: Check Docker
@@ -50234,6 +51119,11 @@ def run_cloudtak_deploy(cfg=None):
                     plog("  arm64: patched tiles Dockerfile base alpine→bookworm-slim (glibc — fixes @mapbox/vtquery)")
             except Exception as _te:
                 plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
+            try:
+                if _patch_cloudtak_tiles_live_tests(cloudtak_dir):
+                    plog("  tiles build: skipping CloudTAK's live-network tests (they need outside map servers)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles live-test skip not applied (non-fatal): {str(_te)[:100]}")
             if _patch_cloudtak_compose_ports(cloudtak_dir):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
@@ -51801,6 +52691,9 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
+            # GH #384: and put back the tiles build's live-network test skip.
+            if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
+                plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
             if os.path.isdir(_cloudtak_hooks_dir()):
                 plog("  ⚠ Pre-build hooks only run for a CloudTAK on this server — not run on the remote host")
         else:
@@ -51809,6 +52702,11 @@ def run_cloudtak_update():
                     plog("  arm64: re-applied tiles Dockerfile base alpine→bookworm-slim after checkout")
             except Exception as _te:
                 plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
+            try:
+                if _patch_cloudtak_tiles_live_tests(cloudtak_dir):
+                    plog("  tiles build: skipping CloudTAK's live-network tests (they need outside map servers)")
+            except Exception as _te:
+                plog(f"  ⚠ tiles live-test skip not applied (non-fatal): {str(_te)[:100]}")
             try:
                 _patch_cloudtak_minio_registry(cloudtak_dir)
                 if _patch_cloudtak_compose_ports(cloudtak_dir):
@@ -56077,14 +56975,15 @@ def _heal_netbird_pinned_image(plog=None):
         _srv_img, _dash_img = _get_netbird_target_images()
         if _srv_img in txt and _dash_img in txt:
             return False  # already on this channel's target — healthy, no-op
-        _log(f"  netbird: compose off the {('dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted')} pin — restoring {_srv_img} + recreating")
+        _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
+        _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
         _netbird_sync_compose_image_tags(nb_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                            capture_output=True, text=True, cwd=nb_dir, timeout=180)
         if r.returncode == 0:
-            _log("  ✓ netbird: restored to vetted pin + recreated")
+            _log(f"  ✓ netbird: restored to {_pin_kind} pin + recreated")
             return True
         _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
         return False
@@ -56277,6 +57176,14 @@ def _netbird_complete_setup(settings, plog):
         return None
 
 
+def _netbird_idp_cert_refusal(err_body):
+    """True when a NetBird identity-provider error body says it can't validate the issuer's
+    TLS certificate (ops #433)."""
+    low = (err_body or '').lower()
+    return any(k in low for k in ('x509', 'unknown authority', 'failed to verify certificate',
+                                  'certificate verify'))
+
+
 def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_secret, settings, plog):
     """Register Authentik as external OIDC IDP (Management Setup — embedded dashboard)."""
     import urllib.error
@@ -56320,7 +57227,7 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
     except urllib.error.HTTPError as e:
         err_body = ''
         try:
-            err_body = e.read().decode()[:300]
+            err_body = e.read().decode()[:600]
         except Exception:
             pass
         if existing:
@@ -56328,17 +57235,31 @@ def _netbird_register_authentik_idp(pat, authentik_issuer, client_id, client_sec
             plog(f'  ⚠ Authentik IDP already registered; update failed HTTP {e.code}: {err_body[:200]}')
             idp_redirect = existing.get('redirect_uri') or existing.get('redirectURL')
         elif e.code in (400, 409, 422):
-            plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+            # NetBird answers 422 when it cannot check the issuer ("identity provider issuer is
+            # unreachable ... x509: certificate signed by unknown authority"). That is a refusal,
+            # not "already registered" (ops #433): the box does not trust Authentik's certificate.
+            if _netbird_idp_cert_refusal(err_body):
+                plog("  ✗ NetBird can't trust Authentik's certificate, so the Authentik login button "
+                     "can't be added. Install the CA that signed it on this box (or use a trusted "
+                     f"certificate), then press Deploy again. NetBird said: {err_body[:200]}")
+                return False
+            found = None
             try:
                 resp = _netbird_mgmt_request('/api/identity-providers', token=pat, timeout=15)
                 idps = json.loads(resp.read().decode())
                 items = idps if isinstance(idps, list) else idps.get('items') or idps.get('data') or []
-                for item in items:
-                    if 'authentik' in (item.get('name') or '').lower():
-                        idp_redirect = item.get('redirect_uri') or item.get('redirectURL')
-                        break
+                found = next((i for i in items if 'authentik' in (i.get('name') or '').lower()), None)
             except Exception:
                 pass
+            if found:
+                plog(f'  ✓ Authentik IDP already registered (HTTP {e.code})')
+                idp_redirect = found.get('redirect_uri') or found.get('redirectURL')
+            elif e.code == 409:
+                plog('  ✓ Authentik IDP already registered (HTTP 409)')
+            else:
+                plog(f'  ✗ NetBird refused the Authentik registration (HTTP {e.code}) and no Authentik '
+                     f'entry exists: {err_body[:200]}')
+                return False
         else:
             plog(f'  ⚠ IDP registration failed HTTP {e.code}: {err_body[:200]}')
             return False
@@ -56648,6 +57569,14 @@ def _run_netbird_deploy(settings):
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        # netbird-server reads the host CA bundle through a single-file bind mount, and
+        # update-ca-certificates swaps that file, so a container started before a CA was installed
+        # keeps the old bundle. Recreate it so the Authentik registration in Step 5 sees the
+        # current one (ops #433: "install the CA, press Deploy again" did nothing without this).
+        r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'netbird-server']),
+                    capture_output=True, text=True, cwd=nb_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose recreate netbird-server failed: {r.stderr[:300]}')
         plog('✓ Containers running')
 
         plog('')
@@ -71291,6 +72220,10 @@ def _authentik_ldap_sa_bind_watchdog_loop():
     """
     import time as _wt
     _wt.sleep(120)  # Let console finish _startup_migrations before first tick
+    # ops #438: the boot heal now waits for Authentik (up to 10 min); don't heal alongside it.
+    _boot_heal = globals().get('_startup_ldap_resync_done')
+    if _boot_heal is not None:
+        _boot_heal.wait(timeout=900)
 
     _ok_log_interval = 10  # ~50 minutes between liveness lines
     _ok_counter = 0
@@ -71455,6 +72388,13 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             except Exception as _re:
                 print(f"[ldap-sa-watchdog] webadmin role check error: {str(_re)[:120]}", flush=True)
 
+            # v10.3.5 W19: does TAK itself treat webadmin as admin? (once per TAK start)
+            try:
+                _tak_webadmin_admin_check(lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True),
+                                          ldap_ok=(_verdict == 'ok'))
+            except Exception as _we:
+                print(f"[ldap-sa-watchdog] webadmin admin check error: {str(_we)[:120]}", flush=True)
+
             # v0.9.23 Phase 1: forensic audit-log scrape AFTER any heal. This
             # captures both (a) external writers that triggered the heal AND
             # (b) our own password_set from _ensure_authentik_ldap_service_account
@@ -71478,6 +72418,246 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             print(f"[ldap-sa-watchdog] tick error (non-fatal): {str(_le)[:120]}", flush=True)
 
         _wt.sleep(300)
+
+
+# v10.3.5 W19: TAK Server can come up from a box reboot handing webadmin no admin role.
+# test8, 2026-11-03: TAK booted while the LDAP service-account bind was still failing (the
+# console's boot heal fixed it two minutes later), and from then on every webadmin login on
+# 8446 got ROLE_ANONYMOUS and landed on WebTAK — fresh sessions included — while Authentik,
+# LDAP, CoreConfig and UserAuthenticationFile.xml were all correct. A TAK restart cleared it.
+# The boot heal can't just restart TAK whenever it healed the bind: that is GH #83 (the bind
+# fails routinely while Authentik starts, so every reboot restarted TAK). So check the
+# symptom itself: once per TAK start, after it has settled, log in as webadmin the way the
+# browser does and ask TAK whether the session is admin. Restart only when TAK says no.
+_TAK_WEBADMIN_CHECK_MIN_UPTIME_S = 300
+_TAK_WEBADMIN_RESTART_MIN_GAP_S = 6 * 3600
+_tak_webadmin_fix_lock = threading.Lock()
+tak_webadmin_fix_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _tak_webadmin_login_is_admin(password):
+    """Log in on 8446 as webadmin (TAK's OAuth password grant, as its login page does) and
+    ask TAK whether that session is admin. True / False, or None when it can't tell
+    (8446 not answering, the login refused, an unexpected reply)."""
+    if not password or not _tcp_accepts(8446):
+        return None
+    d = tempfile.mkdtemp(prefix='tak-webadmin-check-')
+    try:
+        pw_file, jar = os.path.join(d, 'pw'), os.path.join(d, 'jar')
+        # The password goes to curl in a 0600 file, never on its command line.
+        fd = os.open(pw_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(password)
+        base = ['curl', '-sk', '--max-time', '20', '-c', jar, '-b', jar]
+        r = subprocess.run(base + ['-o', '/dev/null', '-w', '%{http_code}',
+                                   '--data-urlencode', 'grant_type=password',
+                                   '--data-urlencode', 'username=webadmin',
+                                   '--data-urlencode', f'password@{pw_file}',
+                                   'https://127.0.0.1:8446/oauth/token'],
+                           capture_output=True, text=True, timeout=30)
+        if (r.stdout or '').strip() != '200':
+            return None
+        r = subprocess.run(base + ['https://127.0.0.1:8446/Marti/api/util/isAdmin'],
+                           capture_output=True, text=True, timeout=30)
+        v = (r.stdout or '').strip().lower()
+        return True if v == 'true' else (False if v == 'false' else None)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _tak_webadmin_probe_after_restart(password, wait_s=240):
+    """TAK's login API answers a while after 8443 opens; retry until it gives a verdict."""
+    t0 = time.time()
+    while True:
+        v = _tak_webadmin_login_is_admin(password)
+        if v is not None or time.time() - t0 >= wait_s:
+            return v
+        time.sleep(20)
+
+
+def _tak_restart_and_wait(plog, tag):
+    """Restart TAK Server (native or container) and wait for 8089, 8443 and 8446."""
+    cmd = ['systemctl', 'restart', 'takserver'] if not _tak_is_container() else ['docker', 'restart', TAK_CONTAINER]
+    try:
+        # Native `systemctl restart` blocks until ExecStart returns (100 s+ observed).
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
+        if r.returncode != 0:
+            plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+            return False
+    except subprocess.TimeoutExpired:
+        plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
+    if not _tak_wait_ready(plog, tag):
+        return False
+    t0 = time.time()
+    while not _tcp_accepts(8446):
+        if time.time() - t0 >= 180:
+            plog(f"  ✗ {tag}: 8446 not up 180s after the API — check journalctl -u takserver")
+            return False
+        time.sleep(5)
+    plog(f"  {tag}: 8446 accepting connections")
+    return True
+
+
+def _tak_webadmin_admin_check(plog, ldap_ok):
+    """Watchdog tick: once per TAK start, confirm TAK treats webadmin as admin; restart TAK
+    once (at most every 6 h) when it doesn't and LDAP is healthy. Needs the webadmin password
+    in settings — without it the TAK Server page's "Fix webadmin admin access" button is the way."""
+    tag = 'webadmin admin check'
+    if not ldap_ok or not os.path.exists('/opt/tak/CoreConfig.xml') or _tak_cert_job_busy():
+        return
+    started = _tak_started_epoch()
+    if not started or time.time() - started < _TAK_WEBADMIN_CHECK_MIN_UPTIME_S:
+        return
+    s = load_settings()
+    password = (s.get('webadmin_password') or '').strip()
+    if not password:
+        return
+    if not _tak_webadmin_fix_lock.acquire(blocking=False):
+        return
+    try:
+        st = dict(s.get('tak_webadmin_check') or {})
+        if abs(float(st.get('tak_started') or 0) - started) >= 30:
+            st = {'tak_started': started, 'tries': 0, 'last_restart': st.get('last_restart', 0)}
+        if st.get('done'):
+            return
+        st['tries'] = int(st.get('tries') or 0) + 1
+
+        def _save():
+            s2 = load_settings()
+            s2['tak_webadmin_check'] = st
+            save_settings(s2)
+
+        verdict = _tak_webadmin_login_is_admin(password)
+        if verdict is None:
+            if st['tries'] >= 3:
+                st['done'] = True
+                st['outcome'] = 'unknown'
+                plog(f"{tag}: couldn't log in as webadmin on 8446 to check — giving up until TAK next restarts")
+            _save()
+            return
+        st['done'] = True
+        if verdict:
+            st['outcome'] = 'admin'
+            _save()
+            plog(f"{tag}: logged in as webadmin on 8446 and asked TAK isAdmin — TAK says admin "
+                 f"(try {st['tries']}); no restart needed")
+            return
+        if time.time() - float(st.get('last_restart') or 0) < _TAK_WEBADMIN_RESTART_MIN_GAP_S:
+            st['outcome'] = 'not admin, restart skipped (one in the last 6 h)'
+            _save()
+            plog(f"{tag}: TAK Server still gives webadmin no admin role after a restart in the last 6 h — "
+                 f"not restarting again; needs a look (TAK Server page → Fix webadmin admin access)")
+            return
+        st['last_restart'] = time.time()
+        st['outcome'] = 'not admin, restarting'
+        _save()
+        plog(f"{tag}: TAK Server gives webadmin no admin role (8446 login lands on WebTAK) while LDAP "
+             f"is healthy — restarting TAK Server once")
+        if _tak_restart_and_wait(plog, tag):
+            after = _tak_webadmin_probe_after_restart(password)
+            plog(f"  {'✓' if after else '⚠'} {tag}: after the restart webadmin is "
+                 f"{'admin again' if after else ('still not admin' if after is False else 'not checkable yet')}")
+            # The restart is a new TAK start; record its verdict so the next tick doesn't re-check.
+            st2 = {'tak_started': _tak_started_epoch() or 0, 'tries': 1, 'done': after is not None,
+                   'last_restart': st['last_restart'],
+                   'outcome': 'admin' if after else ('not admin after restart' if after is False else 'unknown')}
+            st.clear()
+            st.update(st2)
+            _save()
+    except Exception as e:
+        plog(f"{tag}: error (non-fatal): {str(e)[:160]}")
+    finally:
+        _tak_webadmin_fix_lock.release()
+
+
+def _tak_webadmin_fix_job():
+    """The TAK Server page's "Fix webadmin admin access" button."""
+    st = tak_webadmin_fix_status
+
+    def log(m):
+        st['log'].append(m)
+        print(f"[webadmin-fix] {m}", flush=True)
+    try:
+        log("Checking webadmin in Authentik (active, tak_ROLE_ADMIN, authentik Admins)...")
+        try:
+            _authentik_webadmin_role_check_and_heal(plog_fn=lambda m: log(f"  {m}"))
+        except Exception as e:
+            log(f"  ⚠ Authentik check error: {str(e)[:160]}")
+        s = load_settings()
+        sa_pass = _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', sa_pass) if sa_pass else 'inconclusive'
+        if verdict != 'ok':
+            log(f"✗ The LDAP service account can't sign in ({verdict}). Use Resync LDAP to TAK Server first; "
+                f"restarting TAK now would come up without groups again.")
+            st.update({'running': False, 'complete': True, 'error': True})
+            return
+        log("✓ LDAP service account signs in")
+        password = (s.get('webadmin_password') or '').strip()
+        if password:
+            before = _tak_webadmin_login_is_admin(password)
+            if before:
+                log("✓ TAK Server already treats webadmin as admin — nothing to fix. If a browser still lands "
+                    "on WebTAK, sign out of TAK there and log in again.")
+                st.update({'running': False, 'complete': True, 'error': False})
+                return
+            log("TAK Server gives webadmin no admin role" if before is False
+                else "Couldn't log in as webadmin on 8446 to check")
+        else:
+            log("No webadmin password stored on this box, so the console can't log in to check — restarting anyway")
+        log("Restarting TAK Server (clients reconnect on their own; about 2 minutes)...")
+        if not _tak_restart_and_wait(log, 'restart'):
+            st.update({'running': False, 'complete': True, 'error': True})
+            return
+        try:
+            cur = load_settings()
+            cur['tak_webadmin_check'] = {'tak_started': _tak_started_epoch() or 0, 'tries': 1, 'done': True,
+                                         'last_restart': time.time(), 'outcome': 'restarted by button'}
+            save_settings(cur)
+        except Exception:
+            pass
+        if password:
+            after = _tak_webadmin_probe_after_restart(password)
+            if after:
+                log("✓ webadmin is admin again — log in at 8446")
+            elif after is False:
+                log("⚠ TAK Server still gives webadmin no admin role after the restart — this needs a look")
+                st.update({'running': False, 'complete': True, 'error': True})
+                return
+            else:
+                log("⚠ TAK Server is up but its login didn't answer in time — log in at 8446 to check")
+        else:
+            log("✓ TAK Server restarted — log in at 8446 as webadmin to check")
+        st.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        log(f"✗ {str(e)[:200]}")
+        st.update({'running': False, 'complete': True, 'error': True})
+    finally:
+        try:
+            _tak_webadmin_fix_lock.release()
+        except RuntimeError:
+            pass
+
+
+@app.route('/api/takserver/webadmin-fix-admin', methods=['POST'])
+@login_required
+def takserver_webadmin_fix_admin():
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return jsonify({'error': 'TAK Server is not installed on this box.'}), 400
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is running; try again when it finishes.'}), 409
+    if not _tak_webadmin_fix_lock.acquire(blocking=False):
+        return jsonify({'error': 'A webadmin check is already running.'}), 409
+    tak_webadmin_fix_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    threading.Thread(target=_tak_webadmin_fix_job, daemon=True, name='webadmin-fix').start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/takserver/webadmin-fix-admin/status')
+@login_required
+def takserver_webadmin_fix_admin_status():
+    return jsonify(tak_webadmin_fix_status)
 
 
 def _start_ldap_sa_bind_watchdog():
@@ -80748,6 +81928,8 @@ def takserver_ca_info():
                         old_cas.append(a)
                         names[a] = cn
                 info['old_ca_names'] = names
+                # v10.3.5 W6: a root in TAK Server's trust list accepts any intermediate it signed.
+                info['trust_list_roots'] = [a for a, pem in entries if _pem_self_signed(pem)]
             else:
                 # Subjects unreadable: the alias rule, which can't tell what `mykey` is.
                 for a in trusted_aliases:
@@ -80759,6 +81941,508 @@ def takserver_ca_info():
         except Exception:
             pass
     return jsonify(info)
+
+
+# v10.3.5 W11 — "Who still needs to move". After Rotate, every account is on the old or the new
+# intermediate; this says which, per device and per CloudTAK login, so Revoke is a decision made
+# from a list and not a guess. W10's Day-0 mail and W12's reminders use the same rows.
+_CA_MIG_CLASS_CACHE = {}
+# EUD client UIDs: ATAK (ANDROID-<id>), iTAK / TAK Aware (a UUID), WinTAK (a Windows or Entra SID).
+# CloudTAK enrolls its login certs as '<username> (ETL)' (@tak-ps/node-tak credentials.ts), so
+# those move by logging out and back in. Anything else is a server or integration (a Node-RED
+# flow, a gateway, a bridge).
+_CA_MIG_EUD_UID_RE = re.compile(
+    r'^(ANDROID-[0-9A-Za-z]+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
+    r'|S-1-[0-9]+-[0-9-]+)$', re.I)
+_CA_MIG_CLOUDTAK_UID_RE = re.compile(r' \(ETL\)$')
+_CA_MIG_CLOUDTAK_AUTO = 'CloudTAK login: nothing to do — signed out once at Revoke, new cert on next sign-in'
+
+
+def _ca_mig_issuers(pems):
+    """Issuer CN of each PEM, in order — ONE openssl call for the lot (a box can hold hundreds
+    of device certs), via a PKCS#7 bundle. None when openssl can't read the bundle (one bad
+    cert fails the whole call); callers then go one by one."""
+    if not pems:
+        return []
+    try:
+        p7 = subprocess.run(['openssl', 'crl2pkcs7', '-nocrl', '-certfile', '/dev/stdin'],
+                            input=''.join(p if p.endswith('\n') else p + '\n' for p in pems),
+                            capture_output=True, text=True, timeout=60)
+        if p7.returncode != 0:
+            return None
+        r = subprocess.run(['openssl', 'pkcs7', '-print_certs', '-noout'], input=p7.stdout,
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    issuers = re.findall(r'^issuer\s*=(.*)$', r.stdout or '', re.M) if r.returncode == 0 else []
+    if len(issuers) != len(pems):
+        return None
+    out = []
+    for line in issuers:
+        m = re.search(r'CN\s*=\s*([^,/\n]+)', line)
+        out.append(m.group(1).strip() if m else '')
+    return out
+
+
+def _ca_mig_signed_by_many(pems, ca_pem):
+    """_cert_signed_by for many leaves against one CA bundle in ONE `openssl verify` (TAK's
+    makeCert certs carry no authority key id, so there is no shortcut by key: test6, 31 certs,
+    57 calls one by one). Same answers: True signed, False not (issuer/signature failure),
+    None can't tell. openssl prints `<file>: OK` on stdout; a failure is its reason lines then
+    `error <file>: verification failed` on stderr, so each verdict is tied to its own file."""
+    if not pems:
+        return []
+    if not re.search(r'-----BEGIN CERTIFICATE-----', ca_pem or ''):
+        return [None] * len(pems)
+    d = tempfile.mkdtemp(prefix='infratak-camig-')
+    try:
+        files = []
+        for i, p in enumerate(pems):
+            leaf = re.search(r'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----', p or '', re.S)
+            f = os.path.join(d, f'c{i:05d}.pem')
+            with open(f, 'w') as fh:
+                fh.write((leaf.group(0) + '\n') if leaf else '')
+            files.append(f)
+        ca_file = os.path.join(d, 'ca.pem')
+        with open(ca_file, 'w') as fh:
+            fh.write(ca_pem)
+        r = subprocess.run(['openssl', 'verify', '-no_check_time', '-partial_chain', '-CAfile', ca_file] + files,
+                           capture_output=True, text=True, timeout=120)
+    except Exception:
+        return [None] * len(pems)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    verdict = {}
+    for line in (r.stdout or '').splitlines():
+        if line.endswith(': OK'):
+            verdict[line[:-4]] = True
+    reasons = ''
+    for line in (r.stderr or '').splitlines():
+        m = re.match(r'^error (.+): verification failed$', line)
+        if not m:
+            reasons += line.lower() + '\n'
+            continue
+        if 'unable to get local issuer' in reasons or 'unable to get issuer' in reasons or 'signature failure' in reasons:
+            verdict.setdefault(m.group(1), False)
+        reasons = ''
+    return [verdict.get(f) for f in files]
+
+
+def _ca_mig_classify(pems, ca_pem, bundle):
+    """[{'issuer', 'current', 'trusted'}] per PEM: signed by the current intermediate (ca.pem)?
+    trusted by TAK Server's live trust list? (True / False / None = can't tell). Signature checks,
+    not name compares — a re-made CA can carry the same CN. Two openssl verify calls in all.
+    Cached by digest: issued certs never change."""
+    key = hashlib.md5((ca_pem + bundle).encode()).hexdigest()
+    if len(_CA_MIG_CLASS_CACHE) > 20000:
+        _CA_MIG_CLASS_CACHE.clear()
+    digests = [hashlib.md5((p or '').encode()).hexdigest() for p in pems]
+    todo = [i for i, d in enumerate(digests) if (key, d) not in _CA_MIG_CLASS_CACHE]
+    if todo:
+        tp = [pems[i] for i in todo]
+        issuers = _ca_mig_issuers(tp)
+        if issuers is None:
+            issuers = [_pem_issuer_cn(p) for p in tp]
+        cur = _ca_mig_signed_by_many(tp, ca_pem) if ca_pem else [None] * len(tp)
+        rest = [k for k, c in enumerate(cur) if not c]
+        tru = dict(zip(rest, _ca_mig_signed_by_many([tp[k] for k in rest], bundle) if bundle else [None] * len(rest)))
+        for k, i in enumerate(todo):
+            _CA_MIG_CLASS_CACHE[(key, digests[i])] = {'issuer': issuers[k], 'current': cur[k],
+                                                      'trusted': True if cur[k] else tru.get(k)}
+    return [dict(_CA_MIG_CLASS_CACHE[(key, d)]) for d in digests]
+
+
+def _tak_cert_username(dn):
+    """The account name in a TAK certificate row's user_dn / creator_dn: the value itself, or
+    its CN when it's a DN ('CN=jdoe,OU=...' -> 'jdoe')."""
+    s = (dn or '').strip()
+    m = re.search(r'(?:^|[,/]\s*)CN\s*=\s*([^,/]+)', s, re.I)
+    return (m.group(1).strip() if m else s)[:200]
+
+
+def _tak_ca_migration():
+    """W11 rows, one per account: its devices (TAK's certificate table, newest cert per client
+    UID, through the cot seam: works on a remote-DB box) and its CloudTAK login cert (local
+    CloudTAK only), each judged against the current intermediate and the live trust list.
+    Revoked and expired certs are skipped: they connect to nothing either way.
+    Returns {'ok', 'current_ca', 'rows', 'cas', 'cloudtak', 'error'}."""
+    certs, err = _f2b_tak_cert_rows()
+    if certs is None:
+        return {'ok': False, 'error': err, 'rows': [], 'cas': [], 'current_ca': '', 'cloudtak': {}}
+    cert_dir = '/opt/tak/certs/files'
+    ca_pem = _read_priv(os.path.join(cert_dir, 'ca.pem')) or ''
+    current_ca = _pem_cn_and_expiry(ca_pem)[0] if ca_pem else ''
+    bundle = _tak_live_trust_bundle()
+    now = time.time()
+
+    # Callsigns: the last subscription seen from each UID (today's log + yesterday's).
+    callsign = {}
+    try:
+        lines = _f2b_tak_prev_sub_lines() + (_diag_tail(_F2B_TAK_LOG, _F2B_TAK_LOG_TAIL_BYTES) or [])
+        _r, subs, _u = _f2b_tak_refused(lines, now)
+        for ip_subs in subs.values():
+            for t, cs, uid in ip_subs:
+                if t >= callsign.get(uid, (0, ''))[0]:
+                    callsign[uid] = (t, cs)
+    except Exception:
+        pass
+
+    live = [(uid, c) for uid, c in sorted(certs.items())
+            if c['pem'] and not c['revoked'] and not (c['expires'] and c['expires'] < now)]
+    judged = _ca_mig_classify([c['pem'] for _uid, c in live], ca_pem, bundle)
+    accounts = {}
+    for (uid, c), j in zip(live, judged):
+        user = _tak_cert_username(c['user']) or '(no user)'
+        acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
+        acct['devices'].append(dict(j, uid=uid, callsign=callsign.get(uid, (0, ''))[1],
+                                    expires=c['expires'],
+                                    kind=('cloudtak' if _CA_MIG_CLOUDTAK_UID_RE.search(uid)
+                                          else 'eud' if _CA_MIG_EUD_UID_RE.match(uid) else 'integration')))
+
+    # CloudTAK: each user holds their own TAK client cert (profile.auth). An empty one means
+    # CloudTAK issues a fresh cert (from the current CA) at that user's next login.
+    settings = load_settings()
+    ct = {'checked': False, 'note': ''}
+    try:
+        remote = (_get_cloudtak_deployment_config(settings).get('target_mode') or 'local').strip().lower() == 'remote'
+    except Exception:
+        remote = False
+    if remote:
+        ct['note'] = 'CloudTAK is remote — not checked'
+    elif _cloudtak_local_with_local_tak(settings):
+        prof = _cloudtak_postgis_json("select coalesce(json_agg(json_build_object('u', username, "
+                                      "'c', coalesce(auth->>'cert', ''))), '[]') from profile")
+        if prof is None:
+            ct['note'] = "CloudTAK's database didn't answer — CloudTAK logins not checked"
+        else:
+            ct['checked'] = True
+            with_cert = [p for p in prof if isinstance(p, dict) and p.get('c')]
+            for p, j in zip(with_cert, _ca_mig_classify([p['c'] for p in with_cert], ca_pem, bundle)):
+                user = str(p.get('u') or '')[:200]
+                acct = accounts.setdefault(user.lower(), {'user': user, 'devices': [], 'cloudtak': None})
+                acct['cloudtak'] = j
+
+    # `moving`: what's left on a cert TAK still trusts — the window's work. `gone`: certs an
+    # earlier Revoke already cut off (retired phones, old feeds). A device that's still in use
+    # re-enrolls the same way, but these are not "still to move" and stay out of the counts and
+    # the mails (test6 2026-11-03: 23 of 23 accounts "to move", nearly all INT-01 leftovers).
+    rows, cas = [], {}
+    for acct in sorted(accounts.values(), key=lambda a: a['user'].lower()):
+        moving, gone, auto = [], [], []
+        for d in acct['devices']:
+            name = d['callsign'] or d['uid']
+            if d['current']:
+                continue
+            if d['trusted'] is False:
+                gone.append(f'{name}: no longer trusted — ' + {
+                    'integration': 'issue it a new cert', 'cloudtak': 'sign in to CloudTAK again if still used (a new cert is issued then)',
+                }.get(d['kind'], 'scan a new QR code if still in use'))
+            elif d['kind'] == 'cloudtak':
+                # CloudTAK keeps a still-trusted cert across logins; nothing for the user to do
+                # (test6 2026-11-03). Revoke signs them out, and the next login re-issues it.
+                auto.append(_CA_MIG_CLOUDTAK_AUTO)
+            elif d['kind'] == 'integration':
+                moving.append(f'{name}: server/integration client — issue it a new cert')
+            else:
+                moving.append(f'scan a new QR on {name}')
+        c = acct['cloudtak']
+        if c and not c['current']:
+            if c.get('trusted') is False:
+                gone.append('CloudTAK login: no longer trusted — signing in again issues a new cert')
+            else:
+                auto.append(_CA_MIG_CLOUDTAK_AUTO)
+        moving, gone, auto = list(dict.fromkeys(moving)), list(dict.fromkeys(gone)), list(dict.fromkeys(auto))
+        todo = moving + gone
+        status = 'needs_move' if moving else ('untrusted' if gone else 'moved')
+        on = sorted({d['issuer'] for d in acct['devices'] if d['issuer']}
+                    | ({c['issuer']} if c and c['issuer'] else set()))
+        for cn in on:
+            e = cas.setdefault(cn, {'cn': cn, 'accounts': 0, 'current': cn == current_ca})
+            e['accounts'] += 1
+        rows.append(dict(acct, status=status, todo=todo, moving=moving, gone=gone, auto=auto, cas=on))
+    return {'ok': True, 'current_ca': current_ca, 'rows': rows,
+            'cas': sorted(cas.values(), key=lambda e: (not e['current'], e['cn'])),
+            'cloudtak': ct, 'error': '' if bundle else "TAK Server's trust list couldn't be read"}
+
+
+@app.route('/api/takserver/ca-migration')
+@login_required
+def takserver_ca_migration():
+    """Read-only: every account by the CA its certs come from, and what each still has to do to
+    be on the current intermediate (W11)."""
+    return jsonify(_tak_ca_migration())
+
+
+# v10.3.5 W10 — the overlap window. A Rotate on a root-signed box leaves every device connected
+# on the old intermediate; the window is how long people have to move before Revoke cuts them
+# off. Written by a successful Rotate, cleared by the Revoke of that old CA.
+CA_ROTATION_WINDOW_DAYS = 30   # fleet constant (PLAN W10): no per-box tuning
+
+
+def _ca_rotation_state_path():
+    return os.path.join(CONFIG_DIR, 'ca_rotation_state.json')
+
+
+def _ca_rotation_state_load():
+    """{old_ca_cn, old_ca_alias, new_ca_cn, rotated_at, cutoff_at, server_signer, notices_sent,
+    user_email_opt_in}, or {} when no rotation window is open."""
+    try:
+        with open(_ca_rotation_state_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get('old_ca_cn') else {}
+    except Exception:
+        return {}
+
+
+def _ca_rotation_state_save(state):
+    """Atomic write (same as _update_notify_state_save); an empty state removes the file."""
+    if not state:
+        try:
+            os.remove(_ca_rotation_state_path())
+        except OSError:
+            pass
+        return
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.ca-rotation-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _ca_rotation_state_path())
+    except Exception:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _email_relay_ready(settings=None):
+    """Email Relay is configured (the test every Email Relay card uses)."""
+    relay = (settings or load_settings()).get('email_relay') or {}
+    return bool(relay.get('relay_host') and relay.get('smtp_user'))
+
+
+def _ca_rotation_date(ts):
+    d = datetime.utcfromtimestamp(int(ts))
+    return f'{d:%B} {d.day}, {d.year}'
+
+
+_CA_ROTATION_CLOUDTAK_NOTE = ('CloudTAK users have nothing to do: they are signed out once when the old '
+                              'certificate authority is revoked, and get a new certificate when they sign back in.')
+
+
+def _ca_rotation_day0_text(cutoff_at, signer):
+    """The Day-0 notice. Root-signed: devices still connect and people have the window.
+    Intermediate-signed: they've already dropped (W4)."""
+    # CloudTAK re-issues a login cert only when TAK rejects the old one or it is expiring
+    # (stateless/lib/provider.ts valid()), so logging out and back in during the window does
+    # nothing (test6 2026-11-03). Revoke signs those users out (W13); their next login gets one.
+    how = ('on mobile (ATAK, iTAK, TAK Aware) scan a new QR code from TAK Portal. '
+           + _CA_ROTATION_CLOUDTAK_NOTE)
+    if signer == 'root':
+        return f'You have {CA_ROTATION_WINDOW_DAYS} days (until {_ca_rotation_date(cutoff_at)}): {how}'
+    return ("TAK Server's certificates were replaced and devices are disconnected until they move: "
+            f"{how} Old certificates stop working for good by {_ca_rotation_date(cutoff_at)}.")
+
+
+def _ca_rotation_user_emails():
+    """{username lower: email} for every active Authentik user with a valid address, or None
+    when there is no Authentik (or it didn't answer). One paged listing, not a call per user."""
+    try:
+        ak_url, hdr, _s = _w1_ak_ctx()
+        if not ak_url:
+            return None
+        out, page = {}, 1
+        while page and page <= 50:
+            d = _w1_ak_get(ak_url, f'core/users/?is_active=true&page_size=500&page={int(page)}', hdr)
+            for u in d.get('results') or []:
+                em = _safe_alert_email((u.get('email') or '').strip())
+                if u.get('username') and em:
+                    out[str(u['username']).lower()] = em
+            page = (d.get('pagination') or {}).get('next') or 0
+        return out
+    except Exception as e:
+        print(f"[ca-rotation] Authentik user lookup failed: {str(e)[:160]}", flush=True)
+        return None
+
+
+def _ca_rotation_send(kind, state, notice, log=None):
+    """Send one notice of the window: `kind` 'day0' (the Rotate's notice) or a reminder
+    ('day23' / 'day29', W12). The admin (guarddog_alert_email) gets the notice and every account
+    still to move; with the D2 opt-in each such user gets the notice and their own lines only,
+    one message per user (never one envelope: users would see each other's addresses).
+    Logs counts, never addresses (C3). Returns {'sent', 'admin', 'users', 'no_email', 'message'}."""
+    _log = log or (lambda m: print(m, flush=True))
+    settings = load_settings()
+    res = {'sent': False, 'admin': 0, 'users': 0, 'no_email': [], 'message': ''}
+    if not _email_relay_ready(settings):
+        res['message'] = "Email Relay isn't set up, so nothing was sent."
+        return res
+    mig = _tak_ca_migration()
+    todo = [r for r in mig.get('rows') or [] if r['moving']]
+    n_gone = sum(len(r['gone']) for r in mig.get('rows') or [])
+    old, new = state.get('old_ca_cn') or 'the old CA', state.get('new_ca_cn') or mig.get('current_ca') or 'the new CA'
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    left = max(0, int(((state.get('cutoff_at') or 0) - time.time()) // 86400))
+    emails = _ca_rotation_user_emails() if state.get('user_email_opt_in') else None
+    if state.get('user_email_opt_in'):
+        res['no_email'] = [r['user'] for r in todo if not (emails or {}).get(r['user'].lower())]
+    subj = (f'TAK certificate change on {ident}: action needed' if kind == 'day0'
+            else f'TAK certificate change on {ident}: {left} day{"" if left == 1 else "s"} left')
+    lines = [notice, '', f'{len(todo)} of {len(mig.get("rows") or [])} accounts still need to move from {old} to {new}'
+             + ('.' if mig.get('ok') else f' (the account list could not be read: {mig.get("error")}).'), '']
+    for r in todo[:300]:
+        lines.append(f'  {r["user"]}: ' + '; '.join(r['moving']))
+    if len(todo) > 300:
+        lines.append(f'  … and {len(todo) - 300} more (Accounts by CA on the TAK Server page has the full list)')
+    if n_gone:
+        lines += ['', f'Not listed: {n_gone} device cert(s) an earlier Revoke already cut off (retired phones, old '
+                  'feeds). Accounts by CA on the TAK Server page lists them.']
+    if res['no_email']:
+        lines += ['', f'No email on file ({len(res["no_email"])}), so they were not emailed: '
+                  + ', '.join(res['no_email'][:100]) + (' …' if len(res['no_email']) > 100 else '')]
+    lines += ['', f'Revoke {old} on the TAK Server page once everyone has moved.', '', f'Server: {ident}']
+    admin = _safe_alert_email_list(settings.get('guarddog_alert_email'))
+    errors = []
+    if admin:
+        try:
+            if _guarddog_send_alert_email_via_relay(admin, subj, '\n'.join(lines), force=True):
+                res['admin'] = len(admin.split(','))
+        except Exception as e:
+            errors.append(f'admin copy: {str(e)[:120]}')
+    for r in todo if emails else []:
+        to = emails.get(r['user'].lower())
+        if not to:
+            continue
+        body = '\n'.join([f'Hello {r["user"]},', '', notice, '', 'What is left for you:']
+                         + [f'  • {t}' for t in r['moving']] + ['', f'Server: {ident}'])
+        try:
+            if _guarddog_send_alert_email_via_relay(to, subj, body, force=True):
+                res['users'] += 1
+        except Exception as e:
+            errors.append(str(e)[:120])
+    res['sent'] = bool(res['admin'] or res['users'])
+    parts = [f"admin ({res['admin']})" if res['admin'] else 'no admin address set (Guard Dog alert email)']
+    if state.get('user_email_opt_in'):
+        parts.append(f"{res['users']} user(s)" + (f", {len(res['no_email'])} with no email on file" if res['no_email'] else '')
+                     + ('' if emails is not None else ' — Authentik not reachable, users not emailed'))
+    res['message'] = 'Emailed ' + ', '.join(parts) + '.' + (f' {len(errors)} send(s) failed.' if errors else '')
+    _log(f"[ca-rotation] {kind} notice: {res['message']}")
+    if errors:
+        _log(f"[ca-rotation] first send error: {errors[0]}")
+    return res
+
+
+@app.route('/api/takserver/ca-rotation', methods=['GET', 'POST'])
+@login_required
+def takserver_ca_rotation():
+    """GET: the open rotation window (if any) and what a Rotate now would send. POST
+    {user_email_opt_in}: change the D2 choice during the window."""
+    st = _ca_rotation_state_load()
+    if request.method == 'POST':
+        if not st:
+            return jsonify({'error': 'No rotation window is open.'}), 400
+        st['user_email_opt_in'] = bool((request.json or {}).get('user_email_opt_in'))
+        _ca_rotation_state_save(st)
+        print(f"[ca-rotation] user emails {'on' if st['user_email_opt_in'] else 'off'} for this window", flush=True)
+    settings = load_settings()
+    signer = _tak_server_cert_signer_or_default('/opt/tak/certs/files')
+    out = {'active': bool(st), 'window_days': CA_ROTATION_WINDOW_DAYS,
+           'relay_ready': _email_relay_ready(settings),
+           'admin_email_set': bool(_safe_alert_email_list(settings.get('guarddog_alert_email'))),
+           'day0_text': _ca_rotation_day0_text(time.time() + CA_ROTATION_WINDOW_DAYS * 86400, signer)}
+    if st:
+        out.update(st, days_left=max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400)),
+                   cutoff_date=_ca_rotation_date(st.get('cutoff_at') or 0))
+    # "N with an email on file" for the D2 checkbox: accounts holding a TAK cert that Authentik
+    # has an address for. During a window, how many still have to move (W12's banner).
+    emails = _ca_rotation_user_emails()
+    mig = _tak_ca_migration() if (st or emails is not None) else {}
+    if emails is not None:
+        out['users_with_email'] = sum(1 for r in mig.get('rows') or [] if emails.get(r['user'].lower()))
+    if st:
+        out['accounts'] = len(mig.get('rows') or [])
+        out['todo_count'] = sum(1 for r in mig.get('rows') or [] if r['moving'])
+    return jsonify(out)
+
+
+# v10.3.5 W12 — countdown reminders on day 23 and day 29 of the window, each once. Same loop
+# shape as _update_notify_loop: a daemon started at module load, every 6 h, a lock, catch all.
+CA_ROTATION_REMINDER_DAYS = (23, 29)
+CA_ROTATION_REMINDER_FIRST_DELAY_S = 900
+CA_ROTATION_REMINDER_INTERVAL_S = 21600
+_ca_rotation_lock = threading.Lock()
+
+
+def _ca_rotation_reminder_text(st):
+    left = max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400))
+    return (f'{left} day{"" if left == 1 else "s"} left (until {_ca_rotation_date(st.get("cutoff_at") or 0)}) '
+            f'to move to the new TAK certificates: on mobile (ATAK, iTAK, TAK Aware) scan a new QR code '
+            f'from TAK Portal. After that date '
+            f'{st.get("old_ca_cn") or "the old certificate authority"} can be revoked at any time, and certificates '
+            f'from it then stop working. {_CA_ROTATION_CLOUDTAK_NOTE}')
+
+
+def _ca_rotation_reminder_once(kind=None):
+    """Send the reminder that is due (or `kind`, forced: T&E / support). Only the LATEST due one
+    goes out — a box that was down from day 22 to day 30 sends day 29 and marks day 23 done.
+    With no Email Relay nothing is marked, so a relay set up mid-window still reminds; the TAK
+    Server page shows the banner meanwhile. Returns {'sent': kind or None, ...}."""
+    st = _ca_rotation_state_load()
+    if not st:
+        return {'sent': None, 'reason': 'no rotation window'}
+    day = int((time.time() - (st.get('rotated_at') or 0)) // 86400)
+    done = set(st.get('notices_sent') or [])
+    due = [d for d in CA_ROTATION_REMINDER_DAYS if day >= d and f'day{d}' not in done]
+    if kind is None:
+        if not due:
+            return {'sent': None, 'reason': f'day {day}: nothing due'}
+        kind = f'day{due[-1]}'
+    if not _email_relay_ready():
+        return {'sent': None, 'reason': "Email Relay isn't set up"}
+    res = _ca_rotation_send(kind, st, _ca_rotation_reminder_text(st))
+    st = _ca_rotation_state_load()
+    if st:   # a Revoke may have closed the window meanwhile
+        st['notices_sent'] = sorted(set(st.get('notices_sent') or []) | {kind} | {f'day{d}' for d in due},
+                                    key=lambda k: int(k[3:]) if k[3:].isdigit() else 0)
+        _ca_rotation_state_save(st)
+    return dict(res, sent=kind)
+
+
+def _ca_rotation_reminder_loop():
+    time.sleep(CA_ROTATION_REMINDER_FIRST_DELAY_S)
+    while True:
+        try:
+            with _ca_rotation_lock:
+                _ca_rotation_reminder_once()
+        except Exception as e:
+            try:
+                print(f"[ca-rotation] reminder check failed: {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(CA_ROTATION_REMINDER_INTERVAL_S)
+
+
+try:
+    threading.Thread(target=_ca_rotation_reminder_loop, daemon=True, name='ca-rotation-reminders').start()
+except Exception:
+    pass
+
+
+@app.route('/api/takserver/ca-rotation/remind', methods=['POST'])
+@login_required
+def takserver_ca_rotation_remind():
+    """Send a window reminder now (T&E / support — nobody waits 23 days). {kind: 'day23' |
+    'day29'}; it is marked sent like the scheduled one."""
+    kind = str((request.json or {}).get('kind') or '')
+    if kind not in {f'day{d}' for d in CA_ROTATION_REMINDER_DAYS}:
+        return jsonify({'error': 'kind must be ' + ' or '.join(f'day{d}' for d in CA_ROTATION_REMINDER_DAYS)}), 400
+    with _ca_rotation_lock:
+        return jsonify(_ca_rotation_reminder_once(kind))
 
 
 rotate_intca_log = []
@@ -80812,7 +82496,8 @@ _TAK_SAN_BEGIN = '# >>> infra-TAK: TAK Server certificate names (managed - edits
 _TAK_SAN_END = '# <<< infra-TAK: TAK Server certificate names <<<'
 _TAK_SAN_HOST_RE = re.compile(r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
                               r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
-tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0}
+tak_server_cert_job = {'running': False, 'complete': False, 'error': False, 'log': [], 'started': 0.0,
+                       'kind': 'fix'}  # v10.3.5 W3: 'fix' (names) or 'signer' (root <-> intermediate switch)
 
 
 def _tak_server_cert_names(settings):
@@ -81016,6 +82701,158 @@ def _rotate_reissue_cert(kind, name, run, cert_dir='/opt/tak/certs/files'):
     return ok
 
 
+def _tak_issued_validity_cap(cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W9: the longest an enrolled cert can usefully live: the current intermediate's
+    remaining days minus one. TAK stamps validityDays as given, so with the old 3650 default an
+    enrolled cert claimed to outlive the CA that signed it by years (bug 6). None when ca.pem
+    can't be read (the caller then keeps its value)."""
+    try:
+        not_after = _pem_cn_and_expiry(_read_priv(os.path.join(cert_dir, 'ca.pem')))[1]
+    except Exception:
+        return None
+    if not not_after:
+        return None
+    return max(1, (not_after - datetime.utcnow()).days - 1)
+
+
+def _tak_issued_validity(days, cert_dir='/opt/tak/certs/files'):
+    """validityDays for TAKServerCAConfig: `days`, capped by _tak_issued_validity_cap()."""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 730
+    cap = _tak_issued_validity_cap(cert_dir)
+    return max(1, min(days, cap) if cap else days)
+
+
+def _coreconfig_clamp_issued_validity(text, cert_dir='/opt/tak/certs/files'):
+    """(text, (old, new) or None): CoreConfig with TAKServerCAConfig's validityDays capped to the
+    current intermediate (W9). Rotate runs it after the new intermediate is in place."""
+    m = re.search(r'(<TAKServerCAConfig\b[^>]*\bvalidityDays=")(\d+)(")', text or '')
+    if not m:
+        return text, None
+    new = _tak_issued_validity(m.group(2), cert_dir)
+    if str(new) == m.group(2):
+        return text, None
+    return text[:m.start(2)] + str(new) + text[m.end(2):], (int(m.group(2)), new)
+
+
+TAK_SERVER_CERT_SIGNERS = ('root', 'intermediate')
+# makeCert.sh signs with whatever sits in this slot; makeCert.sh ca moves each new intermediate into it.
+_TAK_WORKING_CA_FILES = (('ca.pem', 'root-ca.pem'),
+                         ('ca-do-not-share.key', 'root-ca-do-not-share.key'),
+                         ('ca-trusted.pem', 'root-ca-trusted.pem'))
+
+
+def _pem_dn(pem, which):
+    """'subject' or 'issuer' of the first certificate in `pem`, RFC 2253, or '' if unreadable."""
+    try:
+        r = subprocess.run(['openssl', 'x509', '-noout', f'-{which}', '-nameopt', 'RFC2253'],
+                           input=pem or '', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ''
+    if r.returncode != 0:
+        return ''
+    return r.stdout.strip().split('=', 1)[-1].strip() if '=' in r.stdout else ''
+
+
+def _tak_server_cert_mode(cert_dir='/opt/tak/certs/files'):
+    """Who signed takserver.pem: 'root', 'intermediate' (the current working CA, ca.pem) or 'unknown'.
+
+    Read from the cert itself, never from settings: the box's certificate is the only source of
+    truth (fleet-uniform), and a settings key would drift the first time someone reissued by hand.
+    'unknown' covers a missing/unreadable file and a cert signed by an older intermediate."""
+    try:
+        issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+        root = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+        working = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        return 'unknown'
+    if not issuer:
+        return 'unknown'
+    if root and issuer == root:
+        return 'root'
+    if working and issuer == working and working != root:
+        return 'intermediate'
+    return 'unknown'
+
+
+def _tak_server_cert_signer_or_default(cert_dir='/opt/tak/certs/files'):
+    """The signer a reissue should keep: the box's current mode, and 'intermediate' (what every
+    reissue did before v10.3.5) when it cannot be told."""
+    return 'root' if _tak_server_cert_mode(cert_dir) == 'root' else 'intermediate'
+
+
+def _tak_server_cert_issue(settings, signer, log, run, cert_dir='/opt/tak/certs/files'):
+    """THE one writer of TAK Server's own 8089/8443 certificate (`makeCert.sh server takserver`).
+
+    signer='intermediate' signs with the working CA, as every reissue always has. signer='root'
+    signs with the root CA, which every enrolled device already trusts: ATAK checks 8089 against
+    its own truststore only and ignores the chain we send, so an intermediate-signed server cert
+    drops every phone the moment the intermediate rotates. A root-signed one does not.
+
+    Same key? No: makeCert.sh generates a new key on every run. That is fine — phones pin the CA,
+    not the server key.
+
+    For 'root' the root goes into the working slot (ca.pem / ca-do-not-share.key / ca-trusted.pem)
+    for this one run, and the intermediate that was there is ALWAYS put back (finally): left
+    behind, every client cert issued afterwards would be root-signed too.
+
+    `run(cmd) -> bool` is the caller's own container-aware shell runner (rotate, fix job,
+    deploy); it must log its own failures. `/redteam-selfaudit` fails on any
+    `makeCert.sh server takserver` outside this function — that is how the next rotation is kept
+    from silently going back to dropping everyone. Returns True only when the cert was reissued
+    AND (for 'root') the working CA is back."""
+    say = log or (lambda _m: None)
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        say(f"  ✗ Unknown server certificate signer {signer!r}")
+        return False
+    _tak_server_cert_prepare(settings, say)
+    if signer == 'intermediate':
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+        if ok:
+            say("  Server certificate signed by the intermediate CA")
+        return ok
+
+    missing = [src for _slot, src in _TAK_WORKING_CA_FILES
+               if not _exists_priv(os.path.join(cert_dir, src))]
+    if missing:
+        say(f"  ✗ Cannot sign with the root CA: {', '.join(missing)} not found")
+        return False
+    held, placed = [], []
+    ok = False
+    try:
+        for slot, _src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            if _exists_priv(p):
+                if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + ".w1hold")}'):
+                    say("  ✗ Could not set the working CA aside — nothing was changed")
+                    return False
+                held.append(p)
+        for slot, src in _TAK_WORKING_CA_FILES:
+            p = os.path.join(cert_dir, slot)
+            placed.append(p)
+            if not run(f'cp -p {shlex.quote(os.path.join(cert_dir, src))} {shlex.quote(p)}'):
+                say("  ✗ Could not put the root CA in the working slot")
+                return False
+        ok = _rotate_reissue_cert('server', 'takserver', run, cert_dir)
+    finally:
+        # Every slot is attempted (a list, not a short-circuiting all()). A slot that held
+        # nothing before is emptied again, never left holding the root.
+        results = [run(f'cp -p {shlex.quote(p + ".w1hold")} {shlex.quote(p)} && '
+                       f'rm -f {shlex.quote(p + ".w1hold")}') for p in held]
+        results += [run(f'rm -f {shlex.quote(p)}') for p in placed if p not in held]
+        back = all(results)
+        if not back:
+            say(f"  ✗ The intermediate CA was NOT put back in the working slot — restore "
+                f"{cert_dir}/ca*.w1hold over ca.pem / ca-do-not-share.key / ca-trusted.pem before "
+                "issuing any client certificate")
+            ok = False
+    if ok:
+        say("  Server certificate signed by the root CA")
+    return ok
+
+
 def _rotate_refresh_integrations(log):
     """After a rotation's TAK Server restart: integrations that cache a client cert in memory.
 
@@ -81192,7 +83029,7 @@ def _rotate_carry_forward_truststore(new_ts, prev_ts, prev_pass, cert_pass, old_
     kept, dropped = [], []
     for alias, pem in prev:
         key = _pem_key(pem)
-        if key in have_keys:
+        if key in have_keys or _pem_self_signed(pem):  # v10.3.5 W6: never carry a root forward
             continue
         cn, not_after = _pem_cn_and_expiry(pem)
         if not_after and not_after < now:
@@ -81253,9 +83090,13 @@ def _rotate_log_dropped_cas(ts_path, storepass, live, sh, log):
 @login_required
 def takserver_rotate_intca():
     """Rotate the intermediate CA: create new CA, server cert, admin cert, import old CA into truststore."""
-    if rotate_intca_status.get('running'):
-        return jsonify({'error': 'Rotation already in progress'}), 409
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
+    # v10.3.5 W8 (D3): rotating a CA restarts TAK and can drop every device; same gate as Revoke.
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     new_ca_name = (data.get('new_ca_name') or '').strip()
     if not new_ca_name:
         return jsonify({'error': 'New CA name is required'}), 400
@@ -81316,8 +83157,13 @@ def takserver_rotate_intca():
     if root_days_left is not None and requested_validity > root_days_left:
         pass  # already capped to root_days_left in int_validity_days
 
+    # v10.3.5 W10: the Day-0 notice as the admin edited it in the card (not stored), and the D2
+    # choice (stored per rotation in ca_rotation_state.json).
+    notice = str(data.get('notice') or '').strip()[:4000]
+    email_users = bool(data.get('email_users'))
+
     rotate_intca_log.clear()
-    rotate_intca_status.update({'running': True, 'complete': False, 'error': False})
+    rotate_intca_status.update({'running': True, 'complete': False, 'error': False, 'notice': None})
 
     def do_rotate():
         def log(msg):
@@ -81350,6 +83196,10 @@ def takserver_rotate_intca():
                 run(f'cp {cert_dir}/ca.pem {old_pem}')
                 log(f"  Saved current CA to {old_ca_name}.pem for transition bundle")
 
+            # Read before Step 1 puts the root in the working slot: afterwards ca.pem no longer
+            # names the intermediate the server cert was signed by.
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
+
             log("Step 1/7: Restoring Root CA as working CA...")
             run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
             run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
@@ -81370,11 +83220,11 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Creating new server certificate (signed by new CA)...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            log("Step 3/7: Creating new server certificate...")
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create new server certificate')
-            log("✓ Server certificate regenerated (signed by new CA)")
+            log("✓ Server certificate regenerated (signed by "
+                + ("the root CA" if server_signer == 'root' else "the new CA") + ")")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -81394,11 +83244,6 @@ def takserver_rotate_intca():
             log("")
             log("Step 5/7: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
-            # v10.0.5 non-root: bare keytool writes JKS into tak-owned /opt/tak/certs/files
-            # and fails as takwerx — route via the broker-allowed `runuser -u tak -- keytool`.
-            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
-            log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             try:
                 prev_ts, prev_pass = _rotate_coreconfig_truststore(_read_priv('/opt/tak/CoreConfig.xml'))
@@ -81411,6 +83256,16 @@ def takserver_rotate_intca():
                 log("  ⚠ Could not read TAK Server's certificate table; live cert counts unavailable")
             _rotate_carry_forward_truststore(ts_jks, prev_ts, prev_pass, cert_pass, old_ca_name, old_pem,
                                              live, run, _rotate_sh, log)
+            # v10.3.5 W6: makeCert.sh `ca` put the root in the new truststore; TAK Server's trust
+            # list holds intermediates only. A client cert signed by the root itself would be cut
+            # off, so then the root stays (with a warning) instead of failing a half-done rotation.
+            deps, n_live = _tak_root_signed_dependents(cert_dir, live)
+            if deps or n_live:
+                log(f"  ⚠ Root CA kept in the trust list: signed directly by it: "
+                    f"{', '.join(deps[:10]) or ''}{'; ' if deps and n_live else ''}"
+                    f"{str(n_live) + ' live client cert(s)' if n_live else ''}. Revoke Old CA will refuse until they are reissued")
+            else:
+                _tak_truststore_drop_roots(ts_jks, cert_pass, _rotate_sh, log, cert_dir)
             log("✓ Truststore updated")
 
             log("")
@@ -81424,6 +83279,14 @@ def takserver_rotate_intca():
                         _write_priv(_cc, _t.replace(old_ca_name, new_ca_name))
                 except Exception:
                     pass
+            # v10.3.5 W9: issued certs can't outlive the new intermediate.
+            try:
+                _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)
+                if _cl:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t)
+                    log(f"  Issued cert validity {_cl[0]} → {_cl[1]} days (the new intermediate's remaining life)")
+            except Exception as e:
+                log(f"  ⚠ Could not check issued cert validity: {e}")
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -81456,10 +83319,31 @@ def takserver_rotate_intca():
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
             log(f"  New CA: {new_ca_name}")
-            log(f"  Server cert + all client certs signed by new CA")
             log(f"  Old CA ({old_ca_name}) and earlier CAs kept in truststore — server still accepts their client certs")
-            log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
+            if server_signer == 'root':
+                log(f"  Server cert signed by the root CA, client certs by {new_ca_name}")
+                log(f"  Devices keep connecting; users move to {new_ca_name} by scanning a new QR "
+                    "(mobile) or logging out and back in (CloudTAK)")
+            else:
+                log(f"  Server cert + all client certs signed by {new_ca_name}")
+                log(f"  Every device is disconnected until it scans a new QR: none of them trusts "
+                    f"{new_ca_name} yet")
             log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
+            # v10.3.5 W10: open the window and send the Day-0 notice.
+            log("")
+            now = time.time()
+            state = {'old_ca_cn': old_ca_name, 'old_ca_alias': old_ca_name.lower(), 'new_ca_cn': new_ca_name,
+                     'rotated_at': int(now), 'cutoff_at': int(now + CA_ROTATION_WINDOW_DAYS * 86400),
+                     'server_signer': server_signer, 'notices_sent': ['day0'], 'user_email_opt_in': email_users}
+            _ca_rotation_state_save(state)
+            text = notice or _ca_rotation_day0_text(state['cutoff_at'], server_signer)
+            log(f"Rotation window: {CA_ROTATION_WINDOW_DAYS} days, until {_ca_rotation_date(state['cutoff_at'])} (UTC)")
+            try:
+                sent = _ca_rotation_send('day0', state, text, log)
+            except Exception as e:
+                sent = {'sent': False, 'message': f'The notice could not be sent: {str(e)[:160]}'}
+            log(f"  {'✓' if sent.get('sent') else '⚠'} Notice: {sent.get('message')}")
+            rotate_intca_status['notice'] = {'text': text, 'sent': bool(sent.get('sent')), 'message': sent.get('message', '')}
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
             log(f"")
@@ -81477,14 +83361,124 @@ def takserver_rotate_intca_status():
     return jsonify({'log': rotate_intca_log, **rotate_intca_status})
 
 
+def _pem_self_signed(pem):
+    """True for a self-signed certificate (a root CA): subject == issuer."""
+    subj = _pem_dn(pem, 'subject')
+    return bool(subj) and subj == _pem_dn(pem, 'issuer')
+
+
+def _tak_root_signed_dependents(cert_dir, live):
+    """v10.3.5 W6: what TAK Server would refuse once the root leaves its trust list — client
+    certs signed by the root itself rather than by an intermediate. Returns ([cert names in the
+    cert dir], live count in TAK's certificate table, or None when that can't be read). The
+    8089 server cert is not checked against TAK's own truststore, so a root-signed one (W1)
+    doesn't count."""
+    try:
+        root_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+    except Exception:
+        return [], None
+    names = []
+    for n in _rotate_client_cert_names(cert_dir):
+        try:
+            if _pem_dn(_read_priv(os.path.join(cert_dir, f'{n}.pem')), 'issuer') == root_dn:
+                names.append(n)
+        except Exception:
+            pass
+    m = re.search(r'(?:^|,)CN=([^,]+)', root_dn or '')
+    n_live = None if live is None else live.get((m.group(1) if m else '').lower(), 0)
+    return names, n_live
+
+
+def _tak_truststore_drop_roots(ts_path, storepass, sh, log, cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W6 (D1): TAK Server's own trust list — the .jks CoreConfig's <tls> names — holds
+    intermediates only, never a self-signed root.
+
+    Java PKIX treats every truststore entry as a trust anchor. With the root in it, a client
+    that sends leaf + any root-signed intermediate (including one Revoke just removed) is
+    accepted, so Revoke was never airtight (test6, 2026-11-01; gate on test12 and aws-arm,
+    2026-11-02). TAK 5.8's makeCert.sh `ca` imports the root itself under its CN, and
+    infra-TAK used to add it again as `root-ca`, so entries are matched by subject == issuer,
+    never by alias. The .p12 handed to clients is a different file and keeps the root.
+    sh(argv) -> (ok, output), argv run as `tak`. Returns (ok, removed aliases)."""
+    name = os.path.basename(ts_path)
+    entries = _rotate_truststore_entries(ts_path, storepass, sh)
+    if entries is None:
+        log(f"  ✗ Could not read {name}")
+        return False, []
+    roots = [(a, p) for a, p in entries if _pem_self_signed(p)]
+    if roots and len(roots) == len(entries):
+        log(f"  ✗ {name} holds only root CAs; removing them would leave TAK Server trusting nothing. Not changed.")
+        return False, []
+    try:
+        root_key = _pem_key(_read_priv(os.path.join(cert_dir, 'root-ca.pem')))
+    except Exception:
+        root_key = ''
+    ok, removed = True, []
+    for alias, pem in roots:
+        good, out = sh(['keytool', '-delete', '-alias', alias, '-keystore', ts_path, '-storepass', storepass])
+        if not good:
+            ok = False
+            log(f"  ✗ Could not remove {alias} from {name}: {out.strip()[:200]}")
+            continue
+        removed.append(alias)
+        src = os.path.join(cert_dir, 'root-ca.pem') if _pem_key(pem) == root_key else f'<the {alias} certificate>'
+        log(f"  Removed root CA {alias} from {name}. Undo: runuser -u tak -- keytool -importcert -noprompt "
+            f"-alias {alias} -file {src} -keystore {ts_path} -storepass <certificate password>, "
+            "then restart TAK Server")
+    return ok, removed
+
+
+def _tak_client_truststore_rebuild(ts_jks, storepass, run, cert_dir='/opt/tak/certs/files'):
+    """v10.3.5 W6: the truststore handed to clients (truststore-<INT>.p12: /api/download/truststore,
+    integration packages) = TAK Server's trust list + the root. It needs the root because a
+    root-signed server cert (W1) chains to nothing else. Built fresh beside the old one and
+    moved over it: importing into the existing .p12 merged, so a revoked CA stayed in it.
+    run(cmd) -> bool, the rotations' container-aware runner. Returns True on success."""
+    p12 = ts_jks[:-4] + '.p12'
+    new = p12 + '.new'
+    q = shlex.quote
+    run(f'rm -f {q(new)}')
+    ok = (run(f'runuser -u tak -- keytool -importkeystore -srckeystore {q(ts_jks)} -srcstoretype JKS '
+              f'-srcstorepass {q(storepass)} -destkeystore {q(new)} -deststoretype PKCS12 '
+              f'-deststorepass {q(storepass)} -noprompt 2>&1')
+          and run(f'runuser -u tak -- keytool -importcert -noprompt -alias root-ca '
+                  f'-file {q(os.path.join(cert_dir, "root-ca.pem"))} -keystore {q(new)} '
+                  f'-storetype PKCS12 -storepass {q(storepass)} 2>&1')
+          and run(f'mv -f {q(new)} {q(p12)}'))
+    if not ok:
+        run(f'rm -f {q(new)}')
+    return ok
+
+
+revoke_ca_log = []
+revoke_ca_status = {'running': False, 'complete': False, 'error': False, 'message': ''}
+
+
+def _tak_cert_job_busy():
+    """v10.3.5 W7: one running flag across every job that rewrites TAK Server's certificates."""
+    return bool(tak_server_cert_job['running'] or rotate_rootca_status.get('running')
+                or rotate_intca_status.get('running') or revoke_ca_status.get('running'))
+
+
 @app.route('/api/takserver/revoke-old-ca', methods=['POST'])
 @login_required
 def takserver_revoke_old_ca():
-    """Create new server cert (signed by current/new CA), remove old CA from truststore, restart. Cuts off clients with old certs."""
-    data = request.json or {}
+    """Revoke an old intermediate CA: TAK Server stops accepting every client cert it signed.
+
+    v10.3.5: a job with a log, behind the console password (W7, D3), and airtight (W6): the
+    old intermediate AND every self-signed root leave TAK Server's trust list, so a client
+    can't get back in by sending the revoked intermediate in its own chain. Refused when a
+    client cert is signed by the root directly, since that would cut it off too. The 8089
+    reissue is decided by what 8089 serves (W5)."""
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     old_ca_alias = (data.get('old_ca_alias') or '').strip()
     if not old_ca_alias:
         return jsonify({'error': 'Old CA alias is required'}), 400
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
 
     cert_dir = '/opt/tak/certs/files'
     cert_pass = _get_tak_cert_password(load_settings())
@@ -81495,77 +83489,172 @@ def takserver_revoke_old_ca():
         return jsonify({'error': 'Could not tell which truststore TAK Server is using '
                                  '(CoreConfig.xml and ca.pem name none here). Nothing was changed.'}), 500
     ts_path = os.path.join(cert_dir, ts_name)
-
+    entries = _rotate_truststore_entries(ts_path, cert_pass, _rotate_sh)
+    if entries is None:
+        return jsonify({'error': f'Could not read {ts_name}. Nothing was changed.'}), 500
+    target = [p for a, p in entries if a.lower() == old_ca_alias.lower()]
+    if not target:
+        return jsonify({'error': f'{old_ca_alias} is not in {ts_name}. Nothing was changed.'}), 400
     try:
-        # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
-        le_jks = os.path.join(cert_dir, 'takserver-le.jks')
-        if not os.path.isfile(le_jks):
-            _tak_server_cert_prepare(load_settings())  # v10.2.26: real names, not just `takserver`
-            r = subprocess.run(
-                _rotate_tak_cert_cmd('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'),
-                shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
-            # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
-            p12 = os.path.join(cert_dir, 'takserver.p12')
-            jks = os.path.join(cert_dir, 'takserver.jks')
-            if os.path.isfile(p12):
-                subprocess.run(
-                    _rotate_tak_cert_cmd(
-                        f'runuser -u tak -- keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
-                        f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
-                    shell=True, capture_output=True, text=True, timeout=30)
+        current_key = _pem_key(_read_priv(os.path.join(cert_dir, 'ca.pem')))
+    except Exception:
+        current_key = ''
+    if _pem_key(target[0]) == current_key:
+        return jsonify({'error': f'{old_ca_alias} is the current intermediate CA: revoking it would cut off '
+                                 'every device. Nothing was changed.'}), 400
+    if _pem_self_signed(target[0]):
+        return jsonify({'error': f'{old_ca_alias} is a root CA. Revoke removes root CAs from the trust list '
+                                 'on its own; pick an old intermediate. Nothing was changed.'}), 400
+    live = _rotate_tak_live_certs_by_issuer()
+    deps, n_live = _tak_root_signed_dependents(cert_dir, live)
+    if deps or n_live:
+        what = ', '.join(deps[:10]) + (' …' if len(deps) > 10 else '')
+        if n_live:
+            what = (what + '; ' if what else '') + f"{n_live} live client cert{'' if n_live == 1 else 's'}"
+        return jsonify({'error': f'Signed directly by the root CA: {what}. Revoke takes the root out of '
+                                 "TAK Server's trust list, which would cut these off too. Reissue them from "
+                                 'the current intermediate first. Nothing was changed.'}), 409
 
-        # 2) Remove old CA from truststore
-        r = subprocess.run(
-            _rotate_tak_cert_cmd(
-                f'runuser -u tak -- keytool -delete -alias {shlex.quote(old_ca_alias)} '
-                f'-keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)} 2>&1'),
-            shell=True, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
+    # v10.3.5 W5: whether 8089 needs a new cert is decided by what 8089 serves. The old test
+    # (does takserver-le.jks exist?) is the 8446 connector's file, so every box with LE on 8446
+    # skipped the reissue and said "Server TLS is Let's Encrypt" about 8089. A root-signed
+    # server cert does not chain through the CA being revoked, so it needs no reissue at all.
+    try:
+        ks_8089 = os.path.basename(_tak_coreconfig_keystore(_read_priv('/opt/tak/CoreConfig.xml')) or '')
+    except Exception:
+        ks_8089 = ''
+    own_cert = ks_8089 in ('', 'takserver.jks')
+    server_signer = _tak_server_cert_mode(cert_dir) if own_cert else 'custom'
 
-        # 3) Regenerate .p12 truststore
-        ts_p12 = ts_path.replace('.jks', '.p12')
-        subprocess.run(
-            _rotate_tak_cert_cmd(
-                f'runuser -u tak -- keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
-                f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1'),
-            shell=True, capture_output=True, text=True, timeout=15)
+    revoke_ca_log.clear()
+    revoke_ca_status.update({'running': True, 'complete': False, 'error': False, 'message': '', 'ct_running': False})
 
-        if _tak_is_container():
-            subprocess.run(_sudo_wrap(['docker', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-        else:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+    def do_revoke():
+        log = revoke_ca_log.append
+        problems = []
 
-        # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
-        # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
-        # client cert + CA; restart so the portal picks up the new chain).
-        _takportal_sync_certs(restart=True)
+        def run(cmd):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    log(f"  ✗ Failed (exit {r.returncode}): {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ Exception: {e}")
+                return False
 
-        # v10.3.4 W8: CloudTAK's own connection and every user cert came from the CA just
-        # revoked, so nobody could log in (UND_ERR_SOCKET), and the only documented fix needed
-        # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
-        ct_note = ''
-        if _cloudtak_local_with_local_tak():
-            threading.Thread(target=_cloudtak_heal_after_ca_change,
-                             args=(lambda m: print(f"Revoke Old CA:{m}", flush=True),),
-                             daemon=True, name='ct-cert-heal-revoke').start()
-            ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
-                       'CloudTAK users whose certificate came from the revoked CA get a new one at their '
-                       'next login: anyone signed in to CloudTAK right now must log out and back in once.')
+        try:
+            log(f"━━━ Revoking {old_ca_alias} ━━━")
+            log("")
+            log("Step 1/5: Server certificate (8089)...")
+            if server_signer == 'root':
+                log("  Signed by the root CA: it doesn't depend on the CA being revoked, left as it is")
+            elif server_signer == 'custom':
+                log(f"  Port 8089 presents {ks_8089} (a custom or Let's Encrypt certificate), left as it is")
+            else:
+                if not _tak_server_cert_issue(load_settings(), 'intermediate', log, run, cert_dir):
+                    raise Exception('Creating the new server certificate failed; nothing was revoked')
+                log("✓ Server certificate reissued by the current intermediate CA")
 
-        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-               f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
-               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.'
-               + ct_note)
-        if os.path.isfile(le_jks):
-            msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.'
-                   + ct_note)
-        return jsonify({'success': True, 'message': msg})
-    except Exception as e:
-        return jsonify({'error': str(e)[:200]}), 500
+            log("")
+            log(f"Step 2/5: Removing {old_ca_alias} from {ts_name}...")
+            if not run(f'runuser -u tak -- keytool -delete -alias {shlex.quote(old_ca_alias)} '
+                       f'-keystore {shlex.quote(ts_path)} -storepass {shlex.quote(cert_pass)} 2>&1'):
+                raise Exception(f'keytool could not remove {old_ca_alias}; nothing was revoked')
+            log(f"✓ {old_ca_alias} removed")
+
+            log("")
+            log("Step 3/5: Removing root CAs from TAK Server's trust list...")
+            ok, removed = _tak_truststore_drop_roots(ts_path, cert_pass, _rotate_sh, log, cert_dir)
+            if not ok:
+                problems.append('a root CA could not be removed from the trust list, so a client can still '
+                                f'get in by sending {old_ca_alias} in its own chain')
+            log(f"✓ Trust list: {'root removed (' + ', '.join(removed) + ')' if removed else 'no root CA in it'}"
+                if ok else "  ⚠ Trust list still holds a root CA")
+
+            log("")
+            log("Step 4/5: Rebuilding the truststore given to clients (current CAs + root)...")
+            if _tak_client_truststore_rebuild(ts_path, cert_pass, run, cert_dir):
+                log(f"✓ {ts_name[:-4]}.p12 rebuilt")
+            else:
+                problems.append(f'{ts_name[:-4]}.p12 was not rebuilt and may still list {old_ca_alias}')
+                log(f"  ⚠ {ts_name[:-4]}.p12 not rebuilt")
+
+            log("")
+            log("Step 5/5: Restarting TAK Server...")
+            run('systemctl restart takserver 2>&1')
+            log("✓ TAK Server restarting; devices reconnect in about 1–2 minutes")
+
+            log("")
+            log("Updating TAK Portal certificates...")
+            # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
+            # client cert + CA; restart so the portal picks up the new chain).
+            _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+            log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+
+            # v10.3.4 W8: CloudTAK's own connection and every user cert came from the CA just
+            # revoked, so nobody could log in (UND_ERR_SOCKET), and the only documented fix needed
+            # a CloudTAK login. Repair it here. Own thread: the heal waits ~2 min to be sure.
+            ct_note = ''
+            if _cloudtak_local_with_local_tak():
+                ct_stopgap = ('anyone signed in to CloudTAK right now must log out and back in once.')
+
+                def _ct_heal():
+                    try:
+                        _ct_heal_run()
+                    finally:
+                        revoke_ca_status['ct_running'] = False
+
+                def _ct_heal_run():
+                    r = _cloudtak_heal_after_ca_change(lambda m: log(f"  CloudTAK:{m}"))
+                    # v10.3.5 W13: the stopgap line stands only when the targeted sign-out didn't
+                    # happen. The heal outlives the job, so wait for its final message first.
+                    for _ in range(120):
+                        if revoke_ca_status.get('complete'):
+                            break
+                        time.sleep(1)
+                    if (r or {}).get('signout') == 'ok' or (r or {}).get('reset') == []:
+                        done = (f"the {r['users']} signed in on it were signed out and land on the login page."
+                                if r.get('users') else 'none of them was signed in.')
+                        revoke_ca_status['message'] = revoke_ca_status.get('message', '').replace(ct_stopgap, done)
+
+                revoke_ca_status['ct_running'] = True
+                threading.Thread(target=_ct_heal, daemon=True, name='ct-cert-heal-revoke').start()
+                ct_note = (' CloudTAK is being reconnected with a current certificate (about 3 minutes). '
+                           'CloudTAK users whose certificate came from the revoked CA get a new one at their '
+                           'next login: ' + ct_stopgap)
+
+            server_note = {
+                'root': 'Server cert is signed by the root CA and was not changed.',
+                'custom': f'Port 8089 presents {ks_8089} (a custom or Let\'s Encrypt certificate); unchanged.',
+            }.get(server_signer, 'Server cert is now signed by the current CA.')
+            msg = (f'Removed {old_ca_alias} from the trust list and restarted TAK Server. {server_note} '
+                   f'Clients still using certs signed by {old_ca_alias} must re-enroll.' + ct_note)
+            if problems:
+                msg += ' ⚠ ' + ' ⚠ '.join(p[0].upper() + p[1:] + '.' for p in problems)
+            # v10.3.5 W10: revoking the window's old CA closes the window (and its reminders).
+            st = _ca_rotation_state_load()
+            if st and (_pem_cn_and_expiry(target[0])[0] or old_ca_alias).lower() == str(st.get('old_ca_cn')).lower():
+                _ca_rotation_state_save({})
+                log(f"  Rotation window for {st.get('old_ca_cn')} closed; no more reminders")
+            log("")
+            log("━━━ REVOKE COMPLETE ━━━" if not problems else "━━━ REVOKE DONE WITH WARNINGS ━━━")
+            revoke_ca_status.update({'running': False, 'complete': True, 'error': bool(problems), 'message': msg})
+        except Exception as e:
+            log("")
+            log(f"✗ REVOKE FAILED: {e}")
+            revoke_ca_status.update({'running': False, 'complete': True, 'error': True, 'message': str(e)[:300]})
+
+    threading.Thread(target=do_revoke, daemon=True, name='tak-revoke-ca').start()
+    return jsonify({'success': True, 'started': True})
+
+
+@app.route('/api/takserver/revoke-old-ca/status')
+@login_required
+def takserver_revoke_old_ca_status():
+    return jsonify({**revoke_ca_status, 'log': list(revoke_ca_log)})
 
 
 rotate_rootca_log = []
@@ -81575,17 +83664,25 @@ rotate_rootca_status = {'running': False, 'complete': False, 'error': False}
 @login_required
 def takserver_rotate_rootca():
     """Full Root CA rotation: new root, new intermediate, new server cert, all client certs, update TAK Portal, restart."""
-    if rotate_rootca_status.get('running'):
-        return jsonify({'error': 'Root CA rotation already in progress'}), 409
+    if _tak_cert_job_busy():
+        return jsonify({'error': 'A certificate operation is already running.'}), 409
     data = request.json or {}
+    # v10.3.5 W8 (D3): a full PKI rebuild disconnects every device.
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'error': 'Incorrect console password.', 'need_password': True}), 403
     new_root_name = (data.get('new_root_name') or '').strip()
     new_int_name = (data.get('new_int_name') or '').strip()
     if not new_root_name or not new_int_name:
         return jsonify({'error': 'Both new Root CA and Intermediate CA names are required'}), 400
     import re
-    for name in [new_root_name, new_int_name]:
-        if not re.match(r'^[a-zA-Z0-9._-]+$', name):
-            return jsonify({'error': f'CA name "{name}" can only contain letters, numbers, dots, hyphens, underscores'}), 400
+    # GH #128: the same rule as deploy and intermediate rotate. This route used its own regex,
+    # which allowed underscores, and an underscore makes TAK reject every enrolled device.
+    try:
+        _validate_ca_name(new_root_name, 'New Root CA name')
+        _validate_ca_name(new_int_name, 'New Intermediate CA name')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     # Optional new cert password (save so thread uses it for new keystores)
     new_cert_password = (data.get('new_cert_password') or '').strip()
@@ -81648,6 +83745,8 @@ def takserver_rotate_rootca():
                 return False
 
         try:
+            # Read before Step 1 clears the cert dir: a root-signed box stays root-signed (by the new root).
+            server_signer = _tak_server_cert_signer_or_default(cert_dir)
             log("━━━ Rotating Root CA ━━━")
             log(f"  Old Root CA: {old_root_name}")
             log(f"  Old Intermediate CA: {old_int_name}")
@@ -81673,13 +83772,35 @@ def takserver_rotate_rootca():
                 # rotation starts from a clean slate, exactly like the native rm does. The native
                 # branch below is byte-identical to before — Ubuntu/Rocky are untouched.
                 _tak_real = os.path.realpath('/opt/tak')
+                # v10.3.5: keep the 8446 Let's Encrypt keystore (see the native branch).
                 run(f"docker run --rm -v {shlex.quote(_tak_real)}:/opt/tak:z --entrypoint bash "
-                    f"{TAK_CONTAINER} -c 'rm -rf /opt/tak/certs/files && mkdir -p /opt/tak/certs/files' 2>&1")
+                    f"{TAK_CONTAINER} -c 'rm -rf /opt/tak/certs/.le-keep && mkdir -p /opt/tak/certs/.le-keep && "
+                    f"(mv /opt/tak/certs/files/takserver-le.* /opt/tak/certs/.le-keep/ 2>/dev/null; true) && "
+                    f"rm -rf /opt/tak/certs/files && mkdir -p /opt/tak/certs/files && "
+                    f"(mv /opt/tak/certs/.le-keep/* /opt/tak/certs/files/ 2>/dev/null; true) && "
+                    f"rm -rf /opt/tak/certs/.le-keep' 2>&1")
             else:
+                # v10.3.5: CoreConfig's 8446 connector points at certs/files/takserver-le.jks.
+                # Wiping it took TAK's whole API down (8443 + 8446) until the console's next
+                # LE self-heal (T&E, nuc). It isn't signed by our CA, so it survives the rotate.
+                _le_keep = '/opt/tak/certs/.le-keep'
+                _le_files = [f for f in ('takserver-le.jks', 'takserver-le.p12')
+                             if os.path.exists(f'/opt/tak/certs/files/{f}')]
+                if _le_files:
+                    run(f'rm -rf {_le_keep}', check=False)
+                    run(f'mkdir -p {_le_keep}')
+                    for _f in _le_files:
+                        run(f'mv /opt/tak/certs/files/{_f} {_le_keep}/{_f}')
                 run('rm -rf /opt/tak/certs/files')
                 run('mkdir -p /opt/tak/certs/files')
+                for _f in _le_files:
+                    run(f'mv {_le_keep}/{_f} /opt/tak/certs/files/{_f}')
+                if _le_files:
+                    run(f'rm -rf {_le_keep}', check=False)
                 run('chown -R tak:tak /opt/tak/certs/')
             log("✓ Old cert files cleared")
+            if _tak_8446_connector_has_le(_read_priv('/opt/tak/CoreConfig.xml')):
+                log("  Kept the Let's Encrypt cert TAK serves on 8446")
 
             _patch_openssl_string_mask()
 
@@ -81699,10 +83820,10 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 4/8: Creating new server certificate...")
-            _tak_server_cert_prepare(load_settings(), log)  # v10.2.26: real names, not just `takserver`
-            if not run('cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh server takserver 2>&1'):
+            if not _tak_server_cert_issue(load_settings(), server_signer, log, run, cert_dir):
                 raise Exception('Failed to create server certificate')
-            log("✓ Server certificate created")
+            log("✓ Server certificate created (signed by "
+                + (f"the new root CA {new_root_name}" if server_signer == 'root' else f"{new_int_name}") + ")")
 
             log("")
             log("Step 5/8: Regenerating all client certificates...")
@@ -81721,10 +83842,9 @@ def takserver_rotate_rootca():
             log("")
             log("Step 6/8: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
-            # v10.0.5 non-root: route keytool via broker-allowed `runuser -u tak -- keytool`.
-            run(f'runuser -u tak -- keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
-            log("  Root CA imported into truststore")
+            # v10.3.5 W6: TAK Server's trust list holds the intermediate only. makeCert.sh `ca`
+            # put the new root in it; the client .p12 it built keeps the root.
+            _tak_truststore_drop_roots(ts_jks, cert_pass, _rotate_sh, log, cert_dir)
             log("✓ Truststore updated")
 
             log("")
@@ -81745,6 +83865,14 @@ def takserver_rotate_rootca():
                         _write_priv(_cc, _t)
                 except Exception:
                     pass
+            # v10.3.5 W9: issued certs can't outlive the new intermediate.
+            try:
+                _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)
+                if _cl:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t)
+                    log(f"  Issued cert validity {_cl[0]} → {_cl[1]} days (the new intermediate's remaining life)")
+            except Exception as e:
+                log(f"  ⚠ Could not check issued cert validity: {e}")
             _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
@@ -81774,6 +83902,15 @@ def takserver_rotate_rootca():
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
             log("✓ TAK Server restarted")
+            # v10.3.5: confirm 8446 still serves Caddy's Let's Encrypt cert; repairs it if not.
+            if _tak_8446_connector_has_le(_read_priv('/opt/tak/CoreConfig.xml')):
+                try:
+                    if _selfheal_takserver_le_cert(plog=log):
+                        log("✓ 8446 serves the Let's Encrypt cert")
+                    else:
+                        log("  ⚠ 8446 Let's Encrypt cert not confirmed; the console repairs it daily")
+                except Exception as e:
+                    log(f"  ⚠ 8446 Let's Encrypt check failed: {e}")
 
             log("")
             log("━━━ ROOT CA ROTATION COMPLETE ━━━")
@@ -81806,7 +83943,7 @@ def takserver_rotate_rootca_status():
 def takserver_server_cert_status():
     """v10.2.26 — the TAK Server page's certificate row: live names vs. this box's names,
     plus the Fix job's progress. No live probe while the job runs (TAK is restarting)."""
-    job = {k: tak_server_cert_job[k] for k in ('running', 'complete', 'error')}
+    job = {k: tak_server_cert_job.get(k) for k in ('running', 'complete', 'error', 'kind')}
     job['elapsed'] = int(time.time() - tak_server_cert_job['started']) if tak_server_cert_job['started'] else 0
     job['log'] = list(tak_server_cert_job['log'])
     if tak_server_cert_job['running']:
@@ -81832,12 +83969,12 @@ def takserver_server_cert_fix():
                                            'verify_password': verify_password}, data):
         return jsonify({'success': False, 'error': 'Incorrect console password.',
                         'need_password': True}), 403
-    if (tak_server_cert_job['running'] or rotate_rootca_status.get('running')
-            or rotate_intca_status.get('running')):
+    if _tak_cert_job_busy():
         return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
     settings = load_settings()
     want = _tak_server_cert_names(settings)
-    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time())
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='fix')
 
     def do_fix():
         log = tak_server_cert_job['log'].append
@@ -81894,7 +84031,8 @@ def takserver_server_cert_fix():
                 raise Exception('Could not write the names — nothing was changed')
 
             log("Step 3/4: Reissuing the server certificate (same CA)...")
-            if not _rotate_reissue_cert('server', 'takserver', run, cert_dir):
+            if not _tak_server_cert_issue(settings, _tak_server_cert_signer_or_default(cert_dir),
+                                          log, run, cert_dir):
                 restore()
                 raise Exception('makeCert.sh failed')
             got = _cert_san_entries(_read_priv(f'{cert_dir}/takserver.pem')) or []
@@ -81926,6 +84064,192 @@ def takserver_server_cert_fix():
             tak_server_cert_job.update(running=False, complete=True, error=True)
 
     threading.Thread(target=do_fix, daemon=True).start()
+    return jsonify({'success': True, 'started': True})
+
+
+def _tak_coreconfig_keystore(cc_text):
+    """Absolute keystoreFile of CoreConfig's <tls> under <security> (what 8089/8443 present), or ''."""
+    sec = re.search(r'<security\b.*?</security>', cc_text or '', re.S)
+    m = re.search(r'<tls\b[^>]*>', sec.group(0) if sec else (cc_text or ''))
+    f = re.search(r'\bkeystoreFile="([^"]*)"', m.group(0)) if m else None
+    path = (f.group(1) if f else '').strip()
+    return os.path.join('/opt/tak', path) if path and not path.startswith('/') else path
+
+
+def _tak_server_cert_live_issuer():
+    """Issuer DN (RFC 2253) of the cert TAK Server presents right now, or None if not answering.
+    8443, not 8089, for the reason in _tak_server_cert_live_names(): same keystore, no log spam."""
+    try:
+        r = subprocess.run(['openssl', 's_client', '-connect', '127.0.0.1:8443'],
+                           input='', capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', r.stdout, re.S)
+    return (_pem_dn(m.group(0), 'issuer') or None) if m else None
+
+
+def _tak_server_cert_signer_info(cert_dir='/opt/tak/certs/files'):
+    """What the TAK Server page's "signed by" row shows, plus why a switch would be refused."""
+    def cn(dn):
+        m = re.search(r'(?:^|,)CN=([^,]+)', dn or '')
+        return m.group(1) if m else ''
+    try:
+        root_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem')), 'subject')
+    except Exception:
+        root_dn = ''
+    try:
+        int_dn = _pem_dn(_read_priv(os.path.join(cert_dir, 'ca.pem')), 'subject')
+    except Exception:
+        int_dn = ''
+    try:
+        srv_issuer = _pem_dn(_read_priv(os.path.join(cert_dir, 'takserver.pem')), 'issuer')
+    except Exception:
+        srv_issuer = ''
+    mode = _tak_server_cert_mode(cert_dir)
+    blockers = []
+    if not _exists_priv(os.path.join(cert_dir, 'root-ca-do-not-share.key')):
+        blockers.append("The root CA's private key isn't on this server, so the certificate can't be signed by it.")
+    try:
+        ks = _tak_coreconfig_keystore(_read_priv('/opt/tak/CoreConfig.xml'))
+    except Exception:
+        ks = ''
+    if ks and os.path.basename(ks) != 'takserver.jks':
+        blockers.append(f"TAK Server presents {os.path.basename(ks)} on 8089, not its own certificate "
+                        "(a custom or Let's Encrypt certificate). Switching does not apply.")
+    if _tak_cert_job_busy():
+        blockers.append('A certificate operation is already running.')
+    return {'mode': mode, 'root_cn': cn(root_dn), 'intermediate_cn': cn(int_dn),
+            'issuer_cn': cn(srv_issuer), 'blockers': blockers}
+
+
+@app.route('/api/takserver/server-cert/signer', methods=['GET', 'POST'])
+@login_required
+def takserver_server_cert_signer():
+    """v10.3.5 W3 — who signs TAK Server's own certificate: GET the mode, POST {signer, password}
+    to switch it. Root-signed lets the intermediate rotate without every phone rescanning (ATAK
+    trusts the root it enrolled with and ignores the chain we send). Reversible both ways.
+
+    The job mirrors the names fix: back up takserver.*, reissue through
+    _tak_server_cert_issue(), restart, wait until the LIVE cert's issuer is the one asked for,
+    and put the old files back on any failure. TAK Portal's CA file is rebuilt afterwards."""
+    cert_dir = '/opt/tak/certs/files'
+    if not os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if request.method == 'GET':
+        return jsonify({'success': True, **_tak_server_cert_signer_info(cert_dir)})
+    data = request.get_json(silent=True) or {}
+    if mod_registry._check_admin_password({'load_auth': load_auth,
+                                           'verify_password': verify_password}, data):
+        return jsonify({'success': False, 'error': 'Incorrect console password.',
+                        'need_password': True}), 403
+    signer = data.get('signer')
+    if signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'success': False, 'error': 'signer must be root or intermediate'}), 400
+    info = _tak_server_cert_signer_info(cert_dir)
+    if any('already running' in b for b in info['blockers']):
+        return jsonify({'success': False, 'error': 'A certificate operation is already running.'}), 409
+    if info['blockers']:
+        return jsonify({'success': False, 'error': ' '.join(info['blockers'])}), 400
+    if info['mode'] == signer:
+        return jsonify({'success': False, 'error': f'The certificate is already signed by the {signer} CA.'}), 400
+    settings = load_settings()
+    want = _pem_dn(_read_priv(os.path.join(cert_dir, 'root-ca.pem' if signer == 'root' else 'ca.pem')),
+                   'subject')
+    if not want:
+        return jsonify({'success': False, 'error': 'Could not read the CA certificate to sign with.'}), 500
+    label = 'the root CA' if signer == 'root' else f"the intermediate CA ({info['intermediate_cn']})"
+    tak_server_cert_job.update(running=True, complete=False, error=False, log=[], started=time.time(),
+                               kind='signer')
+
+    def do_switch():
+        log = tak_server_cert_job['log'].append
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        files = [f'{cert_dir}/takserver.{ext}' for ext in ('pem', 'key', 'p12', 'jks', 'csr')]
+        backed = []
+
+        def run(cmd, check=True):
+            cmd = _rotate_tak_cert_cmd(cmd)  # v10.0.1: container-aware (runuser/chown/systemctl → docker)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    log(f"  ✗ {(r.stderr or r.stdout or '').strip()[:200]}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ {str(e)[:200]}")
+                return False
+
+        def restore():
+            ok = all([run(f'cp -p {shlex.quote(p + "." + stamp)} {shlex.quote(p)}') for p in backed])
+            log("  ✓ Previous certificate restored" if ok else "  ✗ Restore incomplete — backups are "
+                f"{cert_dir}/takserver.*.{stamp}")
+            return ok
+
+        try:
+            log(f"━━━ Switching TAK Server's certificate to {label} ━━━")
+            log("Step 1/4: Backing up the current server certificate...")
+            for p in files:
+                if _exists_priv(p):
+                    if not run(f'cp -p {shlex.quote(p)} {shlex.quote(p + "." + stamp)}'):
+                        raise Exception('Backup failed — nothing was changed')
+                    backed.append(p)
+            log(f"  ✓ Saved as {cert_dir}/takserver.*.{stamp}")
+
+            log(f"Step 2/4: Reissuing the server certificate, signed by {label}...")
+            if not _tak_server_cert_issue(settings, signer, log, run, cert_dir):
+                restore()
+                raise Exception('Reissuing the certificate failed')
+            got = _pem_dn(_read_priv(f'{cert_dir}/takserver.pem'), 'issuer')
+            if got != want:
+                restore()
+                raise Exception(f'The new certificate is signed by {got or "nobody"}, not {want}')
+            log("  ✓ New certificate written")
+
+            log("Step 3/4: Restarting TAK Server (devices reconnect on their own)...")
+            if not run('systemctl restart takserver 2>&1'):
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server restart failed')
+            live, end = None, time.time() + 300
+            while time.time() < end:
+                time.sleep(5)
+                live = _tak_server_cert_live_issuer()
+                if live == want:
+                    break
+            if live != want:
+                log("  ✗ TAK Server didn't come back presenting the new certificate within 5 minutes")
+                restore()
+                run('systemctl restart takserver 2>&1')
+                raise Exception('TAK Server did not pick up the new certificate')
+            log(f"  ✓ TAK Server is presenting a certificate signed by {label}")
+            # Keep only this switch's backup: every switch saves a private-key copy, and
+            # older sets are superseded once the new cert is live (switching back reissues).
+            try:
+                _old = [n for n in os.listdir(cert_dir)
+                        if re.fullmatch(r'takserver\.(pem|key|p12|jks|csr)\.\d{8}-\d{6}', n)
+                        and not n.endswith('.' + stamp)]
+            except OSError:
+                _old = []
+            for n in _old:
+                run(f'rm -f {shlex.quote(os.path.join(cert_dir, n))}', check=False)
+            if _old:
+                log(f"  Removed {len(_old)} file(s) from earlier switches")
+
+            log("Step 4/4: Updating TAK Portal's copy of the server certificate...")
+            if _takportal_web_container() is None:
+                log("  TAK Portal isn't running here — nothing to update")
+            else:
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+                log(f"  {'✓' if _tp_ok else '⚠'} {_tp_msg}")
+            log("")
+            log("━━━ DONE ━━━")
+            tak_server_cert_job.update(running=False, complete=True, error=False)
+        except Exception as e:
+            log("")
+            log(f"✗ FAILED: {e}")
+            tak_server_cert_job.update(running=False, complete=True, error=True)
+
+    threading.Thread(target=do_switch, daemon=True).start()
     return jsonify({'success': True, 'started': True})
 
 
@@ -83285,7 +85609,7 @@ def takserver_security_config_get():
     import re
     m = re.search(r'<TAKServerCAConfig[^>]*validityDays="(\d+)"', content)
     validity_days = int(m.group(1)) if m else 3650
-    return jsonify({'validity_days': validity_days})
+    return jsonify({'validity_days': validity_days, 'cap_days': _tak_issued_validity_cap()})
 
 
 @app.route('/api/takserver/security-config', methods=['POST'])
@@ -83312,6 +85636,9 @@ def takserver_security_config_post():
     import re
     if not re.search(r'<TAKServerCAConfig[^>]*validityDays="\d+"', content):
         return jsonify({'error': 'TAKServerCAConfig / validityDays not found in CoreConfig (certificate enrollment may not be enabled)'}), 400
+    # v10.3.5 W9: a cert can't usefully outlive the intermediate that signed it.
+    asked = validity_days
+    validity_days = _tak_issued_validity(validity_days)
     new_content = re.sub(r'(<TAKServerCAConfig[^>]*validityDays=")\d+(")', rf'\g<1>{validity_days}\g<2>', content, count=1)
     if new_content == content:
         return jsonify({'error': 'No change applied'}), 400
@@ -83320,7 +85647,10 @@ def takserver_security_config_post():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=90)  # v10.0.1: container-aware
-    return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
+    capped = (f' ({asked} asked; capped to the {validity_days} days the intermediate CA has left)'
+              if validity_days < asked else '')
+    return jsonify({'success': True, 'validity_days': validity_days, 'cap_days': _tak_issued_validity_cap(),
+                    'message': f'Issued cert validity set to {validity_days} days{capped}. TAK Server restarted.'})
 
 
 # ── TAK 5.8 pre-flight (v10.2.0 W2) ─────────────────────────────────────────
@@ -86198,7 +88528,7 @@ def _tak_snapshot(label, plog=None):
     return True, meta
 
 
-def _tak_rollback_prepare_local_db(plog):
+def _tak_rollback_prepare_local_db(plog, who='rollback'):
     """Make sure the local cluster has a `martiuser` that can log in with the password in
     CoreConfig.xml, and a `cot` database to restore into. Returns True when both hold.
 
@@ -86211,13 +88541,17 @@ def _tak_rollback_prepare_local_db(plog):
     Same statements TAK's own takserver-setup-db.sh uses, with the password re-set even
     when the role exists. TAK logs in with whatever CoreConfig says, so the role must match
     it; this is the same re-encode _tak58_heal_md5_scram does. The password is never logged.
+
+    The deploy calls it too (who='deploy'): TAK's takserver-setup-db.sh treats any box with
+    /usr/pgsql-15/bin/postgresql-15-setup as a 15 -> 18 upgrade and then never creates
+    martiuser or cot (nuc, 2026-11-02: Remove then Deploy on a box that once moved 15 -> 18).
     """
     r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c',
                   "select (select count(*) from pg_roles where rolname='martiuser')"
                   " || ',' || (select count(*) from pg_database where datname='cot')"],
                  timeout=60)
     if not r or r.returncode != 0 or ',' not in (r.stdout or ''):
-        plog("  rollback: cannot reach the local PostgreSQL as postgres: "
+        plog(f"  {who}: cannot reach the local PostgreSQL as postgres: "
              f"{((getattr(r, 'stderr', '') or '').strip())[:200]}")
         return False
     has_role, has_db = [p.strip() == '1' for p in r.stdout.strip().split(',', 1)]
@@ -86225,10 +88559,10 @@ def _tak_rollback_prepare_local_db(plog):
     pw = _tak58_db_password()
     tag = '$takrbpw$'
     if not pw:
-        plog("  rollback: no database password in CoreConfig.xml — cannot set up martiuser")
+        plog(f"  {who}: no database password in CoreConfig.xml — cannot set up martiuser")
         return False
     if tag.strip('$') in pw:
-        plog("  rollback: database password contains the quoting tag — refusing to build the statement")
+        plog(f"  {who}: database password contains the quoting tag — refusing to build the statement")
         return False
     verb = 'ALTER ROLE martiuser' if has_role else \
         'CREATE ROLE martiuser LOGIN INHERIT CREATEDB NOCREATEROLE'
@@ -86236,17 +88570,17 @@ def _tak_rollback_prepare_local_db(plog):
                   "SET password_encryption = 'scram-sha-256'; "
                   "%s PASSWORD %s%s%s;" % (verb, tag, pw, tag)], timeout=60)
     if not r or r.returncode != 0:
-        plog(f"  rollback: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
+        plog(f"  {who}: could not set up martiuser: {((getattr(r, 'stderr', '') or '').strip())[:200]}")
         return False
-    plog("  rollback: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
+    plog(f"  {who}: martiuser " + ("password re-set to match CoreConfig.xml" if has_role
                                      else "was missing — recreated with the CoreConfig.xml password"))
 
     if not has_db:
         r = _pg_exec(['createdb', '--owner=martiuser', 'cot'], timeout=120)
         if not r or r.returncode != 0:
-            plog(f"  rollback: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
+            plog(f"  {who}: could not create the cot database: {((r.stderr if r else '') or '').strip()[:200]}")
             return False
-        plog("  rollback: cot database was missing — recreated, empty, owned by martiuser")
+        plog(f"  {who}: cot database was missing — recreated, empty, owned by martiuser")
     return True
 
 
@@ -87916,7 +90250,8 @@ def takserver_rollback_log_api():
 
 
 def _verify_takserver_dpkg_ok(ulog):
-    """v0.9.44: return True iff `takserver` is fully configured (`install ok installed`).
+    """v0.9.44: return True iff `takserver` is fully configured (`<selection> ok installed`;
+    the selection can be `install` or `hold`).
 
     A .deb postinstall can fail and leave the package `half-configured` while the rest of
     the upgrade looked fine — field: test6 sat half-configured for 3 weeks while the update
@@ -87934,8 +90269,12 @@ def _verify_takserver_dpkg_ok(ulog):
     if r.returncode != 0 or not state:
         ulog("  ⚠ takserver not found in dpkg — skipping state verification")
         return True
-    if state == 'install ok installed':
-        ulog("✓ takserver dpkg state verified: install ok installed")
+    # Judge the 2nd and 3rd words (error flag + status), not the first (the apt selection).
+    # `hold ok installed` is a fully installed, fully configured package that someone pinned
+    # (apt-mark hold); failing the update on it was a false FAILED.
+    _parts = state.split()
+    if len(_parts) == 3 and _parts[1:] == ['ok', 'installed']:
+        ulog(f"✓ takserver dpkg state verified: {state}")
         return True
     ulog(f"✗ Upgrade left takserver dpkg state '{state}' — NOT fully configured.")
     ulog("  Reporting failure so it isn't missed. The console auto-repairs a half-configured")
@@ -89498,6 +91837,10 @@ def deploy_takserver():
     # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
     # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
     # here and returns BEFORE the byte-identical .deb selection logic below.
+    # v10.3.5 W2: who signs TAK Server's own cert. An option, not forced: default intermediate.
+    server_cert_signer = data.get('server_cert_signer') or 'intermediate'
+    if server_cert_signer not in TAK_SERVER_CERT_SIGNERS:
+        return jsonify({'error': 'server_cert_signer must be root or intermediate'}), 400
     _explicit_method = data.get('install_method') if data.get('install_method') in ('native', 'container') else None
     _method = _explicit_method or _tak_install_method()
     # Auto-correct an un-pinned method to match the uploaded artifact: if we'd take
@@ -89542,6 +91885,7 @@ def deploy_takserver():
             'enable_admin_ui': data.get('enable_admin_ui', False),
             'enable_webtak': data.get('enable_webtak', False),
             'webadmin_password': data.get('webadmin_password', ''),
+            'server_cert_signer': server_cert_signer,
         }
         cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
         if cert_password:
@@ -89602,6 +91946,7 @@ def deploy_takserver():
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
         'webadmin_password': data.get('webadmin_password', ''),
+        'server_cert_signer': server_cert_signer,
     }
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
         matches = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(ext)]
@@ -90454,8 +92799,17 @@ def _deploy_takserver_container(config):
         if not _certrun(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"', f"Intermediate CA {int_ca}"):
             return
         log_step("Creating server certificate...")
-        _tak_server_cert_prepare(load_settings(), log_step)  # v10.2.26: real names, not just `takserver`
-        if not _certrun('cd /opt/tak/certs && ./makeCert.sh server takserver', "server cert"):
+
+        def _certrun_sh(cmd):
+            # _tak_server_cert_issue()'s runner: its cp/mv/makeCert strings in the same one-shot
+            # container as _certrun (runuser is native-only; the image user is already tak).
+            inner = cmd.replace('runuser -u tak -- ', '')
+            return run_cmd(f"docker run --rm -v {shlex.quote(tak_dir)}:/opt/tak:z "
+                           f"--entrypoint bash {TAK_CONTAINER} -c {shlex.quote(inner)} 2>&1", quiet=True)
+        if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                      log_step, _certrun_sh):
+            log_step("✗ Certificate generation FAILED at: server cert — aborting (TAK is unusable without certs)")
+            deploy_status.update({'running': False, 'error': True})
             return
         log_step("Creating admin certificate...")
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh client admin', "admin cert"):
@@ -90463,7 +92817,19 @@ def _deploy_takserver_container(config):
         log_step("Creating user certificate...")
         if not _certrun('cd /opt/tak/certs && ./makeCert.sh client user', "user cert"):
             return
-        _certrun(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt', "truststore")
+        # v10.3.5 W6: same as the native deploy — TAK Server's trust list holds the intermediate
+        # only; the client truststore-<INT>.p12 keeps the root. Same one-shot container as _certrun.
+        def _certsh(argv):
+            try:
+                r = subprocess.run(['docker', 'run', '--rm', '-v', f'{tak_dir}:/opt/tak:z', '--entrypoint', 'bash',
+                                    TAK_CONTAINER, '-c', shlex.join(argv) + ' 2>&1'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                return r.returncode == 0, r.stdout or ''
+            except Exception as e:
+                return False, str(e)
+        if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
+                                          _certsh, log_step)[0]:
+            log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
         log_step("✓ Certificates created and truststore built")
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
@@ -90750,6 +93116,12 @@ def _tak_deploy_ensure_local_db(pkg_path, say, log):
             say("✗ upgrade-db.sh failed (exit %d). See the output above." % rc)
             return False
     elif major == want_major:
+        if not (has_role and has_db):
+            # TAK's script skips the role and database on a box that still carries the
+            # PostgreSQL 15 binaries (it takes that as an upgrade); create them first, the
+            # same way it would. With them present it only runs SchemaManager.
+            if not _tak_rollback_prepare_local_db(say, who='deploy'):
+                return False
         say("  Running TAK's takserver-setup-db.sh to create what is missing...")
         rc = _tak58_run_setup_db()
         if rc != 0:
@@ -91299,17 +93671,25 @@ def run_takserver_deploy(config):
         # still reported all certificates created AND the truststore imported. A
         # TAK Server with no certificates cannot serve a single client, so this is
         # not a warning — it ends the deploy.
-        # v10.2.26: the server cert carries this box's real names, not just `takserver`.
-        _tak_server_cert_prepare(load_settings(), log_step)
-        _cert_steps = [
+        # The server cert is not in this list: it goes through _tak_server_cert_issue(), the one
+        # writer (which also writes this box's real names into config.cfg first, v10.2.26).
+        _ca_steps = [
             ("Root CA", ['/opt/tak/certs/makeRootCa.sh'], f'{root_ca}\n', f"Creating Root CA: {root_ca}..."),
             ("Intermediate CA", ['/opt/tak/certs/makeCert.sh', 'ca', int_ca], 'y\n', f"Creating Intermediate CA: {int_ca}..."),
-            ("server cert", ['/opt/tak/certs/makeCert.sh', 'server', 'takserver'], None, "Creating server certificate..."),
+        ]
+        _client_steps = [
             ("admin cert", ['/opt/tak/certs/makeCert.sh', 'client', 'admin'], None, "Creating admin certificate..."),
             ("user cert", ['/opt/tak/certs/makeCert.sh', 'client', 'user'], None, "Creating user certificate..."),
         ]
-        _cert_failed = [name for name, argv, inp, desc in _cert_steps
+        _cert_failed = [name for name, argv, inp, desc in _ca_steps
                         if not _tak_cert(argv, inp=inp, desc=desc)]
+        if not _cert_failed:
+            log_step("Creating server certificate...")
+            if not _tak_server_cert_issue(load_settings(), config.get('server_cert_signer') or 'intermediate',
+                                          log_step, lambda c: run_cmd(c, quiet=True)):
+                _cert_failed.append("server cert")
+        _cert_failed += [name for name, argv, inp, desc in _client_steps
+                         if not _tak_cert(argv, inp=inp, desc=desc)]
         if _cert_failed:
             log_step("✗ FATAL: certificate generation failed (%s). TAK Server cannot serve any "
                      "client without these, so the deploy stops here rather than reporting "
@@ -91318,15 +93698,15 @@ def run_takserver_deploy(config):
             run_cmd('systemctl stop takserver', check=False)
             deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
-        log_step("Importing root CA into TAK clients truststore...")
-        if not _tak_cert(['keytool', '-import', '-alias', 'root-ca', '-file', '/opt/tak/certs/files/root-ca.pem',
-                          '-keystore', f'/opt/tak/certs/files/truststore-{int_ca}.jks',
-                          '-storepass', cert_pass, '-noprompt']):
-            log_step("✗ FATAL: could not import the root CA into the clients truststore — enrolled "
-                     "clients would not trust this server. See the errors above.")
-            run_cmd('systemctl stop takserver', check=False)
-            deploy_status.update({'error': True, 'running': False}); return
-        log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
+        # v10.3.5 W6: TAK Server's own trust list holds the intermediate only (a root in it
+        # accepts any root-signed intermediate a client sends). makeCert.sh `ca` put the root
+        # there; the truststore-<INT>.p12 it built for clients keeps it. The old "enrolled
+        # clients would not trust this server" premise was wrong: enrollment hands out the
+        # signing chain, not this file (gate on test12 + aws-arm, 2026-11-02).
+        log_step("Trimming TAK Server's trust list to the intermediate CA...")
+        if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
+                                          _rotate_sh, log_step)[0]:
+            log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
@@ -91347,7 +93727,9 @@ def run_takserver_deploy(config):
         # broker-denied AND CoreConfig is tak-owned (0640), so every edit failed
         # exit 4 and X.509 auth / truststore / cert-enrollment / WebTAK were never
         # applied (TAK installs but is misconfigured). Do ONE broker read-modify-write.
-        issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
+        # v10.3.5 W9: never longer than the intermediate that signs them has left.
+        issued_days = _tak_issued_validity(config.get('issued_cert_validity_days')
+                                           or config.get('intermediate_ca_validity_days', 730))
         ca_cfg_line = ('<TAKServerCAConfig keystore="JKS" '
             f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
             f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />')
@@ -94564,6 +96946,46 @@ def _ubuntu_pro_security_covered(raw=None):
         return False
 
 
+def _os_upgrade_boot_apps_down(start=False):
+    """['TAK-Portal', 'CloudTAK']: the installed, local apps that Guard Dog's boot sequencer
+    stops at boot and only tak-post-start starts again, that are not running now.
+    start=True also starts each one, as its page's Start button does.
+
+    ops #438 (field, Nov 2): after the 24.04 reboot both stayed Stopped while TAK, Authentik
+    and Caddy ran, and nothing on the box would ever start them: the sequencer's `docker stop`
+    keeps `restart: unless-stopped` from doing it, and tak-post-start runs once per boot.
+    Every normal boot starts both, so starting them here changes nothing an operator chose."""
+    down = []
+    try:
+        tp = _takportal_web_container(all_states=True)
+    except Exception:
+        tp = None
+    if tp is not None and not tp.get('running'):
+        down.append('TAK-Portal')
+        if start:
+            try:
+                _takportal_up(timeout=180)
+            except Exception as e:
+                print(f"[os-upgrade] TAK Portal start failed: {e}", flush=True)
+    try:
+        ct_remote = _get_cloudtak_deployment_config(load_settings()).get('target_mode') == 'remote'
+    except Exception:
+        ct_remote = False
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    if not ct_remote and any(os.path.exists(os.path.join(ct_dir, f)) for f in ('docker-compose.yml', 'compose.yaml')):
+        running, _p, _e = _os_upgrade_containers()
+        if running is not None and not any(n.startswith('cloudtak-api') for n in running):
+            down.append('CloudTAK')
+            if start:
+                try:
+                    _cloudtak_ensure_custom_compose(ct_dir)   # GH #261: before compose, every time
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ct_dir,
+                                   capture_output=True, text=True, timeout=120)
+                except Exception as e:
+                    print(f"[os-upgrade] CloudTAK start failed: {e}", flush=True)
+    return down
+
+
 def _startup_os_upgrade_verify():
     """Post-reboot half of step 8: the console that boots after the flip sees status
     `rebooting`, marks `verifying`, waits for the baseline containers/services to come
@@ -94591,14 +97013,30 @@ def _startup_os_upgrade_verify():
             # Guard Dog's tak-post-start (oneshot, RemainAfterExit) restarts the containers the
             # boot sequencer stopped, after TAK answers. Until it has finished (active / failed)
             # a missing container means "not yet", not "lost".
+            # ops #438: an empty load state is systemctl not answering inside 5 s, not "Guard Dog
+            # is not installed" ('not-found'). Ending the wait on it would judge the box before
+            # the boot sequence has run. (Hardening found while tracing the field report; not
+            # its cause.)
             ps_deadline = time.time() + _OS_UPGRADE_POSTSTART_WAIT_S
             while time.time() < ps_deadline:
                 _ld, _act, _sub, _res, _pid = _kernel_patch_unit_state('tak-post-start.service')
-                if _ld != 'loaded' or _act in ('active', 'failed'):
+                if (_ld and _ld != 'loaded') or _act in ('active', 'failed'):
                     break
                 time.sleep(15)
+            # ops #438: whatever tak-post-start left stopped (it timed out, was killed, or its
+            # start failed), start it once now and give it the same wait as the rest.
+            apps_down = _os_upgrade_boot_apps_down(start=True)
+            if apps_down:
+                print(f"[os-upgrade] after post-start still stopped: {', '.join(apps_down)} — starting them", flush=True)
             deadline = time.time() + _OS_UPGRADE_VERIFY_WAIT_S
+            pg_expect = baseline.get('pg_expect') or ''
             while True:
+                # ops #438: TAK's PostgreSQL gets the same wait as the containers and services.
+                # Field, Nov 2: Install updates, pressed 3 min after the reboot, moved PostgreSQL
+                # to the 24.04 build and restarted it (down 9 s); the one read landed in that gap.
+                clusters = _os_upgrade_pg_clusters() if pg_expect else []
+                pg_ok = (not pg_expect) or any(c[0] == pg_expect and c[2] == '5432' and c[3] == 'online'
+                                               for c in clusters)
                 running, _p, _e = _os_upgrade_containers()
                 missing_c = sorted(want_c - set(running or []))
                 missing_s = []
@@ -94609,17 +97047,21 @@ def _startup_os_upgrade_verify():
                             missing_s.append(svc)
                     except Exception:
                         missing_s.append(svc)
-                if (not missing_c and not missing_s) or time.time() >= deadline:
+                apps_down = _os_upgrade_boot_apps_down() if apps_down else []
+                if (not missing_c and not missing_s and pg_ok and not apps_down) or time.time() >= deadline:
                     break
                 time.sleep(10)
             if missing_c:
                 problems.append('containers=' + ','.join(missing_c))
             if missing_s:
                 problems.append('services=' + ','.join(missing_s))
-            if baseline.get('pg_expect'):
-                clusters = _os_upgrade_pg_clusters()
-                if not any(c[0] == baseline['pg_expect'] and c[2] == '5432' and c[3] == 'online' for c in clusters):
-                    problems.append('postgresql=' + (';'.join('/'.join(c) for c in clusters) or 'none'))
+            if apps_down:
+                problems.append('stopped=' + ','.join(apps_down))
+            if not pg_ok:
+                # ops #438: name TAK's cluster only. Others (the 5.8 migration's rollback copy,
+                # kept stopped on purpose) are not missing, and listing them read as if they were.
+                tak_pg = [c for c in clusters if c[0] == pg_expect or c[2] == '5432']
+                problems.append('postgresql=' + (';'.join('/'.join(c) for c in tak_pg) or f'{pg_expect}/none'))
             if problems:
                 _os_upgrade_write_status('failed:verify:' + ' '.join(problems))
                 print(f"[os-upgrade] ✗ post-reboot verify FAILED: {' '.join(problems)}", flush=True)
@@ -101027,6 +103469,12 @@ _v0_9_12_rep_patched = _startup_fix_reputation_policy_drift()
 # doesn't have LDAP configured. If LDAP IS configured, attempts a probe bind
 # with the .env password; only triggers the full resync flow (set Authentik
 # user password from .env + force-recreate LDAP outpost) when the probe fails.
+_STARTUP_LDAP_AK_WAIT_S = 600   # ops #438: how long the boot heal waits for Authentik to answer
+_STARTUP_LDAP_TRANSIENT = ('Connection reset', 'Connection refused', '502', '503', 'timed out')
+# Set when the boot heal is finished; the 5-min watchdog waits for it so the two never heal at once.
+_startup_ldap_resync_done = threading.Event()
+
+
 def _startup_resync_ldap_service_account():
     try:
         if not os.path.isdir(os.path.expanduser('~/authentik')):
@@ -101037,6 +103485,19 @@ def _startup_resync_ldap_service_account():
         env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         if not env_pass:
             return
+
+        # ops #438 (field, Nov 2, 24.04 reboot): this ran 34 s into the boot, while Authentik
+        # still answered its outpost with 502/503, and the heal died on "Connection reset by
+        # peer". At boot the bind fails because Authentik is starting, not because of drift, so
+        # wait for it first (the same check the ops #214 watchdogs use). Background thread.
+        if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+            ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+            while (_authentik_busy_reason() or not _local_authentik_http_ok()) and time.time() < ak_deadline:
+                time.sleep(10)
+            if _authentik_busy_reason() or not _local_authentik_http_ok():
+                print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
 
         # Probe: does the bind work today? If yes, idempotent no-op (unless the
         # reputation policy was just patched — in that case TAK Server has been
@@ -101060,6 +103521,16 @@ def _startup_resync_ldap_service_account():
             print("Startup migration: LDAP service account bind FAILED — auto-resyncing")
             try:
                 ok, msg = _ensure_authentik_ldap_service_account()
+                # ops #438: Authentik can still drop a request just after it first answers.
+                # Retry once when it does, after it answers again.
+                if not ok and any(s in (msg or '') for s in _STARTUP_LDAP_TRANSIENT):
+                    print(f"Startup migration: LDAP service account resync hit a transient Authentik "
+                          f"error ({(msg or '')[:80]}) — retrying once Authentik answers")
+                    time.sleep(30)
+                    ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
+                    while not _local_authentik_http_ok() and time.time() < ak_deadline:
+                        time.sleep(10)
+                    ok, msg = _ensure_authentik_ldap_service_account()
                 if ok:
                     print(f"Startup migration: LDAP service account resync OK ({msg})")
                     healing_performed = True
@@ -101125,6 +103596,8 @@ def _startup_resync_ldap_service_account():
                   f"NOT restarting takserver (would restart into broken state)")
     except Exception as _e:
         print(f"Startup migration: LDAP service account resync skipped: {_e}")
+    finally:
+        _startup_ldap_resync_done.set()
 
 # v10.0.3: run the boot-time LDAP SA bind heal in the BACKGROUND so an unhealthy LDAP
 # outpost can never wedge the worker boot. 2026-06-23: a misconfigured outpost made this
@@ -102513,7 +104986,7 @@ def _heal_takserver_coreconfig_step8():
                               f'<nameEntry name="OU" value="{subj.get("OU", "TAK")}"/>\n</nameEntries>\n'
                               '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
                               f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-                              'validityDays="730" signatureAlg="SHA256WithRSA" />\n'
+                              f'validityDays="{_tak_issued_validity(730)}" signatureAlg="SHA256WithRSA" />\n'
                               '</certificateSigning>\n<vbm enabled="false"/>')
                 new_cc = new_cc.replace('<vbm enabled="false"/>', cert_block, 1)
                 fixes.append('certificateSigning enrollment block restored')

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.4-alpha)**
+**Current release: [v10.3.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.5-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -210,6 +210,7 @@ After deployment, create users in TAK Portal — they flow through Authentik →
 - **Disk:** At max deployment (all modules) you can sit around **26 GB** used. Plan for growth: CoT data, logs, and retention. **50 GB+** disk is recommended so you have headroom; TAK Server's own minimum is 40 GB per the official configuration guide. Apply Docker log limits (Guard Dog → Apply Docker log limits) to avoid containers filling the disk.
 - **Disk I/O:** SSD-backed storage strongly recommended. **Test your VPS before deploying** — slow disk I/O causes Docker build timeouts, service startup failures, and unreliable boots. See [VPS disk I/O check](#vps-disk-io-check) below.
 - **CPU:** Enough cores for all processes (TAK Server, PostgreSQL, Authentik, Caddy, Node-RED, etc.). TAK Server's minimum is 4 cores; more is better for the full stack.
+- **Running in a VM (TrueNAS, KVM, Proxmox, etc.):** set the VM's CPU mode to **host passthrough** or **host model**, not a generic or "basic" CPU. With a generic CPU, TAK Portal and CloudTAK won't start. The console now checks this before it deploys either one and tells you if the CPU is too basic.
 - **Internet** connection for initial setup.
 - **TAK Server .deb** package from [tak.gov](https://tak.gov).
 
@@ -275,6 +276,7 @@ seams, privilege model, SSO patterns, review bar):
 | CloudTAK Media | 18554 | RTSP | CloudTAK video tab — RTSP clients |
 | CloudTAK Media | 11935 | RTMP | CloudTAK video tab — RTMP publishers |
 | CloudTAK Media | 18890 | SRT | CloudTAK video tab — SRT clients |
+| CloudTAK Media | 9997 | HTTPS | Video control — CloudTAK puts this port on every media URL; Caddy answers it (TLS, auth-gated). Blocked, videos opened from a map marker fail with "Failed to generate proxy stream" |
 | TAK Video Restreamer *(when deployed)* | 8555 | RTSPS | TLS-wrapped RTSP (its RTSP and SRT use MediaMTX's 8554 and 8890) |
 | TAK Video Restreamer *(when deployed)* | 1935 | RTMP | RTMP publishers |
 | ATLAS MDM *(when deployed)* | 8449 | TLS | Enrolled tablets' device channel (mutual TLS) — the provisioning QR points here |
@@ -298,7 +300,7 @@ Reached only through Caddy on 443 via the public FQDN. Raw ports are NOT reachab
 | CloudTAK | 5000 | CloudTAK API (Caddy proxies `https://cloudtak.example.com`) |
 | CloudTAK | 5002 | CloudTAK tiles |
 | CloudTAK | 18888 | CloudTAK media HLS |
-| CloudTAK | 9997 | CloudTAK media admin API |
+| CloudTAK | 9997 | CloudTAK media admin API (the container's own publish; the public side is Caddy's listener in Tier 1) |
 | CloudTAK | 9002 | MinIO web console (operator SSH-tunnels for bucket management) |
 
 ### Tier 4 — Docker-internal (no host port, **service reachable only on the Docker network**)
@@ -441,6 +443,34 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.5-alpha — 2026-11-04 — Rotate the intermediate CA without dropping every phone; Revoke is airtight; CloudTAK video and big map uploads work again
+
+**Headline: TAK Server's certificate can now be signed by the root CA, so rotating the intermediate opens a 30-day window where old and new phones both connect, instead of dropping every phone at once. The console tells users what to do, lists who still has to move, emails reminders, and at Revoke signs out only the CloudTAK users still on the old CA. Revoke now really shuts out the old intermediate. Video from a CloudTAK map marker plays again on relays and home setups behind a router, and big map uploads no longer stop after 2 minutes.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.5-alpha))
+
+**Certificate rotation.**
+- Deploy asks which CA signs TAK Server's certificate: Root CA (recommended) or Intermediate CA. Running boxes get a password-protected, reversible switch on the TAK Server page.
+- On a root-signed box, Rotate keeps phones connected. A 30-day window opens with a Day-0 notice, reminders on day 23 and 29, and an optional email to each user listing only their own devices.
+- **Accounts by CA** shows who still needs to move (phones rescan a QR, CloudTAK users have nothing to do), with search and CSV.
+- Revoke removes the old intermediate completely: a client that sends the old CA in its chain is refused too. Revoke runs as a job with a live log, refuses unsafe choices, and warns about integrations still on the old CA.
+- Rotate, Root rotate and Revoke ask for the console password. New client certificates never outlive their intermediate.
+- Root rotate keeps the Let's Encrypt certificate on the enrollment port (8446).
+
+**CloudTAK.**
+- Video from a map marker plays again behind an Oracle relay (port 9997 is forwarded) and on home setups behind a router (CloudTAK talks to this box directly). Relay users: re-paste the Oracle block from the relay guide, or add TCP 9997, then press **Update Relay**.
+- Big map (tileset) uploads finish instead of failing after 2 minutes (GH #398).
+- CloudTAK Update no longer fails at the tiles build step (GH #384).
+
+**Other fixes.**
+- TAK Server's webadmin is checked for its admin role after each TAK start and fixed if TAK dropped it; a **Fix webadmin admin access** button does it by hand.
+- Ubuntu 24.04 upgrade: the after-reboot check waits for PostgreSQL and Guard Dog, and starts TAK Portal and CloudTAK if they were left stopped.
+- Switching from a custom certificate to automatic HTTPS re-wires TAK Server's enrollment port. Diagnostics say when 8446's certificate isn't publicly trusted.
+- TAK Server Update no longer says FAILED when the package is only held.
+- NetBird deploy fails plainly when NetBird refuses Authentik's certificate.
+- The deploy pages check the CPU before TAK Portal or CloudTAK and say plainly if it is too basic.
+- Guard Dog: patch-now security fixes are emailed within the hour and daily until installed; the memory alert says when the host is reclaiming RAM; the disk alert stays quiet on healthy boxes.
+- Firewall Service Exposure no longer flags ZeroTier's blocked 9993/tcp (GH #315). The relay guide shows how to open one more Oracle port (GH #389).
+- MediaMTX fresh installs use 1.21.3.
 
 ### v10.3.4-alpha — 2026-11-02 — TAK Server comes back after a slow reboot; phones and CloudTAK recover after a CA rotation; Ubuntu Pro installs; CloudTAK 13.117.1
 
