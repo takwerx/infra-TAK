@@ -103,6 +103,7 @@ class Box:
             '_sudo_wrap': lambda a: list(a),
             '_docker_compose_pull': lambda *a, **k: self.calls.append(['PULL']),
             '_cloudtak_media_hls_heal': self.heal,
+            '_cloudtak_upload_limit_heal': lambda *a, **k: True,   # ops #470
             '_cloudtak_open_stream_ports': lambda *a, **k: None,
             '_cloudtak_ensure_custom_compose': lambda *a, **k: False,   # GH #261, tested on its own
             '_cloudtak_containers_without_override': lambda d: self.no_override,   # ops #197

@@ -252,6 +252,7 @@ def _redeploy_ns(remote_env, env_read_ok=True):
         '_ssh_probe': _ssh_probe, '_scp_to_host': _scp_to_host,
         'generate_caddyfile': lambda s=None: None, '_caddy_reload': lambda: None,
         '_cloudtak_media_hls_heal': lambda **k: None,
+        '_cloudtak_upload_limit_heal': lambda **k: None,   # ops #470
         '_cloudtak_remote_custom_compose_sh': lambda: ':',   # GH #261, tested on its own
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
     }
