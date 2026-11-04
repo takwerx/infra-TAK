@@ -76,8 +76,12 @@ def _dd_line(mb_s, size='10485760 bytes (10 MB, 10 MiB)'):
     return '%s copied, 0.3 s, %s\n' % (size, mb_s)
 
 
-@pytest.fixture
-def box(tmp_path):
+DATE_COUNTER = '#!/bin/sh\necho x >> %s\nexec /bin/date "$@"\n'
+
+
+def make_box(tmp_path, script_text=WATCH, count_date=False):
+    """The sandbox described above. count_date puts a `date` in front of the real one
+    that notes each call in tmp_path/date_calls (ops #467 counts them)."""
     gd, state, stubs = tmp_path / 'gd', tmp_path / 'state', tmp_path / 'bin'
     for d in (gd, state, stubs):
         d.mkdir()
@@ -88,10 +92,12 @@ def box(tmp_path):
     (stubs / 'grep').write_text(GREP_SHIM)
     (stubs / 'dd').write_text(DD % {'lat': tmp_path / 'dd_lat', 'tp': tmp_path / 'dd_tp'})
     (stubs / 'logger').write_text('#!/bin/sh\nshift 2\necho "$*" >> %s\n' % (tmp_path / 'log'))
+    if count_date:
+        (stubs / 'date').write_text(DATE_COUNTER % (tmp_path / 'date_calls'))
     for f in list(stubs.iterdir()) + [alert]:
         f.chmod(0o755)
 
-    script = (WATCH.replace('/opt/tak-guarddog/', str(gd) + '/')
+    script = (script_text.replace('/opt/tak-guarddog/', str(gd) + '/')
                    .replace('/var/lib/takguard', str(state))
                    .replace('/tmp/', str(tmp_path) + '/'))
     assert '/var/lib/takguard' not in script and '/opt/tak-guarddog' not in script
@@ -127,6 +133,11 @@ def box(tmp_path):
     run.current = 0
     run.seed, run.state = seed, state
     return run
+
+
+@pytest.fixture
+def box(tmp_path):
+    return make_box(tmp_path)
 
 
 @pytest.mark.parametrize('name', sorted(REAL))
