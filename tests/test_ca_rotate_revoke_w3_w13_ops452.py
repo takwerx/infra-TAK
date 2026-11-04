@@ -177,7 +177,7 @@ def test_a_damaged_or_ownerless_state_file_means_no_window(tmp_path, content):
 
 
 def test_day0_text_depends_on_who_signed_the_server_cert():
-    ns = _load(('_ca_rotation_date', '_ca_rotation_day0_text'), consts=('CA_ROTATION_WINDOW_DAYS',))
+    ns = _load(('_ca_rotation_date', '_ca_rotation_day0_text'), consts=('CA_ROTATION_WINDOW_DAYS', '_CA_ROTATION_CLOUDTAK_NOTE'))
     cutoff = (datetime(2026, 12, 3) - datetime(1970, 1, 1)).total_seconds()
     assert ns['_ca_rotation_date'](cutoff) == 'December 3, 2026'
     root = ns['_ca_rotation_day0_text'](cutoff, 'root')
@@ -211,7 +211,7 @@ class _Window:
                        'notices_sent': list(notices)} if state else {})
         self.sent = []
         self.ns = _load(('_ca_rotation_reminder_text', '_ca_rotation_reminder_once', '_ca_rotation_date'),
-                        consts=('CA_ROTATION_REMINDER_DAYS',),
+                        consts=('CA_ROTATION_REMINDER_DAYS', '_CA_ROTATION_CLOUDTAK_NOTE'),
                         time=types.SimpleNamespace(time=lambda: self.now),
                         _ca_rotation_state_load=lambda: dict(self.state),
                         _ca_rotation_state_save=self._save,
@@ -272,7 +272,7 @@ def test_forced_reminder_is_sent_and_marked_like_the_scheduled_one():
 def test_reminder_text_counts_days_left_and_names_the_old_ca():
     w = _Window(23)
     text = w.ns['_ca_rotation_reminder_text'](w.state)
-    assert text.startswith('6 days left') and 'INT-CA-01' in text and 'log out and back in' in text
+    assert text.startswith('6 days left') and 'INT-CA-01' in text and 'CloudTAK users have nothing to do' in text
     w.now = T0 + 29 * DAY + 60 + 18 * 3600
     assert w.ns['_ca_rotation_reminder_text'](w.state).startswith('0 days left')
     w.now = T0 + 29 * DAY - 3600

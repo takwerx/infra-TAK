@@ -81874,6 +81874,7 @@ _CA_MIG_EUD_UID_RE = re.compile(
     r'^(ANDROID-[0-9A-Za-z]+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}'
     r'|S-1-[0-9]+-[0-9-]+)$', re.I)
 _CA_MIG_CLOUDTAK_UID_RE = re.compile(r' \(ETL\)$')
+_CA_MIG_CLOUDTAK_AUTO = 'CloudTAK login: nothing to do — signed out once at Revoke, new cert on next sign-in'
 
 
 def _ca_mig_issuers(pems):
@@ -82046,26 +82047,30 @@ def _tak_ca_migration():
     # the mails (test6 2026-11-03: 23 of 23 accounts "to move", nearly all INT-01 leftovers).
     rows, cas = [], {}
     for acct in sorted(accounts.values(), key=lambda a: a['user'].lower()):
-        moving, gone = [], []
+        moving, gone, auto = [], [], []
         for d in acct['devices']:
             name = d['callsign'] or d['uid']
             if d['current']:
                 continue
             if d['trusted'] is False:
                 gone.append(f'{name}: no longer trusted — ' + {
-                    'integration': 'issue it a new cert', 'cloudtak': 'log out and back in to CloudTAK if still used',
+                    'integration': 'issue it a new cert', 'cloudtak': 'sign in to CloudTAK again if still used (a new cert is issued then)',
                 }.get(d['kind'], 'scan a new QR code if still in use'))
             elif d['kind'] == 'cloudtak':
-                moving.append('log out and back in to CloudTAK')
+                # CloudTAK keeps a still-trusted cert across logins; nothing for the user to do
+                # (test6 2026-11-03). Revoke signs them out, and the next login re-issues it.
+                auto.append(_CA_MIG_CLOUDTAK_AUTO)
             elif d['kind'] == 'integration':
                 moving.append(f'{name}: server/integration client — issue it a new cert')
             else:
                 moving.append(f'scan a new QR on {name}')
         c = acct['cloudtak']
         if c and not c['current']:
-            # Actionable either way: the next login re-issues the cert from the current CA.
-            moving.append('log out and back in to CloudTAK')
-        moving, gone = list(dict.fromkeys(moving)), list(dict.fromkeys(gone))
+            if c.get('trusted') is False:
+                gone.append('CloudTAK login: no longer trusted — signing in again issues a new cert')
+            else:
+                auto.append(_CA_MIG_CLOUDTAK_AUTO)
+        moving, gone, auto = list(dict.fromkeys(moving)), list(dict.fromkeys(gone)), list(dict.fromkeys(auto))
         todo = moving + gone
         status = 'needs_move' if moving else ('untrusted' if gone else 'moved')
         on = sorted({d['issuer'] for d in acct['devices'] if d['issuer']}
@@ -82073,7 +82078,7 @@ def _tak_ca_migration():
         for cn in on:
             e = cas.setdefault(cn, {'cn': cn, 'accounts': 0, 'current': cn == current_ca})
             e['accounts'] += 1
-        rows.append(dict(acct, status=status, todo=todo, moving=moving, gone=gone, cas=on))
+        rows.append(dict(acct, status=status, todo=todo, moving=moving, gone=gone, auto=auto, cas=on))
     return {'ok': True, 'current_ca': current_ca, 'rows': rows,
             'cas': sorted(cas.values(), key=lambda e: (not e['current'], e['cn'])),
             'cloudtak': ct, 'error': '' if bundle else "TAK Server's trust list couldn't be read"}
@@ -82145,11 +82150,18 @@ def _ca_rotation_date(ts):
     return f'{d:%B} {d.day}, {d.year}'
 
 
+_CA_ROTATION_CLOUDTAK_NOTE = ('CloudTAK users have nothing to do: they are signed out once when the old '
+                              'certificate authority is revoked, and get a new certificate when they sign back in.')
+
+
 def _ca_rotation_day0_text(cutoff_at, signer):
     """The Day-0 notice. Root-signed: devices still connect and people have the window.
     Intermediate-signed: they've already dropped (W4)."""
-    how = ('on mobile (ATAK, iTAK, TAK Aware) scan a new QR code from TAK Portal; in CloudTAK log '
-           'out and back in to get a new certificate.')
+    # CloudTAK re-issues a login cert only when TAK rejects the old one or it is expiring
+    # (stateless/lib/provider.ts valid()), so logging out and back in during the window does
+    # nothing (test6 2026-11-03). Revoke signs those users out (W13); their next login gets one.
+    how = ('on mobile (ATAK, iTAK, TAK Aware) scan a new QR code from TAK Portal. '
+           + _CA_ROTATION_CLOUDTAK_NOTE)
     if signer == 'root':
         return f'You have {CA_ROTATION_WINDOW_DAYS} days (until {_ca_rotation_date(cutoff_at)}): {how}'
     return ("TAK Server's certificates were replaced and devices are disconnected until they move: "
@@ -82289,9 +82301,9 @@ def _ca_rotation_reminder_text(st):
     left = max(0, int(((st.get('cutoff_at') or 0) - time.time()) // 86400))
     return (f'{left} day{"" if left == 1 else "s"} left (until {_ca_rotation_date(st.get("cutoff_at") or 0)}) '
             f'to move to the new TAK certificates: on mobile (ATAK, iTAK, TAK Aware) scan a new QR code '
-            f'from TAK Portal; in CloudTAK log out and back in to get a new certificate. After that date '
+            f'from TAK Portal. After that date '
             f'{st.get("old_ca_cn") or "the old certificate authority"} can be revoked at any time, and certificates '
-            f'from it then stop working.')
+            f'from it then stop working. {_CA_ROTATION_CLOUDTAK_NOTE}')
 
 
 def _ca_rotation_reminder_once(kind=None):

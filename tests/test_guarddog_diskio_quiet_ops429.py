@@ -130,3 +130,48 @@ def test_recovered_email_follows_a_sent_alert_once(box):  # noqa: F811
 def test_no_recovered_email_when_no_alert_was_sent(box):  # noqa: F811
     box.seed([100.0] * 11, lat=[(45, 2.5), (30, 2.4), (15, 2.6)])
     assert box(lat='1600 kB/s')[0] == ''
+
+
+# ── Round 2 (ops #429, Nov 3): throughput alone must not fire on a box whose normal
+# is 40 to 50 MB/s. Verified: the 13 throughput and latency readings below are test6's
+# own history (Nov 3, 14:09 to 17:10 UTC, from /var/lib/takguard) and its 24h average
+# (41.3 MB/s). The shipped round-1 rule emailed on this window because all 12 readings
+# were under the 50 MB/s floor, while commits were mostly fine (median 13 ms, 3 of the
+# 12 under 10 ms) and test6's median over Oct 28 to Nov 3 is 44.6 MB/s.
+NOV3_TP = [51.6, 7.7, 45.6, 18.3, 36.0, 38.4, 9.3, 13.9, 38.1, 24.4, 8.3, 19.6, 22.7]
+NOV3_LAT = [4.62, 34.48, 13.84, 9.20, 5.87, 7.52, 22.35, 14.76, 8.93, 9.76, 19.70, 15.56]
+NOV3_LAT_NOW = 10.13
+
+
+def test_test6_nov3_busy_afternoon_stays_quiet(box):  # noqa: F811
+    box.current = NOV3_TP[-1]
+    box.seed(NOV3_TP[:-1], 41.3,
+             [(15 * (len(NOV3_LAT) - i), ms) for i, ms in enumerate(NOV3_LAT)])
+    alerts, _, log = box(tp='%s MB/s' % NOV3_TP[-1], lat=_kbs(NOV3_LAT_NOW))
+    assert 'Benchmark: 22.7 MB/s' in log
+    assert max(NOV3_TP[1:]) < 50                      # every one of the 12 was under the old floor
+    assert alerts == ''
+
+
+def test_a_normal_forty_to_fifty_mbps_box_stays_quiet(box):  # noqa: F811
+    box.seed([42.0, 38.0, 45.0, 31.0, 47.0, 36.0, 44.0, 40.0, 33.0, 46.0, 39.0],
+             lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
+    assert box(tp='41 MB/s')[0] == ''
+
+
+def test_a_throughput_collapse_with_fast_commits_still_alerts(box):  # noqa: F811
+    box.seed([12.0, 8.0, 15.0, 11.0, 17.0, 6.0, 14.0, 10.0, 13.0, 16.0, 9.0],
+             lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
+    assert box(tp='11 MB/s')[0].count('Disk I/O Degradation') == 1
+
+
+def test_a_sustained_problem_repeats_weekly_not_daily(box):  # noqa: F811
+    def sustained():
+        box.seed([100.0] * 11, lat=[(15 * i, 16.0) for i in range(1, 12)])
+        return box(lat=_kbs(16.0))[0].count('Disk I/O Degradation')
+    assert sustained() == 1
+    sentinel = box.state / 'diskio_alert_sent'
+    for age_h, want in ((25, 1), (6 * 24, 1), (7 * 24 + 1, 2)):
+        old = time.time() - age_h * 3600
+        os.utime(sentinel, (old, old))
+        assert sustained() == want

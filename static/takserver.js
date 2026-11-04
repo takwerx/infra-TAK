@@ -495,7 +495,7 @@ function _takRotateCardText(){
 function _takRotateConfirmText(newName){
   var head='This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server.\n\n';
   if(_takSignerInfo&&_takSignerInfo.mode==='root')
-    return head+'The server certificate stays signed by the root CA, so devices keep connecting. Users then have 30 days to scan a new QR code (mobile) or log out and back in (CloudTAK).\n\nContinue?';
+    return head+'The server certificate stays signed by the root CA, so devices keep connecting. Users then have 30 days to scan a new QR code (mobile); CloudTAK users have nothing to do.\n\nContinue?';
   return head+'⚠ EVERY DEVICE WILL DISCONNECT until it scans a new QR code: the server certificate is signed by the intermediate CA, and no device trusts the new one yet.\n\nTo avoid this, cancel and use "Switch to root-signed" at the top of this page first.\n\nRotate anyway?';
 }
 async function switchTakSigner(to){
@@ -881,6 +881,7 @@ function renderCaMigration(){
     });
     if(r.cloudtak)h+='<div style="color:var(--text-dim);padding-left:12px">CloudTAK login · '+esc(r.cloudtak.issuer||'?')+(r.cloudtak.current?' <span style="color:var(--green)">✓</span>':'')+'</div>';
     r.todo.forEach(function(t){h+='<div style="color:var(--yellow);padding-left:12px">→ '+esc(t)+'</div>';});
+    (r.auto||[]).forEach(function(t){h+='<div style="color:var(--text-dim);padding-left:12px">· '+esc(t)+'</div>';});
     h+='</div>';
   });
   if(rows.length>500)h+='<div style="color:var(--text-dim);padding-top:8px">Showing 500 of '+rows.length+'. Search or use CSV for the rest.</div>';

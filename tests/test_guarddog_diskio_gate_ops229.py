@@ -166,17 +166,18 @@ def test_slow_commits_and_low_hour_give_both_reasons(box):
     assert 'Disk commit latency is stalling' in body
 
 
-def test_three_low_hours_alert_with_fast_commits(box):
-    box.seed([42.0, 38.0, 45.0, 31.0, 47.0, 36.0, 44.0, 40.0, 33.0, 46.0, 39.0],
+def test_three_collapsed_hours_alert_with_fast_commits(box):
+    # ops #429 round 2: the floor for throughput alone is 25 MB/s, not 50.
+    box.seed([12.0, 8.0, 15.0, 11.0, 17.0, 6.0, 14.0, 10.0, 13.0, 16.0, 9.0],
              lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
-    alerts, body, _ = box(tp='41 MB/s')
+    alerts, body, _ = box(tp='11 MB/s')
     assert alerts.count('Disk I/O Degradation') == 1
-    assert 'Every reading for the last 3 hours (best 47.0 MB/s) is below 50 MB/s' in body
-    assert 'Last 3 h (best):   47.0 MB/s' in body
+    assert 'Every reading for the last 3 hours (best 17.0 MB/s) is below 25 MB/s' in body
+    assert 'Last 3 h (best):   17.0 MB/s' in body
 
 
 def test_one_good_reading_in_three_hours_keeps_quiet(box):
-    box.seed([42.0, 38.0, 45.0, 31.0, 61.0, 36.0, 44.0, 40.0, 33.0, 46.0, 39.0],
+    box.seed([12.0, 8.0, 15.0, 11.0, 61.0, 6.0, 14.0, 10.0, 13.0, 16.0, 9.0],
              lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
     alerts, _, _ = box(tp='41 MB/s')
     assert alerts == ''
@@ -201,6 +202,6 @@ def test_stale_readings_are_not_a_sustained_stretch(box):
 
 
 def test_debounce_still_holds_six_hours(box):
-    box.seed([42.0] * 11, lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
-    assert box(tp='41 MB/s')[0].count('Disk I/O Degradation') == 1
-    assert box(tp='41 MB/s')[0].count('Disk I/O Degradation') == 1      # no second email
+    box.seed([12.0] * 11, lat=[(45, 2.0), (30, 2.2), (15, 2.1)])
+    assert box(tp='11 MB/s')[0].count('Disk I/O Degradation') == 1
+    assert box(tp='11 MB/s')[0].count('Disk I/O Degradation') == 1      # no second email
