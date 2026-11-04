@@ -276,6 +276,7 @@ seams, privilege model, SSO patterns, review bar):
 | CloudTAK Media | 18554 | RTSP | CloudTAK video tab — RTSP clients |
 | CloudTAK Media | 11935 | RTMP | CloudTAK video tab — RTMP publishers |
 | CloudTAK Media | 18890 | SRT | CloudTAK video tab — SRT clients |
+| CloudTAK Media | 9997 | HTTPS | Video control — CloudTAK puts this port on every media URL; Caddy answers it (TLS, auth-gated). Blocked, videos opened from a map marker fail with "Failed to generate proxy stream" |
 | TAK Video Restreamer *(when deployed)* | 8555 | RTSPS | TLS-wrapped RTSP (its RTSP and SRT use MediaMTX's 8554 and 8890) |
 | TAK Video Restreamer *(when deployed)* | 1935 | RTMP | RTMP publishers |
 | ATLAS MDM *(when deployed)* | 8449 | TLS | Enrolled tablets' device channel (mutual TLS) — the provisioning QR points here |
@@ -299,7 +300,7 @@ Reached only through Caddy on 443 via the public FQDN. Raw ports are NOT reachab
 | CloudTAK | 5000 | CloudTAK API (Caddy proxies `https://cloudtak.example.com`) |
 | CloudTAK | 5002 | CloudTAK tiles |
 | CloudTAK | 18888 | CloudTAK media HLS |
-| CloudTAK | 9997 | CloudTAK media admin API |
+| CloudTAK | 9997 | CloudTAK media admin API (the container's own publish; the public side is Caddy's listener in Tier 1) |
 | CloudTAK | 9002 | MinIO web console (operator SSH-tunnels for bucket management) |
 
 ### Tier 4 — Docker-internal (no host port, **service reachable only on the Docker network**)

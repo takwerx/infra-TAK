@@ -38,6 +38,7 @@ and internal port:
 | TCP | 18554 | CloudTAK video RTSP — only if you deploy CloudTAK |
 | TCP | 11935 | CloudTAK video RTMP — only if you deploy CloudTAK |
 | UDP | 18890 | CloudTAK video SRT — only if you deploy CloudTAK |
+| TCP | 9997 | CloudTAK video control (videos opened from a map marker fail without it) — only if you deploy CloudTAK |
 | TCP | 8449 | ATLAS MDM device channel — only if you deploy ATLAS (tablets enroll here) |
 | TCP | 8448 | EUD Remote Assist device API — only if you deploy Remote Assist |
 | TCP + UDP | 3479 | CoTURN control — only if you deploy Remote Assist |
