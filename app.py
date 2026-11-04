@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.5-alpha"
+VERSION = "10.3.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -10673,6 +10673,54 @@ def _repo_ownership_selfheal(trigger=''):
     return offenders
 
 
+# ops #489: Update Now's `git fetch` ran with one fixed 60 s limit and, when it expired, showed
+# the customer Python's raw "Command [...] timed out after 60 seconds". Boxes on slow or shared
+# links (small teams behind one NAT, satellite, government proxies) hit that, and the same click
+# worked minutes later. Now: up to three tries with a longer limit each time, a short pause
+# between them, and one plain sentence if GitHub still does not answer. Only a timeout or a
+# network-looking git error is retried; anything else (dubious ownership, bad ref) fails at once.
+# Total worst case 90+120+150 s plus pauses: the console runs gthread workers, so a request
+# thread may outlive gunicorn's --timeout 300 heartbeat.
+_GIT_FETCH_TIMEOUTS_S = (90, 120, 150)
+_GIT_FETCH_PAUSE_S = 5
+_GIT_TRANSIENT_RE = re.compile(
+    r'(could not resolve host|temporary failure in name resolution|connection (?:reset|timed out|refused)'
+    r'|failed to connect|early eof|rpc failed|unexpected disconnect|the remote end hung up'
+    r'|returned error: 5\d\d|gnutls|ssl_|tls |operation timed out|http/2 stream)', re.I)
+
+
+def _git_fetch_retry(run_git, args, timeouts=None, pause_s=None, sleep=None):
+    """Run `git fetch` (via `run_git(args, timeout=, isolated_fetch=True)`) with retries.
+
+    Returns a CompletedProcess-like object. After the last timeout the result has
+    returncode 124 and a plain-English stderr, so callers keep using their usual
+    `_git_err(result)` path."""
+    timeouts = timeouts or _GIT_FETCH_TIMEOUTS_S
+    pause_s = _GIT_FETCH_PAUSE_S if pause_s is None else pause_s
+    sleep = sleep or time.sleep
+    for i, limit in enumerate(timeouts):
+        if i:
+            sleep(pause_s)
+        try:
+            r = run_git(args, timeout=limit, isolated_fetch=True)
+        except subprocess.TimeoutExpired:
+            print(f"Update Now: git fetch timed out after {limit}s (try {i + 1}/{len(timeouts)})", flush=True)
+            continue
+        if r.returncode == 0:
+            return r
+        if not _GIT_TRANSIENT_RE.search((r.stderr or '') + ' ' + (r.stdout or '')):
+            return r
+        print(f"Update Now: git fetch failed, will retry (try {i + 1}/{len(timeouts)}): "
+              f"{((r.stderr or r.stdout or '').strip().splitlines() or [''])[-1][:200]}", flush=True)
+    # Every try timed out or failed the way a bad link does (test12 box test, Nov 4: timeout, then
+    # connect failures): say so in plain words. The git text of each try is already in the journal.
+    return subprocess.CompletedProcess(
+        args, 124, '',
+        f'GitHub did not answer (tried {len(timeouts)} times, up to {max(timeouts)} seconds each). '
+        "This server's internet connection to github.com is slow or blocked (shared link, proxy or "
+        'firewall). Nothing was changed. Click Update Now again in a minute or two.')
+
+
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
@@ -10849,9 +10897,7 @@ def update_apply():
             # "[rejected] dev -> origin/dev (non-fast-forward)" — Update Now can never
             # recover on its own (test12, 2026-07-16). Forcing mirrors the default refspec
             # (+refs/heads/*) and is safe: the checkout below is already --force.
-            fetch_dev = _git(
-                ['fetch', 'origin', '+dev:refs/remotes/origin/dev'], timeout=60, isolated_fetch=True
-            )
+            fetch_dev = _git_fetch_retry(_git, ['fetch', 'origin', '+dev:refs/remotes/origin/dev'])
             if fetch_dev.returncode != 0:
                 return _fail_release_lock(_error_payload(_git_err(fetch_dev)))
             target_ref = 'refs/remotes/origin/dev'
@@ -10865,7 +10911,7 @@ def update_apply():
             target_ref = None
             if tag_name:
                 refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
-                fetch_tag = _git(['fetch', 'origin', refspec], timeout=120, isolated_fetch=True)
+                fetch_tag = _git_fetch_retry(_git, ['fetch', 'origin', refspec])
                 if fetch_tag.returncode != 0:
                     return _fail_release_lock(_error_payload(_git_err(fetch_tag)))
                 verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
@@ -10874,9 +10920,7 @@ def update_apply():
 
             # Fallback: track origin/main if tag lookup fails.
             if not target_ref:
-                fetch_main = _git(
-                    ['fetch', 'origin', '+main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
-                )
+                fetch_main = _git_fetch_retry(_git, ['fetch', 'origin', '+main:refs/remotes/origin/main'])
                 if fetch_main.returncode != 0:
                     return _fail_release_lock(_error_payload(_git_err(fetch_main)))
                 target_ref = 'refs/remotes/origin/main'
@@ -48250,6 +48294,98 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         return False
 
 
+# ops #470 (infra-TAK #398): CloudTAK's own nginx caps every request body at 5G, so a hosted PMTiles
+# file bigger than that (Admin > Public Tiles posts it to /api/server/tileset) is refused with a 413.
+# The API itself streams the file straight into the object store and has no size cap (verified on
+# test12: 6 GiB through the raised limit, 200 in 141 s). Raise the cap for that ONE URL only; nginx
+# buffers a request body to disk before forwarding it, so every other URL keeps the 5G cap, and this
+# one is streamed (proxy_request_buffering off): the API checks the login before it reads the body, so
+# an anonymous POST costs no disk. The container writes /etc/nginx/nginx.conf from nginx.conf.js on
+# each start, so a recreate drops this; _cloudtak_upload_limit_heal re-applies it (check-before-apply,
+# reload only, no restart).
+CLOUDTAK_TILESET_UPLOAD_MAX = '25G'
+_CT_NGINX_UPLOAD_SH = r'''f=/etc/nginx/nginx.conf
+grep -q 'location = /api/server/tileset' "$f" && { echo OK; exit 0; }
+grep -q 'location ~ ^/api' "$f" || { echo NOCONF; exit 0; }
+cp "$f" "$f.ops470.bak"
+awk '/location ~ \^\/api/ && !done {
+  print "        # ops #470: hosted PMTiles uploads can be tens of GB; every other URL keeps the 5G cap"
+  print "        location = /api/server/tileset {"
+  print "            client_max_body_size __MAX__;"
+  print "            proxy_pass http://127.0.0.1:5001;"
+  print "            proxy_http_version 1.1;"
+  print "            proxy_request_buffering off;"
+  print "            proxy_set_header Host $host;"
+  print "            proxy_set_header X-Real-IP $remote_addr;"
+  print "            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+  print "            proxy_read_timeout 3600s;"
+  print "            proxy_send_timeout 3600s;"
+  print "            client_body_timeout 3600s;"
+  print "        }"
+  print ""
+  done=1
+}
+{ print }' "$f.ops470.bak" > "$f" \
+  && nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 && echo HEALED \
+  || { cp "$f.ops470.bak" "$f"; echo FAIL; }
+rm -f "$f.ops470.bak"
+'''
+
+
+def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
+    """ops #470: give /api/server/tileset a bigger body limit in the CloudTAK api container's nginx.
+    Convergence like _cloudtak_media_hls_heal: reads the live nginx.conf first and only edits it
+    (then reloads nginx, no restart) when the block is missing, so a converged box is a no-op.
+    `wait=True` also waits for the container and for nginx.conf.js to write the real config (the
+    stock nginx.conf is there for a moment first) - use it right after `up -d`.
+    Returns True if converged (already there or applied), False on error or no container."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    tries = 30 if wait else 1
+    script = _CT_NGINX_UPLOAD_SH.replace('__MAX__', CLOUDTAK_TILESET_UPLOAD_MAX)
+    try:
+        if remote_cfg:
+            import base64
+            b64 = base64.b64encode(script.encode()).decode()
+            cmd = (
+                "for i in $(seq 1 %d); do "
+                "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
+                "[ -n \"$m\" ] && out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null) "
+                "&& [ \"$out\" != NOCONF ] && break; sleep 2; done; "
+                "echo \"${out:-NOCONTAINER}\""
+            ) % (tries, b64)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=30 + 2 * tries)
+            out = (out or '').strip().splitlines()[-1:] or ['']
+            out = out[0]
+        else:
+            out = 'NOCONTAINER'
+            for _ in range(tries):
+                r = subprocess.run(
+                    _sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api-', '--format', '{{.Names}}']),
+                    capture_output=True, text=True, timeout=15)
+                names = [n for n in (r.stdout or '').split() if n.strip()]
+                if names:
+                    ap = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', '-i', names[0], 'sh']),
+                        input=script, capture_output=True, text=True, timeout=30)
+                    out = (ap.stdout or '').strip().splitlines()[-1:] or ['']
+                    out = out[0]
+                    if out != 'NOCONF':
+                        break
+                time.sleep(2)
+        if out == 'HEALED':
+            _log(f"  ✓ CloudTAK upload limit: /api/server/tileset now takes up to {CLOUDTAK_TILESET_UPLOAD_MAX} (other URLs stay 5G)")
+            return True
+        if out == 'OK':
+            return True  # already converged - silent
+        if wait or out == 'FAIL':
+            _log(f"  ⚠ CloudTAK upload limit not applied ({out or 'no answer'}); large tileset uploads stay capped at 5G")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK upload limit error (non-fatal): {e}")
+        return False
+
+
 def _compose_cmd(remote_cfg=None):
     """Return the working Docker Compose invocation ('docker compose' or
     'docker-compose'), preferring v2, or None if neither is present.
@@ -50849,6 +50985,7 @@ def run_cloudtak_deploy(cfg=None):
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
             plog("Deploy finished — CloudTAK is running.")
@@ -51591,6 +51728,7 @@ def run_cloudtak_deploy(cfg=None):
 
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
+        _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
 
@@ -51724,6 +51862,7 @@ def run_cloudtak_redeploy(cfg=None):
                 except subprocess.TimeoutExpired:
                     plog("⚠ Caddy reload timed out — reload manually if needed")
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ Update config & restart done (remote)")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -51845,6 +51984,7 @@ def run_cloudtak_redeploy(cfg=None):
                 plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
         try:
@@ -52935,6 +53075,7 @@ def run_cloudtak_update():
         _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_upload_limit_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -58487,10 +58628,10 @@ def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
     ]
 
 
-def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
+def _docker_compose_pull_once(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
                          ignore_failures=False):
     """`docker compose pull` as its own step, with streamed progress and a
-    generous timeout. Returns True on success, False on failure (never raises).
+    generous timeout. Returns (ok, why, tail) and never raises; `_docker_compose_pull` adds retries.
 
     `compose_yml=None` means "let compose discover its own files in `cwd`", i.e.
     exactly what a bare `docker compose up -d` in that directory would load —
@@ -58572,7 +58713,7 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', se
         )
     except Exception as e:
         plog(f"✗ Could not start the {label} pull: {str(e)[:150]}")
-        return False
+        return False, 'start', []
 
     tail = deque(maxlen=40)
     last_emit = [0.0]
@@ -58605,14 +58746,70 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', se
         plog(f"✗ Pulling the {label} exceeded {_budget} and was stopped.")
         plog("  Layers that finished are cached — running Deploy again resumes from there")
         plog("  rather than starting over, so a second run usually gets further.")
-        return False
+        return False, 'timeout', list(tail)
     reader.join(timeout=5)
     if proc.returncode != 0:
-        plog(f"✗ Pulling the {label} failed (exit {proc.returncode}):")
-        for line in list(tail)[-8:]:
-            plog(f"    {line}")
-        return False
-    return True
+        return False, 'failed', list(tail)
+    return True, 'ok', list(tail)
+
+
+# ops #489: a failed pull used to end the module install at once, however brief the cause. A
+# registry that answers with a 5xx, resets the connection or drops mid-layer usually works a
+# few seconds later. Retry those twice with a pause; do NOT retry what a retry cannot fix (a
+# timeout already resumes from cached layers on the next Deploy, "not found"/"denied" are the
+# image, and a rate limit stays until its window passes). Docker Hub's limit is 100 pulls per
+# 6 hours per IPv4 address (IPv6 /64) without a login and answers HTTP 429 "You have reached
+# your pull rate limit" (https://docs.docker.com/docker-hub/usage/pulls/); say that plainly.
+_PULL_RETRY_PAUSES_S = (10, 30)
+_PULL_RATE_LIMIT_RE = re.compile(r'(toomanyrequests|rate limit|\b429\b)', re.I)
+_PULL_TRANSIENT_RE = re.compile(
+    r'(unexpected status from get request to \S+: 5\d\d|\b50[234]\b|unexpected eof|\beof\b'
+    r'|connection reset|connection refused|tls handshake timeout|i/o timeout|timeout awaiting'
+    r'|temporary failure|no such host|server misbehaving|unexpected status from get request'
+    r'|failed to copy|context deadline exceeded)', re.I)
+
+
+def _docker_pull_failure_lines(tail):
+    """Plain-English explanation of a failed pull, from the output lines it printed."""
+    text = '\n'.join(tail)
+    if _PULL_RATE_LIMIT_RE.search(text):
+        return ["Docker Hub is limiting pulls from this server's address (100 pulls per 6 hours "
+                "without a Docker login, shared by everyone behind the same public address).",
+                '  Nothing is wrong with this server. Wait a few hours (the window is 6 hours) '
+                'and click the button again.']
+    if _PULL_TRANSIENT_RE.search(text):
+        return ['Docker Hub or the link to it kept dropping the download. Click the button again '
+                'in a few minutes; layers that finished are kept.']
+    return []
+
+
+def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', services=None,
+                         ignore_failures=False, sleep=None):
+    """Pull with up to two retries for network-looking failures. True on success, False on
+    failure (never raises). Arguments as `_docker_compose_pull_once`."""
+    sleep = sleep or time.sleep
+    pauses = _PULL_RETRY_PAUSES_S
+    for attempt in range(len(pauses) + 1):
+        ok, why, tail = _docker_compose_pull_once(
+            compose_yml, cwd, plog, timeout=timeout, label=label, services=services,
+            ignore_failures=ignore_failures)
+        if ok or why != 'failed':
+            return ok
+        text = '\n'.join(tail)
+        retryable = (not _PULL_RATE_LIMIT_RE.search(text)
+                     and re.search(r'(not found|denied|manifest unknown|unauthorized)', text, re.I) is None
+                     and _PULL_TRANSIENT_RE.search(text) is not None)
+        if not retryable or attempt >= len(pauses):
+            plog(f"✗ Pulling the {label} failed:")
+            for line in tail[-8:]:
+                plog(f"    {line}")
+            for line in _docker_pull_failure_lines(tail):
+                plog(f"  {line}")
+            return False
+        plog(f"  ⚠ Pulling the {label} failed ({(tail[-1] if tail else 'no output')[:160]}); "
+             f"trying again in {pauses[attempt]} s (try {attempt + 2} of {len(pauses) + 1}).")
+        sleep(pauses[attempt])
+    return False
 
 
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
@@ -102830,6 +103027,7 @@ def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
     log("CloudTAK recreated with hardened port bindings")
     # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
     # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+    _cloudtak_upload_limit_heal(plog=log, wait=True)   # ops #470: the recreate rewrote nginx.conf
     if not _cloudtak_media_hls_heal(wait=True):
         return 'heal'
     return 'ok'
@@ -102930,6 +103128,7 @@ def _startup_heal_cloudtak_media_hls():
         if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
                 or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
             return  # CloudTAK not installed locally (or split/remote) — nothing to heal here
+        _cloudtak_upload_limit_heal()   # ops #470: nginx.conf is rewritten on every container start
         if _cloudtak_media_hls_heal():
             return
     except Exception as _e:
