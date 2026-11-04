@@ -12,6 +12,18 @@
 #   SSH_USER_PLACEHOLDER       → SSH user for Server One
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email (empty = no email)
 
+# ops #488 (test8 emailed "DB Credential Alert ... Check pg_hba.conf" at 3:04 AM PT after ONE
+# failed password check, with the password matching on Server One and TAK using the database
+# normally; the next run passed):
+#   - A failed check that Server One's own password does not explain needs AUTH_ALERT_AFTER (3)
+#     failures IN A ROW (one per timer run, 2 min apart) before it emails. Fewer is logged as
+#     a blip. A passing check resets the count.
+#   - Proven drift is still fixed at once: a fresh password that differs AND logs in is patched
+#     in on the first failure, as before.
+#   - If the SSH session for the check itself fails (ssh rc 255) nothing was learned about the
+#     credentials: log and stand down, like the probe above.
+#   - The alert says which check failed and what the database port did at the same moment.
+
 # v10.3.0 W4.e: while the console is upgrading / updating / rebooting the database server,
 # a stopped PostgreSQL is the job working, not an outage — never restart it mid-dpkg.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
@@ -25,6 +37,7 @@ SSH_USER="SSH_USER_PLACEHOLDER"
 
 ALERT_SENT_FILE="/var/lib/takguard/remotedb_auth_alert_sent"
 FAIL_COUNT_FILE="/var/lib/takguard/remotedb_auth_fail_count"
+AUTH_ALERT_AFTER=3   # failed checks in a row (no proven drift) before the email
 RESYNC_COOLDOWN_FILE="/var/lib/takguard/remotedb_auth_last_resync"
 
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
@@ -82,13 +95,21 @@ fi
 AUTH_OUT=$($SSH_CMD \
   "PGPASSWORD='${DB_PASSWORD}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>/dev/null | tr -d '[:space:]'" \
   2>/dev/null)
+AUTH_RC=$?
 
 if [ "$AUTH_OUT" = "1" ]; then
   rm -f "$ALERT_SENT_FILE" "$FAIL_COUNT_FILE"
   exit 0
 fi
 
-# Auth failed — resync immediately
+# ssh itself failed (255): the credentials were never tested, so this is not a credential failure.
+if [ "$AUTH_RC" = "255" ]; then
+  mkdir -p /var/log/takguard
+  echo "$(date): remote DB auth check SKIPPED - the SSH session to $DB_HOST dropped mid-check (ssh rc 255). Credentials were not tested." >> /var/log/takguard/restarts.log
+  exit 0
+fi
+
+# Auth failed — resync immediately when drift is proven (below); otherwise count it
 FAIL_COUNT=0
 [ -f "$FAIL_COUNT_FILE" ] && FAIL_COUNT=$(cat "$FAIL_COUNT_FILE")
 FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -136,7 +157,15 @@ elif [ -n "$FRESH_PW" ]; then
   RESYNC_MSG="Password on Server One matches CoreConfig.xml but auth still fails. Check pg_hba.conf or PostgreSQL status on Server One."
 fi
 
-# Always notify on resync. Rate-limit repeat alerts only if resync failed.
+# One failed check that no password drift explains is a blip (ops #488): email only after
+# AUTH_ALERT_AFTER in a row. A successful resync always notifies, it is proven and acted on.
+if ! $RESYNCED && [ "$FAIL_COUNT" -lt "$AUTH_ALERT_AFTER" ]; then
+  mkdir -p /var/log/takguard
+  echo "$(date): DB password check failed ($FAIL_COUNT of $AUTH_ALERT_AFTER in a row, no alert yet) — $RESYNC_MSG" >> /var/log/takguard/restarts.log
+  exit 0
+fi
+
+# Rate-limit repeat alerts only if resync failed.
 if ! $RESYNCED; then
   if [ -f "$ALERT_SENT_FILE" ] && [ -z "$(find "$ALERT_SENT_FILE" -mmin +60 2>/dev/null)" ]; then
     mkdir -p /var/log/takguard
@@ -146,6 +175,11 @@ if ! $RESYNCED; then
 fi
 
 touch "$ALERT_SENT_FILE"
+if timeout 6 bash -c "</dev/tcp/$DB_HOST/$DB_PORT" >/dev/null 2>&1; then
+  PORT_NOW="OPEN — TCP $DB_HOST:$DB_PORT answered"
+else
+  PORT_NOW="CLOSED — TCP $DB_HOST:$DB_PORT did not answer"
+fi
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 if $RESYNCED; then
@@ -171,7 +205,8 @@ else
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
-Consecutive failures: $FAIL_COUNT
+Check that failed: database login as martiuser to $DB_HOST:$DB_PORT ($FAIL_COUNT checks in a row, about 2 minutes apart)
+Database port at the same moment: $PORT_NOW
 Resync result: $RESYNC_MSG
 
 The password in /opt/tak/CoreConfig.xml does not authenticate against
