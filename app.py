@@ -37562,6 +37562,11 @@ def _caddy_registry_loaded():
         print('[startup] post-registry Caddyfile regen failed (non-fatal): %s' % str(_e)[:160], flush=True)
 
 
+# ops #470: how long Caddy lets one CloudTAK request run before it gives up on a read or write
+# to the upstream (see generate_caddyfile).
+_CLOUDTAK_MAP_TIMEOUT = '6h'
+
+
 # ops #222: /print-api on the CloudTAK map site, while infra-TAK has TAK Portal's Print set up on
 # loopback (its overlay exists, _cloudtak_print_converge). It is TAK Portal's own snippet — same
 # name, same matcher — with the one upstream host Caddy can reach. That is deliberate: TAK
@@ -38035,8 +38040,14 @@ def generate_caddyfile(settings=None):
         # GH #90: same as the TAK Server vhost, for CloudTAK's live socket.
         lines += _caddy_stream_close_delay_lines("        ")
         lines.append(f"        transport http {{")
-        lines.append(f"            read_timeout 120s")
-        lines.append(f"            write_timeout 120s")
+        # ops #470 (infra-TAK #398): Caddy's read_timeout is a deadline on the first read from
+        # the upstream, and that read starts as soon as the request does. A hosted-tileset
+        # upload sends nothing back until the whole file is in, so anything over 120 s (a
+        # multi-GB pmtiles on a home uplink) died with a 502. write_timeout has the same
+        # trap: the body copy to the upstream is one write, so it died with a 504. Long
+        # enough for the 5G upload cap.
+        lines.append(f"            read_timeout {_CLOUDTAK_MAP_TIMEOUT}")
+        lines.append(f"            write_timeout {_CLOUDTAK_MAP_TIMEOUT}")
         lines.append(f"        }}")
         lines.append(f"    }}")
         lines.append(f"    # CloudTAK's image ships no Cache-Control on the PWA entry points, so")
