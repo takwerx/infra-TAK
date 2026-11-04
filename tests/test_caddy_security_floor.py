@@ -14,7 +14,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Caddy security floor (2.11.7).
+"""Caddy security floor (2.11.8 on apt, 2.11.7 on dnf; ops #487).
 
 Caddy is not pinned: a box keeps whatever version it was installed at. The fleet
 was mixed (2.11.4 on most boxes, 2.11.7 on one), and the only version gate was
@@ -24,6 +24,10 @@ does, and console Update, Caddy → Update and the deploy gate all call it.
 2.11.6 also added a 1-minute request-body idle timeout that cuts NetBird's quiet
 gRPC streams (measured: a 90 s quiet HTTP/2 body is cut at 60.0 s through 2.11.7,
 completes through 2.11.4 and through 2.11.7 with `read_body_idle -1s`).
+
+ops #487: 2.11.8 closes the Go HTTP/2 denial-of-service batch. Cloudsmith apt had it on
+2026-11-04, the @caddy/caddy COPR (Rocky/RHEL) still only 2.11.7-1, so the floor is per
+package manager: one shared floor would leave every dnf box short for good.
 
 app.py cannot be imported in a test, so the helper is cut out of it and run
 against stubs: the code under test is the shipped text.
@@ -53,10 +57,14 @@ def _segment(name):
 class _Box:
     """A fake host: a Caddy version that the package sources can move."""
 
-    def __init__(self, version, pm='apt', repo_ok=True, pkg_gives=(2, 11, 7),
-                 fallback_gives=(2, 11, 7), validate=('ok', '')):
+    def __init__(self, version, pm='apt', repo_ok=True, pkg_gives=None,
+                 fallback_gives=None, validate=('ok', '')):
         self.version, self.pm, self.repo_ok = version, pm, repo_ok
-        self.pkg_gives, self.fallback_gives = pkg_gives, fallback_gives
+        # What the sources serve. Unset = the newest each one carried on 2026-11-04:
+        # Cloudsmith apt 2.11.8, the COPR 2.11.7. `False` = the source gives nothing.
+        newest = (2, 11, 7) if pm == 'dnf' else (2, 11, 8)
+        self.pkg_gives = newest if pkg_gives is None else (pkg_gives or None)
+        self.fallback_gives = (2, 11, 8) if fallback_gives is None else (fallback_gives or None)
         self.verdict = validate
         self.calls, self.log = [], []
 
@@ -97,7 +105,8 @@ class _Box:
             'load_settings': lambda: {'fqdn': 'example.com'},
             'generate_caddyfile': lambda s: self.calls.append(('generate',)),
         }
-        src = '\n\n'.join(_segment(n) for n in ('_CADDY_MIN_SECURE', '_caddy_lift_to_secure_floor'))
+        src = '\n\n'.join(_segment(n) for n in ('_CADDY_MIN_SECURE', '_CADDY_MIN_SECURE_DNF',
+                                                 '_caddy_min_secure', '_caddy_lift_to_secure_floor'))
         exec(compile(src, 'app.py:_caddy_lift_to_secure_floor', 'exec'), ns)
         return ns['_caddy_lift_to_secure_floor'](self.log.append, restart=restart,
                                                  regenerate=regenerate)
@@ -110,16 +119,34 @@ class _Box:
         return [c for c in self.calls if 'restart' in c]
 
 
-def test_the_floor_is_2_11_7():
-    ns = {}
-    exec(_segment('_CADDY_MIN_SECURE'), ns)
-    assert ns['_CADDY_MIN_SECURE'] == (2, 11, 7)
+def test_the_floor_is_2_11_8_on_apt_and_2_11_7_on_dnf():
+    ns = {'_pkg_mgr': lambda: 'apt'}
+    exec(_segment('_CADDY_MIN_SECURE') + '\n' + _segment('_CADDY_MIN_SECURE_DNF') + '\n'
+         + _segment('_caddy_min_secure'), ns)
+    assert ns['_CADDY_MIN_SECURE'] == (2, 11, 8)
+    assert ns['_caddy_min_secure']() == (2, 11, 8)
+    ns['_pkg_mgr'] = lambda: 'dnf'
+    assert ns['_CADDY_MIN_SECURE_DNF'] == (2, 11, 7)
+    assert ns['_caddy_min_secure']() == (2, 11, 7)
 
 
-@pytest.mark.parametrize('version', [(2, 11, 7), (2, 12, 0), (3, 0, 0)])
+@pytest.mark.parametrize('version', [(2, 11, 8), (2, 12, 0), (3, 0, 0)])
 def test_a_box_at_or_above_the_floor_is_left_alone(version):
     box = _Box(version)
     assert box.lift() == (version, version)
+    assert box.calls == []
+
+
+def test_apt_2_11_7_is_lifted_to_2_11_8():
+    box = _Box((2, 11, 7))
+    assert box.lift() == ((2, 11, 7), (2, 11, 8))
+    assert box.did('pkg_install') and len(box.restarts) == 1
+
+
+def test_dnf_2_11_7_is_at_the_floor_while_the_copr_is_still_on_it():
+    """The ops #487 trap: a shared 2.11.8 floor would send this box to the static build on every start."""
+    box = _Box((2, 11, 7), pm='dnf')
+    assert box.lift() == ((2, 11, 7), (2, 11, 7))
     assert box.calls == []
 
 
@@ -132,7 +159,7 @@ def test_an_unreadable_version_is_left_alone():
 
 def test_apt_lifts_from_the_package_repo_and_restarts_once():
     box = _Box((2, 11, 4))
-    assert box.lift() == ((2, 11, 4), (2, 11, 7))
+    assert box.lift() == ((2, 11, 4), (2, 11, 8))
     assert box.did('ensure_repo') and box.did('pkg_install')
     assert not box.did('github_deb')
     assert len(box.restarts) == 1
@@ -141,14 +168,14 @@ def test_apt_lifts_from_the_package_repo_and_restarts_once():
 
 def test_apt_falls_back_to_the_github_deb_when_the_repo_is_not_serving():
     box = _Box((2, 11, 4), repo_ok=False)
-    assert box.lift()[1] == (2, 11, 7)
+    assert box.lift()[1] == (2, 11, 8)
     assert not box.did('pkg_install')
     assert box.did('github_deb')
 
 
 def test_apt_falls_back_when_the_repo_is_behind():
     box = _Box((2, 11, 4), pkg_gives=(2, 11, 6))
-    assert box.lift()[1] == (2, 11, 7)
+    assert box.lift()[1] == (2, 11, 8)
     assert box.did('pkg_install') and box.did('github_deb')
 
 
@@ -161,13 +188,13 @@ def test_dnf_lifts_from_the_copr():
 
 
 def test_dnf_falls_back_to_the_static_build_when_the_copr_lags():
-    box = _Box((2, 11, 4), pm='dnf', pkg_gives=None)
-    assert box.lift()[1] == (2, 11, 7)
+    box = _Box((2, 11, 4), pm='dnf', pkg_gives=False)
+    assert box.lift()[1] == (2, 11, 8)
     assert box.did('static')
 
 
 def test_still_short_is_said_out_loud_and_not_restarted_into():
-    box = _Box((2, 11, 4), pkg_gives=None, fallback_gives=None)
+    box = _Box((2, 11, 4), pkg_gives=False, fallback_gives=False)
     assert box.lift() == ((2, 11, 4), (2, 11, 4))
     assert any('still 2.11.4' in m for m in box.log)
     assert box.restarts == []
@@ -202,7 +229,7 @@ def test_deploy_mode_touches_neither_the_file_nor_the_service():
 
 
 def test_no_version_change_means_no_regeneration_and_no_restart():
-    box = _Box((2, 11, 4), pkg_gives=None, fallback_gives=None)
+    box = _Box((2, 11, 4), pkg_gives=False, fallback_gives=False)
     box.lift()
     assert not box.did('generate') and box.restarts == []
 
@@ -255,6 +282,12 @@ def test_caddy_update_button_lifts_the_box_and_restarts_after():
     body = _segment('caddy_update')
     assert '_caddy_lift_to_secure_floor(_lift_log.append, restart=False)' in body
     assert body.index('_caddy_lift_to_secure_floor(') < body.index("'systemctl', 'restart', 'caddy'")
+
+
+def test_deploy_gate_uses_the_per_distro_floor():
+    body = _segment('run_caddy_deploy')
+    assert '_cv < _caddy_min_secure()' in body
+    assert '_CADDY_MIN_SECURE' not in body
 
 
 def test_deploy_lifts_a_caddy_that_was_already_installed():

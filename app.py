@@ -27917,6 +27917,8 @@ THIRD_PARTY_ADVISORY_CACHE_S = 6 * 3600   # the hourly check stays inside GitHub
 _third_party_adv_cache = {}
 
 _OS_INSTALL_HOW = 'Console page → "Operating system updates available" → Install updates.'
+# ops #487: Caddy has its own button, which also regenerates the Caddyfile and restarts it.
+_THIRD_PARTY_HOW = {'caddy': 'Caddy page → Update.'}
 _OS_REBOOT_HOW = 'Console page → Reboot now (the box is back in 1-3 minutes).'
 
 
@@ -28244,7 +28246,7 @@ def _third_party_security_items(pending, unknown, now=None):
                       'installed': p.get('old') or '?', 'target': p['new'],
                       'summary': f"{label}: security update {inst} → {tgt}",
                       'identity': tgt + '+security', 'patch_now': crit,
-                      'security': lines, 'how': _OS_INSTALL_HOW})
+                      'security': lines, 'how': _THIRD_PARTY_HOW.get(p['name'], _OS_INSTALL_HOW)})
     return items
 
 
@@ -36590,9 +36592,20 @@ _CADDY_MIN_TRUST_POOL = (2, 8)
 # 2.11.7, not 2.11.6: 2.11.6's new idle timeouts crashed HTTP/2 proxying and cut streams.
 # Verified 2026-10-19: Cloudsmith apt and the @caddy/caddy COPR (epel-9 x86_64 + aarch64)
 # both carry 2.11.7.
-_CADDY_MIN_SECURE = (2, 11, 7)
+# ops #487: 2.11.8 (Go 1.27 build, closes the Go HTTP/2 denial-of-service batch plus Caddy's
+# own advisories). Per package manager, because the two sources do not move together:
+# verified 2026-11-04 Cloudsmith apt carries 2.11.8 while the @caddy/caddy COPR is still on
+# 2.11.7-1. One floor for both would leave every dnf box permanently short, falling back to
+# the static build on each console start. Raise _CADDY_MIN_SECURE_DNF once the COPR has it.
+_CADDY_MIN_SECURE = (2, 11, 8)
+_CADDY_MIN_SECURE_DNF = (2, 11, 7)
 # `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
 _CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
+
+
+def _caddy_min_secure():
+    """The security floor for this box's package source (see _CADDY_MIN_SECURE)."""
+    return _CADDY_MIN_SECURE_DNF if _pkg_mgr() == 'dnf' else _CADDY_MIN_SECURE
 
 _caddy_version_cache = {'ver': None, 'ts': 0.0}
 
@@ -36745,7 +36758,7 @@ def _caddy_install_official_static(plog=None):
 
 
 def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
-    """Move an installed Caddy below _CADDY_MIN_SECURE onto it. Returns (before, after).
+    """Move an installed Caddy below the security floor onto it. Returns (before, after).
 
     Package manager first, so the binary stays package-managed: apt from the Cloudsmith repo,
     dnf from the @caddy/caddy COPR. Only when that leaves the box short (repo not serving,
@@ -36765,28 +36778,29 @@ def _caddy_lift_to_secure_floor(log_fn=None, restart=True, regenerate=True):
     (deploy, Caddy → Update) pass restart=False."""
     _log = log_fn or (lambda m: None)
     _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+    floor = _caddy_min_secure()
     before = _caddy_version_tuple(refresh=True)
-    if not before or before >= _CADDY_MIN_SECURE:
+    if not before or before >= floor:
         return before, before
-    _log(f'Caddy {_vs(before)} is below the {_vs(_CADDY_MIN_SECURE)} security floor — upgrading')
+    _log(f'Caddy {_vs(before)} is below the {_vs(floor)} security floor — upgrading')
     if _pkg_mgr() == 'dnf':
         # Through the shim (Dependency Rule), so this is `dnf install`, which may or may not
         # move an installed Caddy to the COPR's newest build. Either way the version is
         # re-read below and anything still short gets the static build.
         _pkg_install(['caddy'], log_fn=_log, timeout=300)
         _caddy_version_cache['ver'] = None
-        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+        if _caddy_version_tuple(refresh=True) < floor:
             _log('  the COPR has no new enough Caddy — installing the official static build')
             _caddy_install_official_static(_log)
     else:
         if _caddy_ensure_apt_repo(_log):
             _pkg_install(['caddy'], log_fn=_log, timeout=300)
             _caddy_version_cache['ver'] = None
-        if _caddy_version_tuple(refresh=True) < _CADDY_MIN_SECURE:
+        if _caddy_version_tuple(refresh=True) < floor:
             _caddy_install_github_deb(_log)
     after = _caddy_version_tuple(refresh=True)
-    if not after or after < _CADDY_MIN_SECURE:
-        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(_CADDY_MIN_SECURE)}) — no newer Caddy '
+    if not after or after < floor:
+        _log(f'  ⚠ Caddy is still {_vs(after)} (< {_vs(floor)}) — no newer Caddy '
              'was reachable from this box. Retry with Caddy → Update.')
     else:
         _log(f'  ✓ Caddy {_vs(before)} → {_vs(after)}')
@@ -39594,7 +39608,7 @@ def run_caddy_deploy(domain):
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
                 _caddy_install_official_static(plog)
             _cv = _caddy_version_tuple(refresh=True)
-        if _cv and _cv < _CADDY_MIN_SECURE:
+        if _cv and _cv < _caddy_min_secure():
             # A box that already had Caddy may keep it through Step 1 (the package step can
             # leave an installed Caddy where it is), so lift it to the security floor too.
             # Step 2 regenerates the Caddyfile and Step 4 restarts Caddy.
