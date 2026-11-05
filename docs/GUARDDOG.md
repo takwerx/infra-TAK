@@ -97,6 +97,8 @@ In **two-server** mode, Guard Dog deploys a small **health agent** on Server One
 
 **TCP + SSH** (the other Remote Database check) only verifies port 5432 and SSH; it does not run the agent. So TCP + SSH can be green while Health Agent is red if the agent isn’t installed or 8080 isn’t open.
 
+**One blip does not email (ops #488).** The two timer checks on a split box (TCP + SSH, and DB Auth) run every 2 minutes and now email only after **3 failures in a row** (about 4–6 minutes). A single SSH timeout or a single failed password check is written to `/var/log/takguard/restarts.log` as `1 of 3 in a row` and nothing is sent; one passing run resets the count. The email names the check that failed and says whether the database port was open at that moment. A closed database port, and a password that has really changed on Server One (fixed at once), are not delayed.
+
 **After migrating the database to a new Server One:** The console monitors (**TCP + SSH**, **Health Agent**) use the **saved TAK deployment** `server_one.host` (same as **DB Auth**). On successful migration, infra-TAK also rewrites `/opt/tak-guarddog/guarddog.conf` and `tak-remotedb-*.sh` so timer-based alerts match the new host. If you moved DB before this behavior existed, click **Deploy health agent to Server One** once (it also runs that sync) or use **↻ Update Guard Dog** / redeploy Guard Dog to refresh scripts.
 
 ## Alerts

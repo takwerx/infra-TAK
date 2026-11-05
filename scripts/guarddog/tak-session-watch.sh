@@ -39,6 +39,8 @@ LOGDIR="/var/log/takguard"
 LOGFILE="$LOGDIR/session.log"
 FAIL_FILE="$STATE_DIR/session.failcount"
 COOLDOWN_FILE="$STATE_DIR/session.last_alert"
+STATE_FILE="$STATE_DIR/session.state"             # what is being reported (back-off resets when it changes)
+STATE_SINCE_FILE="$STATE_DIR/session.state_since" # epoch that same state began
 
 PORT=8089
 API_URL="https://127.0.0.1:8443/Marti/api/subscriptions/all?page=1&limit=1000"
@@ -62,7 +64,8 @@ OWN_KEY="/opt/tak-guarddog/_sessionwatch.key"
 MIN_UPTIME_SECS=1200     # 20 min — matches the timer's OnBootSec
 STARTUP_GRACE=600        # TAK needs ~5-7 min to finish starting
 CONSEC_REQUIRED=3        # 3 consecutive runs (15 min) before anyone is emailed
-COOLDOWN_SECS=3600       # one alert per hour at most
+COOLDOWN_SECS=3600       # one alert per hour at most...
+DAILY_AFTER_SECS=86400   # ...and one per day once the same state has lasted this long (ops #486)
 
 # ── W2 connection-storm thresholds (v10.1.47) ──
 # Provenance, stated plainly because it is not symmetrical: the FLOOR is ours and
@@ -89,7 +92,7 @@ LOCAL_PEER_RE='^(127\.|::1|172\.(1[6-9]|2[0-9]|3[01])\.)'
 mkdir -p "$STATE_DIR" "$LOGDIR" 2>/dev/null
 
 _log()  { echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | $1" >> "$LOGFILE"; }
-_quiet_exit() { echo 0 > "$FAIL_FILE"; exit 0; }
+_quiet_exit() { echo 0 > "$FAIL_FILE"; rm -f "$STATE_FILE" "$STATE_SINCE_FILE"; exit 0; }
 
 _cleanup() { rm -f "$OWN_PEM" "$OWN_KEY"; }
 trap _cleanup EXIT
@@ -331,19 +334,52 @@ if [ "$INVISIBLE" -eq 0 ] && [ "$GROUPLESS" -eq 0 ] \
   _quiet_exit
 fi
 
+# ── Storm cap (ops #486): hourly for the first 24 h of the SAME state, daily after ──
+# Same shape as tak-remotedb-watch.sh. "State" is which kinds of problem are present, not
+# their counts, so a client count moving by one doesn't restart the clock. test8 got ~15
+# identical emails in a day and a half from one client with no channel, because the hourly
+# cooldown never backed off. A new state (or the box going healthy) starts over and alerts
+# promptly.
+NOW=$(date +%s)
+STATE_KEY="api_broken=$API_BROKEN invisible=$([ "$INVISIBLE" -gt 0 ] && echo 1 || echo 0) groupless=$([ "$GROUPLESS" -gt 0 ] && echo 1 || echo 0) storm_uid=$STORM_UID storm_ip=$STORM_IP"
+PREV_KEY=""; [ -f "$STATE_FILE" ] && PREV_KEY=$(cat "$STATE_FILE" 2>/dev/null)
+if [ "$STATE_KEY" != "$PREV_KEY" ]; then
+  echo "$STATE_KEY" > "$STATE_FILE"
+  echo "$NOW" > "$STATE_SINCE_FILE"
+  rm -f "$COOLDOWN_FILE"
+fi
+STATE_SINCE=$NOW; [ -f "$STATE_SINCE_FILE" ] && STATE_SINCE=$(cat "$STATE_SINCE_FILE" 2>/dev/null || echo "$NOW")
+case "$STATE_SINCE" in ''|*[!0-9]*) STATE_SINCE=$NOW ;; esac
+STATE_AGE=$((NOW - STATE_SINCE))
+[ "$STATE_AGE" -lt 0 ] && STATE_AGE=0
+ALERT_EVERY=$COOLDOWN_SECS
+[ "$STATE_AGE" -ge "$DAILY_AFTER_SECS" ] && ALERT_EVERY=$DAILY_AFTER_SECS
+
 FAILS=0
 [ -f "$FAIL_FILE" ] && FAILS=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
 FAILS=$((FAILS + 1))
 echo "$FAILS" > "$FAIL_FILE"
 [ "$FAILS" -lt "$CONSEC_REQUIRED" ] && exit 0
 
-NOW=$(date +%s)
 LAST=0
 [ -f "$COOLDOWN_FILE" ] && LAST=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
-if [ $((NOW - LAST)) -lt "$COOLDOWN_SECS" ]; then
+if [ $((NOW - LAST)) -lt "$ALERT_EVERY" ]; then
   exit 0
 fi
 echo "$NOW" > "$COOLDOWN_FILE"
+
+if [ "$STATE_AGE" -ge 86400 ]; then
+  LASTED="$((STATE_AGE / 86400)) d $(((STATE_AGE % 86400) / 3600)) h"
+elif [ "$STATE_AGE" -ge 3600 ]; then
+  LASTED="$((STATE_AGE / 3600)) h $(((STATE_AGE % 3600) / 60)) min"
+else
+  LASTED="$((STATE_AGE / 60)) min"
+fi
+if [ "$ALERT_EVERY" -ge "$DAILY_AFTER_SECS" ]; then
+  REPEAT_NOTE="Same state for over a day, so this report now repeats once a day. It goes back to hourly if the state changes."
+else
+  REPEAT_NOTE="This report repeats hourly for the first day of the same state, then daily."
+fi
 
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -452,7 +488,8 @@ BODY="TAK Server has connected clients that it cannot fully account for.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
-Sustained for: $FAILS consecutive checks (~$((FAILS * 5)) minutes)
+Same state for: $LASTED
+$REPEAT_NOTE
 
 WHAT WAS FOUND
 $FINDINGS

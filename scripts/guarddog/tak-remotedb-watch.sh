@@ -57,6 +57,15 @@
 #     also ask DB_HOST:DB_PORT, and, if this SSH user cannot sudo to postgres, the local
 #     socket as itself, as before. Same livelier-answer rule.
 
+# ops #488 (test8 emailed "management channel degraded" at 2:43 AM PT after ONE SSH probe
+# timed out on port 22, with the database port open and TAK using it normally; same on
+# Oct 24, 28, 31 and Nov 1):
+#   - mgmt_degraded needs MGMT_ALERT_AFTER (3) failed probes IN A ROW, one per timer run
+#     (2 min apart, so about 4-6 min), before it emails. One timeout is logged as a blip
+#     and nothing is sent. A passing probe resets the count. The db_down path already
+#     needed 3 in a row and still does, so a real outage alerts within a few minutes.
+#   - The email names the check that failed and what the database port did at the same moment.
+
 # v10.3.0 W4.e: while the console is upgrading / updating / rebooting the database server,
 # a stopped PostgreSQL is the job working, not an outage — never restart it mid-dpkg.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
@@ -73,6 +82,8 @@ ALERT_SENT_FILE="/var/lib/takguard/remotedb_alert_sent"            # db_down ale
 DEGRADED_SENT_FILE="/var/lib/takguard/remotedb_mgmt_degraded_sent" # mgmt-degraded dedupe
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
 FAIL_COUNT_FILE="/var/lib/takguard/remotedb_fail_count"            # consecutive TCP-down count
+MGMT_FAIL_COUNT_FILE="/var/lib/takguard/remotedb_mgmt_fail_count"  # consecutive SSH-probe failures
+MGMT_ALERT_AFTER=3                                                 # probes in a row before the email
 STATE_FILE="/var/lib/takguard/remotedb_state"                     # last state (storm-cap reset)
 STATE_SINCE_FILE="/var/lib/takguard/remotedb_state_since"         # epoch current state began
 DB_RESTART_COUNT_FILE="/var/lib/takguard/remotedb_restart_count_24h"
@@ -159,7 +170,7 @@ if [ "$STATE" = "healthy" ]; then
   if [ -f "$LOGGED_FILE" ]; then
     echo "$(date): remote DB ($DB_HOST) checks healthy again (was: $(cat "$LOGGED_FILE"))" >> /var/log/takguard/restarts.log
   fi
-  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE" "$STATE_FILE" "$STATE_SINCE_FILE" "$LOGGED_FILE"
+  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE" "$MGMT_FAIL_COUNT_FILE" "$STATE_FILE" "$STATE_SINCE_FILE" "$LOGGED_FILE"
   exit 0
 fi
 
@@ -169,7 +180,7 @@ PREV_STATE=""; [ -f "$STATE_FILE" ] && PREV_STATE=$(cat "$STATE_FILE")
 if [ "$STATE" != "$PREV_STATE" ]; then
   echo "$STATE" > "$STATE_FILE"
   echo "$NOW"   > "$STATE_SINCE_FILE"
-  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE"   # new state → alert promptly
+  rm -f "$ALERT_SENT_FILE" "$DEGRADED_SENT_FILE" "$FAIL_COUNT_FILE" "$MGMT_FAIL_COUNT_FILE"   # new state → count afresh
 fi
 STATE_SINCE=$NOW; [ -f "$STATE_SINCE_FILE" ] && STATE_SINCE=$(cat "$STATE_SINCE_FILE")
 DEDUPE_MIN=60
@@ -201,12 +212,20 @@ send_alert() {  # $1=subject  $2=body  $3=dedupe_file
 # ── mgmt_degraded: DB is UP, only the SSH management probe fails ──────────────
 # No restart. No "manual intervention". A distinct, low-severity, self-fixable note.
 if [ "$STATE" = "mgmt_degraded" ]; then
+  # One failed probe is a blip (ops #488): count runs in a row, email only at MGMT_ALERT_AFTER.
+  MGMT_FAILS=0; [ -f "$MGMT_FAIL_COUNT_FILE" ] && MGMT_FAILS=$(cat "$MGMT_FAIL_COUNT_FILE")
+  MGMT_FAILS=$((MGMT_FAILS + 1)); echo "$MGMT_FAILS" > "$MGMT_FAIL_COUNT_FILE"
+  if [ "$MGMT_FAILS" -lt "$MGMT_ALERT_AFTER" ]; then
+    echo "$(date): remote DB ($DB_HOST) SSH management probe failed ($MGMT_FAILS of $MGMT_ALERT_AFTER in a row, database port open, no alert yet) — $SSH_DETAIL" >> /var/log/takguard/restarts.log
+    exit 0
+  fi
   SUBJ="Guard Dog: remote DB management channel degraded on $SERVER_IDENTIFIER"
   BODY="Guard Dog's SSH management probe to Server One is failing, but the database itself is HEALTHY.
 
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
-Database: REACHABLE — TCP $DB_HOST:$DB_PORT is open and TAK Server is using it normally.
+Check that failed: SSH management probe to $SSH_USER@$DB_HOST ($MGMT_FAILS probes in a row, about 2 minutes apart)
+Database port at the same moment: OPEN — TCP $DB_HOST:$DB_PORT answered and TAK Server is using it normally.
 Failing leg: $SSH_DETAIL
 
 This is a MONITORING/ACCESS issue on Guard Dog's SSH health check — NOT a database
