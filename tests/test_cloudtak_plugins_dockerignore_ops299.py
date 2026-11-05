@@ -131,3 +131,76 @@ def test_runs_inside_the_shield_that_every_build_calls():
                 and n.name == '_cloudtak_shield_foreign_plugins')
     assert '_cloudtak_keep_plugins_in_build(ct_dir, plog)' in ast.get_source_segment(src, node)
     assert os.path.basename(__file__)
+
+
+# ops #503: the Dispatcher plugin's own installer writes a Dockerfile.dockerignore that re-includes
+# only its folder. infra-TAK used to leave it alone, so every other plugin dropped out of the next
+# image build with no error.
+DISPATCHER_MARK = '# managed by cloudtak-dispatcher-plugin install.sh'
+
+
+def _dispatcher_file(base=UPSTREAM):
+    return (DISPATCHER_MARK + "\n# copy of CloudTAK's .dockerignore + our re-include; re-run install.sh after "
+            "updating CloudTAK\n" + base + "\n# re-include the Dispatcher web plugin\n!app/plugins/tak-dispatcher\n")
+
+
+def test_dispatcher_written_file_is_replaced_so_other_plugins_stay_in_ops503(tmp_path):
+    ct = _tree(tmp_path, ('tak-dispatcher', 'taksim', 'livewx-radar'))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    (ct / 'Dockerfile.dockerignore').write_text(_dispatcher_file())
+    log = []
+    _load()['_cloudtak_shield_foreign_plugins'](str(ct), log.append)
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert out.splitlines()[0].startswith('# infra-TAK (ops #299)')
+    for n in ('tak-dispatcher', 'taksim', 'livewx-radar'):
+        assert f'\n!app/plugins/{n}\n' in out
+    assert any('Dispatcher' in m for m in log)
+
+
+def test_after_replacing_it_stays_stable_ops503(tmp_path):
+    ct = _tree(tmp_path, ('tak-dispatcher', 'taksim'))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    (ct / 'Dockerfile.dockerignore').write_text(_dispatcher_file())
+    _load()['_cloudtak_keep_plugins_in_build'](str(ct), lambda m: None)
+    first = (ct / 'Dockerfile.dockerignore').read_text()
+    log = []
+    _load()['_cloudtak_keep_plugins_in_build'](str(ct), log.append)
+    assert log == [] and (ct / 'Dockerfile.dockerignore').read_text() == first
+
+
+def test_dispatcher_file_goes_when_cloudtak_stops_excluding_plugins_ops503(tmp_path):
+    ct = _tree(tmp_path, ('tak-dispatcher',))
+    (ct / '.dockerignore').write_text(OLD)
+    (ct / 'Dockerfile.dockerignore').write_text(_dispatcher_file(OLD))
+    _load()['_cloudtak_keep_plugins_in_build'](str(ct), lambda m: None)
+    assert not (ct / 'Dockerfile.dockerignore').exists()
+
+
+def test_operators_file_that_drops_plugins_is_kept_but_named_in_the_log_ops503(tmp_path):
+    ct = _tree(tmp_path, ('tak-dispatcher', 'taksim'))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    mine = '# mine\napp/plugins/*\n!app/plugins/tak-dispatcher\n'
+    (ct / 'Dockerfile.dockerignore').write_text(mine)
+    log = []
+    _load()['_cloudtak_keep_plugins_in_build'](str(ct), log.append)
+    assert (ct / 'Dockerfile.dockerignore').read_text() == mine
+    warn = ' '.join(log)
+    assert 'Dockerfile.dockerignore' in warn and 'taksim' in warn and 'tak-dispatcher' not in warn
+
+
+def test_operators_file_that_keeps_plugins_gets_no_warning_ops503(tmp_path):
+    ct = _tree(tmp_path, ('tak-dispatcher', 'taksim'))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    for body in ('# mine\nfoo\n', '# mine\napp/plugins/*\n!app/plugins/tak-dispatcher\n!app/plugins/taksim\n',
+                 '# mine\napp/plugins/*\n!app/plugins/*\n'):
+        (ct / 'Dockerfile.dockerignore').write_text(body)
+        log = []
+        _load()['_cloudtak_keep_plugins_in_build'](str(ct), log.append)
+        assert log == [], body
+        assert (ct / 'Dockerfile.dockerignore').read_text() == body
+
+
+def test_missing_menu_entry_warning_points_at_the_dockerignore_ops503():
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath('app.py').read_text(encoding='utf-8')
+    i = src.index("is NOT in the built web app")
+    assert 'Dockerfile.dockerignore' in src[i:i + 900]
