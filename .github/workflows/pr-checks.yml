@@ -37,6 +37,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -I .github/ci/compile_check.py --only simulator/
+      # ETL Runner shim (v10.4.0): pure-logic unit tests, runner's preinstalled Node, no npm.
+      - run: node --test modules/etlrunner/shim/test/*.test.mjs
 
   # 1b. shellcheck, errors only, against a baseline of the findings that already existed.
   shellcheck:
