@@ -49341,6 +49341,59 @@ def _cloudtak_plugin_missing_deps(web, foreign):
 # installed folder) puts them back without touching a tracked file.
 _CT_DOCKERIGNORE_MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
 _CT_PLUGIN_DIR_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+# ops #503: the Dispatcher plugin's own installer writes a Dockerfile.dockerignore too (first line
+# below). It re-includes only its own folder, so with it in place every other plugin dropped out of the
+# image build. Its content is a plain copy of .dockerignore plus that one re-include, which ours
+# covers, so we treat it as ours to regenerate. The Dispatcher installer leaves a file starting with
+# our marker alone, so the two do not fight.
+_CT_DOCKERIGNORE_DISPATCHER_MARK = '# managed by cloudtak-dispatcher-plugin install.sh'
+
+
+def _ct_dockerignore_leaves_out(text, rel, names):
+    """ops #503: which of the plugin folders `names` does this ignore file leave out of the build?
+    Simplified Docker rule: a plain pattern excludes a path or any parent of it, a `!` pattern
+    re-includes only that exact path, last match wins."""
+    def rx(pat):
+        pat = pat.strip().lstrip('/').rstrip('/')
+        out, i = '', 0
+        while i < len(pat):
+            if pat.startswith('**/', i):
+                out, i = out + '(?:.*/)?', i + 3
+            elif pat.startswith('**', i):
+                out, i = out + '.*', i + 2
+            elif pat[i] == '*':
+                out, i = out + '[^/]*', i + 1
+            elif pat[i] == '?':
+                out, i = out + '[^/]', i + 1
+            else:
+                out, i = out + re.escape(pat[i]), i + 1
+        return re.compile(out + r'\Z')
+    rules = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#'):
+            continue
+        neg = ln.startswith('!')
+        if neg:
+            ln = ln[1:].strip()
+        try:
+            rules.append((neg, rx(ln)))
+        except re.error:
+            continue
+    left_out = []
+    for n in names:
+        path = f'{rel}/{n}'
+        parents = ['/'.join(path.split('/')[:k]) for k in range(1, len(path.split('/')) + 1)]
+        ignored = False
+        for neg, r in rules:
+            if neg:
+                if r.match(path):
+                    ignored = False
+            elif any(r.match(x) for x in parents):
+                ignored = True
+        if ignored:
+            left_out.append(n)
+    return left_out
 
 
 def _cloudtak_keep_plugins_in_build(ct_dir, plog):
@@ -49351,11 +49404,29 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
         base = os.path.join(ct_dir, '.dockerignore')
         out = os.path.join(ct_dir, 'Dockerfile.dockerignore')
         mine = False
+        from_dispatcher = False
         if os.path.exists(out):
             with open(out, encoding='utf-8', errors='replace') as f:
-                mine = f.readline().rstrip('\r\n') == _CT_DOCKERIGNORE_MARK
+                first = f.readline().rstrip('\r\n')
+            from_dispatcher = first == _CT_DOCKERIGNORE_DISPATCHER_MARK
+            mine = first == _CT_DOCKERIGNORE_MARK or from_dispatcher
             if not mine:
-                return                      # the operator's own file: theirs to keep
+                # the operator's own file: theirs to keep, but say so when it drops installed plugins
+                try:
+                    with open(out, encoding='utf-8', errors='replace') as f:
+                        theirs = f.read()
+                    plugins = os.path.join(ct_dir, rel)
+                    have_dirs = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
+                                       and os.path.isdir(os.path.join(plugins, n)))
+                    dropped = _ct_dockerignore_leaves_out(theirs, rel, have_dirs)
+                except OSError:
+                    dropped = []
+                if dropped:
+                    plog(f"  ⚠ Dockerfile.dockerignore in the CloudTAK folder is not ours and leaves {rel}/ plugin "
+                         f"folders out of the image build: {', '.join(dropped)}. Those plugins will be missing "
+                         f"from the menu after this build. Delete that file (infra-TAK writes a correct one) "
+                         f"or add a '!{rel}/<name>' line for each.")
+                return
         text = ''
         if os.path.isfile(base):
             with open(base, encoding='utf-8', errors='replace') as f:
@@ -49385,6 +49456,9 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
         if have != want:
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(want)
+            if from_dispatcher:
+                plog("  The Dispatcher plugin's installer had written a Dockerfile.dockerignore that kept only "
+                     "its own folder in the image build; replaced it so every installed plugin stays in (ops #503)")
             plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
                  f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
     except Exception as e:
@@ -49495,8 +49569,10 @@ def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
             plog(f"  ✓ {n}: menu entry '{label}' is in the built web app")
         for n, label in missing:
             plog(f"  ⚠ {n}: menu entry '{label}' is NOT in the built web app. The plugin files were copied but "
-                 f"did not make it into the build, so the menu item will not show. Likely cause: CloudTAK "
-                 f"changed where it builds plugins from (this happened in 13.102.0). Please report it with this log.")
+                 f"did not make it into the build, so the menu item will not show. Likely causes: a "
+                 f"Dockerfile.dockerignore or .dockerignore in the CloudTAK folder that leaves the plugin folders out "
+                 f"of the build (check that file first), or CloudTAK changed where it builds plugins from (this "
+                 f"happened in 13.102.0). Please report it with this log.")
         if not found and not missing:
             return None
         return not missing
@@ -49611,11 +49687,12 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 # plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
 # copy in shell, the functions above are sent as they are and run by the remote python3.
 _CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE',
+                     '_CT_DOCKERIGNORE_DISPATCHER_MARK')
 _CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                     '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                    '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
-                    '_cloudtak_shield_foreign_plugins')
+                    '_cloudtak_plugin_missing_deps', '_ct_dockerignore_leaves_out',
+                    '_cloudtak_keep_plugins_in_build', '_cloudtak_shield_foreign_plugins')
 
 
 def _cloudtak_shield_py():
