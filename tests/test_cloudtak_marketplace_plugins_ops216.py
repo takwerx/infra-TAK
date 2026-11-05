@@ -130,6 +130,7 @@ class PluginBox(Box):
         for n in ('cloudtak-api-1', 'cloudtak-media-1', 'cloudtak-postgis-1', 'cloudtak-events-1'):
             self.labels[n] = files
         self.media_image, self.api_ca, self.hls = 'ghcr.io/dfpc-coe/media-infra:v9.12.1', True, True
+        self.upload = True      # ops #502: the api's nginx.conf has the tileset rule
 
     def run(self, argv, **kw):
         if list(argv[:2]) == ['docker', 'ps'] and 'label=com.docker.compose.project=cloudtak' in argv:
