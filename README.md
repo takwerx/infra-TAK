@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.5-alpha)**
+**Current release: [v10.3.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,25 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.6-alpha — 2026-11-05 — Caddy security update; CloudTAK takes map uploads over 5 GB; quieter Guard Dog; Update Now retries a slow download
+
+**Headline: Caddy gets a security update. CloudTAK's tileset upload now takes map files over CloudTAK's own 5 GB limit (up to 25 GB). Guard Dog stops repeating the same client-visibility email every hour, no longer emails about a remote database box on a single blip, and its disk check runs in under a second. Update Now retries a slow download instead of failing.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.6-alpha))
+
+**Security.**
+- Security update for Caddy: Ubuntu boxes move to Caddy 2.11.8 or newer. Rocky/RHEL boxes stay on 2.11.7 until Caddy's RHEL package repo carries 2.11.8. The "Security update pending" email for Caddy now points to **Caddy page → Update**.
+
+**CloudTAK.**
+- Admin > Public Tiles upload takes files up to 25 GB (CloudTAK's own web server refused anything over 5 GB). Every other CloudTAK upload keeps the 5 GB limit. The upload is streamed, so a request without a login is refused before anything is written to disk (GH #398).
+
+**Guard Dog.**
+- The client visibility email backs off to once a day after 24 hours of the same state, and says how long the state has lasted. A new kind of problem alerts right away.
+- Two-server installs: the database-box SSH and password checks need 3 failures in a row (about 4-6 minutes) before emailing, and the email names the check that failed.
+- The disk I/O check runs in a single pass, under a second instead of minutes on a month of history.
+
+**Other fixes.**
+- Update Now retries a slow GitHub download up to 3 times and, if GitHub still doesn't answer, says so plainly with nothing changed. CloudTAK, Node-RED and Authentik image pulls retry a dropped connection, and a Docker Hub rate limit is named as such.
+- Relay guide: relays set up before TCP 9997 was added need it for CloudTAK video from a map marker; the guide says how to add it (GH #389).
 
 ### v10.3.5-alpha — 2026-11-04 — Rotate the intermediate CA without dropping every phone; Revoke is airtight; CloudTAK video and big map uploads work again
 
