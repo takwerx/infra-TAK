@@ -89,6 +89,7 @@ class Box:
         self.api_started = time.time() - 600
         self.up_rc = 0
         self.heal_ok = True
+        self.upload_heal_ok = True
         self.busy = None
         self.settings = {'guarddog_alert_email': 'ops@example.com'}
         self.takportal_recreate()
@@ -100,6 +101,7 @@ class Box:
                        'cloudtak-postgis-1': base,
                        'cloudtak-events-1': base.replace('marketplace', 'override')}
         self.media_image, self.api_ca, self.hls = STOCK_MEDIA, False, False
+        self.upload = False      # ops #502: every recreate of the api rewrites its nginx.conf
 
     def run(self, argv, **kw):
         argv = list(argv)
@@ -122,6 +124,9 @@ class Box:
             out = ''.join(f'{n}|{f}\n' for n, f in self.labels.items())
         elif argv[:2] == ['docker', 'ps'] and 'name=cloudtak-media' in argv:
             out = 'cloudtak-media-1\n'
+        elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1']:
+            # ops #502: self.upload is True (rule there), False (rule gone) or 'NOCONF' (stock file)
+            out = {True: 'OK', False: 'MISSING'}.get(self.upload, 'NOCONF') + '\n'
         elif argv[:2] == ['docker', 'exec']:
             out = ('ok' if self.hls else 'drift') + ' ok na\n'
         elif argv[:5] == ['docker', 'compose', 'up', '-d', '--force-recreate']:
@@ -133,6 +138,7 @@ class Box:
                                  for f in env['COMPOSE_FILE'].split(':'))
                 self.labels = {n: files for n in self.labels}
                 self.media_image, self.api_ca, self.hls = PINNED_MEDIA, True, False
+                self.upload = False
                 self.api_started = time.time()
         return types.SimpleNamespace(stdout=out, stderr='', returncode=rc)
 
@@ -141,6 +147,15 @@ class Box:
         if self.heal_ok:
             self.hls = True
         return self.heal_ok
+
+    def upload_heal(self, plog=None, remote_cfg=None, wait=False):
+        self.calls.append((['UPLOAD'], None))
+        if self.upload_heal_ok:
+            self.upload = True
+        return self.upload_heal_ok
+
+    def uploads(self):
+        return [c for c, _ in self.calls if c == ['UPLOAD']]
 
     def ns(self):
         fake_threading = types.SimpleNamespace(
@@ -162,7 +177,7 @@ class Box:
             '_patch_cloudtak_compose_ports': lambda d: self.calls.append((['PORTS'], d)) or False,
             '_docker_compose_pull': lambda *a, **k: self.calls.append((['PULL'], k.get('services'))) or True,
             '_cloudtak_media_hls_heal': self.heal,
-            '_cloudtak_upload_limit_heal': lambda *a, **k: True,   # ops #470
+            '_cloudtak_upload_limit_heal': self.upload_heal,   # ops #470, #502
             '_write_priv': lambda path, content, mode='w', perm=None: self.guard_log.append((path, content, mode)),
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
@@ -173,7 +188,7 @@ class Box:
         src = '\n\n'.join(
             [_assign(n) for n in (
                 '_CT_ENV_LINE_RE', 'CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_CUSTOM_COMPOSE_SEED',
-                '_CLOUDTAK_TAKPORTAL_CSP_COMPOSE', '_CT_MEDIA_CHECK_SH',
+                '_CLOUDTAK_TAKPORTAL_CSP_COMPOSE', '_CT_MEDIA_CHECK_SH', '_CT_NGINX_UPLOAD_CHECK_SH',
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
@@ -236,6 +251,7 @@ def test_drift_after_a_takportal_install_is_found(box):
     assert drift['kind'] == 'recreate'
     assert drift['no_override'] == ['cloudtak-api-1', 'cloudtak-media-1', 'cloudtak-postgis-1']
     assert drift['hls'] is False and drift['api_ca'] is False and drift['media_image'] == STOCK_MEDIA
+    assert drift['upload'] is False
 
 
 def test_drift_is_repaired_through_the_console_restart_path(box):
@@ -252,6 +268,7 @@ def test_drift_is_repaired_through_the_console_restart_path(box):
              and (c[0] != 'docker' or c[:3] == ['docker', 'compose', 'up'])]
     assert order == ['PORTS', 'PULL', 'docker', 'HEAL']  # ports re-asserted before the recreate
     assert box.media_image == PINNED_MEDIA and box.api_ca is True and box.hls is True
+    assert box.upload is True and len(box.uploads()) == 1   # ops #502: the recreate path puts it back too
     assert box.record()['last']['result'] == 'repaired'
     assert not box.pending()                             # journaled recreate finished
     assert box.request()['state'] == 'ok'
@@ -299,9 +316,10 @@ def test_hls_only_drift_gets_the_media_heal_not_a_recreate(box):
     box.labels = {n: f'{box.ct}/docker-compose.yml,{box.ct}/docker-compose.override.yml'
                   for n in box.labels}
     box.media_image, box.api_ca = PINNED_MEDIA, True
+    box.upload = True
     assert box.request()['state'] == 'repairing'
     box.finish()
-    assert box.ups() == [] and box.hls is True
+    assert box.ups() == [] and box.hls is True and box.uploads() == []
     assert box.record()['last']['result'] == 'repaired'
     assert box.mails == []
     assert 're-applied the HLS profile to cloudtak-media' in box.guard_log[0][1]
@@ -311,8 +329,64 @@ def test_clean_box_is_ok_and_does_nothing(box):
     box.labels = {n: f'{box.ct}/docker-compose.yml,{box.ct}/docker-compose.override.yml'
                   for n in box.labels}
     box.hls = True
+    box.upload = True
     assert box.request()['state'] == 'ok'
     assert box.threads == [] and box.ups() == [] and box.record() == {}
+
+
+# ── console: only the tileset upload rule is gone (ops #502) ─────────────────
+
+def _converged(box):
+    """Everything infra-TAK owns is in place: the state after a console restart."""
+    box.labels = {n: f'{box.ct}/docker-compose.yml,{box.ct}/docker-compose.override.yml'
+                  for n in box.labels}
+    box.media_image, box.api_ca, box.hls, box.upload = PINNED_MEDIA, True, True, True
+
+
+def test_upload_rule_gone_alone_is_drift_and_gets_only_the_upload_heal(box):
+    # A TAK Portal plugin install/update recreates the api; its nginx.conf comes back without the
+    # 25G rule (test12, v10.3.6 T&E: 413 on a 6 GiB upload until a console restart). Nothing else
+    # drifts here, so before ops #502 this answered "ok" and the rule stayed gone.
+    _converged(box)
+    box.upload = False
+    assert box.request()['state'] == 'repairing'
+    box.finish()
+    assert box.ups() == [] and box.threads == []            # no recreate, no media restart
+    assert [c[0] for c, _ in box.calls if c[0] in ('HEAL', 'UPLOAD')] == ['UPLOAD']
+    assert box.upload is True
+    assert box.record()['last']['result'] == 'repaired'
+    assert box.mails == []
+    assert 'tileset upload limit missing' in box.guard_log[0][1]
+    assert "re-applied the 25G tileset upload limit" in box.guard_log[0][1]
+    assert box.request()['state'] == 'ok'                   # and the next check is clean
+
+
+def test_upload_rule_gone_with_the_hls_profile_gets_both_heals(box):
+    _converged(box)
+    box.hls = box.upload = False
+    assert box.request()['state'] == 'repairing'
+    box.finish()
+    assert box.ups() == [] and box.hls is True and box.upload is True
+    assert box.record()['last']['result'] == 'repaired'
+
+
+def test_a_stock_or_unreadable_nginx_conf_is_not_drift(box):
+    # nginx.conf.js has not written the real config yet (or the exec failed): never counted.
+    _converged(box)
+    box.upload = 'NOCONF'
+    assert box.request()['state'] == 'ok'
+    assert box.threads == [] and box.uploads() == [] and box.record() == {}
+
+
+def test_upload_heal_that_does_not_confirm_is_a_failure(box):
+    _converged(box)
+    box.upload = False
+    box.upload_heal_ok = False
+    box.request()
+    box.finish()
+    last = box.record()['last']
+    assert last['result'] == 'failed' and 'upload limit did not re-apply' in last['detail']
+    assert box.guard_log == []                               # no "repaired" line for a failure
 
 
 # ── console: a TAK Portal install still running → wait ───────────────────────
@@ -433,6 +507,11 @@ def test_endpoint_is_exempt_from_the_browser_csrf_check():
 
 PROFILE = 'hlsVariant: mpegts\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n'
 STOCK = 'hlsVariant: fmp4\nhlsSegmentCount: 7\nhlsSegmentDuration: 1s\n'
+# ops #502: the api container's /etc/nginx/nginx.conf as nginx.conf.js writes it, with and without
+# infra-TAK's rule, and the stock file that is there for a moment at container start
+NGINX_NO_RULE = 'http {\n  server {\n    location ~ ^/api(?:/(.*))?$ {\n      proxy_pass http://127.0.0.1:5001;\n    }\n  }\n}\n'
+NGINX_WITH_RULE = NGINX_NO_RULE.replace('    location ~', '    location = /api/server/tileset {\n      client_max_body_size 25G;\n    }\n    location ~')
+NGINX_STOCK = 'user nginx;\nhttp {\n  server {\n    location / {\n    }\n  }\n}\n'
 
 
 @pytest.fixture
@@ -456,9 +535,10 @@ def gd(tmp_path):
         '#!/bin/sh\necho "docker $*" >> %(calls)s\n'
         'case "$1" in\n'
         '  inspect) case "$*" in *com.docker.compose.project*) echo cloudtak ;; esac; exit 0 ;;\n'
-        '  exec) cat %(yml)s; exit 0 ;;\n'
+        '  exec) case "$*" in *cloudtak-api-1*) cat %(nginx)s ;; *) cat %(yml)s ;; esac; exit 0 ;;\n'
         '  ps) case "$*" in *label=*) cat %(labels)s ;; *) echo "Up 3 hours" ;; esac ;;\n'
-        'esac\nexit 0\n' % {'calls': calls, 'yml': tmp_path / 'media.yml', 'labels': tmp_path / 'labels'})
+        'esac\nexit 0\n' % {'calls': calls, 'yml': tmp_path / 'media.yml', 'labels': tmp_path / 'labels',
+                                'nginx': tmp_path / 'nginx.conf'})
     (stubs / 'docker').chmod(0o755)
     # curl: answer from $tmp/console (empty file = no answer, like a console that is down)
     (stubs / 'curl').write_text(
@@ -475,8 +555,9 @@ def gd(tmp_path):
     clean = f'{ct}/docker-compose.yml,{ct}/docker-compose.override.yml'
     takportal = f'{ct}/docker-compose.yml,{ct}/docker-compose.marketplace.yml'
 
-    def tick(yml=STOCK, labels=None, console=None):
+    def tick(yml=STOCK, labels=None, console=None, nginx=NGINX_WITH_RULE):
         (tmp_path / 'media.yml').write_text(yml)
+        (tmp_path / 'nginx.conf').write_text(nginx)
         rows = labels if labels is not None else {'cloudtak-api-1': takportal, 'cloudtak-media-1': takportal}
         (tmp_path / 'labels').write_text(''.join(f'{n}|{f}\n' for n, f in rows.items()))
         (tmp_path / 'console').write_text(json.dumps(console) if console else '')
@@ -569,3 +650,43 @@ def test_gd_without_an_override_file_nothing_is_flagged(gd, tmp_path):
     gd(yml=PROFILE)
     calls = gd(yml=PROFILE)
     assert _alerts(calls) == [] and _repair_calls(calls) == [] and 'drift' not in gd.log()
+
+
+# ── Guard Dog: the tileset upload rule (ops #502) ────────────────────────────
+
+def test_gd_upload_rule_gone_alone_is_drift(gd):
+    # HLS fine, the override is loaded, only the api's nginx.conf lost the 25G rule.
+    labels = {'cloudtak-api-1': gd.clean, 'cloudtak-media-1': gd.clean}
+    calls = gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE)
+    assert _alerts(calls) == [] and _repair_calls(calls) == []        # first sight: wait a check
+    assert 'tileset upload limit' in gd.log() and 'MISSING' not in gd.log()
+    calls = gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE, console={'state': 'repairing'})
+    assert len(_repair_calls(calls)) == 1 and _alerts(calls) == []
+
+
+def test_gd_upload_rule_that_cannot_be_put_back_alarms_with_the_settings_subject(gd):
+    labels = {'cloudtak-api-1': gd.clean, 'cloudtak-media-1': gd.clean}
+    gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE)
+    alerts = _alerts(gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE, console={'state': 'failed'}))
+    assert len(alerts) == 1 and alerts[0].startswith('alert Guard Dog: CloudTAK settings drift on ')
+    assert 'large-upload (tileset) limit' in gd.body() and 'location = /api/server/tileset' in gd.body()
+
+
+def test_gd_repaired_upload_rule_clears_without_any_alarm(gd):
+    labels = {'cloudtak-api-1': gd.clean, 'cloudtak-media-1': gd.clean}
+    gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE)
+    gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE, console={'state': 'repairing'})
+    calls = gd(yml=PROFILE, labels=labels)                            # the rule is back
+    assert _alerts(calls) == [] and _repair_calls(calls) == []
+    assert not (gd.state / 'cloudtak_media_drift_pending').exists()
+
+
+def test_gd_stock_nginx_conf_is_not_drift_and_does_not_clear_an_open_episode(gd):
+    labels = {'cloudtak-api-1': gd.clean, 'cloudtak-media-1': gd.clean}
+    calls = gd(yml=PROFILE, labels=labels, nginx=NGINX_STOCK)         # container just started
+    assert _alerts(calls) == [] and (not (gd.state / 'cloudtak_media_drift_pending').exists())
+    gd(yml=PROFILE, labels=labels, nginx=NGINX_NO_RULE)               # a real episode opens
+    assert (gd.state / 'cloudtak_media_drift_pending').exists()
+    gd(yml=PROFILE, labels=labels, nginx=NGINX_STOCK)                 # api restarting: unknown
+    assert (gd.state / 'cloudtak_media_drift_pending').exists()       # neither starts nor clears
+    assert 'upload limit UNKNOWN' in gd.log()
