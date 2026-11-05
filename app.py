@@ -48344,6 +48344,13 @@ awk '/location ~ \^\/api/ && !done {
   || { cp "$f.ops470.bak" "$f"; echo FAIL; }
 rm -f "$f.ops470.bak"
 '''
+# ops #502: read-only twin of the script above, for the drift check. OK = the rule is there, MISSING =
+# the real config is written but the rule is not, NOCONF = nginx.conf.js has not written it yet (the
+# stock file has no `location ~ ^/api`), which is never counted as drift.
+_CT_NGINX_UPLOAD_CHECK_SH = r'''f=/etc/nginx/nginx.conf
+grep -q 'location = /api/server/tileset' "$f" 2>/dev/null && { echo OK; exit 0; }
+grep -q 'location ~ ^/api' "$f" 2>/dev/null && echo MISSING || echo NOCONF
+'''
 
 
 def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
@@ -103183,23 +103190,30 @@ _cloudtak_autorepair_lock = threading.Lock()
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'print'|'media'|'', 'no_override': [names], 'print': [names],
-     'hls': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'upload'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'upload': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
     recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
     — restarting that one container fixes it. 'media': only the HLS profile is gone — the media
     heal alone fixes that. hls None means the read failed, which is never counted as drift
-    (ops #161)."""
+    (ops #161). 'upload' (ops #502): only the 25G /api/server/tileset rule is gone from the api's
+    nginx.conf, which any recreate of the api (a TAK Portal plugin install or update) rewrites —
+    the upload-limit heal alone fixes that. upload None = could not read, or nginx.conf.js has
+    not written the real config yet: not drift."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
            'print': _cloudtak_print_drift(ct_dir),
-           'hls': None, 'media_image': '', 'api_ca': None}
+           'hls': None, 'upload': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
         chk = _ct_docker_out(['exec', '-i', media, 'sh'], timeout=25, stdin=_CT_MEDIA_CHECK_SH)
         if chk and chk.strip():
             out['hls'] = _ct_media_converged(chk)
         out['media_image'] = (_ct_docker_out(['inspect', media, '--format', '{{.Config.Image}}']) or '').strip()
+    chk = _ct_docker_out(['exec', '-i', 'cloudtak-api-1', 'sh'], timeout=25, stdin=_CT_NGINX_UPLOAD_CHECK_SH)
+    chk = (chk or '').strip().splitlines()[-1:] or ['']
+    if chk[0] in ('OK', 'MISSING'):
+        out['upload'] = chk[0] == 'OK'
     env = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{json .Config.Env}}'])
     if env:
         try:
@@ -103212,6 +103226,8 @@ def _cloudtak_drift(ct_dir):
         out['kind'] = 'print'
     elif out['hls'] is False:
         out['kind'] = 'media'
+    elif out['upload'] is False:
+        out['kind'] = 'upload'
     return out
 
 
@@ -103224,6 +103240,8 @@ def _cloudtak_drift_summary(d):
         parts.append("Print started without infra-TAK's /print-api settings: " + ', '.join(d['print']))
     if d.get('hls') is False:
         parts.append('HLS profile missing')
+    if d.get('upload') is False:
+        parts.append('tileset upload limit missing')
     if d.get('media_image'):
         parts.append(f"media image {d['media_image']}")
     if d.get('api_ca') is not None:
@@ -103338,8 +103356,9 @@ def _cloudtak_autorepair_run(ct_dir, drift):
     to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
     operator's custom file stay in it), re-assert the loopback port patch on the base file (the
     recreate must never publish a port we closed), then the journaled recreate + media heal.
-    'media': the media heal alone. 'print' (ops #222): Print restarted with infra-TAK's overlay
-    (plus the media heal if that is gone too); every kind ends with that step. Success is judged
+    'media': the media heal alone. 'upload' (ops #502): the upload-limit heal alone (it also runs
+    after any of the other kinds when the rule is gone too). 'print' (ops #222): Print restarted
+    with infra-TAK's overlay (plus the media heal if that is gone too); every kind ends with that step. Success is judged
     by a fresh drift check, not by exit codes."""
     def _log(m):
         print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
@@ -103358,6 +103377,11 @@ def _cloudtak_autorepair_run(ct_dir, drift):
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
         elif drift['kind'] == 'media' or drift.get('hls') is False:
             why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+        # ops #502: the 'recreate' kind got the upload rule back through _cloudtak_recreate_and_heal;
+        # every other kind that found it gone puts it back here. Check-before-apply, so a no-op if present.
+        if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
+            if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
+                why = 'the tileset upload limit did not re-apply'
         # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
         # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
         if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
@@ -103393,7 +103417,8 @@ def _cloudtak_autorepair_notify(before, after):
         done = {'recreate': "rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK "
                             "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
                             "the HLS profile",
-                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api"
+                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api",
+                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx"
                 }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | repaired automatically, "
                 f"nothing to do (likely a TAK Portal marketplace install) | "

@@ -187,6 +187,7 @@ def test_console_only_waiting_answers_carry_busy(box, field):
         box.labels = {n: f'{box.ct}/docker-compose.yml,{box.ct}/docker-compose.override.yml'
                       for n in box.labels}
         box.hls = True
+        box.upload = True       # ops #502
     elif field == 'failed':
         (box.ct / 'COMPROMISE-DETECTED.txt').write_text('x')
     r = box.request()
