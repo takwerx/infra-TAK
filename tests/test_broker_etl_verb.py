@@ -175,3 +175,25 @@ def test_etl_setup_takes_no_fields(m):
     assert m._evaluate({'op': 'etl_setup', 'user': 'root'})[0] == 'DENY'
     with pytest.raises(m.Denied):
         m._do_etl_setup({'op': 'etl_setup', 'user': 'root'})
+
+
+def test_a_refused_stop_is_audited_as_deny_only(m, monkeypatch):
+    """etlspike 2026-11-05: a stop of a non-ETL container logged ALLOW, then DENY 'None'."""
+    lines = []
+    monkeypatch.setattr(m, 'audit', lambda peer, op, summary, verdict, detail='': lines.append((op, summary, verdict)))
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): {'Config': {'Labels': {}}})
+    r = m._etl_dispatch({'op': 'etl', 'action': 'stop', 'id': 'a' * 64}, (1, 997, 996))
+    assert r['code'] == 'DENIED'
+    assert lines == [('etl', 'stop id=' + 'a' * 64, 'DENY')]
+
+
+def test_a_docker_failure_is_audited_once_with_the_summary(m, monkeypatch):
+    lines = []
+    monkeypatch.setattr(m, 'audit', lambda peer, op, summary, verdict, detail='': lines.append((summary, verdict)))
+
+    def boom(*a, **k):
+        raise RuntimeError('docker down')
+    monkeypatch.setattr(m, '_etl_list', boom)
+    with pytest.raises(m._EtlAudited):
+        m._etl_dispatch(_run(), (1, 997, 996))
+    assert lines == [('run fn=test-layer-7 image=etl-local:etl-geojson-v2.13.0 mem=512', 'ERROR')]

@@ -4027,10 +4027,27 @@ def _etl_dispatch(req, peer):
     if verdict == 'DENY':
         audit(peer, 'etl', _etl_summary(req), 'DENY', reason)
         return {'ok': False, 'code': 'DENIED', 'error': reason}
-    # Runs happen every minute per layer; audit what changes state, not every read.
+    # Runs happen every minute per layer; audit what changes state, not every read — and
+    # audit the OUTCOME: stop's ownership check runs inside _do_etl, so logging ALLOW up
+    # front recorded refused stops as allowed (seen live on etlspike, 2026-11-05).
+    try:
+        resp = _do_etl(req)
+    except Denied as d:
+        audit(peer, 'etl', _etl_summary(req), 'DENY', str(d))
+        return {'ok': False, 'code': 'DENIED', 'error': str(d)}
+    except Exception as e:  # noqa: BLE001 — recorded here with the real summary, then re-raised
+        audit(peer, 'etl', _etl_summary(req), 'ERROR', f'{type(e).__name__}: {e}'[:300])
+        raise _EtlAudited(e)
     if req.get('action') in ETL_MUTATING:
-        audit(peer, 'etl', _etl_summary(req), 'ALLOW')
-    return _do_etl(req)
+        audit(peer, 'etl', _etl_summary(req), 'ALLOW' if resp.get('ok') else 'ERROR',
+              '' if resp.get('ok') else str(resp.get('error'))[:300])
+    return resp
+
+
+class _EtlAudited(Exception):
+    """An ETL failure already written to the audit log; the handler must not log it twice."""
+    def __init__(self, inner):
+        super().__init__(f'{type(inner).__name__}: {inner}')
 
 
 def _evaluate(req):
@@ -4296,6 +4313,8 @@ class _Handler(socketserver.BaseRequestHandler):
         except subprocess.TimeoutExpired:
             resp = {'ok': False, 'code': 'TIMEOUT', 'error': 'command timed out'}
             audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', 'command timed out')
+        except _EtlAudited as e:
+            resp = {'ok': False, 'code': 'ERROR', 'error': str(e)}
         except Exception as e:  # noqa: BLE001 — broker must never crash a worker thread
             resp = {'ok': False, 'code': 'ERROR', 'error': f'{type(e).__name__}: {e}'}
             audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', f'{type(e).__name__}: {e}')
