@@ -16,7 +16,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import { randomUUID, createHash } from 'node:crypto';
 import {
-    compile, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
+    compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO,
 } from './lib.mjs';
 
@@ -34,6 +34,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---- state ----
 let stacks = {};            // StackName -> { id, status, created, desc, fn }
 try { stacks = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { /* fresh */ }
+for (const [name, s] of Object.entries(stacks)) {
+    const fn = normalizeFn(s?.fn);
+    if (fn) s.fn = fn; else { log(`state: dropping stack ${name} (not a runnable ETL function)`); delete stacks[name]; }
+}
 function save() {
     try {
         const tmp = `${STATE}.tmp`;
@@ -177,7 +181,7 @@ async function invokeNow(fnName, payload, type) {
     try {
         if (c) { clearTimeout(c.idle); delete warm[fnName]; }
         if (c && c.image !== fn.Image) { await stopContainer(c); c = null; }
-        if (!c) { c = await startContainer(fn); cold = true; }
+        if (!c) { cold = true; c = await startContainer(fn); }
         const body = Buffer.from(JSON.stringify(payload ?? {}));
         for (let i = 0; i < 100; i++) {          // RIE needs a moment to listen after a cold start
             try { result = await post(c.ip, body, fn.Timeout * 1000 + 2000); break; }

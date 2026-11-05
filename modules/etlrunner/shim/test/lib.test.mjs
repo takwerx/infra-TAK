@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     compile, ValidationError, rateMs, parseCron, cronMatch, field, warmBudgetMb, wantsWarm, planEviction,
-    parseLogLines, parseSubnet, inSubnet, clampMem, TASK_RE,
+    parseLogLines, parseSubnet, inSubnet, clampMem, TASK_RE, normalizeFn,
 } from '../lib.mjs';
 
 const tmpl = (over = {}) => JSON.stringify({
@@ -112,4 +112,14 @@ test('log lines and the ETL-subnet guard', () => {
     assert.ok(!inSubnet('172.31.0.1', net));
     assert.ok(!inSubnet('fe80::1', net));
     assert.throws(() => parseSubnet('nope'));
+});
+
+test('normalizeFn: state from the spike (numeric env) is fixed; non-ETL images dropped', () => {
+    const fn = normalizeFn({ FunctionName: 'test-layer-13', Image: 'etl-local:etl-geojson-v2.13.0', Env: { ETL_LAYER: 13, X: null }, MemorySize: 64, Timeout: 'x' });
+    assert.deepEqual(fn.Env, { ETL_LAYER: '13', X: '' });
+    assert.equal(fn.MemorySize, 128);
+    assert.equal(fn.Timeout, 60);
+    assert.equal(normalizeFn({ FunctionName: 'a', Image: 'alpine:latest' }), null);
+    assert.equal(normalizeFn({ FunctionName: '../a', Image: 'etl-local:etl-a-v1.0.0' }), null);
+    assert.equal(normalizeFn(null), null);
 });

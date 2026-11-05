@@ -75,6 +75,19 @@ export function compile(name, templateBody, paramList, etlApi) {
     };
 }
 
+// A function record loaded from /data (written by an older shim, or edited by hand) gets the
+// same normalization compile() applies, or is dropped: the broker refuses anything else anyway,
+// and a refused run every minute is noise, not safety. Returns the fixed fn, or null.
+export function normalizeFn(fn) {
+    if (!fn || typeof fn !== 'object') return null;
+    const image = String(fn.Image || '');
+    if (!image.startsWith(`${REPO}:`) || !TASK_RE.test(image.slice(REPO.length + 1))) return null;
+    if (!FN_RE.test(String(fn.FunctionName || ''))) return null;
+    const env = {};
+    for (const [k, v] of Object.entries(fn.Env || {})) env[k] = v === null || v === undefined ? '' : String(v);
+    return { ...fn, Env: env, MemorySize: clampMem(fn.MemorySize), Timeout: Math.min(900, Math.max(1, Number(fn.Timeout) || 60)) };
+}
+
 // ---- schedules: EventBridge semantics, UTC ----
 export function rateMs(expr) {
     const m = /^rate\((\d+)\s+(second|minute|hour|day)s?\)$/.exec(String(expr).trim());
