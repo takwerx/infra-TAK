@@ -308,7 +308,7 @@ def load_job(ctx, job, path, info):
         plog(f'✓ {free // (1 << 30)} GiB free')
 
         plog('')
-        plog('━━━ Step 3/4: Loading the image (about a minute) ━━━')
+        plog('━━━ Step 3/4: Loading the image (a few minutes) ━━━')
         r = _docker(ctx, 'image', 'load', '--input', path, timeout=900)
         out = ((r.stdout or '') + (r.stderr or '')).strip()
         if r.returncode != 0:
