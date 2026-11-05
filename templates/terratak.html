@@ -1,0 +1,194 @@
+{% extends 'base.html' %}
+{% block title %}TerraTAK — infra-TAK{% endblock %}
+{% block page_css %}<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}.btn-danger:disabled{opacity:.4;cursor:not-allowed}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}.btn-secondary:disabled{opacity:.4;cursor:not-allowed}
+.mono{font-family:'JetBrains Mono',monospace}
+.note{font-size:12px;color:var(--text-dim);line-height:1.5}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:300px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:13px}
+.kv .k{color:var(--text-dim);font-size:12px}
+.kv .v{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-primary);word-break:break-all}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:900px){.grid2{grid-template-columns:1fr}}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.drop{border:1px dashed var(--border);border-radius:10px;padding:26px;text-align:center;background:#0a0e1a}
+.bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:12px;display:none}
+.bar>div{height:100%;width:0;background:linear-gradient(90deg,#1e40af,#0e7490);transition:width .2s}
+.banner{background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.3);border-radius:10px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.warn{color:var(--yellow)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:440px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
+.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:16px;line-height:1.6}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;padding:9px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+</style>{% endblock %}
+{% block content %}<div class="main">
+
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <span style="font-size:44px;line-height:1">&#x1F5FA;</span>
+  <div>
+    <div class="mono" style="font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">TERRATAK</div>
+    <div class="note">TAK Product Center tile server: a searchable imagery, terrain and vector repository, streamed to ATAK as on-demand tiles.</div>
+  </div>
+</div>
+
+{# ── Upload card: shown until deployed, and as the update path afterwards ── #}
+{% set has_image = info.get('image') %}
+{% if not tt.get('installed') %}
+<div class="card">
+  <div class="card-title">{% if has_image %}Image loaded{% else %}Step 1 — Upload the TerraTAK image{% endif %}</div>
+  {% if has_image %}
+  <div class="kv" style="margin-bottom:16px">
+    <div class="k">Image</div><div class="v">{{ info.image|e }} ({{ info.arch|e }})</div>
+    <div class="k">sha256</div><div class="v">{{ info.tar_sha256|e }}{% if info.known_release %} <span style="color:var(--green)">✓ tak.gov release</span>{% else %} <span class="warn">unrecognized build</span>{% endif %}</div>
+    <div class="k">Loaded</div><div class="v">{{ info.loaded_at|e }}</div>
+  </div>
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if job_running %}disabled{% endif %}><span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy</button>
+  <span class="note" style="margin-left:12px">Runs non-root with a read-only filesystem; every request needs a login.</span>
+  <div class="note" style="margin-top:16px">Wrong file? Upload another one below — it replaces this one.</div>
+  {% else %}
+  <p style="color:var(--text-secondary);font-size:13px;line-height:1.6;margin-bottom:14px">
+    TerraTAK is distributed by the TAK Product Center on <a href="https://tak.gov" target="_blank" rel="noopener" style="color:var(--cyan)">tak.gov</a> and needs your tak.gov account to download.
+    Download the <strong>{{ host_arch|e }}</strong> archive (e.g. <span class="mono">terratak-0.8.3-{{ host_arch|e }}.tar</span>) and upload it here unchanged. This console never downloads it for you.
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if tt.get('installed') %}
+{% if info.get('image') and info.get('image') != info.get('deployed_image') %}
+<div class="banner">
+  <span style="color:var(--cyan);font-size:13px;font-weight:600">⬆ {{ info.image|e }} is loaded; {{ info.deployed_image|e }} is running. Redeploy to switch.</span>
+  <button class="btn btn-primary" style="font-size:11px;margin-left:auto" id="deployBtn" onclick="startDeploy()" {% if job_running %}disabled{% endif %}>Redeploy</button>
+</div>
+{% endif %}
+<div class="grid2" style="margin-bottom:16px">
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Status</div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+      <span class="dot" style="background:{% if tt.get('running') and tt.get('health') == 'healthy' %}var(--green){% elif tt.get('running') %}var(--yellow){% else %}var(--red){% endif %}"></span>
+      <span style="font-weight:600">{% if tt.get('running') %}Running{% if tt.get('health') %} · {{ tt.health|e }}{% endif %}{% else %}Stopped{% endif %}</span>
+      <span class="mono note" style="margin-left:auto">{{ info.deployed_image|e }}</span>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" style="font-size:11px" onclick="control('start')">Start</button>
+      <button class="btn btn-danger" style="font-size:11px" onclick="control('stop')">Stop</button>
+      <button class="btn btn-secondary" style="font-size:11px" onclick="control('restart')">Restart</button>
+      <button class="btn btn-danger" style="font-size:11px;margin-left:auto" onclick="openUninstall()">Remove</button>
+    </div>
+    <div class="note" id="diskLine" style="margin-top:12px"></div>
+  </div>
+  <div class="card" style="margin-bottom:0">
+    <div class="card-title">Deployment</div>
+    <div class="kv">
+      <div class="k">Endpoint</div><div class="v">127.0.0.1:8095 <span class="note">(local only — not published yet)</span></div>
+      <div class="k">Deployed</div><div class="v">{{ info.deployed_at|e }}</div>
+      <div class="k">Rollback image</div><div class="v">{{ info.previous_image or '—' }}</div>
+      <div class="k">Image sha256</div><div class="v">{{ (info.tar_sha256 or '')[:16]|e }}…{% if info.known_release %} <span style="color:var(--green)">✓ tak.gov</span>{% endif %}</div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title">{% if tt.get('installed') %}Update — upload a newer TerraTAK image{% elif has_image %}Upload a different image{% else %}Upload{% endif %}</div>
+  <div class="drop">
+    <span class="material-symbols-outlined" style="font-size:32px;color:var(--text-dim);margin-bottom:8px;display:block">upload</span>
+    <input type="file" id="tarFile" accept=".tar,application/x-tar" style="display:none" onchange="pickFile(this)">
+    <button class="btn btn-secondary" onclick="document.getElementById('tarFile').click()" id="pickBtn" {% if job_running %}disabled{% endif %}>Choose .tar file</button>
+    <div class="note" id="fileName" style="margin-top:10px">Only a single <span class="mono">terratak:&lt;version&gt;</span> image for {{ host_arch|e }} is accepted.</div>
+    <div class="bar" id="bar"><div id="barFill"></div></div>
+    <div id="uploadMsg" style="margin-top:10px;font-size:13px"></div>
+  </div>
+</div>
+
+<div class="card" id="logCard" {% if not job_log and not job_running %}style="display:none"{% endif %}>
+  <div class="card-title">Job log</div>
+  <div class="log-box" id="logBox">{% for line in job_log %}<div>{{ line|e }}</div>{% endfor %}</div>
+  <div id="jobError" style="{% if not job_error %}display:none;{% endif %}margin-top:12px;color:var(--red);font-size:13px">✗ Failed — see log above.</div>
+</div>
+
+{% if tt.get('installed') %}
+<div class="card">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px"><span class="card-title" style="margin:0">Container log</span><button class="btn btn-secondary" style="font-size:11px" onclick="fetchLogs()">Refresh</button></div>
+  <div class="log-box" id="ctrLog">Loading…</div>
+</div>
+
+<div class="modal-overlay" id="tt-uninstall-modal">
+<div class="modal">
+<h3>⚠ Remove TerraTAK?</h3>
+<p>Stops and removes the container, every loaded TerraTAK image, and the generated config. Your tilesets and source data stay in the <span class="mono">terratak-data</span> volume unless you tick the box.</p>
+<label style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--text-secondary);margin-bottom:12px"><input type="checkbox" id="tt-delete-data"> Also delete all tile and source data (cannot be undone)</label>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="tt-uninstall-password" type="password" placeholder="Confirm your password" autocomplete="off">
+<div class="modal-actions">
+<button type="button" class="btn btn-secondary" id="tt-uninstall-cancel" onclick="document.getElementById('tt-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="btn btn-danger" id="tt-uninstall-confirm" onclick="doUninstall()">Remove</button>
+</div>
+<div id="tt-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div>
+</div>
+{% endif %}
+</div>
+
+<script>
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+async function api(path, opts){ opts=opts||{}; opts.credentials='same-origin'; if(opts.body && !(opts.body instanceof FormData)){ opts.headers=Object.assign({'Content-Type':'application/json'}, opts.headers||{}); }
+  const r=await fetch(path, opts); let d={}; try{ d=await r.json(); }catch(e){ d={error:'HTTP '+r.status}; } return {ok:r.ok, d:d}; }
+
+let polling=false;
+function showLog(){ document.getElementById('logCard').style.display=''; }
+function poll(){
+  if(!polling) return;
+  api('/api/terratak/log').then(r=>{ const d=r.d; const box=document.getElementById('logBox');
+    box.innerHTML=(d.entries||[]).map(l=>'<div>'+esc(l)+'</div>').join(''); box.scrollTop=box.scrollHeight;
+    if(d.complete){ polling=false; setTimeout(()=>location.reload(),2000); }
+    else if(d.error&&!d.running){ polling=false; document.getElementById('jobError').style.display=''; ['deployBtn','pickBtn'].forEach(id=>{const b=document.getElementById(id); if(b) b.disabled=false;}); }
+    else setTimeout(poll,1500);
+  }).catch(()=>setTimeout(poll,3000));
+}
+function startDeploy(){
+  const b=document.getElementById('deployBtn'); if(b) b.disabled=true; showLog(); document.getElementById('jobError').style.display='none';
+  api('/api/terratak/deploy',{method:'POST',body:'{}'}).then(r=>{ if(r.d.success){ polling=true; poll(); } else { alert('Deploy failed: '+(r.d.error||'unknown')); if(b) b.disabled=false; } });
+}
+function pickFile(inp){
+  const f=inp.files[0]; if(!f) return; const msg=document.getElementById('uploadMsg');
+  if(!f.name.toLowerCase().endsWith('.tar')){ msg.innerHTML='<span style="color:var(--red)">✗ Pick the .tar archive from tak.gov.</span>'; return; }
+  if(f.size>2*1024*1024*1024){ msg.innerHTML='<span style="color:var(--red)">✗ Larger than the console\'s 2 GiB upload limit.</span>'; return; }
+  document.getElementById('fileName').textContent=f.name+' — '+(f.size/1048576).toFixed(0)+' MiB';
+  document.getElementById('pickBtn').disabled=true; const bar=document.getElementById('bar'), fill=document.getElementById('barFill'); bar.style.display='block';
+  const fd=new FormData(); fd.append('file', f);
+  const x=new XMLHttpRequest(); x.open('POST','/api/terratak/upload'); x.withCredentials=true;
+  x.upload.onprogress=e=>{ if(e.lengthComputable){ fill.style.width=(e.loaded*100/e.total).toFixed(1)+'%'; msg.textContent='Uploading… '+(e.loaded*100/e.total).toFixed(0)+'%'; if(e.loaded===e.total) msg.textContent='Checking the archive…'; } };
+  x.onload=()=>{ let d={}; try{ d=JSON.parse(x.responseText); }catch(e){ d={error:'HTTP '+x.status}; }
+    if(x.status===200&&d.success){ msg.innerHTML='<span style="color:var(--green)">✓ '+esc(d.image)+' ('+esc(d.arch)+') accepted — loading into Docker…</span>'; showLog(); polling=true; poll(); }
+    else { msg.innerHTML='<span style="color:var(--red)">✗ '+esc(d.error||('HTTP '+x.status))+'</span>'; document.getElementById('pickBtn').disabled=false; bar.style.display='none'; fill.style.width='0'; } };
+  x.onerror=()=>{ msg.innerHTML='<span style="color:var(--red)">✗ Upload failed (connection dropped).</span>'; document.getElementById('pickBtn').disabled=false; };
+  x.send(fd);
+}
+{% if job_running %}polling=true; poll();{% endif %}
+{% if tt.get('installed') %}
+function control(action){ api('/api/terratak/control',{method:'POST',body:JSON.stringify({action:action})}).then(r=>{ if(r.d.success) setTimeout(()=>location.reload(),2000); else alert(r.d.output||r.d.error||'Failed'); }); }
+function fetchLogs(){ api('/api/terratak/logs').then(r=>{ const box=document.getElementById('ctrLog'); box.innerHTML=(r.d.lines||[]).map(l=>'<div>'+esc(l)+'</div>').join('')||'<div class="note">(no log lines)</div>'; box.scrollTop=box.scrollHeight; }); }
+function loadStatus(){ api('/api/terratak/status').then(r=>{ const p=r.d.disk_used_pct; if(p==null) return; const el=document.getElementById('diskLine');
+  el.innerHTML='Root disk '+p+'% used'+(p>80?' — <span class="warn">above 80%: imagery and tilesets live on this disk</span>':''); }); }
+function openUninstall(){ document.getElementById('tt-uninstall-msg').textContent=''; document.getElementById('tt-uninstall-password').value=''; document.getElementById('tt-uninstall-modal').classList.add('open'); }
+async function doUninstall(){ const pw=document.getElementById('tt-uninstall-password').value; const m=document.getElementById('tt-uninstall-msg'); if(!pw){ m.textContent='Please enter your password'; return; }
+  const ok=document.getElementById('tt-uninstall-confirm'); ok.disabled=true; m.style.color='var(--text-secondary)'; m.textContent='Removing…';
+  try{ const r=await api('/api/terratak/uninstall',{method:'POST',body:JSON.stringify({password:pw, delete_data:document.getElementById('tt-delete-data').checked})});
+    if(r.d.success){ m.textContent='Done. Redirecting…'; setTimeout(()=>{window.location.href='/marketplace';},800); }
+    else { m.style.color='var(--red)'; m.textContent=r.d.error||'Remove failed'; ok.disabled=false; } }
+  catch(e){ m.style.color='var(--red)'; m.textContent='Request failed: '+e.message; ok.disabled=false; } }
+fetchLogs(); loadStatus();
+{% endif %}
+</script>
+{% endblock %}

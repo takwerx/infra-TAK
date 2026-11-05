@@ -4510,6 +4510,20 @@ def _detect_modules_uncached():
             'route': _ef_desc['route'], 'priority': _ef_desc['priority'],
             'tokens': int(_ef_state.get('tokens') or 0)}
 
+    # TerraTAK — registry-resident (modules/terratak.py). Inert until the operator uploads
+    # the tak.gov image tarball; the tile is what reaches the upload page at all.
+    _tt_desc = mod_registry.MODULES.get('terratak')
+    if _tt_desc:
+        try:
+            _tt_state = _tt_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _tt_state = {}
+        modules['terratak'] = {'name': _tt_desc['name'],
+            'installed': bool(_tt_state.get('installed')),
+            'running': bool(_tt_state.get('running')),
+            'description': _tt_desc['description'], 'icon': _tt_desc['icon'],
+            'route': _tt_desc['route'], 'priority': _tt_desc['priority'], 'conflicts': []}
+
     # NetBird VPN
     netbird_enabled = settings.get('netbird_enabled', False)
     netbird_running = False
@@ -5155,6 +5169,11 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     cf = modules.get('clientfeed', {})
     if cf.get('installed'):
         parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
+    tt = modules.get('terratak', {})
+    if tt.get('installed'):
+        # Emoji, not a Material Symbols ligature: the console's icon font is a subset and a
+        # new ligature name renders as the literal word ([[material-symbols-font-is-a-subset]]).
+        parts.append(link('/terratak', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F5FA</span><span>TerraTAK</span>', 'TerraTAK'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -99336,6 +99355,15 @@ def run_full_uninstall():
             plog(f"⚠ TAK Simulator removal error (non-fatal): {e}")
         plog("✓ TAK Simulator removed")
 
+        # 1d. TerraTAK — registry uninstall path (modules/terratak.py). Tile data volume is
+        # kept (operator imagery can be many GB); the per-module Remove dialog can delete it.
+        plog("━━━ TerraTAK ━━━")
+        try:
+            mod_registry.uninstall_module('terratak', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ TerraTAK removal error (non-fatal): {e}")
+        plog("✓ TerraTAK removed")
+
         # 2. TAK Portal
         plog("━━━ TAK Portal ━━━")
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -110500,6 +110528,25 @@ def clientfeed_page():
         feed_host = f'{_ip}:5001' if _ip else ''
     return render_template('clientfeed.html', settings=settings, modules=modules,
                            clientfeed=state, feed_host=feed_host, version=VERSION)
+
+
+@app.route('/terratak')
+@login_required
+def terratak_page():
+    """TerraTAK console page. Passwords never reach the template."""
+    from flask import abort
+    if not mod_registry.MODULES.get('terratak'):
+        abort(404)
+    settings = load_settings()
+    modules = detect_modules()
+    tt = mod_registry.MODULES['terratak']['detect'](mod_registry.get_ctx())
+    st = settings.get('terratak') or {}
+    info = {k: st.get(k) for k in ('image', 'version', 'arch', 'tar_sha256', 'known_release',
+                                   'loaded_at', 'deployed_image', 'deployed_at', 'previous_image')}
+    job = mod_registry.job_state('terratak')
+    return render_template('terratak.html', settings=settings, modules=modules, tt=tt, info=info,
+                           host_arch=_host_arch(), job_running=job['running'],
+                           job_log=list(job['log']), job_error=job['error'], version=VERSION)
 
 try:
     import threading as _threading_sh
