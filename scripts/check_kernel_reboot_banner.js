@@ -228,6 +228,52 @@ async function main() {
   check("\"I'll reboot later\" on the done panel is honoured by the restart panel",
         p.el("kernel-patch-banner").style.display === "none", p.el("kernel-patch-banner").style.display);
 
+  // 9. GH #416: an old failed run (FATAL still the last word in the log after the
+  //    operator fixed apt by hand and rebooted) must stay closed once dismissed,
+  //    across reloads and past the 24 h expiry, without the log being touched.
+  const FAIL_JOB = { running: false, done: false, error: true, error_at: "2026-11-05T21:14:03",
+    reboot_required: false, reboot_sig: "",
+    log_tail: "[2026-11-05T21:14:03Z] FATAL: apt-get update failed (exit 100)" };
+  const QUIET = { total: 0, reboot_required: false, reboot: NONE };
+  p = page({ "/api/system/kernel-patch/job-status": FAIL_JOB, "/api/os-updates": QUIET });
+  await p.ctx.checkKernelPatch();
+  check("failed run shows the error panel",
+        p.el("kernel-patch-banner").style.display === "block" && p.el("kpatch-error").style.display === "block");
+  p.ctx.dismissKernelBanner();
+  check("Dismiss on the failed panel records that run",
+        /error@2026-11-05T21:14:03/.test(localStorage.getItem("kernel-patch-dismissed-error") || ""),
+        localStorage.getItem("kernel-patch-dismissed-error"));
+  p = page({ "/api/system/kernel-patch/job-status": FAIL_JOB, "/api/os-updates": QUIET });
+  await p.ctx.checkKernelPatch();
+  check("dismissed failed run stays closed on reload",
+        p.el("kernel-patch-banner").style.display === "none", p.el("kernel-patch-banner").style.display);
+  const rec = JSON.parse(localStorage.getItem("kernel-patch-dismissed-error"));
+  rec.ts = Date.now() - 3 * 24 * 60 * 60 * 1000;
+  localStorage.setItem("kernel-patch-dismissed-error", JSON.stringify(rec));
+  p = page({ "/api/system/kernel-patch/job-status": FAIL_JOB, "/api/os-updates": QUIET });
+  await p.ctx.checkKernelPatch();
+  check("dismissed failed run stays closed days later",
+        p.el("kernel-patch-banner").style.display === "none", p.el("kernel-patch-banner").style.display);
+  p = page({ "/api/system/kernel-patch/job-status": FAIL_JOB,
+    "/api/os-updates": { total: 1, pkg_sig: "ghi", managed: [], restarts: [], alerts: [], routine_count: 1,
+      reboot_required: false, reboot: NONE },
+    "/api/system/kernel-patch-status": { cve_banner: null, patched: false } });
+  await p.ctx.checkKernelPatch();
+  check("a dismissed failure does not hide updates pending now",
+        p.el("kernel-patch-banner").style.display === "block" && p.el("kpatch-idle").style.display === "block");
+  localStorage.removeItem("kernel-patch-dismissed-pending");
+  p = page({ "/api/system/kernel-patch/job-status": Object.assign({}, FAIL_JOB, { error_at: "2026-11-06T09:00:00" }),
+    "/api/os-updates": QUIET });
+  await p.ctx.checkKernelPatch();
+  check("a new failed run shows again",
+        p.el("kernel-patch-banner").style.display === "block" && p.el("kpatch-error").style.display === "block");
+  p = page({ "/api/system/kernel-patch/job-status": Object.assign({}, FAIL_JOB, { error_at: undefined }),
+    "/api/os-updates": QUIET });
+  await p.ctx.checkKernelPatch();
+  check("older backend without error_at still shows the failure",
+        p.el("kpatch-error").style.display === "block");
+  localStorage.removeItem("kernel-patch-dismissed-error");
+
   if (fails) {
     console.log(fails + " kernel-reboot banner check(s) failed");
     process.exit(1);

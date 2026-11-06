@@ -23,6 +23,13 @@
 #   - If the SSH session for the check itself fails (ssh rc 255) nothing was learned about the
 #     credentials: log and stand down, like the probe above.
 #   - The alert says which check failed and what the database port did at the same moment.
+#
+# ops #511: the alert could not say WHY the login failed (wrong password, PostgreSQL restarting,
+# connection dropped) because psql's error text was thrown away (2>/dev/null). Now psql's own
+# first error line goes into the alert email and restarts.log. It is passed through
+# pg_error_line() first: the passwords this script holds are masked, any user:password@ in a
+# connection string or password= value is masked, control characters are dropped, and the line
+# is cut to 300 characters. The password itself is never written anywhere.
 
 # v10.3.0 W4.e: while the console is upgrading / updating / rebooting the database server,
 # a stopped PostgreSQL is the job working, not an outage — never restart it mid-dpkg.
@@ -39,6 +46,26 @@ ALERT_SENT_FILE="/var/lib/takguard/remotedb_auth_alert_sent"
 FAIL_COUNT_FILE="/var/lib/takguard/remotedb_auth_fail_count"
 AUTH_ALERT_AFTER=3   # failed checks in a row (no proven drift) before the email
 RESYNC_COOLDOWN_FILE="/var/lib/takguard/remotedb_auth_last_resync"
+
+# psql's first error line, safe to email and log (ops #511). $1 = what the remote psql printed
+# (stdout and stderr together); the remaining arguments are secrets to mask (the passwords).
+# Prints nothing-to-say text if psql printed no error.
+pg_error_line() {
+  local raw="$1" line s
+  shift
+  line=$(printf '%s\n' "$raw" | tr -d '\r' | grep -v -E '^[[:space:]]*(1)?[[:space:]]*$' | head -n 1)
+  for s in "$@"; do
+    [ -n "$s" ] && line=${line//"$s"/[hidden]}
+  done
+  line=$(printf '%s' "$line" | sed -E 's#(://[^:/@ ]*:)[^@ ]*@#\1[hidden]@#g; s#([Pp]assword=)[^ &"]*#\1[hidden]#g' | tr -cd '[:print:]' | cut -c1-300)
+  [ -n "$line" ] || line="(PostgreSQL printed no error text)"
+  printf '%s' "$line"
+}
+
+# True when the remote psql printed the single line "1" (login worked), even if warnings came with it.
+pg_login_ok() {
+  printf '%s\n' "$1" | tr -d '\r' | grep -q -x -E '[[:space:]]*1[[:space:]]*'
+}
 
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
 if [ -f "$LAST_RESTART_FILE" ]; then
@@ -92,12 +119,14 @@ if [ "$SSH_PROBE" != "__mgmt_ok__" ]; then
 fi
 
 # Test current password
-AUTH_OUT=$($SSH_CMD \
-  "PGPASSWORD='${DB_PASSWORD}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>/dev/null | tr -d '[:space:]'" \
+# 2>&1 so psql's error text comes back (ops #511); head keeps the remote exit status 0, so an
+# ssh exit of 255 still means only "the ssh session itself failed".
+AUTH_RAW=$($SSH_CMD \
+  "PGPASSWORD='${DB_PASSWORD}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>&1 | head -n 5" \
   2>/dev/null)
 AUTH_RC=$?
 
-if [ "$AUTH_OUT" = "1" ]; then
+if pg_login_ok "$AUTH_RAW"; then
   rm -f "$ALERT_SENT_FILE" "$FAIL_COUNT_FILE"
   exit 0
 fi
@@ -130,11 +159,11 @@ RESYNC_MSG="Could not fetch fresh password from Server One."
 
 if [ -n "$FRESH_PW" ] && [ "$FRESH_PW" != "$DB_PASSWORD" ]; then
   # Verify the fresh password actually works
-  VERIFY=$($SSH_CMD \
-    "PGPASSWORD='${FRESH_PW}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>/dev/null | tr -d '[:space:]'" \
+  VERIFY_RAW=$($SSH_CMD \
+    "PGPASSWORD='${FRESH_PW}' psql -h 127.0.0.1 -p ${DB_PORT} -U martiuser -d cot -tAc 'select 1' 2>&1 | head -n 5" \
     2>/dev/null)
 
-  if [ "$VERIFY" = "1" ]; then
+  if pg_login_ok "$VERIFY_RAW"; then
     # Patch CoreConfig.xml with the fresh password
     sudo cp "$CORE_CONFIG" "${CORE_CONFIG}.pre-resync.bak" 2>/dev/null
     ESCAPED_PW=$(printf '%s\n' "$FRESH_PW" | sed 's/[&/\]/\\&/g')
@@ -152,16 +181,23 @@ if [ -n "$FRESH_PW" ] && [ "$FRESH_PW" != "$DB_PASSWORD" ]; then
     fi
   else
     RESYNC_MSG="Fresh password from Server One also failed authentication. Manual intervention required."
+    VERIFY_ERR=$(pg_error_line "$VERIFY_RAW" "$DB_PASSWORD" "$FRESH_PW")
   fi
 elif [ -n "$FRESH_PW" ]; then
   RESYNC_MSG="Password on Server One matches CoreConfig.xml but auth still fails. Check pg_hba.conf or PostgreSQL status on Server One."
 fi
 
+# Why the login failed, in PostgreSQL's own words (ops #511), with both passwords masked.
+AUTH_ERR=$(pg_error_line "$AUTH_RAW" "$DB_PASSWORD" "$FRESH_PW")
+VERIFY_NOTE=""
+[ -n "${VERIFY_ERR:-}" ] && VERIFY_NOTE="
+PostgreSQL's answer to Server One's password: $VERIFY_ERR"
+
 # One failed check that no password drift explains is a blip (ops #488): email only after
 # AUTH_ALERT_AFTER in a row. A successful resync always notifies, it is proven and acted on.
 if ! $RESYNCED && [ "$FAIL_COUNT" -lt "$AUTH_ALERT_AFTER" ]; then
   mkdir -p /var/log/takguard
-  echo "$(date): DB password check failed ($FAIL_COUNT of $AUTH_ALERT_AFTER in a row, no alert yet) — $RESYNC_MSG" >> /var/log/takguard/restarts.log
+  echo "$(date): DB password check failed ($FAIL_COUNT of $AUTH_ALERT_AFTER in a row, no alert yet) — PostgreSQL said: $AUTH_ERR — $RESYNC_MSG" >> /var/log/takguard/restarts.log
   exit 0
 fi
 
@@ -189,6 +225,7 @@ if $RESYNCED; then
 Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Consecutive failures before fix: $FAIL_COUNT
+PostgreSQL said before the fix: $AUTH_ERR
 
 $RESYNC_MSG
 
@@ -207,6 +244,7 @@ Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Check that failed: database login as martiuser to $DB_HOST:$DB_PORT ($FAIL_COUNT checks in a row, about 2 minutes apart)
 Database port at the same moment: $PORT_NOW
+Why the login failed (PostgreSQL said): $AUTH_ERR$VERIFY_NOTE
 Resync result: $RESYNC_MSG
 
 The password in /opt/tak/CoreConfig.xml does not authenticate against
@@ -221,7 +259,7 @@ and update /opt/tak/CoreConfig.xml on this host.
 "
 fi
 
-echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+printf '%s\n' "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   TMPF="/tmp/gd-sms-$$.txt"
   printf '%s' "$BODY" > "$TMPF"
@@ -232,5 +270,5 @@ mkdir -p /var/log/takguard
 if $RESYNCED; then
   echo "$(date): DB credential drift auto-resynced — fresh password from $DB_HOST, TAK Server restarted (failures: $FAIL_COUNT)" >> /var/log/takguard/restarts.log
 else
-  echo "$(date): DB credential drift detected — auto-resync FAILED on $DB_HOST:$DB_PORT (failures: $FAIL_COUNT) — $RESYNC_MSG" >> /var/log/takguard/restarts.log
+  echo "$(date): DB credential drift detected — auto-resync FAILED on $DB_HOST:$DB_PORT (failures: $FAIL_COUNT) — PostgreSQL said: $AUTH_ERR — $RESYNC_MSG" >> /var/log/takguard/restarts.log
 fi

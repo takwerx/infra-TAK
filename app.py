@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.7-alpha"
+VERSION = "10.3.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -4636,8 +4636,11 @@ _MODULES_CACHE_LOCK = threading.Lock()
 def _modules_running_jobs():
     """frozenset of in-flight job names, or None when it cannot be determined."""
     try:
+        # ops #526: *_update_job too. TAK Portal's Update runs as a job dict of that name (ops #72),
+        # not a *_status one, so the cache never saw it end: the page that /takportal redirects to
+        # was served the "Stopped" cached while the container was down for the rebuild.
         names = {_n for _n, _v in list(globals().items())
-                 if _n.endswith('_status') and isinstance(_v, dict) and _v.get('running')}
+                 if _n.endswith(('_status', '_update_job')) and isinstance(_v, dict) and _v.get('running')}
     except Exception:
         return None
     try:
@@ -42770,6 +42773,10 @@ def _takportal_update_worker(portal_dir, job_id):
     with _TAKPORTAL_UPDATE_LOCK:
         if _takportal_update_job.get('id') == job_id:
             _takportal_update_job.update({'running': False, 'result': result, 'code': code})
+    # ops #526: the container was down during the rebuild, and any console page loaded in that
+    # window cached "TAK Portal stopped". The POST that started this job dropped the cache at the
+    # START; nothing dropped it at the end, so the page the update redirects to showed Stopped.
+    _invalidate_modules_cache()
 
 
 # TAK Portal's image build (Deploy and Update). Through the broker the subprocess timeout
@@ -49505,6 +49512,19 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                  f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
     except Exception as e:
         plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
+
+
+def _cloudtak_heal_dockerignore_at_start(ct_dir):
+    """ops #503 follow-up: put the plugin-keeping Dockerfile.dockerignore right on every console start.
+    TAK Portal's marketplace rebuilds CloudTAK through its own helper, which never calls the build
+    shield above, so a stale Dispatcher-written file used to sit there until a console-driven build
+    (plugin install, CloudTAK Update) and the next Portal rebuild dropped every other plugin from the
+    image. Every update restarts the console, so this reaches every box. File only: no rebuild, no
+    restart; check-before-write, so a clean box is a no-op. Never raises."""
+    try:
+        _cloudtak_keep_plugins_in_build(ct_dir, lambda m: print(f"Startup self-heal: {str(m).strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup self-heal: CloudTAK plugin dockerignore error (non-fatal): {_e}")
 
 
 # ops #301: "installed" is not "in the app". CloudTAK 13.102.0 moved its web folder; a plugin installer
@@ -95729,7 +95749,9 @@ def _kernel_patch_apt_script(tak_pkgs=_KERNEL_PATCH_TAK_PKGS, status_file=''):
         # apt keeps the dead repo's LAST index, so full-upgrade still tries to download its
         # newer packages (measured on test8: caddy 2.11.7 -> 402 again, nothing installed).
         # Hence --fix-missing on this path only, plus the distro-skip check after it.
-        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
+        # GH #416: packages.microsoft.com too (Azure boxes carry microsoft-prod.list); a
+        # 404 there failed every kernel-patch run after a 22.04 -> 24.04 upgrade.
+        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org|packages[.]microsoft[.]com)/"\n'
         'FIXMISSING=""\n'
         'UPDLOG="$(mktemp)"\n'
         'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
@@ -96106,6 +96128,17 @@ def _kernel_patch_job_state():
                 done_fresh = _dt.timestamp() >= psutil.boot_time()
             except Exception:
                 done_fresh = completed_ok      # unparseable stamp: fail toward showing it
+    # GH #416: the failed run needs the same handle. A FATAL stays the last word in
+    # this log until another patch run is started (a later apt upgrade by hand or a
+    # reboot writes nothing here), so the failed panel came back on every load and
+    # Dismiss had nothing to key to. Keyed to the FATAL line itself: its stamp when
+    # it has one, else a hash of the line, so the next failed run re-surfaces.
+    error_at = ''
+    if log_failed:
+        _eol = log_tail.find('\n', last_fatal)
+        _fl = log_tail[log_tail.rfind('\n', 0, last_fatal) + 1:(_eol if _eol != -1 else len(log_tail))]
+        _m = re.match(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*FATAL:', _fl)
+        error_at = _m.group(1) if _m else 'h' + hashlib.sha1(_fl.encode('utf-8', 'replace')).hexdigest()[:12]
 
     if load != 'loaded':
         return {
@@ -96118,6 +96151,7 @@ def _kernel_patch_job_state():
             'done_at': done_at,
             'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
+            'error_at': error_at,
             'reboot_required': reboot_required,
             'reboot_sig': reboot_sig,
             'log_tail': log_tail,
@@ -96148,6 +96182,7 @@ def _kernel_patch_job_state():
         'done': done,
         'done_at': done_at,
         'error': err,
+        'error_at': error_at,
         'reboot_required': reboot_required,
         'reboot_sig': reboot_sig,
         'log_tail': log_tail,
@@ -96286,7 +96321,7 @@ _OS_UPGRADE_SH_FUNCS = (
     'fail() {\n'
     '  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"\n'
     '  if [ ! -s "$PRE/dpkg-versions.txt" ] || dpkg-query -W -f=\'${Package} ${Version}\\n\' 2>/dev/null | sort | cmp -s - "$PRE/dpkg-versions.txt"; then\n'
-    '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+    '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/preferences.d/infratak-no-aznfs /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
     '    [ -f "$PRE/release-upgrades" ] && cp -a "$PRE/release-upgrades" /etc/update-manager/release-upgrades\n'
     '    echo "[$(TS)] UNCHANGED: no package was touched — this box is exactly as it was and the upgrade\'s temporary settings were removed. Fix the cause above and run the upgrade again."\n'
     '  else\n'
@@ -96407,6 +96442,21 @@ _OS_UPGRADE_SH_FLIP = (
     'Pin: release *\n'
     'Pin-Priority: -1\n'
     'EOF\n'
+    # L7 (ops #527): Microsoft's package list (packages-microsoft-prod.deb) marks aznfs
+    # `Priority: required`, so do-release-upgrade installs it while the jammy list is still
+    # enabled. aznfs pulls stunnel4, whose postinst (systemd-sysusers) fails mid-upgrade
+    # because PID 1 has re-exec'd into systemd 255 and the userdb socket refuses connections;
+    # dpkg is then left broken and the job stops before repos-noble. Keep a NEW aznfs out of
+    # the upgrade; a box that already has it keeps it (the pin is only written when absent,
+    # so apt never treats the installed copy as unwanted). repos-noble removes the pin.
+    'if ! dpkg-query -W -f=\'${Status}\' aznfs 2>/dev/null | grep -q "install ok installed"; then\n'
+    '  cat > /etc/apt/preferences.d/infratak-no-aznfs <<\'EOF\'\n'
+    'Package: aznfs\n'
+    'Pin: release *\n'
+    'Pin-Priority: -1\n'
+    'EOF\n'
+    '  echo "[$(TS)] aznfs pinned out for the upgrade (not installed on this box)"\n'
+    'fi\n'
     # L6: keep obsolete packages — DistUpgradeConfigParser reads *.cfg here after
     # the bundled DistUpgrade.cfg; doPostUpgrade() then logs "Skipping obsolete Removal".
     'mkdir -p /etc/update-manager/release-upgrades.d\n'
@@ -96436,6 +96486,9 @@ _OS_UPGRADE_SH_FLIP = (
     '\n'
     # ---- 4. repos-noble -------------------------------------------------------
     'step repos-noble\n'
+    # ops #527: the aznfs pin only guards the release upgrade; drop it so the operator can
+    # install aznfs on 24.04 later if they want it.
+    'rm -f /etc/apt/preferences.d/infratak-no-aznfs\n'
     # L3: the upgrader comments third-party entries out ("disabled on upgrade to noble")
     # and leaves them saying jammy. Rewrite from the PRE-flip copy, not the mangled one.
     'for f in "$PRE/sources.list.d/"*.list; do\n'
@@ -96444,11 +96497,19 @@ _OS_UPGRADE_SH_FLIP = (
     # W4.g.2: MongoDB publishes 7.0 for jammy only (the Fed Hub guide uses jammy on 24.04
     # too) — re-enable that list as it was, never point it at a noble 7.0 that 404s.
     '  case "$b" in mongodb-org-7.0.list) cp -a "$f" "/etc/apt/sources.list.d/$b"; echo "[$(TS)] re-enabled $b (kept on jammy: no noble build of MongoDB 7.0)"; continue ;; esac\n'
-    '  sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"\n'
+    # GH #416: Microsoft's lists carry the release in the path too
+    # (packages.microsoft.com/ubuntu/22.04/prod jammy main); jammy -> noble alone gives
+    # /ubuntu/22.04/prod/dists/noble, a 404. Its noble feed is /ubuntu/24.04/prod.
+    '  sed -e "s/jammy/noble/g" -e "s#/ubuntu/22[.]04/#/ubuntu/24.04/#g" "$f" > "/etc/apt/sources.list.d/$b"\n'
     '  echo "[$(TS)] re-enabled $b (jammy -> noble)"\n'
     'done\n'
     'rm -f /etc/apt/sources.list.d/*.distUpgrade 2>/dev/null\n'
-    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
+    # GH #416: the OS has already flipped here, so failing on one third-party list skips
+    # venv-rebuild and strands the console on a python 3.10 venv (502 at its next restart).
+    # Every list re-enabled above is third-party by construction (Ubuntu's own sources are
+    # not in sources.list.d), so each of their hosts only warns, ubuntu.com hosts excepted.
+    'TP_HOSTS="$(sed -nE \'s#^[[:space:]]*deb(-src)?[[:space:]].*https?://([^/[:space:]]+).*#\\2#p\' "$PRE/sources.list.d/"*.list 2>/dev/null | grep -viE "(^|[.])ubuntu[.]com$" | sort -u | sed \'s/[.]/[.]/g\' | paste -sd "|" -)"\n'
+    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org|packages[.]microsoft[.]com${TP_HOSTS:+|$TP_HOSTS})/"\n'
     'UPDLOG="$(mktemp)"\n'
     'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
     'rc=${PIPESTATUS[0]}\n'
@@ -101307,6 +101368,19 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
         actually see gets touched.
       * `prune` names directories to skip entirely; .docker-store is always pruned.
 
+    infra-TAK #421: container data is never ours, whatever it is called. A non-root CloudTAK
+    Update re-owned an operator's postgis bind-mount (.docker-postgres/postgres-data, uid 70,
+    mode 700) to takwerx and Postgres refused every new connection until it was chowned back
+    by hand. The console cannot even list that directory, so the walk saw it as ONE entry and
+    chowned the directory itself. Three guards, any one of which keeps it out:
+      * every `.docker-*` directory is pruned (CloudTAK's naming for container data);
+      * every host directory bind-mounted into a container is pruned (_container_bind_dirs);
+      * a foreign-owned directory the console cannot list is left alone: git never wrote it
+        (a root-era clone makes 755 dirs) and we cannot see what is inside it.
+    An immutable file (chattr +i, e.g. an operator-locked docker-compose.override.yml) is the
+    operator's choice, not a failure. Every path re-owned is logged, so a heal that stops
+    partway can be undone from the log.
+
     `chown -R -h` / `chown -h` on a module dir already passes the broker rulebook via
     HOME_MODULE_DIRS / ROOT_MODULE_DIRS (every name in MODULE_DIR_NAMES). -h re-owns
     symlinks rather than following them, as the console-repo carve-out requires.
@@ -101323,12 +101397,30 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
     # v10.2.7: CloudTAK >= 13.102.0 stores objects in Garage (.docker-garage/, root-owned bind
     # mounts) and the MinIO->Garage migration archives the old tree as .docker-store-migrated-<ts>
     # (or .docker-garage-failed-<ts> after a rolled-back attempt) — container data, never ours.
-    _skip_prefixes = ('.docker-store-migrated-', '.docker-garage-failed-')
-    git_dirty, work_offenders = False, []
+    # infra-TAK #421: any `.docker-` dir (.docker-postgres/ etc.) is container data too.
+    _skip_prefixes = ('.docker-',)
+    bind_dirs = _container_bind_dirs(mod_dir)
+    git_dirty, work_offenders, left_alone = False, [], []
     _CAP = 400
     try:
         for dirpath, dirnames, filenames in os.walk(mod_dir):
-            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(_skip_prefixes)]
+            _keep = []
+            for d in dirnames:
+                if d in skip or d.startswith(_skip_prefixes):
+                    continue
+                full = os.path.join(dirpath, d)
+                try:
+                    _foreign = os.lstat(full).st_uid != uid
+                except OSError:
+                    continue
+                if os.path.realpath(full) in bind_dirs or (
+                        _foreign and not os.path.islink(full)
+                        and not os.access(full, os.R_OK | os.X_OK)):
+                    if _foreign:
+                        left_alone.append(full)
+                    continue
+                _keep.append(d)
+            dirnames[:] = _keep
             for name in dirnames + filenames:
                 full = os.path.join(dirpath, name)
                 try:
@@ -101344,6 +101436,9 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
                     work_offenders.append(full)
     except Exception as e:
         return False, f'ownership scan failed: {e}'
+    for p in left_alone:
+        _log(f'  {mod_dir}: left alone (container data, not git\'s): '
+             f'{os.path.relpath(p, mod_dir)}')
     if not git_dirty and not work_offenders:
         return False, ''
     import pwd as _pwd
@@ -101357,7 +101452,7 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
     _log(f'  {mod_dir}: foreign-owned entries found '
          f'(.git={"yes" if git_dirty else "no"}, worktree={len(work_offenders)}) '
          f'-- re-owning to {owner} before git')
-    errs = []
+    errs, immutable = [], []
 
     def _chown(args, what):
         try:
@@ -101366,18 +101461,83 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
         except Exception as e:
             errs.append(f'{what}: {e}')
             return
-        if r.returncode != 0:
-            errs.append(f'{what}: rc={r.returncode} '
-                        f'{(r.stderr or r.stdout or "").strip()[:200]}')
+        if r.returncode == 0:
+            return
+        # chown carries on past a path it cannot change; keep only the failures that are
+        # not an operator's chattr +i (that one is expected, not "did not complete").
+        unexplained = []
+        for line in (r.stderr or r.stdout or '').splitlines():
+            m = re.search(r"changing ownership of '(.+)': Operation not permitted", line)
+            if m and m.group(1) in args and _path_is_immutable(m.group(1)):
+                immutable.append(m.group(1))
+            elif line.strip():
+                # relative paths, so the 200-char cap keeps the reason, not just the path
+                unexplained.append(line.strip().replace(mod_dir.rstrip(os.sep) + os.sep, ''))
+        if unexplained or not immutable:
+            errs.append(f'{what}: rc={r.returncode} {"; ".join(unexplained)[:200]}')
 
     if git_dirty:
         _chown(['-R', '-h', owner, os.path.join(mod_dir, '.git')], '.git')
     for i in range(0, len(work_offenders), 100):
         _chown(['-h', owner] + work_offenders[i:i + 100], f'worktree batch {i // 100 + 1}')
+    # Log what actually changed, read back from disk -- the undo list if this was wrong.
+    reowned = []
+    for p in work_offenders:
+        try:
+            if os.lstat(p).st_uid == uid:
+                reowned.append(p)
+        except OSError:
+            pass
+    for p in reowned:
+        _log(f'    re-owned: {os.path.relpath(p, mod_dir)}')
+    for p in immutable:
+        _log(f'  {mod_dir}: left immutable file as it is (chattr +i): '
+             f'{os.path.relpath(p, mod_dir)}')
     if errs:
-        return False, '; '.join(errs[:3])
+        return False, (f're-owned {len(reowned)} of {len(work_offenders)} worktree entries '
+                       f'(listed above); ' + '; '.join(errs[:3]))
     _log(f'  {mod_dir} re-owned to {owner}')
     return True, ''
+
+
+def _container_bind_dirs(mod_dir):
+    """Real paths of the host directories under `mod_dir` that any container bind-mounts.
+
+    infra-TAK #421: those are container data (an operator's postgis PGDATA, upstream's
+    .docker-garage), never part of the checkout, whatever their name. Best effort: if docker
+    cannot be asked, returns an empty set and the name/permission guards still apply."""
+    root = os.path.realpath(mod_dir)
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '-q']),
+                           capture_output=True, text=True, timeout=30)
+        cids = (r.stdout or '').split() if r.returncode == 0 else []
+        if not cids:
+            return set()
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{range .Mounts}}{{if eq .Type "bind"}}'
+                                       '{{println .Source}}{{end}}{{end}}'] + cids),
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return set()
+    out = set()
+    for line in (r.stdout or '').splitlines():
+        src = line.strip()
+        if not src:
+            continue
+        real = os.path.realpath(src)
+        if real.startswith(root + os.sep):
+            out.add(real)
+    return out
+
+
+def _path_is_immutable(path):
+    """True when `path` carries the chattr +i flag (lsattr needs no privilege)."""
+    try:
+        r = subprocess.run(['lsattr', '-d', path], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    flags = (r.stdout or '').split(None, 1)[0] if r.returncode == 0 and r.stdout else ''
+    return 'i' in flags
 
 
 def _startup_repo_ownership_heal():
@@ -103261,6 +103421,7 @@ def _startup_heal_cloudtak_media_hls():
         if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
                 or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
             return  # CloudTAK not installed locally (or split/remote) — nothing to heal here
+        _cloudtak_heal_dockerignore_at_start(_ct_dir)   # ops #503: before any Portal-driven rebuild
         _cloudtak_upload_limit_heal()   # ops #470: nginx.conf is rewritten on every container start
         if _cloudtak_media_hls_heal():
             return
