@@ -180,6 +180,20 @@ def test_a_job_starting_or_finishing_invalidates(h):
     assert h.calls == 3
 
 
+def test_takportal_update_job_ending_drops_the_stale_stopped_status_ops526(h):
+    """AJ, garesponder: Update TAK Portal, 'Updated' redirected to /takportal, page said Stopped
+    until a manual refresh. The container is down while it rebuilds; a page loaded then cached
+    'not running', and the update job (_takportal_update_job, no _status suffix) was invisible to
+    the cache's job key, so nothing made the redirect recompute."""
+    h.ns['_takportal_update_job'] = {'running': True, 'id': 'J1', 'result': None, 'code': None}
+    h.result = {'takportal': {'installed': True, 'running': False}}   # container down mid-rebuild
+    assert h.detect_modules()['takportal']['running'] is False
+    h.clock[0] += 5
+    h.ns['_takportal_update_job'].update({'running': False, 'result': {'success': True}, 'code': 200})
+    h.result = {'takportal': {'installed': True, 'running': True}}    # rebuilt and up
+    assert h.detect_modules()['takportal']['running'] is True         # first load after: not stale
+
+
 def test_registry_jobs_count_too(h):
     h.detect_modules()
     h.registry_running = ['tvr']

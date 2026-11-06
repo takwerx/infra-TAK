@@ -161,9 +161,106 @@ def test_step3_release_upgrade_noninteractive_and_verified(script):
 def test_step4_repos_rewritten_from_pre_flip_copy(script):
     s = _between(script, 'repos-noble', 'venv-rebuild')
     assert 'for f in "$PRE/sources.list.d/"*.list' in s                          # L3
-    assert 'sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"' in s
+    assert 'sed -e "s/jammy/noble/g" -e "s#/ubuntu/22[.]04/#/ubuntu/24.04/#g" "$f" > "/etc/apt/sources.list.d/$b"' in s
     assert 'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update' in s
     assert 'fail repos-noble' in s
+
+
+def _run_aznfs_pin(tmp_path, script, *, installed):
+    """Run the real pin-pg16 step's aznfs block in a sandbox: /etc is rewritten under
+    tmp_path and dpkg-query is a stub that says whether aznfs is installed."""
+    s = _between(script, 'pin-pg16', 'release-upgrade')
+    i = s.index('if ! dpkg-query -W -f=')
+    blk = s[i:s.index('\nfi\n', i) + 4].replace('/etc/', str(tmp_path) + '/etc/')
+    (tmp_path / 'etc/apt/preferences.d').mkdir(parents=True)
+    (tmp_path / 'bin').mkdir()
+    stub = tmp_path / 'bin' / 'dpkg-query'
+    stub.write_text('#!/bin/bash\n' + ('printf "install ok installed"\n' if installed else 'exit 1\n'))
+    stub.chmod(0o755)
+    r = subprocess.run(['bash', '-c', 'TS() { echo T; }\n' + blk], capture_output=True, text=True,
+                       env={'PATH': f'{tmp_path}/bin:/usr/bin:/bin'})
+    assert r.returncode == 0, r.stderr
+    return tmp_path / 'etc/apt/preferences.d/infratak-no-aznfs'
+
+
+def test_aznfs_is_pinned_out_of_the_release_upgrade(tmp_path, script):
+    # ops #527: Microsoft's list marks aznfs Priority: required; its stunnel4 dependency
+    # breaks dpkg mid-upgrade. A box without aznfs must not get it during the upgrade.
+    pin = _run_aznfs_pin(tmp_path, script, installed=False)
+    assert pin.read_text() == 'Package: aznfs\nPin: release *\nPin-Priority: -1\n'
+    assert script.index('infratak-no-aznfs <<') < script.index('step release-upgrade')
+
+
+def test_aznfs_already_installed_is_left_alone(tmp_path, script):
+    assert not _run_aznfs_pin(tmp_path, script, installed=True).exists()
+
+
+def test_aznfs_pin_is_dropped_after_the_upgrade(script):
+    assert 'rm -f /etc/apt/preferences.d/infratak-no-aznfs' in _between(script, 'repos-noble', 'venv-rebuild')
+
+
+MS_LIST = 'deb [arch=amd64,arm64,armhf] https://packages.microsoft.com/ubuntu/22.04/prod jammy main\n'
+VENDOR_LIST = 'deb [signed-by=/usr/share/keyrings/v.gpg] https://apt.example-vendor.io/debian jammy main\n'
+
+
+def _run_repos_noble(tmp_path, lists, apt_errors):
+    """Run the real repos-noble fragment in bash: the pre-flip lists in tmp_path/pre, the
+    live sources.list.d in tmp_path/live, apt-get update stubbed to print `apt_errors`."""
+    pre, live = tmp_path / 'pre' / 'sources.list.d', tmp_path / 'live'
+    pre.mkdir(parents=True)
+    live.mkdir()
+    for name, text in lists.items():
+        (pre / name).write_text(text)
+    flip = _ns()['_OS_UPGRADE_SH_FLIP']
+    frag = flip[flip.index('step repos-noble'):].replace('/etc/apt/sources.list.d', str(live))
+    errs = tmp_path / 'errs'
+    errs.write_text(apt_errors)
+    harness = (
+        f'PRE={str(tmp_path / "pre")!r}\n'
+        'TS() { echo T; }\nstep() { :; }\n'
+        'fail() { echo "FAILED:$1 $2"; exit 1; }\n'
+        f'apt-get() {{ cat {str(errs)!r}; [ -s {str(errs)!r} ] && return 100; return 0; }}\n'
+        + frag + 'echo CONTINUED\n')
+    r = subprocess.run(['bash', '-c', harness], capture_output=True, text=True)
+    return r, live
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+def test_repos_noble_points_microsoft_at_its_24_04_feed_gh416(tmp_path):
+    # GH #416: jammy -> noble alone left /ubuntu/22.04/prod noble, a 404 on Microsoft's side.
+    r, live = _run_repos_noble(tmp_path, {'microsoft-prod.list': MS_LIST}, '')
+    assert 'CONTINUED' in r.stdout, r.stdout + r.stderr
+    assert (live / 'microsoft-prod.list').read_text() == \
+        'deb [arch=amd64,arm64,armhf] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n'
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+@pytest.mark.parametrize('host', ['packages.microsoft.com', 'apt.example-vendor.io'])
+def test_repos_noble_third_party_refresh_failure_still_reaches_venv_rebuild_gh416(tmp_path, host):
+    # The OS has flipped by now: a dead third-party list must warn, not skip venv-rebuild
+    # (that left the reporter's console on a python 3.10 venv, crash-looping with 502).
+    path = '/ubuntu/24.04/prod' if 'microsoft' in host else '/debian'
+    errs = (f"E: The repository 'https://{host}{path} noble Release' does not have a Release file.\n"
+            f'E: Failed to fetch https://{host}{path}/dists/noble/InRelease  404  Not Found\n')
+    r, _ = _run_repos_noble(tmp_path, {'microsoft-prod.list': MS_LIST, 'vendor.list': VENDOR_LIST}, errs)
+    assert 'FAILED' not in r.stdout and 'CONTINUED' in r.stdout, r.stdout + r.stderr
+    assert 'WARN: a third-party repository could not be refreshed' in r.stdout
+
+
+@pytest.mark.skipif(not shutil.which('bash'), reason='bash not available')
+def test_repos_noble_ubuntu_mirror_failure_is_still_fatal_gh416(tmp_path):
+    # an Ubuntu mirror kept in sources.list.d is not "third-party": ubuntu.com hosts stay fatal
+    errs = 'E: Failed to fetch http://azure.archive.ubuntu.com/ubuntu/dists/noble/InRelease  Temporary failure resolving\n'
+    lists = {'microsoft-prod.list': MS_LIST,
+             'mirror.list': 'deb http://azure.archive.ubuntu.com/ubuntu jammy-backports main\n'}
+    r, _ = _run_repos_noble(tmp_path, lists, errs)
+    assert 'FAILED:repos-noble' in r.stdout and 'CONTINUED' not in r.stdout, r.stdout + r.stderr
+
+
+def test_patch_job_tolerates_a_dead_microsoft_repo_gh416():
+    # The reporter's later kernel-patch run died on the same Microsoft 404 and released the TAK hold.
+    s = _fn('_kernel_patch_apt_script')
+    assert 'packages[.]microsoft[.]com' in s[s.index('THIRD_PARTY='):s.index('FIXMISSING=""')]
 
 
 def test_step5_venv_rebuilt_as_console_user_before_console_restart(script):
@@ -954,7 +1051,8 @@ def _run_fail(tmp_path, *, changed, os_version='22.04'):
     stub = tmp_path / 'bin' / 'dpkg-query'
     stub.write_text('#!/bin/bash\nprintf "%s" "' + now + '"\n')
     stub.chmod(0o755)
-    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/preferences.d/infratak-no-aznfs',
+              'etc/apt/apt.conf.d/99infratak-os-upgrade',
               'etc/update-manager/release-upgrades.d/infratak.cfg', 'etc/update-manager/release-upgrades'):
         (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / f).write_text('Prompt=lts\n' if f.endswith('release-upgrades') else 'x\n')
@@ -970,7 +1068,8 @@ def test_fail_on_an_unchanged_box_undoes_the_jobs_settings(tmp_path):
     r, status = _run_fail(tmp_path, changed=False)
     assert r.returncode == 1 and status == 'failed:release-upgrade'
     assert 'UNCHANGED' in r.stdout and 'run the upgrade again' in r.stdout
-    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/preferences.d/infratak-no-aznfs',
+              'etc/apt/apt.conf.d/99infratak-os-upgrade',
               'etc/update-manager/release-upgrades.d/infratak.cfg'):
         assert not (tmp_path / f).exists(), f
     assert (tmp_path / 'etc/update-manager/release-upgrades').read_text() == 'Prompt=never\n'   # restored
