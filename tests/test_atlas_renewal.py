@@ -138,12 +138,16 @@ def deployment(tmp_path):
     return tmp_path
 
 
-def _ctx(token='admin-token', fqdn='auth.example.com'):
-    env = {'AUTHENTIK_TOKEN': token, 'AUTHENTIK_FQDN': fqdn}
+def _ctx(token='admin-token', domain='auth.example.com', port=None):
+    # The box's shape: Authentik's .env has the token but no AUTHENTIK_FQDN; the
+    # console names Authentik with _get_service_domain and _pub_hostport.
+    env = {'AUTHENTIK_TOKEN': token}
     return {
         'load_settings': lambda: {},
         '_get_authentik_env_value': lambda s, k: env.get(k),
         '_get_authentik_api_url': lambda s: 'http://127.0.0.1:9090',
+        '_get_service_domain': lambda s, key: domain if key == 'authentik' else '',
+        '_pub_hostport': lambda host, s=None: host if port is None else '%s:%d' % (host, port),
     }
 
 
@@ -294,9 +298,9 @@ def test_removal_keeps_the_group_while_another_deployment_uses_it(deployment, ak
 
 def test_deploy_update_and_removal_all_call_it():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
-    # deploy, update, and the on/off switch
-    assert src.count('atlas_renewal.ensure(ctx,') == 3
-    assert src.count('atlas_renewal.start(') == 3
+    # deploy, update, update with nothing to install, and the on/off switch
+    assert src.count('atlas_renewal.ensure(ctx,') == 4
+    assert src.count('atlas_renewal.start(') == 4
     assert 'atlas_renewal.remove(ctx, inst)' in src
 
 
@@ -381,3 +385,26 @@ def test_the_page_offers_the_switch_and_the_route_exists():
     assert 'renewal_enabled' in atlas.INSTANCE_FIELDS
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     assert "/instances/<slug>/renewal" in src
+
+
+# --------------------------------------------------------------------------- #
+# Authentik's public address (found on the box, 2026-11-05)
+# --------------------------------------------------------------------------- #
+
+def test_the_public_address_comes_from_the_console_not_authentiks_env(deployment, ak):
+    # The first box update said "Authentik is not configured": AUTHENTIK_FQDN is
+    # not in Authentik's .env on an InfraTAK box.
+    result, _ = _ensure(deployment, ak)
+    assert result['ready'] is True
+    assert (deployment / ar.SECRETS_DIR / ar.URL_FILE).read_text() == 'https://auth.example.com'
+
+
+def test_a_moved_caddy_port_is_in_the_address(deployment, ak):
+    _ensure(deployment, ak, ctx=_ctx(port=8443))
+    assert (deployment / ar.SECRETS_DIR / ar.URL_FILE).read_text() == 'https://auth.example.com:8443'
+
+
+def test_no_fqdn_says_so_plainly(deployment, ak):
+    result, log = _ensure(deployment, ak, ctx=_ctx(domain=''))
+    assert result['ready'] is False and ak.calls == []
+    assert "public name is unknown" in log[0]
