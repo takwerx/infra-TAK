@@ -294,8 +294,9 @@ def test_removal_keeps_the_group_while_another_deployment_uses_it(deployment, ak
 
 def test_deploy_update_and_removal_all_call_it():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
-    assert src.count('atlas_renewal.ensure(ctx,') == 2
-    assert src.count('atlas_renewal.start(') == 2
+    # deploy, update, and the on/off switch
+    assert src.count('atlas_renewal.ensure(ctx,') == 3
+    assert src.count('atlas_renewal.start(') == 3
     assert 'atlas_renewal.remove(ctx, inst)' in src
 
 
@@ -321,3 +322,62 @@ def test_a_container_that_fails_to_start_is_reported_not_raised():
     log = []
     ar.start(lambda action: R(), log.append)
     assert 'did not start' in log[0] and 'no such service' in log[0]
+
+
+# --------------------------------------------------------------------------- #
+# The off switch
+# --------------------------------------------------------------------------- #
+
+OFF = dict(PLAIN, renewal_disabled=True)
+
+
+def test_renewal_is_on_unless_turned_off():
+    assert ar.enabled(PLAIN) is True and ar.enabled(None) is True
+    assert ar.enabled(OFF) is False
+
+
+def test_an_update_with_renewal_off_makes_no_account(deployment, ak):
+    result, log = _ensure(deployment, ak, inst=OFF)
+    assert result == {'env_changed': False, 'ready': False}
+    assert ak.users == {} and ak.tokens == {}
+    assert 'Certificate renewal is off' in log[0]
+
+
+def test_an_update_with_renewal_off_removes_what_was_there(deployment, ak):
+    _ensure(deployment, ak)
+    token = deployment / ar.SECRETS_DIR / ar.TOKEN_FILE
+    assert token.exists()
+    _ensure(deployment, ak, inst=OFF)
+    assert not token.exists()
+    assert ak.users == {} and ak.tokens == {} and ak.groups == {}
+
+
+def test_turning_it_off_stops_the_container_and_deletes_token_and_account(deployment, ak):
+    _ensure(deployment, ak)
+    calls, log = [], []
+
+    class R:
+        returncode, stderr = 0, ''
+    ar.disable(_ctx(), OFF, str(deployment), lambda a: (calls.append(a), R())[1],
+               log.append, opener=ak)
+    assert calls == ['rm -s -f renewal']
+    assert not (deployment / ar.SECRETS_DIR / ar.TOKEN_FILE).exists()
+    assert ak.users == {} and ak.tokens == {}
+    assert log == ['Renewal container stopped', 'Token file deleted',
+                   "Renewal account 'atlas-renewal' removed"]
+
+
+def test_turning_it_off_twice_is_harmless(deployment, ak):
+    class R:
+        returncode, stderr = 0, ''
+    log = []
+    ar.disable(_ctx(), OFF, str(deployment), lambda a: R(), log.append, opener=ak)
+    assert log[-1] == 'No renewal account to remove'
+
+
+def test_the_page_offers_the_switch_and_the_route_exists():
+    page = (ROOT / 'templates' / 'atlas.html').read_text(encoding='utf-8')
+    assert "toggleRenewal(i)" in page and "/renewal'" in page
+    assert 'renewal_enabled' in atlas.INSTANCE_FIELDS
+    src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
+    assert "/instances/<slug>/renewal" in src
