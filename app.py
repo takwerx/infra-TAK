@@ -27532,7 +27532,8 @@ def _console_pending_update(settings):
                     'how': 'Console page → Update Now.'}
             # ops #168: name every security release between what runs here and the
             # target — skipping one (installed .20, security .22, latest .25) still
-            # leaves the box exposed. Unreadable release list = unknown, not security.
+            # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
+            # to update. Unreadable release list = unknown, not security.
             try:
                 req = urllib.request.Request(
                     f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50', headers=gh_headers)
@@ -27551,7 +27552,7 @@ def _console_pending_update(settings):
                     what = _release_security_summary(rel.get('body'))
                     if what:
                         sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
-                item['security'] = [s for _, s in sorted(sec)]
+                item['security'] = [s for _, s in sorted(sec, reverse=True)]
             except Exception as e:
                 item['security_unknown'] = True
                 print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
@@ -27561,20 +27562,54 @@ def _console_pending_update(settings):
     return None
 
 
-# ops #168: the ship skill already opens a security release's notes with this headline
-# (v10.2.21/22 `## Security release: …`, v10.2.24 `## Security: …`). Only the FIRST
-# line counts — a "### Security" section deeper in ordinary notes is not a flag.
+# ops #168: the ship skill opens a security release's notes with this headline
+# (v10.2.21/22 `## Security release: …`, v10.2.24 `## Security: …`).
 _SECURITY_RELEASE_HEADLINE_RE = re.compile(
     r'^\s*#{1,6}\s*[*_]*\s*security(?:\s+release)?\s*[*_]*\s*:\s*[*_]*\s*(.+?)\s*[*_]*\s*$', re.I)
+# ops #505: a release that leads with something else (v10.3.6 "Caddy security update, …")
+# still lists its fix under a `### Security` section; a Guard Dog email on a box at 10.3.0
+# named only 10.3.2's reason because only a first-line headline counted. A section heading
+# is exactly "Security" or "Security: <what>" (not "Security notes", not a bullet).
+_SECURITY_SECTION_HEADING_RE = re.compile(
+    r'^\s*#{2,6}\s*[*_]*\s*security(?:\s+release)?\s*[*_]*\s*(?::\s*[*_]*\s*(.+?)\s*[*_]*)?\s*$', re.I)
+_MD_MARKS_RE = re.compile(r'[*_`]+')
+
+
+def _security_section_summary(lines):
+    """First `### Security` section anywhere in the notes as one short plain line:
+    the heading's own text after the colon, else its bullets (first sentence of each,
+    markdown stripped), else None. An empty section or "none" claims nothing."""
+    for i, ln in enumerate(lines):
+        m = _SECURITY_SECTION_HEADING_RE.match(ln)
+        if not m:
+            continue
+        if m.group(1):
+            return _MD_MARKS_RE.sub('', m.group(1))[:240]
+        bullets = []
+        for nxt in lines[i + 1:]:
+            if re.match(r'^\s*#{1,6}\s', nxt):
+                break
+            b = re.match(r'^\s*[-*+]\s+(.+?)\s*$', nxt)
+            if b:
+                t = _MD_MARKS_RE.sub('', b.group(1))
+                bullets.append(re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0].rstrip('.'))
+        text = '; '.join(b for b in bullets if b)
+        if text and not re.match(r'^(none|n/?a|no security)\b', text, re.I):
+            return text[:240]
+    return None
 
 
 def _release_security_summary(body):
-    """What a release fixes when its notes open with the security headline, else None."""
-    for ln in (body or '').splitlines():
+    """What a release fixes when its notes open with the security headline or carry a
+    `Security` section, else None."""
+    lines = (body or '').splitlines()
+    for ln in lines:
         if ln.strip():
             m = _SECURITY_RELEASE_HEADLINE_RE.match(ln)
-            return m.group(1)[:240] if m else None
-    return None
+            if m:
+                return m.group(1)[:240]
+            break
+    return _security_section_summary(lines)
 
 
 def _semver_tuple(v):
