@@ -83095,6 +83095,14 @@ def _rotate_refresh_integrations(log):
         _cloudtak_tak_cert_heal(log=log)
     except Exception as e:
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+    # ATLAS W460: ATLAS lists only this TAK Server's CAs, from a copy this
+    # writes; a new intermediate is missing from it until refreshed here.
+    try:
+        _atlas_hook = (mod_registry.MODULES.get('atlas') or {}).get('tak_ca_changed')
+        if _atlas_hook:
+            _atlas_hook(mod_registry.get_ctx(), log)
+    except Exception as e:
+        log(f"  ⚠ ATLAS TAK Server CA list skipped: {str(e)[:160]}")
 
 
 def _rotate_sh(argv, timeout=120):
