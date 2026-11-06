@@ -40,6 +40,13 @@ So the power is fenced in another way:
 * **A new token on every deploy and update**, and the old ones deleted after
   the new one is on disk, so there is no moment without a working token.
 
+* **Never for a revoked certificate (ATLAS W461).** TAK Server's enrollment
+  does not look at the certificate a device holds, so renewal must. TAK Server
+  records a revocation in its `certificate` table (what its own login check
+  reads) and in the issuing CA's CRL. Both are copied beside the token every
+  five minutes, and the container refuses renewal when the copy is missing or
+  an hour old: a gap here is never a way through.
+
 Nothing here is fatal. A deployment without renewal works exactly as before; the
 console says renewal is not set up.
 
@@ -292,6 +299,89 @@ def write_files(dirpath, token, authentik_url, ca_pem, key, uid):
     _write_secret(os.path.join(sdir, TOKEN_FILE), token, chown)
 
 
+#: ATLAS W461: what the container reads to refuse revoked certificates
+#: (`app/renewal/revocation.py` in ATLAS).
+REVOKED_FILE = 'revoked.txt'
+CRL_FILE = 'tak-crls.pem'
+TAK_CERT_DIR = os.path.dirname(TAK_ROOT_CA)
+
+#: TAK Server's own record: `CertManagerAdminApi` sets it, `X509Authenticator`
+#: reads it. `hash` is the SHA-256 fingerprint, upper case, colon-separated.
+REVOKED_SQL = ('SELECT hash FROM certificate WHERE revocation_date IS NOT NULL '
+               'ORDER BY hash')
+_FINGERPRINT = re.compile(r'^[0-9A-F]{2}(?::[0-9A-F]{2}){31}$')
+_CRL_BLOCK = re.compile(r'-----BEGIN X509 CRL-----\r?\n[A-Za-z0-9+/=\r\n]+?-----END X509 CRL-----')
+
+#: How often the copy is refreshed. The container refuses one older than an hour.
+REVOCATION_INTERVAL_S = 300
+
+
+def revoked_fingerprints(ctx):
+    """Every revoked certificate's fingerprint, or None when TAK Server's
+    database could not be read, or answered with something that is not one."""
+    settings = ctx['load_settings']()
+    ok, out = ctx['_cotdb_psql'](ctx['_get_tak_deployment_config'](settings), REVOKED_SQL)
+    if not ok:
+        return None
+    found = []
+    for line in (out or '').splitlines():
+        line = line.strip().upper()
+        if not line:
+            continue
+        if not _FINGERPRINT.match(line):
+            return None
+        found.append(line)
+    return found
+
+
+def tak_crls(cert_dir=TAK_CERT_DIR):
+    """Every CA's CRL from TAK Server's certificate folder, PEM. Public data."""
+    blocks = []
+    try:
+        names = sorted(n for n in os.listdir(cert_dir) if n.endswith('.crl'))
+    except OSError:
+        return ''
+    for name in names:
+        try:
+            with open(os.path.join(cert_dir, name), encoding='ascii', errors='replace') as fh:
+                blocks.extend(b.replace('\r\n', '\n') for b in _CRL_BLOCK.findall(fh.read()))
+        except OSError:
+            continue
+    return '\n'.join(dict.fromkeys(blocks)) + '\n' if blocks else ''
+
+
+def write_revocations(dirpath, fingerprints, crls_pem, uid, now=time.time):
+    """The CRLs, then the list with the time it was taken: the list is what the
+    container checks for freshness, so it goes last."""
+    sdir = os.path.join(dirpath, SECRETS_DIR)
+    chown = uid if _uid() == 0 else None
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now()))
+    _write_secret(os.path.join(sdir, CRL_FILE), crls_pem, chown)
+    _write_secret(os.path.join(sdir, REVOKED_FILE),
+                  '\n'.join(['written=' + stamp] + list(fingerprints)) + '\n', chown)
+
+
+def refresh_revocations(ctx, inst, dirpath, plog, cert_dir=TAK_CERT_DIR):
+    """Copy TAK Server's revocations for one deployment. True when written.
+
+    ⚠️ When the database cannot be read, nothing is written: the old copy ages
+    out and the container refuses renewal, which is the safe way to fail.
+    """
+    try:
+        if not enabled(inst) or not os.path.isdir(os.path.join(dirpath, SECRETS_DIR)):
+            return False
+        prints = revoked_fingerprints(ctx)
+        if prints is None:
+            plog("  ⚠ Could not read TAK Server's revoked certificates; certificate "
+                 'renewal stops within an hour until it can.')
+            return False
+        write_revocations(dirpath, prints, tak_crls(cert_dir), container_uid())
+        return True
+    except Exception as exc:
+        plog("  ⚠ Could not copy TAK Server's revoked certificates: %s" % str(exc)[:120])
+        return False
+
+
 def _read_ca(path=TAK_ROOT_CA):
     try:
         with open(path, encoding='utf-8') as fh:
@@ -351,6 +441,9 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_R
         # ⚠️ The public name, not `_get_authentik_api_url`: that answers the
         # host's loopback, which inside a container is the container itself.
         write_files(dirpath, token, public, ca_pem, key, uid)
+        # ATLAS W461: at once, not only at the next tick, or renewal is refused
+        # for the first minutes after every deploy and update.
+        refresh_revocations(ctx, inst, dirpath, plog)
         retired = retire_old_tokens(api, inst, user_pk, keep=identifier)
 
         env = os.path.join(dirpath, '.env')
