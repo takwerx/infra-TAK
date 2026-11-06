@@ -63,6 +63,7 @@ from . import register_module, job_log, job_state, get_ctx
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
 from . import atlas_instances
+from . import atlas_renewal
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
 KEY = 'atlas'
@@ -3799,6 +3800,10 @@ def deploy(ctx, job, params):
         plog('✓ %s owned by uid %d (the container is not root)'
              % (', '.join(WRITABLE_DIRS), APP_UID))
 
+        # ⚠️ Before the containers start, so the renewal container's uid and
+        # ATLAS's client key are in `.env` when compose reads it.
+        atlas_renewal.ensure(ctx, _inst, dirpath, write_env_value, plog)
+
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
         plog('━━━ Step 4/7: Starting containers ━━━')
@@ -5039,6 +5044,10 @@ def _run_update(ctx, inst=None):
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
         _set_trusted_proxies(dirpath, plog, _me['compose_project'])
+        # ⚠️ On every update, not only at deploy: this is how a deployment
+        # made before renewal existed gets its account, and how the token is
+        # rotated. Before the rebuild, so compose reads the new `.env`.
+        atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
@@ -5311,6 +5320,12 @@ def remove_instance(ctx, inst, plog=None):
     group_note = remove_agency_admin_group(ctx, inst)
     if group_note:
         note(f'{label}: {group_note}')
+
+    # ⚠️ And its renewal account: a superuser token left behind for a
+    # deployment that no longer exists is the worst thing to orphan.
+    renewal_note = atlas_renewal.remove(ctx, inst)
+    if renewal_note:
+        note(f'{label}: {renewal_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
