@@ -204,3 +204,52 @@ def test_missing_menu_entry_warning_points_at_the_dockerignore_ops503():
     src = pathlib.Path(__file__).resolve().parent.parent.joinpath('app.py').read_text(encoding='utf-8')
     i = src.index("is NOT in the built web app")
     assert 'Dockerfile.dockerignore' in src[i:i + 900]
+
+
+# ops #503 follow-up: TAK Portal's marketplace rebuilds CloudTAK through its own helper, which never
+# runs the build shield, so a stale Dispatcher-written file used to wait for a console-driven build.
+# Now the console puts it right on every start (and every update restarts the console).
+def _startup_heal():
+    from test_cloudtak_marketplace_shield_gh252 import _body
+    ns = _load()
+    exec(compile(_body('_cloudtak_heal_dockerignore_at_start'), 'app.py', 'exec'), ns)
+    return ns['_cloudtak_heal_dockerignore_at_start']
+
+
+def test_console_start_replaces_a_stale_dispatcher_file_without_a_build_ops503(tmp_path, capsys):
+    ct = _tree(tmp_path, ('tak-dispatcher', 'taksim', 'livewx-radar'))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    (ct / 'Dockerfile.dockerignore').write_text(_dispatcher_file())
+    _startup_heal()(str(ct))
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert out.splitlines()[0].startswith('# infra-TAK (ops #299)')
+    for n in ('tak-dispatcher', 'taksim', 'livewx-radar'):
+        assert f'\n!app/plugins/{n}\n' in out
+    assert 'Startup self-heal' in capsys.readouterr().out
+
+
+def test_console_start_is_quiet_on_a_clean_box_and_keeps_an_operators_file_ops503(tmp_path, capsys):
+    ct = _tree(tmp_path, ('taksim',))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    heal = _startup_heal()
+    heal(str(ct))
+    first = (ct / 'Dockerfile.dockerignore').read_text()
+    capsys.readouterr()
+    heal(str(ct))
+    assert (ct / 'Dockerfile.dockerignore').read_text() == first
+    assert capsys.readouterr().out == ''
+    (ct / 'Dockerfile.dockerignore').write_text('# mine\napp/plugins/*\n')
+    heal(str(ct))
+    assert (ct / 'Dockerfile.dockerignore').read_text() == '# mine\napp/plugins/*\n'
+
+
+def test_console_start_with_no_cloudtak_folder_does_not_raise_ops503(tmp_path):
+    _startup_heal()(str(tmp_path / 'missing'))
+
+
+def test_startup_heal_runs_the_dockerignore_fix_before_the_other_cloudtak_heals_ops503():
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath('app.py').read_text(encoding='utf-8')
+    start = src[src.index('def _startup_heal_cloudtak_media_hls'):]
+    body = start[:start.index('_startup_heal_cloudtak_media_hls()\n')]
+    assert '_cloudtak_heal_dockerignore_at_start(_ct_dir)' in body
+    assert body.index('_cloudtak_heal_dockerignore_at_start(') < body.index('_cloudtak_upload_limit_heal()')
