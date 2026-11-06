@@ -163,6 +163,12 @@ def ensure_account(api, inst, now=time.time):
         api.call('core/groups/%s/' % group['pk'], {'is_superuser': True}, method='PATCH')
 
     user = _find(api, 'core/users/', 'username', n['username'])
+    if user is not None and not _is_ours(user):
+        # ⚠️ Somebody's account with our name, made in Authentik or TAK Portal
+        # before this ran. Adding it to a superuser group would hand whoever
+        # knows its password the whole of Authentik (ops #510).
+        raise RuntimeError("an Authentik user named %s exists and is not a service "
+                           "account; rename it, then update ATLAS" % n['username'])
     if user is None:
         user = api.call('core/users/', {
             'username': n['username'],
@@ -187,13 +193,25 @@ def ensure_account(api, inst, now=time.time):
     return key, identifier, user['pk']
 
 
+def _is_ours(user):
+    """An account this module made: a service account, never a person's."""
+    return user.get('type') == 'service_account'
+
+
 def retire_old_tokens(api, inst, user_pk, keep):
-    """Delete this account's other API tokens. Returns how many went."""
-    prefix = names(inst)['token_prefix']
+    """Delete this account's other API tokens. Returns how many went.
+
+    ⚠️ `user__username`, not `user`: Authentik ignores `?user=` and lists
+    every API token on the box (seen on test12, 2026.5.6), so the owner is
+    checked here as well as the prefix.
+    """
+    n = names(inst)
+    prefix = n['token_prefix']
     gone = 0
-    for token in api.results('core/tokens/?user=%s&intent=api&page_size=100' % user_pk):
+    for token in api.results('core/tokens/?user__username=%s&intent=api&page_size=100'
+                             % urllib.parse.quote(n['username'])):
         ident = token.get('identifier') or ''
-        if ident.startswith(prefix) and ident != keep:
+        if token.get('user') == user_pk and ident.startswith(prefix) and ident != keep:
             api.call('core/tokens/%s/' % urllib.parse.quote(ident), method='DELETE')
             gone += 1
     return gone
@@ -203,7 +221,8 @@ def remove_account(api, inst):
     """Delete the account and its tokens. The shared group goes when empty."""
     n = names(inst)
     user = _find(api, 'core/users/', 'username', n['username'])
-    if user is None:
+    if user is None or not _is_ours(user):
+        # Never delete a person who happens to have the account's name.
         return False
     retire_old_tokens(api, inst, user['pk'], keep=None)
     api.call('core/users/%s/' % user['pk'], method='DELETE')

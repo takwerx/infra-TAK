@@ -108,8 +108,12 @@ class FakeAuthentik:
                 return None
         if parts[:2] == ['core', 'tokens']:
             if len(parts) == 2 and method == 'GET':
+                # Like the real one (2026.5.6 on test12): `user__username`
+                # filters, `user` is ignored.
+                want = query.get('user__username')
                 return {'results': [t for t in self.tokens.values()
-                                    if str(t['user']) == query.get('user')
+                                    if (want is None or
+                                        self.users.get(t['user'], {}).get('username') == want)
                                     and t['intent'] == query.get('intent')]}
             if len(parts) == 2 and method == 'POST':
                 t = dict(body, key='key-for-' + body['identifier'])
@@ -215,6 +219,32 @@ def test_tokens_of_other_deployments_are_left_alone(deployment, ak):
     _ensure(deployment, ak, inst=PLAIN)
     owners = sorted(t['identifier'].rsplit('-', 1)[0] for t in ak.tokens.values())
     assert owners == ['atlas-renewal-api', 'atlas-renewal-corona-api']
+
+
+def test_a_token_with_our_prefix_on_someone_elses_account_is_left_alone(deployment, ak):
+    """⚠️ Authentik ignores `?user=`, so the owner is checked, not only the name."""
+    ak.users[7] = {'pk': 7, 'username': 'alice', 'type': 'internal'}
+    ak.tokens['atlas-renewal-api-1'] = {'identifier': 'atlas-renewal-api-1', 'intent': 'api',
+                                        'user': 7, 'key': 'k'}
+    _ensure(deployment, ak)
+    assert 'atlas-renewal-api-1' in ak.tokens
+
+
+def test_a_person_with_the_accounts_name_is_never_made_superuser(deployment, ak):
+    """⚠️ A TAK Portal user called `atlas-renewal` would otherwise be put in a
+    superuser group, and whoever knows its password owns Authentik (ops #510)."""
+    ak.users[7] = {'pk': 7, 'username': 'atlas-renewal', 'type': 'internal', 'is_active': True}
+    result, log = _ensure(deployment, ak)
+    assert result['ready'] is False
+    assert 'not a service account' in log[-1]
+    assert all(7 not in g['users'] for g in ak.groups.values())
+    assert ak.tokens == {}
+
+
+def test_removal_never_deletes_a_person_with_the_accounts_name(ak):
+    ak.users[7] = {'pk': 7, 'username': 'atlas-renewal', 'type': 'internal', 'is_active': True}
+    assert ar.remove(_ctx(), PLAIN, opener=ak) is None
+    assert 7 in ak.users
 
 
 # --------------------------------------------------------------------------- #

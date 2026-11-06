@@ -1836,6 +1836,12 @@ def global_admin_group(ak_url, ak_headers, plog=None):
     group that does not exist, and the first one to notice would be an
     administrator locked out of the console they would use to fix it. Falls back
     to the name only when the question cannot be asked.
+
+    ⚠️ **Never the certificate-renewal group.** It is a superuser group too
+    (only a superuser can make a token for another user), and it sorts before
+    `authentik Admins`. Picked first, it became every deployment's admin group
+    on the next update, and ATLAS turned away every administrator: only the
+    renewal service account is in it (ops #510).
     """
     import urllib.request as _urlreq
 
@@ -1846,7 +1852,7 @@ def global_admin_group(ak_url, ak_headers, plog=None):
     except Exception:
         return ADMIN_GROUP
     for group in body.get('results', []):
-        if group.get('is_superuser'):
+        if group.get('is_superuser') and group.get('name') != atlas_renewal.GROUP_NAME:
             return group.get('name') or ADMIN_GROUP
     return ADMIN_GROUP
 
