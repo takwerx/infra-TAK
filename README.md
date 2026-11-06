@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.7-alpha)**
+**Current release: [v10.3.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,24 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.8-alpha — 2026-11-06 — CloudTAK Update keeps its database working; TAK Portal shows the right state after an update; Ubuntu 24.04 upgrade fix
+
+**Headline: On a non-root install, CloudTAK Update no longer takes over CloudTAK's database folder, so the database keeps accepting connections. The TAK Portal page no longer says "Stopped" right after a good update. The Ubuntu 22.04 to 24.04 upgrade works on servers with Microsoft's package list.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha))
+
+**CloudTAK.**
+- CloudTAK Update's file-ownership repair re-owned CloudTAK's database data folder, and PostgreSQL then refused new connections until it was fixed by hand. The repair now leaves container data alone: `.docker-*` folders, any folder a container mounts, and any folder the console can't read. Every path it does re-own is logged.
+- A leftover build file from an older Dispatcher install could drop every other CloudTAK plugin when TAK Portal rebuilt CloudTAK. The console now replaces that file each time it starts.
+
+**TAK Portal.**
+- Right after a successful update, the TAK Portal page could show "Stopped" until you refreshed. It now shows the real state.
+
+**OS upgrade and updates.**
+- The Ubuntu 22.04 to 24.04 upgrade failed on servers with Microsoft's package list (its 22.04 address doesn't work on 24.04) and left the console unable to start. The list now moves to Microsoft's 24.04 feed, a broken third-party list only warns, and Microsoft's `aznfs` package is kept out of the upgrade.
+- A failed "Install updates" warning can be dismissed, and it stays dismissed after a reload or reboot. A later failure still shows.
+
+**Guard Dog.**
+- The remote-database password alert now says why the login failed (wrong password, PostgreSQL restarting, connection dropped), with passwords masked.
 
 ### v10.3.7-alpha — 2026-11-06 — CloudTAK keeps its big-upload limit and every plugin; ATLAS stays admin-only after an update; clearer security email
 
