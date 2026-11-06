@@ -255,8 +255,8 @@ def test_kernel_not_staged_is_none_without_asking():
 # ── infra-TAK security release: the ship skill's headline ─────────────────────
 
 def _rel_ns():
-    return _exec({'re': re}, '_release_security_summary',
-                 consts=('_SECURITY_RELEASE_HEADLINE_RE',))
+    return _exec({'re': re}, '_release_security_summary', '_security_section_summary',
+                 consts=('_SECURITY_RELEASE_HEADLINE_RE', '_SECURITY_SECTION_HEADING_RE', '_MD_MARKS_RE'))
 
 
 @pytest.mark.parametrize('body, want', [
@@ -266,7 +266,17 @@ def _rel_ns():
      'TAK Portal and Remote Assist on the newest Node 22'),
     ('\n\n### **Security release:** fixes GHSA-abcd-efgh-ijkl\n', 'fixes GHSA-abcd-efgh-ijkl'),
     ('## Hotfix: Node-RED feeds get their groups back\n\nmoves Node-RED onto the Node.js 22 security release', None),
-    ('## Guard Dog frees disk\n\n## Security: not the headline\n', None),
+    # ops #505: a Security section lower down counts (the headline is not the only way in)
+    ('## Guard Dog frees disk\n\n## Security: Authentik 2026.8.5\n', 'Authentik 2026.8.5'),
+    ('## Caddy security update, a quieter Guard Dog\n\n### Security\n'
+     '- **Caddy security update:** Ubuntu boxes move to Caddy 2.11.8 or newer. Rocky/RHEL boxes '
+     'stay on 2.11.7 until the repo carries it.\n\n### Also fixed\n- something else\n',
+     'Caddy security update: Ubuntu boxes move to Caddy 2.11.8 or newer'),
+    ('## Fixes\n\n### Security\n- **A:** first fix. More.\n- B second fix\n\n### Other\n- C\n',
+     'A: first fix; B second fix'),
+    ('## Fixes\n\n### Security\n\n### Also fixed\n- x\n', None),
+    ('## Fixes\n\n### Security\n- None in this release.\n', None),
+    ('## Fixes\n\n### Security notes\n- **x:** y\n', None),
     ('Security release notes are below\n', None),
     ('', None),
     (None, None),
@@ -312,8 +322,8 @@ def _console(routes, version='10.2.23-alpha'):
     fake = _fake_urllib(routes)
     n = {'json': json, 'subprocess': _real_subprocess, 'os': os, 're': re, 'VERSION': version,
          'GITHUB_REPO': 'takwerx/infra-TAK'}
-    _exec(n, '_console_pending_update', '_release_security_summary',
-          consts=('_SECURITY_RELEASE_HEADLINE_RE',))
+    _exec(n, '_console_pending_update', '_release_security_summary', '_security_section_summary',
+          consts=('_SECURITY_RELEASE_HEADLINE_RE', '_SECURITY_SECTION_HEADING_RE', '_MD_MARKS_RE'))
     real = sys.modules['urllib.request']
     sys.modules['urllib.request'] = fake
     try:
@@ -331,11 +341,29 @@ def _console(routes, version='10.2.23-alpha'):
 def test_console_names_every_security_release_since_installed():
     item = _console({'/releases/latest': {'tag_name': 'v10.2.27-alpha'}, '/releases?': RELEASES})
     assert item['target'] == 'v10.2.27-alpha' and item['how'] == 'Console page → Update Now.'
-    # .22 is older than what runs (.23); the draft is past the target; oldest first
+    # .22 is older than what runs (.23); the draft is past the target; newest first (ops #505)
     assert item['security'] == [
-        'v10.2.24-alpha is a security release: TAK Portal on the newest Node 22',
-        'v10.2.26-alpha is a security release: Authentik 2026.8.4 (CVE-2026-11111)']
+        'v10.2.26-alpha is a security release: Authentik 2026.8.4 (CVE-2026-11111)',
+        'v10.2.24-alpha is a security release: TAK Portal on the newest Node 22']
     assert 'security_unknown' not in item
+
+
+def test_console_names_newest_release_whose_security_item_is_a_section_ops505():
+    # garesponder, Nov 5: a box on 10.3.0 was told 10.3.2's reason only; 10.3.6 leads with
+    # something else and lists Caddy under "### Security".
+    rels = [
+        {'tag_name': 'v10.3.6-alpha', 'body': '## Caddy security update, big uploads, a quieter Guard Dog\n\n'
+         '### Security\n- **Caddy security update:** Ubuntu boxes move to Caddy 2.11.8 or newer. '
+         'Rocky/RHEL boxes stay on 2.11.7.\n\n### Also fixed\n- other\n'},
+        {'tag_name': 'v10.3.5-alpha', 'body': '## Rotate the intermediate CA without dropping phones\n'},
+        {'tag_name': 'v10.3.2-alpha', 'body': '## Security: old Node.js is now flagged and emailed\n'},
+        {'tag_name': 'v10.3.0-alpha', 'body': '## Ubuntu 24.04\n\n### Security\n- not in range\n'},
+    ]
+    item = _console({'/releases/latest': {'tag_name': 'v10.3.6-alpha'}, '/releases?': rels},
+                    version='10.3.0-alpha')
+    assert item['security'] == [
+        'v10.3.6-alpha is a security release: Caddy security update: Ubuntu boxes move to Caddy 2.11.8 or newer',
+        'v10.3.2-alpha is a security release: old Node.js is now flagged and emailed']
 
 
 def test_console_plain_release_has_empty_security():

@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.6-alpha"
+VERSION = "10.3.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -27532,7 +27532,8 @@ def _console_pending_update(settings):
                     'how': 'Console page → Update Now.'}
             # ops #168: name every security release between what runs here and the
             # target — skipping one (installed .20, security .22, latest .25) still
-            # leaves the box exposed. Unreadable release list = unknown, not security.
+            # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
+            # to update. Unreadable release list = unknown, not security.
             try:
                 req = urllib.request.Request(
                     f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50', headers=gh_headers)
@@ -27551,7 +27552,7 @@ def _console_pending_update(settings):
                     what = _release_security_summary(rel.get('body'))
                     if what:
                         sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
-                item['security'] = [s for _, s in sorted(sec)]
+                item['security'] = [s for _, s in sorted(sec, reverse=True)]
             except Exception as e:
                 item['security_unknown'] = True
                 print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
@@ -27561,20 +27562,54 @@ def _console_pending_update(settings):
     return None
 
 
-# ops #168: the ship skill already opens a security release's notes with this headline
-# (v10.2.21/22 `## Security release: …`, v10.2.24 `## Security: …`). Only the FIRST
-# line counts — a "### Security" section deeper in ordinary notes is not a flag.
+# ops #168: the ship skill opens a security release's notes with this headline
+# (v10.2.21/22 `## Security release: …`, v10.2.24 `## Security: …`).
 _SECURITY_RELEASE_HEADLINE_RE = re.compile(
     r'^\s*#{1,6}\s*[*_]*\s*security(?:\s+release)?\s*[*_]*\s*:\s*[*_]*\s*(.+?)\s*[*_]*\s*$', re.I)
+# ops #505: a release that leads with something else (v10.3.6 "Caddy security update, …")
+# still lists its fix under a `### Security` section; a Guard Dog email on a box at 10.3.0
+# named only 10.3.2's reason because only a first-line headline counted. A section heading
+# is exactly "Security" or "Security: <what>" (not "Security notes", not a bullet).
+_SECURITY_SECTION_HEADING_RE = re.compile(
+    r'^\s*#{2,6}\s*[*_]*\s*security(?:\s+release)?\s*[*_]*\s*(?::\s*[*_]*\s*(.+?)\s*[*_]*)?\s*$', re.I)
+_MD_MARKS_RE = re.compile(r'[*_`]+')
+
+
+def _security_section_summary(lines):
+    """First `### Security` section anywhere in the notes as one short plain line:
+    the heading's own text after the colon, else its bullets (first sentence of each,
+    markdown stripped), else None. An empty section or "none" claims nothing."""
+    for i, ln in enumerate(lines):
+        m = _SECURITY_SECTION_HEADING_RE.match(ln)
+        if not m:
+            continue
+        if m.group(1):
+            return _MD_MARKS_RE.sub('', m.group(1))[:240]
+        bullets = []
+        for nxt in lines[i + 1:]:
+            if re.match(r'^\s*#{1,6}\s', nxt):
+                break
+            b = re.match(r'^\s*[-*+]\s+(.+?)\s*$', nxt)
+            if b:
+                t = _MD_MARKS_RE.sub('', b.group(1))
+                bullets.append(re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0].rstrip('.'))
+        text = '; '.join(b for b in bullets if b)
+        if text and not re.match(r'^(none|n/?a|no security)\b', text, re.I):
+            return text[:240]
+    return None
 
 
 def _release_security_summary(body):
-    """What a release fixes when its notes open with the security headline, else None."""
-    for ln in (body or '').splitlines():
+    """What a release fixes when its notes open with the security headline or carry a
+    `Security` section, else None."""
+    lines = (body or '').splitlines()
+    for ln in lines:
         if ln.strip():
             m = _SECURITY_RELEASE_HEADLINE_RE.match(ln)
-            return m.group(1)[:240] if m else None
-    return None
+            if m:
+                return m.group(1)[:240]
+            break
+    return _security_section_summary(lines)
 
 
 def _semver_tuple(v):
@@ -48344,6 +48379,13 @@ awk '/location ~ \^\/api/ && !done {
   || { cp "$f.ops470.bak" "$f"; echo FAIL; }
 rm -f "$f.ops470.bak"
 '''
+# ops #502: read-only twin of the script above, for the drift check. OK = the rule is there, MISSING =
+# the real config is written but the rule is not, NOCONF = nginx.conf.js has not written it yet (the
+# stock file has no `location ~ ^/api`), which is never counted as drift.
+_CT_NGINX_UPLOAD_CHECK_SH = r'''f=/etc/nginx/nginx.conf
+grep -q 'location = /api/server/tileset' "$f" 2>/dev/null && { echo OK; exit 0; }
+grep -q 'location ~ ^/api' "$f" 2>/dev/null && echo MISSING || echo NOCONF
+'''
 
 
 def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
@@ -49341,6 +49383,59 @@ def _cloudtak_plugin_missing_deps(web, foreign):
 # installed folder) puts them back without touching a tracked file.
 _CT_DOCKERIGNORE_MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
 _CT_PLUGIN_DIR_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+# ops #503: the Dispatcher plugin's own installer writes a Dockerfile.dockerignore too (first line
+# below). It re-includes only its own folder, so with it in place every other plugin dropped out of the
+# image build. Its content is a plain copy of .dockerignore plus that one re-include, which ours
+# covers, so we treat it as ours to regenerate. The Dispatcher installer leaves a file starting with
+# our marker alone, so the two do not fight.
+_CT_DOCKERIGNORE_DISPATCHER_MARK = '# managed by cloudtak-dispatcher-plugin install.sh'
+
+
+def _ct_dockerignore_leaves_out(text, rel, names):
+    """ops #503: which of the plugin folders `names` does this ignore file leave out of the build?
+    Simplified Docker rule: a plain pattern excludes a path or any parent of it, a `!` pattern
+    re-includes only that exact path, last match wins."""
+    def rx(pat):
+        pat = pat.strip().lstrip('/').rstrip('/')
+        out, i = '', 0
+        while i < len(pat):
+            if pat.startswith('**/', i):
+                out, i = out + '(?:.*/)?', i + 3
+            elif pat.startswith('**', i):
+                out, i = out + '.*', i + 2
+            elif pat[i] == '*':
+                out, i = out + '[^/]*', i + 1
+            elif pat[i] == '?':
+                out, i = out + '[^/]', i + 1
+            else:
+                out, i = out + re.escape(pat[i]), i + 1
+        return re.compile(out + r'\Z')
+    rules = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#'):
+            continue
+        neg = ln.startswith('!')
+        if neg:
+            ln = ln[1:].strip()
+        try:
+            rules.append((neg, rx(ln)))
+        except re.error:
+            continue
+    left_out = []
+    for n in names:
+        path = f'{rel}/{n}'
+        parents = ['/'.join(path.split('/')[:k]) for k in range(1, len(path.split('/')) + 1)]
+        ignored = False
+        for neg, r in rules:
+            if neg:
+                if r.match(path):
+                    ignored = False
+            elif any(r.match(x) for x in parents):
+                ignored = True
+        if ignored:
+            left_out.append(n)
+    return left_out
 
 
 def _cloudtak_keep_plugins_in_build(ct_dir, plog):
@@ -49351,11 +49446,29 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
         base = os.path.join(ct_dir, '.dockerignore')
         out = os.path.join(ct_dir, 'Dockerfile.dockerignore')
         mine = False
+        from_dispatcher = False
         if os.path.exists(out):
             with open(out, encoding='utf-8', errors='replace') as f:
-                mine = f.readline().rstrip('\r\n') == _CT_DOCKERIGNORE_MARK
+                first = f.readline().rstrip('\r\n')
+            from_dispatcher = first == _CT_DOCKERIGNORE_DISPATCHER_MARK
+            mine = first == _CT_DOCKERIGNORE_MARK or from_dispatcher
             if not mine:
-                return                      # the operator's own file: theirs to keep
+                # the operator's own file: theirs to keep, but say so when it drops installed plugins
+                try:
+                    with open(out, encoding='utf-8', errors='replace') as f:
+                        theirs = f.read()
+                    plugins = os.path.join(ct_dir, rel)
+                    have_dirs = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
+                                       and os.path.isdir(os.path.join(plugins, n)))
+                    dropped = _ct_dockerignore_leaves_out(theirs, rel, have_dirs)
+                except OSError:
+                    dropped = []
+                if dropped:
+                    plog(f"  ⚠ Dockerfile.dockerignore in the CloudTAK folder is not ours and leaves {rel}/ plugin "
+                         f"folders out of the image build: {', '.join(dropped)}. Those plugins will be missing "
+                         f"from the menu after this build. Delete that file (infra-TAK writes a correct one) "
+                         f"or add a '!{rel}/<name>' line for each.")
+                return
         text = ''
         if os.path.isfile(base):
             with open(base, encoding='utf-8', errors='replace') as f:
@@ -49385,6 +49498,9 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
         if have != want:
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(want)
+            if from_dispatcher:
+                plog("  The Dispatcher plugin's installer had written a Dockerfile.dockerignore that kept only "
+                     "its own folder in the image build; replaced it so every installed plugin stays in (ops #503)")
             plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
                  f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
     except Exception as e:
@@ -49495,8 +49611,10 @@ def _cloudtak_verify_plugins_in_app(ct_dir, plog, only=None):
             plog(f"  ✓ {n}: menu entry '{label}' is in the built web app")
         for n, label in missing:
             plog(f"  ⚠ {n}: menu entry '{label}' is NOT in the built web app. The plugin files were copied but "
-                 f"did not make it into the build, so the menu item will not show. Likely cause: CloudTAK "
-                 f"changed where it builds plugins from (this happened in 13.102.0). Please report it with this log.")
+                 f"did not make it into the build, so the menu item will not show. Likely causes: a "
+                 f"Dockerfile.dockerignore or .dockerignore in the CloudTAK folder that leaves the plugin folders out "
+                 f"of the build (check that file first), or CloudTAK changed where it builds plugins from (this "
+                 f"happened in 13.102.0). Please report it with this log.")
         if not found and not missing:
             return None
         return not missing
@@ -49611,11 +49729,12 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
 # plugins broke the remote build exactly as #252 / #271 broke the local one. Rather than a second
 # copy in shell, the functions above are sent as they are and run by the remote python3.
 _CT_SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
+                     '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE',
+                     '_CT_DOCKERIGNORE_DISPATCHER_MARK')
 _CT_SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                     '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                    '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
-                    '_cloudtak_shield_foreign_plugins')
+                    '_cloudtak_plugin_missing_deps', '_ct_dockerignore_leaves_out',
+                    '_cloudtak_keep_plugins_in_build', '_cloudtak_shield_foreign_plugins')
 
 
 def _cloudtak_shield_py():
@@ -103183,23 +103302,30 @@ _cloudtak_autorepair_lock = threading.Lock()
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'print'|'media'|'', 'no_override': [names], 'print': [names],
-     'hls': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'upload'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'upload': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
     recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
     — restarting that one container fixes it. 'media': only the HLS profile is gone — the media
     heal alone fixes that. hls None means the read failed, which is never counted as drift
-    (ops #161)."""
+    (ops #161). 'upload' (ops #502): only the 25G /api/server/tileset rule is gone from the api's
+    nginx.conf, which any recreate of the api (a TAK Portal plugin install or update) rewrites —
+    the upload-limit heal alone fixes that. upload None = could not read, or nginx.conf.js has
+    not written the real config yet: not drift."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
            'print': _cloudtak_print_drift(ct_dir),
-           'hls': None, 'media_image': '', 'api_ca': None}
+           'hls': None, 'upload': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
         chk = _ct_docker_out(['exec', '-i', media, 'sh'], timeout=25, stdin=_CT_MEDIA_CHECK_SH)
         if chk and chk.strip():
             out['hls'] = _ct_media_converged(chk)
         out['media_image'] = (_ct_docker_out(['inspect', media, '--format', '{{.Config.Image}}']) or '').strip()
+    chk = _ct_docker_out(['exec', '-i', 'cloudtak-api-1', 'sh'], timeout=25, stdin=_CT_NGINX_UPLOAD_CHECK_SH)
+    chk = (chk or '').strip().splitlines()[-1:] or ['']
+    if chk[0] in ('OK', 'MISSING'):
+        out['upload'] = chk[0] == 'OK'
     env = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{json .Config.Env}}'])
     if env:
         try:
@@ -103212,6 +103338,8 @@ def _cloudtak_drift(ct_dir):
         out['kind'] = 'print'
     elif out['hls'] is False:
         out['kind'] = 'media'
+    elif out['upload'] is False:
+        out['kind'] = 'upload'
     return out
 
 
@@ -103224,6 +103352,8 @@ def _cloudtak_drift_summary(d):
         parts.append("Print started without infra-TAK's /print-api settings: " + ', '.join(d['print']))
     if d.get('hls') is False:
         parts.append('HLS profile missing')
+    if d.get('upload') is False:
+        parts.append('tileset upload limit missing')
     if d.get('media_image'):
         parts.append(f"media image {d['media_image']}")
     if d.get('api_ca') is not None:
@@ -103338,8 +103468,9 @@ def _cloudtak_autorepair_run(ct_dir, drift):
     to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
     operator's custom file stay in it), re-assert the loopback port patch on the base file (the
     recreate must never publish a port we closed), then the journaled recreate + media heal.
-    'media': the media heal alone. 'print' (ops #222): Print restarted with infra-TAK's overlay
-    (plus the media heal if that is gone too); every kind ends with that step. Success is judged
+    'media': the media heal alone. 'upload' (ops #502): the upload-limit heal alone (it also runs
+    after any of the other kinds when the rule is gone too). 'print' (ops #222): Print restarted
+    with infra-TAK's overlay (plus the media heal if that is gone too); every kind ends with that step. Success is judged
     by a fresh drift check, not by exit codes."""
     def _log(m):
         print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
@@ -103358,6 +103489,11 @@ def _cloudtak_autorepair_run(ct_dir, drift):
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
         elif drift['kind'] == 'media' or drift.get('hls') is False:
             why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+        # ops #502: the 'recreate' kind got the upload rule back through _cloudtak_recreate_and_heal;
+        # every other kind that found it gone puts it back here. Check-before-apply, so a no-op if present.
+        if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
+            if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
+                why = 'the tileset upload limit did not re-apply'
         # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
         # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
         if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
@@ -103393,7 +103529,8 @@ def _cloudtak_autorepair_notify(before, after):
         done = {'recreate': "rewrote infra-TAK's compose override and recreated CloudTAK with it (TAK "
                             "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
                             "the HLS profile",
-                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api"
+                'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api",
+                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx"
                 }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | repaired automatically, "
                 f"nothing to do (likely a TAK Portal marketplace install) | "

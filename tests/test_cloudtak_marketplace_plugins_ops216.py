@@ -130,6 +130,7 @@ class PluginBox(Box):
         for n in ('cloudtak-api-1', 'cloudtak-media-1', 'cloudtak-postgis-1', 'cloudtak-events-1'):
             self.labels[n] = files
         self.media_image, self.api_ca, self.hls = 'ghcr.io/dfpc-coe/media-infra:v9.12.1', True, True
+        self.upload = True      # ops #502: the api's nginx.conf has the tileset rule
 
     def run(self, argv, **kw):
         if list(argv[:2]) == ['docker', 'ps'] and 'label=com.docker.compose.project=cloudtak' in argv:
@@ -228,9 +229,9 @@ def test_deploy_build_retry_does_not_remove_orphans():
 
 _SHIELD = ['_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
            '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place', '_cloudtak_plugin_missing_deps',
-           '_cloudtak_keep_plugins_in_build', '_cloudtak_shield_foreign_plugins']
+           '_ct_dockerignore_leaves_out', '_cloudtak_keep_plugins_in_build', '_cloudtak_shield_foreign_plugins']
 _SHIELD_CONSTS = ['_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                  '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE',
+                  '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE', '_CT_DOCKERIGNORE_DISPATCHER_MARK',
                   '_CT_SHIELD_CONSTS', '_CT_SHIELD_FUNCS']
 OURS = [{'install_dir': d, 'key': d} for d in ('taksim',)]
 
