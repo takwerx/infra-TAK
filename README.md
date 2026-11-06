@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.6-alpha)**
+**Current release: [v10.3.7-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.7-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,20 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.7-alpha — 2026-11-06 — CloudTAK keeps its big-upload limit and every plugin; ATLAS stays admin-only after an update; clearer security email
+
+**Headline: CloudTAK keeps its 25 GB map-upload limit after a plugin is installed or updated from TAK Portal, and a Dispatcher install no longer drops the other CloudTAK plugins from the next build. Updating ATLAS re-checks that only admins can open it. Guard Dog's "Security update pending" email names the newest security fix first.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.7-alpha))
+
+**CloudTAK.**
+- The 25 GB upload limit for Admin > Public Tiles came back only after a console restart once a CloudTAK plugin was installed or updated from TAK Portal. The console and Guard Dog now notice it is missing and put it back, with no CloudTAK restart.
+- The Dispatcher plugin's installer wrote a build file that left every other CloudTAK plugin out of the next CloudTAK build. infra-TAK now replaces that file with one that keeps every installed plugin. A build file you wrote yourself is still kept, and the build log names any plugin it leaves out.
+
+**ATLAS.**
+- Updating ATLAS re-checks that only Authentik admins can open it. Before, the check never ran on an update.
+
+**Guard Dog.**
+- The "Security update pending" email counts a release's Security section (not only its first line), so it now names 10.3.6's Caddy fix, and lists security releases newest first.
 
 ### v10.3.6-alpha — 2026-11-05 — Caddy security update; CloudTAK takes map uploads over 5 GB; quieter Guard Dog; Update Now retries a slow download
 
