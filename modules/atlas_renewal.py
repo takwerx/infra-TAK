@@ -42,6 +42,11 @@ So the power is fenced in another way:
 
 Nothing here is fatal. A deployment without renewal works exactly as before; the
 console says renewal is not set up.
+
+**It can be turned off per deployment** (`renewal_disabled` in the deployment's
+record, set from the ATLAS page). Off stops the container, deletes the token
+file and deletes the account, and every later deploy and update keeps it that
+way instead of re-creating the account.
 """
 
 import json
@@ -86,6 +91,11 @@ ENV_UID = 'TAKMDM_RENEWAL_UID'
 IMAGE_UID = 1000
 
 _RENEWAL_SERVICE = re.compile(r'^  renewal:\s*$', re.MULTILINE)
+
+
+def enabled(inst):
+    """Whether renewal is on for this deployment. On unless an operator said off."""
+    return not (inst or {}).get('renewal_disabled')
 
 
 def names(inst):
@@ -291,6 +301,14 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_R
     try:
         if not compose_has_renewal(dirpath):
             return nothing
+        if not enabled(inst):
+            # Kept off on every update, not only when the switch was flipped:
+            # an account restored from an Authentik backup goes again here.
+            _delete_token_file(dirpath)
+            note = remove(ctx, inst, opener)
+            plog('  Certificate renewal is off for this deployment%s.'
+                 % ('; ' + note if note else ''))
+            return nothing
         settings = ctx['load_settings']()
         admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
                  ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
@@ -336,6 +354,38 @@ def start(compose, plog):
                  % ((r.stderr or '')[-160:].strip() or 'no output'))
     except Exception as exc:
         plog('  ⚠ Certificate renewal container did not start: %s' % str(exc)[:120])
+
+
+def _delete_token_file(dirpath):
+    path = os.path.join(dirpath, SECRETS_DIR, TOKEN_FILE)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        # Windows will not delete a read-only file; POSIX never gets here.
+        os.chmod(path, 0o600)
+        os.unlink(path)
+    return True
+
+
+def disable(ctx, inst, dirpath, compose, plog, opener=None):
+    """Turn renewal off now: stop the container, then delete the token and the
+    account. Never raises; each step says what happened."""
+    try:
+        r = compose('rm -s -f renewal')
+        plog('Renewal container stopped' if r.returncode == 0 else
+             'Renewal container not stopped: %s'
+             % ((r.stderr or '')[-160:].strip() or 'no output'))
+    except Exception as exc:
+        plog('Renewal container not stopped: %s' % str(exc)[:120])
+    try:
+        if _delete_token_file(dirpath):
+            plog('Token file deleted')
+    except OSError as exc:
+        plog('Token file not deleted: %s' % str(exc)[:120])
+    note = remove(ctx, inst, opener)
+    plog(note[0].upper() + note[1:] if note else 'No renewal account to remove')
 
 
 def remove(ctx, inst, opener=None):

@@ -836,6 +836,48 @@ def write_env_value(env_path, key, value):
     return True
 
 
+def set_renewal(ctx, inst, enabled):
+    """Turn certificate renewal on or off for a built deployment. `(steps, error)`.
+
+    Off stops the renewal container and deletes its token and Authentik account
+    at once; on re-creates them and starts the container. Recorded in the
+    deployment's record, so every later deploy and update keeps the choice.
+    """
+    paths = instance_paths(ctx, inst)
+    dirpath = paths['dir']
+    if not os.path.exists(os.path.join(dirpath, '.env')):
+        return [], 'That deployment has no configuration on disk yet.'
+    if not atlas_renewal.compose_has_renewal(dirpath):
+        return [], ('This ATLAS release has no certificate renewal. Update ATLAS '
+                    'first.')
+
+    remaining = []
+    for other in load_instances(ctx):
+        if (other.get('slug') or None) == (inst or {}).get('slug'):
+            other = dict(other, renewal_disabled=not enabled)
+            inst = other
+        remaining.append(other)
+    save_instances(ctx, remaining)
+    steps = ['Recorded: renewal ' + ('on' if enabled else 'off')]
+
+    def compose(action):
+        return _compose(ctx, action, timeout=1800, inst=inst)
+
+    if not enabled:
+        atlas_renewal.disable(ctx, inst, dirpath, compose, steps.append)
+        return steps, None
+
+    result = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, steps.append)
+    if not result['ready']:
+        return steps, (steps[-1].strip() if len(steps) > 1 else
+                       'Certificate renewal could not be set up.')
+    if result['env_changed']:
+        _compose(ctx, 'up -d api', timeout=300, inst=inst)
+        steps.append('ATLAS restarted with the renewal settings')
+    atlas_renewal.start(compose, steps.append)
+    return steps, None
+
+
 def set_agency_name(ctx, inst, raw_name):
     """Name a deployment that is already built. `(steps, error)`.
 
@@ -1142,6 +1184,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         # record is what the page edits and what survives a container that is
         # not running.
         'agency_name': inst.get('agency_name') or '',
+        # Certificate renewal (W458), on unless the operator turned it off.
+        'renewal_enabled': atlas_renewal.enabled(inst),
         'version': _installed_version(ctx, inst),
         'running_version': (_running_version(ctx, inst)
                             if running and probe_version else None),
@@ -1161,7 +1205,7 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'admin_group_problem', 'latest',
+                   'agency_name', 'renewal_enabled', 'admin_group_problem', 'latest',
                    'update_available', 'paths')
 
 
@@ -6134,6 +6178,23 @@ def register(ctx):
                             'steps': steps}), 400
         return jsonify({'success': True, 'steps': steps})
 
+    def instance_renewal_view(slug):
+        """Turn certificate renewal on or off for one deployment."""
+        from flask import request as _rq
+
+        inst = _addressed(slug)
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        data = _rq.get_json(silent=True) or {}
+        if not isinstance(data.get('enabled'), bool):
+            return jsonify({'success': False,
+                            'error': 'enabled must be true or false'}), 400
+        steps, err = set_renewal(ctx, inst, data['enabled'])
+        if err:
+            return jsonify({'success': False, 'error': err, 'steps': steps}), 400
+        return jsonify({'success': True, 'steps': steps})
+
     def instance_control_view(slug):
         """Start, stop or restart one deployment.
 
@@ -6286,6 +6347,8 @@ def register(ctx):
              'endpoint': f'{KEY}_instance_control', 'view': instance_control_view},
             {'url': f'/api/{KEY}/instances/<slug>/name', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_name', 'view': instance_name_view},
+            {'url': f'/api/{KEY}/instances/<slug>/renewal', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_renewal', 'view': instance_renewal_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_remove', 'view': instance_remove_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
