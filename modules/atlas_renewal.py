@@ -312,9 +312,13 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_R
         settings = ctx['load_settings']()
         admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
                  ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
-        fqdn = ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_FQDN') or ''
-        if not admin or not fqdn:
+        public = authentik_public_url(ctx, settings)
+        if not admin:
             plog('  ⚠ Certificate renewal not set up: Authentik is not configured.')
+            return nothing
+        if not public:
+            plog("  ⚠ Certificate renewal not set up: Authentik's public name is unknown "
+                 "(no FQDN in the settings).")
             return nothing
         ca_pem = _read_ca(ca_path)
         if ca_pem is None:
@@ -327,7 +331,7 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_R
         key = client_key(dirpath)
         # ⚠️ The public name, not `_get_authentik_api_url`: that answers the
         # host's loopback, which inside a container is the container itself.
-        write_files(dirpath, token, 'https://%s' % fqdn, ca_pem, key, uid)
+        write_files(dirpath, token, public, ca_pem, key, uid)
         retired = retire_old_tokens(api, inst, user_pk, keep=identifier)
 
         env = os.path.join(dirpath, '.env')
@@ -354,6 +358,25 @@ def start(compose, plog):
                  % ((r.stderr or '')[-160:].strip() or 'no output'))
     except Exception as exc:
         plog('  ⚠ Certificate renewal container did not start: %s' % str(exc)[:120])
+
+
+def authentik_public_url(ctx, settings):
+    """`https://<Authentik's public host>[:port]`, the way the console builds it.
+
+    ⚠️ **Not `AUTHENTIK_FQDN` from Authentik's `.env`.** That key is not there
+    on an InfraTAK box, and the first box update stopped with "Authentik is not
+    configured" while Authentik was working. The console names Authentik with
+    `_get_service_domain` (a custom `authentik_domain`, else `authentik.<fqdn>`)
+    and `_pub_hostport` (Caddy may listen on a port other than 443).
+    """
+    domain = ctx['_get_service_domain'](settings, 'authentik') if '_get_service_domain' in ctx else ''
+    if not domain:
+        domain = ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_FQDN') or ''
+    if not domain:
+        return ''
+    if '_pub_hostport' in ctx:
+        domain = ctx['_pub_hostport'](domain, settings)
+    return 'https://%s' % domain
 
 
 def _delete_token_file(dirpath):

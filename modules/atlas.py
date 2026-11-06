@@ -5049,6 +5049,16 @@ def _run_update(ctx, inst=None):
                 plog('✓ Already on the newest release for the ' + channel +
                      ' channel — nothing to install')
                 _reconcile_access(ctx, inst, plog)
+                # ⚠️ Reconciled here too, or a deployment already on the newest
+                # release (installed before this module could set renewal up,
+                # or by an update that failed to) could never get it: this
+                # path returns before the rebuild below.
+                _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+                if _renewal['ready']:
+                    if _renewal['env_changed']:
+                        _compose(ctx, 'up -d api', timeout=300, inst=inst)
+                    atlas_renewal.start(
+                        lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
                 slot.update({'running': False, 'complete': True, 'error': False})
                 return
             # ⚠️ The checkout says done and the box says otherwise. Run the
