@@ -149,9 +149,9 @@ def _ctx(token='admin-token', fqdn='auth.example.com'):
 
 def _ensure(deployment, ak, inst=PLAIN, ctx=None, log=None):
     log = [] if log is None else log
-    changed = ar.ensure(ctx or _ctx(), inst, str(deployment), atlas.write_env_value,
-                        log.append, opener=ak, ca_path=str(deployment / 'root-ca.pem'))
-    return changed, log
+    result = ar.ensure(ctx or _ctx(), inst, str(deployment), atlas.write_env_value,
+                       log.append, opener=ak, ca_path=str(deployment / 'root-ca.pem'))
+    return result, log
 
 
 # --------------------------------------------------------------------------- #
@@ -229,14 +229,14 @@ def test_the_files_are_private_and_complete(deployment, ak):
 
 
 def test_the_client_key_and_uid_reach_env_and_the_key_is_kept(deployment, ak):
-    changed, _ = _ensure(deployment, ak)
-    assert changed is True
+    result, _ = _ensure(deployment, ak)
+    assert result == {'env_changed': True, 'ready': True}
     env = (deployment / '.env').read_text()
     key = (deployment / ar.SECRETS_DIR / ar.CLIENT_KEY_FILE).read_text()
     assert '%s=%s' % (ar.ENV_CLIENT_KEY, key) in env
     assert '%s=%d' % (ar.ENV_UID, ar.container_uid()) in env
-    changed, _ = _ensure(deployment, ak)
-    assert changed is False, 'a second update must keep the same client key'
+    result, _ = _ensure(deployment, ak)
+    assert result['env_changed'] is False, 'a second update must keep the same client key'
 
 
 def test_the_token_is_never_logged(deployment, ak):
@@ -250,27 +250,27 @@ def test_the_token_is_never_logged(deployment, ak):
 
 def test_an_atlas_release_without_the_container_gets_no_account(deployment, ak):
     (deployment / 'docker-compose.yml').write_text(COMPOSE_WITHOUT)
-    changed, log = _ensure(deployment, ak)
-    assert changed is False and ak.calls == [] and log == []
+    result, log = _ensure(deployment, ak)
+    assert result['ready'] is False and ak.calls == [] and log == []
 
 
 def test_no_authentik_says_so_and_does_not_fail(deployment, ak):
-    changed, log = _ensure(deployment, ak, ctx=_ctx(token=None))
-    assert changed is False and ak.calls == []
+    result, log = _ensure(deployment, ak, ctx=_ctx(token=None))
+    assert result['ready'] is False and ak.calls == []
     assert 'Authentik is not configured' in log[0]
 
 
 def test_no_tak_server_says_so(deployment, ak):
     (deployment / 'root-ca.pem').unlink()
-    changed, log = _ensure(deployment, ak)
-    assert changed is False and 'no TAK Server root CA' in log[0]
+    result, log = _ensure(deployment, ak)
+    assert result['ready'] is False and 'no TAK Server root CA' in log[0]
 
 
 def test_an_authentik_error_is_reported_not_raised(deployment):
     def broken(req, timeout=None):
         raise OSError('connection refused')
-    changed, log = _ensure(deployment, broken)
-    assert changed is False and 'connection refused' in log[0]
+    result, log = _ensure(deployment, broken)
+    assert result['ready'] is False and 'connection refused' in log[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -295,4 +295,29 @@ def test_removal_keeps_the_group_while_another_deployment_uses_it(deployment, ak
 def test_deploy_update_and_removal_all_call_it():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     assert src.count('atlas_renewal.ensure(ctx,') == 2
+    assert src.count('atlas_renewal.start(') == 2
     assert 'atlas_renewal.remove(ctx, inst)' in src
+
+
+def test_the_container_is_started_by_name_and_never_as_a_dependency():
+    # api must not pull it up before its files exist: Docker would create the
+    # bind-mount source as a root-owned directory nobody could write again.
+    src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
+    for line in src.splitlines():
+        if "atlas_renewal.start(" in line:
+            assert "_renewal['ready']" in src
+    calls = []
+
+    class R:
+        returncode, stderr = 0, ''
+    log = []
+    ar.start(lambda action: (calls.append(action), R())[1], log.append)
+    assert calls == ['up -d --build renewal'] and 'running' in log[0]
+
+
+def test_a_container_that_fails_to_start_is_reported_not_raised():
+    class R:
+        returncode, stderr = 1, 'no such service: renewal'
+    log = []
+    ar.start(lambda action: R(), log.append)
+    assert 'did not start' in log[0] and 'no such service' in log[0]

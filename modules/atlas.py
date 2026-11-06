@@ -3802,7 +3802,7 @@ def deploy(ctx, job, params):
 
         # ⚠️ Before the containers start, so the renewal container's uid and
         # ATLAS's client key are in `.env` when compose reads it.
-        atlas_renewal.ensure(ctx, _inst, dirpath, write_env_value, plog)
+        _renewal = atlas_renewal.ensure(ctx, _inst, dirpath, write_env_value, plog)
 
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
@@ -3825,6 +3825,9 @@ def deploy(ctx, job, params):
             if r2.returncode != 0:
                 plog('  ⚠ Could not restart with the narrowed range; it applies on '
                      'the next update')
+        if _renewal['ready']:
+            atlas_renewal.start(
+                lambda action: _compose(ctx, action, timeout=1800, inst=_inst), plog)
 
         # ── 5/7 Firewall ──────────────────────────────────────────────────────
         plog('')
@@ -5047,7 +5050,7 @@ def _run_update(ctx, inst=None):
         # ⚠️ On every update, not only at deploy: this is how a deployment
         # made before renewal existed gets its account, and how the token is
         # rotated. Before the rebuild, so compose reads the new `.env`.
-        atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+        _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
@@ -5058,6 +5061,9 @@ def _run_update(ctx, inst=None):
         plog('✓ Containers rebuilt — database and device CA untouched')
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
+        if _renewal['ready']:
+            atlas_renewal.start(
+                lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
 
         _reconcile_access(ctx, inst, plog)
 
