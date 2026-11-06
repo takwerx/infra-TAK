@@ -5057,6 +5057,9 @@ def _run_update(ctx, inst=None):
                 plog('✓ Already on the newest release for the ' + channel +
                      ' channel — nothing to install')
                 _reconcile_access(ctx, inst, plog)
+                # ⚠️ Before anything below reads or writes `.env` (W243): a
+                # deployment built before W240 has a root-owned one.
+                _repair_env_ownership(os.path.join(dirpath, '.env'), ctx, plog)
                 # ⚠️ Reconciled here too, or a deployment already on the newest
                 # release (installed before this module could set renewal up,
                 # or by an update that failed to) could never get it: this
