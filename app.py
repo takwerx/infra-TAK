@@ -96108,6 +96108,17 @@ def _kernel_patch_job_state():
                 done_fresh = _dt.timestamp() >= psutil.boot_time()
             except Exception:
                 done_fresh = completed_ok      # unparseable stamp: fail toward showing it
+    # GH #416: the failed run needs the same handle. A FATAL stays the last word in
+    # this log until another patch run is started (a later apt upgrade by hand or a
+    # reboot writes nothing here), so the failed panel came back on every load and
+    # Dismiss had nothing to key to. Keyed to the FATAL line itself: its stamp when
+    # it has one, else a hash of the line, so the next failed run re-surfaces.
+    error_at = ''
+    if log_failed:
+        _eol = log_tail.find('\n', last_fatal)
+        _fl = log_tail[log_tail.rfind('\n', 0, last_fatal) + 1:(_eol if _eol != -1 else len(log_tail))]
+        _m = re.match(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*FATAL:', _fl)
+        error_at = _m.group(1) if _m else 'h' + hashlib.sha1(_fl.encode('utf-8', 'replace')).hexdigest()[:12]
 
     if load != 'loaded':
         return {
@@ -96120,6 +96131,7 @@ def _kernel_patch_job_state():
             'done_at': done_at,
             'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
+            'error_at': error_at,
             'reboot_required': reboot_required,
             'reboot_sig': reboot_sig,
             'log_tail': log_tail,
@@ -96150,6 +96162,7 @@ def _kernel_patch_job_state():
         'done': done,
         'done_at': done_at,
         'error': err,
+        'error_at': error_at,
         'reboot_required': reboot_required,
         'reboot_sig': reboot_sig,
         'log_tail': log_tail,
