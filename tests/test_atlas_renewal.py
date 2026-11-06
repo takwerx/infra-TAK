@@ -438,3 +438,47 @@ def test_no_fqdn_says_so_plainly(deployment, ak):
     result, log = _ensure(deployment, ak, ctx=_ctx(domain=''))
     assert result['ready'] is False and ak.calls == []
     assert "public name is unknown" in log[0]
+
+
+# --------------------------------------------------------------------------- #
+# The people's admin group is never the renewal group (found on the box)
+# --------------------------------------------------------------------------- #
+
+def _groups_opener(groups):
+    def opener(req, timeout=None):
+        return io.BytesIO(json.dumps({'results': groups}).encode())
+    return opener
+
+
+def _resolve(groups):
+    import urllib.request as ur
+    real = ur.urlopen
+    try:
+        ur.urlopen = _groups_opener(groups)
+        return atlas.global_admin_group('http://ak', {})
+    finally:
+        ur.urlopen = real
+
+
+def test_the_renewal_group_is_never_the_administrators_group():
+    # On leckliter2 it came back first, ATLAS required "atlas-sample-admins or
+    # ATLAS certificate renewal", and every administrator was refused.
+    groups = [{'name': ar.GROUP_NAME, 'is_superuser': True},
+              {'name': 'authentik Admins', 'is_superuser': True}]
+    assert _resolve(groups) == 'authentik Admins'
+
+
+def test_a_renamed_admin_group_is_still_found_beside_the_renewal_group():
+    groups = [{'name': ar.GROUP_NAME, 'is_superuser': True},
+              {'name': 'Sheriff IT', 'is_superuser': True}]
+    assert _resolve(groups) == 'Sheriff IT'
+
+
+def test_the_default_name_wins_when_several_people_groups_are_superusers():
+    groups = [{'name': 'Break glass', 'is_superuser': True},
+              {'name': 'authentik Admins', 'is_superuser': True}]
+    assert _resolve(groups) == 'authentik Admins'
+
+
+def test_only_the_renewal_group_falls_back_to_the_default_name():
+    assert _resolve([{'name': ar.GROUP_NAME, 'is_superuser': True}]) == atlas.ADMIN_GROUP
