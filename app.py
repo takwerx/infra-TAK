@@ -95736,7 +95736,9 @@ def _kernel_patch_apt_script(tak_pkgs=_KERNEL_PATCH_TAK_PKGS, status_file=''):
         # apt keeps the dead repo's LAST index, so full-upgrade still tries to download its
         # newer packages (measured on test8: caddy 2.11.7 -> 402 again, nothing installed).
         # Hence --fix-missing on this path only, plus the distro-skip check after it.
-        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
+        # GH #416: packages.microsoft.com too (Azure boxes carry microsoft-prod.list); a
+        # 404 there failed every kernel-patch run after a 22.04 -> 24.04 upgrade.
+        'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org|packages[.]microsoft[.]com)/"\n'
         'FIXMISSING=""\n'
         'UPDLOG="$(mktemp)"\n'
         'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
@@ -96113,6 +96115,17 @@ def _kernel_patch_job_state():
                 done_fresh = _dt.timestamp() >= psutil.boot_time()
             except Exception:
                 done_fresh = completed_ok      # unparseable stamp: fail toward showing it
+    # GH #416: the failed run needs the same handle. A FATAL stays the last word in
+    # this log until another patch run is started (a later apt upgrade by hand or a
+    # reboot writes nothing here), so the failed panel came back on every load and
+    # Dismiss had nothing to key to. Keyed to the FATAL line itself: its stamp when
+    # it has one, else a hash of the line, so the next failed run re-surfaces.
+    error_at = ''
+    if log_failed:
+        _eol = log_tail.find('\n', last_fatal)
+        _fl = log_tail[log_tail.rfind('\n', 0, last_fatal) + 1:(_eol if _eol != -1 else len(log_tail))]
+        _m = re.match(r'\[(\d{4}-\d{2}-\d{2}T[\d:]{8})Z\]\s*FATAL:', _fl)
+        error_at = _m.group(1) if _m else 'h' + hashlib.sha1(_fl.encode('utf-8', 'replace')).hexdigest()[:12]
 
     if load != 'loaded':
         return {
@@ -96125,6 +96138,7 @@ def _kernel_patch_job_state():
             'done_at': done_at,
             'done': bool(done_fresh),
             'error': bool(last_fatal != -1 and last_fatal > last_done),
+            'error_at': error_at,
             'reboot_required': reboot_required,
             'reboot_sig': reboot_sig,
             'log_tail': log_tail,
@@ -96155,6 +96169,7 @@ def _kernel_patch_job_state():
         'done': done,
         'done_at': done_at,
         'error': err,
+        'error_at': error_at,
         'reboot_required': reboot_required,
         'reboot_sig': reboot_sig,
         'log_tail': log_tail,
@@ -96451,11 +96466,19 @@ _OS_UPGRADE_SH_FLIP = (
     # W4.g.2: MongoDB publishes 7.0 for jammy only (the Fed Hub guide uses jammy on 24.04
     # too) — re-enable that list as it was, never point it at a noble 7.0 that 404s.
     '  case "$b" in mongodb-org-7.0.list) cp -a "$f" "/etc/apt/sources.list.d/$b"; echo "[$(TS)] re-enabled $b (kept on jammy: no noble build of MongoDB 7.0)"; continue ;; esac\n'
-    '  sed -e "s/jammy/noble/g" "$f" > "/etc/apt/sources.list.d/$b"\n'
+    # GH #416: Microsoft's lists carry the release in the path too
+    # (packages.microsoft.com/ubuntu/22.04/prod jammy main); jammy -> noble alone gives
+    # /ubuntu/22.04/prod/dists/noble, a 404. Its noble feed is /ubuntu/24.04/prod.
+    '  sed -e "s/jammy/noble/g" -e "s#/ubuntu/22[.]04/#/ubuntu/24.04/#g" "$f" > "/etc/apt/sources.list.d/$b"\n'
     '  echo "[$(TS)] re-enabled $b (jammy -> noble)"\n'
     'done\n'
     'rm -f /etc/apt/sources.list.d/*.distUpgrade 2>/dev/null\n'
-    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org)/"\n'
+    # GH #416: the OS has already flipped here, so failing on one third-party list skips
+    # venv-rebuild and strands the console on a python 3.10 venv (502 at its next restart).
+    # Every list re-enabled above is third-party by construction (Ubuntu's own sources are
+    # not in sources.list.d), so each of their hosts only warns, ubuntu.com hosts excepted.
+    'TP_HOSTS="$(sed -nE \'s#^[[:space:]]*deb(-src)?[[:space:]].*https?://([^/[:space:]]+).*#\\2#p\' "$PRE/sources.list.d/"*.list 2>/dev/null | grep -viE "(^|[.])ubuntu[.]com$" | sort -u | sed \'s/[.]/[.]/g\' | paste -sd "|" -)"\n'
+    'THIRD_PARTY="https?://(dl[.]cloudsmith[.]io|download[.]docker[.]com|apt[.]postgresql[.]org|repo[.]mongodb[.]org|packages[.]microsoft[.]com${TP_HOSTS:+|$TP_HOSTS})/"\n'
     'UPDLOG="$(mktemp)"\n'
     'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 | tee "$UPDLOG"\n'
     'rc=${PIPESTATUS[0]}\n'
