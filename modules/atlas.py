@@ -1845,10 +1845,18 @@ def global_admin_group(ak_url, ak_headers, plog=None):
         body = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
     except Exception:
         return ADMIN_GROUP
-    for group in body.get('results', []):
-        if group.get('is_superuser'):
-            return group.get('name') or ADMIN_GROUP
-    return ADMIN_GROUP
+    # ⚠️ **Not just the first superuser group.** ATLAS certificate renewal adds
+    # a second one for its service account, and on the first box that had it,
+    # it came back first: ATLAS then required "atlas-sample-admins or ATLAS
+    # certificate renewal" and every administrator was refused. A service
+    # account's group is never the people's group, and the default name wins
+    # whenever it is still there.
+    people = [g.get('name') for g in body.get('results', [])
+              if g.get('is_superuser') and g.get('name')
+              and g.get('name') != atlas_renewal.GROUP_NAME]
+    if ADMIN_GROUP in people:
+        return ADMIN_GROUP
+    return people[0] if people else ADMIN_GROUP
 
 
 def _global_admin_group(ctx):
@@ -5054,9 +5062,20 @@ def _run_update(ctx, inst=None):
                 # or by an update that failed to) could never get it: this
                 # path returns before the rebuild below.
                 _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+                # ⚠️ The admin gate too. A wrong `TAKMDM_ADMIN_GROUP` locks
+                # every administrator out of the console, and before this the
+                # only repair was waiting for a newer release: this path
+                # returned before the rebuild that re-arms it (found on the
+                # box when the renewal group was picked as the admin group).
+                try:
+                    restart_api = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
+                                                   global_group=_global_admin_group(ctx))
+                except Exception as exc:
+                    restart_api = False
+                    plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
+                if _renewal['env_changed'] or restart_api:
+                    _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if _renewal['ready']:
-                    if _renewal['env_changed']:
-                        _compose(ctx, 'up -d api', timeout=300, inst=inst)
                     atlas_renewal.start(
                         lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
                 slot.update({'running': False, 'complete': True, 'error': False})
