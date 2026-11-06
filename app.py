@@ -49514,6 +49514,19 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
         plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
 
 
+def _cloudtak_heal_dockerignore_at_start(ct_dir):
+    """ops #503 follow-up: put the plugin-keeping Dockerfile.dockerignore right on every console start.
+    TAK Portal's marketplace rebuilds CloudTAK through its own helper, which never calls the build
+    shield above, so a stale Dispatcher-written file used to sit there until a console-driven build
+    (plugin install, CloudTAK Update) and the next Portal rebuild dropped every other plugin from the
+    image. Every update restarts the console, so this reaches every box. File only: no rebuild, no
+    restart; check-before-write, so a clean box is a no-op. Never raises."""
+    try:
+        _cloudtak_keep_plugins_in_build(ct_dir, lambda m: print(f"Startup self-heal: {str(m).strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup self-heal: CloudTAK plugin dockerignore error (non-fatal): {_e}")
+
+
 # ops #301: "installed" is not "in the app". CloudTAK 13.102.0 moved its web folder; a plugin installer
 # that kept copying into the old one reported success and the plugin never reached the build (ops
 # #297, found by hand). After a rebuild we look in the web app the api container is SERVING for the
@@ -103291,6 +103304,7 @@ def _startup_heal_cloudtak_media_hls():
         if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
                 or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
             return  # CloudTAK not installed locally (or split/remote) — nothing to heal here
+        _cloudtak_heal_dockerignore_at_start(_ct_dir)   # ops #503: before any Portal-driven rebuild
         _cloudtak_upload_limit_heal()   # ops #470: nginx.conf is rewritten on every container start
         if _cloudtak_media_hls_heal():
             return
