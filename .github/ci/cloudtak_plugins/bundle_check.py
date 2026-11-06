@@ -289,11 +289,12 @@ def write_expect(work, expect):
 # ── infra-TAK's own pre-build step, taken from app.py as written ─────────────────
 
 SHIELD_CONSTS = ('_CT_MARKETPLACE_TSCONFIG', '_CT_MARKETPLACE_ROUTES_RE', '_CT_IMPORT_RE',
-                 '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE')
+                 '_CT_NPM_NAME_RE', '_CT_NPM_SPEC_RE', '_CT_DOCKERIGNORE_MARK', '_CT_PLUGIN_DIR_RE',
+                 '_CT_DOCKERIGNORE_DISPATCHER_MARK')
 SHIELD_FUNCS = ('_cloudtak_web_dir', '_cloudtak_plugins_dir', '_cloudtak_foreign_plugins',
                 '_cloudtak_has_ts_nocheck', '_cloudtak_rewrite_in_place',
-                '_cloudtak_plugin_missing_deps', '_cloudtak_keep_plugins_in_build',
-                '_cloudtak_shield_foreign_plugins')
+                '_cloudtak_plugin_missing_deps', '_ct_dockerignore_leaves_out',
+                '_cloudtak_keep_plugins_in_build', '_cloudtak_shield_foreign_plugins')
 
 
 def load_shield(app_py=REPO_ROOT / 'app.py', catalog=()):

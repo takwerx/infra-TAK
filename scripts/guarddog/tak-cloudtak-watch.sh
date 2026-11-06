@@ -152,20 +152,45 @@ if docker inspect cloudtak-media-1 >/dev/null 2>&1; then
     done
   fi
 fi
+# ops #502: the third signal. infra-TAK adds a 25G body limit for /api/server/tileset to the api
+# container's nginx.conf (ops #470, so a hosted PMTiles file over 5G isn't refused with a 413). The
+# container writes that file afresh on every start, so ANY recreate of the api drops the rule — a TAK
+# Portal plugin install or update does, even one that loads the override (test12, v10.3.6 T&E) — and
+# nothing else re-applies it before the next console restart. Same rule as the HLS read: the file is
+# read once; a read we could not make, or a stock nginx.conf (no `location ~ ^/api` yet: nginx.conf.js
+# has not written the real one) is UNKNOWN and neither starts nor clears an episode.
+_ul_ok=na
+if docker inspect cloudtak-api-1 >/dev/null 2>&1; then
+  _ul_cfg="$(docker exec cloudtak-api-1 cat /etc/nginx/nginx.conf 2>/dev/null)"
+  if [ $? -ne 0 ] || [ -z "$_ul_cfg" ]; then
+    _ul_ok=unknown
+  elif printf '%s\n' "$_ul_cfg" | grep -q 'location = /api/server/tileset'; then
+    _ul_ok=1
+  elif printf '%s\n' "$_ul_cfg" | grep -q 'location ~ ^/api'; then
+    _ul_ok=0
+  else
+    _ul_ok=unknown
+  fi
+fi
 _ct_found=""
 [ "$_hls_ok" = 0 ] && _ct_found="cloudtak-media HLS profile missing"
+[ "$_ul_ok" = 0 ] && _ct_found="${_ct_found:+$_ct_found; }CloudTAK api is missing the large-upload (tileset) limit"
 [ -n "$_ct_no_override" ] && _ct_found="${_ct_found:+$_ct_found; }created without infra-TAK's compose override:$_ct_no_override"
 [ -n "$_ct_print_stale" ] && _ct_found="${_ct_found:+$_ct_found; }Print started without infra-TAK's /print-api settings:$_ct_print_stale"
-if [ "$_hls_ok" != na ] || [ -n "$_ct_found" ]; then
+if [ "$_hls_ok" != na ] || [ "$_ul_ok" != na ] || [ -n "$_ct_found" ]; then
   _DRIFT_STATE="$STATE_DIR/cloudtak_media_drift"
   _DRIFT_PENDING="$STATE_DIR/cloudtak_media_drift_pending"
   _DRIFT_BUSY="$STATE_DIR/cloudtak_media_drift_busy"
   if [ -z "$_ct_found" ] && [ "$_hls_ok" = unknown ]; then
     _log "drift | cloudtak-media HLS profile UNKNOWN — could not read /mediamtx.yml (docker exec rc=$_hls_rc); not counted as missing"
+  elif [ -z "$_ct_found" ] && [ "$_ul_ok" = unknown ]; then
+    # ops #502: the api's nginx.conf is unreadable or still the stock one (a start in progress)
+    _log "drift | CloudTAK api upload limit UNKNOWN — nginx.conf unreadable or not written yet; not counted as missing"
   elif [ -n "$_ct_found" ]; then
     [ "$_hls_ok" = 0 ] && _log "drift | cloudtak-media HLS profile MISSING — container was recreated outside the console; CoT video will black-screen until reconverged"
     [ -n "$_ct_no_override" ] && _log "drift | created without infra-TAK's compose override (image pins, console CA):$_ct_no_override"
     [ -n "$_ct_print_stale" ] && _log "drift | Print started without infra-TAK's /print-api settings (no loopback port):$_ct_print_stale"
+    [ "$_ul_ok" = 0 ] && _log "drift | CloudTAK api nginx lost the /api/server/tileset upload limit — the api was recreated outside the console; uploads over 5G get a 413"
     # v10.1.57 W12: TWO-STRIKE. Do not alert on first sight.
     #
     # The console recreates CloudTAK itself during post-update security hardening and
@@ -263,6 +288,8 @@ Time (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')
 Check it yourself:
   docker exec cloudtak-media-1 grep -E '^hls' /mediamtx.yml
   (expect hlsVariant: mpegts, hlsSegmentCount: 3, hlsSegmentDuration: 500ms)
+  docker exec cloudtak-api-1 grep 'location = /api/server/tileset' /etc/nginx/nginx.conf
+  (expect one line; without it a hosted map file over 5 GB is refused with a 413)
 
 To fix: restart the infra-TAK console (systemctl restart takwerx-console) — it rewrites
 the override, recreates CloudTAK with it and re-applies the profile. A CloudTAK rebuild
