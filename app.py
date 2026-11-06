@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.7-alpha"
+VERSION = "10.3.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -4636,8 +4636,11 @@ _MODULES_CACHE_LOCK = threading.Lock()
 def _modules_running_jobs():
     """frozenset of in-flight job names, or None when it cannot be determined."""
     try:
+        # ops #526: *_update_job too. TAK Portal's Update runs as a job dict of that name (ops #72),
+        # not a *_status one, so the cache never saw it end: the page that /takportal redirects to
+        # was served the "Stopped" cached while the container was down for the rebuild.
         names = {_n for _n, _v in list(globals().items())
-                 if _n.endswith('_status') and isinstance(_v, dict) and _v.get('running')}
+                 if _n.endswith(('_status', '_update_job')) and isinstance(_v, dict) and _v.get('running')}
     except Exception:
         return None
     try:
@@ -42770,6 +42773,10 @@ def _takportal_update_worker(portal_dir, job_id):
     with _TAKPORTAL_UPDATE_LOCK:
         if _takportal_update_job.get('id') == job_id:
             _takportal_update_job.update({'running': False, 'result': result, 'code': code})
+    # ops #526: the container was down during the rebuild, and any console page loaded in that
+    # window cached "TAK Portal stopped". The POST that started this job dropped the cache at the
+    # START; nothing dropped it at the end, so the page the update redirects to showed Stopped.
+    _invalidate_modules_cache()
 
 
 # TAK Portal's image build (Deploy and Update). Through the broker the subprocess timeout

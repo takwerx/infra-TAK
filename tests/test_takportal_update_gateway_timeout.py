@@ -254,7 +254,8 @@ def ns(tmp_path):
                                       route=lambda *a, **k: (lambda f: f)),
          'login_required': lambda f: f, 'jsonify': lambda d: d,
          '_get_takportal_version_info': lambda: {'version': '2.0.11'},
-         '_patch_takportal_compose_ports': lambda pd=None: False}
+         '_patch_takportal_compose_ports': lambda pd=None: False,
+         '_invalidate_modules_cache': lambda: n['_cache_drops'].append(1), '_cache_drops': []}
     exec(compile(rec, 'app.py', 'exec'), n)
     exec(compile(JOB, 'app.py', 'exec'), n)
     return n
@@ -288,3 +289,13 @@ def test_a_stale_worker_does_not_overwrite_a_newer_job(ns):
     ns['_takportal_update_job'].update({'running': True, 'id': 'NEW'})
     ns['_takportal_update_worker']('/x', 'OLD')
     assert ns['_takportal_update_job']['running'] is True and ns['_takportal_update_job']['result'] is None
+
+
+def test_the_worker_drops_the_module_status_cache_when_it_ends_ops526(ns):
+    """The container is down during the rebuild; a page loaded then cached 'Stopped'. The POST
+    dropped the cache at the start; the worker must drop it again at the end, success or failure."""
+    ns['_takportal_update_git'] = lambda pd: {'ok': False, 'channel': 'stable', 'error': 'x'}
+    ns['_takportal_update_job'].update({'running': True, 'id': 'J9'})
+    ns['_takportal_update_worker']('/x', 'J9')
+    assert ns['_cache_drops'] == [1]
+    assert ns['_takportal_update_job']['running'] is False     # dropped AFTER the job reads as finished
