@@ -101350,6 +101350,19 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
         actually see gets touched.
       * `prune` names directories to skip entirely; .docker-store is always pruned.
 
+    infra-TAK #421: container data is never ours, whatever it is called. A non-root CloudTAK
+    Update re-owned an operator's postgis bind-mount (.docker-postgres/postgres-data, uid 70,
+    mode 700) to takwerx and Postgres refused every new connection until it was chowned back
+    by hand. The console cannot even list that directory, so the walk saw it as ONE entry and
+    chowned the directory itself. Three guards, any one of which keeps it out:
+      * every `.docker-*` directory is pruned (CloudTAK's naming for container data);
+      * every host directory bind-mounted into a container is pruned (_container_bind_dirs);
+      * a foreign-owned directory the console cannot list is left alone: git never wrote it
+        (a root-era clone makes 755 dirs) and we cannot see what is inside it.
+    An immutable file (chattr +i, e.g. an operator-locked docker-compose.override.yml) is the
+    operator's choice, not a failure. Every path re-owned is logged, so a heal that stops
+    partway can be undone from the log.
+
     `chown -R -h` / `chown -h` on a module dir already passes the broker rulebook via
     HOME_MODULE_DIRS / ROOT_MODULE_DIRS (every name in MODULE_DIR_NAMES). -h re-owns
     symlinks rather than following them, as the console-repo carve-out requires.
@@ -101366,12 +101379,30 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
     # v10.2.7: CloudTAK >= 13.102.0 stores objects in Garage (.docker-garage/, root-owned bind
     # mounts) and the MinIO->Garage migration archives the old tree as .docker-store-migrated-<ts>
     # (or .docker-garage-failed-<ts> after a rolled-back attempt) — container data, never ours.
-    _skip_prefixes = ('.docker-store-migrated-', '.docker-garage-failed-')
-    git_dirty, work_offenders = False, []
+    # infra-TAK #421: any `.docker-` dir (.docker-postgres/ etc.) is container data too.
+    _skip_prefixes = ('.docker-',)
+    bind_dirs = _container_bind_dirs(mod_dir)
+    git_dirty, work_offenders, left_alone = False, [], []
     _CAP = 400
     try:
         for dirpath, dirnames, filenames in os.walk(mod_dir):
-            dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(_skip_prefixes)]
+            _keep = []
+            for d in dirnames:
+                if d in skip or d.startswith(_skip_prefixes):
+                    continue
+                full = os.path.join(dirpath, d)
+                try:
+                    _foreign = os.lstat(full).st_uid != uid
+                except OSError:
+                    continue
+                if os.path.realpath(full) in bind_dirs or (
+                        _foreign and not os.path.islink(full)
+                        and not os.access(full, os.R_OK | os.X_OK)):
+                    if _foreign:
+                        left_alone.append(full)
+                    continue
+                _keep.append(d)
+            dirnames[:] = _keep
             for name in dirnames + filenames:
                 full = os.path.join(dirpath, name)
                 try:
@@ -101387,6 +101418,9 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
                     work_offenders.append(full)
     except Exception as e:
         return False, f'ownership scan failed: {e}'
+    for p in left_alone:
+        _log(f'  {mod_dir}: left alone (container data, not git\'s): '
+             f'{os.path.relpath(p, mod_dir)}')
     if not git_dirty and not work_offenders:
         return False, ''
     import pwd as _pwd
@@ -101400,7 +101434,7 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
     _log(f'  {mod_dir}: foreign-owned entries found '
          f'(.git={"yes" if git_dirty else "no"}, worktree={len(work_offenders)}) '
          f'-- re-owning to {owner} before git')
-    errs = []
+    errs, immutable = [], []
 
     def _chown(args, what):
         try:
@@ -101409,18 +101443,83 @@ def _module_checkout_ownership_selfheal(mod_dir, plog=None, prune=()):
         except Exception as e:
             errs.append(f'{what}: {e}')
             return
-        if r.returncode != 0:
-            errs.append(f'{what}: rc={r.returncode} '
-                        f'{(r.stderr or r.stdout or "").strip()[:200]}')
+        if r.returncode == 0:
+            return
+        # chown carries on past a path it cannot change; keep only the failures that are
+        # not an operator's chattr +i (that one is expected, not "did not complete").
+        unexplained = []
+        for line in (r.stderr or r.stdout or '').splitlines():
+            m = re.search(r"changing ownership of '(.+)': Operation not permitted", line)
+            if m and m.group(1) in args and _path_is_immutable(m.group(1)):
+                immutable.append(m.group(1))
+            elif line.strip():
+                # relative paths, so the 200-char cap keeps the reason, not just the path
+                unexplained.append(line.strip().replace(mod_dir.rstrip(os.sep) + os.sep, ''))
+        if unexplained or not immutable:
+            errs.append(f'{what}: rc={r.returncode} {"; ".join(unexplained)[:200]}')
 
     if git_dirty:
         _chown(['-R', '-h', owner, os.path.join(mod_dir, '.git')], '.git')
     for i in range(0, len(work_offenders), 100):
         _chown(['-h', owner] + work_offenders[i:i + 100], f'worktree batch {i // 100 + 1}')
+    # Log what actually changed, read back from disk -- the undo list if this was wrong.
+    reowned = []
+    for p in work_offenders:
+        try:
+            if os.lstat(p).st_uid == uid:
+                reowned.append(p)
+        except OSError:
+            pass
+    for p in reowned:
+        _log(f'    re-owned: {os.path.relpath(p, mod_dir)}')
+    for p in immutable:
+        _log(f'  {mod_dir}: left immutable file as it is (chattr +i): '
+             f'{os.path.relpath(p, mod_dir)}')
     if errs:
-        return False, '; '.join(errs[:3])
+        return False, (f're-owned {len(reowned)} of {len(work_offenders)} worktree entries '
+                       f'(listed above); ' + '; '.join(errs[:3]))
     _log(f'  {mod_dir} re-owned to {owner}')
     return True, ''
+
+
+def _container_bind_dirs(mod_dir):
+    """Real paths of the host directories under `mod_dir` that any container bind-mounts.
+
+    infra-TAK #421: those are container data (an operator's postgis PGDATA, upstream's
+    .docker-garage), never part of the checkout, whatever their name. Best effort: if docker
+    cannot be asked, returns an empty set and the name/permission guards still apply."""
+    root = os.path.realpath(mod_dir)
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '-q']),
+                           capture_output=True, text=True, timeout=30)
+        cids = (r.stdout or '').split() if r.returncode == 0 else []
+        if not cids:
+            return set()
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
+                                       '{{range .Mounts}}{{if eq .Type "bind"}}'
+                                       '{{println .Source}}{{end}}{{end}}'] + cids),
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return set()
+    out = set()
+    for line in (r.stdout or '').splitlines():
+        src = line.strip()
+        if not src:
+            continue
+        real = os.path.realpath(src)
+        if real.startswith(root + os.sep):
+            out.add(real)
+    return out
+
+
+def _path_is_immutable(path):
+    """True when `path` carries the chattr +i flag (lsattr needs no privilege)."""
+    try:
+        r = subprocess.run(['lsattr', '-d', path], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    flags = (r.stdout or '').split(None, 1)[0] if r.returncode == 0 and r.stdout else ''
+    return 'i' in flags
 
 
 def _startup_repo_ownership_heal():
