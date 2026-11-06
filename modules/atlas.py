@@ -63,6 +63,8 @@ from . import register_module, job_log, job_state, get_ctx
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
 from . import atlas_instances
+from . import atlas_renewal
+from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
 KEY = 'atlas'
@@ -835,6 +837,48 @@ def write_env_value(env_path, key, value):
     return True
 
 
+def set_renewal(ctx, inst, enabled):
+    """Turn certificate renewal on or off for a built deployment. `(steps, error)`.
+
+    Off stops the renewal container and deletes its token and Authentik account
+    at once; on re-creates them and starts the container. Recorded in the
+    deployment's record, so every later deploy and update keeps the choice.
+    """
+    paths = instance_paths(ctx, inst)
+    dirpath = paths['dir']
+    if not os.path.exists(os.path.join(dirpath, '.env')):
+        return [], 'That deployment has no configuration on disk yet.'
+    if not atlas_renewal.compose_has_renewal(dirpath):
+        return [], ('This ATLAS release has no certificate renewal. Update ATLAS '
+                    'first.')
+
+    remaining = []
+    for other in load_instances(ctx):
+        if (other.get('slug') or None) == (inst or {}).get('slug'):
+            other = dict(other, renewal_disabled=not enabled)
+            inst = other
+        remaining.append(other)
+    save_instances(ctx, remaining)
+    steps = ['Recorded: renewal ' + ('on' if enabled else 'off')]
+
+    def compose(action):
+        return _compose(ctx, action, timeout=1800, inst=inst)
+
+    if not enabled:
+        atlas_renewal.disable(ctx, inst, dirpath, compose, steps.append)
+        return steps, None
+
+    result = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, steps.append)
+    if not result['ready']:
+        return steps, (steps[-1].strip() if len(steps) > 1 else
+                       'Certificate renewal could not be set up.')
+    if result['env_changed']:
+        _compose(ctx, 'up -d api', timeout=300, inst=inst)
+        steps.append('ATLAS restarted with the renewal settings')
+    atlas_renewal.start(compose, steps.append)
+    return steps, None
+
+
 def set_agency_name(ctx, inst, raw_name):
     """Name a deployment that is already built. `(steps, error)`.
 
@@ -1141,6 +1185,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         # record is what the page edits and what survives a container that is
         # not running.
         'agency_name': inst.get('agency_name') or '',
+        # Certificate renewal (W458), on unless the operator turned it off.
+        'renewal_enabled': atlas_renewal.enabled(inst),
         'version': _installed_version(ctx, inst),
         'running_version': (_running_version(ctx, inst)
                             if running and probe_version else None),
@@ -1160,7 +1206,7 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'admin_group_problem', 'latest',
+                   'agency_name', 'renewal_enabled', 'admin_group_problem', 'latest',
                    'update_available', 'paths')
 
 
@@ -1800,10 +1846,18 @@ def global_admin_group(ak_url, ak_headers, plog=None):
         body = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
     except Exception:
         return ADMIN_GROUP
-    for group in body.get('results', []):
-        if group.get('is_superuser'):
-            return group.get('name') or ADMIN_GROUP
-    return ADMIN_GROUP
+    # ⚠️ **Not just the first superuser group.** ATLAS certificate renewal adds
+    # a second one for its service account, and on the first box that had it,
+    # it came back first: ATLAS then required "atlas-sample-admins or ATLAS
+    # certificate renewal" and every administrator was refused. A service
+    # account's group is never the people's group, and the default name wins
+    # whenever it is still there.
+    people = [g.get('name') for g in body.get('results', [])
+              if g.get('is_superuser') and g.get('name')
+              and g.get('name') != atlas_renewal.GROUP_NAME]
+    if ADMIN_GROUP in people:
+        return ADMIN_GROUP
+    return people[0] if people else ADMIN_GROUP
 
 
 def _global_admin_group(ctx):
@@ -3803,6 +3857,13 @@ def deploy(ctx, job, params):
         plog('✓ %s owned by uid %d (the container is not root)'
              % (', '.join(WRITABLE_DIRS), APP_UID))
 
+        # ⚠️ Before the containers start, so the renewal container's uid and
+        # ATLAS's client key are in `.env` when compose reads it.
+        _renewal = atlas_renewal.ensure(ctx, _inst, dirpath, write_env_value, plog)
+        # ATLAS W460: before the containers start, so `api` mounts the folder
+        # this console made rather than one Docker makes as root.
+        atlas_tak_cas.refresh(dirpath, plog)
+
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
         plog('━━━ Step 4/7: Starting containers ━━━')
@@ -3824,6 +3885,9 @@ def deploy(ctx, job, params):
             if r2.returncode != 0:
                 plog('  ⚠ Could not restart with the narrowed range; it applies on '
                      'the next update')
+        if _renewal['ready']:
+            atlas_renewal.start(
+                lambda action: _compose(ctx, action, timeout=1800, inst=_inst), plog)
 
         # ── 5/7 Firewall ──────────────────────────────────────────────────────
         plog('')
@@ -5001,6 +5065,36 @@ def _run_update(ctx, inst=None):
                 plog('✓ Already on the newest release for the ' + channel +
                      ' channel — nothing to install')
                 _reconcile_access(ctx, inst, plog)
+                # ⚠️ Before anything below reads or writes `.env` (W243): a
+                # deployment built before W240 has a root-owned one.
+                _repair_env_ownership(os.path.join(dirpath, '.env'), ctx, plog)
+                # ⚠️ Reconciled here too, or a deployment already on the newest
+                # release (installed before this module could set renewal up,
+                # or by an update that failed to) could never get it: this
+                # path returns before the rebuild below.
+                _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+                # ATLAS W460: here too, or a deployment already on the newest
+                # release would never get its TAK Server CAs.
+                _cas = atlas_tak_cas.refresh(dirpath, plog)
+                # ⚠️ The admin gate too. A wrong `TAKMDM_ADMIN_GROUP` locks
+                # every administrator out of the console, and before this the
+                # only repair was waiting for a newer release: this path
+                # returned before the rebuild that re-arms it (found on the
+                # box when the renewal group was picked as the admin group).
+                try:
+                    restart_api = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
+                                                   global_group=_global_admin_group(ctx))
+                except Exception as exc:
+                    restart_api = False
+                    plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
+                if _renewal['env_changed'] or restart_api:
+                    _compose(ctx, 'up -d api', timeout=300, inst=inst)
+                if _cas['recreated']:
+                    # The running `api` still mounts the folder Docker made.
+                    _compose(ctx, 'restart api', timeout=300, inst=inst)
+                if _renewal['ready']:
+                    atlas_renewal.start(
+                        lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
                 slot.update({'running': False, 'complete': True, 'error': False})
                 return
             # ⚠️ The checkout says done and the box says otherwise. Run the
@@ -5043,6 +5137,12 @@ def _run_update(ctx, inst=None):
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
         _set_trusted_proxies(dirpath, plog, _me['compose_project'])
+        # ⚠️ On every update, not only at deploy: this is how a deployment
+        # made before renewal existed gets its account, and how the token is
+        # rotated. Before the rebuild, so compose reads the new `.env`.
+        _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+        # ATLAS W460: before the rebuild, so a new `api` mounts this folder.
+        _cas = atlas_tak_cas.refresh(dirpath, plog)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
@@ -5050,9 +5150,16 @@ def _run_update(ctx, inst=None):
         r = _compose(ctx, 'up -d --build api', timeout=1800, inst=inst)
         if r.returncode != 0:
             raise RuntimeError(compose_error(r, 'docker compose up'))
+        if _cas['recreated']:
+            # ⚠️ An unchanged image is not recreated, and its mount would still
+            # point at the folder Docker made as root.
+            _compose(ctx, 'restart api', timeout=300, inst=inst)
         plog('✓ Containers rebuilt — database and device CA untouched')
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
+        if _renewal['ready']:
+            atlas_renewal.start(
+                lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
 
         _reconcile_access(ctx, inst, plog)
 
@@ -5103,6 +5210,24 @@ def _run_update(ctx, inst=None):
     except Exception as exc:
         plog('ERROR: ' + str(exc))
         slot.update({'running': False, 'complete': False, 'error': True})
+
+
+def tak_ca_changed(ctx, log):
+    """ATLAS W460: after InfraTAK rotates the TAK Server CA, give every built
+    deployment the new CA list. The console calls this through the module spec.
+
+    ATLAS reads the file at each page load, so nothing restarts unless the
+    folder had to be made again (`atlas_tak_cas.write`).
+    """
+    projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        if not instance_is_built(ctx, inst, projects):
+            continue
+        name = atlas_instances.derive(inst)['name']
+        result = atlas_tak_cas.refresh(instance_paths(ctx, inst)['dir'],
+                                       lambda m, n=name: log(n + ':' + m))
+        if result['recreated']:
+            _compose(ctx, 'restart api', timeout=300, inst=inst)
 
 
 def _run_update_all(ctx):
@@ -5315,6 +5440,12 @@ def remove_instance(ctx, inst, plog=None):
     group_note = remove_agency_admin_group(ctx, inst)
     if group_note:
         note(f'{label}: {group_note}')
+
+    # ⚠️ And its renewal account: a superuser token left behind for a
+    # deployment that no longer exists is the worst thing to orphan.
+    renewal_note = atlas_renewal.remove(ctx, inst)
+    if renewal_note:
+        note(f'{label}: {renewal_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
@@ -6117,6 +6248,23 @@ def register(ctx):
                             'steps': steps}), 400
         return jsonify({'success': True, 'steps': steps})
 
+    def instance_renewal_view(slug):
+        """Turn certificate renewal on or off for one deployment."""
+        from flask import request as _rq
+
+        inst = _addressed(slug)
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        data = _rq.get_json(silent=True) or {}
+        if not isinstance(data.get('enabled'), bool):
+            return jsonify({'success': False,
+                            'error': 'enabled must be true or false'}), 400
+        steps, err = set_renewal(ctx, inst, data['enabled'])
+        if err:
+            return jsonify({'success': False, 'error': err, 'steps': steps}), 400
+        return jsonify({'success': True, 'steps': steps})
+
     def instance_control_view(slug):
         """Start, stop or restart one deployment.
 
@@ -6236,6 +6384,8 @@ def register(ctx):
         'detect': detect,
         'deploy': deploy,
         'deploy_validate': deploy_validate,
+        # ATLAS W460: called by the console after a TAK Server CA rotation.
+        'tak_ca_changed': tak_ca_changed,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),
@@ -6269,6 +6419,8 @@ def register(ctx):
              'endpoint': f'{KEY}_instance_control', 'view': instance_control_view},
             {'url': f'/api/{KEY}/instances/<slug>/name', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_name', 'view': instance_name_view},
+            {'url': f'/api/{KEY}/instances/<slug>/renewal', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_renewal', 'view': instance_renewal_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_remove', 'view': instance_remove_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
