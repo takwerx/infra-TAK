@@ -5226,6 +5226,42 @@ def tak_ca_changed(ctx, log):
             _compose(ctx, 'restart api', timeout=300, inst=inst)
 
 
+def revocation_tick(ctx, log):
+    """ATLAS W461: copy TAK Server's revoked certificates to every built
+    deployment's renewal container. The container refuses renewal on a copy
+    an hour old, so this must keep running."""
+    projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        if instance_is_built(ctx, inst, projects):
+            atlas_renewal.refresh_revocations(ctx, inst, instance_paths(ctx, inst)['dir'], log)
+
+
+_revocation_loop_started = False
+
+
+def _start_revocation_loop(ctx):
+    """Once per console process. A failed tick is logged and the next one runs."""
+    import threading
+
+    global _revocation_loop_started
+    if _revocation_loop_started:
+        return
+    _revocation_loop_started = True
+
+    def loop():
+        # A short wait first, as the console's other loops do: the module
+        # registry is still loading, and deploy and update write it at once.
+        time.sleep(30)
+        while True:
+            try:
+                revocation_tick(ctx, lambda m: print('[' + KEY + '] revocations:' + m, flush=True))
+            except Exception as exc:
+                print('[' + KEY + '] revocations: tick failed: ' + str(exc)[:160], flush=True)
+            time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)
+
+    threading.Thread(target=loop, daemon=True, name='atlas-revocations').start()
+
+
 def _run_update_all(ctx):
     """Update every finished deployment, in order, without stopping at a failure.
 
@@ -5715,6 +5751,9 @@ services:
 
 def register(ctx):
     from flask import jsonify, request
+
+    # ATLAS W461: renewal refuses a revoked-certificate list an hour old.
+    _start_revocation_loop(ctx)
 
     def _requested_instance(default_first=False):
         """The deployment a request is about, from `?slug=` or a JSON body.

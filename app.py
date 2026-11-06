@@ -110467,6 +110467,8 @@ _MODULE_CTX = {
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
+    # ATLAS W461: TAK Server's revoked certificates, for ATLAS's renewal.
+    '_cotdb_psql': _cotdb_psql,
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
