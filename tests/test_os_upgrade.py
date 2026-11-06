@@ -166,6 +166,39 @@ def test_step4_repos_rewritten_from_pre_flip_copy(script):
     assert 'fail repos-noble' in s
 
 
+def _run_aznfs_pin(tmp_path, script, *, installed):
+    """Run the real pin-pg16 step's aznfs block in a sandbox: /etc is rewritten under
+    tmp_path and dpkg-query is a stub that says whether aznfs is installed."""
+    s = _between(script, 'pin-pg16', 'release-upgrade')
+    i = s.index('if ! dpkg-query -W -f=')
+    blk = s[i:s.index('\nfi\n', i) + 4].replace('/etc/', str(tmp_path) + '/etc/')
+    (tmp_path / 'etc/apt/preferences.d').mkdir(parents=True)
+    (tmp_path / 'bin').mkdir()
+    stub = tmp_path / 'bin' / 'dpkg-query'
+    stub.write_text('#!/bin/bash\n' + ('printf "install ok installed"\n' if installed else 'exit 1\n'))
+    stub.chmod(0o755)
+    r = subprocess.run(['bash', '-c', 'TS() { echo T; }\n' + blk], capture_output=True, text=True,
+                       env={'PATH': f'{tmp_path}/bin:/usr/bin:/bin'})
+    assert r.returncode == 0, r.stderr
+    return tmp_path / 'etc/apt/preferences.d/infratak-no-aznfs'
+
+
+def test_aznfs_is_pinned_out_of_the_release_upgrade(tmp_path, script):
+    # ops #527: Microsoft's list marks aznfs Priority: required; its stunnel4 dependency
+    # breaks dpkg mid-upgrade. A box without aznfs must not get it during the upgrade.
+    pin = _run_aznfs_pin(tmp_path, script, installed=False)
+    assert pin.read_text() == 'Package: aznfs\nPin: release *\nPin-Priority: -1\n'
+    assert script.index('infratak-no-aznfs <<') < script.index('step release-upgrade')
+
+
+def test_aznfs_already_installed_is_left_alone(tmp_path, script):
+    assert not _run_aznfs_pin(tmp_path, script, installed=True).exists()
+
+
+def test_aznfs_pin_is_dropped_after_the_upgrade(script):
+    assert 'rm -f /etc/apt/preferences.d/infratak-no-aznfs' in _between(script, 'repos-noble', 'venv-rebuild')
+
+
 MS_LIST = 'deb [arch=amd64,arm64,armhf] https://packages.microsoft.com/ubuntu/22.04/prod jammy main\n'
 VENDOR_LIST = 'deb [signed-by=/usr/share/keyrings/v.gpg] https://apt.example-vendor.io/debian jammy main\n'
 
@@ -1018,7 +1051,8 @@ def _run_fail(tmp_path, *, changed, os_version='22.04'):
     stub = tmp_path / 'bin' / 'dpkg-query'
     stub.write_text('#!/bin/bash\nprintf "%s" "' + now + '"\n')
     stub.chmod(0o755)
-    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/preferences.d/infratak-no-aznfs',
+              'etc/apt/apt.conf.d/99infratak-os-upgrade',
               'etc/update-manager/release-upgrades.d/infratak.cfg', 'etc/update-manager/release-upgrades'):
         (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / f).write_text('Prompt=lts\n' if f.endswith('release-upgrades') else 'x\n')
@@ -1034,7 +1068,8 @@ def test_fail_on_an_unchanged_box_undoes_the_jobs_settings(tmp_path):
     r, status = _run_fail(tmp_path, changed=False)
     assert r.returncode == 1 and status == 'failed:release-upgrade'
     assert 'UNCHANGED' in r.stdout and 'run the upgrade again' in r.stdout
-    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/apt.conf.d/99infratak-os-upgrade',
+    for f in ('etc/apt/preferences.d/infratak-no-pg16', 'etc/apt/preferences.d/infratak-no-aznfs',
+              'etc/apt/apt.conf.d/99infratak-os-upgrade',
               'etc/update-manager/release-upgrades.d/infratak.cfg'):
         assert not (tmp_path / f).exists(), f
     assert (tmp_path / 'etc/update-manager/release-upgrades').read_text() == 'Prompt=never\n'   # restored

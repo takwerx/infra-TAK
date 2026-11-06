@@ -96321,7 +96321,7 @@ _OS_UPGRADE_SH_FUNCS = (
     'fail() {\n'
     '  echo "failed:$1" > "$STATUS"; echo "[$(TS)] FATAL: step $1 failed — $2"\n'
     '  if [ ! -s "$PRE/dpkg-versions.txt" ] || dpkg-query -W -f=\'${Package} ${Version}\\n\' 2>/dev/null | sort | cmp -s - "$PRE/dpkg-versions.txt"; then\n'
-    '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
+    '    rm -f /etc/apt/preferences.d/infratak-no-pg16 /etc/apt/preferences.d/infratak-no-aznfs /etc/apt/apt.conf.d/99infratak-os-upgrade /etc/update-manager/release-upgrades.d/infratak.cfg\n'
     '    [ -f "$PRE/release-upgrades" ] && cp -a "$PRE/release-upgrades" /etc/update-manager/release-upgrades\n'
     '    echo "[$(TS)] UNCHANGED: no package was touched — this box is exactly as it was and the upgrade\'s temporary settings were removed. Fix the cause above and run the upgrade again."\n'
     '  else\n'
@@ -96442,6 +96442,21 @@ _OS_UPGRADE_SH_FLIP = (
     'Pin: release *\n'
     'Pin-Priority: -1\n'
     'EOF\n'
+    # L7 (ops #527): Microsoft's package list (packages-microsoft-prod.deb) marks aznfs
+    # `Priority: required`, so do-release-upgrade installs it while the jammy list is still
+    # enabled. aznfs pulls stunnel4, whose postinst (systemd-sysusers) fails mid-upgrade
+    # because PID 1 has re-exec'd into systemd 255 and the userdb socket refuses connections;
+    # dpkg is then left broken and the job stops before repos-noble. Keep a NEW aznfs out of
+    # the upgrade; a box that already has it keeps it (the pin is only written when absent,
+    # so apt never treats the installed copy as unwanted). repos-noble removes the pin.
+    'if ! dpkg-query -W -f=\'${Status}\' aznfs 2>/dev/null | grep -q "install ok installed"; then\n'
+    '  cat > /etc/apt/preferences.d/infratak-no-aznfs <<\'EOF\'\n'
+    'Package: aznfs\n'
+    'Pin: release *\n'
+    'Pin-Priority: -1\n'
+    'EOF\n'
+    '  echo "[$(TS)] aznfs pinned out for the upgrade (not installed on this box)"\n'
+    'fi\n'
     # L6: keep obsolete packages — DistUpgradeConfigParser reads *.cfg here after
     # the bundled DistUpgrade.cfg; doPostUpgrade() then logs "Skipping obsolete Removal".
     'mkdir -p /etc/update-manager/release-upgrades.d\n'
@@ -96471,6 +96486,9 @@ _OS_UPGRADE_SH_FLIP = (
     '\n'
     # ---- 4. repos-noble -------------------------------------------------------
     'step repos-noble\n'
+    # ops #527: the aznfs pin only guards the release upgrade; drop it so the operator can
+    # install aznfs on 24.04 later if they want it.
+    'rm -f /etc/apt/preferences.d/infratak-no-aznfs\n'
     # L3: the upgrader comments third-party entries out ("disabled on upgrade to noble")
     # and leaves them saying jammy. Rewrite from the PRE-flip copy, not the mangled one.
     'for f in "$PRE/sources.list.d/"*.list; do\n'
