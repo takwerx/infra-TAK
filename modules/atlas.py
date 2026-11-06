@@ -64,6 +64,7 @@ from . import register_module, job_log, job_state, get_ctx
 # deciding whether an image reserves its blocks.
 from . import atlas_instances
 from . import atlas_renewal
+from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
 KEY = 'atlas'
@@ -3865,6 +3866,9 @@ def deploy(ctx, job, params):
         # ⚠️ Before the containers start, so the renewal container's uid and
         # ATLAS's client key are in `.env` when compose reads it.
         _renewal = atlas_renewal.ensure(ctx, _inst, dirpath, write_env_value, plog)
+        # ATLAS W460: before the containers start, so `api` mounts the folder
+        # this console made rather than one Docker makes as root.
+        atlas_tak_cas.refresh(dirpath, plog)
 
         # ── 4/7 Start ─────────────────────────────────────────────────────────
         plog('')
@@ -5075,6 +5079,9 @@ def _run_update(ctx, inst=None):
                 # or by an update that failed to) could never get it: this
                 # path returns before the rebuild below.
                 _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+                # ATLAS W460: here too, or a deployment already on the newest
+                # release would never get its TAK Server CAs.
+                _cas = atlas_tak_cas.refresh(dirpath, plog)
                 # ⚠️ The admin gate too. A wrong `TAKMDM_ADMIN_GROUP` locks
                 # every administrator out of the console, and before this the
                 # only repair was waiting for a newer release: this path
@@ -5088,6 +5095,9 @@ def _run_update(ctx, inst=None):
                     plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
                 if _renewal['env_changed'] or restart_api:
                     _compose(ctx, 'up -d api', timeout=300, inst=inst)
+                if _cas['recreated']:
+                    # The running `api` still mounts the folder Docker made.
+                    _compose(ctx, 'restart api', timeout=300, inst=inst)
                 if _renewal['ready']:
                     atlas_renewal.start(
                         lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
@@ -5137,6 +5147,8 @@ def _run_update(ctx, inst=None):
         # made before renewal existed gets its account, and how the token is
         # rotated. Before the rebuild, so compose reads the new `.env`.
         _renewal = atlas_renewal.ensure(ctx, inst, dirpath, write_env_value, plog)
+        # ATLAS W460: before the rebuild, so a new `api` mounts this folder.
+        _cas = atlas_tak_cas.refresh(dirpath, plog)
 
         plog('━━━ Step 2/3: Rebuilding ━━━')
         # ⚠️ No `-v` anywhere here. `down -v` would take the database and the
@@ -5144,6 +5156,10 @@ def _run_update(ctx, inst=None):
         r = _compose(ctx, 'up -d --build api', timeout=1800, inst=inst)
         if r.returncode != 0:
             raise RuntimeError(compose_error(r, 'docker compose up'))
+        if _cas['recreated']:
+            # ⚠️ An unchanged image is not recreated, and its mount would still
+            # point at the folder Docker made as root.
+            _compose(ctx, 'restart api', timeout=300, inst=inst)
         plog('✓ Containers rebuilt — database and device CA untouched')
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
@@ -5200,6 +5216,24 @@ def _run_update(ctx, inst=None):
     except Exception as exc:
         plog('ERROR: ' + str(exc))
         slot.update({'running': False, 'complete': False, 'error': True})
+
+
+def tak_ca_changed(ctx, log):
+    """ATLAS W460: after InfraTAK rotates the TAK Server CA, give every built
+    deployment the new CA list. The console calls this through the module spec.
+
+    ATLAS reads the file at each page load, so nothing restarts unless the
+    folder had to be made again (`atlas_tak_cas.write`).
+    """
+    projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        if not instance_is_built(ctx, inst, projects):
+            continue
+        name = atlas_instances.derive(inst)['name']
+        result = atlas_tak_cas.refresh(instance_paths(ctx, inst)['dir'],
+                                       lambda m, n=name: log(n + ':' + m))
+        if result['recreated']:
+            _compose(ctx, 'restart api', timeout=300, inst=inst)
 
 
 def _run_update_all(ctx):
@@ -6356,6 +6390,8 @@ def register(ctx):
         'detect': detect,
         'deploy': deploy,
         'deploy_validate': deploy_validate,
+        # ATLAS W460: called by the console after a TAK Server CA rotation.
+        'tak_ca_changed': tak_ca_changed,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),
