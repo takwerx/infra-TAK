@@ -2442,9 +2442,13 @@ def _verify_access_control(ctx, plog=None, inst=None):
     """
     try:
         s = ctx['load_settings']()
-        fqdn = ctx['_get_authentik_env_value'](s, 'AUTHENTIK_FQDN') or ''
+        # ⚠️ Gated on the token alone. This used to also require
+        # `AUTHENTIK_FQDN` in Authentik's `.env`, which infra-TAK never writes, so
+        # the check returned None on every box and an update never re-bound the
+        # admin-only policy. The name is not used below: only the API URL and the
+        # token are.
         token = _authentik_token(ctx, s)
-        if not fqdn or not token:
+        if not token:
             return None
         ak_url = ctx['_get_authentik_api_url'](s)
         headers = {'Authorization': 'Bearer %s' % token,
