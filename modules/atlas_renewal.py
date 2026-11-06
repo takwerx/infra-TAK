@@ -273,25 +273,35 @@ def _read_ca(path=TAK_ROOT_CA):
 
 
 def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_ROOT_CA):
-    """Set renewal up for one deployment. Returns True when `.env` changed.
+    """Set renewal up for one deployment.
+
+    Returns ``{'env_changed': bool, 'ready': bool}``. ``ready`` means the files
+    are in place and the caller should start the container
+    (``up -d --build renewal``).
+
+    ⚠️ **The container is started by name, after this, and never as a
+    dependency of `api`.** Docker creates a missing bind-mount source as an
+    empty root-owned directory; had `api` pulled the container up before these
+    files existed, this console could never write into that directory again.
 
     Called by deploy and by update. Never raises: renewal is an addition, and a
     failure here must not turn a working update into a failed one.
     """
+    nothing = {'env_changed': False, 'ready': False}
     try:
         if not compose_has_renewal(dirpath):
-            return False
+            return nothing
         settings = ctx['load_settings']()
         admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
                  ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
         fqdn = ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_FQDN') or ''
         if not admin or not fqdn:
             plog('  ⚠ Certificate renewal not set up: Authentik is not configured.')
-            return False
+            return nothing
         ca_pem = _read_ca(ca_path)
         if ca_pem is None:
             plog('  ⚠ Certificate renewal not set up: no TAK Server root CA at %s.' % ca_path)
-            return False
+            return nothing
 
         api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
         token, identifier, user_pk = ensure_account(api, inst)
@@ -308,11 +318,24 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, ca_path=TAK_R
         plog('  ✓ Certificate renewal: account %s, new token%s' % (
             names(inst)['username'],
             ' (%d old one%s deleted)' % (retired, '' if retired == 1 else 's') if retired else ''))
-        return changed
+        return {'env_changed': changed, 'ready': True}
     except Exception as exc:
         # Never the token: the message comes from urllib or the filesystem.
         plog('  ⚠ Certificate renewal not set up: %s' % str(exc)[:120])
-        return False
+        return nothing
+
+
+def start(compose, plog):
+    """Start or rebuild the renewal container. Never raises."""
+    try:
+        r = compose('up -d --build renewal')
+        if r.returncode == 0:
+            plog('  ✓ Certificate renewal container running')
+        else:
+            plog('  ⚠ Certificate renewal container did not start: %s'
+                 % ((r.stderr or '')[-160:].strip() or 'no output'))
+    except Exception as exc:
+        plog('  ⚠ Certificate renewal container did not start: %s' % str(exc)[:120])
 
 
 def remove(ctx, inst, opener=None):
