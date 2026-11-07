@@ -323,6 +323,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">{{ host.get('mechanism','unattended-upgrades') }}{% if host.get('installed', True) == False %} — not installed{% endif %}</div>
 {# ops #154: per-host "installed but not running" — same signal as the banner. #}
 <div class="metric-detail" id="uu-reboot-{{ host.id }}" style="margin-top:2px;font-size:10px;color:var(--yellow);display:{% if host.get('reboot_required') %}block{% else %}none{% endif %}">&#9888; Restart needed{% if host.get('staged_kernel') %} &mdash; kernel {{ host.staged_kernel }} installed, not running{% endif %}</div>
+{% if host.id == 'tak_db' %}<div class="metric-detail" id="uu-noreboot-{{ host.id }}" style="margin-top:2px;font-size:10px;color:var(--green);display:{% if host.get('reboot_required') %}none{% else %}block{% endif %}">&#10003; No restart needed</div>
+<div class="metric-detail" id="dbs-card-updates-line" style="display:none;margin-top:2px;font-size:10px;color:var(--text-dim)"></div>{% endif %}
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 {# v10.1.37: no toggle when the mechanism is not installed. On Rocky the switch
@@ -340,7 +342,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 {% endif %}
 </div>
-{% if host.id == 'tak_db' %}<button type="button" onclick="event.stopPropagation();dbsOpenUpdates()" title="Install this server's updates or reboot it — does not upgrade Ubuntu, and TAK Server stays up" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">{% if host.get('reboot_required') %}Reboot / updates&hellip;{% else %}Updates&hellip;{% endif %}</button>{% endif %}
+{% if host.id == 'tak_db' %}<button type="button" id="dbs-card-updates-btn" data-dbs-updates-btn="1" onclick="event.stopPropagation();dbsCardInstallUpdates()" title="Install this server's updates — does not upgrade Ubuntu, and TAK Server stays up" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">&#9888; Updates needed</button><button type="button" id="dbs-card-reboot-btn" onclick="event.stopPropagation();dbsOpenReboot()" title="Reboot this server any time — TAK Server stays up and reconnects by itself" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot&hellip;</button>{% endif %}
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
@@ -480,6 +482,7 @@ function updateUUHosts(hosts){
         var rb=document.getElementById('uu-reboot-'+h.id);
         if(rb){
             rb.style.display=h.reboot_required?'block':'none';
+            var nr=document.getElementById('uu-noreboot-'+h.id); if(nr)nr.style.display=h.reboot_required?'none':'block';
             rb.textContent='⚠ Restart needed'+(h.staged_kernel?' — kernel '+h.staged_kernel+' installed, not running':'');
         }
     });
@@ -1371,7 +1374,7 @@ var _OSUP_STEP_LABELS={'stack-backup':'full backup','pre-snapshot':'snapshot','p
 var _osupTarget='core',_rhKey='',_rhHost='';
 // ops #535: the database server card's Updates button opens this same modal in a routine-updates
 // mode (Install updates / Reboot only). Only osupOpenPreflight() turns the upgrade view on.
-var _osupUpdatesOnly=false;
+var _osupUpdatesOnly=false,_dbsRebootMode=false;
 var _OSUP_ACK={core:'I have a snapshot',dbserver:'I have a snapshot of the database server',remotehost:'I have a snapshot of the remote host'};
 function _osupApi(p){ return (_osupTarget==='dbserver'?'/api/console/dbserver/':(_osupTarget==='remotehost'?'/api/console/remotehosts/'+encodeURIComponent(_rhKey)+'/':'/api/console/os-upgrade/'))+p; }
 function _osupShow(which){
@@ -1508,7 +1511,7 @@ function _osupApplyMode(){
 }
 function osupOpenPreflight(target,key,host){
     var m=document.getElementById('osup-modal'); if(!m)return;
-    _osupUpdatesOnly=false;
+    _osupUpdatesOnly=false; _dbsRebootMode=false;
     _osupApplyMode();
     _osupTarget=(target==='dbserver'||target==='remotehost')?target:'core';
     if(_osupTarget==='remotehost'){ _rhKey=key||''; _rhHost=host||''; }
@@ -1524,18 +1527,20 @@ function osupOpenPreflight(target,key,host){
     osupLoadPreflight();
 }
 // ops #535: routine updates / reboot for the database server — never the Ubuntu 24.04 upgrade.
-function dbsOpenUpdates(){
+function dbsOpenUpdates(reboot){
     var m=document.getElementById('osup-modal'); if(!m)return;
-    _osupTarget='dbserver'; _osupUpdatesOnly=true;
+    _osupTarget='dbserver'; _osupUpdatesOnly=true; _dbsRebootMode=(reboot===true);
     _osupApplyMode();
     var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
     var pw=document.getElementById('osup-pw-input'); if(pw)pw.value='';
     var t=document.getElementById('osup-modal-title');
-    if(t)t.innerHTML='&#128451; Database server updates'+(_dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':'');
+    if(t)t.innerHTML=(_dbsRebootMode?'&#128451; Reboot the database server':'&#128451; Database server updates')+(_dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':'');
     _dbsRenderActions(null);
     m.style.display='flex';
     osupLoadPreflight();
 }
+// ops #535: the card's own Reboot button — any time, whether or not updates left a reboot pending.
+function dbsOpenReboot(){ dbsOpenUpdates(true); }
 function osupCloseModal(){ var m=document.getElementById('osup-modal'); if(m)m.style.display='none'; }
 function _osupSetStartEnabled(on){
     if(_osupUpdatesOnly)on=false;
@@ -1560,6 +1565,7 @@ function _dbsRenderUpdatesView(d){
     }
     if(box)box.innerHTML=html;
     var idle=reach&&d.pending_count===0&&!d.reboot_required&&!(by.no_reboot_pending&&!by.no_reboot_pending.pass);
+    if(intro&&_dbsRebootMode&&reach){ intro.textContent='Reboots the database server now. TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.'; _osupSetStartEnabled(false); _dbsRenderActions(d); return; }
     if(intro)intro.textContent=reach?(idle?'Nothing to do: every update is installed and no reboot is needed.':'Installs this server\'s pending updates and reboots it. This does not upgrade Ubuntu.'):'The console could not check this server. Nothing has been changed.';
     _osupSetStartEnabled(false);
     _dbsRenderActions(d);
@@ -1647,12 +1653,18 @@ function _dbsRenderResult(d){
     var head=document.getElementById('dbs-result-head'),body=document.getElementById('dbs-result-body');
     if(!head||!body)return;
     var notes=(d.notices||[]).length?' Notes: '+(d.notices||[]).join(' · '):'';
-    // after updates or a reboot the next thing is the upgrade itself: offer it here, not behind Close
-    var nx=document.getElementById('dbs-result-next'); if(nx)nx.style.display=(d.state==='done'&&d.job!=='os-upgrade')?'inline-block':'none';
+    // after updates the next thing is the reboot when one is pending (ops #535), else the upgrade itself: offer it here, not behind Close
+    var needRb=d.job==='updates'&&!!(d.reboot_required||/reboot/i.test(d.detail||''));
+    var nx=document.getElementById('dbs-result-next');
+    if(nx){
+        nx.style.display=(d.state==='done'&&d.job!=='os-upgrade')?'inline-block':'none';
+        nx.innerHTML=needRb?'Reboot&hellip;':'Check &amp; upgrade&hellip;';
+        nx.onclick=needRb?function(){dbsDismiss().then(function(){dbsOpenUpdates();});}:function(){dbsDismiss().then(function(){osupOpenPreflight('dbserver');});};
+    }
     if(d.state==='done'){
         head.style.color='var(--green)';
         if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
-        else if(d.job==='updates'){ head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Check & upgrade, then Reboot database server.':'No reboot needed.')+notes; }
+        else if(d.job==='updates'){ try{sessionStorage.removeItem('dbs-card-updates');}catch(e){} head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Reboot… to open it, then Reboot database server. TAK Server stays up.':'No reboot needed.')+notes; }
         else { head.innerHTML='&#10003; Database server rebooted'; body.textContent='PostgreSQL is back and TAK Server reconnected by itself.'+notes; }
         return;
     }
@@ -1685,7 +1697,7 @@ async function _dbsPollOnce(){
         if(r.status===404){ _dbsStopPolling(); _dbsShow(null); return; }
         var d=await r.json(); if(!d||!d.ok)return;
         if(d.running){ _dbsRenderProgress(d); if(d.state!=='rebooting'&&d.job!=='reboot')await _dbsFetchLog('dbs-log',d.job); return; }
-        _dbsStopPolling(); _dbsApply(d);
+        _dbsStopPolling(); _dbsApply(d); dbsCardCheck(true);
     }catch(e){}
 }
 function _dbsApply(d){
@@ -1703,12 +1715,46 @@ function _dbsApply(d){
     // A split install whose database is this box has nothing for this card to do.
     _dbsShow(d.target_is_local?null:'dbs-idle');
 }
+// ops #535: the card says in plain words whether updates are waiting (one read-only check over SSH).
+async function dbsCardCheck(force){
+    var line=document.getElementById('dbs-card-updates-line'); if(!line)return;
+    var cached=null;
+    if(!force){ try{ cached=JSON.parse(sessionStorage.getItem('dbs-card-updates')||'null'); }catch(e){} }
+    if(cached&&Date.now()-cached.t<300000){ _dbsCardUpdatesText(line,cached.n,cached.err); return; }
+    var n=null,err='';
+    try{
+        var r=await fetch('/api/console/dbserver/preflight',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        if(d&&d.pending_count!=null)n=d.pending_count;
+        else{ var by={}; ((d&&d.checks)||[]).forEach(function(c){by[c.name]=c;}); var bad=by.ssh_sudo&&!by.ssh_sudo.pass?by.ssh_sudo:(by.split_config&&!by.split_config.pass?by.split_config:by.os_up_to_date); err=(bad&&bad.detail)||(d&&d.error)||'no answer'; }
+    }catch(e){ err=e.message; }
+    if(err===''){ try{ sessionStorage.setItem('dbs-card-updates',JSON.stringify({t:Date.now(),n:n,err:''})); }catch(e){} }
+    _dbsCardUpdatesText(line,n,err);
+}
+// AJ, Sat Nov 7: with updates waiting the card shows one yellow "Updates needed" button (click it and the updates install,
+// after a confirm); with nothing pending it shows nothing. If the check fails it says so in a line. Reboot... is always there.
+function _dbsCardUpdatesText(line,n,err){
+    var ub=document.getElementById('dbs-card-updates-btn');
+    if(n==null){ line.style.display='block'; line.style.color='var(--text-dim)'; line.textContent='Updates: could not check'+(err?' \u2014 '+err.slice(0,80):''); if(ub)ub.style.display='none'; return; }
+    line.style.display='none'; line.textContent='';
+    if(n>0){ if(ub){ ub.style.display='inline-block'; ub.innerHTML='&#9888; Updates needed ('+n+')'; } return; }
+    if(ub)ub.style.display='none';
+}
+// The card's Updates needed button: straight to the confirm, then the install job. When it finishes the result banner says
+// whether a reboot is needed.
+async function dbsCardInstallUpdates(){
+    _osupTarget='dbserver'; _osupUpdatesOnly=true; _dbsRebootMode=false;
+    var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
+    await dbsInstallUpdates();
+    if(err&&err.textContent)alert(err.textContent);   // the dialog is closed here, so say why it did not start
+}
 async function dbsInit(){
     if(!document.getElementById('dbserver-card'))return;
     try{
         var r=await fetch('/api/console/dbserver/status',{credentials:'same-origin',cache:'no-store'});
         if(r.status===404)return;
         _dbsApply(await r.json());
+        dbsCardCheck(false);
     }catch(e){}
 }
 function dbsToggleResultLog(){ var p=document.getElementById('dbs-log-result'); if(p)p.style.display=(p.style.display==='none'?'block':'none'); }
@@ -1729,9 +1775,11 @@ function _dbsRenderActions(pf){
     var sshOk=core||(by.ssh_sudo&&by.ssh_sudo.pass), busy=by.no_job_running&&!by.no_job_running.pass;
     var needUpd=!!(by.os_up_to_date&&!by.os_up_to_date.pass&&pf.pending_count);
     var needRb=!!((by.no_reboot_pending&&!by.no_reboot_pending.pass)||pf.reboot_required);
-    if(!sshOk||busy||(!needUpd&&!needRb)){ box.style.display='none'; return; }
-    if(ub)ub.style.display=needUpd?'inline-block':'none';
-    if(rb)rb.style.display=(needRb&&!needUpd)?'inline-block':'none';   // updates first; they may add a reboot
+    // ops #535: in the database server's updates view Reboot is always there (any time, not only when one is pending)
+    var anyRb=_osupUpdatesOnly&&_osupTarget==='dbserver';
+    if(!sshOk||busy||(!needUpd&&!needRb&&!anyRb)){ box.style.display='none'; return; }
+    if(ub)ub.style.display=(needUpd&&!_dbsRebootMode)?'inline-block':'none';
+    if(rb)rb.style.display=anyRb?'inline-block':((needRb&&!needUpd)?'inline-block':'none');   // updates first; they may add a reboot
     if(msg)msg.textContent=core
         ?(needUpd?(pf.pending_count||'Some')+' update(s) are pending on this box. Install updates runs the same job as the "operating system updates available" banner at the top of this page (TAK Server is held). When it finishes, open Check & upgrade again.'
                  :'This box needs a reboot before Ubuntu\'s upgrader will run. Every connected EUD drops for the minute or two it is down.')
@@ -1740,7 +1788,7 @@ function _dbsRenderActions(pf){
                  :where+' needs a reboot before Ubuntu\'s upgrader will run. Its modules are unavailable for the minute or two it is down.')
         :(needUpd
         ?pf.pending_count+' update(s) are pending on the database server. Install updates runs apt full-upgrade there (TAK\'s database package is held). TAK Server stays up; PostgreSQL may restart briefly. Then Re-check.'
-        :(_osupUpdatesOnly?'The database server needs a reboot to finish its updates.':'The database server needs a reboot before Ubuntu\'s upgrader will run.')+' TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.');
+        :(_dbsRebootMode?'Reboot the database server now. You will be asked for the console password.':(anyRb&&!needRb)?'No reboot is needed, but you can reboot the database server any time.':_osupUpdatesOnly?'The database server needs a reboot to finish its updates.':'The database server needs a reboot before Ubuntu\'s upgrader will run.')+' TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.');
     box.style.display='block';
 }
 function _dbsJobStarted(job,message){

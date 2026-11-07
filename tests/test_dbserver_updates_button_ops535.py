@@ -35,9 +35,19 @@ CONSOLE = (ROOT / 'templates' / 'console.html').read_text(encoding='utf-8')
 
 def test_card_update_button_is_not_wired_to_the_upgrade_dialog():
     start = CONSOLE.index("{% if host.id == 'tak_db' %}<button")
-    button = CONSOLE[start:CONSOLE.index('</button>', start)]
-    assert 'dbsOpenUpdates()' in button
-    assert 'osupOpenPreflight' not in button
+    buttons = CONSOLE[start:CONSOLE.index('{% endif %}', start)]
+    assert 'dbsCardInstallUpdates()' in buttons   # AJ, Sat Nov 7: "Updates needed" installs them when clicked
+    assert 'osupOpenPreflight' not in buttons
+
+
+def test_card_has_a_reboot_button_that_is_always_there():
+    """Sat Nov 7, 2026 (AJ): "i need a way to reboot anytime i want", "the card should clearly say if an update is needed"."""
+    start = CONSOLE.index("{% if host.id == 'tak_db' %}<button")
+    buttons = CONSOLE[start:CONSOLE.index('{% endif %}', start)]
+    assert 'dbsOpenReboot()' in buttons
+    assert 'reboot_required' not in buttons
+    assert 'id="dbs-card-updates-line"' in CONSOLE
+    assert '&#10003; No restart needed' in CONSOLE
 
 
 def test_upgrade_keeps_its_own_named_buttons():
@@ -55,3 +65,10 @@ def test_updates_view_is_driven():
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert 'all checks passed' in out, out
+
+
+def test_result_banner_after_updates_leads_to_the_reboot():
+    """Sat Nov 7, 2026: after Install updates the banner said "press Check & upgrade, then Reboot" and its only
+    button opened the 24.04 upgrade dialog. The banner now says Reboot and opens the updates view (driven above)."""
+    assert 'press Check & upgrade, then Reboot database server' not in CONSOLE
+    assert "dbsOpenUpdates();});}" in CONSOLE
