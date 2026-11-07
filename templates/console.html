@@ -1647,12 +1647,18 @@ function _dbsRenderResult(d){
     var head=document.getElementById('dbs-result-head'),body=document.getElementById('dbs-result-body');
     if(!head||!body)return;
     var notes=(d.notices||[]).length?' Notes: '+(d.notices||[]).join(' · '):'';
-    // after updates or a reboot the next thing is the upgrade itself: offer it here, not behind Close
-    var nx=document.getElementById('dbs-result-next'); if(nx)nx.style.display=(d.state==='done'&&d.job!=='os-upgrade')?'inline-block':'none';
+    // after updates the next thing is the reboot when one is pending (ops #535), else the upgrade itself: offer it here, not behind Close
+    var needRb=d.job==='updates'&&!!(d.reboot_required||/reboot/i.test(d.detail||''));
+    var nx=document.getElementById('dbs-result-next');
+    if(nx){
+        nx.style.display=(d.state==='done'&&d.job!=='os-upgrade')?'inline-block':'none';
+        nx.innerHTML=needRb?'Reboot&hellip;':'Check &amp; upgrade&hellip;';
+        nx.onclick=needRb?function(){dbsDismiss().then(function(){dbsOpenUpdates();});}:function(){dbsDismiss().then(function(){osupOpenPreflight('dbserver');});};
+    }
     if(d.state==='done'){
         head.style.color='var(--green)';
         if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
-        else if(d.job==='updates'){ head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Check & upgrade, then Reboot database server.':'No reboot needed.')+notes; }
+        else if(d.job==='updates'){ head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Reboot… to open it, then Reboot database server. TAK Server stays up.':'No reboot needed.')+notes; }
         else { head.innerHTML='&#10003; Database server rebooted'; body.textContent='PostgreSQL is back and TAK Server reconnected by itself.'+notes; }
         return;
     }

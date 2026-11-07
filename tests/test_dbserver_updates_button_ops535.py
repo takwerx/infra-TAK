@@ -55,3 +55,10 @@ def test_updates_view_is_driven():
     out = r.stdout + r.stderr
     assert r.returncode == 0, out
     assert 'all checks passed' in out, out
+
+
+def test_result_banner_after_updates_leads_to_the_reboot():
+    """Sat Nov 7, 2026: after Install updates the banner said "press Check & upgrade, then Reboot" and its only
+    button opened the 24.04 upgrade dialog. The banner now says Reboot and opens the updates view (driven above)."""
+    assert 'press Check & upgrade, then Reboot database server' not in CONSOLE
+    assert "dbsOpenUpdates();});}" in CONSOLE

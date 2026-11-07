@@ -152,6 +152,43 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
   check("upgrade action: the acknowledgment block is back", e["osup-ack-block"].style.display === "block", JSON.stringify(e["osup-ack-block"]) + " err=" + e["osup-modal-err"].textContent);
   check("upgrade action: the updates-view button is hidden", e["osup-upgrade-link-btn"].style.display === "none");
 
+  // F. After "Install updates" the result banner must lead to the reboot (Sat Nov 7, 2026: it only offered
+  //    Check & upgrade, which opens the Ubuntu upgrade dialog, so there was no way to reboot).
+  // what the server says right after Install updates: nothing pending, reboot still needed
+  const afterInstall = pf({ pending_count: 0, checks: pf().checks.map((c) => (c.name === "os_up_to_date" ? ck("os_up_to_date", true) : c)) });
+  async function banner(d) {
+    const dom = makeDom();
+    const sb = {
+      document: { getElementById: dom.get, createElement: () => ({ textContent: "" }) },
+      fetch: async () => ({ ok: true, status: 200, json: async () => afterInstall }),
+      _dbsTargetHost: "10.0.0.9", _rhHost: "", _rhKey: "", _osupTarget: "core",
+      dbsDismiss: async () => {}, console,
+    };
+    vm.createContext(sb);
+    const more = ["_dbsRenderResult", "_dbsHostLabel"].map(fn).join("\n");
+    vm.runInContext(source + "\n" + more + "\nvar _DBS_TITLE={};_osupUpdatesOnly=false;", sb);
+    vm.runInContext("_dbsRenderResult(" + JSON.stringify(d) + ")", sb);
+    const nx = dom.els["dbs-result-next"];
+    // the button's own handler: whatever the render set, else the inline one written in the page
+    const inline = (html.match(/id="dbs-result-next" onclick="([^"]*)"/) || [, ""])[1];
+    if (typeof nx.onclick === "function") await nx.onclick();
+    else await vm.runInContext("(function(){" + inline + "})()", sb);
+    await new Promise((r) => setTimeout(r, 0));
+    return { els: dom.els, nx };
+  }
+  let b = await banner({ state: "done", job: "updates", reboot_required: true });
+  check("updates done, reboot pending: the banner button says Reboot", /^Reboot/.test(b.nx.innerHTML) && shown(b.nx), b.nx.innerHTML);
+  check("updates done, reboot pending: the banner text points to Reboot, not Check & upgrade",
+    /press Reboot/.test(b.els["dbs-result-body"].textContent) && !/Check & upgrade/.test(b.els["dbs-result-body"].textContent), b.els["dbs-result-body"].textContent);
+  check("updates done, reboot pending: the button opens the updates view where Reboot is offered",
+    /Database server updates/.test(b.els["osup-modal-title"].innerHTML) && shown(b.els["dbs-reboot-btn"]),
+    b.els["osup-modal-title"].innerHTML + " | reboot btn display=" + b.els["dbs-reboot-btn"].style.display);
+  b = await banner({ state: "done", job: "updates", reboot_required: false, detail: "" });
+  check("updates done, no reboot: the banner button is Check & upgrade and opens the upgrade dialog",
+    /Check &amp; upgrade/.test(b.nx.innerHTML) && /to Ubuntu 24\.04 LTS/.test(b.els["osup-modal-title"].innerHTML), b.nx.innerHTML + " | " + b.els["osup-modal-title"].innerHTML);
+  b = await banner({ state: "done", job: "reboot" });
+  check("rebooted: the banner button is Check & upgrade", /Check &amp; upgrade/.test(b.nx.innerHTML), b.nx.innerHTML);
+
   console.log(fails ? "\n" + fails + " check(s) failed" : "\nall checks passed");
   process.exit(fails ? 1 : 0);
 })();
