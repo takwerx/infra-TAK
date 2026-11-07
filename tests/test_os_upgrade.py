@@ -305,13 +305,19 @@ def test_tak_packages_held_for_the_run(script):
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
+def _pg_list_hint():
+    ns = {'re': re}
+    exec(compile(_fn('_os_upgrade_pg_list_hint'), 'app.py:_os_upgrade_pg_list_hint', 'exec'), ns)
+    return ns['_os_upgrade_pg_list_hint']
+
+
 class Box:
     def __init__(self, os_release=('ubuntu-22.04', 'Ubuntu 22.04.5 LTS'), tak_ver='5.8-RELEASE84',
                  tak_installed=True, container=False, db_host='127.0.0.1', clusters=(('18', 'main', '5432', 'online'),),
                  root_free_gb=40, boot_free_mb=400, busy=(), systemd_run=True, broker=(True, 'root console'),
                  upgrader_ver='1:22.04.20', prompt='lts', containers=('authentik-server', 'tak-portal'),
                  problems=(), docker_err='', pending=(), pending_err='', reboot_pkgs=(),
-                 mongo=('', False)):
+                 mongo=('', False), pg_err=''):
         calls = self.calls = []
         exists = {'/opt/tak/CoreConfig.xml': tak_installed, '/usr/bin/systemd-run': systemd_run,
                   '/bin/systemd-run': False, '/usr/bin/do-release-upgrade': bool(upgrader_ver),
@@ -346,7 +352,8 @@ class Box:
             _tak_is_container=lambda: container,
             _tak_db_host_from_coreconfig=lambda: db_host,
             _tak_db_is_remote=lambda h=None: (h or db_host) not in ('127.0.0.1', 'localhost', ''),
-            _os_upgrade_pg_clusters=lambda: list(clusters),
+            _os_upgrade_pg_clusters_ex=lambda: (list(clusters), pg_err),
+            _os_upgrade_pg_list_hint=_pg_list_hint(),
             _os_upgrade_running_jobs=lambda: list(busy),
             _os_upgrade_broker_current=lambda: broker,
             _os_upgrade_containers=lambda: (None if docker_err else list(containers), list(problems), docker_err),
@@ -402,6 +409,46 @@ def test_preflight_tak_gate_L5():
     # container TAK: no host cluster to check
     pf = Box(container=True, clusters=()).run()
     assert _check(pf, 'takserver_58')['pass'] is True and pf['baseline']['pg_expect'] == ''
+
+
+PG_STALE_ERR = ('pg_lsclusters exited 1: Error: /var/lib/postgresql/15/main is not accessible; please fix '
+                'the directory permissions (/var/lib/postgresql/15/ should be world readable)')
+
+
+def test_failed_pg_listing_is_not_reported_as_no_database_ops537():
+    # infra-TAK #426: a stale 15 registration with no data folder makes pg_lsclusters exit 1
+    # with empty stdout while PostgreSQL 18 runs fine. The check must say the listing failed.
+    c = _check(Box(clusters=(), pg_err=PG_STALE_ERR).run(), 'takserver_58')
+    assert c['pass'] is False
+    assert 'no local PostgreSQL cluster found' not in c['detail']
+    assert 'could not list PostgreSQL clusters' in c['detail']
+    assert '/var/lib/postgresql/15/main is not accessible' in c['detail']   # stderr is quoted
+    assert 'pg_dropcluster 15 main' in c['detail']                         # and the next step named
+    # a listing that works and is really empty keeps the old wording
+    c = _check(Box(clusters=()).run(), 'takserver_58')
+    assert c['pass'] is False and 'no local PostgreSQL cluster found' in c['detail']
+
+
+def test_pg_list_hint_for_an_unrecognised_error_points_at_pg_lsclusters_ops537():
+    hint = _pg_list_hint()('pg_lsclusters could not run: [Errno 2] No such file')
+    assert 'pg_lsclusters' in hint and 'pg_dropcluster' not in hint
+
+
+@pytest.mark.parametrize('rc,out,err,want_clusters,want_err', [
+    (0, '18 main 5432 online postgres /var/lib/postgresql/18/main log\n', '', [('18', 'main', '5432', 'online')], ''),
+    (1, '', 'Error: /var/lib/postgresql/15/main is not accessible; please fix the directory permissions\n',
+     [], 'pg_lsclusters exited 1: Error: /var/lib/postgresql/15/main is not accessible'),
+    (2, '', '', [], 'pg_lsclusters exited 2 with no output'),
+])
+def test_pg_clusters_ex_reports_why_the_listing_failed_ops537(rc, out, err, want_clusters, want_err):
+    ns = _ns(subprocess=types.SimpleNamespace(
+        run=lambda argv, **kw: types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)),
+        _sudo_wrap=lambda c: list(c))
+    exec(compile(_fn('_os_upgrade_pg_clusters_ex'), 'app.py:_os_upgrade_pg_clusters_ex', 'exec'), ns)
+    exec(compile(_fn('_os_upgrade_pg_clusters'), 'app.py:_os_upgrade_pg_clusters', 'exec'), ns)
+    clusters, e = ns['_os_upgrade_pg_clusters_ex']()
+    assert clusters == want_clusters and e.startswith(want_err)
+    assert ns['_os_upgrade_pg_clusters']() == want_clusters   # the old callers still get a plain list
 
 
 def test_docker_tak_database_is_local_not_a_separate_box():
