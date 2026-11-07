@@ -27634,6 +27634,9 @@ def _release_notes_line(body):
         t = re.sub(r'^#{1,6}\s*', '', t)
         t = re.sub(r'^[-*+]\s+', '', t)
         t = _MD_MARKS_RE.sub('', t).strip()
+        # the mail relay turns ' " & < > into &#39; &quot; &amp; &lt; &gt; in plain text
+        t = re.sub(r'\s+', ' ', t.replace("'", '\u2019').replace('&', ' and ')
+                   .replace('"', '').replace('<', '').replace('>', '')).strip()
         if not t:
             continue
         if len(t) > 240 and re.search(r'[.!?]\s', t):
@@ -28516,12 +28519,12 @@ def _update_notify_check_once(fast=False):
         # (newest first, at most 5), or a link when the notes could not be read.
         notes = [n for n in (p.get('release_notes') or []) if n]
         if notes:
-            out = ["      What's new:"] + [f"        - {n}" for n in notes[:5]]
+            out = ["      New in this update:"] + [f"        - {n}" for n in notes[:5]]
             if len(notes) > 5:
                 out.append(f"        - (+{len(notes) - 5} older release{'s' if len(notes) != 6 else ''})")
             return out
         if p.get('release_url'):
-            return [f"      What's new: {p['release_url']}"]
+            return [f"      New in this update: {p['release_url']}"]
         return []
 
     new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]

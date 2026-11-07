@@ -192,7 +192,7 @@ def test_update_pending_email_says_what_is_new_and_where_to_press():
     assert r['emailed'] is True and len(sent) == 1
     subj, body = sent[0]
     assert subj == '⬆ Update pending on tak-prod-1'
-    assert "What's new:" in body
+    assert "New in this update:" in body
     assert '        - v10.3.8-alpha: CloudTAK Update keeps its database working' in body
     assert '        - v10.3.7-alpha: Guard Dog alerts say why a remote-database login failed' in body
     assert 'Console page → Update Now.' in body
@@ -212,7 +212,7 @@ def test_notes_unreadable_email_links_the_release():
     item.pop('release_notes')
     _, sent, _ = _sweep([item], {})
     body = sent[0][1]
-    assert "What's new: https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha" in body
+    assert "New in this update: https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha" in body
     assert 'Console page → Update Now.' in body
 
 
@@ -233,3 +233,19 @@ def test_still_one_email_per_update_never_repeated():
 def test_no_pending_update_sends_nothing():
     r, sent, _ = _sweep([], {})
     assert sent == [] and r['emailed'] is False
+
+
+# ── characters the mail relay turns into codes (ops #547, lead: no apostrophes) ─
+
+def test_notes_have_no_characters_the_relay_turns_into_codes():
+    n = _exec({'re': re}, '_release_notes_line', consts=('_MD_MARKS_RE',))
+    line = n['_release_notes_line']('## Fixes what\'s broken in "Q&A" pages if a < b > c\n')
+    assert not any(c in line for c in '\'"&<>')
+    assert line == 'Fixes what\u2019s broken in Q and A pages if a b c'
+
+
+def test_email_never_says_whats_new_with_an_apostrophe():
+    for item in (CONSOLE, CONSOLE_SEC, {k: v for k, v in CONSOLE.items() if k != 'release_notes'}):
+        _, sent, _ = _sweep([item], {})
+        body = sent[0][1]
+        assert 'New in this update:' in body and "What's" not in body
