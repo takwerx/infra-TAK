@@ -35,9 +35,19 @@ CONSOLE = (ROOT / 'templates' / 'console.html').read_text(encoding='utf-8')
 
 def test_card_update_button_is_not_wired_to_the_upgrade_dialog():
     start = CONSOLE.index("{% if host.id == 'tak_db' %}<button")
-    button = CONSOLE[start:CONSOLE.index('</button>', start)]
-    assert 'dbsOpenUpdates()' in button
-    assert 'osupOpenPreflight' not in button
+    buttons = CONSOLE[start:CONSOLE.index('{% endif %}', start)]
+    assert 'dbsOpenUpdates()' in buttons
+    assert 'osupOpenPreflight' not in buttons
+
+
+def test_card_has_a_reboot_button_that_is_always_there():
+    """Sat Nov 7, 2026 (AJ): "i need a way to reboot anytime i want", "the card should clearly say if an update is needed"."""
+    start = CONSOLE.index("{% if host.id == 'tak_db' %}<button")
+    buttons = CONSOLE[start:CONSOLE.index('{% endif %}', start)]
+    assert 'dbsOpenReboot()' in buttons
+    assert 'reboot_required' not in buttons
+    assert 'id="dbs-card-updates-line"' in CONSOLE
+    assert '&#10003; No restart needed' in CONSOLE
 
 
 def test_upgrade_keeps_its_own_named_buttons():

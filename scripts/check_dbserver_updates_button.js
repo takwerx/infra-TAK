@@ -57,17 +57,22 @@ function fn(name) {
   return scripts.slice(m.index, end + 3);
 }
 
-// 1. The button on the card.
-const card = html.match(/\{% if host\.id == 'tak_db' %\}<button[^>]*onclick="([^"]*)"/);
-check("the database server card has its update button", !!card);
-const onclick = card ? card[1] : "";
-check("the card button opens the routine updates view", /dbsOpenUpdates\(\)/.test(onclick), onclick);
-check("the card button never calls the upgrade dialog", !/osupOpenPreflight/.test(onclick), onclick);
+// 1. The buttons on the card.
+const cardBtn = (id) => (html.match(new RegExp('<button[^>]*id="' + id + '"[^>]*onclick="([^"]*)"')) || [])[1];
+const updClick = cardBtn("dbs-card-updates-btn"), rbClick = cardBtn("dbs-card-reboot-btn");
+check("the database server card has an Updates button", !!updClick);
+check("the Updates button opens the routine updates view", /dbsOpenUpdates\(\)/.test(updClick || ""), updClick);
+check("the card has its own Reboot button that is always there (not tied to a pending reboot)", !!rbClick &&
+  !/\{%[^%]*reboot_required[^%]*%\}[^<]*<button[^>]*id="dbs-card-reboot-btn"/.test(html), rbClick);
+check("the Reboot button opens the reboot view", /dbsOpenReboot\(\)/.test(rbClick || ""), rbClick);
+check("no card button calls the upgrade dialog", !/osupOpenPreflight/.test((updClick || "") + (rbClick || "")));
+check("the card says in plain words when no restart is needed", /id="uu-noreboot-\{\{ host\.id \}\}"[^>]*>&#10003; No restart needed/.test(html));
+check("the card has an updates status line", /id="dbs-card-updates-line"/.test(html));
 
 // 2. The modal, driven.
 const NAMES = [
   "_osupApi", "_osupEsc", "_osupApplyMode", "osupOpenPreflight", "dbsOpenUpdates", "osupLoadPreflight",
-  "_osupSetStartEnabled", "_dbsRenderUpdatesView", "_osupRenderPreflight", "_dbsRenderActions",
+  "_osupSetStartEnabled", "_dbsRenderUpdatesView", "_osupRenderPreflight", "_dbsRenderActions", "dbsOpenReboot",
 ];
 const labels = (scripts.match(/var _OSUP_LABELS=\{[^\n]*\};/) || [""])[0];
 const acks = (scripts.match(/var _OSUP_ACK=\{[^\n]*\};/) || [""])[0];
@@ -89,7 +94,7 @@ async function open(openFn, preflight) {
     console,
   };
   vm.createContext(sandbox);
-  vm.runInContext(source + "\n_osupUpdatesOnly=false;", sandbox);
+  vm.runInContext(source + "\n_osupUpdatesOnly=false;_dbsRebootMode=false;", sandbox);
   vm.runInContext(openFn, sandbox);
   await new Promise((r) => setTimeout(r, 0));
   return dom.els;
@@ -131,12 +136,34 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
   check("reboot only: message is about finishing updates, not Ubuntu's upgrader",
     /finish its updates/.test(e["dbs-actions-msg"].textContent) && !/upgrader/.test(e["dbs-actions-msg"].textContent), e["dbs-actions-msg"].textContent);
 
-  // C. Nothing pending: a plain "nothing to do", no buttons.
+  // C. Nothing pending: says so, and Reboot is still there (AJ, Sat Nov 7: "a way to reboot anytime I want").
   e = await open("dbsOpenUpdates()", pf({
     pending_count: 0, reboot_required: false,
     checks: [ck("split_config", true), ck("ssh_sudo", true), ck("os_up_to_date", true), ck("no_reboot_pending", true)],
   }));
-  check("nothing pending: says so and offers no action", /Nothing to do/.test(e["osup-modal-intro"].textContent) && e["dbs-actions"].style.display === "none");
+  check("nothing pending: says so", /Nothing to do/.test(e["osup-modal-intro"].textContent), e["osup-modal-intro"].textContent);
+  check("nothing pending: Reboot is still offered, Install updates is not", shown(e["dbs-reboot-btn"]) && !shown(e["dbs-updates-btn"]) && shown(e["dbs-actions"]));
+  check("nothing pending: the message says no reboot is needed but you may reboot",
+    /No reboot is needed, but you can reboot/.test(e["dbs-actions-msg"].textContent), e["dbs-actions-msg"].textContent);
+
+  // C2. Updates due, no reboot pending: both buttons.
+  e = await open("dbsOpenUpdates()", pf({ reboot_required: false, checks: pf().checks.map((c) => (c.name === "no_reboot_pending" ? ck("no_reboot_pending", true) : c)) }));
+  check("updates due, no reboot pending: Install updates and Reboot are both offered", shown(e["dbs-updates-btn"]) && shown(e["dbs-reboot-btn"]));
+
+  // C3. The card's Reboot button: a reboot window, no updates button, Reboot even with nothing pending.
+  e = await open("dbsOpenReboot()", pf({
+    pending_count: 0, reboot_required: false,
+    checks: [ck("split_config", true), ck("ssh_sudo", true), ck("os_up_to_date", true), ck("no_reboot_pending", true)],
+  }));
+  check("reboot view: title says Reboot the database server, not the 24.04 upgrade",
+    /Reboot the database server/.test(e["osup-modal-title"].innerHTML) && !/24\.04/.test(e["osup-modal-title"].innerHTML), e["osup-modal-title"].innerHTML);
+  check("reboot view: Reboot is offered and Install updates is not", shown(e["dbs-reboot-btn"]) && !shown(e["dbs-updates-btn"]));
+  check("reboot view: no Start upgrade button", e["osup-start-btn"].style.display === "none");
+  check("reboot view: intro says it reboots and TAK Server stays up", /Reboots the database server now/.test(e["osup-modal-intro"].textContent) && /TAK Server stays up/.test(e["osup-modal-intro"].textContent), e["osup-modal-intro"].textContent);
+  e = await open("dbsOpenReboot()", pf());
+  check("reboot view with updates pending: still only Reboot, never Install updates", shown(e["dbs-reboot-btn"]) && !shown(e["dbs-updates-btn"]));
+  e = await open("dbsOpenReboot()", pf({ pending_count: null, checks: [ck("split_config", true), ck("ssh_sudo", false, "cannot reach the database server over SSH: timeout")] }));
+  check("reboot view, server unreachable: no Reboot button", !shown(e["dbs-reboot-btn"]) && e["dbs-actions"].style.display === "none");
 
   // D. Server unreachable: the reason, no action buttons.
   e = await open("dbsOpenUpdates()", pf({ pending_count: null, checks: [ck("split_config", true), ck("ssh_sudo", false, "cannot reach the database server over SSH: timeout")] }));
@@ -166,7 +193,7 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
     };
     vm.createContext(sb);
     const more = ["_dbsRenderResult", "_dbsHostLabel"].map(fn).join("\n");
-    vm.runInContext(source + "\n" + more + "\nvar _DBS_TITLE={};_osupUpdatesOnly=false;", sb);
+    vm.runInContext(source + "\n" + more + "\nvar _DBS_TITLE={};_osupUpdatesOnly=false;_dbsRebootMode=false;", sb);
     vm.runInContext("_dbsRenderResult(" + JSON.stringify(d) + ")", sb);
     const nx = dom.els["dbs-result-next"];
     // the button's own handler: whatever the render set, else the inline one written in the page
@@ -188,6 +215,30 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
     /Check &amp; upgrade/.test(b.nx.innerHTML) && /to Ubuntu 24\.04 LTS/.test(b.els["osup-modal-title"].innerHTML), b.nx.innerHTML + " | " + b.els["osup-modal-title"].innerHTML);
   b = await banner({ state: "done", job: "reboot" });
   check("rebooted: the banner button is Check & upgrade", /Check &amp; upgrade/.test(b.nx.innerHTML), b.nx.innerHTML);
+
+  // G. The card's updates line (AJ, Sat Nov 7: "the card should clearly say if an update is needed").
+  async function cardLine(answer) {
+    const dom = makeDom();
+    const store = {};
+    const sb = {
+      document: { getElementById: dom.get },
+      fetch: async () => ({ ok: true, json: async () => answer }),
+      sessionStorage: { getItem: (k) => store[k] || null, setItem: (k, v) => { store[k] = v; } },
+      Date, JSON, console,
+    };
+    vm.createContext(sb);
+    vm.runInContext(["dbsCardCheck", "_dbsCardUpdatesText"].map(fn).join("\n"), sb);
+    await vm.runInContext("dbsCardCheck(true)", sb);
+    return dom.els["dbs-card-updates-line"];
+  }
+  let l = await cardLine(pf({ pending_count: 95 }));
+  check("card line: 95 pending says so and points at Updates", /95 updates waiting/.test(l.textContent) && /Updates/.test(l.textContent), l.textContent);
+  l = await cardLine(pf({ pending_count: 1 }));
+  check("card line: one update is singular", /1 update waiting/.test(l.textContent), l.textContent);
+  l = await cardLine(pf({ pending_count: 0 }));
+  check("card line: nothing pending says all installed", /all installed/.test(l.textContent), l.textContent);
+  l = await cardLine(pf({ pending_count: null, checks: [ck("split_config", true), ck("ssh_sudo", false, "cannot reach the database server over SSH: timeout")] }));
+  check("card line: unreachable says it could not check, never 'all installed'", /could not check/.test(l.textContent) && !/all installed/.test(l.textContent), l.textContent);
 
   console.log(fails ? "\n" + fails + " check(s) failed" : "\nall checks passed");
   process.exit(fails ? 1 : 0);
