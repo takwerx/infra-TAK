@@ -166,6 +166,17 @@ def test_the_superuser_group_is_resolved_by_what_it_is(authentik):
     assert atlas.global_admin_group('http://ak', {}) == 'Platform Owners'
 
 
+def test_the_certificate_renewal_group_is_never_the_admin_group(authentik):
+    """⚠️ It is a superuser group and sorts first. Picked, it locked every
+    administrator out of ATLAS on test12 after one update (ops #510)."""
+    authentik(FakeAuthentik(groups=[
+        {'name': 'ATLAS certificate renewal', 'is_superuser': True, 'pk': 'g0'},
+        {'name': 'authentik Admins', 'is_superuser': True, 'pk': 'g1'},
+    ]))
+
+    assert atlas.global_admin_group('http://ak', {}) == 'authentik Admins'
+
+
 def test_an_unreachable_authentik_falls_back_to_the_default_name(authentik):
     """⚠️ A deploy must not fail because the identity provider was briefly
     unreachable, and the default is right on every box nobody has renamed."""
