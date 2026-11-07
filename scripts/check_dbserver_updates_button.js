@@ -61,7 +61,7 @@ function fn(name) {
 const cardBtn = (id) => (html.match(new RegExp('<button[^>]*id="' + id + '"[^>]*onclick="([^"]*)"')) || [])[1];
 const updClick = cardBtn("dbs-card-updates-btn"), rbClick = cardBtn("dbs-card-reboot-btn");
 check("the database server card has an Updates button", !!updClick);
-check("the Updates button opens the routine updates view", /dbsOpenUpdates\(\)/.test(updClick || ""), updClick);
+check("the Updates needed button installs the updates (after a confirm), it does not just open a dialog", /dbsCardInstallUpdates\(\)/.test(updClick || "") && !/dbsOpenUpdates/.test(updClick || ""), updClick);
 check("the card has its own Reboot button that is always there (not tied to a pending reboot)", !!rbClick &&
   !/\{%[^%]*reboot_required[^%]*%\}[^<]*<button[^>]*id="dbs-card-reboot-btn"/.test(html), rbClick);
 check("the Reboot button opens the reboot view", /dbsOpenReboot\(\)/.test(rbClick || ""), rbClick);
@@ -237,16 +237,41 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
   }
   const hidden = (e) => e.style.display === "none";
   let l = await cardLine(pf({ pending_count: 95 }));
-  check("card line: 95 pending says so and points at Updates", /95 updates waiting/.test(l.textContent) && /Updates/.test(l.textContent), l.textContent);
+  check("card: 95 pending shows an 'Updates needed' button with the count", /Updates needed \(95\)/.test(l.updBtn.innerHTML) && l.updBtn.style.display === "inline-block", l.updBtn.innerHTML);
   l = await cardLine(pf({ pending_count: 1 }));
-  check("card line: one update is singular", /1 update waiting/.test(l.textContent), l.textContent);
+  check("card: one pending still says Updates needed", /Updates needed \(1\)/.test(l.updBtn.innerHTML), l.updBtn.innerHTML);
   l = await cardLine(pf({ pending_count: 0 }));
-  check("card line: nothing pending shows no updates line and no Updates button",
+  check("card: nothing pending shows no updates line and no Updates button",
     hidden(l) && hidden(l.updBtn) && l.textContent === "", "line=" + l.style.display + " btn=" + l.updBtn.style.display);
-  check("card line: updates waiting shows the line and the Updates button",
-    !hidden((await cardLine(pf({ pending_count: 3 })))) && (await cardLine(pf({ pending_count: 3 }))).updBtn.style.display === "inline-block");
   l = await cardLine(pf({ pending_count: null, checks: [ck("split_config", true), ck("ssh_sudo", false, "cannot reach the database server over SSH: timeout")] }));
-  check("card line: unreachable says it could not check, never 'all installed'", /could not check/.test(l.textContent) && !/all installed/.test(l.textContent) && !hidden(l) && l.updBtn.style.display === "inline-block", l.textContent);
+  check("card: unreachable says it could not check, never 'all installed', and offers no install button",
+    /could not check/.test(l.textContent) && !/all installed/.test(l.textContent) && !hidden(l) && hidden(l.updBtn), l.textContent + " btn=" + l.updBtn.style.display);
+
+  // H. Clicking Updates needed goes straight to the confirm and the install job (AJ, Sat Nov 7: "you click on that, it updates").
+  async function clickCard(confirmAnswer, postAnswer) {
+    const dom = makeDom();
+    const calls = { confirm: 0, posts: [], started: 0, closed: 0, alerts: [] };
+    const sb = {
+      document: { getElementById: dom.get },
+      fetch: async (url) => { calls.posts.push(url); return { ok: postAnswer.ok, status: postAnswer.ok ? 200 : 500, json: async () => postAnswer.body }; },
+      confirm: () => { calls.confirm += 1; return confirmAnswer; },
+      alert: (m) => calls.alerts.push(m),
+      _dbsTargetHost: "10.0.0.9", _rhHost: "", _osupTarget: "core", _dbsBusy: false,
+      osupCloseModal: () => { calls.closed += 1; }, _dbsJobStarted: () => { calls.started += 1; },
+      _osupApi: (p) => "/api/console/dbserver/" + p, console,
+    };
+    vm.createContext(sb);
+    vm.runInContext(["dbsCardInstallUpdates", "dbsInstallUpdates", "_dbsPost"].map(fn).join("\n") + "\nvar _osupUpdatesOnly=false,_dbsRebootMode=false;", sb);
+    await vm.runInContext("dbsCardInstallUpdates()", sb);
+    return { calls, dom, target: vm.runInContext("_osupTarget", sb) };
+  }
+  let c = await clickCard(true, { ok: true, body: { ok: true, message: "started" } });
+  check("click: targets the database server, asks once, posts to /updates and starts the job",
+    c.target === "dbserver" && c.calls.confirm === 1 && c.calls.posts.length === 1 && /\/updates$/.test(c.calls.posts[0]) && c.calls.started === 1, JSON.stringify(c.calls));
+  c = await clickCard(false, { ok: true, body: { ok: true } });
+  check("click, then Cancel at the confirm: nothing is posted", c.calls.confirm === 1 && c.calls.posts.length === 0 && c.calls.started === 0, JSON.stringify(c.calls));
+  c = await clickCard(true, { ok: false, body: { ok: false, error: "a job is already running" } });
+  check("click, server refuses: the reason is shown (the dialog is closed, so as an alert)", c.calls.alerts.length === 1 && /already running/.test(c.calls.alerts[0]) && c.calls.started === 0, JSON.stringify(c.calls));
 
   console.log(fails ? "\n" + fails + " check(s) failed" : "\nall checks passed");
   process.exit(fails ? 1 : 0);

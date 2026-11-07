@@ -342,7 +342,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 {% endif %}
 </div>
-{% if host.id == 'tak_db' %}<button type="button" id="dbs-card-updates-btn" data-dbs-updates-btn="1" onclick="event.stopPropagation();dbsOpenUpdates()" title="Install this server's updates — does not upgrade Ubuntu, and TAK Server stays up" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Updates&hellip;</button><button type="button" id="dbs-card-reboot-btn" onclick="event.stopPropagation();dbsOpenReboot()" title="Reboot this server any time — TAK Server stays up and reconnects by itself" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot&hellip;</button>{% endif %}
+{% if host.id == 'tak_db' %}<button type="button" id="dbs-card-updates-btn" data-dbs-updates-btn="1" onclick="event.stopPropagation();dbsCardInstallUpdates()" title="Install this server's updates — does not upgrade Ubuntu, and TAK Server stays up" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">&#9888; Updates needed</button><button type="button" id="dbs-card-reboot-btn" onclick="event.stopPropagation();dbsOpenReboot()" title="Reboot this server any time — TAK Server stays up and reconnects by itself" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot&hellip;</button>{% endif %}
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
@@ -1664,7 +1664,7 @@ function _dbsRenderResult(d){
     if(d.state==='done'){
         head.style.color='var(--green)';
         if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
-        else if(d.job==='updates'){ head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Reboot… to open it, then Reboot database server. TAK Server stays up.':'No reboot needed.')+notes; }
+        else if(d.job==='updates'){ try{sessionStorage.removeItem('dbs-card-updates');}catch(e){} head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Reboot… to open it, then Reboot database server. TAK Server stays up.':'No reboot needed.')+notes; }
         else { head.innerHTML='&#10003; Database server rebooted'; body.textContent='PostgreSQL is back and TAK Server reconnected by itself.'+notes; }
         return;
     }
@@ -1731,13 +1731,22 @@ async function dbsCardCheck(force){
     if(err===''){ try{ sessionStorage.setItem('dbs-card-updates',JSON.stringify({t:Date.now(),n:n,err:''})); }catch(e){} }
     _dbsCardUpdatesText(line,n,err);
 }
-// AJ, Sat Nov 7: the card shows an updates line and an Updates... button only when there is something to do
-// (updates waiting, or the check failed); with nothing pending it shows neither. Reboot... is always there.
+// AJ, Sat Nov 7: with updates waiting the card shows one yellow "Updates needed" button (click it and the updates install,
+// after a confirm); with nothing pending it shows nothing. If the check fails it says so in a line. Reboot... is always there.
 function _dbsCardUpdatesText(line,n,err){
     var ub=document.getElementById('dbs-card-updates-btn');
-    if(n==null){ line.style.display='block'; line.style.color='var(--text-dim)'; line.textContent='Updates: could not check'+(err?' \u2014 '+err.slice(0,80):''); if(ub)ub.style.display='inline-block'; return; }
-    if(n>0){ line.style.display='block'; line.style.color='var(--yellow)'; line.textContent='\u26A0 '+n+' update'+(n===1?'':'s')+' waiting \u2014 press Updates\u2026'; if(ub)ub.style.display='inline-block'; return; }
-    line.style.display='none'; line.textContent=''; if(ub)ub.style.display='none';
+    if(n==null){ line.style.display='block'; line.style.color='var(--text-dim)'; line.textContent='Updates: could not check'+(err?' \u2014 '+err.slice(0,80):''); if(ub)ub.style.display='none'; return; }
+    line.style.display='none'; line.textContent='';
+    if(n>0){ if(ub){ ub.style.display='inline-block'; ub.innerHTML='&#9888; Updates needed ('+n+')'; } return; }
+    if(ub)ub.style.display='none';
+}
+// The card's Updates needed button: straight to the confirm, then the install job. When it finishes the result banner says
+// whether a reboot is needed.
+async function dbsCardInstallUpdates(){
+    _osupTarget='dbserver'; _osupUpdatesOnly=true; _dbsRebootMode=false;
+    var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
+    await dbsInstallUpdates();
+    if(err&&err.textContent)alert(err.textContent);   // the dialog is closed here, so say why it did not start
 }
 async function dbsInit(){
     if(!document.getElementById('dbserver-card'))return;

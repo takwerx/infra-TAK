@@ -36,7 +36,7 @@ CONSOLE = (ROOT / 'templates' / 'console.html').read_text(encoding='utf-8')
 def test_card_update_button_is_not_wired_to_the_upgrade_dialog():
     start = CONSOLE.index("{% if host.id == 'tak_db' %}<button")
     buttons = CONSOLE[start:CONSOLE.index('{% endif %}', start)]
-    assert 'dbsOpenUpdates()' in buttons
+    assert 'dbsCardInstallUpdates()' in buttons   # AJ, Sat Nov 7: "Updates needed" installs them when clicked
     assert 'osupOpenPreflight' not in buttons
 
 
