@@ -5242,8 +5242,8 @@ def revocation_tick(ctx, log):
     an hour old, so this must keep running.
 
     ⚠️ The deployments first, and docker only when one has renewal on: this
-    runs every five minutes on every box, most of which have no ATLAS at all
-    (ops #510)."""
+    runs every five minutes on every box, most of which have no ATLAS at all.
+    """
     wanted = [inst for inst in load_instances(ctx) if atlas_renewal.enabled(inst)]
     if not wanted:
         return
