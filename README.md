@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.6-alpha)**
+**Current release: [v10.3.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -361,7 +361,7 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ### CloudTAK: keeping your own source patches (pre-build hooks)
 
-CloudTAK **Update** checks out a clean release, so any edit you made to `~/CloudTAK`'s source is wiped before the rebuild. To have it put back every time, put a script in `.config/cloudtak-hooks/pre-build.d/` inside the infra-TAK folder. Executable files there run in name order (`10-…`, `20-…`) right before every CloudTAK build: on Update, on a plugin install/update/remove, and on the tree a failed update rolls back to. They run as the console user, with `~/CloudTAK` as the working directory and `INFRATAK_HOOK_PHASE` (`update` / `plugin` / `revert`), `INFRATAK_CLOUDTAK_DIR`, `INFRATAK_CLOUDTAK_TAG` and `INFRATAK_CLOUDTAK_PREV_SHA` set. If a hook exits non-zero or runs over 5 minutes, the build does not start: the update rolls back and CloudTAK keeps running, and the log names the hook and shows its output. Hooks must be safe to run twice and should fail loudly when the code they patch has moved. The folders and scripts must be owned by the console user and not writable by anyone else, or nothing runs; `chmod -x` a script to turn it off. Hooks run only for a CloudTAK on the same server as the console, not for a remote CloudTAK host or a fresh Deploy.
+CloudTAK **Update** checks out a clean release, so any edit you made to `~/CloudTAK`'s source is wiped before the rebuild. To have it put back every time, put a script in `.config/cloudtak-hooks/pre-build.d/` inside the infra-TAK folder. Executable files there run in name order (`10-…`, `20-…`) right before every CloudTAK build: on Update, on a plugin install/update/remove, and on the tree a failed update rolls back to. They run as the console user, with `~/CloudTAK` as the working directory and `INFRATAK_HOOK_PHASE` (`update` / `plugin` / `revert`), `INFRATAK_CLOUDTAK_DIR`, `INFRATAK_CLOUDTAK_TAG` and `INFRATAK_CLOUDTAK_PREV_SHA` set. If a hook exits non-zero or runs over 5 minutes, the build does not start: the update rolls back and CloudTAK keeps running, and the log names the hook and shows its output. Hooks must be safe to run twice and should fail loudly when the code they patch has moved. The folders and scripts must be owned by the console user and not writable by anyone else, or nothing runs; `chmod -x` a script to turn it off. On a non-root console, anything a hook runs or reads (a script in another user's home, a patch file) must be readable by the console user too, or the hook fails with `Permission denied`. Hooks run only for a CloudTAK on the same server as the console, not for a remote CloudTAK host or a fresh Deploy.
 
 ### Caddy: your own lines inside a generated site
 
@@ -443,6 +443,38 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.8-alpha — 2026-11-06 — CloudTAK Update keeps its database working; TAK Portal shows the right state after an update; Ubuntu 24.04 upgrade fix
+
+**Headline: On a non-root install, CloudTAK Update no longer takes over CloudTAK's database folder, so the database keeps accepting connections. The TAK Portal page no longer says "Stopped" right after a good update. The Ubuntu 22.04 to 24.04 upgrade works on servers with Microsoft's package list.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha))
+
+**CloudTAK.**
+- CloudTAK Update's file-ownership repair re-owned CloudTAK's database data folder, and PostgreSQL then refused new connections until it was fixed by hand. The repair now leaves container data alone: `.docker-*` folders, any folder a container mounts, and any folder the console can't read. Every path it does re-own is logged.
+- A leftover build file from an older Dispatcher install could drop every other CloudTAK plugin when TAK Portal rebuilt CloudTAK. The console now replaces that file each time it starts.
+
+**TAK Portal.**
+- Right after a successful update, the TAK Portal page could show "Stopped" until you refreshed. It now shows the real state.
+
+**OS upgrade and updates.**
+- The Ubuntu 22.04 to 24.04 upgrade failed on servers with Microsoft's package list (its 22.04 address doesn't work on 24.04) and left the console unable to start. The list now moves to Microsoft's 24.04 feed, a broken third-party list only warns, and Microsoft's `aznfs` package is kept out of the upgrade.
+- A failed "Install updates" warning can be dismissed, and it stays dismissed after a reload or reboot. A later failure still shows.
+
+**Guard Dog.**
+- The remote-database password alert now says why the login failed (wrong password, PostgreSQL restarting, connection dropped), with passwords masked.
+
+### v10.3.7-alpha — 2026-11-06 — CloudTAK keeps its big-upload limit and every plugin; ATLAS stays admin-only after an update; clearer security email
+
+**Headline: CloudTAK keeps its 25 GB map-upload limit after a plugin is installed or updated from TAK Portal, and a Dispatcher install no longer drops the other CloudTAK plugins from the next build. Updating ATLAS re-checks that only admins can open it. Guard Dog's "Security update pending" email names the newest security fix first.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.7-alpha))
+
+**CloudTAK.**
+- The 25 GB upload limit for Admin > Public Tiles came back only after a console restart once a CloudTAK plugin was installed or updated from TAK Portal. The console and Guard Dog now notice it is missing and put it back, with no CloudTAK restart.
+- The Dispatcher plugin's installer wrote a build file that left every other CloudTAK plugin out of the next CloudTAK build. infra-TAK now replaces that file with one that keeps every installed plugin. A build file you wrote yourself is still kept, and the build log names any plugin it leaves out.
+
+**ATLAS.**
+- Updating ATLAS re-checks that only Authentik admins can open it. Before, the check never ran on an update.
+
+**Guard Dog.**
+- The "Security update pending" email counts a release's Security section (not only its first line), so it now names 10.3.6's Caddy fix, and lists security releases newest first.
 
 ### v10.3.6-alpha — 2026-11-05 — Caddy security update; CloudTAK takes map uploads over 5 GB; quieter Guard Dog; Update Now retries a slow download
 

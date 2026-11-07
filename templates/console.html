@@ -340,7 +340,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 {% endif %}
 </div>
-{% if host.id == 'tak_db' %}<button type="button" onclick="event.stopPropagation();osupOpenPreflight('dbserver')" title="Install updates, reboot or upgrade the database server — checked first, and TAK Server stays up" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">{% if host.get('reboot_required') %}Reboot / updates&hellip;{% else %}Updates&hellip;{% endif %}</button>{% endif %}
+{% if host.id == 'tak_db' %}<button type="button" onclick="event.stopPropagation();dbsOpenUpdates()" title="Install this server's updates or reboot it — does not upgrade Ubuntu, and TAK Server stays up" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">{% if host.get('reboot_required') %}Reboot / updates&hellip;{% else %}Updates&hellip;{% endif %}</button>{% endif %}
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
@@ -422,7 +422,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
         <button type="button" id="dbs-reboot-btn" onclick="dbsReboot()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer">Reboot database server</button>
       </div>
     </div>
-    <div style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:4px">What cannot be undone</div>
+    <div id="osup-irr-head" style="font-size:11px;font-weight:600;color:var(--red);margin-bottom:4px">What cannot be undone</div>
     <ul id="osup-irreversible" style="font-size:11px;color:var(--text-dim);line-height:1.5;margin:0 0 12px 18px;padding:0"></ul>
     <div id="osup-ack-block" style="display:none">
       <label id="osup-stackbk-row" style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px;cursor:pointer"><input id="osup-stackbk" type="checkbox" checked style="margin-top:2px"><span><b style="color:var(--text-primary)">Take a full backup first (recommended)</b> &mdash; TAK Server, Authentik, TAK Portal, CloudTAK, Node-RED, MediaMTX and console settings, saved on this box. If the backup fails, the upgrade does not start. It is not a substitute for an off-box snapshot.</span></label>
@@ -434,6 +434,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <div id="osup-modal-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
     <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end;flex-wrap:wrap">
       <button type="button" onclick="osupCloseModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button type="button" id="osup-upgrade-link-btn" onclick="osupOpenPreflight('dbserver')" style="display:none;padding:7px 16px;background:rgba(59,130,246,0.12);color:var(--cyan);border:1px solid rgba(59,130,246,0.3);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px" title="A separate, one-way job: Ubuntu 22.04 to 24.04">Upgrade to Ubuntu 24.04&hellip;</button>
       <button type="button" id="osup-recheck-btn" onclick="osupLoadPreflight()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Re-check</button>
       <button type="button" id="osup-start-btn" onclick="osupStart()" disabled style="padding:7px 16px;background:var(--red);color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700;opacity:.5">Start upgrade</button>
     </div>
@@ -885,9 +886,11 @@ function _kpatchShowState(state){
 // namespace — there is no argument for it to get wrong.
 // ops #154: a third namespace for "installed, needs a restart", keyed to the staged
 // kernel, so a newer staged kernel re-shows it.
+// GH #416: a fourth for a failed run, keyed to its FATAL line.
 function _kpatchNs(sig){
     var s=String(sig||'');
-    return s.indexOf('done@')===0?'done':(s.indexOf('reboot@')===0?'reboot':'pending');
+    return s.indexOf('done@')===0?'done':(s.indexOf('reboot@')===0?'reboot':
+           (s.indexOf('error@')===0?'error':'pending'));
 }
 function _kpatchKey(ns){ return 'kernel-patch-dismissed-'+ns; }
 
@@ -919,7 +922,11 @@ function _kpatchClearDismiss(ns){
 }
 function _kpatchDismissMatches(sig){
     var d=_kpatchReadDismiss(_kpatchNs(sig));
-    return !!(d && d.sig===sig && d.ts>0 && (Date.now()-d.ts)<24*60*60*1000);
+    if(!(d && d.sig===sig && d.ts>0))return false;
+    // GH #416: a closed failed run stays closed. Its log never changes again, so a
+    // 24 h expiry would only bring back the same stale failure every day; the next
+    // failed run has a new stamp and shows, and pending updates still show below it.
+    return _kpatchNs(sig)==='error' || (Date.now()-d.ts)<24*60*60*1000;
 }
 function _kpatchBannerTone(tone){
     // A yellow warning panel that says "nothing restarts" trains people to
@@ -1134,10 +1141,20 @@ async function checkKernelPatch(){
             }
         }
         if(jd && jd.error){
-            banner.style.display='block';
-            _kpatchShowState('error');
-            setLogPane('kpatch-log-error',jd.log_tail||'');
-            return;
+            // GH #416: same rule as the done panel. This branch used to show and
+            // return with no signature, so Dismiss recorded nothing and an old
+            // failure (still the last line of the log after a manual fix and a
+            // reboot) came back on every load. Dismissed: fall through, so updates
+            // that are pending now still show. Older backend, no error_at: no
+            // signature, so it re-shows as before rather than hiding for good.
+            var esig=jd.error_at?('error@'+jd.error_at):'';
+            if(!esig||!_kpatchDismissMatches(esig)){
+                banner.setAttribute('data-osupd-sig',esig);
+                banner.style.display='block';
+                _kpatchShowState('error');
+                setLogPane('kpatch-log-error',jd.log_tail||'');
+                return;
+            }
         }
     }catch(e){}
     // No in-flight job. The panel now covers ALL pending OS updates, not just a
@@ -1297,6 +1314,8 @@ async function _kpatchPollOnce(){
         }
         if(d.error){
             clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            var _eb=document.getElementById('kernel-patch-banner');
+            if(_eb)_eb.setAttribute('data-osupd-sig',d.error_at?('error@'+d.error_at):'');
             _kpatchShowState('error');
             document.getElementById('kpatch-log-error').textContent=d.log_tail||'';
             return;
@@ -1350,6 +1369,9 @@ var _OSUP_STEP_LABELS={'stack-backup':'full backup','pre-snapshot':'snapshot','p
 // Which box the shared preflight modal is driving: 'core' (this box), 'dbserver' (W4.e) or
 // 'remotehost' (W4.g, the machine _rhKey names).
 var _osupTarget='core',_rhKey='',_rhHost='';
+// ops #535: the database server card's Updates button opens this same modal in a routine-updates
+// mode (Install updates / Reboot only). Only osupOpenPreflight() turns the upgrade view on.
+var _osupUpdatesOnly=false;
 var _OSUP_ACK={core:'I have a snapshot',dbserver:'I have a snapshot of the database server',remotehost:'I have a snapshot of the remote host'};
 function _osupApi(p){ return (_osupTarget==='dbserver'?'/api/console/dbserver/':(_osupTarget==='remotehost'?'/api/console/remotehosts/'+encodeURIComponent(_rhKey)+'/':'/api/console/os-upgrade/'))+p; }
 function _osupShow(which){
@@ -1476,8 +1498,18 @@ async function osupDismiss(){
     try{localStorage.setItem('os-upgrade-dismissed',raw);}catch(e){}
     _osupShow(_osupOsType==='ubuntu-22.04'?'osup-idle':null);
 }
+function _osupApplyMode(){
+    var u=_osupUpdatesOnly;
+    var h=document.getElementById('osup-irr-head'),ul=document.getElementById('osup-irreversible'),sb=document.getElementById('osup-start-btn'),lk=document.getElementById('osup-upgrade-link-btn');
+    if(h)h.style.display=u?'none':'block';
+    if(ul)ul.style.display=u?'none':'block';
+    if(sb)sb.style.display=u?'none':'';
+    if(lk)lk.style.display=u?'inline-block':'none';
+}
 function osupOpenPreflight(target,key,host){
     var m=document.getElementById('osup-modal'); if(!m)return;
+    _osupUpdatesOnly=false;
+    _osupApplyMode();
     _osupTarget=(target==='dbserver'||target==='remotehost')?target:'core';
     if(_osupTarget==='remotehost'){ _rhKey=key||''; _rhHost=host||''; }
     var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
@@ -1491,13 +1523,49 @@ function osupOpenPreflight(target,key,host){
     m.style.display='flex';
     osupLoadPreflight();
 }
+// ops #535: routine updates / reboot for the database server — never the Ubuntu 24.04 upgrade.
+function dbsOpenUpdates(){
+    var m=document.getElementById('osup-modal'); if(!m)return;
+    _osupTarget='dbserver'; _osupUpdatesOnly=true;
+    _osupApplyMode();
+    var err=document.getElementById('osup-modal-err'); if(err)err.textContent='';
+    var pw=document.getElementById('osup-pw-input'); if(pw)pw.value='';
+    var t=document.getElementById('osup-modal-title');
+    if(t)t.innerHTML='&#128451; Database server updates'+(_dbsTargetHost?' ('+_osupEsc(_dbsTargetHost)+')':'');
+    _dbsRenderActions(null);
+    m.style.display='flex';
+    osupLoadPreflight();
+}
 function osupCloseModal(){ var m=document.getElementById('osup-modal'); if(m)m.style.display='none'; }
 function _osupSetStartEnabled(on){
+    if(_osupUpdatesOnly)on=false;
     var b=document.getElementById('osup-start-btn'); if(!b)return;
     b.disabled=!on; b.style.opacity=on?'1':'.5';
     var blk=document.getElementById('osup-ack-block'); if(blk)blk.style.display=on?'block':'none';
 }
+function _dbsRenderUpdatesView(d){
+    var box=document.getElementById('osup-checks'),intro=document.getElementById('osup-modal-intro');
+    var by={}; (d.checks||[]).forEach(function(c){by[c.name]=c;});
+    function row(ok,label,detail){
+        return '<div style="display:flex;gap:8px;align-items:flex-start"><span style="color:'+(ok?'var(--green)':'var(--red)')+';flex:0 0 14px">'+(ok?'&#10003;':'&#10007;')+'</span><div><span style="color:var(--text-primary)">'+_osupEsc(label)+'</span><span style="color:var(--text-dim)"> &mdash; '+_osupEsc(detail)+'</span></div></div>';
+    }
+    var html='',reach=true;
+    ['split_config','ssh_sudo'].forEach(function(n){ var c=by[n]; if(c&&!c.pass){ reach=false; html+=row(false,_OSUP_LABELS[n]||n,c.detail||''); } });
+    if(reach){
+        if(d.pending_count==null)html+=row(false,'Updates','could not ask apt which updates are pending');
+        else html+=row(d.pending_count===0,'Updates',d.pending_count===0?'every available update is installed':d.pending_count+' pending');
+        var rb=!!d.reboot_required||!!(by.no_reboot_pending&&!by.no_reboot_pending.pass);
+        html+=row(!rb,'Reboot',rb?'needed to finish earlier updates (a new kernel or library is installed but not running)':'not needed');
+        var bz=by.no_job_running; if(bz&&!bz.pass)html+=row(false,_OSUP_LABELS.no_job_running,bz.detail||'');
+    }
+    if(box)box.innerHTML=html;
+    var idle=reach&&d.pending_count===0&&!d.reboot_required&&!(by.no_reboot_pending&&!by.no_reboot_pending.pass);
+    if(intro)intro.textContent=reach?(idle?'Nothing to do: every update is installed and no reboot is needed.':'Installs this server\'s pending updates and reboots it. This does not upgrade Ubuntu.'):'The console could not check this server. Nothing has been changed.';
+    _osupSetStartEnabled(false);
+    _dbsRenderActions(d);
+}
 function _osupRenderPreflight(d){
+    if(_osupUpdatesOnly){ _dbsRenderUpdatesView(d); return; }
     var box=document.getElementById('osup-checks'),intro=document.getElementById('osup-modal-intro'),irr=document.getElementById('osup-irreversible');
     if(!box)return;
     var html='';
@@ -1672,7 +1740,7 @@ function _dbsRenderActions(pf){
                  :where+' needs a reboot before Ubuntu\'s upgrader will run. Its modules are unavailable for the minute or two it is down.')
         :(needUpd
         ?pf.pending_count+' update(s) are pending on the database server. Install updates runs apt full-upgrade there (TAK\'s database package is held). TAK Server stays up; PostgreSQL may restart briefly. Then Re-check.'
-        :'The database server needs a reboot before Ubuntu\'s upgrader will run. TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.');
+        :(_osupUpdatesOnly?'The database server needs a reboot to finish its updates.':'The database server needs a reboot before Ubuntu\'s upgrader will run.')+' TAK Server stays up and reconnects by itself; nothing is saved to the database for the minute or two it is down.');
     box.style.display='block';
 }
 function _dbsJobStarted(job,message){
