@@ -60,6 +60,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -315,6 +316,11 @@ _CRL_BLOCK = re.compile(r'-----BEGIN X509 CRL-----\r?\n[A-Za-z0-9+/=\r\n]+?-----
 #: How often the copy is refreshed. The container refuses one older than an hour.
 REVOCATION_INTERVAL_S = 300
 
+#: ⚠️ The five-minute loop and a deploy or update both write these files, and
+#: `_write_secret` uses one fixed `.tmp` name: two writers at once can unlink
+#: each other's temporary file and publish an empty list (ops #510).
+_REVOCATION_LOCK = threading.Lock()
+
 
 def revoked_fingerprints(ctx):
     """Every revoked certificate's fingerprint, or None when TAK Server's
@@ -356,9 +362,10 @@ def write_revocations(dirpath, fingerprints, crls_pem, uid, now=time.time):
     sdir = os.path.join(dirpath, SECRETS_DIR)
     chown = uid if _uid() == 0 else None
     stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now()))
-    _write_secret(os.path.join(sdir, CRL_FILE), crls_pem, chown)
-    _write_secret(os.path.join(sdir, REVOKED_FILE),
-                  '\n'.join(['written=' + stamp] + list(fingerprints)) + '\n', chown)
+    with _REVOCATION_LOCK:
+        _write_secret(os.path.join(sdir, CRL_FILE), crls_pem, chown)
+        _write_secret(os.path.join(sdir, REVOKED_FILE),
+                      '\n'.join(['written=' + stamp] + list(fingerprints)) + '\n', chown)
 
 
 def refresh_revocations(ctx, inst, dirpath, plog, cert_dir=TAK_CERT_DIR):

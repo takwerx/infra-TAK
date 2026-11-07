@@ -5239,9 +5239,16 @@ def tak_ca_changed(ctx, log):
 def revocation_tick(ctx, log):
     """ATLAS W461: copy TAK Server's revoked certificates to every built
     deployment's renewal container. The container refuses renewal on a copy
-    an hour old, so this must keep running."""
+    an hour old, so this must keep running.
+
+    ⚠️ The deployments first, and docker only when one has renewal on: this
+    runs every five minutes on every box, most of which have no ATLAS at all
+    (ops #510)."""
+    wanted = [inst for inst in load_instances(ctx) if atlas_renewal.enabled(inst)]
+    if not wanted:
+        return
     projects = compose_projects_present(ctx)
-    for inst in load_instances(ctx):
+    for inst in wanted:
         if instance_is_built(ctx, inst, projects):
             atlas_renewal.refresh_revocations(ctx, inst, instance_paths(ctx, inst)['dir'], log)
 

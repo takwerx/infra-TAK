@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 from modules import atlas_instances as ai  # noqa: E402
 from modules import atlas_renewal as ar  # noqa: E402
 import modules.atlas as atlas  # noqa: E402
-from tests.test_atlas_renewal import FakeAuthentik, _ctx, deployment  # noqa: E402,F401
+from test_atlas_renewal import FakeAuthentik, _ctx, deployment  # noqa: E402,F401
 
 NL = '\n'
 FP1 = ':'.join(['6C'] * 32)
@@ -197,3 +197,30 @@ def test_the_loop_starts_once_and_survives_a_failed_tick():
 def test_the_console_hands_modules_the_tak_database():
     app = (ROOT / 'app.py').read_text(encoding='utf-8')
     assert "'_cotdb_psql': _cotdb_psql," in app
+
+
+# ------------------------------------------------------- review fixes (ops #510)
+
+def test_a_box_without_renewal_never_asks_docker(monkeypatch):
+    """The tick runs every five minutes on every box; most have no ATLAS."""
+    off = dict(PLAIN, renewal_disabled=True)
+    for listed in ([], [off]):
+        monkeypatch.setattr(atlas, 'load_instances', lambda ctx, listed=listed: listed)
+        monkeypatch.setattr(atlas, 'compose_projects_present',
+                            lambda ctx: pytest.fail('docker asked with no renewal to copy for'))
+        atlas.revocation_tick({}, print)
+
+
+def test_two_writers_never_overlap(deployment):
+    """The loop and a deploy both write the list; one fixed .tmp name means a
+    second writer could unlink the first one's file and publish an empty list."""
+    import threading
+
+    sdir = _secrets(deployment)
+    with ar._REVOCATION_LOCK:
+        t = threading.Thread(target=ar.write_revocations, args=(str(deployment), [FP1], '', None))
+        t.start()
+        t.join(0.3)
+        assert t.is_alive() and not (sdir / ar.REVOKED_FILE).exists()
+    t.join(5)
+    assert FP1 in (sdir / ar.REVOKED_FILE).read_text()
