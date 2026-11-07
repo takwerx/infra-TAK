@@ -96617,22 +96617,46 @@ def _os_upgrade_tak_version_tuple(ver):
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def _os_upgrade_pg_clusters():
-    """[(version, name, port, status)] from `pg_lsclusters --no-header` (broker-gated
-    to exactly that shape); [] when the tool is absent or fails."""
+def _os_upgrade_pg_clusters_ex():
+    """([(version, name, port, status)], error) from `pg_lsclusters --no-header` (broker-gated
+    to exactly that shape). error is '' when the listing worked; otherwise the reason it did
+    not (tool absent, timeout, or its stderr) and the list is [].
+
+    ops #537 / infra-TAK #426: one registered cluster whose data folder is gone makes
+    postgresql-common abort the whole listing with "... is not accessible" and exit 1, hiding
+    a healthy live cluster. The caller must be able to say that, not "no cluster found"."""
     try:
         r = subprocess.run(_sudo_wrap(['pg_lsclusters', '--no-header']),
                            capture_output=True, text=True, timeout=15)
-    except Exception:
-        return []
+    except Exception as e:
+        return [], 'pg_lsclusters could not run: ' + (str(e) or type(e).__name__)[:160]
     if r.returncode != 0:
-        return []
+        msg = ' '.join((r.stderr or r.stdout or '').split())[:300]
+        return [], f'pg_lsclusters exited {r.returncode}' + (f': {msg}' if msg else ' with no output')
     out = []
     for line in (r.stdout or '').splitlines():
         parts = line.split()
         if len(parts) >= 4:
             out.append((parts[0], parts[1], parts[2], parts[3]))
-    return out
+    return out, ''
+
+
+def _os_upgrade_pg_clusters():
+    """[(version, name, port, status)]; [] when the tool is absent or fails."""
+    return _os_upgrade_pg_clusters_ex()[0]
+
+
+def _os_upgrade_pg_list_hint(err):
+    """One-line next step for a failed cluster listing (ops #537). Names the stale
+    registration when the error is postgresql-common's "<datadir> is not accessible"."""
+    m = re.search(r'/var/lib/postgresql/(\d+)/(\w+) is not accessible', err or '')
+    if not m:
+        return 'Run sudo pg_lsclusters on the box and fix what it reports, then Re-check.'
+    ver, name = m.group(1), m.group(2)
+    return (f'The PostgreSQL {ver}/{name} entry in /etc/postgresql/{ver}/{name} has no data folder, '
+            f'and that stops the whole listing; TAK\'s own database is probably fine. If {ver}/{name} is a '
+            f'stopped leftover with no data, remove it (sudo install -d -o postgres -g postgres -m 700 '
+            f'/var/lib/postgresql/{ver}/{name} then sudo pg_dropcluster {ver} {name}), then Re-check.')
 
 
 def _os_upgrade_running_jobs():
@@ -96891,8 +96915,13 @@ def _os_upgrade_preflight(for_start=False, data=None):
             except Exception:
                 native_local_db = False
             if native_local_db:
-                clusters = _os_upgrade_pg_clusters()
-                if not clusters:
+                clusters, pg_list_err = _os_upgrade_pg_clusters_ex()
+                if not clusters and pg_list_err:
+                    # ops #537: a failed listing is not "no database" (infra-TAK #426).
+                    ok = False
+                    detail += (' — could not list PostgreSQL clusters (' + pg_list_err + '). '
+                               + _os_upgrade_pg_list_hint(pg_list_err))
+                elif not clusters:
                     ok = False
                     detail += ' — no local PostgreSQL cluster found (expected 18 on 5432 after the 5.8 migration)'
                 elif not any(c[0] == '18' for c in clusters):
