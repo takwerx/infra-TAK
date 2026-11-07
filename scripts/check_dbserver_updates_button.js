@@ -67,7 +67,9 @@ check("the card has its own Reboot button that is always there (not tied to a pe
 check("the Reboot button opens the reboot view", /dbsOpenReboot\(\)/.test(rbClick || ""), rbClick);
 check("no card button calls the upgrade dialog", !/osupOpenPreflight/.test((updClick || "") + (rbClick || "")));
 check("the card says in plain words when no restart is needed", /id="uu-noreboot-\{\{ host\.id \}\}"[^>]*>&#10003; No restart needed/.test(html));
-check("the card has an updates status line", /id="dbs-card-updates-line"/.test(html));
+check("the card has an updates status line, hidden until there is something to say", /id="dbs-card-updates-line" style="display:none/.test(html));
+check("the card Updates button starts hidden (shown only when updates are waiting)", /id="dbs-card-updates-btn"[^>]*style="display:none/.test(html));
+check("the card Reboot button is never hidden", !/id="dbs-card-reboot-btn"[^>]*style="display:none/.test(html));
 
 // 2. The modal, driven.
 const NAMES = [
@@ -229,16 +231,22 @@ const shown = (e) => e && e.style.display && e.style.display !== "none";
     vm.createContext(sb);
     vm.runInContext(["dbsCardCheck", "_dbsCardUpdatesText"].map(fn).join("\n"), sb);
     await vm.runInContext("dbsCardCheck(true)", sb);
-    return dom.els["dbs-card-updates-line"];
+    const line = dom.els["dbs-card-updates-line"];
+    line.updBtn = dom.els["dbs-card-updates-btn"];
+    return line;
   }
+  const hidden = (e) => e.style.display === "none";
   let l = await cardLine(pf({ pending_count: 95 }));
   check("card line: 95 pending says so and points at Updates", /95 updates waiting/.test(l.textContent) && /Updates/.test(l.textContent), l.textContent);
   l = await cardLine(pf({ pending_count: 1 }));
   check("card line: one update is singular", /1 update waiting/.test(l.textContent), l.textContent);
   l = await cardLine(pf({ pending_count: 0 }));
-  check("card line: nothing pending says all installed", /all installed/.test(l.textContent), l.textContent);
+  check("card line: nothing pending shows no updates line and no Updates button",
+    hidden(l) && hidden(l.updBtn) && l.textContent === "", "line=" + l.style.display + " btn=" + l.updBtn.style.display);
+  check("card line: updates waiting shows the line and the Updates button",
+    !hidden((await cardLine(pf({ pending_count: 3 })))) && (await cardLine(pf({ pending_count: 3 }))).updBtn.style.display === "inline-block");
   l = await cardLine(pf({ pending_count: null, checks: [ck("split_config", true), ck("ssh_sudo", false, "cannot reach the database server over SSH: timeout")] }));
-  check("card line: unreachable says it could not check, never 'all installed'", /could not check/.test(l.textContent) && !/all installed/.test(l.textContent), l.textContent);
+  check("card line: unreachable says it could not check, never 'all installed'", /could not check/.test(l.textContent) && !/all installed/.test(l.textContent) && !hidden(l) && l.updBtn.style.display === "inline-block", l.textContent);
 
   console.log(fails ? "\n" + fails + " check(s) failed" : "\nall checks passed");
   process.exit(fails ? 1 : 0);
