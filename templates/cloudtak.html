@@ -239,8 +239,10 @@
     </div>
   </div>
   <div class="card">
-    <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+    <div class="card-title ct-collapse-head" data-collapse="ct-logs" data-default="closed">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span><span class="ct-collapse-icon">&#9662;</span></div>
+    <div id="ct-logs-body">
     <div class="log-box" id="container-logs">Loading...</div>
+    </div>
   </div>
   {% endif %}
 
@@ -252,10 +254,12 @@
   </div>
   {% elif cloudtak_plugins is defined %}
   <div class="card" id="ct-plugins-section">
-    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+    <div class="card-title ct-collapse-head" data-collapse="ct-plugins" data-default="closed">
       <span>Plugins</span>
-      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
+      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0;margin-left:auto">upstream docs ↗</a>
+      <span class="ct-collapse-icon">&#9662;</span>
     </div>
+    <div id="ct-plugins-body">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
       Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
       After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
@@ -307,16 +311,19 @@
       <div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span><button class="btn btn-ghost" style="margin-left:auto;font-size:11px;padding:4px 10px;text-transform:none;letter-spacing:0" onclick="ctCopyPluginLog(this)">⧉ Copy</button></div>
       <div class="log-box" id="ct-plugin-log">Waiting...</div>
     </div>
+    </div>
   </div>
   {% endif %}
 
   {% if cloudtak_cfg.get('target_mode') != 'remote' %}
   <!-- ETL (v10.4.0): infra-TAK turns ETL on and installs ETLs; CloudTAK is where people use them -->
   <div class="card" id="ct-etl-section">
-    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+    <div class="card-title ct-collapse-head" data-collapse="ct-etl" data-default="open">
       <span>ETL — data feeds</span>
-      <a href="https://docs.cloudtak.io/integrations/" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">what each ETL does ↗</a>
+      <a href="https://docs.cloudtak.io/integrations/" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0;margin-left:auto">what each ETL does ↗</a>
+      <span class="ct-collapse-icon">&#9662;</span>
     </div>
+    <div id="ct-etl-body">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.6">
       An ETL pulls data from another service (CalTopo, Waze, ArcGIS, a drone or tracker platform…) and puts it on the TAK map on a schedule.
       CloudTAK normally needs an AWS account to run them — with ETL on, they run right here on this server instead.
@@ -327,13 +334,15 @@
       <span id="ct-etl-state" style="font-size:12px;color:var(--text-dim)">Checking…</span>
       <button class="btn btn-primary" id="ct-etl-toggle" style="font-size:12px;padding:7px 14px;display:none"></button>
     </div>
-    <div id="ct-etl-filter-row" style="display:none;margin-bottom:12px">
-      <input id="ct-etl-filter" type="search" placeholder="Filter ETLs…" style="width:100%;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
+    <div id="ct-etl-filter-row" style="display:none;margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
+      <input id="ct-etl-filter" type="search" placeholder="Search ETLs…" style="flex:1;min-width:200px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
+      <div id="ct-etl-tabs" style="display:flex;gap:4px;flex-wrap:wrap"></div>
     </div>
-    <div id="ct-etl-list" style="display:grid;grid-template-columns:1fr;gap:10px"></div>
+    <div id="ct-etl-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px"></div>
     <div id="ct-etl-log-card" style="display:none;margin-top:20px">
       <div class="section-title" style="margin-bottom:10px">ETL Log <span id="ct-etl-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
       <div class="log-box" id="ct-etl-log">Waiting...</div>
+    </div>
     </div>
   </div>
   <script>
@@ -344,40 +353,64 @@
     function el(tag, style, text){ var e = document.createElement(tag); if (style) e.style.cssText = style; if (text != null) e.textContent = text; return e; }
     function badge(text, color){ return el('span', 'font-size:10px;font-weight:600;color:'+color+';border:1px solid '+color+';border-radius:4px;padding:1px 6px;opacity:.85', text); }
     function btn(text, cls, fn){ var b = el('button', 'font-size:12px;padding:6px 12px', text); b.className = 'btn ' + cls; b.disabled = busy; b.onclick = fn; return b; }
+    var tab = 'all';
+    var TABS = [['all','All'],['available','Available'],['installed','Installed'],['updates','Updates']];
+    function renderTabs(){
+      var box = document.getElementById('ct-etl-tabs'); box.textContent = '';
+      TABS.forEach(function(t){
+        var n = entries.filter(function(e){ return match(e, t[0]); }).length;
+        var b = el('button', 'font-size:12px;padding:7px 12px', t[1] + ' (' + n + ')');
+        b.className = 'btn ' + (tab === t[0] ? 'btn-primary' : 'btn-ghost');
+        b.onclick = function(){ tab = t[0]; renderTabs(); render(); };
+        box.appendChild(b);
+      });
+    }
+    function match(e, t){
+      var inst = (e.installed || []).length > 0;
+      if (t === 'installed') return inst;
+      if (t === 'available') return !inst && e.installable;
+      if (t === 'updates') return !!e.update;
+      return true;
+    }
     function render(){
       list.textContent = '';
-      var q = (filter.value || '').toLowerCase();
+      var q = (filter.value || '').toLowerCase(), shown = 0;
       entries.forEach(function(e){
+        if (!match(e, tab)) return;
         if (q && (e.name + ' ' + e.description + ' ' + e.author).toLowerCase().indexOf(q) < 0) return;
+        shown++;
         var inst = (e.installed || []).length > 0;
-        var card = el('div', 'background:var(--bg-surface);border:1px solid '+(inst?'rgba(16,185,129,.35)':'var(--border)')+';border-radius:10px;padding:14px 18px;display:flex;gap:12px;align-items:flex-start');
-        var body = el('div', 'flex:1;min-width:0');
-        var title = el('div', 'font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px;display:flex;flex-wrap:wrap;gap:6px;align-items:center');
-        title.appendChild(el('span', '', e.name));
-        if (e.community) title.appendChild(badge('COMMUNITY', '#a78bfa'));
-        if (e.flags && e.flags.outgoing) title.appendChild(badge('TWO-WAY', 'var(--cyan)'));
-        body.appendChild(title);
-        body.appendChild(el('div', 'font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:6px', e.description || 'No description from the author.'));
-        var meta = el('div', "font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace",
-          'v' + e.version + ' · ' + e.author + (inst ? ' · installed ' + e.installed.join(', ') : '') + (e.update ? ' · update available' : ''));
-        body.appendChild(meta);
-        if (e.note) body.appendChild(el('div', 'font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5', e.note));
+        var card = el('div', 'background:var(--bg-surface);border:1px solid '+(inst?'rgba(16,185,129,.35)':'var(--border)')+';border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;min-height:230px');
+        var head = el('div', 'display:flex;align-items:flex-start;justify-content:space-between;gap:8px');
+        head.appendChild(el('div', 'font-size:15px;font-weight:700;color:var(--text-primary);line-height:1.3', e.name));
+        var tags = el('div', 'display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0');
+        if (inst) tags.appendChild(badge('INSTALLED', 'var(--green)'));
+        if (e.update) tags.appendChild(badge('UPDATE', 'var(--cyan)'));
+        if (e.community) tags.appendChild(badge('COMMUNITY', '#a78bfa'));
+        if (e.flags && e.flags.outgoing) tags.appendChild(badge('TWO-WAY', '#eab308'));
+        head.appendChild(tags); card.appendChild(head);
         if (e.repo_url && /^https:\/\/github\.com\//.test(e.repo_url)) {
-          var a = el('a', 'font-size:11px;color:var(--cyan);text-decoration:none', e.repo_url.replace('https://','') + ' ↗');
-          a.href = e.repo_url; a.target = '_blank'; a.rel = 'noopener'; body.appendChild(a);
+          var a = el('a', 'font-size:12px;font-weight:600;color:var(--text-secondary);text-decoration:none', 'View Original Repository ↗');
+          a.href = e.repo_url; a.target = '_blank'; a.rel = 'noopener'; card.appendChild(a);
         }
-        var side = el('div', 'display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0');
+        card.appendChild(el('div', 'font-size:12px;color:var(--text-dim)', 'By: ' + e.author + ' · v' + e.version + (inst && e.update ? ' (installed ' + e.installed.join(', ') + ')' : '')));
+        var d = el('div', 'font-size:12.5px;color:var(--text-secondary);line-height:1.5;flex:1;overflow:hidden;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical', e.description || 'No description from the author.');
+        d.title = (e.description || '') + (e.note ? '\n\n' + e.note : '');
+        card.appendChild(d);
+        var foot = el('div', 'display:flex;flex-direction:column;gap:6px;margin-top:8px');
+        var full = 'width:100%;font-size:13px;font-weight:600;padding:9px 12px';
         if (inst) {
-          side.appendChild(badge('INSTALLED', 'var(--green)'));
-          if (e.update) side.appendChild(btn('⬆ Update to ' + e.version, 'btn-ghost', function(){ act('update', e); }));
-          side.appendChild(btn('Remove', 'btn-ghost', function(){ if (confirm('Remove ' + e.name + '? CloudTAK will refuse while a layer still uses it.')) act('remove', e); }));
+          if (e.update) { var u = btn('Update to v' + e.version, 'btn-primary', function(){ act('update', e); }); u.style.cssText = full; foot.appendChild(u); }
+          var r = btn('Uninstall', '', function(){ if (confirm('Uninstall ' + e.name + '? CloudTAK will refuse while a layer still uses it.')) act('remove', e); });
+          r.style.cssText = full + ';background:rgba(239,68,68,.85);color:#fff;border:none'; foot.appendChild(r);
         } else if (e.installable && enabled) {
-          side.appendChild(btn('Install', 'btn-primary', function(){ act('install', e); }));
+          var i = btn('Install', 'btn-primary', function(){ act('install', e); }); i.style.cssText = full; foot.appendChild(i);
         } else {
-          side.appendChild(el('span', 'font-size:11px;color:var(--text-dim);max-width:180px;text-align:right', enabled ? e.reason : 'Turn ETL on first'));
+          foot.appendChild(el('div', full + ';text-align:center;border-radius:8px;background:rgba(234,179,8,.12);color:#eab308;border:1px solid rgba(234,179,8,.3)', enabled ? e.reason : 'Turn ETL on first'));
         }
-        card.appendChild(body); card.appendChild(side); list.appendChild(card);
+        card.appendChild(foot); list.appendChild(card);
       });
+      if (!shown) list.appendChild(el('div', 'font-size:13px;color:var(--text-dim);padding:12px', 'No ETLs match.'));
     }
     function load(){
       fetch('/api/cloudtak/etl/status').then(function(r){ return r.json(); }).then(function(st){
@@ -390,8 +423,8 @@
       }).then(function(r){ return r.json(); }).then(function(d){
         entries = d.entries || [];
         entries.sort(function(a, b){ return ((b.installed||[]).length>0) - ((a.installed||[]).length>0) || a.name.localeCompare(b.name); });
-        document.getElementById('ct-etl-filter-row').style.display = '';
-        render();
+        document.getElementById('ct-etl-filter-row').style.display = 'flex';
+        renderTabs(); render();
       }).catch(function(){ stateEl.textContent = 'Could not load ETL status'; });
     }
     function follow(logUrl, label){
@@ -561,6 +594,26 @@
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script src="/cloudtak/page.js"></script>
+<style>
+.ct-collapse-head{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.ct-collapse-icon{margin-left:auto;font-size:16px;color:var(--text-dim);transition:transform .2s ease}
+.ct-collapse-head a + .ct-collapse-icon{margin-left:0}
+.ct-collapse-head.open .ct-collapse-icon{transform:rotate(180deg)}
+.ct-collapse-head:not(.open){margin-bottom:0}
+</style>
+<script>
+(function(){
+  document.querySelectorAll('.ct-collapse-head').forEach(function(h){
+    var key = h.getAttribute('data-collapse'), body = document.getElementById(key + '-body');
+    if (!body) return;
+    var open = h.getAttribute('data-default') !== 'closed';
+    try { var v = localStorage.getItem('ct-collapse:' + key); if (v !== null) open = v === '1'; } catch (e) {}
+    function apply(){ body.style.display = open ? '' : 'none'; h.classList.toggle('open', open); }
+    h.addEventListener('click', function(){ open = !open; try { localStorage.setItem('ct-collapse:' + key, open ? '1' : '0'); } catch (e) {} apply(); });
+    apply();
+  });
+})();
+</script>
 <script>
 (function(){
   var deploying = document.body.getAttribute('data-deploying') === 'true';
