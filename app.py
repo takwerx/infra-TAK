@@ -9065,9 +9065,13 @@ def _diag_section_connectivity(settings):
                                               f'authentik.{fqdn}', _tak_name) if h):
             try:
                 ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
-                _own = _box_local_ipv4s().intersection(ips)
-                out.append(f"dns {host}: {', '.join(ips)}"
-                           f"{'' if (not sip or sip in ips) else ('   (this box\'s own address: split-horizon DNS)' if _own else '   <-- not server_ip ' + sip)}")
+                if not sip or sip in ips:
+                    note = ''
+                elif _box_local_ipv4s().intersection(ips):
+                    note = "   (this box's own address: split-horizon DNS)"
+                else:
+                    note = '   <-- not server_ip ' + sip
+                out.append(f"dns {host}: {', '.join(ips)}{note}")
             except Exception as e:
                 out.append(f"dns {host}: does not resolve ({str(e)[:60]})"
                            f"{'   (apex record — optional)' if host == fqdn else ''}")
