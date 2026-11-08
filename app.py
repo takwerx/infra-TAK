@@ -48990,10 +48990,18 @@ def _etlcat_ct(method, path, payload=None):
 
 
 def _etlcat_integrations():
-    ok, code, d = _etlcat_ct('GET', '/integration?limit=1000')
-    if not ok or not isinstance(d, dict):
-        return None
-    return {i.get('prefix'): i for i in d.get('items') or [] if isinstance(i, dict)}
+    # CloudTAK caps `limit` at 100 (a larger value is a 400), so page through
+    out, page = {}, 0
+    while page < 50:
+        ok, code, d = _etlcat_ct('GET', f'/integration?limit=100&page={page}')
+        if not ok or not isinstance(d, dict):
+            return None
+        items = [i for i in d.get('items') or [] if isinstance(i, dict)]
+        out.update({i.get('prefix'): i for i in items})
+        if len(items) < 100 or len(out) >= int(d.get('total') or 0):
+            return out
+        page += 1
+    return out
 
 
 def _etlcat_git(args, cwd=None, timeout=300):
