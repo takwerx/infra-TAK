@@ -95,6 +95,7 @@ def _override(pin):
         'POSTGIS_IMAGE': 'postgis/postgis:17-3.6-alpine', 'POSTGIS_IMAGE_ARM64': 'x',
         '_host_arch': lambda: 'x86_64', '_container_ca_trust': lambda node=False: ('', ''),
         '_cloudtak_video_host_pin': lambda s: pin,
+        '_cloudtak_stream_host_pin': lambda s: '',
     }
     ns['_sock'] = None
     src = _fn('_cloudtak_build_override_yml')

@@ -34308,6 +34308,34 @@ def _cloudtak_video_host_pin(settings):
     return f'{host}:{ip}' if host and ip else ''
 
 
+def _cloudtak_stream_host_pin(settings):
+    """extra_hosts entry `stream.<fqdn>:<this box's address>` for CloudTAK's media container.
+
+    ops #560. A feed whose URL names this box's own MediaMTX (rtsp://stream.<fqdn>:8554/...) is
+    pulled by the media container. Resolved through public DNS, the pull leaves the box: on a
+    cloud box (AWS: checked on a fresh Ubuntu 22.04 box) the provider's NAT returns it with the box's
+    own public address as the source, which is not the Docker network the standalone MediaMTX lets
+    read without a password (ops #193), so MediaMTX answered 401 and every play ended "source of
+    path ... has timed out". On a home or office network with no NAT hairpin it never returns at
+    all. Pinning the name to the box's own address keeps the pull on the box, arriving from the
+    Docker network, so no new address is trusted. '' when there is nothing to pin (no local
+    MediaMTX, no domain, remote CloudTAK, no address). Same address as the video pin (ops #471).
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return ''
+    except Exception:
+        return ''
+    if not os.path.exists('/usr/local/bin/mediamtx'):
+        return ''
+    stream = (_get_service_domain(settings, 'mediamtx') or '').strip()
+    if not stream or not (settings.get('fqdn') or '').strip():
+        return ''
+    host = stream.split()[0].strip()
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return f'{host}:{ip}' if host and ip else ''
+
+
 def _get_cloudtak_upstreams(settings):
     """Return CloudTAK upstream endpoints for Caddy and readiness checks.
 
@@ -47874,6 +47902,9 @@ def _cloudtak_build_override_yml(settings):
     # ops #471: only the api container calls the media server by its public name.
     video_pin = _cloudtak_video_host_pin(settings)
     api_hosts_block = hosts_block + (f'\n      - "{video_pin}"' if video_pin else '')
+    # ops #560: only the media container pulls feeds from the standalone MediaMTX by its public name.
+    stream_pin = _cloudtak_stream_host_pin(settings)
+    media_hosts_block = hosts_block + (f'\n      - "{stream_pin}"' if stream_pin else '')
     # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
     # CloudTAK's api container runs both nginx and Node in the same image;
     # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
@@ -48039,7 +48070,7 @@ services:
     # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
     extra_hosts:
-{hosts_block}
+{media_hosts_block}
     environment:
       API_URL: "http://api:5000"
 {media_ca_env}{media_ca_vol_block}  postgis:
@@ -48051,12 +48082,25 @@ services:
 {_sim_networks_top}"""
 
 
+def _cloudtak_override_service_block(text, name, rest=False):
+    """The body of the `  <name>:` service block of a compose override ('' when absent); with
+    rest=True the override text WITHOUT that block instead."""
+    pat = r'(?ms)^  ' + re.escape(name) + r':\n(.*?)(?=^  \S|^\S|\Z)'
+    if rest:
+        return re.sub(pat, '', text or '')
+    m = re.search(pat, text or '')
+    return m.group(1) if m else ''
+
+
 def _cloudtak_refresh_override(plog=None):
     """v10.1.61 W10: rewrite CloudTAK's compose override from current settings and, when
-    it changed, recreate ONLY the api service (`up -d --no-deps api`). The simulator module
-    calls this on deploy and uninstall so the api container joins / leaves the infratak
-    network and gets / loses the engine URL + token. Local CloudTAK only; a no-op when it
-    is not installed here. Returns (changed, message)."""
+    it changed, recreate ONLY the services whose block changed (`up -d --no-deps api`; the
+    media service too when its block changed, ops #560, then its HLS heal, which a recreate
+    reverts). The simulator module calls this on deploy and uninstall so the api container
+    joins / leaves the infratak network and gets / loses the engine URL + token; the MediaMTX
+    link converge calls it so the media container's stream-name pin follows the standalone
+    MediaMTX. Local CloudTAK only; a no-op when it is not installed here.
+    Returns (changed, message)."""
     _log = plog or (lambda m: print(m, flush=True))
     ct_dir = os.path.expanduser('~/CloudTAK')
     if not (os.path.exists(os.path.join(ct_dir, 'docker-compose.yml'))
@@ -48087,10 +48131,24 @@ def _cloudtak_refresh_override(plog=None):
         os.chmod(override_path, 0o600)
     except OSError:
         pass
-    _log('  CloudTAK override rewritten — recreating the api container (no other service touched)...')
-    r = _broker_compose(ct_dir, 'up -d --no-deps api', timeout=240)
+    # ops #560: a change confined to the media block recreates media only (and leaves the api's
+    # icon self-heal watch below alone); anything else keeps the old api recreate.
+    media_changed = (_cloudtak_override_service_block(old, 'media')
+                     != _cloudtak_override_service_block(new, 'media'))
+    api_changed = not (media_changed and old.strip()
+                       and _cloudtak_override_service_block(old, 'media', rest=True)
+                       == _cloudtak_override_service_block(new, 'media', rest=True))
+    svcs = (['api'] if api_changed else []) + (['media'] if media_changed else [])
+    _log('  CloudTAK override rewritten — recreating %s (no other service touched)...'
+         % ' and '.join(f'the {x} container' for x in svcs))
+    r = _broker_compose(ct_dir, 'up -d --no-deps ' + ' '.join(svcs), timeout=240)
     if r.returncode != 0:
-        return True, f'override written but the api recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+        return True, f'override written but the {" and ".join(svcs)} recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+    if media_changed:
+        # a recreate puts the image's HLS profile back; converge it right away (check-first)
+        _cloudtak_media_hls_heal(_log, wait=True)
+    if not api_changed:
+        return True, 'CloudTAK media container recreated with the new override'
     # v10.1.62 T&E finding (nuc, 2026-09-09): recreating the api container from its image
     # wipes the sprite-regen guard the icon self-heal patches in, and a box carrying one
     # undecodable icon then crash-loops on `vipspng: libpng read error` at API boot
@@ -102194,6 +102252,12 @@ def _mediamtx_converge_cloudtak_read(log=None):
     container missing mid-deploy, or Docker not answering → no change. Restarts MediaMTX
     only when the file changed and the operator has not stopped it. Returns True if changed."""
     _log = log or (lambda m: print(m, flush=True))
+    # ops #560: the media container's stream-name pin follows the standalone MediaMTX (installed
+    # after CloudTAK, or CloudTAK updated from a release without the pin). A no-op when current.
+    try:
+        _cloudtak_refresh_override(_log)
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK override refresh skipped (non-fatal): {e}")
     cfg_path = '/usr/local/etc/mediamtx.yml'
     if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
         return False
