@@ -12827,7 +12827,8 @@ _PGDG_GIS_PIN_BODY = (
 _PGDG_REMOTE_SETUP_SH = (
     'sudo mkdir -p /usr/share/keyrings && '
     f'if ! grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then '
-    f'sudo curl -sL {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
+    # ops #563: -f so an error page is never saved as the key; retry any error (reset, timeout).
+    f'sudo curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 15 --max-time 60 {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
     # v10.3.0 W1: codename from /etc/os-release, lsb_release fallback, and REFUSE on
     # empty — a bare $(lsb_release -cs) on a noble minimal image expands to nothing and
     # writes "apt -pgdg main", which apt then rejects for every source on the box.
@@ -92632,7 +92633,40 @@ def _apt_disable_dead_local_sources(log_fn=None):
     return done
 
 
-def _apt_update_capture(timeout=600):
+# ops #563: a Sunday scan box lost its whole TAK Server install to ONE connection reset
+# (curl exit 56) fetching the PGDG key. Network steps in the deploy get 3 tries,
+# 5 and 15 seconds apart, before they give up with their own clear message.
+_NET_RETRY_DELAYS = (5, 15)
+
+# apt's own words for "the network blinked". Deliberately narrow: an HTTP 4xx from a
+# dead repo (Cloudsmith 402, a 404 suite) is not transient and must reach the heal logic fast.
+_APT_TRANSIENT_RE = re.compile(
+    r'Temporary failure resolving|Could not resolve|Connection (?:reset|timed out|failed|refused)'
+    r'|Could not connect|Unable to connect|Network is unreachable|Undetermined Error'
+    r'|Error reading from server|Bad header line|Connection closed', re.I)
+
+
+def _apt_failure_is_transient(output):
+    return bool(_APT_TRANSIENT_RE.search(output or ''))
+
+
+def _retry_transient(attempt, done, what, log_fn=None, delays=_NET_RETRY_DELAYS, sleep=None):
+    """Call attempt() until done(result) is true, waiting delays[i] seconds between tries
+    (len(delays) + 1 tries in all). Returns the last result, good or bad, so the caller keeps
+    its own failure message. Raises only what attempt() raises."""
+    sleep = sleep or time.sleep
+    result = attempt()
+    for n, wait in enumerate(delays, start=2):
+        if done(result):
+            break
+        if log_fn:
+            log_fn(f"  ⚠ {what} failed — retrying in {wait}s (try {n} of {len(delays) + 1})")
+        sleep(wait)
+        result = attempt()
+    return result
+
+
+def _apt_update_capture(timeout=600, log_fn=None):
     """`apt-get update` with the output KEPT. Returns (ok, combined_output).
 
     The old call was `apt-get update -qq > /dev/null 2>&1`, which threw away the
@@ -92643,13 +92677,19 @@ def _apt_update_capture(timeout=600):
     That entry fails the update for reasons that have nothing to do with the repo
     the caller is actually configuring, so without this the caller misdiagnoses a
     USB-installed box as a broken PGDG/Docker/Caddy repo."""
-    def _run():
+    def _run_once():
         try:
             r = subprocess.run('apt-get update -qq', shell=True, capture_output=True, text=True,
                                timeout=timeout, env=_broker_shim_env())
             return r.returncode == 0, ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
         except Exception as e:
             return False, f'{type(e).__name__}: {e}'
+
+    # ops #563: one network reset must not kill the deploy. The retry is ours, not apt's
+    # `-o Acquire::Retries`: the non-root broker denies every apt `-o` option.
+    def _run():
+        return _retry_transient(_run_once, lambda res: res[0] or not _apt_failure_is_transient(res[1]),
+                                'apt-get update', log_fn=log_fn)
 
     ok, out = _run()
     # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
@@ -92687,6 +92727,26 @@ def _pgdg_gis_pin_ensure(log_fn=None):
         if log_fn:
             log_fn(f"  ⚠ could not write {_PGDG_GIS_PIN}: {type(e).__name__}: {e}")
         return False
+
+
+def _pgdg_key_ok(rc, key):
+    return rc == 0 and len(key) >= 100 and b'BEGIN PGP PUBLIC KEY BLOCK' in key
+
+
+def _pgdg_key_fetch(log_fn=None, sleep=None):
+    """Fetch the PGDG signing key, up to 3 tries (ops #563). Returns (curl rc, bytes) of the
+    last try; the caller judges it with _pgdg_key_ok and words the failure."""
+    def _once():
+        try:
+            k = subprocess.run(['curl', '-fsSL', '--connect-timeout', '15', '--max-time', '60',
+                                _PGDG_KEY_URL], capture_output=True, timeout=75)
+            return k.returncode, (k.stdout or b'')
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ✗ Key fetch raised: {type(e).__name__}: {e}")
+            return -1, b''
+    return _retry_transient(_once, lambda res: _pgdg_key_ok(*res), 'PostgreSQL key fetch',
+                            log_fn=log_fn, sleep=sleep)
 
 
 def _setup_pgdg_apt_source():
@@ -92729,16 +92789,10 @@ def _setup_pgdg_apt_source():
         log_step("  Adding PostgreSQL GPG key...")
         # v10.0.5 non-root: fetch the key as takwerx, then write key + list through
         # the broker into already-allowlisted dirs (/usr/share/keyrings, /etc/apt).
-        key = b''
-        rc = -1
-        try:
-            _k = subprocess.run(['curl', '-fsSL', _PGDG_KEY_URL], capture_output=True, timeout=60)
-            rc, key = _k.returncode, (_k.stdout or b'')
-        except Exception as e:
-            log_step(f"  ✗ Key fetch raised: {type(e).__name__}: {e}")
+        rc, key = _pgdg_key_fetch(log_step)
         # An unchecked curl used to write a 0-byte keyring here, and the next
         # apt-get update then failed with the useless "not signed" error.
-        if rc != 0 or len(key) < 100 or b'BEGIN PGP PUBLIC KEY BLOCK' not in key:
+        if not _pgdg_key_ok(rc, key):
             log_step("")
             log_step("✗ FATAL: could not fetch the PostgreSQL signing key")
             log_step(f"    URL: {_PGDG_KEY_URL}")
@@ -92772,7 +92826,7 @@ def _setup_pgdg_apt_source():
     _pgdg_gis_pin_ensure(log_step)
     wait_for_package_lock()
     log_step("  Updating package lists...")
-    ok, out = _apt_update_capture()
+    ok, out = _apt_update_capture(log_fn=log_step)
     if ok:
         log_step("✓ PostgreSQL repository configured (apt-get update clean)")
         return True

@@ -160,7 +160,7 @@ def test_ensure_skips_rhel_and_never_raises():
 def test_every_debian_postgis_path_writes_the_pin():
     # single-box deploy: before the apt-get update that precedes Step 4's install
     body = _fn('_setup_pgdg_apt_source')
-    assert body.index('_pgdg_gis_pin_ensure(log_step)') < body.index('_apt_update_capture()')
+    assert body.index('_pgdg_gis_pin_ensure(log_step)') < body.index('_apt_update_capture(')
     # TAK upgrade: before apt-get install of the new .deb
     body = _fn('_tak_upgrade_apt_install')
     assert body.index('_pgdg_gis_pin_ensure(') < body.index("apt-get install -y ./")
