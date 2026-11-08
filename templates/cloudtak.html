@@ -408,7 +408,8 @@
           more.textContent = clamped ? 'Show less' : 'Show more';
         };
         card.appendChild(more);
-        requestAnimationFrame(function(){ if (d.scrollHeight > d.clientHeight + 2) more.style.display = ''; });
+        // by length, not layout: a collapsed section has no layout to measure
+        if (full_text.length > 200) more.style.display = '';
         var foot = el('div', 'display:flex;flex-direction:column;gap:6px;margin-top:auto;padding-top:8px');
         var full = 'width:100%;font-size:13px;font-weight:600;padding:9px 12px';
         if (inst) {
