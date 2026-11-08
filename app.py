@@ -9065,7 +9065,9 @@ def _diag_section_connectivity(settings):
                                               f'authentik.{fqdn}', _tak_name) if h):
             try:
                 ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
-                out.append(f"dns {host}: {', '.join(ips)}{'' if (not sip or sip in ips) else '   <-- not server_ip ' + sip}")
+                _own = _box_local_ipv4s().intersection(ips)
+                out.append(f"dns {host}: {', '.join(ips)}"
+                           f"{'' if (not sip or sip in ips) else ('   (this box\'s own address: split-horizon DNS)' if _own else '   <-- not server_ip ' + sip)}")
             except Exception as e:
                 out.append(f"dns {host}: does not resolve ({str(e)[:60]})"
                            f"{'   (apex record — optional)' if host == fqdn else ''}")
@@ -33691,6 +33693,28 @@ def _dns_resolve_ipv4(host):
         return [], f'error: {e}'
 
 
+def _box_local_ipv4s():
+    """IPv4 addresses on this box's physical NICs (container, VPN and loopback interfaces
+    left out). A name that resolves to one of these is answered by THIS box. Behind NAT
+    that is the LAN address, which server_ip (the public one) never equals."""
+    out = set()
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show'], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[1].split('@')[0].startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        out.add(str(ipaddress.ip_interface(parts[i + 1]).ip))
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return out
+
+
 def _dns_precheck_hosts(settings, modules):
     """{host: needed_now} for every subdomain this box uses, in SERVICE_DOMAIN_DEFAULTS
     order. needed_now = Caddy serves it now, so it is about to ask Let's Encrypt for it:
@@ -33719,11 +33743,14 @@ def _dns_precheck_message(blocking, server_ip):
     return '\n'.join(lines)
 
 
-def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT):
+def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT, local_ips=None):
     """Compare each subdomain's A record to server_ip. Only names Caddy is about to request
     certificates for (needed_now) can block; the rest are reported so the operator sees a
     bad record before installing that module. A lookup that fails on this box, or an
-    unknown server_ip, is reported but never blocks — neither says the record is wrong."""
+    unknown server_ip, is reported but never blocks — neither says the record is wrong.
+    A name that resolves to an address on this box's own NIC (status 'local') is split-horizon
+    DNS: the router answers LAN clients with the private address while public DNS, which is
+    what Let's Encrypt reads, keeps the public one. That is not a mismatch (GH #434)."""
     resolve = resolve or _dns_resolve_ipv4
     sip = str(settings.get('server_ip') or '').strip()
     hosts = _dns_precheck_hosts(settings, modules)
@@ -33737,6 +33764,7 @@ def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT)
     deadline = time.time() + timeout
     for t in threads:
         t.join(max(0.0, deadline - time.time()))
+    local = set(_box_local_ipv4s() if local_ips is None else local_ips)
     rows = []
     for host, needed in hosts.items():
         ips, problem = answers.get(host) or ([], 'error: lookup timed out')
@@ -33748,6 +33776,8 @@ def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT)
             status = 'unknown'
         elif sip in ips:
             status = 'ok'
+        elif local.intersection(ips):
+            status = 'local'
         else:
             status = 'mismatch'
         rows.append({'host': host, 'needed': needed, 'ips': ips, 'status': status,
