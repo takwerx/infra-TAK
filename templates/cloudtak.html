@@ -310,6 +310,119 @@
   </div>
   {% endif %}
 
+  {% if cloudtak_cfg.get('target_mode') != 'remote' %}
+  <!-- ETL (v10.4.0): infra-TAK turns ETL on and installs ETLs; CloudTAK is where people use them -->
+  <div class="card" id="ct-etl-section">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>ETL — data feeds</span>
+      <a href="https://docs.cloudtak.io/integrations/" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">what each ETL does ↗</a>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.6">
+      An ETL pulls data from another service (CalTopo, Waze, ArcGIS, a drone or tracker platform…) and puts it on the TAK map on a schedule.
+      CloudTAK normally needs an AWS account to run them — with ETL on, they run right here on this server instead.
+      <strong style="color:var(--text-secondary)">1.</strong> Turn ETL on. <strong style="color:var(--text-secondary)">2.</strong> Install the ETLs you want.
+      <strong style="color:var(--text-secondary)">3.</strong> In CloudTAK, open a Connection → Layers → <strong style="color:var(--text-secondary)">+</strong> and pick the ETL's card.
+    </p>
+    <div id="ct-etl-onoff" style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      <span id="ct-etl-state" style="font-size:12px;color:var(--text-dim)">Checking…</span>
+      <button class="btn btn-primary" id="ct-etl-toggle" style="font-size:12px;padding:7px 14px;display:none"></button>
+    </div>
+    <div id="ct-etl-filter-row" style="display:none;margin-bottom:12px">
+      <input id="ct-etl-filter" type="search" placeholder="Filter ETLs…" style="width:100%;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
+    </div>
+    <div id="ct-etl-list" style="display:grid;grid-template-columns:1fr;gap:10px"></div>
+    <div id="ct-etl-log-card" style="display:none;margin-top:20px">
+      <div class="section-title" style="margin-bottom:10px">ETL Log <span id="ct-etl-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="log-box" id="ct-etl-log">Waiting...</div>
+    </div>
+  </div>
+  <script>
+  (function(){
+    var list = document.getElementById('ct-etl-list'), stateEl = document.getElementById('ct-etl-state'),
+        toggle = document.getElementById('ct-etl-toggle'), filter = document.getElementById('ct-etl-filter');
+    var entries = [], enabled = false, busy = false;
+    function el(tag, style, text){ var e = document.createElement(tag); if (style) e.style.cssText = style; if (text != null) e.textContent = text; return e; }
+    function badge(text, color){ return el('span', 'font-size:10px;font-weight:600;color:'+color+';border:1px solid '+color+';border-radius:4px;padding:1px 6px;opacity:.85', text); }
+    function btn(text, cls, fn){ var b = el('button', 'font-size:12px;padding:6px 12px', text); b.className = 'btn ' + cls; b.disabled = busy; b.onclick = fn; return b; }
+    function render(){
+      list.textContent = '';
+      var q = (filter.value || '').toLowerCase();
+      entries.forEach(function(e){
+        if (q && (e.name + ' ' + e.description + ' ' + e.author).toLowerCase().indexOf(q) < 0) return;
+        var inst = (e.installed || []).length > 0;
+        var card = el('div', 'background:var(--bg-surface);border:1px solid '+(inst?'rgba(16,185,129,.35)':'var(--border)')+';border-radius:10px;padding:14px 18px;display:flex;gap:12px;align-items:flex-start');
+        var body = el('div', 'flex:1;min-width:0');
+        var title = el('div', 'font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px;display:flex;flex-wrap:wrap;gap:6px;align-items:center');
+        title.appendChild(el('span', '', e.name));
+        if (e.community) title.appendChild(badge('COMMUNITY', '#a78bfa'));
+        if (e.flags && e.flags.outgoing) title.appendChild(badge('TWO-WAY', 'var(--cyan)'));
+        body.appendChild(title);
+        body.appendChild(el('div', 'font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:6px', e.description || 'No description from the author.'));
+        var meta = el('div', "font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace",
+          'v' + e.version + ' · ' + e.author + (inst ? ' · installed ' + e.installed.join(', ') : '') + (e.update ? ' · update available' : ''));
+        body.appendChild(meta);
+        if (e.note) body.appendChild(el('div', 'font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5', e.note));
+        if (e.repo_url && /^https:\/\/github\.com\//.test(e.repo_url)) {
+          var a = el('a', 'font-size:11px;color:var(--cyan);text-decoration:none', e.repo_url.replace('https://','') + ' ↗');
+          a.href = e.repo_url; a.target = '_blank'; a.rel = 'noopener'; body.appendChild(a);
+        }
+        var side = el('div', 'display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0');
+        if (inst) {
+          side.appendChild(badge('INSTALLED', 'var(--green)'));
+          if (e.update) side.appendChild(btn('⬆ Update to ' + e.version, 'btn-ghost', function(){ act('update', e); }));
+          side.appendChild(btn('Remove', 'btn-ghost', function(){ if (confirm('Remove ' + e.name + '? CloudTAK will refuse while a layer still uses it.')) act('remove', e); }));
+        } else if (e.installable && enabled) {
+          side.appendChild(btn('Install', 'btn-primary', function(){ act('install', e); }));
+        } else {
+          side.appendChild(el('span', 'font-size:11px;color:var(--text-dim);max-width:180px;text-align:right', enabled ? e.reason : 'Turn ETL on first'));
+        }
+        card.appendChild(body); card.appendChild(side); list.appendChild(card);
+      });
+    }
+    function load(){
+      fetch('/api/cloudtak/etl/status').then(function(r){ return r.json(); }).then(function(st){
+        enabled = !!st.enabled;
+        stateEl.textContent = enabled ? ('ETL is ON — runner ' + st.shim) : 'ETL is OFF';
+        stateEl.style.color = enabled ? 'var(--green)' : 'var(--text-dim)';
+        toggle.style.display = ''; toggle.textContent = enabled ? 'Turn ETL off' : 'Turn ETL on';
+        toggle.className = 'btn ' + (enabled ? 'btn-ghost' : 'btn-primary');
+        return fetch('/api/cloudtak/etl/catalog');
+      }).then(function(r){ return r.json(); }).then(function(d){
+        entries = d.entries || [];
+        entries.sort(function(a, b){ return ((b.installed||[]).length>0) - ((a.installed||[]).length>0) || a.name.localeCompare(b.name); });
+        document.getElementById('ct-etl-filter-row').style.display = '';
+        render();
+      }).catch(function(){ stateEl.textContent = 'Could not load ETL status'; });
+    }
+    function follow(logUrl, label){
+      busy = true; render();
+      var card = document.getElementById('ct-etl-log-card'), box = document.getElementById('ct-etl-log');
+      card.style.display = ''; document.getElementById('ct-etl-log-action').textContent = label; box.textContent = 'Starting…';
+      (function poll(){
+        fetch(logUrl).then(function(r){ return r.json(); }).then(function(j){
+          box.textContent = (j.log || []).join('\n') || 'Starting…'; box.scrollTop = box.scrollHeight;
+          if (j.running) return setTimeout(poll, 2000);
+          busy = false; load();
+        }).catch(function(){ setTimeout(poll, 4000); });
+      })();
+    }
+    function act(action, e){
+      fetch('/api/cloudtak/etl/catalog/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prefix: e.prefix})})
+        .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/catalog/log', action + ' ' + e.name); });
+    }
+    toggle.onclick = function(){
+      var action = enabled ? 'disable' : 'enable';
+      if (!confirm(enabled ? 'Turn ETL off? Running ETL layers stop; installed ETLs and layers are kept.' : 'Turn ETL on? CloudTAK restarts for about a minute.')) return;
+      fetch('/api/cloudtak/etl/' + action, {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'turn ETL ' + (enabled ? 'off' : 'on')); });
+    };
+    filter.oninput = render;
+    load();
+  })();
+  </script>
+  {% endif %}
+
   {% else %}
   <!-- Deployment Target -->
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">

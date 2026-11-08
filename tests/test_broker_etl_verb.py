@@ -49,7 +49,7 @@ def test_valid_requests_pass(m):
 
 @pytest.mark.parametrize('image', [
     'alpine', 'etl-local:latest', 'etl-local:etl-x', 'docker.io/etl-local:etl-x-v1.0.0',
-    'etl-local:etl-x-v1.0.0@sha256:00', 'etl-local:etl-X-v1.0.0', 'etl-local:etl-x-v1.0.0 ',
+    'etl-local:etl-x-v1.0.0@sha256:00', 'etl-local:etl-x_y-v1.0.0', 'etl-local:etl-x-v1.0.0 ',
     'other:etl-x-v1.0.0', 'etl-local:etl-x-v1.0.0\n', ['etl-local:etl-x-v1.0.0'],
 ])
 def test_only_local_etl_images(m, image):

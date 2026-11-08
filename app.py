@@ -48962,6 +48962,199 @@ def cloudtak_etl_log():
                     'error': bool(job.get('error'))})
 
 
+# ── W3: ETL catalog install / update / remove ────────────────────────────────────────────────
+# infra-TAK turns ETL on and installs ETLs; CloudTAK is where people use them. An install builds
+# etl-local:<prefix>-v<ver> on the box from the catalog's pinned commit (never a branch tip),
+# labels it with the ETL's own capabilities.json (CloudTAK reads static capabilities from it) and
+# registers the CloudTAK Integration, so the ETL appears as a card in CloudTAK's Task Selection.
+_ETLCAT_KEY = 'etlcatalog'
+_ETLCAT_LOGO_MAX = 512 * 1024
+
+
+def _etlcat_src_root():
+    return os.path.join(os.path.expanduser('~'), '.cache', 'infratak-etl-src')
+
+
+def _etlcat_installed():
+    r = subprocess.run(_sudo_wrap(['docker', 'images', _etl.ETL_REPO, '--format', '{{.Tag}}']),
+                       capture_output=True, text=True, timeout=30)
+    return _etl.installed_versions(r.stdout.splitlines()) if r.returncode == 0 else {}
+
+
+def _etlcat_ct(method, path, payload=None):
+    secret = _cloudtak_signing_secret()
+    if not secret:
+        return False, 0, {'message': "CloudTAK's SigningSecret is not readable"}
+    return _cloudtak_request_json(method, 'http://127.0.0.1:5000/api' + path, payload, timeout=30,
+                                  headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+
+
+def _etlcat_integrations():
+    ok, code, d = _etlcat_ct('GET', '/integration?limit=1000')
+    if not ok or not isinstance(d, dict):
+        return None
+    return {i.get('prefix'): i for i in d.get('items') or [] if isinstance(i, dict)}
+
+
+def _etlcat_git(args, cwd=None, timeout=300):
+    return subprocess.run(['git'] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+
+
+def _etlcat_build(e, log):
+    """Build the pinned commit. Returns (ok, logo_data_url). Skips the build when the image is
+    already there with this exact SHA label."""
+    tag = _etl.image_tag(e['prefix'], e['version'])
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHA_LABEL, tag]),
+                       capture_output=True, text=True, timeout=30)
+    src = os.path.join(_etlcat_src_root(), e['prefix'])
+    built = r.returncode == 0 and r.stdout.strip() == e['sha']
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src, mode=0o700)
+    try:
+        url = f"https://github.com/{e['source']}.git"
+        log(f"  Fetching {e['source']} @ {e['sha'][:12]} ({e['ref']})…")
+        for args in (['init', '-q'], ['fetch', '-q', '--depth', '1', url, e['sha']],
+                     ['checkout', '-q', '--detach', 'FETCH_HEAD']):
+            g = _etlcat_git(args, cwd=src)
+            if g.returncode != 0:
+                log(f"  ✗ git {args[0]} failed: {(g.stderr or g.stdout).strip()[-300:]}")
+                return False, ''
+        head = _etlcat_git(['rev-parse', 'HEAD'], cwd=src).stdout.strip()
+        if head != e['sha']:
+            log(f"  ✗ fetched commit {head[:12]} is not the pinned {e['sha'][:12]} — refusing to build")
+            return False, ''
+        logo = ''
+        lp = os.path.join(src, 'logo.png')
+        if os.path.isfile(lp) and not os.path.islink(lp) and os.path.getsize(lp) <= _ETLCAT_LOGO_MAX:
+            with open(lp, 'rb') as f:
+                logo = 'data:image/png;base64,' + _b64.b64encode(f.read()).decode()
+        if built:
+            log(f"  ✓ {tag} already built from this commit")
+            return True, logo
+        cp = os.path.join(src, 'capabilities.json')
+        caps = ''
+        if os.path.isfile(cp) and not os.path.islink(cp):
+            with open(cp) as f:
+                caps = json.dumps(json.load(f), separators=(',', ':'))
+        log(f"  Building {tag} (first build of an ETL takes a few minutes)…")
+        args = ['docker', 'build', '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
+        if caps:
+            args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
+        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600)
+        # BuildKit keeps ~1 GB of cache per build; nothing reuses it (PLAN W3)
+        subprocess.run(_sudo_wrap(['docker', 'builder', 'prune', '-f']), capture_output=True, text=True, timeout=600)
+        if b.returncode != 0:
+            log("  ✗ build failed:\n" + '\n'.join((b.stderr or b.stdout or '').splitlines()[-10:]))
+            return False, ''
+        log(f"  ✓ built {tag}")
+        return True, logo
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+
+
+def _etlcat_job(action, prefix):
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    log = lambda m: mod_registry.job_log(_ETLCAT_KEY, m.rstrip())
+    ok = False
+    try:
+        e = next((x for x in _etl.load_catalog() if x['prefix'] == prefix), None)
+        s = load_settings()
+        if action in ('install', 'update'):
+            can, why = _etl.installable(e or {}, bool(_etlrunner_cfg(s).get('allow_unreviewed')))
+            if not e:
+                log(f"✗ {prefix} is not in the catalog")
+            elif not _etlrunner_cfg(s).get('enabled'):
+                log("✗ Turn on ETL first")
+            elif not can:
+                log(f"✗ {e['name']}: {why}")
+            else:
+                log(f"{'Installing' if action == 'install' else 'Updating'} {e['name']} {e['version']}")
+                built, logo = _etlcat_build(e, log)
+                if built:
+                    have = _etlcat_integrations()
+                    if have is None:
+                        log("✗ CloudTAK API is not answering — the image is built; retry to register it")
+                    elif prefix in have:
+                        log("  ✓ already registered in CloudTAK — the new version shows in each layer's version list")
+                        ok = True
+                    else:
+                        okr, code, d = _etlcat_ct('POST', '/integration', {
+                            'name': e['name'][:120], 'prefix': prefix, 'favorite': False, 'logo': logo,
+                            'repo': e.get('repo_url') or '', 'readme': e.get('readme') or ''})
+                        if okr:
+                            log(f"  ✓ registered in CloudTAK — '{e['name']}' is now a card when you create a layer")
+                            ok = True
+                        else:
+                            log(f"✗ CloudTAK refused the registration (HTTP {code}): {str(d.get('message', d))[:200]}")
+        elif action == 'remove':
+            have = _etlcat_integrations()
+            if have is None:
+                log("✗ CloudTAK API is not answering")
+            else:
+                if prefix in have:
+                    okd, code, d = _etlcat_ct('DELETE', f"/integration/{int(have[prefix]['id'])}")
+                    if not okd:
+                        # CloudTAK refuses while any layer still uses it — say so, remove nothing
+                        log(f"✗ CloudTAK kept it (HTTP {code}): {str(d.get('message', d))[:200]}. "
+                            "Delete the layers that use it first.")
+                        raise StopIteration
+                    log("  ✓ unregistered from CloudTAK")
+                for v in _etlcat_installed().get(prefix, []):
+                    subprocess.run(_sudo_wrap(['docker', 'rmi', _etl.image_tag(prefix, v)]),
+                                   capture_output=True, text=True, timeout=120)
+                    log(f"  ✓ removed image {prefix} {v}")
+                ok = True
+    except StopIteration:
+        pass
+    except Exception as ex:
+        log(f"✗ {action} {prefix}: {ex}")
+    job.update({'running': False, 'complete': True, 'error': not ok})
+
+
+@app.route('/api/cloudtak/etl/catalog')
+@login_required
+def cloudtak_etl_catalog():
+    s = load_settings()
+    allow = bool(_etlrunner_cfg(s).get('allow_unreviewed'))
+    inst = _etlcat_installed()
+    reg = _etlcat_integrations() or {}
+    out = []
+    for e in _etl.load_catalog():
+        can, why = _etl.installable(e, allow)
+        have = inst.get(e['prefix'], [])
+        out.append({k: e.get(k) for k in ('prefix', 'name', 'description', 'version', 'author',
+                                           'community', 'repo_url', 'note', 'flags', 'reviewed', 'ref')}
+                   | {'installed': have, 'registered': e['prefix'] in reg,
+                      'update': bool(have) and e['version'] not in have,
+                      'installable': can, 'reason': why})
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    return jsonify({'entries': out, 'enabled': bool(_etlrunner_cfg(s).get('enabled')),
+                    'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
+
+
+@app.route('/api/cloudtak/etl/catalog/<action>', methods=['POST'])
+@login_required
+def cloudtak_etl_catalog_action(action):
+    if action not in ('install', 'update', 'remove'):
+        return jsonify({'error': 'unknown action'}), 404
+    prefix = str((request.get_json(silent=True) or {}).get('prefix') or '')
+    if not _etl.PREFIX_RE.fullmatch(prefix) or prefix not in {e['prefix'] for e in _etl.load_catalog()}:
+        return jsonify({'error': 'not a catalog ETL'}), 400
+    if not mod_registry.job_start(_ETLCAT_KEY, action, _etlcat_job, (action, prefix)):
+        return jsonify({'error': 'an ETL install is already running'}), 409
+    return jsonify({'started': action, 'prefix': prefix})
+
+
+@app.route('/api/cloudtak/etl/catalog/log')
+@login_required
+def cloudtak_etl_catalog_log():
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    return jsonify({'log': list(job.get('log') or []), 'running': bool(job.get('running')),
+                    'error': bool(job.get('error'))})
+
+
 # ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
 # from its own docker-compose.plugin-print.yml in the CloudTAK project, with `expose: 5010` only
 # and internal URLs (http://cloudtak-api:5000, http://cloudtak-tiles:5002) that don't resolve on

@@ -1,0 +1,1167 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "prefix": "etl-active911",
+      "name": "Active 911",
+      "description": "Active 911 is a service that provides real-time emergency dispatch information to first responders. Alerts are written to CloudTAK Events with the responders of each alert as Assignments.",
+      "source": "dfpc-coe/etl-active911",
+      "ref": "v4.10.0",
+      "sha": "78c83001c498e25907c96b9dd8ca01aefeac83e1",
+      "version": "4.10.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/78c83001c498e25907c96b9dd8ca01aefeac83e1/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/78c83001c498e25907c96b9dd8ca01aefeac83e1/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-active911",
+      "compute": {
+        "memory": 256,
+        "timeout": 30
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-adsbx",
+      "name": "ADS-B Exchange",
+      "description": "Ingests real-time ADS-B aircraft position data from ADS-B Exchange and posts aircraft tracks to the map.",
+      "source": "dfpc-coe/etl-adsbx",
+      "ref": "v5.16.0",
+      "sha": "5f1a55790b7a76e3a45a75c08d19c3c65dc8130d",
+      "version": "5.16.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/5f1a55790b7a76e3a45a75c08d19c3c65dc8130d/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/5f1a55790b7a76e3a45a75c08d19c3c65dc8130d/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-adsbx",
+      "compute": {
+        "memory": 1024,
+        "timeout": 120
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-air-data",
+      "name": "AirData",
+      "description": "Ingests drone flight telemetry from AirData and posts aircraft positions to the map.",
+      "source": "dfpc-coe/etl-air-data",
+      "ref": "v2.13.0",
+      "sha": "693b03b7ef6e98c81d91b8ff73aa84f9b77f3a74",
+      "version": "2.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/693b03b7ef6e98c81d91b8ff73aa84f9b77f3a74/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/693b03b7ef6e98c81d91b8ff73aa84f9b77f3a74/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-air-data",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-AlertWest",
+      "name": "ALERTWest",
+      "description": "Ingests ALERTWest camera locations, orientation and latest imagery from the public ALERTWest camera API and registers each camera site as a Core Device.",
+      "source": "dfpc-coe/etl-AlertWest",
+      "ref": "v2.2.0",
+      "sha": "1c379f30aadd5f073ea4500f01fea4e9a0068c79",
+      "version": "2.2.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-AlertWest/1c379f30aadd5f073ea4500f01fea4e9a0068c79/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-AlertWest",
+      "compute": {
+        "memory": 512,
+        "timeout": 300
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-axon",
+      "name": "Axon",
+      "description": "Ingests device and unit locations from the Axon platform and posts them to the map.",
+      "source": "dfpc-coe/etl-axon",
+      "ref": "v1.18.0",
+      "sha": "74df25acec0b021a8244fa3dd8b3e5efb81d35ed",
+      "version": "1.18.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/74df25acec0b021a8244fa3dd8b3e5efb81d35ed/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/74df25acec0b021a8244fa3dd8b3e5efb81d35ed/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-axon",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-brinc",
+      "name": "BRINC",
+      "description": "Pulls BRINC UAS drone telemetry into the TAK system and posts drone positions to the map.",
+      "source": "dfpc-coe/etl-brinc",
+      "ref": "v1.7.0",
+      "sha": "d93b393502289889d182c578507eb75f5bb937aa",
+      "version": "1.7.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/d93b393502289889d182c578507eb75f5bb937aa/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/d93b393502289889d182c578507eb75f5bb937aa/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-brinc",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-buddi",
+      "name": "BUDDI",
+      "description": "Ingests BUDDI GPS tracker locations and posts them to the map.",
+      "source": "dfpc-coe/etl-buddi",
+      "ref": "v1.13.0",
+      "sha": "db7b1b410b11ea067ca224a3a7946d912e520228",
+      "version": "1.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/db7b1b410b11ea067ca224a3a7946d912e520228/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/db7b1b410b11ea067ca224a3a7946d912e520228/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-buddi",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-caltopo",
+      "name": "CalTopo",
+      "description": "Ingests map objects from a shared CalTopo map, or the live Shared Locations of a CalTopo Team Account, and posts them to the map. Optionally creates a CalTopo Map in a Team Account for every CoreEvent created.",
+      "source": "dfpc-coe/etl-caltopo",
+      "ref": "v5.18.0",
+      "sha": "86429bbd090a989be90ee4f14e6cc7a29d1f0fb6",
+      "version": "5.18.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/86429bbd090a989be90ee4f14e6cc7a29d1f0fb6/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/86429bbd090a989be90ee4f14e6cc7a29d1f0fb6/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-caltopo",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": true,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cellping",
+      "name": "Cell Ping",
+      "description": "Receives the cell phone location emails that carriers send in response to an exigent location request and posts the location & its uncertainty to the map as Cursor-on-Target.",
+      "source": "dfpc-coe/etl-cellping",
+      "ref": "v1.2.0",
+      "sha": "95820a40e4c2c4ad6baf6101401c92aefead9b6b",
+      "version": "1.2.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cellping/95820a40e4c2c4ad6baf6101401c92aefead9b6b/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cellping",
+      "compute": {
+        "memory": 256,
+        "timeout": 30
+      },
+      "flags": {
+        "schedule": false,
+        "webhook": false,
+        "email": true,
+        "outgoing": false,
+        "installable": false
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-central-square",
+      "name": "CentralSquare",
+      "description": "Ingests CentralSquare Public Safety Suite Professional CAD data from the Pro Suite REST API - active calls for service are written to CloudTAK Events with their dispatched units as Assignments and their command log on the Event Timeline, AVL unit locations are posted to the map.",
+      "source": "dfpc-coe/etl-central-square",
+      "ref": "v1.11.0",
+      "sha": "7e69016668a6286c3ef48e7623d28cc486611976",
+      "version": "1.11.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7e69016668a6286c3ef48e7623d28cc486611976/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7e69016668a6286c3ef48e7623d28cc486611976/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-central-square",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-caic",
+      "name": "Colorado Avalanche Information Center",
+      "description": "Ingests avalanche forecast zones and observations from the Colorado Avalanche Information Center (CAIC) and posts them to the map.",
+      "source": "dfpc-coe/etl-caic",
+      "ref": "v3.17.1",
+      "sha": "8cebbc933745cf8e7aa7aaa6fd18a8f3d239f02a",
+      "version": "3.17.1",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/8cebbc933745cf8e7aa7aaa6fd18a8f3d239f02a/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/8cebbc933745cf8e7aa7aaa6fd18a8f3d239f02a/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-caic",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cotrip-signs",
+      "name": "COtrip Dynamic Message Signs",
+      "description": "Ingests dynamic message sign locations and messages from the Colorado COtrip system and posts them to the map.",
+      "source": "dfpc-coe/etl-cotrip-signs",
+      "ref": "v4.13.0",
+      "sha": "c078b587fa06e2c871691171a3c80af3c47c4a17",
+      "version": "4.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-signs/c078b587fa06e2c871691171a3c80af3c47c4a17/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-signs/c078b587fa06e2c871691171a3c80af3c47c4a17/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cotrip-signs",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cotrip-incidents",
+      "name": "COtrip Incidents",
+      "description": "Ingests road incident and closure data from the Colorado COtrip system and posts them to the map.",
+      "source": "dfpc-coe/etl-cotrip-incidents",
+      "ref": "v5.13.0",
+      "sha": "0180a5dfd1f9a73f964c0ff80b897b77929fafe6",
+      "version": "5.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/0180a5dfd1f9a73f964c0ff80b897b77929fafe6/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/0180a5dfd1f9a73f964c0ff80b897b77929fafe6/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cotrip-incidents",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cotrip-plows",
+      "name": "COtrip Snowplows",
+      "description": "Ingests snowplow locations from the Colorado COtrip system and posts them to the map.",
+      "source": "dfpc-coe/etl-cotrip-plows",
+      "ref": "v4.13.0",
+      "sha": "49e01a2fb1bac84425e5ec13b0cab45f554d9118",
+      "version": "4.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/49e01a2fb1bac84425e5ec13b0cab45f554d9118/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/49e01a2fb1bac84425e5ec13b0cab45f554d9118/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cotrip-plows",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cotrip-cameras",
+      "name": "COtrip Traffic Cameras",
+      "description": "Ingests traffic camera locations and imagery metadata from the Colorado COtrip system and posts them to the map.",
+      "source": "dfpc-coe/etl-cotrip-cameras",
+      "ref": "v2.14.0",
+      "sha": "6a3fdcd60c6892d78fd7b1ded1d27a9bf2a87ab0",
+      "version": "2.14.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/6a3fdcd60c6892d78fd7b1ded1d27a9bf2a87ab0/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/6a3fdcd60c6892d78fd7b1ded1d27a9bf2a87ab0/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cotrip-cameras",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cotrip-weather",
+      "name": "COtrip Weather Stations",
+      "description": "Ingests roadside weather station observations from the Colorado COtrip system and posts them to the map.",
+      "source": "dfpc-coe/etl-cotrip-weather",
+      "ref": "v3.12.0",
+      "sha": "c1e08eecfa1e0939d917ccba8723d937c24c87fd",
+      "version": "3.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-weather/c1e08eecfa1e0939d917ccba8723d937c24c87fd/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-weather/c1e08eecfa1e0939d917ccba8723d937c24c87fd/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cotrip-weather",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-cot",
+      "name": "Cursor-on-Target Webhook",
+      "description": "Webhook endpoint that receives Cursor-on-Target events as GeoJSON or XML and posts them to the map.",
+      "source": "dfpc-coe/etl-cot",
+      "ref": "v1.3.0",
+      "sha": "031185257afc148451a637fe7fbfa78a7e579958",
+      "version": "1.3.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cot/031185257afc148451a637fe7fbfa78a7e579958/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-cot",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": false,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-dji-flight-hub",
+      "name": "DJI FlightHub 2",
+      "description": "Polls the DJI FlightHub 2 OpenAPI for aircraft, dock, and remote controller locations and posts them to the map as Cursor-on-Target.",
+      "source": "dfpc-coe/etl-dji-flight-hub",
+      "ref": "v1.8.1",
+      "sha": "58334205007379a8fd139d170deae33a13522d3a",
+      "version": "1.8.1",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-dji-flight-hub/58334205007379a8fd139d170deae33a13522d3a/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-dji-flight-hub",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-drone-sense",
+      "name": "DroneSense",
+      "description": "Ingests drone telemetry from DroneSense and posts aircraft positions to the map.",
+      "source": "dfpc-coe/etl-drone-sense",
+      "ref": "v2.15.0",
+      "sha": "55ab4093430b62cd1eeb97c40fd89346ca8ad122",
+      "version": "2.15.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/55ab4093430b62cd1eeb97c40fd89346ca8ad122/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/55ab4093430b62cd1eeb97c40fd89346ca8ad122/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-drone-sense",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-drone-tag",
+      "name": "Dronetag",
+      "description": "Ingests Remote ID drone telemetry from Dronetag and posts aircraft positions to the map.",
+      "source": "dfpc-coe/etl-drone-tag",
+      "ref": "v1.5.0",
+      "sha": "2964590acca292c5c4d829cf0ac32a7e68ceab69",
+      "version": "1.5.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-tag/2964590acca292c5c4d829cf0ac32a7e68ceab69/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-tag/2964590acca292c5c4d829cf0ac32a7e68ceab69/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-drone-tag",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-ensurity",
+      "name": "Ensurity Mobile",
+      "description": "Receives Ensurity Mobile vehicle telemetry via webhook and on a schedule and posts vehicle positions to the map.",
+      "source": "dfpc-coe/etl-ensurity",
+      "ref": "v1.9.0",
+      "sha": "14eecece15c762488a690cd9b8a5c0607466705e",
+      "version": "1.9.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-ensurity/14eecece15c762488a690cd9b8a5c0607466705e/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-ensurity",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-arcgis",
+      "name": "Esri ArcGIS",
+      "description": "Synchronizes features with Esri ArcGIS: ingests ArcGIS Feature and Map Server layers to the map on a schedule and optionally pushes map features back out to ArcGIS.",
+      "source": "dfpc-coe/etl-arcgis",
+      "ref": "v7.32.0",
+      "sha": "ea54b128e3be52fa520ca68cc589c1d1c7a6c4e7",
+      "version": "7.32.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/ea54b128e3be52fa520ca68cc589c1d1c7a6c4e7/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/ea54b128e3be52fa520ca68cc589c1d1c7a6c4e7/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-arcgis",
+      "compute": {
+        "memory": 1024,
+        "timeout": 120
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": true,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-everywhere-hub",
+      "name": "Everywhere Hub",
+      "description": "Ingests device and team tracking data from Everywhere Hub via webhook and scheduled cache refresh and posts positions to the map.",
+      "source": "dfpc-coe/etl-everywhere-hub",
+      "ref": "v1.15.0",
+      "sha": "b9cfb5af8ca317620a9a6706fbc52bbd2a367c67",
+      "version": "1.15.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/b9cfb5af8ca317620a9a6706fbc52bbd2a367c67/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/b9cfb5af8ca317620a9a6706fbc52bbd2a367c67/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-everywhere-hub",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-first-due",
+      "name": "First Due",
+      "description": "Ingests active CAD dispatches or AVL device locations from the First Due REST API and posts each call - location, address, assigned units, dispatch message and call notes - or device to the map.",
+      "source": "dfpc-coe/etl-first-due",
+      "ref": "v1.3.0",
+      "sha": "943c232c7d4d1f57f329173e66ab3dc2cb03dd7e",
+      "version": "1.3.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-first-due/943c232c7d4d1f57f329173e66ab3dc2cb03dd7e/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-first-due",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-inreach",
+      "name": "Garmin inReach",
+      "description": "Ingests satellite tracking positions from Garmin inReach and posts them to the map.",
+      "source": "dfpc-coe/etl-inreach",
+      "ref": "v6.3.0",
+      "sha": "f7eb367b7a369b777fb9d5940281c98d27ba4094",
+      "version": "6.3.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/f7eb367b7a369b777fb9d5940281c98d27ba4094/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/f7eb367b7a369b777fb9d5940281c98d27ba4094/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-inreach",
+      "compute": {
+        "memory": 512,
+        "timeout": 90
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-geojson",
+      "name": "GeoJSON",
+      "description": "Fetches GeoJSON from a configurable HTTP endpoint and posts the features to the map.",
+      "source": "dfpc-coe/etl-geojson",
+      "ref": "v2.14.0",
+      "sha": "8ccca24c3967d0c12d40a79620a67b137186a718",
+      "version": "2.14.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geojson/8ccca24c3967d0c12d40a79620a67b137186a718/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-geojson",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-geotab",
+      "name": "Geotab",
+      "description": "Ingests fleet vehicle telematics from Geotab and posts vehicle positions to the map.",
+      "source": "dfpc-coe/etl-geotab",
+      "ref": "v3.12.0",
+      "sha": "5a02d1b568e9f6c0625a38b992adb48c1dd4f467",
+      "version": "3.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5a02d1b568e9f6c0625a38b992adb48c1dd4f467/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5a02d1b568e9f6c0625a38b992adb48c1dd4f467/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-geotab",
+      "compute": {
+        "memory": 1024,
+        "timeout": 120
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-jeffcom",
+      "name": "JeffCom 911",
+      "description": "Ingests computer-aided dispatch (CAD) incidents and unit locations from JeffCom 911 via schedule and webhook and posts them to the map.",
+      "source": "dfpc-coe/etl-jeffcom",
+      "ref": "v1.20.0",
+      "sha": "2058a72f7c2c7f1570649b53ffd92aa7111c51ab",
+      "version": "1.20.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-jeffcom/2058a72f7c2c7f1570649b53ffd92aa7111c51ab/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-jeffcom",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-nasa-acero",
+      "name": "NASA ACERO",
+      "description": "Receives NASA ACERO aircraft and mission data via webhook and posts it to the map.",
+      "source": "dfpc-coe/etl-nasa-acero",
+      "ref": "v1.8.0",
+      "sha": "d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569",
+      "version": "1.8.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-nasa-acero",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": false,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-optimus",
+      "name": "Optimus",
+      "description": "Ingests tracker positions from Optimus (Optimus Pro) and posts them to the map.",
+      "source": "dfpc-coe/etl-optimus",
+      "ref": "v1.19.0",
+      "sha": "c16dc35923ed1ec7df84a5359a7db6c604418751",
+      "version": "1.19.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-optimus/c16dc35923ed1ec7df84a5359a7db6c604418751/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-optimus",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-santa",
+      "name": "Santa Tracker",
+      "description": "Posts Santa's simulated position to the map as a seasonal tracking feature.",
+      "source": "dfpc-coe/etl-santa",
+      "ref": "v2.12.0",
+      "sha": "e7473c675361e14e982c83f7924b93b4eca3537a",
+      "version": "2.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-santa/e7473c675361e14e982c83f7924b93b4eca3537a/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-santa",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-shotover",
+      "name": "Shotover",
+      "description": "Rotates CloudTAK video lease credentials and maintains server video injectors so Shotover camera feeds stay available in TAK.",
+      "source": "dfpc-coe/etl-shotover",
+      "ref": "v2.13.0",
+      "sha": "5dbd15136b58e8eaa5501aefda975b303fc4afe8",
+      "version": "2.13.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-shotover/5dbd15136b58e8eaa5501aefda975b303fc4afe8/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-shotover",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-skydio",
+      "name": "Skydio",
+      "description": "Streams live Skydio Cloud drone telemetry into TAK as Cursor-on-Target and receives Skydio webhook events for flight state, device alerts, and live stream status.",
+      "source": "dfpc-coe/etl-skydio",
+      "ref": "v1.3.0",
+      "sha": "1e353be93827ce199c4d6343a4d5a5610e193b4c",
+      "version": "1.3.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/1e353be93827ce199c4d6343a4d5a5610e193b4c/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/1e353be93827ce199c4d6343a4d5a5610e193b4c/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-skydio",
+      "compute": {
+        "memory": 1024,
+        "timeout": 120
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": true,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-skymira",
+      "name": "SkyMira",
+      "description": "Ingests satellite vehicle tracking messages from SkyMira and posts vehicle positions to the map.",
+      "source": "dfpc-coe/etl-skymira",
+      "ref": "v2.12.0",
+      "sha": "4557747258a5e963af6122e09b1c517e9d8db5ec",
+      "version": "2.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/4557747258a5e963af6122e09b1c517e9d8db5ec/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/4557747258a5e963af6122e09b1c517e9d8db5ec/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-skymira",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-slack-bsar",
+      "name": "Slack BSAR",
+      "description": "Creates a Slack channel for every SAR CoreEvent placed on a CoreEvent Board or created in a TAK Server Channel, with a pinned card whose controls assign, close & prioritise the Event from Slack.",
+      "source": "dfpc-coe/etl-slack-bsar",
+      "ref": "v1.14.0",
+      "sha": "b0e7852752874b0dd025a48c991b2b75cd6e0719",
+      "version": "1.14.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-slack-bsar/b0e7852752874b0dd025a48c991b2b75cd6e0719/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-slack-bsar",
+      "compute": {
+        "memory": 256,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": false,
+        "webhook": true,
+        "email": false,
+        "outgoing": true,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-spider-tracks",
+      "name": "Spidertracks",
+      "description": "Ingests aircraft tracking positions from Spidertracks and posts them to the map.",
+      "source": "dfpc-coe/etl-spider-tracks",
+      "ref": "v2.12.0",
+      "sha": "4c77a4cef78e241681aed7fb809ae3b86c95ef5a",
+      "version": "2.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/4c77a4cef78e241681aed7fb809ae3b86c95ef5a/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/4c77a4cef78e241681aed7fb809ae3b86c95ef5a/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-spider-tracks",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-spot",
+      "name": "SPOT",
+      "description": "Ingests satellite GPS messenger positions from SPOT and posts them to the map.",
+      "source": "dfpc-coe/etl-spot",
+      "ref": "v3.11.0",
+      "sha": "1a7e84acc67a8448fd2361a2278428cff2711595",
+      "version": "3.11.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1a7e84acc67a8448fd2361a2278428cff2711595/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1a7e84acc67a8448fd2361a2278428cff2711595/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-spot",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-strato",
+      "name": "Strato",
+      "description": "Polls a configurable Strato HTTP endpoint for GeoJSON features and posts them to the map, with optional track history handling.",
+      "source": "dfpc-coe/etl-strato",
+      "ref": "v2.12.0",
+      "sha": "000d5fa2ae96dc70271be670954d622d69e8b77d",
+      "version": "2.12.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-strato/000d5fa2ae96dc70271be670954d622d69e8b77d/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-strato",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-usgs-gauges",
+      "name": "USGS Stream Gauges",
+      "description": "Ingests stream gauge water level and flow observations from the USGS and posts them to the map.",
+      "source": "dfpc-coe/etl-usgs-gauges",
+      "ref": "v1.5.0",
+      "sha": "f969271abe00280e393655b9406d97c14269646b",
+      "version": "1.5.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/f969271abe00280e393655b9406d97c14269646b/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/f969271abe00280e393655b9406d97c14269646b/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-usgs-gauges",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-verkada",
+      "name": "Verkada",
+      "description": "Ingests Verkada camera locations and manages CloudTAK video leases so camera streams are available in TAK.",
+      "source": "dfpc-coe/etl-verkada",
+      "ref": "v1.20.0",
+      "sha": "488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027",
+      "version": "1.20.0",
+      "author": "COE",
+      "community": false,
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-verkada",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-waze",
+      "name": "Waze",
+      "description": "Ingests one collection of the Waze for Cities partner feed - user reported alerts, traffic jams or unusual traffic - and posts it to the map.",
+      "source": "dfpc-coe/etl-waze",
+      "ref": "v1.2.0",
+      "sha": "f8deeea3bd009776c18bcdc06d046710e31104e7",
+      "version": "1.2.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-waze/f8deeea3bd009776c18bcdc06d046710e31104e7/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-waze",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-wildweb",
+      "name": "WildWeb CAD",
+      "description": "Ingests wildland fire incident dispatch data from WildWeb CAD and posts incidents to the map.",
+      "source": "dfpc-coe/etl-wildweb",
+      "ref": "v4.14.0",
+      "sha": "edb037bfd9c72aa342bec53a49efe9bae96ca986",
+      "version": "4.14.0",
+      "author": "COE",
+      "community": false,
+      "logo": null,
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-wildweb/edb037bfd9c72aa342bec53a49efe9bae96ca986/README.md",
+      "repo_url": "https://github.com/dfpc-coe/etl-wildweb",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": false,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "reviewed": null
+    },
+    {
+      "prefix": "etl-caltopo-clptak",
+      "name": "CalTopo Two-Way Sync (community)",
+      "description": "Ingests map objects from a shared CalTopo map, or the live Shared Locations of a CalTopo Team Account, and posts them to the map. Optionally forwards TAK positions to CalTopo Trackable Devices and creates a CalTopo Map in a Team Account for every CoreEvent created.",
+      "source": "clptak/etl-caltopo",
+      "ref": "deploy",
+      "sha": "3df8f15fe53ebefb1accae3f00044c00e1a6ad91",
+      "version": "5.19.1",
+      "author": "Paul (clptak)",
+      "community": true,
+      "logo": "https://raw.githubusercontent.com/clptak/etl-caltopo/3df8f15fe53ebefb1accae3f00044c00e1a6ad91/logo.png",
+      "readme": "https://raw.githubusercontent.com/clptak/etl-caltopo/3df8f15fe53ebefb1accae3f00044c00e1a6ad91/README.md",
+      "repo_url": "https://github.com/clptak/etl-caltopo",
+      "compute": {
+        "memory": 512,
+        "timeout": 60
+      },
+      "flags": {
+        "schedule": true,
+        "webhook": false,
+        "email": false,
+        "outgoing": true,
+        "installable": true
+      },
+      "has_capabilities": true,
+      "note": "Fork of COE CalTopo: adds TAK->CalTopo Mission Sync, PLI forwarding to CalTopo Trackable Devices, and CalTopo App Tracks as live positions. Pinned to a branch SHA because the fork has no release tag yet.",
+      "reviewed": null
+    }
+  ]
+}

@@ -76,3 +76,42 @@ def test_source_hash_tracks_the_shim_source(e, tmp_path):
     assert h1 == e.shim_source_hash(str(tmp_path))
     (tmp_path / 'shim.mjs').write_text('changed')
     assert e.shim_source_hash(str(tmp_path)) != h1
+
+
+# ── W3 catalog ──────────────────────────────────────────────────────────────────────────────
+def test_shipped_catalog_is_all_valid_and_unique(e):
+    raw = __import__('json').load(open(e.CATALOG))['entries']
+    cat = e.load_catalog()
+    assert len(cat) == len(raw) >= 40                     # every entry passed valid_entry
+    prefixes = [x['prefix'] for x in cat]
+    assert len(prefixes) == len(set(prefixes))            # CloudTAK keys integrations by prefix
+    assert 'etl-caltopo' in prefixes and 'etl-caltopo-clptak' in prefixes
+
+
+def test_catalog_entries_are_pinned_to_a_commit(e):
+    for x in e.load_catalog():
+        assert e.SHA_RE.fullmatch(x['sha']), x['prefix']
+
+
+def test_hostile_entries_are_dropped(e, tmp_path):
+    good = {'prefix': 'etl-ok', 'version': '1.2.3', 'sha': 'a' * 40, 'source': 'o/r'}
+    bad = [dict(good, prefix='etl-x; rm -rf /'), dict(good, sha='main'), dict(good, version='1.2'),
+           dict(good, source='o/r --upload-pack=evil'), dict(good, prefix='../etl')]
+    p = tmp_path / 'c.json'
+    p.write_text(__import__('json').dumps({'entries': [good] + bad}))
+    assert [x['prefix'] for x in e.load_catalog(str(p))] == ['etl-ok']
+
+
+def test_installable_gates(e):
+    sched = {'flags': {'schedule': True}, 'reviewed': {'result': 'PASS'}}
+    assert e.installable(sched) == (True, '')
+    assert e.installable(dict(sched, reviewed=None))[0] is False          # unscanned never installs
+    assert e.installable(dict(sched, reviewed=None), allow_unreviewed=True)[0] is True
+    assert e.installable({'flags': {'email': True}, 'reviewed': {}}, True)[0] is False
+    assert e.installable({'flags': {'webhook': True}, 'reviewed': {}}, True)[0] is False
+
+
+def test_installed_versions_parses_docker_tags(e):
+    got = e.installed_versions(['etl-geojson-v2.13.0', 'etl-geojson-v2.9.1', 'etl-AlertWest-v2.2.0', 'junk', ''])
+    assert got == {'etl-geojson': ['2.9.1', '2.13.0'], 'etl-AlertWest': ['2.2.0']}
+    assert e.image_tag('etl-AlertWest', '2.2.0') == 'etl-local:etl-AlertWest-v2.2.0'
