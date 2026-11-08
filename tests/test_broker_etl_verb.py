@@ -177,6 +177,53 @@ def test_etl_setup_takes_no_fields(m):
         m._do_etl_setup({'op': 'etl_setup', 'user': 'root'})
 
 
+def _tls_sandbox(m, monkeypatch, tmp_path):
+    import shutil as _sh
+    openssl = _sh.which('openssl')
+    if not openssl:
+        pytest.skip('openssl not installed')
+    d = tmp_path / 'etl-tls'
+    monkeypatch.setattr(m, 'ETL_TLS_DIR', str(d))
+    monkeypatch.setattr(m, 'BROKER_TRUSTED_PATH', str(pathlib.Path(openssl).parent))
+    monkeypatch.setattr(m.os, 'chown', lambda *a, **k: None)     # not root in CI
+    return d, openssl
+
+
+def test_etl_tls_mints_a_leaf_for_the_sqs_host_and_drops_the_ca_key(m, monkeypatch, tmp_path):
+    import subprocess as _sp
+    d, openssl = _tls_sandbox(m, monkeypatch, tmp_path)
+    out = m._etl_tls_ensure(0)
+    assert out['state'] == 'created'
+    assert out['ca_pem'].startswith('-----BEGIN CERTIFICATE-----')
+    assert sorted(p.name for p in d.iterdir()) == ['ca.pem', 'tls.key', 'tls.pem']   # no ca.key, no .new
+    assert (d / 'tls.key').stat().st_mode & 0o777 == 0o640
+    assert d.stat().st_mode & 0o777 == 0o750
+    v = _sp.run([openssl, 'verify', '-CAfile', str(d / 'ca.pem'), '-verify_hostname', m.ETL_SQS_HOST,
+                 str(d / 'tls.pem')], capture_output=True, text=True)
+    assert v.returncode == 0, v.stderr
+    bad = _sp.run([openssl, 'verify', '-CAfile', str(d / 'ca.pem'), '-verify_hostname', 'api',
+                   str(d / 'tls.pem')], capture_output=True, text=True)
+    assert bad.returncode != 0                                   # good for the SQS host only
+
+
+def test_etl_tls_is_idempotent_and_heals_a_broken_pair(m, monkeypatch, tmp_path):
+    d, _ = _tls_sandbox(m, monkeypatch, tmp_path)
+    first = m._etl_tls_ensure(0)
+    again = m._etl_tls_ensure(0)
+    assert again == {'ca_pem': first['ca_pem'], 'state': 'kept'}
+    (d / 'tls.pem').write_text('garbage')
+    healed = m._etl_tls_ensure(0)
+    assert healed['state'] == 'created' and healed['ca_pem'] != first['ca_pem']
+
+
+def test_etl_tls_refuses_a_symlinked_dir(m, monkeypatch, tmp_path):
+    d, _ = _tls_sandbox(m, monkeypatch, tmp_path)
+    (tmp_path / 'elsewhere').mkdir()
+    d.symlink_to(tmp_path / 'elsewhere')
+    with pytest.raises(RuntimeError):
+        m._etl_tls_ensure(0)
+
+
 def test_a_refused_stop_is_audited_as_deny_only(m, monkeypatch):
     """etlspike 2026-11-05: a stop of a non-ETL container logged ALLOW, then DENY 'None'."""
     lines = []

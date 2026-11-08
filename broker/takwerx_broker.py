@@ -3762,6 +3762,14 @@ ETL_RUN_USER = '1000:1000'
 ETL_ACTIONS = ('run', 'stop', 'logs', 'inspect', 'list', 'list-images', 'net')
 ETL_MUTATING = ('run', 'stop')
 DOCKER_SOCK = '/var/run/docker.sock'
+# W6/W11: CloudTAK builds a real-AWS SQS QueueUrl, and the SDK ignores the endpoint override for
+# it, so the shim answers that hostname over TLS (network alias) with a cert from a per-box CA.
+# Root-owned, NOT under ETL_DATA_DIR: the shim owns that directory, so it could swap a path
+# there for a symlink and redirect root's writes. root:<etl group> 0750, mounted read-only.
+ETL_TLS_DIR = '/var/lib/takwerx-etl-tls'
+ETL_SQS_HOST = 'sqs.us-east-1.amazonaws.com'     # fleet constant; the overlay pins AWS_REGION to match
+ETL_TLS_DAYS = 3650
+ETL_TLS_RENEW_SEC = 30 * 86400
 
 
 class _DockerConn(http.client.HTTPConnection):
@@ -3970,10 +3978,80 @@ def _do_etl_setup(req):
     os.makedirs(ETL_DATA_DIR, exist_ok=True)
     os.chown(ETL_DATA_DIR, pw.pw_uid, pw.pw_gid)
     os.chmod(ETL_DATA_DIR, 0o700)
+    try:
+        tls = _etl_tls_ensure(pw.pw_gid)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        return {'ok': False, 'error': f'etl tls: {e}'[-300:]}
     started = _etl_listener_start()
     return {'ok': True, 'user': ETL_USER, 'uid': pw.pw_uid, 'gid': pw.pw_gid,
             'socket_dir': ETL_SOCKET_DIR, 'data_dir': ETL_DATA_DIR,
-            'listener': 'started' if started else 'running'}
+            'tls_dir': ETL_TLS_DIR, 'sqs_host': ETL_SQS_HOST, 'ca_pem': tls['ca_pem'],
+            'tls': tls['state'], 'listener': 'started' if started else 'running'}
+
+
+def _etl_tls_valid(openssl):
+    """The leaf in ETL_TLS_DIR exists, is for ETL_SQS_HOST, chains to the CA next to it and
+    is not within ETL_TLS_RENEW_SEC of expiry."""
+    ca, leaf, key = (os.path.join(ETL_TLS_DIR, n) for n in ('ca.pem', 'tls.pem', 'tls.key'))
+    if not all(os.path.isfile(p) and not os.path.islink(p) for p in (ca, leaf, key)):
+        return False
+    v = subprocess.run([openssl, 'verify', '-CAfile', ca, '-verify_hostname', ETL_SQS_HOST, leaf],
+                       capture_output=True, text=True, timeout=30)
+    if v.returncode != 0:
+        return False
+    e = subprocess.run([openssl, 'x509', '-noout', '-checkend', str(ETL_TLS_RENEW_SEC), '-in', leaf],
+                       capture_output=True, text=True, timeout=30)
+    return e.returncode == 0
+
+
+def _etl_tls_ensure(etl_gid):
+    """Create (or renew) the per-box CA + leaf the shim serves ETL_SQS_HOST with. Idempotent:
+    a valid pair is left alone. The CA key never lands in ETL_TLS_DIR — it is created in a
+    root-only temp dir and deleted once the leaf is signed, so nothing can mint another cert
+    CloudTAK's `api`/`events` would trust. Returns {'ca_pem', 'state'}."""
+    openssl = shutil.which('openssl', path=BROKER_TRUSTED_PATH)
+    if not openssl:
+        raise RuntimeError('openssl not found')
+    if os.path.islink(ETL_TLS_DIR):
+        raise RuntimeError(f'{ETL_TLS_DIR} is a symlink — refusing')
+    os.makedirs(ETL_TLS_DIR, exist_ok=True)
+    os.chown(ETL_TLS_DIR, 0, etl_gid)
+    os.chmod(ETL_TLS_DIR, 0o750)
+    state = 'kept'
+    if not _etl_tls_valid(openssl):
+        state = 'created'
+        with tempfile.TemporaryDirectory(prefix='etl-tls-') as tmp:   # 0700, root
+            def ossl(*args):
+                r = subprocess.run([openssl, *args], capture_output=True, text=True, timeout=60, cwd=tmp)
+                if r.returncode != 0:
+                    raise RuntimeError(f'openssl {args[0]}: {(r.stderr or r.stdout).strip()[-200:]}')
+            ext = os.path.join(tmp, 'leaf.ext')
+            with open(ext, 'w') as f:
+                f.write('basicConstraints=critical,CA:FALSE\n'
+                        'keyUsage=critical,digitalSignature\n'
+                        'extendedKeyUsage=serverAuth\n'
+                        f'subjectAltName=DNS:{ETL_SQS_HOST}\n')
+            ossl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+                 '-keyout', 'ca.key', '-out', 'ca.pem', '-days', str(ETL_TLS_DAYS),
+                 '-subj', '/CN=infra-TAK ETL Runner local CA',
+                 '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
+                 '-addext', 'keyUsage=critical,keyCertSign,cRLSign')
+            ossl('req', '-new', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+                 '-keyout', 'tls.key', '-out', 'tls.csr', '-subj', f'/CN={ETL_SQS_HOST}')
+            ossl('x509', '-req', '-in', 'tls.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key',
+                 '-set_serial', '0x' + os.urandom(16).hex(), '-days', str(ETL_TLS_DAYS),
+                 '-sha256', '-extfile', ext, '-out', 'tls.pem')
+            # Into the root-owned dir: write next to the target, then rename (atomic per file).
+            for name, mode in (('tls.key', 0o640), ('tls.pem', 0o644), ('ca.pem', 0o644)):
+                dst = os.path.join(ETL_TLS_DIR, name)
+                part = dst + '.new'
+                shutil.copyfile(os.path.join(tmp, name), part)
+                os.chown(part, 0, etl_gid)
+                os.chmod(part, mode)
+                os.replace(part, dst)
+        # ca.key goes with the temp dir.
+    with open(os.path.join(ETL_TLS_DIR, 'ca.pem')) as f:
+        return {'ca_pem': f.read(), 'state': state}
 
 
 _ETL_SRV = {'srv': None}

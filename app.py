@@ -91,6 +91,7 @@ from collections import defaultdict, deque
 # imports nothing from app.py — seams flow the other way, via the ctx dict
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
+from modules import etlrunner as _etl
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
 # whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
@@ -48682,9 +48683,14 @@ def _cloudtak_compose_file_value(cloudtak_dir, current=''):
     ours = [base]
     if os.path.exists(os.path.join(d, 'docker-compose.override.yml')):
         ours.append('docker-compose.override.yml')
+    # v10.4.0 W11: the ETL Runner's own overlay, only while it exists (enabled), and before
+    # the operator's file so their settings still win.
+    if os.path.exists(os.path.join(d, _etl.OVERLAY)):
+        ours.append(_etl.OVERLAY)
     files = [os.path.join(d, f) for f in ours]
     seen = {os.path.join(d, n) for n in ('docker-compose.yml', 'compose.yaml',
-                                         'docker-compose.override.yml', CLOUDTAK_CUSTOM_COMPOSE)}
+                                         'docker-compose.override.yml', _etl.OVERLAY,
+                                         CLOUDTAK_CUSTOM_COMPOSE)}
     others = [i.strip() for i in (current or '').strip().strip('"\'').split(':')]
     if os.path.exists(os.path.join(d, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE)):
         others.append(_CLOUDTAK_TAKPORTAL_CSP_COMPOSE)
@@ -48709,7 +48715,7 @@ def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
         env_path = os.path.join(cloudtak_dir, '.env')
         if not os.path.isfile(env_path):
             return False                 # not deployed (or remote): nothing runs compose here
-        changed = False
+        changed = _etlrunner_sync_overlay(cloudtak_dir, _log)   # before COMPOSE_FILE is computed
         custom = os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE)
         if not os.path.lexists(custom):
             with open(custom, 'x') as f:  # 'x': a file that appeared meanwhile is not ours
@@ -48749,6 +48755,211 @@ def _cloudtak_remote_custom_compose_sh():
         "grep -v '^COMPOSE_FILE=' .env > .env.ct261.tmp; echo \"COMPOSE_FILE=$f\" >> .env.ct261.tmp && "
         'cat .env.ct261.tmp > .env; rm -f .env.ct261.tmp; fi'
     )
+
+
+# v10.4.0 W11 — ETL Runner wiring (PLAN-v10.4.0 W11). infra-TAK owns ~/CloudTAK/
+# docker-compose.infratak-etl.yml (modules/etlrunner: the shim service, api/events AWS endpoint
+# env, the CA bundle mount, the cloudtak_etl network). It exists only while the runner is
+# enabled; _cloudtak_compose_file_value() lists it before the operator's custom file. The
+# privileged half (takwerx-etl user, ETL socket, TLS for the SQS host) is broker `etl_setup`.
+# Local CloudTAK only — a remote CloudTAK host is not supported in 10.4.0.
+_ETLRUNNER_KEY = 'etlrunner'
+_ETLRUNNER_SHIM_CONTAINER = 'cloudtak-etl-shim-1'
+
+
+def _etlrunner_cfg(settings=None):
+    s = settings if settings is not None else load_settings()
+    c = s.get('etl_runner')
+    return dict(c) if isinstance(c, dict) else {}
+
+
+def _etlrunner_ct_local(settings):
+    try:
+        return _get_cloudtak_deployment_config(settings).get('target_mode') != 'remote'
+    except Exception:
+        return False
+
+
+def _etlrunner_write(path, text, in_place=False):
+    """Write `text` only if it differs. `in_place` truncates the existing file instead of
+    replacing it: a single-file bind mount pins the inode, so a rename would leave the
+    running container reading the old file. Returns True when written."""
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except FileNotFoundError:
+        pass
+    if in_place or not os.path.exists(path):
+        with open(path, 'w') as f:
+            f.write(text)
+    else:
+        tmp = path + '.infratak-tmp'
+        with open(tmp, 'w') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    return True
+
+
+def _etlrunner_sync_overlay(cloudtak_dir, log):
+    """Converge the overlay + CA bundle with settings: written while enabled, removed when not.
+    Cheap and idempotent — runs inside _cloudtak_ensure_custom_compose before every CloudTAK
+    compose action. Returns True when anything changed. Never raises."""
+    try:
+        s = load_settings()
+        c = _etlrunner_cfg(s)
+        overlay = os.path.join(cloudtak_dir, _etl.OVERLAY)
+        ca_path = os.path.join(cloudtak_dir, _etl.CA_FILE)
+        on = (bool(c.get('enabled')) and _etlrunner_ct_local(s) and os.path.isfile(ca_path)
+              and all(c.get(k) not in (None, '') for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')))
+        if not on:
+            if os.path.lexists(overlay):
+                os.remove(overlay)
+                log(f"  ETL Runner off — removed {_etl.OVERLAY}")
+                return True
+            return False
+        with open(ca_path) as f:
+            ca = f.read()
+        crt = ''
+        try:
+            with open(os.path.join(CONFIG_DIR, 'ssl', 'console.crt')) as f:
+                crt = f.read()
+        except OSError:
+            pass
+        changed = _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_BUNDLE), _etl.ca_bundle(crt, ca), in_place=True)
+        if _etlrunner_write(overlay, _etl.overlay_yml(cloudtak_dir, c['uid'], c['gid'], c['socket_dir'],
+                                                       c['data_dir'], c['tls_dir'])):
+            log(f"  ETL Runner: wrote {_etl.OVERLAY}")
+            changed = True
+        return changed
+    except Exception as e:
+        log(f"  ⚠ ETL Runner overlay: {e}")
+        return False
+
+
+def _etlrunner_setup(cloudtak_dir, log):
+    """Broker etl_setup (idempotent: user, data dir, socket, TLS — renews a leaf near expiry)
+    and record what it returned. Returns True on success."""
+    try:
+        r = _broker_request({'op': 'etl_setup'}, timeout=120)
+    except Exception as e:
+        log(f"  ✗ ETL Runner setup: broker unreachable: {e}")
+        return False
+    if not (isinstance(r, dict) and r.get('ok')):
+        log(f"  ✗ ETL Runner setup failed: {(r or {}).get('error') or r}")
+        return False
+    _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_FILE), r['ca_pem'])
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    c.update({k: r[k] for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')})
+    s['etl_runner'] = c
+    save_settings(s)
+    log(f"  ✓ ETL Runner setup: user {r.get('user')} ({r['uid']}:{r['gid']}), TLS {r.get('tls')}, "
+        f"listener {r.get('listener')}")
+    return True
+
+
+def _etlrunner_build_image(log):
+    """Build infratak-etl-shim:local from modules/etlrunner/shim unless the image on the box
+    already carries this source's hash. Never pulled (base pinned by digest in the Dockerfile)."""
+    want = _etl.shim_source_hash()
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHIM_HASH_LABEL, _etl.SHIM_IMAGE]),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode == 0 and r.stdout.strip() == want:
+        log(f"  ✓ {_etl.SHIM_IMAGE} is current")
+        return True
+    log(f"  Building {_etl.SHIM_IMAGE}…")
+    r = subprocess.run(_sudo_wrap(['docker', 'build', '--label', f'{_etl.SHIM_HASH_LABEL}={want}',
+                                   '-t', _etl.SHIM_IMAGE, _etl.SHIM_DIR]),
+                       capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        log("  ✗ shim image build failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+        return False
+    log(f"  ✓ built {_etl.SHIM_IMAGE}")
+    return True
+
+
+def _etlrunner_job(action):
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    log = lambda m: mod_registry.job_log(_ETLRUNNER_KEY, m.strip())
+    ok = False
+    try:
+        ct_dir = os.path.expanduser('~/CloudTAK')
+        s = load_settings()
+        if action == 'enable':
+            if not os.path.isfile(os.path.join(ct_dir, '.env')):
+                log("✗ CloudTAK is not deployed on this box")
+            elif not _etlrunner_ct_local(s):
+                log("✗ ETL Runner needs CloudTAK on this box (a remote CloudTAK is not supported)")
+            elif _etlrunner_setup(ct_dir, log) and _etlrunner_build_image(log):
+                s = load_settings()
+                c = _etlrunner_cfg(s)
+                c['enabled'] = True
+                s['etl_runner'] = c
+                save_settings(s)
+                _cloudtak_ensure_custom_compose(ct_dir, log)
+                r = _broker_compose(ct_dir, f'up -d api events {_etl.SHIM_SERVICE}', timeout=900)
+                if r.returncode != 0:
+                    log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+                else:
+                    log("✓ ETL Runner enabled — etl-shim running, CloudTAK api/events pointed at it")
+                    ok = True
+        else:  # disable: keep images, stacks state and TLS; a re-enable picks up where it was
+            if os.path.exists(os.path.join(ct_dir, _etl.OVERLAY)):
+                # while the overlay is still loaded, so compose knows the service
+                _broker_compose(ct_dir, f'rm -sf {_etl.SHIM_SERVICE}', timeout=300)
+            ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'label=etl-shim=1']),
+                                 capture_output=True, text=True, timeout=30).stdout.split()
+            if ids:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + ids), capture_output=True, text=True, timeout=120)
+                log(f"  removed {len(ids)} ETL run container(s)")
+            c = _etlrunner_cfg(s)
+            c['enabled'] = False
+            s['etl_runner'] = c
+            save_settings(s)
+            _cloudtak_ensure_custom_compose(ct_dir, log)
+            r = _broker_compose(ct_dir, 'up -d api events', timeout=900)
+            if r.returncode != 0:
+                log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+            else:
+                log("✓ ETL Runner disabled — images and layer state kept")
+                ok = True
+    except Exception as e:
+        log(f"✗ ETL Runner {action}: {e}")
+    job.update({'running': False, 'complete': True, 'error': not ok})
+
+
+@app.route('/api/cloudtak/etl/status')
+@login_required
+def cloudtak_etl_status():
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Status}}', _ETLRUNNER_SHIM_CONTAINER]),
+                        capture_output=True, text=True, timeout=10)
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    return jsonify({'enabled': bool(c.get('enabled')), 'local_cloudtak': _etlrunner_ct_local(s),
+                    'overlay': os.path.exists(os.path.join(os.path.expanduser('~/CloudTAK'), _etl.OVERLAY)),
+                    'shim': st.stdout.strip() if st.returncode == 0 else 'absent',
+                    'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
+
+
+@app.route('/api/cloudtak/etl/<action>', methods=['POST'])
+@login_required
+def cloudtak_etl_action(action):
+    if action not in ('enable', 'disable'):
+        return jsonify({'error': 'unknown action'}), 404
+    if not mod_registry.job_start(_ETLRUNNER_KEY, action, _etlrunner_job, (action,)):
+        return jsonify({'error': 'an ETL Runner job is already running'}), 409
+    return jsonify({'started': action})
+
+
+@app.route('/api/cloudtak/etl/log')
+@login_required
+def cloudtak_etl_log():
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    return jsonify({'log': list(job.get('log') or []), 'running': bool(job.get('running')),
+                    'error': bool(job.get('error'))})
 
 
 # ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
@@ -103341,6 +103552,13 @@ def _startup_harden_cloudtak_ports():
         _override_changed = _cloudtak_write_override_file(_ct_dir)
         if _override_changed:
             print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+        # v10.4.0 W11: ETL Runner — broker setup is idempotent (renews the SQS-host TLS leaf
+        # near expiry), then a changed overlay or CA bundle needs api/events recreated.
+        _etl_changed = False
+        if _etlrunner_cfg().get('enabled'):
+            _etl_log = lambda m: print(f"Startup migration: {m.strip()}", flush=True)
+            _etlrunner_setup(_ct_dir, _etl_log)
+            _etl_changed = _etlrunner_sync_overlay(_ct_dir, _etl_log)
         # GH #261: before the recreate below, so it keeps the operator's own services.
         if _cloudtak_ensure_custom_compose(_ct_dir, plog=lambda m: print(f"Startup migration: {m.strip()}", flush=True)):
             print("Startup migration: CloudTAK compose now loads docker-compose.custom.yml")
@@ -103348,7 +103566,7 @@ def _startup_harden_cloudtak_ports():
         _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
-        _needs_recreate = _changed or _override_changed or _pending is not None
+        _needs_recreate = _changed or _override_changed or _etl_changed or _pending is not None
         if os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt')):
             # Post-update hardening left it STOPPED for Remove + Reinstall — never bring it back.
             if _needs_recreate:
@@ -103360,7 +103578,7 @@ def _startup_harden_cloudtak_ports():
                   "tries — giving up; check `docker compose ps` in ~/CloudTAK")
             _ct_recreate_clear()
             _pending = None
-            _needs_recreate = _changed or _override_changed
+            _needs_recreate = _changed or _override_changed or _etl_changed
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
