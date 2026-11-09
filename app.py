@@ -70610,6 +70610,163 @@ def _tak_drop_stuck_unnamed_sessions(plog):
     return dropped
 
 
+# New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs
+# search_mode: cached, so the outpost answers TAK from an in-memory copy of the directory that it
+# reloads every 5 min (outpost refresh_interval default). Authentik does not push a reload when a
+# user or a group membership changes (authentik/outposts/signals.py: only Outpost / Provider /
+# cert / brand / session saves do). A phone enrolled right after TAK Portal created its user
+# connects to 8089 while the copy has no entry for it; TAK puts no user and no groups on the
+# connection and never looks it up again. nuc: TBOLT connected 2 min, TAKWERX-S22 35 s after
+# the user was created; both sat with no channels.
+# Fix: watch the directory (users and their tak_ groups) every 15 s; on a change, save the LDAP
+# outpost unchanged (outpost_post_save -> outpost_send_update; proven on nuc: new user visible
+# 4.2 s after the PATCH), confirm LDAP now answers with the new groups, then for a window drop
+# connections TAK gave no user and no groups so they reconnect and are looked up again.
+_AK_DIR_WATCH_TICK_S = 15
+_AK_DIR_REFRESH_MIN_GAP_S = 20
+_AK_DIR_CONFIRM_WAIT_S = 30
+_AK_DIR_DROP_WINDOW_S = 900
+_AK_DIR_DROP_COOLDOWN_S = 120
+_AK_DIR_DROP_MAX = 2
+_ak_dir_watch = {'snap': None, 'pending': set(), 'last_refresh': 0.0, 'confirmed_at': 0.0, 'drops': {}}
+
+
+def _ak_directory_snapshot():
+    """{username: frozenset of its tak_ group names without the prefix} for every active
+    Authentik user, read from Authentik's database (one query, no API, no LDAP). None when
+    Authentik's database can't be read (no Authentik on this box, container down)."""
+    sql = ("SELECT u.username, coalesce(string_agg(g.name, chr(31)) FILTER (WHERE g.name LIKE 'tak\\_%'), '') "
+           "FROM authentik_core_user u "
+           "LEFT JOIN authentik_core_user_groups ug ON ug.user_id = u.id "
+           "LEFT JOIN authentik_core_group g ON g.group_uuid = ug.group_id "
+           "WHERE u.is_active GROUP BY u.username;")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                                       '-d', 'authentik', '-tA', '-F', chr(30), '-c', sql]),
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for line in (r.stdout or '').split('\n'):   # not splitlines(): it also splits on chr(30)
+        if chr(30) not in line:
+            continue
+        user, groups = line.split(chr(30), 1)
+        out[user] = frozenset(g[4:] for g in groups.split(chr(31)) if g.startswith('tak_'))
+    return out
+
+
+def _ak_refresh_ldap_outposts(plog):
+    """Save every LDAP outpost unchanged, so Authentik tells it to reload users and groups
+    now. True when at least one was saved."""
+    settings = load_settings()
+    token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+             or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if not token:
+        return False
+    base = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        with _ak_api_call(f'{base}/api/v3/outposts/instances/?page_size=100', headers=headers, max_retries=1) as r:
+            outposts = json.loads(r.read().decode()).get('results', [])
+    except Exception as e:
+        plog(f"  LDAP outpost refresh: couldn't list outposts: {str(e)[:120]}")
+        return False
+    saved = 0
+    for o in outposts:
+        if o.get('type') != 'ldap' or not o.get('pk'):
+            continue
+        try:
+            with _ak_api_call(f"{base}/api/v3/outposts/instances/{o['pk']}/", method='PATCH', headers=headers,
+                              data=json.dumps({'name': o.get('name')}).encode(), max_retries=1):
+                saved += 1
+        except Exception as e:
+            plog(f"  LDAP outpost refresh: couldn't save outpost {o.get('name')}: {str(e)[:120]}")
+    return saved > 0
+
+
+def _ak_directory_watch_tick(plog):
+    """One pass of the directory watch (see the block comment above). Returns what it did:
+    {'refreshed': [users], 'confirmed': bool, 'dropped': [connection uids]}."""
+    st = _ak_dir_watch
+    did = {'refreshed': [], 'confirmed': False, 'dropped': []}
+    if _console_update_in_progress():
+        return did
+    snap = _ak_directory_snapshot()
+    if snap is not None:
+        old, st['snap'] = st['snap'], snap
+        if old is not None:
+            st['pending'] |= {u for u in set(old) | set(snap) if old.get(u) != snap.get(u)}
+    now = time.time()
+    if st['pending'] and snap is not None and now - st['last_refresh'] >= _AK_DIR_REFRESH_MIN_GAP_S:
+        users, st['pending'] = sorted(st['pending']), set()
+        if not _ak_refresh_ldap_outposts(plog):
+            st['pending'] |= set(users)       # try again next tick
+            return did
+        st['last_refresh'] = now
+        did['refreshed'] = users
+        want = {u: snap[u] for u in users if u in snap}    # removed users: nothing to wait for
+        removed = {u: (old or {}).get(u, frozenset()) - snap.get(u, frozenset()) for u in want}
+        ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        t0 = time.time()
+        while True:
+            seen = _ldap_users_tak_groups(ldap_pass, list(want)) if (ldap_pass and want) else {}
+            if seen is not None:
+                low = {cn.lower(): set(g) for cn, g in seen.items()}
+                if all(u.lower() in low and want[u] <= low[u.lower()] and not (removed[u] & low[u.lower()])
+                       for u in want):
+                    break
+            if time.time() - t0 >= _AK_DIR_CONFIRM_WAIT_S:
+                plog(f"  LDAP outpost refresh: directory changed ({', '.join(users[:10])}) but LDAP "
+                     f"didn't show it within {_AK_DIR_CONFIRM_WAIT_S} s; the 10-min check stays the safety net")
+                return did
+            time.sleep(2)
+        st['confirmed_at'] = time.time()
+        st['drops'] = {}
+        did['confirmed'] = True
+        plog(f"  LDAP outpost refreshed (directory changed: {', '.join(users[:10])}"
+             f"{' …' if len(users) > 10 else ''}); LDAP answers in {st['confirmed_at'] - now:.0f} s")
+    if not st['confirmed_at'] or time.time() - st['confirmed_at'] >= _AK_DIR_DROP_WINDOW_S:
+        return did
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        return did
+    sessions = _tak_client_sessions()
+    if not sessions:
+        return did
+    now = time.time()
+    for s in sorted(sessions, key=lambda s: _subscription_num(s['uid'])):
+        if not s['unnamed'] or s['groups']:
+            continue
+        _tak_stuck_unnamed_seen.setdefault(s['uid'], now)
+        n, last = st['drops'].get(s['client'], (0, 0.0))
+        if n >= _AK_DIR_DROP_MAX or now - last < _AK_DIR_DROP_COOLDOWN_S:
+            continue
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                       timeout=20, method='DELETE')
+        st['drops'][s['client']] = (n + 1, now)
+        _tak_stuck_unnamed_dropped[s['client']] = now
+        if ok is None:
+            plog(f"  LDAP outpost refresh: couldn't drop {s['uid']} ({s['callsign']}): {err}")
+            continue
+        _tak_stuck_unnamed_seen.pop(s['uid'], None)
+        did['dropped'].append(s['uid'])
+    if did['dropped']:
+        plog(f"  LDAP outpost refresh: dropped {len(did['dropped'])} connection(s) TAK gave no user and no "
+             f"groups ({', '.join(did['dropped'][:15])}); they reconnect and are looked up again")
+    return did
+
+
+def _ak_directory_watch_loop():
+    log = lambda m: print(f"[ak-directory-watch] {m}", flush=True)
+    while True:
+        try:
+            _ak_directory_watch_tick(log)
+        except Exception as e:
+            log(f"error (non-fatal): {str(e)[:200]}")
+        time.sleep(_AK_DIR_WATCH_TICK_S)
+
+
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
     """v0.9.27-alpha: deterministic-autotune pool sizing — fleet-uniform.
 
@@ -110982,6 +111139,13 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# New-user enrollment race (ops #565 root cause): reload the LDAP outpost when a user or a tak_
+# membership changes, and drop the TAK connections that came in before the reload with no user.
+try:
+    threading.Thread(target=_ak_directory_watch_loop, daemon=True, name='ak-directory-watch').start()
+except Exception as _e:
+    print(f"[startup] failed to start Authentik directory watch (non-fatal): {_e}", flush=True)
 
 # v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
 # timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when
