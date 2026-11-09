@@ -34526,6 +34526,31 @@ def _cloudtak_stream_host_pin(settings):
     return f'{host}:{ip}' if host and ip else ''
 
 
+def _cloudtak_takserver_host_pin(settings):
+    """`(takserver host, this box's address)` for CloudTAK's api container, or None.
+
+    infra-TAK #439. CloudTAK dials TAK Server at ssl://<takserver host>:8089 (mutual TLS). The
+    override used to pin that name to whatever public DNS returned at deploy time. On a home or
+    office network that is the router's public address, so the call goes out and back in through
+    the router (and through a reverse proxy such as HAProxy if one fronts 8089). A proxy that
+    ends TLS never passes CloudTAK's client certificate on, so TAK Server logs "Certificate
+    error: peer not verified", resets the connection, and the api container restarts in a loop
+    (HTTP 502). Pinning the name to this box's own address keeps that hop on the box; TLS still
+    validates because the URL keeps its hostname. None when there is nothing to pin: no domain,
+    remote CloudTAK, TAK Server not on this box, or no usable local address.
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return None
+    except Exception:
+        return None
+    if not _takserver_installed_local():
+        return None
+    host = (_get_takserver_host(settings) or '').strip().split()[0:1]
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return (host[0], ip) if host and ip else None
+
+
 def _get_cloudtak_upstreams(settings):
     """Return CloudTAK upstream endpoints for Caddy and readiness checks.
 
@@ -48190,13 +48215,19 @@ def _cloudtak_build_override_yml(settings):
     extra_hosts = ['host.docker.internal:host-gateway']
     tak_fqdn = (_get_takserver_host(settings) or '').strip()
     if tak_fqdn:
-        try:
-            tak_ip = _sock.gethostbyname(tak_fqdn)
-            extra_hosts.append(f'{tak_fqdn}:{tak_ip}')
-        except Exception:
-            server_ip = (settings.get('server_ip') or '').strip()
-            if server_ip:
-                extra_hosts.append(f'{tak_fqdn}:{server_ip}')
+        # infra-TAK #439: TAK Server on this box is reached at this box's address, not through
+        # public DNS (a router or reverse proxy in that path breaks the 8089 client-cert handshake).
+        tak_pin = _cloudtak_takserver_host_pin(settings)
+        if tak_pin:
+            extra_hosts.append(f'{tak_pin[0]}:{tak_pin[1]}')
+        else:
+            try:
+                tak_ip = _sock.gethostbyname(tak_fqdn)
+                extra_hosts.append(f'{tak_fqdn}:{tak_ip}')
+            except Exception:
+                server_ip = (settings.get('server_ip') or '').strip()
+                if server_ip:
+                    extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
     # ops #471: only the api container calls the media server by its public name.
     video_pin = _cloudtak_video_host_pin(settings)
