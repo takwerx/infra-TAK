@@ -70242,7 +70242,7 @@ def _authentik_reconfigure_heal_tak_clients(plog, before=None):
 _TAK_STUCK_UNNAMED_MIN_S = 600
 _TAK_STUCK_UNNAMED_COOLDOWN_S = 3600
 _tak_stuck_unnamed_seen = {}    # connection uid → epoch first seen with no user and no groups
-_tak_stuck_unnamed_dropped = {}  # device uid (else connection uid) → epoch of our last drop
+_tak_stuck_unnamed_dropped = {}  # device uid (else '' = any connection without one) → epoch of our last drop
 
 
 def _tak_drop_stuck_unnamed_sessions(plog):
@@ -70262,7 +70262,10 @@ def _tak_drop_stuck_unnamed_sessions(plog):
             del _tak_stuck_unnamed_seen[uid]
     for uid in stuck:
         _tak_stuck_unnamed_seen.setdefault(uid, now)
-    key = lambda s: s['client'] or s['uid']
+    # test12 2026-11-08: TAK gives a connection it never looked up no device uid either, and its
+    # number changes at every reconnect, so neither can hold the hourly limit. Without a device
+    # uid they all share one slot: a client that keeps coming back this way is dropped once an hour.
+    key = lambda s: s['client']
     due = [s for uid, s in stuck.items()
            if now - _tak_stuck_unnamed_seen[uid] >= _TAK_STUCK_UNNAMED_MIN_S
            and now - _tak_stuck_unnamed_dropped.get(key(s), 0) >= _TAK_STUCK_UNNAMED_COOLDOWN_S]

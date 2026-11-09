@@ -51,7 +51,12 @@ def monitor(box):
 def stuck_box(**kw):
     """nuc: an enrolled phone whose connection TAK gave no user and no groups; everyone else fine."""
     kw.setdefault('tak_start', T0 - 3 * 24 * HOUR)
-    return outage_box(**kw)
+    box = outage_box(**kw)
+    # test12 2026-11-08: TAK gave the stuck connection no clientUid either (clientUid "", callsign tls:N)
+    for s in box.subs:
+        if s['dn'] is None:
+            s['clientUid'] = ''
+    return box
 
 
 def test_the_heal_after_an_outage_does_not_cover_it():
@@ -146,6 +151,28 @@ def test_a_client_that_comes_back_the_same_way_is_retried_hourly_and_never_resta
         assert tick(TICK - 100) == []
     assert tick(1100) == [again['subscriptionUid']]    # just over an hour after the first drop
     assert box.restarts() == []
+
+
+def test_a_stuck_client_with_a_device_uid_is_limited_by_that_uid_not_by_the_box():
+    box = stuck_box()
+    box.subs.append(sess(30, 'ghost', (), unmapped=True, client='ANDROID-other'))
+    tick = monitor(box)
+    tick(0)
+    assert sorted(tick(TICK)) == ['tls:16', 'tls:30']
+    box.t += 20
+    assert tick(TICK - 100) == []            # both back, both inside their hour
+
+
+def test_without_a_device_uid_all_stuck_connections_share_one_hourly_slot():
+    """The number TAK gives a connection changes at every reconnect, so it cannot hold the limit."""
+    box = stuck_box()
+    tick = monitor(box)
+    tick(0)
+    assert tick(TICK) == ['tls:16']
+    box.subs.append(sess(31, 'ghost', (), unmapped=True, client=''))   # another phone, also unnamed
+    box.t += 20
+    assert tick(0) == [] and tick(TICK) == []                          # inside the hour
+    assert 'tls:31' in tick(3000)                                      # an hour after the drop
 
 
 def test_nothing_to_do_without_ldap_in_coreconfig():
