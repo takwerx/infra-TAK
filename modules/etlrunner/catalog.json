@@ -515,33 +515,6 @@
       "reviewed": "2026-11-08 /module-scan"
     },
     {
-      "prefix": "etl-drone-tag",
-      "name": "Dronetag",
-      "description": "Ingests Remote ID drone telemetry from Dronetag and posts aircraft positions to the map.",
-      "source": "dfpc-coe/etl-drone-tag",
-      "ref": "v1.5.0",
-      "sha": "2964590acca292c5c4d829cf0ac32a7e68ceab69",
-      "version": "1.5.0",
-      "author": "COE",
-      "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-tag/2964590acca292c5c4d829cf0ac32a7e68ceab69/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-tag/2964590acca292c5c4d829cf0ac32a7e68ceab69/README.md",
-      "repo_url": "https://github.com/dfpc-coe/etl-drone-tag",
-      "compute": {
-        "memory": 512,
-        "timeout": 60
-      },
-      "flags": {
-        "schedule": true,
-        "webhook": false,
-        "email": false,
-        "outgoing": false,
-        "installable": true
-      },
-      "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
-    },
-    {
       "prefix": "etl-ensurity",
       "name": "Ensurity Mobile",
       "description": "Receives Ensurity Mobile vehicle telemetry via webhook and on a schedule and posts vehicle positions to the map.",
@@ -797,33 +770,6 @@
       "logo": null,
       "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-optimus/c16dc35923ed1ec7df84a5359a7db6c604418751/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-optimus",
-      "compute": {
-        "memory": 512,
-        "timeout": 60
-      },
-      "flags": {
-        "schedule": true,
-        "webhook": false,
-        "email": false,
-        "outgoing": false,
-        "installable": true
-      },
-      "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
-    },
-    {
-      "prefix": "etl-santa",
-      "name": "Santa Tracker",
-      "description": "Posts Santa's simulated position to the map as a seasonal tracking feature.",
-      "source": "dfpc-coe/etl-santa",
-      "ref": "v2.12.0",
-      "sha": "e7473c675361e14e982c83f7924b93b4eca3537a",
-      "version": "2.12.0",
-      "author": "COE",
-      "community": false,
-      "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-santa/e7473c675361e14e982c83f7924b93b4eca3537a/README.md",
-      "repo_url": "https://github.com/dfpc-coe/etl-santa",
       "compute": {
         "memory": 512,
         "timeout": 60

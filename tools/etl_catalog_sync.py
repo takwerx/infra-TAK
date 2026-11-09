@@ -33,6 +33,7 @@ CATALOG = os.path.join(MOD, 'catalog.json')
 COMMUNITY = os.path.join(MOD, 'community.json')
 COE_ORG = 'dfpc-coe'
 NOT_ETLS = {'etl-base', 'etl-template'}          # libraries, not runnable ETLs
+HIDDEN = {'etl-santa', 'etl-drone-tag'}           # operator 2026-11-08: novelty / empty template
 SEMVER = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)$')
 
 
@@ -103,7 +104,7 @@ def entry(owner, repo, ref, sha, version, prefix, community, author, name_overri
 
 def coe_entries():
     repos = [r for r in gh(f'orgs/{COE_ORG}/repos?per_page=100')
-             if r['name'].startswith('etl-') and r['name'] not in NOT_ETLS
+             if r['name'].startswith('etl-') and r['name'] not in NOT_ETLS and r['name'] not in HIDDEN
              and not r['archived'] and not r['private']]
 
     def one(r):
