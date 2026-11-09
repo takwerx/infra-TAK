@@ -46,7 +46,7 @@ def _ns(srv, admins, local=True):
           '_tak_ca_bundle': lambda: '', '_cert_signed_by': lambda c, b: None}
     for n in TREE.body:
         if isinstance(n, ast.FunctionDef) and n.name in (
-                '_cloudtak_untrusted_user_certs', '_cloudtak_admin_users',
+                '_cloudtak_untrusted_user_certs', '_cloudtak_admin_users', '_cloudtak_admin_candidates',
                 '_cloudtak_connect_state_core', '_cloudtak_connect_state'):
             exec(ast.get_source_segment(APP, n), ns)
     ns['sql_seen'] = sql_seen
@@ -105,4 +105,4 @@ def test_the_page_has_the_line_and_escapes_the_names():
     assert "document.getElementById('ct-connect-admins')" in JS
     assert 'admins.map(esc).join' in JS and 'CloudTAK admin' in JS
     # Hidden again when there are none (unconfigured, remote, unreadable).
-    assert "adm.style.display = admins.length ? '' : 'none'" in JS
+    assert "adm.style.display = (admins.length || d.no_admin) ? '' : 'none'" in JS
