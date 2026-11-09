@@ -334,3 +334,71 @@ export function hookEventHeaders(headers) {
     }
     return out;
 }
+
+// ---- the shim's AWS API authenticates its callers (SigV4, as AWS does) ----
+// CloudTAK's api/events sign every AWS SDK call with the per-box secret infra-TAK puts in their
+// env; the shim recomputes the signature exactly as @smithy/signature-v4 builds it. Without
+// this, any container on CloudTAK's default network could create, invoke or delete ETL stacks.
+import { createHash as _hash, createHmac as _hmac } from 'node:crypto';
+export const SIGV4_SKEW_MS = 15 * 60 * 1000;
+const _sha = (b) => _hash('sha256').update(b).digest('hex');
+export const escapeUri = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+export function sigv4CanonicalPath(path) {
+    const segs = [];
+    for (const p of path.split('/')) {
+        if (!p || p === '.') continue;
+        if (p === '..') segs.pop(); else segs.push(p);
+    }
+    const norm = `${path.startsWith('/') ? '/' : ''}${segs.join('/')}${segs.length && path.endsWith('/') ? '/' : ''}`;
+    return escapeUri(norm).replace(/%2F/g, '/');
+}
+
+export function sigv4CanonicalQuery(search) {
+    const q = new Map();
+    for (const part of String(search || '').replace(/^\?/, '').split('&')) {
+        if (!part) continue;
+        const i = part.indexOf('=');
+        const dec = (x) => decodeURIComponent(x.replace(/\+/g, '%20'));
+        const k = dec(i < 0 ? part : part.slice(0, i)), v = i < 0 ? '' : dec(part.slice(i + 1));
+        if (k.toLowerCase() === 'x-amz-signature') continue;
+        (q.get(k) || q.set(k, []).get(k)).push(v);
+    }
+    return [...q.keys()].sort().flatMap((k) => q.get(k).sort().map((v) => `${escapeUri(k)}=${escapeUri(v)}`)).join('&');
+}
+
+// Returns null when the request is signed with `secret`, else the reason.
+export function sigv4Verify({ method, url, headers, body, secret, now = Date.now(), timingSafeEqual }) {
+    if (!secret) return 'no secret configured';
+    const auth = String(headers.authorization || '');
+    const m = /^AWS4-HMAC-SHA256 Credential=([^/,\s]+)\/(\d{8})\/([a-z0-9-]{1,32})\/([a-z0-9-]{1,32})\/aws4_request, ?SignedHeaders=([a-z0-9;.-]+), ?Signature=([0-9a-f]{64})$/.exec(auth);
+    if (!m) return 'not signed';
+    const [, , date, region, service, signedHeaders, sig] = m;
+    const amzDate = String(headers['x-amz-date'] || '');
+    const dm = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(amzDate);
+    if (!dm || amzDate.slice(0, 8) !== date) return 'bad x-amz-date';
+    const t = Date.UTC(+dm[1], +dm[2] - 1, +dm[3], +dm[4], +dm[5], +dm[6]);
+    if (Math.abs(now - t) > SIGV4_SKEW_MS) return 'request time too skewed';
+    const names = signedHeaders.split(';');
+    if (!names.includes('host') || !names.includes('x-amz-date')) return 'host and x-amz-date must be signed';
+    const bodyHash = _sha(body || Buffer.alloc(0));
+    const claimed = headers['x-amz-content-sha256'];
+    if (claimed !== undefined && claimed !== bodyHash) return 'body hash mismatch';
+    const hdrs = names.map((n) => {
+        const v = headers[n];
+        if (v === undefined) return null;
+        return `${n}:${[].concat(v).join(',').trim().replace(/\s+/g, ' ')}\n`;
+    });
+    if (hdrs.includes(null)) return 'a signed header is missing';
+    const qi = String(url).indexOf('?');
+    const path = qi < 0 ? String(url) : String(url).slice(0, qi);
+    const canonical = [method, sigv4CanonicalPath(path), sigv4CanonicalQuery(qi < 0 ? '' : String(url).slice(qi + 1)),
+        hdrs.join(''), signedHeaders, bodyHash].join('\n');
+    const scope = `${date}/${region}/${service}/aws4_request`;
+    const sts = ['AWS4-HMAC-SHA256', amzDate, scope, _sha(canonical)].join('\n');
+    let k = _hmac('sha256', `AWS4${secret}`).update(date).digest();
+    for (const p of [region, service, 'aws4_request']) k = _hmac('sha256', k).update(p).digest();
+    const want = _hmac('sha256', k).update(sts).digest();
+    const got = Buffer.from(sig, 'hex');
+    return got.length === want.length && timingSafeEqual(got, want) ? null : 'bad signature';
+}

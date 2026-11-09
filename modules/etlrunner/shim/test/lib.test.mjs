@@ -211,3 +211,30 @@ test('hookRoute: the secret may come in Caddy\'s cookie when the path is masked'
     assert.equal(hookCookie(`a=1; ${HOOK_COOKIE}=${SEC}; b=2`), SEC);
     assert.equal(hookCookie('a=1'), '');
 });
+
+// Vectors signed by AWS's own @smithy/signature-v4 (generated once, 2026-11-09).
+import { sigv4Verify, sigv4CanonicalPath } from '../lib.mjs';
+import { readFileSync } from 'node:fs';
+const V = JSON.parse(readFileSync(new URL('./sigv4-vectors.json', import.meta.url)));
+test('sigv4: requests signed by the AWS SDK signer verify', () => {
+    for (const v of V.vectors) {
+        assert.equal(sigv4Verify({ ...v, body: Buffer.from(v.body), secret: V.secret, now: V.now, timingSafeEqual }), null, v.url);
+    }
+});
+test('sigv4: tampering, wrong key, replay window, unsigned all refused', () => {
+    const v = V.vectors[0], base = { ...v, body: Buffer.from(v.body), secret: V.secret, now: V.now, timingSafeEqual };
+    assert.equal(sigv4Verify({ ...base, body: Buffer.from(v.body.replace('test-layer-5', 'test-layer-6')) }), 'body hash mismatch');
+    const noHash = { ...v.headers }; delete noHash['x-amz-content-sha256'];
+    assert.ok(sigv4Verify({ ...base, headers: noHash }));                  // the hash header is signed
+    assert.equal(sigv4Verify({ ...base, secret: V.secret + 'x' }), 'bad signature');
+    assert.equal(sigv4Verify({ ...base, now: V.now + 16 * 60e3 }), 'request time too skewed');
+    assert.equal(sigv4Verify({ ...base, headers: { ...v.headers, authorization: '' } }), 'not signed');
+    assert.equal(sigv4Verify({ ...base, secret: '' }), 'no secret configured');
+    assert.equal(sigv4Verify({ ...base, headers: { ...v.headers, host: 'other:4000' } }), 'bad signature');
+    const g = V.vectors[1];
+    assert.ok(sigv4Verify({ ...g, url: g.url.replace('b%20c', 'b%20d'), body: Buffer.from(''), secret: V.secret, now: V.now, timingSafeEqual }));
+});
+test('sigv4: canonical path double-encodes like the SDK', () => {
+    assert.equal(sigv4CanonicalPath('/2015-03-31/functions/test%20layer/x'), '/2015-03-31/functions/test%2520layer/x');
+    assert.equal(sigv4CanonicalPath('/a/./b/../c/'), '/a/c/');
+});

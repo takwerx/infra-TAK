@@ -194,3 +194,28 @@ def test_fallback_upstream_and_loopback_site():
     assert 'lb_policy first' in lines and 'fail_duration' in lines
     site = etl.caddy_hook_fallback_site()
     assert site[1].startswith(f'http://:{etl.HOOK_FALLBACK_PORT} {{') and '    bind 127.0.0.1' in site
+
+
+def test_aws_secret_goes_to_api_events_and_shim():
+    yaml = pytest.importorskip('yaml')
+    key = etl.new_hook_secret()
+    d = yaml.safe_load(etl.overlay_yml('/h/CloudTAK', 990, 990, '/run/takwerx-etl', '/var/lib/takwerx-etl',
+                                       '/var/lib/takwerx-etl-tls', SEC, None, key))
+    sv = d['services']
+    assert sv['api']['environment']['AWS_SECRET_ACCESS_KEY'] == key
+    assert sv['events']['environment']['AWS_SECRET_ACCESS_KEY'] == key
+    assert sv[etl.SHIM_SERVICE]['environment']['SHIM_AWS_SECRET'] == key
+    d = yaml.safe_load(etl.overlay_yml('/h/CloudTAK', 990, 990, '/run/takwerx-etl', '/var/lib/takwerx-etl',
+                                       '/var/lib/takwerx-etl-tls', SEC, None, 'short'))
+    assert d['services']['api']['environment']['AWS_SECRET_ACCESS_KEY'] == 'local'
+    assert 'SHIM_AWS_SECRET' not in d['services'][etl.SHIM_SERVICE]['environment']
+
+
+def test_key_changes_recreate_api_events_and_shim_together():
+    for name in ('_etlrunner_job',):
+        src = ast.get_source_segment(APP, _FNS[name])
+        assert "'up -d api {_etl.SHIM_SERVICE}'" not in src
+        assert src.count("up -d api events {_etl.SHIM_SERVICE}") >= 2      # enable + rotate
+    src = ast.get_source_segment(APP, _FNS['_etlrunner_startup_converge'])
+    assert "job_start(_ETLRUNNER_KEY, 'enable'" in src and 'shim_source_hash()' in src
+    assert "c['aws_secret'] = _etl.new_hook_secret()" in ast.get_source_segment(APP, _FNS['_etlrunner_sync_overlay'])

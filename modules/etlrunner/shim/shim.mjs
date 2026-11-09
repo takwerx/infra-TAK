@@ -19,7 +19,7 @@ import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
     sqsReplay, sqsSnapshot, sqsBytes, SQS_MAX_PER_LAYER, SQS_MAX_DEAD, SQS_MAX_BYTES,
-    hookResponse, hookEventHeaders, hookCookie, HOOK_FIXED_HEADERS,
+    hookResponse, hookEventHeaders, hookCookie, HOOK_FIXED_HEADERS, sigv4Verify,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -30,6 +30,16 @@ const STATE = process.env.SHIM_STATE || '/data/stacks.json';
 const SQS_JOURNAL = process.env.SHIM_SQS_JOURNAL || STATE.replace(/[^/]*$/, 'sqs.journal');
 // W7: the box's webhook secret (infra-TAK's overlay). Absent or malformed = every webhook refused.
 const HOOK_SECRET = process.env.SHIM_HOOK_SECRET || '';
+// The AWS API answers only SigV4-signed calls made with this per-box secret (CloudTAK's api and
+// events carry it as AWS_SECRET_ACCESS_KEY). Absent or malformed = every AWS call refused.
+const AWS_SECRET = HOOK_SECRET_RE.test(process.env.SHIM_AWS_SECRET || '') ? process.env.SHIM_AWS_SECRET : '';
+const authRefusals = {};
+function authRefused(reason, ip) {
+    const now = Date.now(), r = authRefusals[reason] || (authRefusals[reason] = { n: 0, at: 0 });
+    r.n += 1;
+    if (now - r.at >= 60_000) { log(`AWS API refused (${reason}) x${r.n} last from ${ip}`); r.n = 0; r.at = now; }
+}
+const isLoopback = (a) => a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 const CAP_LABEL = 'com.cloudtak.capabilities';
 const NS = 'http://cloudformation.amazonaws.com/doc/2010-05-15/';
 
@@ -509,7 +519,16 @@ function apiHandler(req, res) {
     if (!etlNets || fromEtlNet(req.socket.remoteAddress)) { res.writeHead(403, { Connection: 'close' }); res.end(); return req.resume(); }
     readBody(req, res, async (body) => {
         try {
-            if (req.url === '/_status') return json(res, 200, statusDoc());
+            if (req.url === '/_status') {
+                // the console reads it with `docker exec` from inside this container
+                if (!isLoopback(req.socket.remoteAddress)) { res.writeHead(403); return res.end(); }
+                return json(res, 200, statusDoc());
+            }
+            const why = sigv4Verify({ method: req.method, url: req.url, headers: req.headers, body, secret: AWS_SECRET, timingSafeEqual });
+            if (why) {
+                authRefused(why, req.socket.remoteAddress);
+                return json(res, 403, { __type: 'InvalidSignatureException', message: 'The request signature does not match.' });
+            }
             const target = req.headers['x-amz-target'];
             if (target) return await jsonTarget(target, body, res);
             if (req.url.startsWith('/2015-03-31/functions')) return await lambda(req, res, body);

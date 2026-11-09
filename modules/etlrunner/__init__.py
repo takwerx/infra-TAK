@@ -63,19 +63,22 @@ def _q(s):
     return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def overlay_yml(ct_dir, uid, gid, socket_dir, data_dir, tls_dir, hook_secret=None, webhooks_url=None):
+def overlay_yml(ct_dir, uid, gid, socket_dir, data_dir, tls_dir, hook_secret=None, webhooks_url=None,
+                aws_secret=None):
     """The whole overlay file. `uid`/`gid` are the takwerx-etl ids etl_setup returned.
     W7: `hook_secret` goes to the shim only; `webhooks_url` (webhooks_base()) to api, so the URL
     CloudTAK shows on a layer is the working one. The file therefore holds a secret: 0600."""
     uid, gid = int(uid), int(gid)
     bundle = os.path.join(os.path.abspath(ct_dir), CA_BUNDLE)
+    # The shim's AWS API verifies SigV4 with this per-box secret; api/events sign with it.
+    aws_key = aws_secret if aws_secret and HOOK_SECRET_RE.match(str(aws_secret)) else None
     shim_ep = f'http://{AWS_ALIAS}:4000'
 
     def aws_env(services):
         lines = [f'      AWS_ENDPOINT_URL_{s}: {_q(shim_ep)}' for s in services]
         lines += [f'      AWS_REGION: {_q(AWS_REGION)}',
                   '      AWS_ACCESS_KEY_ID: "local"',
-                  '      AWS_SECRET_ACCESS_KEY: "local"',
+                  f'      AWS_SECRET_ACCESS_KEY: {_q(aws_key or "local")}',
                   f'      NODE_EXTRA_CA_CERTS: {_q(BUNDLE_IN_CONTAINER)}']
         return '\n'.join(lines)
 
@@ -118,7 +121,7 @@ services:
       SHIM_STATE: "/data/stacks.json"
       SHIM_TLS_CERT: "/tls/tls.pem"
       SHIM_TLS_KEY: "/tls/tls.key"
-{f'      SHIM_HOOK_SECRET: {_q(hook_secret)}' + chr(10) if hook_secret and HOOK_SECRET_RE.match(hook_secret) else ''}    volumes:
+{f'      SHIM_HOOK_SECRET: {_q(hook_secret)}' + chr(10) if hook_secret and HOOK_SECRET_RE.match(hook_secret) else ''}{f'      SHIM_AWS_SECRET: {_q(aws_key)}' + chr(10) if aws_key else ''}    volumes:
       - {_q(socket_dir + ':/run/etl')}
       - {_q(data_dir + ':/data')}
       - {_q(tls_dir + ':/tls:ro')}

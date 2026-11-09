@@ -49354,9 +49354,18 @@ def _etlrunner_sync_overlay(cloudtak_dir, log):
             pass
         changed = _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_BUNDLE), _etl.ca_bundle(crt, ca), in_place=True)
         secret = c.get('hook_secret')
+        if not _etl.HOOK_SECRET_RE.match(str(c.get('aws_secret') or '')):
+            # a box enabled before the shim checked signatures: create the key now. api, events
+            # and the shim all read it from this one overlay, so they change together.
+            s = load_settings()
+            c = _etlrunner_cfg(s)
+            c['aws_secret'] = _etl.new_hook_secret()
+            s['etl_runner'] = c
+            save_settings(s)
         hooks_url = _etl.webhooks_base(_cloudtak_env_read(os.path.join(cloudtak_dir, '.env')).get('API_URL'), secret)
         if _etlrunner_write(overlay, _etl.overlay_yml(cloudtak_dir, c['uid'], c['gid'], c['socket_dir'],
-                                                       c['data_dir'], c['tls_dir'], secret, hooks_url), mode=0o600):
+                                                       c['data_dir'], c['tls_dir'], secret, hooks_url,
+                                                       c.get('aws_secret')), mode=0o600):
             log(f"  ETL Runner: wrote {_etl.OVERLAY}")
             changed = True
         try:
@@ -49386,6 +49395,8 @@ def _etlrunner_setup(cloudtak_dir, log):
     c.update({k: r[k] for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')})
     if not _etl.HOOK_SECRET_RE.match(str(c.get('hook_secret') or '')):
         c['hook_secret'] = _etl.new_hook_secret()     # W7: settings.json is 0600
+    if not _etl.HOOK_SECRET_RE.match(str(c.get('aws_secret') or '')):
+        c['aws_secret'] = _etl.new_hook_secret()      # shim AWS API SigV4 key (api/events/shim)
     s['etl_runner'] = c
     save_settings(s)
     log(f"  ✓ ETL Runner setup: user {r.get('user')} ({r['uid']}:{r['gid']}), TLS {r.get('tls')}, "
@@ -49536,8 +49547,32 @@ def _etlrunner_hooks_converge(log=None):
     return want
 
 
+def _etlrunner_startup_converge():
+    """After an update: when the runner is on and the shim source or the overlay changed, run
+    the (idempotent) enable job once — rebuild the shim, egress first, then api/events/shim up
+    together. Otherwise a box keeps running the old shim until someone clicks Turn ETL on, and
+    a new key in the overlay could reach the shim but not api/events. Returns True if started."""
+    if not _etlrunner_cfg().get('enabled'):
+        return False
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHIM_HASH_LABEL, _etl.SHIM_IMAGE]),
+                       capture_output=True, text=True, timeout=30)
+    stale = r.returncode != 0 or r.stdout.strip() != _etl.shim_source_hash()
+    changed = _etlrunner_sync_overlay(ct_dir, lambda m: print(f"[etlrunner] {m.strip()}", flush=True))
+    if not (stale or changed):
+        return False
+    print(f"[etlrunner] startup: {'shim source changed' if stale else 'overlay changed'} — re-running enable",
+          flush=True)
+    return bool(mod_registry.job_start(_ETLRUNNER_KEY, 'enable', _etlrunner_job, ('enable',)))
+
+
 def _etlrunner_hooks_loop():
     time.sleep(90)
+    try:
+        _etlrunner_startup_converge()
+    except Exception as e:
+        print(f"[etlrunner] startup converge: {e}", flush=True)
     while True:
         try:
             if _etlrunner_cfg().get('enabled') or _etlrunner_cfg().get('hooks_route'):
@@ -49609,7 +49644,7 @@ def _etlrunner_job(action):
                 save_settings(s)
                 _cloudtak_ensure_custom_compose(ct_dir, log)
                 # both carry the secret in their env (api: WEBHOOKS_URL, shim: SHIM_HOOK_SECRET)
-                r = _broker_compose(ct_dir, f'up -d api {_etl.SHIM_SERVICE}', timeout=900)
+                r = _broker_compose(ct_dir, f'up -d api events {_etl.SHIM_SERVICE}', timeout=900)
                 if r.returncode != 0:
                     log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
                 else:
