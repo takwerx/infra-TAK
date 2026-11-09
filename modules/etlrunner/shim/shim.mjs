@@ -14,10 +14,10 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import fs from 'node:fs';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
-    parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO,
+    parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -25,6 +25,8 @@ const HOOK_PORT = 4001;                                       // webhooks — th
 const ETL_API = process.env.SHIM_ETL_API || 'http://api:5000';
 const BROKER_SOCK = process.env.SHIM_BROKER_SOCK || '/run/etl/broker.sock';
 const STATE = process.env.SHIM_STATE || '/data/stacks.json';
+// W7: the box's webhook secret (infra-TAK's overlay). Absent or malformed = every webhook refused.
+const HOOK_SECRET = process.env.SHIM_HOOK_SECRET || '';
 const CAP_LABEL = 'com.cloudtak.capabilities';
 const NS = 'http://cloudformation.amazonaws.com/doc/2010-05-15/';
 
@@ -361,7 +363,8 @@ let etlNets = null;         // [[base, maskBits], ...] of the ETL network
 const fromEtlNet = (addr) => etlNets.some((n) => inSubnet(addr, n));
 
 function statusDoc() {
-    return { active, queued: waiters.length, max_concurrent: MAX_CONCURRENT, keepwarm_sec: KEEPWARM_MS / 1000, warm_budget_mb: WARM_BUDGET_MB,
+    return { hooks: { secret: HOOK_SECRET_RE.test(HOOK_SECRET), layers: Object.values(stacks).filter((s) => s.fn.Webhook).length },
+        active, queued: waiters.length, max_concurrent: MAX_CONCURRENT, keepwarm_sec: KEEPWARM_MS / 1000, warm_budget_mb: WARM_BUDGET_MB,
         functions: Object.values(stacks).map((s) => ({ name: s.fn.FunctionName, image: s.fn.Image, schedule: s.fn.Schedule, outgoing: s.fn.Outgoing,
             webhook: s.fn.Webhook, warm: Boolean(warm[s.fn.FunctionName]), outgoing_backlog: queues[s.fn.FunctionName]?.q.length || 0,
             dead_letters: queues[s.fn.FunctionName]?.dead.length || 0, ...(status[s.fn.FunctionName] || { runs: 0, errors: 0, skipped: 0 }) })) };
@@ -388,20 +391,38 @@ function apiHandler(req, res) {
     });
 }
 
+// Refusals are logged at most once a minute per reason, with the source IP and never the path
+// (it may carry a guess at the secret, or the real one on a mismatched layer id).
+const hookRefusals = {};
+function hookRefused(reason, ip) {
+    const now = Date.now(), r = hookRefusals[reason] || (hookRefusals[reason] = { n: 0, at: 0 });
+    r.n += 1;
+    if (now - r.at >= 60_000) { log(`webhook refused (${reason}) x${r.n} last from ${ip}`); r.n = 0; r.at = now; }
+}
+
 function webhookHandler(req, res) {
+    const notFound = () => { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end('{"message":"Not Found"}'); };
+    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+    let u;
+    try { u = new URL(req.url, 'http://x'); } catch { hookRefused('bad url', ip); return notFound(); }
+    // Check the secret BEFORE reading a byte of the body: a refused caller costs nothing.
+    const route = hookRoute(u.pathname, HOOK_SECRET, timingSafeEqual);
+    if (route.refuse) { hookRefused(route.refuse, ip); req.resume(); return notFound(); }
+    const len = Number(req.headers['content-length'] || 0);
+    if (len > HOOK_MAX_BODY) { res.writeHead(413); res.end(); return req.destroy(); }
     readBody(req, res, async (body) => {
-        const u = new URL(req.url, 'http://x');
-        const [, uid, ...rest] = u.pathname.split('/');
+        if (body.length > HOOK_MAX_BODY) { res.writeHead(413); return res.end(); }
+        const { uid, rest } = route;
         const s = Object.values(stacks).find((x) => x.fn.Webhook && x.fn.Webhook === uid);
-        if (!s) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end('{"message":"Not Found"}'); }
+        if (!s) { hookRefused('unknown layer', ip); return notFound(); }
         const bin = !/^(text\/|application\/(json|xml|x-www-form-urlencoded))/.test(req.headers['content-type'] || 'text/plain');
         const routeKey = rest.length ? `ANY /${uid}/{proxy+}` : `ANY /${uid}`;
-        const event = { version: '2.0', routeKey, rawPath: u.pathname, rawQueryString: u.search.slice(1),
+        const event = { version: '2.0', routeKey, rawPath: route.rawPath, rawQueryString: u.search.slice(1),
             headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, [].concat(v).join(',')])),
             queryStringParameters: u.search ? Object.fromEntries(u.searchParams) : undefined,
             pathParameters: rest.length ? { proxy: rest.join('/') } : undefined,
-            requestContext: { accountId: '000000000000', apiId: 'etlshim', domainName: req.headers.host, http: { method: req.method, path: u.pathname,
-                protocol: `HTTP/${req.httpVersion}`, sourceIp: req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress, userAgent: req.headers['user-agent'] || '' },
+            requestContext: { accountId: '000000000000', apiId: 'etlshim', domainName: req.headers.host, http: { method: req.method, path: route.rawPath,
+                protocol: `HTTP/${req.httpVersion}`, sourceIp: ip, userAgent: req.headers['user-agent'] || '' },
                 requestId: randomUUID(), routeKey, stage: '$default', time: new Date().toUTCString(), timeEpoch: Date.now() },
             body: body.length ? (bin ? body.toString('base64') : body.toString()) : undefined, isBase64Encoded: Boolean(body.length && bin) };
         try {

@@ -123,3 +123,29 @@ test('normalizeFn: state from the spike (numeric env) is fixed; non-ETL images d
     assert.equal(normalizeFn({ FunctionName: '../a', Image: 'etl-local:etl-a-v1.0.0' }), null);
     assert.equal(normalizeFn(null), null);
 });
+
+// ---- W7 webhooks ----
+import { timingSafeEqual } from 'node:crypto';
+import { hookRoute, HOOK_PREFIX } from '../lib.mjs';
+const SEC = 'A'.repeat(43);
+test('hookRoute: right secret routes and strips prefix + secret', () => {
+    const r = hookRoute(`${HOOK_PREFIX}/${SEC}/1b2c-3d/a/b`, SEC, timingSafeEqual);
+    assert.deepEqual(r, { uid: '1b2c-3d', rest: ['a', 'b'], rawPath: '/1b2c-3d/a/b' });
+    assert.equal(hookRoute(`${HOOK_PREFIX}/${SEC}/abc`, SEC, timingSafeEqual).rawPath, '/abc');
+});
+test('hookRoute: wrong, short, missing secret refused', () => {
+    for (const p of [`${HOOK_PREFIX}/${'B'.repeat(43)}/abc`, `${HOOK_PREFIX}/AAA/abc`, `${HOOK_PREFIX}//abc`,
+        `${HOOK_PREFIX}/abc`, `/abc`, `/${SEC}/abc`, `/etl-hooksX/${SEC}/abc`]) {
+        assert.ok(hookRoute(p, SEC, timingSafeEqual).refuse, p);
+    }
+});
+test('hookRoute: no secret configured refuses everything (fail closed)', () => {
+    for (const s of ['', undefined, 'short', 'A'.repeat(44)]) {
+        assert.equal(hookRoute(`${HOOK_PREFIX}/${SEC}/abc`, s, timingSafeEqual).refuse, 'no secret configured');
+    }
+});
+test('hookRoute: bad layer id and dot segments refused', () => {
+    assert.ok(hookRoute(`${HOOK_PREFIX}/${SEC}/`, SEC, timingSafeEqual).refuse);
+    assert.ok(hookRoute(`${HOOK_PREFIX}/${SEC}/a$b`, SEC, timingSafeEqual).refuse);
+    assert.ok(hookRoute(`${HOOK_PREFIX}/${SEC}/abc/../x`, SEC, timingSafeEqual).refuse);
+});

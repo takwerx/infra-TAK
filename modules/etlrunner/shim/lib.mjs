@@ -192,3 +192,33 @@ export function inSubnet(addr, net) {
     const mask = net[1] ? (~0 << (32 - net[1])) >>> 0 : 0;
     return ((ip4(addr) & mask) >>> 0) === ((net[0] & mask) >>> 0);
 }
+
+// ---- W7: webhooks ----------------------------------------------------------------------------
+// The public route is https://<CloudTAK map host>/etl-hooks/<box secret>/<layer UniqueID>[/...].
+// CloudTAK shows WEBHOOKS_URL + '/' + layer uuid, and infra-TAK sets WEBHOOKS_URL to the part up
+// to the secret, so the URL CloudTAK hands out is the working one. Without the secret, nothing
+// reaches an ETL: several catalog ETLs accept unauthenticated webhooks (module-scan 2026-11-08).
+export const HOOK_PREFIX = '/etl-hooks';
+export const HOOK_SECRET_RE = /^[A-Za-z0-9_-]{43}$/;      // secrets.token_urlsafe(32): 256 bits
+export const HOOK_MAX_BODY = 1024 * 1024;
+
+// Constant-time string compare (equal length checked first; the length is public: 43).
+export function secretEqual(a, b, timingSafeEqual) {
+    const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+    return x.length === y.length && timingSafeEqual(x, y);
+}
+
+// pathname -> { uid, rest, rawPath } or { refuse: reason }. rawPath is the path the ETL sees:
+// '/<uid>/...' exactly as API Gateway would have passed it, without our prefix or the secret.
+export function hookRoute(pathname, secret, timingSafeEqual) {
+    if (!HOOK_SECRET_RE.test(String(secret || ''))) return { refuse: 'no secret configured' };
+    const parts = String(pathname).split('/');
+    // ['', 'etl-hooks', '<secret>', '<uid>', ...rest]
+    if (parts[0] !== '' || `/${parts[1]}` !== HOOK_PREFIX) return { refuse: 'not a hook path' };
+    if (!secretEqual(parts[2] || '', secret, timingSafeEqual)) return { refuse: 'bad secret' };
+    const uid = parts[3] || '';
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(uid)) return { refuse: 'bad layer id' };
+    const rest = parts.slice(4);
+    if (rest.some((p) => p === '..' || p === '.')) return { refuse: 'bad path' };
+    return { uid, rest, rawPath: '/' + [uid, ...rest].join('/') };
+}

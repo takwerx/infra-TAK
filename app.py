@@ -38252,6 +38252,8 @@ def generate_caddyfile(settings=None):
         lines.append(f"    @ct_pwa_entry path /sw.js /registerSW.js /manifest.webmanifest / /index.html")
         lines.append(f"    header @ct_pwa_entry Cache-Control \"no-cache, no-store, must-revalidate\"")
         lines += _ct_print_caddy[1]   # ops #222: `import cloudtak_print` (defined at the top)
+        if _etlrunner_hooks_wanted(settings):
+            lines += _etl.caddy_hook_lines()   # v10.4.0 W7
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
@@ -48906,7 +48908,7 @@ def _etlrunner_ct_local(settings):
         return False
 
 
-def _etlrunner_write(path, text, in_place=False):
+def _etlrunner_write(path, text, in_place=False, mode=0o644):
     """Write `text` only if it differs. `in_place` truncates the existing file instead of
     replacing it: a single-file bind mount pins the inode, so a rename would leave the
     running container reading the old file. Returns True when written."""
@@ -48917,11 +48919,13 @@ def _etlrunner_write(path, text, in_place=False):
     except FileNotFoundError:
         pass
     if in_place or not os.path.exists(path):
-        with open(path, 'w') as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, 'w') as f:
             f.write(text)
     else:
         tmp = path + '.infratak-tmp'
-        with open(tmp, 'w') as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)   # a 0600 file is never readable, even briefly
+        with os.fdopen(fd, 'w') as f:
             f.write(text)
         os.replace(tmp, path)
     return True
@@ -48953,10 +48957,16 @@ def _etlrunner_sync_overlay(cloudtak_dir, log):
         except OSError:
             pass
         changed = _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_BUNDLE), _etl.ca_bundle(crt, ca), in_place=True)
+        secret = c.get('hook_secret')
+        hooks_url = _etl.webhooks_base(_cloudtak_env_read(os.path.join(cloudtak_dir, '.env')).get('API_URL'), secret)
         if _etlrunner_write(overlay, _etl.overlay_yml(cloudtak_dir, c['uid'], c['gid'], c['socket_dir'],
-                                                       c['data_dir'], c['tls_dir'])):
+                                                       c['data_dir'], c['tls_dir'], secret, hooks_url), mode=0o600):
             log(f"  ETL Runner: wrote {_etl.OVERLAY}")
             changed = True
+        try:
+            os.chmod(overlay, 0o600)      # W7: it carries the webhook secret
+        except OSError:
+            pass
         return changed
     except Exception as e:
         log(f"  ⚠ ETL Runner overlay: {e}")
@@ -48978,6 +48988,8 @@ def _etlrunner_setup(cloudtak_dir, log):
     s = load_settings()
     c = _etlrunner_cfg(s)
     c.update({k: r[k] for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')})
+    if not _etl.HOOK_SECRET_RE.match(str(c.get('hook_secret') or '')):
+        c['hook_secret'] = _etl.new_hook_secret()     # W7: settings.json is 0600
     s['etl_runner'] = c
     save_settings(s)
     log(f"  ✓ ETL Runner setup: user {r.get('user')} ({r['uid']}:{r['gid']}), TLS {r.get('tls')}, "
@@ -49067,6 +49079,71 @@ def _etlrunner_net_missing():
     return [svc for svc, name in want.items() if name not in have]
 
 
+def _etlrunner_shim_status():
+    """The shim's own /_status (loopback inside its container), or None if it cannot be read."""
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', _ETLRUNNER_SHIM_CONTAINER, 'node', '-e',
+                                   'fetch("http://127.0.0.1:4000/_status").then((r) => r.text())'
+                                   '.then((t) => process.stdout.write(t)).catch(() => process.exit(3))']),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _etlrunner_hooks_wanted(settings=None):
+    """W7: the public webhook route exists only while the runner is on, the map host is a real
+    https name, and the shim reported at least one layer with webhooks on (hooks_route)."""
+    s = settings if settings is not None else load_settings()
+    c = _etlrunner_cfg(s)
+    return bool(c.get('enabled') and c.get('hooks_route') and _etl.HOOK_SECRET_RE.match(str(c.get('hook_secret') or '')))
+
+
+def _etlrunner_hooks_converge(log=None):
+    """Read the shim, record whether any layer has webhooks on, and regenerate + reload Caddy
+    when that flips. A shim that cannot be read changes nothing (no flapping on a restart).
+    Returns the current route state."""
+    log = log or (lambda m: print(f"[etlrunner] {m}", flush=True))
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    want = False
+    if c.get('enabled'):
+        st = _etlrunner_shim_status()
+        if st is None:
+            return bool(c.get('hooks_route'))
+        want = int(((st.get('hooks') or {}).get('layers')) or 0) > 0
+    if bool(c.get('hooks_route')) == want:
+        return want
+    c['hooks_route'] = want
+    s['etl_runner'] = c
+    save_settings(s)
+    generate_caddyfile(s)
+    ok, detail = _caddy_reload_if_changed(plog=log)
+    log(f"ETL webhooks route {'opened' if want else 'closed'} on the CloudTAK site"
+        f" ({'reloaded' if ok else 'reload FAILED: ' + str(detail)[:200]})")
+    return want
+
+
+def _etlrunner_hooks_loop():
+    time.sleep(90)
+    while True:
+        try:
+            if _etlrunner_cfg().get('enabled') or _etlrunner_cfg().get('hooks_route'):
+                _etlrunner_hooks_converge()
+        except Exception as e:
+            print(f"[etlrunner] webhooks route check: {e}", flush=True)
+        time.sleep(60)
+
+
+try:
+    threading.Thread(target=_etlrunner_hooks_loop, daemon=True, name='etl-hooks-route').start()
+except Exception:
+    pass
+
+
 def _etlrunner_job(action):
     job = mod_registry.job_state(_ETLRUNNER_KEY)
     log = lambda m: mod_registry.job_log(_ETLRUNNER_KEY, m.strip())
@@ -49107,6 +49184,23 @@ def _etlrunner_job(action):
                 else:
                     log("✓ ETL Runner enabled — etl-shim running, CloudTAK api/events pointed at it")
                     ok = True
+        elif action == 'rotate-hooks':
+            c = _etlrunner_cfg(s)
+            if not c.get('enabled'):
+                log("✗ ETL is off — nothing to rotate")
+            else:
+                c['hook_secret'] = _etl.new_hook_secret()
+                s['etl_runner'] = c
+                save_settings(s)
+                _cloudtak_ensure_custom_compose(ct_dir, log)
+                # both carry the secret in their env (api: WEBHOOKS_URL, shim: SHIM_HOOK_SECRET)
+                r = _broker_compose(ct_dir, f'up -d api {_etl.SHIM_SERVICE}', timeout=900)
+                if r.returncode != 0:
+                    log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+                else:
+                    log("✓ New webhook secret in place. Every old webhook URL now fails: copy the new"
+                        " URL from each layer in CloudTAK into the service that sends to it.")
+                    ok = True
         else:  # disable: keep images, stacks state and TLS; a re-enable picks up where it was
             if os.path.exists(os.path.join(ct_dir, _etl.OVERLAY)):
                 # while the overlay is still loaded, so compose knows the service
@@ -49128,6 +49222,7 @@ def _etlrunner_job(action):
                 # No ETL container is left, so the block has nothing to guard (rules kept on a
                 # failed compose: an ETL could still be around).
                 _etlrunner_egress('remove', log)
+                _etlrunner_hooks_converge(log)      # enabled is False now: closes the webhook route
                 log("✓ ETL Runner disabled — images and layer state kept")
                 ok = True
     except Exception as e:
@@ -49148,6 +49243,7 @@ def cloudtak_etl_status():
                     'overlay': os.path.exists(os.path.join(os.path.expanduser('~/CloudTAK'), _etl.OVERLAY)),
                     'shim': st.stdout.strip() if st.returncode == 0 else 'absent',
                     'net_missing': _etlrunner_net_missing() if c.get('enabled') else [],
+                    'webhooks': {'route': _etlrunner_hooks_wanted(s)},
                     'egress': {'enforced': bool(eg.get('enforced')), 'v4': bool(eg.get('v4')),
                                'v6': eg.get('v6'), 'allow': list(c.get('egress_allow') or [])},
                     'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
@@ -49189,7 +49285,7 @@ def cloudtak_etl_egress():
 @app.route('/api/cloudtak/etl/<action>', methods=['POST'])
 @login_required
 def cloudtak_etl_action(action):
-    if action not in ('enable', 'disable'):
+    if action not in ('enable', 'disable', 'rotate-hooks'):
         return jsonify({'error': 'unknown action'}), 404
     if not mod_registry.job_start(_ETLRUNNER_KEY, action, _etlrunner_job, (action,)):
         return jsonify({'error': 'an ETL Runner job is already running'}), 409

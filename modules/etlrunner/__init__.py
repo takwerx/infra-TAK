@@ -63,8 +63,10 @@ def _q(s):
     return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def overlay_yml(ct_dir, uid, gid, socket_dir, data_dir, tls_dir):
-    """The whole overlay file. `uid`/`gid` are the takwerx-etl ids etl_setup returned."""
+def overlay_yml(ct_dir, uid, gid, socket_dir, data_dir, tls_dir, hook_secret=None, webhooks_url=None):
+    """The whole overlay file. `uid`/`gid` are the takwerx-etl ids etl_setup returned.
+    W7: `hook_secret` goes to the shim only; `webhooks_url` (webhooks_base()) to api, so the URL
+    CloudTAK shows on a layer is the working one. The file therefore holds a secret: 0600."""
     uid, gid = int(uid), int(gid)
     bundle = os.path.join(os.path.abspath(ct_dir), CA_BUNDLE)
     shim_ep = f'http://{AWS_ALIAS}:4000'
@@ -89,7 +91,7 @@ services:
     environment:
 {aws_env(_API_SERVICES)}
       ECR_TASKS_REPOSITORY_NAME: "etl-local"
-    volumes:
+{f'      WEBHOOKS_URL: {_q(webhooks_url)}' + chr(10) if webhooks_url else ''}    volumes:
       - {_q(bundle + ':' + BUNDLE_IN_CONTAINER + ':ro')}
   events:
     environment:
@@ -116,7 +118,7 @@ services:
       SHIM_STATE: "/data/stacks.json"
       SHIM_TLS_CERT: "/tls/tls.pem"
       SHIM_TLS_KEY: "/tls/tls.key"
-    volumes:
+{f'      SHIM_HOOK_SECRET: {_q(hook_secret)}' + chr(10) if hook_secret and HOOK_SECRET_RE.match(hook_secret) else ''}    volumes:
       - {_q(socket_dir + ':/run/etl')}
       - {_q(data_dir + ':/data')}
       - {_q(tls_dir + ':/tls:ro')}
@@ -169,6 +171,47 @@ def egress_allow_norm(allow):
             raise ValueError(f'{n} is not a private network (public addresses are already allowed)')
         out.add(str(n))
     return sorted(out, key=lambda x: (ipaddress.ip_network(x).version, x))
+
+
+# ── W7: webhooks ─────────────────────────────────────────────────────────────────────────────
+HOOK_PATH = '/etl-hooks'                       # shim/lib.mjs HOOK_PREFIX
+HOOK_SECRET_RE = _re.compile(r'^[A-Za-z0-9_-]{43}$')
+
+
+def new_hook_secret():
+    import secrets
+    return secrets.token_urlsafe(32)           # 43 chars, 256 bits — lib.mjs HOOK_SECRET_RE
+
+
+def webhooks_base(api_url, secret):
+    """https://<CloudTAK map host>/etl-hooks/<secret> from CloudTAK's API_URL, or None when the
+    map host is not a plain https name (no public route is made then)."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(str(api_url or ''))
+    except ValueError:
+        return None
+    host = u.hostname or ''
+    if (u.scheme != 'https' or not _re.fullmatch(r'[A-Za-z0-9.-]{1,253}', host) or u.username
+            or u.password or u.path not in ('', '/') or not HOOK_SECRET_RE.match(str(secret or ''))):
+        return None
+    return f"https://{host}{f':{u.port}' if u.port else ''}{HOOK_PATH}/{secret}"
+
+
+def caddy_hook_lines(port=HOOK_LOOPBACK_PORT):
+    """Lines for the CloudTAK map site while at least one layer has webhooks on. The shim checks
+    the secret before it reads the body; Caddy caps the body and passes nothing else."""
+    return [
+        "    # ETL Runner webhooks (W7): only while a layer has webhooks on. The secret in the path",
+        "    # is checked by the shim; no access log on this site, so it is never written to disk.",
+        f"    @etl_hooks path {HOOK_PATH}/*",
+        "    handle @etl_hooks {",
+        "        request_body {",
+        "            max_size 1MB",
+        "        }",
+        f"        reverse_proxy 127.0.0.1:{int(port)}",
+        "    }",
+    ]
 
 
 def image_tag(prefix, version):

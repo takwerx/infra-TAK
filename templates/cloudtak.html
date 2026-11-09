@@ -342,6 +342,10 @@
         <button class="btn btn-primary" id="ct-etl-net-save" style="font-size:12px;padding:7px 14px">Save</button>
         <div style="width:100%;color:var(--text-dim)">Only for an ETL that must reach a server on your own network. Private addresses only. This server itself and the cloud metadata address stay blocked.</div>
       </div>
+      <div style="margin-top:6px">
+        <span id="ct-etl-hooks-state"></span>
+        <a id="ct-etl-hooks-rotate" style="color:var(--cyan);cursor:pointer;margin-left:8px">Change webhook password…</a>
+      </div>
     </div>
     <div id="ct-etl-filter-row" style="display:none;margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
       <input id="ct-etl-filter" type="search" placeholder="Search ETLs…" style="flex:1;min-width:200px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
@@ -457,6 +461,11 @@
             ns.style.color = 'var(--text-dim)';
           }
           document.getElementById('ct-etl-net-allow').value = allow.join(', ');
+          var hs = document.getElementById('ct-etl-hooks-state');
+          hs.style.color = 'var(--text-dim)';
+          hs.textContent = (st.webhooks && st.webhooks.route)
+            ? 'Webhooks: open — at least one layer receives webhooks. Each URL carries this server\u2019s webhook password; copy it from the layer in CloudTAK.'
+            : 'Webhooks: closed — no layer uses them, so there is no webhook address on the internet.';
         }
         return fetch('/api/cloudtak/etl/catalog');
       }).then(function(r){ return r.json(); }).then(function(d){
@@ -498,6 +507,11 @@
             body: JSON.stringify({allow: document.getElementById('ct-etl-net-allow').value})})
         .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
         .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); document.getElementById('ct-etl-net-form').style.display = 'none'; load(); });
+    };
+    document.getElementById('ct-etl-hooks-rotate').onclick = function(){
+      if (!confirm('Change the webhook password? Every webhook URL you already gave to an outside service stops working. You must copy each new URL from the layer in CloudTAK. CloudTAK restarts for about a minute.')) return;
+      fetch('/api/cloudtak/etl/rotate-hooks', {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'change webhook password'); });
     };
     filter.oninput = render;
     load();
