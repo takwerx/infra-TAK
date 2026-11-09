@@ -158,3 +158,14 @@ def test_route_needs_a_valid_secret():
     b = Box(route=True)
     b.settings['etl_runner']['hook_secret'] = 'short'
     assert b.ns['_etlrunner_hooks_wanted'](b.settings) is False
+
+
+def test_caddy_moves_the_secret_out_of_the_uri_before_proxying():
+    lines = [ln.strip() for ln in etl.caddy_hook_lines()]
+    i_route = lines.index('route {')
+    i_cookie = next(i for i, ln in enumerate(lines) if ln.startswith('request_header Cookie'))
+    i_uri = next(i for i, ln in enumerate(lines) if ln.startswith('uri path_regexp'))
+    i_proxy = next(i for i, ln in enumerate(lines) if ln.startswith('reverse_proxy'))
+    assert i_route < i_cookie < i_uri < i_proxy               # route keeps the written order
+    assert f'{etl.HOOK_COOKIE}={{http.request.uri.path.1}}' in lines[i_cookie]
+    assert lines[i_uri].endswith(f'{etl.HOOK_PATH}/{etl.HOOK_PATH_MASK}')

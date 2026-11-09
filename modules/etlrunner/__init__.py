@@ -199,18 +199,29 @@ def webhooks_base(api_url, secret):
     return f"https://{host}{f':{u.port}' if u.port else ''}{HOOK_PATH}/{secret}"
 
 
+HOOK_COOKIE = 'infratak_hook'                  # shim/lib.mjs HOOK_COOKIE
+HOOK_PATH_MASK = '_'                           # what the URI carries after Caddy moves the secret
+
+
 def caddy_hook_lines(port=HOOK_LOOPBACK_PORT):
-    """Lines for the CloudTAK map site while at least one layer has webhooks on. The shim checks
-    the secret before it reads the body; Caddy caps the body and passes nothing else."""
+    """Lines for the CloudTAK map site while at least one layer has webhooks on. The secret is
+    in the public URL (CloudTAK shows WEBHOOKS_URL/<layer>), but Caddy's error logger writes the
+    request URI and headers to the journal (seen live with the shim down). So Caddy moves the
+    secret into a Cookie it sets itself — Caddy redacts Cookie in logs, it replaces whatever the
+    client sent, and the shim never passes Cookie to an ETL — and rewrites the path segment to
+    `_` before the proxy. The shim checks the secret before it reads the body."""
     return [
-        "    # ETL Runner webhooks (W7): only while a layer has webhooks on. The secret in the path",
-        "    # is checked by the shim; no access log on this site, so it is never written to disk.",
+        "    # ETL Runner webhooks (W7): only while a layer has webhooks on.",
         f"    @etl_hooks path {HOOK_PATH}/*",
         "    handle @etl_hooks {",
         "        request_body {",
         "            max_size 1MB",
         "        }",
-        f"        reverse_proxy 127.0.0.1:{int(port)}",
+        "        route {",
+        f"            request_header Cookie \"{HOOK_COOKIE}={{http.request.uri.path.1}}\"",
+        f"            uri path_regexp ^{HOOK_PATH}/[^/]* {HOOK_PATH}/{HOOK_PATH_MASK}",
+        f"            reverse_proxy 127.0.0.1:{int(port)}",
+        "        }",
         "    }",
     ]
 

@@ -199,3 +199,15 @@ test('compile: FunctionName must be the stack name; webhook UniqueID is checked'
     assert.throws(() => compile2('test-layer-9', t('test-layer-9', { hook: true, uid: '../x' }), [], 'http://api:5000'), ValidationError);
     assert.equal(compile2('test-layer-9', t('test-layer-9', { hook: true }), [], 'http://api:5000').Webhook, 'abc-123');
 });
+
+import { hookCookie, HOOK_COOKIE, HOOK_MASK } from '../lib.mjs';
+test('hookRoute: the secret may come in Caddy\'s cookie when the path is masked', () => {
+    const p = `${HOOK_PREFIX}/${HOOK_MASK}/abc-1/x`;
+    assert.equal(hookRoute(p, SEC, timingSafeEqual, SEC).uid, 'abc-1');
+    assert.equal(hookRoute(p, SEC, timingSafeEqual, SEC).rawPath, '/abc-1/x');
+    for (const c of ['', '_', SEC.slice(1), 'x'.repeat(43)]) assert.ok(hookRoute(p, SEC, timingSafeEqual, c).refuse, c);
+    // a cookie never stands in for a wrong secret in the path
+    assert.ok(hookRoute(`${HOOK_PREFIX}/${'y'.repeat(43)}/abc`, SEC, timingSafeEqual, SEC).refuse);
+    assert.equal(hookCookie(`a=1; ${HOOK_COOKIE}=${SEC}; b=2`), SEC);
+    assert.equal(hookCookie('a=1'), '');
+});

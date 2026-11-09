@@ -219,12 +219,24 @@ export function secretEqual(a, b, timingSafeEqual) {
 
 // pathname -> { uid, rest, rawPath } or { refuse: reason }. rawPath is the path the ETL sees:
 // '/<uid>/...' exactly as API Gateway would have passed it, without our prefix or the secret.
-export function hookRoute(pathname, secret, timingSafeEqual) {
+// Caddy moves the secret out of the URI (its error log writes URIs) into this cookie and puts
+// HOOK_MASK in the path; Caddy redacts Cookie in logs. A direct call may still carry it in the path.
+export const HOOK_COOKIE = 'infratak_hook';
+export const HOOK_MASK = '_';
+export function hookCookie(cookieHeader) {
+    for (const part of String(cookieHeader || '').split(';')) {
+        const i = part.indexOf('=');
+        if (i > 0 && part.slice(0, i).trim() === HOOK_COOKIE) return part.slice(i + 1).trim();
+    }
+    return '';
+}
+export function hookRoute(pathname, secret, timingSafeEqual, cookieSecret = '') {
     if (!HOOK_SECRET_RE.test(String(secret || ''))) return { refuse: 'no secret configured' };
     const parts = String(pathname).split('/');
-    // ['', 'etl-hooks', '<secret>', '<uid>', ...rest]
+    // ['', 'etl-hooks', '<secret>' | '_', '<uid>', ...rest]
     if (parts[0] !== '' || `/${parts[1]}` !== HOOK_PREFIX) return { refuse: 'not a hook path' };
-    if (!secretEqual(parts[2] || '', secret, timingSafeEqual)) return { refuse: 'bad secret' };
+    const given = parts[2] === HOOK_MASK ? String(cookieSecret || '') : (parts[2] || '');
+    if (!secretEqual(given, secret, timingSafeEqual)) return { refuse: 'bad secret' };
     const uid = parts[3] || '';
     if (!/^[A-Za-z0-9-]{1,64}$/.test(uid)) return { refuse: 'bad layer id' };
     const rest = parts.slice(4);
@@ -287,7 +299,7 @@ export const sqsBytes = (m) => Buffer.byteLength(m?.MessageBody || '') + 512;
 // on the CloudTAK origin. Status must be an integer 200-599; only JSON or plain text; nothing
 // else from the ETL's headers survives.
 export const HOOK_SAFE_TYPE = /^(application\/json|text\/plain)(\s*;[\w=\-\s."]*)?$/i;
-const HOOK_FIXED_HEADERS = {
+export const HOOK_FIXED_HEADERS = {
     'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': "sandbox; default-src 'none'",
     'Cache-Control': 'no-store',

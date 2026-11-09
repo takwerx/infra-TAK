@@ -19,7 +19,7 @@ import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
     sqsReplay, sqsSnapshot, sqsBytes, SQS_MAX_PER_LAYER, SQS_MAX_DEAD, SQS_MAX_BYTES,
-    hookResponse, hookEventHeaders,
+    hookResponse, hookEventHeaders, hookCookie, HOOK_FIXED_HEADERS,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -530,19 +530,20 @@ function hookRefused(reason, ip) {
 }
 
 function webhookHandler(req, res) {
-    const notFound = () => { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end('{"message":"Not Found"}'); };
+    const reply = (code, body = '') => { res.writeHead(code, { ...HOOK_FIXED_HEADERS, 'Content-Type': 'application/json' }); res.end(body); };
+    const notFound = () => reply(404, '{"message":"Not Found"}');
     // X-Forwarded-For is Caddy's (it replaces a client's); an ETL on the ETL net could forge it.
     const peer = req.socket.remoteAddress;
     const ip = (etlNets && !fromEtlNet(peer) && req.headers['x-forwarded-for']?.split(',')[0].trim()) || peer;
     let u;
     try { u = new URL(req.url, 'http://x'); } catch { hookRefused('bad url', ip); return notFound(); }
     // Check the secret BEFORE reading a byte of the body: a refused caller costs nothing.
-    const route = hookRoute(u.pathname, HOOK_SECRET, timingSafeEqual);
+    const route = hookRoute(u.pathname, HOOK_SECRET, timingSafeEqual, hookCookie(req.headers.cookie));
     if (route.refuse) { hookRefused(route.refuse, ip); req.resume(); return notFound(); }
     const len = Number(req.headers['content-length'] || 0);
-    if (len > HOOK_MAX_BODY) { res.writeHead(413); res.end(); return req.destroy(); }
+    if (len > HOOK_MAX_BODY) { reply(413); return req.destroy(); }
     readBody(req, res, async (body) => {
-        if (body.length > HOOK_MAX_BODY) { res.writeHead(413); return res.end(); }
+        if (body.length > HOOK_MAX_BODY) return reply(413);
         const { uid, rest } = route;
         const s = Object.values(stacks).find((x) => x.fn.Webhook && x.fn.Webhook === uid);
         if (!s) { hookRefused('unknown layer', ip); return notFound(); }
@@ -558,7 +559,7 @@ function webhookHandler(req, res) {
             body: body.length ? (bin ? body.toString('base64') : body.toString()) : undefined, isBase64Encoded: Boolean(body.length && bin) };
         try {
             const { result, fnError } = await invoke(s.fn.FunctionName, event, 'Webhook');
-            if (fnError) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end('{"message":"Internal Server Error"}'); }
+            if (fnError) return reply(500, '{"message":"Internal Server Error"}');
             let r; try { r = JSON.parse(result.toString()); } catch { r = result.toString(); }
             const out = hookResponse(r);
             res.writeHead(out.status, out.headers);
@@ -566,7 +567,7 @@ function webhookHandler(req, res) {
         } catch (e) {
             log('webhook fail', e.message);
             if (res.headersSent) return res.destroy();
-            res.writeHead(e.code === 429 ? 429 : 502); res.end();
+            reply(e.code === 429 ? 429 : 502);
         }
     }, HOOK_MAX_BODY);
 }
