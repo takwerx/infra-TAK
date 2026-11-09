@@ -323,6 +323,7 @@ def _console(routes, version='10.2.23-alpha'):
     n = {'json': json, 'subprocess': _real_subprocess, 'os': os, 're': re, 'VERSION': version,
          'GITHUB_REPO': 'takwerx/infra-TAK'}
     _exec(n, '_console_pending_update', '_release_security_summary', '_security_section_summary',
+          '_release_notes_line',
           consts=('_SECURITY_RELEASE_HEADLINE_RE', '_SECURITY_SECTION_HEADING_RE', '_MD_MARKS_RE'))
     real = sys.modules['urllib.request']
     sys.modules['urllib.request'] = fake

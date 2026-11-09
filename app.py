@@ -539,6 +539,113 @@ def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True
                                  restart_on_error=restart_on_error)[0]
 
 
+# ops #580 — a module deploy used to reload Caddy, throw the result away and print
+# "Caddy config updated for <module>". Found in the 3:58 AM PT real-name fresh install of
+# 10.3.9: the TAK Portal name did not answer at the check because Caddy had no certificate for
+# it yet (it logged "obtaining certificate" 10 minutes later), and the deploy log had already
+# said "updated". The helpers below make the deploy log say only what was seen.
+CADDY_CERT_WAIT_S = 180     # how long a deploy waits for Caddy to serve a valid certificate
+CADDY_CERT_POLL_S = 5
+
+
+def _caddy_serves_cert(hostname, settings=None, timeout=5):
+    """Ask the local Caddy for `hostname` over TLS. Returns (ok, detail).
+
+    Connects to 127.0.0.1 and sends `hostname` as the SNI name, so the answer is what Caddy
+    itself holds for that name. Public DNS and a router with no NAT hairpin cannot change it.
+    The certificate must verify for the name. In custom-certificate mode (ssl_mode 'custom')
+    the operator's own chain may not be in this box's trust store, so there any certificate
+    counts: Caddy has the one it was given."""
+    custom = ((settings or {}).get('ssl_mode') or '').strip().lower() == 'custom'
+    try:
+        ctx = ssl.create_default_context()
+        if custom:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(('127.0.0.1', _caddy_https_port(settings)), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=hostname) as tls:
+                if not tls.getpeercert(binary_form=True):
+                    return False, 'Caddy sent no certificate'
+        return True, ''
+    except Exception as e:
+        return False, (str(e) or e.__class__.__name__)[:120]
+
+
+def _caddy_wait_for_cert(hostname, settings=None, max_wait=CADDY_CERT_WAIT_S,
+                         poll=CADDY_CERT_POLL_S, check=None, sleep=None, clock=None):
+    """Wait until Caddy serves a valid certificate for `hostname`. Returns (ok, detail, seconds).
+
+    Never raises. `detail` is the last failure when the wait ran out."""
+    check = check or (lambda h: _caddy_serves_cert(h, settings))
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    start = clock()
+    detail = ''
+    while True:
+        ok, detail = check(hostname)
+        if ok:
+            return True, '', int(clock() - start)
+        if clock() - start + poll > max_wait:
+            return False, detail, int(clock() - start)
+        sleep(poll)
+
+
+def _caddy_apply_and_verify(plog, label, hostnames=(), settings=None, wait_for_cert=True,
+                            max_wait=CADDY_CERT_WAIT_S, reload=None, read_caddyfile=None,
+                            wait=None):
+    """Reload Caddy after a module deploy rewrote the Caddyfile, then report what is true.
+
+    Returns 'ok', 'reload-failed', 'no-vhost' or 'no-cert'. The deploy log says
+    "Caddy config updated for <label>" only for 'ok': Caddy loaded the config, the file has
+    a vhost for every name in `hostnames`, and (when wait_for_cert) Caddy serves a valid
+    certificate for each of them. Never raises, so a Caddy problem cannot fail the deploy."""
+    reload = reload or _caddy_reload_checked
+    names = [h.split(':')[0] for h in hostnames if h]
+    try:
+        ok, detail = reload(plog)
+    except Exception as e:
+        ok, detail = False, str(e)[:160]
+    if not ok:
+        plog(f"  ✗ Caddy did not load the new config for {label}: {(detail or '').strip()[:160]}")
+        plog("    The running Caddy is still on its OLD config. Reload it from the Caddy page once fixed.")
+        return 'reload-failed'
+    if not names:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    try:
+        text = (read_caddyfile or (lambda: _read_priv(CADDYFILE_PATH)))()
+    except Exception as e:
+        text = None
+        plog(f"  ⚠ Could not read the Caddyfile to check the {label} vhost ({str(e)[:80]})")
+    if text is not None:
+        # Anchor on the leading newline: `tak.x` is a suffix of `infratak.x`.
+        missing = [n for n in names if ('\n%s {' % n) not in ('\n' + text)]
+        if missing:
+            plog(f"  ✗ Caddy was reloaded, but its config has no site for {', '.join(missing)}.")
+            plog(f"    Caddy is not serving {label} there, so no certificate will be issued for it.")
+            return 'no-vhost'
+    if not wait_for_cert:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    waiter = wait or (lambda h: _caddy_wait_for_cert(h, settings, max_wait=max_wait))
+    bad = []
+    for n in names:
+        plog(f"  Waiting for Caddy to serve a valid certificate for {n} (up to {max_wait}s)...")
+        w_ok, w_detail, secs = waiter(n)
+        if w_ok:
+            plog(f"  ✓ Certificate ready for {n} ({secs}s)")
+        else:
+            bad.append(n)
+            plog(f"  ⚠ No valid certificate for {n} after {secs}s: {w_detail}")
+    if bad:
+        plog(f"  ⚠ {label} is deployed and Caddy has its site, but {', '.join(bad)} has no valid")
+        plog("    certificate yet. Caddy keeps trying in the background. Check that the name points at this")
+        plog("    server, then look at: journalctl -u caddy | grep -i 'obtain\\|acme'")
+        return 'no-cert'
+    plog(f"  ✓ Caddy config updated for {label}")
+    return 'ok'
+
+
 def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
     """Load the on-disk Caddyfile ONLY if Caddy is not already running it. Returns (ok, detail).
 
@@ -27525,7 +27632,8 @@ def _console_pending_update(settings):
             local = ''
         if remote_full and not remote_full.startswith(local or 'XXXXXXXX'):
             return {'label': 'infra-TAK console', 'installed': f'v{VERSION} @ {local or "?"}',
-                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7]}
+                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7],
+                    'how': 'Console page → Update Now.'}
         return None
     req = urllib.request.Request(
         f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
@@ -27539,7 +27647,8 @@ def _console_pending_update(settings):
         if tag and _vt(tag) > _vt(VERSION):
             item = {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
                     'target': tag, 'identity': tag,
-                    'how': 'Console page → Update Now.'}
+                    'how': 'Console page → Update Now.',
+                    'release_url': f'https://github.com/{GITHUB_REPO}/releases/tag/{tag}'}
             # ops #168: name every security release between what runs here and the
             # target — skipping one (installed .20, security .22, latest .25) still
             # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
@@ -27550,6 +27659,7 @@ def _console_pending_update(settings):
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     rels = json.loads(resp.read().decode())
                 sec = []
+                notes = []
                 for rel in rels if isinstance(rels, list) else []:
                     rtag = (rel.get('tag_name') or '').strip()
                     if rel.get('draft') or not rtag:
@@ -27562,7 +27672,12 @@ def _console_pending_update(settings):
                     what = _release_security_summary(rel.get('body'))
                     if what:
                         sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
+                    line = _release_notes_line(rel.get('body'))
+                    if line:
+                        notes.append((_vt(rtag), f'{rtag}: {line}'))
                 item['security'] = [s for _, s in sorted(sec, reverse=True)]
+                # ops #547: one plain line per new release, newest first
+                item['release_notes'] = [n for _, n in sorted(notes, reverse=True)]
             except Exception as e:
                 item['security_unknown'] = True
                 print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
@@ -27620,6 +27735,28 @@ def _release_security_summary(body):
                 return m.group(1)[:240]
             break
     return _security_section_summary(lines)
+
+
+def _release_notes_line(body):
+    """ops #547: what a release means for users, as one plain line: the notes' headline
+    (the ship skill opens every release with a `## <what changed>` line), else the first
+    sentence of the first paragraph. Markdown stripped, capped. '' when there is nothing."""
+    for ln in (body or '').splitlines():
+        t = ln.strip()
+        if not t or t == '---' or t.startswith('<!--'):
+            continue
+        t = re.sub(r'^#{1,6}\s*', '', t)
+        t = re.sub(r'^[-*+]\s+', '', t)
+        t = _MD_MARKS_RE.sub('', t).strip()
+        # the mail relay turns ' " & < > into &#39; &quot; &amp; &lt; &gt; in plain text
+        t = re.sub(r'\s+', ' ', t.replace("'", '\u2019').replace('&', ' and ')
+                   .replace('"', '').replace('<', '').replace('>', '')).strip()
+        if not t:
+            continue
+        if len(t) > 240 and re.search(r'[.!?]\s', t):
+            t = re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0]
+        return t if len(t) <= 240 else t[:237].rstrip() + '...'
+    return ''
 
 
 def _semver_tuple(v):
@@ -28491,6 +28628,19 @@ def _update_notify_check_once(fast=False):
         except (TypeError, ValueError):
             return True
 
+    def _notes_lines(p):
+        # ops #547: what is in the update, in plain words: each new release's one line
+        # (newest first, at most 5), or a link when the notes could not be read.
+        notes = [n for n in (p.get('release_notes') or []) if n]
+        if notes:
+            out = ["      New in this update:"] + [f"        - {n}" for n in notes[:5]]
+            if len(notes) > 5:
+                out.append(f"        - (+{len(notes) - 5} older release{'s' if len(notes) != 6 else ''})")
+            return out
+        if p.get('release_url'):
+            return [f"      New in this update: {p['release_url']}"]
+        return []
+
     new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]
     emailed = False
     if new_items:
@@ -28508,6 +28658,7 @@ def _update_notify_check_once(fast=False):
             for p in pn_items:
                 lines.append(f"  • {p.get('summary') or p['label']}")
                 lines += [f"      {s}" for s in p.get('security') or []]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 rec = sent_pn.get(p['key'])
@@ -28525,6 +28676,7 @@ def _update_notify_check_once(fast=False):
             for p in sec_items:
                 lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
                 lines += [f"      {s}" for s in p['security']]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 lines.append('')
@@ -28535,6 +28687,9 @@ def _update_notify_check_once(fast=False):
             lines += [f"The following updates are pending on {server_id}:", '']
         for p in other:
             lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
+            lines += _notes_lines(p)
+            if p.get('how'):
+                lines.append(f"      To install: {p['how']}")
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
@@ -43873,8 +44028,8 @@ def run_takportal_deploy():
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            plog(f"  \u2713 Caddy config updated for TAK Portal")
+            # ops #580: say "updated" only after Caddy loaded it and serves a valid certificate.
+            _caddy_apply_and_verify(plog, 'TAK Portal', [_get_service_domain(settings, 'takportal')], settings)
             plog(f"  Open: https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}")
         plog("=" * 50)
         plog("")
@@ -44744,13 +44899,15 @@ paths:
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
     if mtx_domain:
-        plog(f"✓ Caddyfile updated — {mtx_domain} → {host}:5080")
+        # ops #580: report what Caddy really did, not that the file was written.
+        if _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings) == 'ok':
+            plog(f"✓ {mtx_domain} → {host}:5080")
     else:
-        plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
+        if _caddy_reload(plog):
+            plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
 
     # Step 8: SSL cert sync for RTSPS / HLS encryption
     plog("")
@@ -45590,9 +45747,10 @@ WantedBy=multi-user.target
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
-            _caddy_reload()
             mtx_domain = _get_service_domain(settings, 'mediamtx')
-            plog(f"✓ Caddyfile updated — {mtx_domain}")
+            # ops #580: the cert wait just below is this step's own; only the reload and the
+            # vhost are checked here.
+            _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings, wait_for_cert=False)
 
             # Wait up to 60s for cert
             cert_base = _caddy_acme_cert_base(mtx_domain)
@@ -52160,11 +52318,9 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             if domain:
                 generate_caddyfile(settings)
-                try:
-                    _caddy_reload()
-                    plog("✓ Caddy reloaded")
-                except subprocess.TimeoutExpired:
-                    plog("⚠ Caddy reload timed out — reload manually if needed")
+                # ops #580: _caddy_reload() never raises, so the old except was dead code and
+                # "Caddy reloaded" printed even when the reload failed.
+                _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
@@ -52281,11 +52437,8 @@ def run_cloudtak_redeploy(cfg=None):
             plog("⚠ API did not respond in time — if map.<domain> stays on 'Loading CloudTAK', check Container Logs and ensure the api container is running")
         if domain:
             generate_caddyfile(settings)
-            try:
-                _caddy_reload()
-                plog("✓ Caddy reloaded")
-            except subprocess.TimeoutExpired:
-                plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
+            # ops #580: see the remote path above; report what Caddy really did.
+            _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
@@ -53917,16 +54070,25 @@ def _webodm_odm_limits(detected_cores, cfg):
 #   wo_broker  — upstream WebODM still ships redis:7.0.10, end of life with open CVEs
 #                (CVE-2025-49844 Lua use-after-free, CVE-2025-21605, CVE-2025-32023, …).
 #                WebODM's Celery 4.4 / kombu 4.6 / redis-py 3.2 client runs against 8.x.
-#   wo_db      — upstream publishes only :latest (PostgreSQL 9.5 / PostGIS 2.3, an upstream
-#                limitation), so it is pinned by digest.
-WEBODM_VERSION = '3.3.1'
+#   wo_db      — WebODM 4.0 moved to PostgreSQL 18 (ops #579; 3.x ran 9.5 / PostGIS 2.3). The
+#                :18 tag is pinned by digest. On its first start over a 9.5 data dir the image
+#                upgrades it in place (db-upgrade-9-to-18): it copies the 9.5 cluster to
+#                db/backup-9.5, turns PostGIS columns into GeoJSON, and loads a new cluster into
+#                db/18. A 4.x database cannot be opened by 3.x, so Update dumps the 9.5 database
+#                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
+#                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
+WEBODM_VERSION = '4.0.0'
 WEBODM_IMAGES = {
-    'wo_db':      'webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+    'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
     'wo_broker':  'redis:8.10.2-alpine',
     'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_nodeodm': 'webodm/nodeodx:2.4.0',
 }
+WEBODM_DB_VOLUME = '/var/lib/postgresql/data'   # the db/ bind mount inside wo_db
+# Inside the volume root so it needs no host path; the upgrade leaves `backup-*` names alone.
+WEBODM_DB_DUMP_PREFIX = 'backup-infratak-'
+WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are small (metadata only)
 
 
 def _webodm_pin_images(compose_txt, services=None):
@@ -54628,6 +54790,111 @@ def _webodm_compose(wo_dir, action, timeout=300):
     flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied)."""
     return _broker_compose(wo_dir, action, timeout=timeout)
 
+def _webodm_db_sh(cmd, timeout=60):
+    """Run `sh -c cmd` as postgres inside wo_db (through the broker on a non-root box)."""
+    return subprocess.run(_sudo_wrap(['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd]),
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _webodm_db_needs_upgrade(wo_dir):
+    """True when wo_db holds a PostgreSQL 9.5 data dir (WebODM 3.x) that the 4.x image will
+    upgrade, False when it is already on 18. Starts wo_db first if it is down. Raises when the
+    database can't be read: Update must not start a one-way upgrade it can't back up."""
+    v = WEBODM_DB_VOLUME
+    probe = f'if [ -s {v}/18/PG_VERSION ]; then echo 18; else cat {v}/PG_VERSION; fi'
+    for attempt in range(13):
+        r = _webodm_db_sh(probe, timeout=15)
+        ver = (r.stdout or '').strip()
+        if r.returncode == 0 and ver:
+            return ver == '9.5'
+        if attempt == 0:
+            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120)
+        time.sleep(5)
+    raise RuntimeError('could not read the WebODM database version (is wo_db running?). Nothing was changed.')
+
+
+def _webodm_db_room_check(plog):
+    """Before the 9.5 → 18 upgrade: raise (nothing changed yet) unless the db volume has room."""
+    v = WEBODM_DB_VOLUME
+    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120)
+    try:
+        lines = r.stdout.strip().splitlines()
+        used_kb, free_kb = int(lines[0].split()[0]), int(lines[-1].split()[3])
+    except (IndexError, ValueError):
+        raise RuntimeError(f'could not measure the WebODM database: {(r.stderr or r.stdout or "")[:200]}')
+    # The upgrade keeps a full 9.5 copy and builds the new cluster beside it (upstream checks
+    # for 3x); our dump is at most one more.
+    need_kb = used_kb * 4
+    plog(f'  Database {used_kb // 1024} MB, free disk {free_kb // 1024} MB, needed {need_kb // 1024} MB')
+    if free_kb < need_kb:
+        raise RuntimeError(f'not enough free disk for the WebODM database upgrade ({need_kb // 1024} MB '
+                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again.')
+
+
+def _webodm_backup_db_95():
+    """pg_dumpall the 9.5 database into the db volume root (the upgrade leaves `backup-*` names
+    in place) and check the dump holds WebODM's database. Returns its path under the WebODM dir."""
+    v = WEBODM_DB_VOLUME
+    name =f'{WEBODM_DB_DUMP_PREFIX}{time.strftime("%Y%m%d-%H%M%S")}-pg95.sql'
+    r = _webodm_db_sh(f'pg_dumpall -U postgres -f {v}/{name} && gzip {v}/{name} && '
+                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800)
+    if r.returncode != 0 or (r.stdout or '').strip() != '1':
+        raise RuntimeError(f'database backup failed: {(r.stderr or r.stdout or "")[:300]}')
+    return f'db/{name}.gz'
+
+
+def _webodm_answers():
+    """True when Django in the webapp container answers HTTP. WebODM 4.x answers /api/ with
+    403 to a caller that isn't signed in (3.x: 200), so `curl -f` reads a healthy 4.x as down."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
+                                       '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return r.returncode == 0 and (r.stdout or '').strip()[:1] in ('2', '3', '4')
+
+
+def _webodm_wait_upgraded(deadline_s):
+    """Wait for the first 4.x start: (True, '') once the webapp answers, (False, why) when the
+    DB upgrade reports a failure or the time runs out."""
+    end = time.time() + deadline_s
+    while time.time() < end:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', 'wo_db']), capture_output=True, text=True, timeout=30)
+        if 'UPGRADE FAILED' in (r.stdout or '') + (r.stderr or ''):
+            return False, 'the database upgrade failed (details: db/upgrade.log)'
+        if _webodm_answers():
+            return True, ''
+        time.sleep(15)
+    return False, f'WebODM did not answer within {deadline_s // 60} minutes'
+
+
+def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
+    """Undo a failed 3.x → 4.x Update: put the untouched 9.5 copy (db/backup-9.5) back in the
+    volume root, rewrite the old compose and start 3.x again. Runs in a one-off wo_db container
+    (the 18 image has bash) so the console never touches the uid-999 data dir itself."""
+    plog('Putting the previous WebODM version back…')
+    _webodm_compose(wo_dir, 'stop', timeout=180)
+    v = WEBODM_DB_VOLUME
+    # The copy is renamed once restored: the next upgrade reuses a `backup-9.5` it finds instead
+    # of copying again, and this one would miss whatever 3.x writes from now on.
+    script = (f'set -e; cd {v}; if [ -s backup-9.5/PG_VERSION ]; then '
+              f'find . -mindepth 1 -maxdepth 1 ! -name "backup-*" ! -name upgrade.log ! -name lost+found '
+              f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; mv backup-9.5 backup-9.5-restored-$(date +%Y%m%d%H%M%S); '
+              f'fi; test "$(cat PG_VERSION)" = 9.5')
+    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800)
+    if r.returncode != 0:
+        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or "")[:300]}. '
+                           f'The untouched copy is in db/backup-9.5 and the dump in db/{WEBODM_DB_DUMP_PREFIX}*.')
+    _write_priv(compose_path, old_compose)
+    r = _webodm_compose(wo_dir, 'up -d', timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+    ok, _why = _webodm_wait_upgraded(300)
+    plog('  ✓ Previous WebODM version is running again with its data' if ok else
+         '  ⚠ Previous WebODM version started but does not answer yet — check: docker logs webapp')
+
+
 def _run_webodm_update():
     global _webodm_update_status
     wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
@@ -54645,18 +54912,44 @@ def _run_webodm_update():
         stripped = _webodm_strip_olefile(pinned)
         if stripped != pinned:
             plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
+        # ops #579: WebODM 3.x → 4.x upgrades the database from PostgreSQL 9.5 to 18, one way.
+        db_upgrade = _webodm_db_needs_upgrade(wo_dir)
+        if db_upgrade:
+            plog('This update upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+            _webodm_db_room_check(plog)
         if stripped != compose_txt:
             _write_priv(compose_path, stripped)
         plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
+            if stripped != compose_txt:
+                _write_priv(compose_path, compose_txt)   # leave the box on what it runs
             raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
+        if db_upgrade:
+            plog('Stopping WebODM and backing up its database…')
+            subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
+                           capture_output=True, text=True, timeout=180)
+            try:
+                dump = _webodm_backup_db_95()
+            except Exception:
+                _write_priv(compose_path, compose_txt)
+                _webodm_compose(wo_dir, 'up -d', timeout=180)
+                raise
+            plog(f'  ✓ Database backed up to {os.path.join(wo_dir, dump)}')
         plog('Restarting containers with new images…')
-        r = _webodm_compose(wo_dir, 'up -d', timeout=120)
+        r = _webodm_compose(wo_dir, 'up -d', timeout=180)
         plog(r.stdout[-300:] if r.stdout else '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+        if db_upgrade:
+            plog('Upgrading the database and starting WebODM (a few minutes)…')
+            ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
+            if not ok:
+                plog(f'  ✗ {why}')
+                _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
+                raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({why}); the previous version and its data are back.')
+            plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -54711,14 +55004,8 @@ def webodm_ready():
         return jsonify({'ready': True, 'status': 'healthy', 'url': wo_url})
 
     # 2. Fallback: probe WebODM's internal API endpoint directly from the container
-    try:
-        r2 = _sp.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
-                      'http://localhost:8000/api/']),
-                     capture_output=True, text=True, timeout=8)
-        if r2.returncode == 0:
-            return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
-    except Exception:
-        pass
+    if _webodm_answers():
+        return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
 
     # 3. Not ready yet — figure out a useful status message
     try:
@@ -59298,8 +59585,8 @@ volumes:
     if domain:
         plog("  Updating Caddy...")
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog(f"✓ Caddy updated — https://nodered.{domain}")
+        # ops #580: say "updated" only when Caddy loaded it and serves a valid certificate.
+        _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings)
     else:
         # v10.1.85 (field report, 2026-09-21): a remote deploy from a console with no
         # domain silently produced no route and no certificate anywhere.
@@ -59610,11 +59897,10 @@ volumes:
         # other half, so a failure there is named instead of aborting the whole deploy.
         if domain:
             generate_caddyfile(settings)
-            if _caddy_reload(plog):
-                plog(f"✓ Caddy updated — open via https://nodered.{domain}")
+            if _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings) == 'ok':
+                plog(f"  Open via https://{_pub_hostport(_get_service_domain(settings, 'nodered'), settings)}")
             else:
-                plog(f"  ⚠ Caddy did not reload cleanly — nodered.{domain} may not be")
-                plog(f"    reachable yet. Node-RED itself is running on port 1880.")
+                plog("  Node-RED itself is running on port 1880.")
         else:
             plog("  No domain configured — access via http://<server>:1880")
         if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.expanduser('~/authentik/.env')):
@@ -63470,8 +63756,8 @@ networks:
     settings['authentik_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
-    plog("✓ Caddyfile updated")
+    # ops #580: report the reload result; Authentik's own TLS wait runs in its deploy.
+    _caddy_apply_and_verify(plog, 'Authentik', (), settings)
 
     # v0.9.12 — remote Authentik firewall (security-hardened):
     #   * 9090/9443 (Authentik HTTP/HTTPS): NOT opened publicly. Compose
@@ -85196,8 +85482,7 @@ def _sync_webadmin_after_authentik_reconfigure(plog):
         plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog("  ✓ Caddy reloaded.")
+        _caddy_apply_and_verify(plog, 'WebAdmin', (), settings)
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
@@ -93547,8 +93832,8 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             try:
                 generate_caddyfile(settings)
-                _caddy_reload()
-                log_step("  ✓ Caddy config updated for TAK Server")
+                # ops #580: print "updated" only when Caddy took the config.
+                _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
 
@@ -94702,8 +94987,8 @@ def run_takserver_deploy(config):
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            log_step(f"  ✓ Caddy config updated for TAK Server")
+            # ops #580: print "updated" only when Caddy took the config.
+            _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
 
         # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
         if webadmin_pass and _get_authentik_env_content(settings):
@@ -98016,6 +98301,8 @@ _DBSERVER_IRREVERSIBLE = (
 )
 _dbserver_lock = threading.Lock()
 _dbserver_start_lock = threading.Lock()
+# infra-TAK #442 / ops #585: one preflight over SSH at a time (see _dbserver_preflight_once).
+_dbserver_preflight_lock = threading.Lock()
 _dbserver_watch_active = False
 _dbserver_log_cache = {}
 
@@ -98855,6 +99142,24 @@ def _dbserver_log_tail(job, limit=12000):
     return val[1], val[2]
 
 
+def _dbserver_preflight_once():
+    """(http_status, payload) for the read-only preflight, one SSH probe at a time.
+
+    infra-TAK #442 / ops #585: since 10.3.9 the database server card runs this on every
+    dashboard load. The console has 8 request threads, and a slow database server holds
+    each probe for up to 4 minutes; test pair 2026-11-09 (PostgreSQL frozen on the database
+    server): 9 dashboard loads left the console answering nothing, not even its login page,
+    for about 3.5 minutes. A second caller now gets an immediate 'busy' answer instead of a
+    second probe, so at most one request thread ever waits on the database server here."""
+    if not _dbserver_preflight_lock.acquire(blocking=False):
+        return 429, {'ok': False, 'busy': True,
+                     'error': 'the console is already checking the database server; try again in a minute'}
+    try:
+        return 200, _dbserver_preflight()
+    finally:
+        _dbserver_preflight_lock.release()
+
+
 @app.route('/api/console/dbserver/preflight')
 @login_required
 def console_dbserver_preflight_api():
@@ -98862,7 +99167,8 @@ def console_dbserver_preflight_api():
     if not _dbserver_routes_available():
         return jsonify({'ok': False, 'error': 'not a split install'}), 404
     try:
-        return jsonify(_dbserver_preflight())
+        code, payload = _dbserver_preflight_once()
+        return jsonify(payload), code
     except Exception as e:
         return jsonify({'ok': False, 'error': f'preflight error: {str(e)[:200]}'}), 500
 

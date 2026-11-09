@@ -79,13 +79,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      # tests/test_release_hygiene_ops354.py compares app.py's VERSION with the newest release tag.
+      # tests/test_release_hygiene_ops354.py compares app.py's VERSION with the newest release tag. For a
+      # PR into dev it reads only the PR's own README, never dev's live tip, so a release cut after the
+      # PR branched can't turn it red (ops #435, ops #586).
       - run: git fetch --depth=1 origin 'refs/tags/v*:refs/tags/v*'
-      # ...and, for a PR, its base branch: the test holds a PR into dev only to the release dev itself
-      # has, so a release tagged on main after the PR branched can't turn it red (ops #435).
-      - env:
-          BASE_REF: ${{ github.base_ref }}
-        run: git fetch --depth=1 origin "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'
