@@ -24,6 +24,7 @@ SHIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shim')
 SHIM_SOURCES = ('Dockerfile', 'lib.mjs', 'shim.mjs')
 SHIM_SERVICE = 'etl-shim'
 ETL_NETWORK = 'cloudtak_etl'
+ETL_BRIDGE = 'br-cloudtak-etl'            # fixed: the broker's W5 egress rules match this interface
 AWS_ALIAS = 'aws-local'                   # default-network-only: Docker DNS must never answer
                                           # api/events with the shim's ETL-net address (W5)
 AWS_REGION = 'us-east-1'                  # must match the broker's ETL_SQS_HOST
@@ -122,6 +123,8 @@ services:
 networks:
   etl:
     name: {_q(ETL_NETWORK)}
+    driver_opts:
+      com.docker.network.bridge.name: {_q(ETL_BRIDGE)}
 """
 
 
@@ -140,6 +143,32 @@ PREFIX_RE = _re.compile(r'^etl-[A-Za-z0-9-]{1,64}$')      # etl-AlertWest is mix
 VERSION_RE = _re.compile(r'^\d{1,4}\.\d{1,4}\.\d{1,4}$')
 SHA_RE = _re.compile(r'^[0-9a-f]{40}$')
 SOURCE_RE = _re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$')
+
+
+EGRESS_MAX_ALLOW = 32
+
+
+def egress_allow_norm(allow):
+    """The W5 allow-list rule, for the console to reject a bad list early. The broker applies
+    the same rule (_etl_egress_allow_norm) and is the authority. Raises ValueError."""
+    import ipaddress
+    if not isinstance(allow, list) or len(allow) > EGRESS_MAX_ALLOW:
+        raise ValueError(f'at most {EGRESS_MAX_ALLOW} CIDRs')
+    cgnat = ipaddress.ip_network('100.64.0.0/10')
+    out = set()
+    for a in allow:
+        try:
+            n = ipaddress.ip_network(str(a), strict=False)
+        except ValueError:
+            raise ValueError(f'bad CIDR: {str(a)[:60]!r}')
+        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified:
+            raise ValueError(f'{n} can never be allowed (loopback / link-local / multicast)')
+        if n.prefixlen < (8 if n.version == 4 else 16):
+            raise ValueError(f'{n} is too wide')
+        if not (n.is_private or (n.version == 4 and n.subnet_of(cgnat))):
+            raise ValueError(f'{n} is not a private network (public addresses are already allowed)')
+        out.add(str(n))
+    return sorted(out, key=lambda x: (ipaddress.ip_network(x).version, x))
 
 
 def image_tag(prefix, version):

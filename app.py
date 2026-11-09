@@ -49006,6 +49006,53 @@ def _etlrunner_build_image(log):
     return True
 
 
+def _etlrunner_egress(action, log, allow=None):
+    """W5: broker etl_egress apply/remove/status. apply goes in BEFORE compose up — the rules
+    match the bridge by name, so they hold from the first packet. Returns the broker reply,
+    or {'ok': False, 'error': ...}."""
+    req = {'op': 'etl_egress', 'action': action}
+    if action == 'apply':
+        req['allow'] = list(allow if allow is not None else (_etlrunner_cfg().get('egress_allow') or []))
+    try:
+        r = _broker_request(req, timeout=120)
+    except Exception as e:
+        r = {'ok': False, 'error': f'broker unreachable: {e}'}
+    if not isinstance(r, dict):
+        r = {'ok': False, 'error': str(r)}
+    if action != 'status':
+        if r.get('ok'):
+            log(f"  ✓ ETL egress block {'removed' if action == 'remove' else 'in place'}"
+                + (f" (allowed: {', '.join(r.get('allow') or []) or 'none'}; {r.get('state')})" if action == 'apply' else ''))
+        else:
+            log(f"  ✗ ETL egress block {action}: {r.get('error')}")
+    return r
+
+
+def _etlrunner_net_migrate(log):
+    """A cloudtak_etl network made before W5 has Docker's generated bridge name, so the egress
+    rules would not match it. Remove it (detaching what is on it) and let compose recreate it
+    with the fixed name. Returns False only when it is wrong and could not be removed."""
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                   '{{ index .Options "com.docker.network.bridge.name" }}|'
+                                   '{{ range .Containers }}{{ .Name }} {{ end }}', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return True                      # absent: compose creates it right
+    name, _, members = r.stdout.strip().partition('|')
+    if name == _etl.ETL_BRIDGE:
+        return True
+    log(f"  Recreating {_etl.ETL_NETWORK} with bridge {_etl.ETL_BRIDGE} (was {name or 'auto-named'})")
+    for c in members.split():
+        subprocess.run(_sudo_wrap(['docker', 'network', 'disconnect', '-f', _etl.ETL_NETWORK, c]),
+                       capture_output=True, text=True, timeout=60)
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'rm', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        log(f"  ✗ could not remove {_etl.ETL_NETWORK}: {(r.stderr or r.stdout).strip()[-200:]}")
+        return False
+    return True
+
+
 def _etlrunner_job(action):
     job = mod_registry.job_state(_ETLRUNNER_KEY)
     log = lambda m: mod_registry.job_log(_ETLRUNNER_KEY, m.strip())
@@ -49019,6 +49066,11 @@ def _etlrunner_job(action):
             elif not _etlrunner_ct_local(s):
                 log("✗ ETL Runner needs CloudTAK on this box (a remote CloudTAK is not supported)")
             elif _etlrunner_setup(ct_dir, log) and _etlrunner_build_image(log):
+                # W5 first: no ETL container may ever start without the egress block.
+                if not _etlrunner_egress('apply', log).get('ok'):
+                    raise RuntimeError('egress block could not be applied — not enabling')
+                if not _etlrunner_net_migrate(log):
+                    raise RuntimeError(f'{_etl.ETL_NETWORK} has the wrong bridge — not enabling')
                 s = load_settings()
                 c = _etlrunner_cfg(s)
                 c['enabled'] = True
@@ -49049,6 +49101,9 @@ def _etlrunner_job(action):
             if r.returncode != 0:
                 log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
             else:
+                # No ETL container is left, so the block has nothing to guard (rules kept on a
+                # failed compose: an ETL could still be around).
+                _etlrunner_egress('remove', log)
                 log("✓ ETL Runner disabled — images and layer state kept")
                 ok = True
     except Exception as e:
@@ -49064,10 +49119,46 @@ def cloudtak_etl_status():
     st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Status}}', _ETLRUNNER_SHIM_CONTAINER]),
                         capture_output=True, text=True, timeout=10)
     job = mod_registry.job_state(_ETLRUNNER_KEY)
+    eg = _etlrunner_egress('status', lambda m: None) if c.get('enabled') else {}
     return jsonify({'enabled': bool(c.get('enabled')), 'local_cloudtak': _etlrunner_ct_local(s),
                     'overlay': os.path.exists(os.path.join(os.path.expanduser('~/CloudTAK'), _etl.OVERLAY)),
                     'shim': st.stdout.strip() if st.returncode == 0 else 'absent',
+                    'egress': {'enforced': bool(eg.get('enforced')), 'v4': bool(eg.get('v4')),
+                               'v6': eg.get('v6'), 'allow': list(c.get('egress_allow') or [])},
                     'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
+
+
+@app.route('/api/cloudtak/etl/egress', methods=['POST'])
+@login_required
+def cloudtak_etl_egress():
+    """W5 admin allow-list: private CIDRs ETL containers may reach (a LAN ArcGIS, say). The
+    broker validates (private only; never loopback / link-local / the host itself) and is the
+    authority — settings only remember the list for the UI and the next enable."""
+    data = request.get_json(silent=True) or {}
+    allow = data.get('allow')
+    if isinstance(allow, str):
+        allow = [a.strip() for a in re.split(r'[\s,]+', allow) if a.strip()]
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        return jsonify({'ok': False, 'error': 'allow must be a list of CIDRs'}), 400
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    if c.get('enabled'):
+        r = _etlrunner_egress('apply', lambda m: None, allow=allow)
+        if not r.get('ok'):
+            return jsonify({'ok': False, 'error': r.get('error') or 'refused'}), 400
+        allow = r.get('allow') or []
+    else:
+        # Validate the same way even while off, so a bad list fails now, not at enable.
+        try:
+            allow = _etl.egress_allow_norm(allow)
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    c['egress_allow'] = allow
+    s['etl_runner'] = c
+    save_settings(s)
+    return jsonify({'ok': True, 'allow': allow})
 
 
 @app.route('/api/cloudtak/etl/<action>', methods=['POST'])

@@ -47,6 +47,7 @@ import base64
 import grp
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -4065,6 +4066,256 @@ def _etl_tls_ensure(etl_gid):
         return {'ca_pem': f.read(), 'state': state}
 
 
+# ---------------------------------------------------------------------------
+# ETL Runner W5 (v10.4.0): egress block for ETL containers.
+#
+# ETLs run third-party code with network access. Docker already keeps them off CloudTAK's
+# other networks, but two paths stay open without this: (1) through the bridge to any
+# private / CGNAT / link-local address — the LAN, other boxes, a cloud's metadata service
+# (169.254.169.254 hands out instance credentials); (2) to the HOST itself (console :5001,
+# TAK :8443/:8089, every published container port), which is INPUT, not FORWARD, so
+# DOCKER-USER never sees it. The ETL network has a fixed bridge name, so both rule sets
+# match the interface and survive container restarts. Allowed: the ETL network itself
+# (ETL -> api:5000), DNS, the public internet, and admin-listed private CIDRs (FORWARD
+# only — the allow-list can never open the host). Rejected, not dropped, so a blocked ETL
+# fails fast with a clear error instead of hanging to its timeout.
+# State: ETL_EGRESS_CONF (root 0600). Present = enforced; the egress-watch thread re-asserts
+# the rules every ETL_EGRESS_HEAL_SEC (reboot, docker restart, firewall reload).
+# ---------------------------------------------------------------------------
+ETL_BRIDGE = 'br-cloudtak-etl'                  # 15 chars: the Linux IFNAMSIZ limit
+ETL_EGRESS_CHAIN = 'TAKWERX-ETL'
+ETL_EGRESS_CHAIN_IN = 'TAKWERX-ETL-IN'
+ETL_EGRESS_CONF = '/var/lib/takwerx-etl-egress.json'
+ETL_EGRESS_HEAL_SEC = 60
+ETL_EGRESS_MAX_ALLOW = 32
+ETL_EGRESS_BLOCK = {
+    4: ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
+        '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4',
+        '240.0.0.0/4'),
+    6: ('::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8'),
+}
+_ETL_EGRESS_LOCK = threading.Lock()
+_ETL_EGRESS_WATCH = {'started': False}
+
+
+def _etl_egress_allow_norm(allow):
+    """Validate the admin allow-list. Every entry must be a private / CGNAT network (that is
+    the only thing the block stops, so anything else is a mistake) and never loopback or
+    link-local — the metadata service stays blocked whatever an admin types. Returns the
+    sorted, de-duplicated canonical strings. Raises Denied."""
+    if not isinstance(allow, list) or len(allow) > ETL_EGRESS_MAX_ALLOW:
+        raise Denied(f'etl_egress: allow must be a list of at most {ETL_EGRESS_MAX_ALLOW} CIDRs')
+    out = set()
+    cgnat = ipaddress.ip_network('100.64.0.0/10')
+    for a in allow:
+        if not isinstance(a, str) or not re.fullmatch(r'[0-9A-Fa-f:./]{2,49}', a):
+            raise Denied(f'etl_egress: bad CIDR: {str(a)[:60]!r}')
+        try:
+            n = ipaddress.ip_network(a, strict=False)
+        except ValueError:
+            raise Denied(f'etl_egress: bad CIDR: {a!r}')
+        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified:
+            raise Denied(f'etl_egress: {n} can never be allowed (loopback / link-local / multicast)')
+        if n.prefixlen < (8 if n.version == 4 else 16):
+            raise Denied(f'etl_egress: {n} is too wide')
+        if not (n.is_private or (n.version == 4 and n.subnet_of(cgnat))):
+            raise Denied(f'etl_egress: {n} is not a private network (public addresses are already allowed)')
+        out.add(str(n))
+    return sorted(out, key=lambda s: (ipaddress.ip_network(s).version, s))
+
+
+def _etl_egress_specs(version, allow):
+    """(forward_rules, input_rules) for one IP family, each rule an argv tail after
+    `-A <chain>`. The first FORWARD rule carries a hash of the whole set, so a check is one
+    `-S` and a grep, independent of how a given iptables version prints the rest."""
+    fwd = [['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'RETURN'],
+           ['-o', ETL_BRIDGE, '-j', 'RETURN'],
+           ['-p', 'udp', '--dport', '53', '-j', 'RETURN'],
+           ['-p', 'tcp', '--dport', '53', '-j', 'RETURN']]
+    fwd += [['-d', a, '-j', 'RETURN'] for a in allow if ipaddress.ip_network(a).version == version]
+    rej = 'icmp-admin-prohibited' if version == 4 else 'adm-prohibited'
+    fwd += [['-d', b, '-j', 'REJECT', '--reject-with', rej] for b in ETL_EGRESS_BLOCK[version]]
+    inp = [['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'RETURN'],
+           ['-j', 'REJECT', '--reject-with', rej]]
+    tag = hashlib.sha256(json.dumps([fwd, inp]).encode()).hexdigest()[:16]
+    for rules in (fwd, inp):
+        rules.insert(0, ['-m', 'comment', '--comment', f'takwerx-etl-{tag}'])
+    return fwd, inp, tag
+
+
+def _etl_egress_tools():
+    """[(version, iptables-binary)] for the families this box has. IPv4 is required."""
+    out = []
+    for v, name in ((4, 'iptables'), (6, 'ip6tables')):
+        b = shutil.which(name, path=BROKER_TRUSTED_PATH)
+        if b:
+            out.append((v, b))
+    return out
+
+
+def _ipt(binary, *args):
+    return subprocess.run([binary, '-w', '10', *args], capture_output=True, text=True, timeout=30)
+
+
+def _etl_egress_converge(allow):
+    """Make the rules exactly what `allow` says, for every family. Idempotent and cheap when
+    already right (a few -S/-C calls). Returns {'v4': state, 'v6': state}; raises
+    RuntimeError if IPv4 could not be enforced."""
+    states = {}
+    tools = _etl_egress_tools()
+    if not any(v == 4 for v, _ in tools):
+        raise RuntimeError('iptables not found')
+    for v, ipt in tools:
+        fwd, inp, tag = _etl_egress_specs(v, allow)
+        try:
+            changed = False
+            for chain, rules in ((ETL_EGRESS_CHAIN, fwd), (ETL_EGRESS_CHAIN_IN, inp)):
+                cur = _ipt(ipt, '-S', chain)
+                if cur.returncode != 0:
+                    r = _ipt(ipt, '-N', chain)
+                    if r.returncode != 0:
+                        raise RuntimeError(f'-N {chain}: {r.stderr.strip()[-200:]}')
+                    cur_lines = []
+                else:
+                    cur_lines = [ln for ln in cur.stdout.splitlines() if ln.startswith('-A ')]
+                ok = (len(cur_lines) == len(rules)
+                      and f'takwerx-etl-{tag}' in (cur_lines[0] if cur_lines else ''))
+                if not ok:
+                    _ipt(ipt, '-F', chain)
+                    for spec in rules:
+                        r = _ipt(ipt, '-A', chain, *spec)
+                        if r.returncode != 0:
+                            raise RuntimeError(f'-A {chain} {" ".join(spec)}: {r.stderr.strip()[-200:]}')
+                    changed = True
+            # Hooks. FORWARD goes through DOCKER-USER when Docker made it (Docker keeps that
+            # jump first in FORWARD); otherwise FORWARD itself.
+            hook = 'DOCKER-USER' if _ipt(ipt, '-S', 'DOCKER-USER').returncode == 0 else 'FORWARD'
+            for parent, child in ((hook, ETL_EGRESS_CHAIN), ('INPUT', ETL_EGRESS_CHAIN_IN)):
+                jump = ['-i', ETL_BRIDGE, '-j', child]
+                if _ipt(ipt, '-C', parent, *jump).returncode != 0:
+                    r = _ipt(ipt, '-I', parent, '1', *jump)
+                    if r.returncode != 0:
+                        raise RuntimeError(f'-I {parent}: {r.stderr.strip()[-200:]}')
+                    changed = True
+            states[f'v{v}'] = 'applied' if changed else 'kept'
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            if v == 4:
+                raise RuntimeError(f'IPv4: {e}')
+            states[f'v{v}'] = f'error: {e}'[:200]     # IPv6 off / no ip6 filter table
+    return states
+
+
+def _etl_egress_teardown():
+    """Remove every hook and both chains, all families. Idempotent."""
+    for _v, ipt in _etl_egress_tools():
+        for parent, child in (('DOCKER-USER', ETL_EGRESS_CHAIN), ('FORWARD', ETL_EGRESS_CHAIN),
+                              ('INPUT', ETL_EGRESS_CHAIN_IN)):
+            for _ in range(8):           # duplicates from an older bug must not survive
+                if _ipt(ipt, '-D', parent, '-i', ETL_BRIDGE, '-j', child).returncode != 0:
+                    break
+        for chain in (ETL_EGRESS_CHAIN, ETL_EGRESS_CHAIN_IN):
+            _ipt(ipt, '-F', chain)
+            _ipt(ipt, '-X', chain)
+
+
+def _etl_egress_conf_read():
+    try:
+        with open(ETL_EGRESS_CONF) as f:
+            c = json.load(f)
+        return _etl_egress_allow_norm(c.get('allow') or [])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, Denied):
+        return []        # damaged state: enforce with no allow-list (fail closed)
+
+
+def _etl_egress_conf_write(allow):
+    if os.path.islink(ETL_EGRESS_CONF):
+        os.unlink(ETL_EGRESS_CONF)
+    part = ETL_EGRESS_CONF + '.new'
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({'allow': allow}, f)
+    os.replace(part, ETL_EGRESS_CONF)
+
+
+def _etl_egress_watch():
+    while True:
+        time.sleep(ETL_EGRESS_HEAL_SEC)
+        try:
+            with _ETL_EGRESS_LOCK:
+                allow = _etl_egress_conf_read()
+                if allow is None:
+                    continue
+                st = _etl_egress_converge(allow)
+            if 'applied' in st.values() and AUDIT:
+                AUDIT.info(json.dumps({'op': 'etl_egress', 'verdict': 'INFO',
+                                       'summary': f'egress rules re-applied: {st}'}))
+        except Exception as e:  # noqa: BLE001 — the watch must outlive one bad pass
+            if AUDIT:
+                AUDIT.info(json.dumps({'op': 'etl_egress', 'verdict': 'ERROR',
+                                       'summary': f'egress heal failed: {e}'[:300]}))
+
+
+def _etl_egress_watch_start():
+    with _ETL_EGRESS_LOCK:
+        if _ETL_EGRESS_WATCH['started']:
+            return
+        _ETL_EGRESS_WATCH['started'] = True
+    if _etl_egress_conf_read() is not None:
+        try:
+            with _ETL_EGRESS_LOCK:
+                _etl_egress_converge(_etl_egress_conf_read())
+        except Exception:  # noqa: BLE001 — the watch retries in a minute
+            pass
+    threading.Thread(target=_etl_egress_watch, daemon=True, name='etl-egress-watch').start()
+
+
+def _check_etl_egress(req):
+    extra = set(req) - {'op', 'action', 'allow', 'timeout'}
+    if extra:
+        raise Denied(f'etl_egress: unknown fields: {sorted(extra)}')
+    action = req.get('action')
+    if action not in ('apply', 'remove', 'status'):
+        raise Denied(f'etl_egress: unknown action: {action!r}')
+    if action == 'apply':
+        _etl_egress_allow_norm(req.get('allow', []))
+    elif 'allow' in req:
+        raise Denied(f'etl_egress {action}: takes no allow')
+
+
+def _do_etl_egress(req):
+    action = req['action']
+    with _ETL_EGRESS_LOCK:
+        if action == 'apply':
+            allow = _etl_egress_allow_norm(req.get('allow', []))
+            _etl_egress_conf_write(allow)        # first: the watch enforces even if this pass fails
+            try:
+                st = _etl_egress_converge(allow)
+            except RuntimeError as e:
+                return {'ok': False, 'error': str(e)[-300:]}
+            return {'ok': True, 'allow': allow, 'state': st}
+        if action == 'remove':
+            if os.path.lexists(ETL_EGRESS_CONF):
+                os.unlink(ETL_EGRESS_CONF)
+            _etl_egress_teardown()
+            return {'ok': True}
+        allow = _etl_egress_conf_read()
+        out = {'ok': True, 'enforced': allow is not None, 'allow': allow or [],
+               'bridge': os.path.isdir(f'/sys/class/net/{ETL_BRIDGE}')}
+        for v, ipt in _etl_egress_tools():
+            _fwd, _inp, tag = _etl_egress_specs(v, allow or [])
+            hook = 'DOCKER-USER' if _ipt(ipt, '-S', 'DOCKER-USER').returncode == 0 else 'FORWARD'
+            s = _ipt(ipt, '-S', ETL_EGRESS_CHAIN)
+            si = _ipt(ipt, '-S', ETL_EGRESS_CHAIN_IN)
+            out[f'v{v}'] = bool(
+                s.returncode == 0 and f'takwerx-etl-{tag}' in s.stdout
+                and si.returncode == 0 and f'takwerx-etl-{tag}' in si.stdout
+                and _ipt(ipt, '-C', hook, '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode == 0
+                and _ipt(ipt, '-C', 'INPUT', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN_IN).returncode == 0)
+        return out
+
+
 _ETL_SRV = {'srv': None}
 _ETL_SRV_LOCK = threading.Lock()
 
@@ -4181,6 +4432,8 @@ def _evaluate(req):
         elif op == 'etl_setup':
             if set(req) - {'op', 'timeout'}:
                 raise Denied('etl_setup: takes no fields')
+        elif op == 'etl_egress':
+            _check_etl_egress(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -4337,6 +4590,15 @@ def _dispatch(req, peer):
         if verdict == 'DENY':
             return {'ok': False, 'code': 'DENIED', 'error': reason}
         return _do_etl_setup(req)
+    if op == 'etl_egress':
+        # Console-only (main socket). Not reachable from the ETL socket: the shim must never
+        # be able to loosen the box's own egress block.
+        verdict, reason = _evaluate(req)
+        audit(peer, 'etl_egress', f"{req.get('action')} allow={req.get('allow') or []}"[:300],
+              verdict, reason)
+        if verdict == 'DENY':
+            return {'ok': False, 'code': 'DENIED', 'error': reason}
+        return _do_etl_egress(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
         summary = _summary(req)
@@ -4921,6 +5183,7 @@ def serve():
                                           '(TAKWERX_BROKER_RECYCLE_SECS test hook)' % _after}))
     _audit_clean_window_cached()   # warm the readiness cache so the first ping is fast
     _etl_listener_start()          # no-op unless the ETL Runner created its user (v10.4.0)
+    _etl_egress_watch_start()      # re-asserts the ETL egress block while it is configured (W5)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
