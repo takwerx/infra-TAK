@@ -2769,9 +2769,20 @@ TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
 #             so `import /etc/shadow` is refused and only a line number is echoed, never file
 #             contents (TAK Portal #81, ops #340). Versions 2 (2.0.23-2.0.24) and the 2.0.26/2.0.28
 #             build ran `caddy validate` as root on caller text; they stay unpinned.
+#   0eb07556… version 4, 2.0.31: same as 4d093f4b… except the as-root fallback of `caddy validate`
+#             only carries on when EVERY error line is permission-denied AND names /var/log/caddy or
+#             /var/lib/caddy (before: any all-permission-denied output). A tightening; no new command,
+#             path or input. Reviewed by Security Fri Nov 6, 2026 (ops #538).
+#   5996839d… 2.0.32 (still prints version 4): 0eb07556… plus docker_compose_with_pull_retry, which wraps
+#             the two `docker compose build/up` calls `rebuild` already made and retries up to 3 times on
+#             a dropped Docker Hub layer or 5xx (never on a 429). Fixed command, mktemp log it deletes,
+#             one digits-only env var. No new caller-controlled input or privilege. Reviewed by Security
+#             Fri Nov 6, 2026 (ops #538).
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
+    '0eb07556d0d3618574ce4b135bf8866fca269c053c67f61c8e0ad97defa26cb6',
+    '5996839d6d663e3f1c6230a7d64c8f2580e8776b6be1ee708e9f02eec8b86d58',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a

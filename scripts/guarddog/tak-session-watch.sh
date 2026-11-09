@@ -449,7 +449,9 @@ if [ "$GROUPLESS" -gt 0 ]; then
     * Most often: they CONNECTED DURING AN LDAP OUTAGE (a reboot, a console
       update, or an Authentik restart by Guard Dog) and the account is fine.
       The console reconnects these by itself within about 10 minutes of LDAP
-      being healthy again. If they are still there: reconnect the client
+      being healthy again (and drops one TAK never looked up, with no user at
+      all, after it has stayed that way 10 minutes). If they are still there:
+      reconnect the client
       (for Node-RED data feeds, restart Node-RED); restart TAK Server only if
       that does not clear them.
     * If the same account keeps coming back __ANON__ after reconnecting, the

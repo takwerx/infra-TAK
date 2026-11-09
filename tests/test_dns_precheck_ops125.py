@@ -70,6 +70,8 @@ def _load(installed=()):
         'socket': socket, 'threading': threading, 'time': time,
         'jsonify': _Blocked,
         'detect_modules': lambda fresh=False: {m: {'installed': True} for m in installed},
+        # The real address list is the test machine's own; the split-horizon tests below pass local_ips.
+        '_box_local_ipv4s': lambda: set(),
     }
     for name in ('SERVICE_DOMAIN_DEFAULTS', '_get_service_domain', 'DNS_PRECHECK_TIMEOUT',
                  '_dns_resolve_ipv4', '_dns_precheck_hosts', '_dns_precheck_message',
@@ -346,3 +348,61 @@ def test_page_scripts_parse(tmp_path):
         p.write_text(s, encoding='utf-8')
         r = subprocess.run(['node', '--check', str(p)], capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
+
+
+# --- split-horizon DNS (GH #434) ----------------------------------------------------------
+
+LAN = '192.168.1.50'
+
+
+def test_name_that_resolves_to_this_boxs_lan_address_is_not_a_mismatch():
+    """Router DNS answers LAN clients with the private address while public DNS keeps server_ip.
+    Let's Encrypt reads public DNS, so this must not stop the deploy."""
+    ns = _load()
+    res = ns['_dns_precheck'](_settings(), {}, resolve=_resolver({'infratak.cmd.takserver.us': [LAN]}),
+                              local_ips={LAN})
+    assert res['ok'] is True
+    assert res['message'] == '' and res['problems'] == []
+    assert _row(res, 'infratak.cmd.takserver.us')['status'] == 'local'
+
+
+def test_private_address_that_is_not_this_box_still_stops():
+    """A typo to another LAN host is still wrong: only addresses on this box's own NICs pass."""
+    ns = _load()
+    res = ns['_dns_precheck'](_settings(), {}, resolve=_resolver({'infratak.cmd.takserver.us': ['192.168.1.99']}),
+                              local_ips={LAN})
+    assert res['ok'] is False
+    assert _row(res, 'infratak.cmd.takserver.us')['status'] == 'mismatch'
+
+
+def test_gate_does_not_block_a_split_horizon_name():
+    ns = _load()
+    ns['_box_local_ipv4s'] = lambda: {LAN}
+    blocked, res = _gate(ns, _settings(), {}, table={'infratak.cmd.takserver.us': [LAN]})
+    assert blocked is None
+    assert res['ok'] is True
+
+
+def test_box_local_ipv4s_reads_physical_nics_only(monkeypatch):
+    ns = _load()
+    import ipaddress
+    ns.update({'subprocess': subprocess, 'ipaddress': ipaddress,
+               '_F2B_VIRTUAL_IFACE_PREFIXES': ('lo', 'docker', 'br-', 'veth', 'tailscale')})
+    exec(compile(_segment('_box_local_ipv4s'), 'app.py', 'exec'), ns)
+    out = (
+        '1: lo    inet 127.0.0.1/8 scope host lo\n'
+        '2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0\n'
+        '3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n'
+        '4: br-1a2b3c    inet 172.18.0.1/16 scope global br-1a2b3c\n'
+        '5: tailscale0    inet 100.64.0.7/32 scope global tailscale0\n'
+        '6: eth1@if9    inet 10.0.0.4/24 scope global eth1\n')
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ''))
+    assert ns['_box_local_ipv4s']() == {'192.168.1.50', '10.0.0.4'}
+    def boom(*a, **k):
+        raise FileNotFoundError('ip')
+    monkeypatch.setattr(subprocess, 'run', boom)
+    assert ns['_box_local_ipv4s']() == set()
+
+
+def test_template_knows_the_local_status():
+    assert re.search(r"local:\['✓ points here \(LAN address\)'", TEMPLATE)
