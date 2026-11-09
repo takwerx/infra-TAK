@@ -121,12 +121,18 @@ class Box:
                         save_settings=self._save, _etl=etl,
                         _etlrunner_shim_status=lambda: ({'hooks': {'secret': True, 'layers': self.layers}}
                                                         if self.readable else None),
-                        generate_caddyfile=lambda s: self.caddy.append(
-                            'hooks' if self.ns['_etlrunner_hooks_wanted'](s) else 'none'),
-                        _caddy_reload_if_changed=lambda plog=None: (True, ''))
+                        generate_caddyfile=self._gen,
+                        _caddy_reload_if_changed=lambda plog=None: (True, ''),
+                        _read_priv=lambda path: self.live, CADDYFILE_PATH='/etc/caddy/Caddyfile')
+        self.live = '\n'.join(etl.caddy_hook_lines()) if route else ''
 
     def _save(self, s):
         self.settings = s
+
+    def _gen(self, s):
+        on = self.ns['_etlrunner_hooks_wanted'](s)
+        self.caddy.append('hooks' if on else 'none')
+        self.live = '\n'.join(etl.caddy_hook_lines()) if on else ''
 
     def converge(self):
         return self.ns['_etlrunner_hooks_converge'](lambda m: None)
@@ -169,3 +175,10 @@ def test_caddy_moves_the_secret_out_of_the_uri_before_proxying():
     assert i_route < i_cookie < i_uri < i_proxy               # route keeps the written order
     assert f'{etl.HOOK_COOKIE}={{http.request.uri.path.1}}' in lines[i_cookie]
     assert lines[i_uri].endswith(f'{etl.HOOK_PATH}/{etl.HOOK_PATH_MASK}')
+
+
+def test_an_open_route_with_old_lines_is_refreshed_once():
+    b = Box(route=True, layers=1)
+    b.live = '    @etl_hooks path /etl-hooks/*\n    handle @etl_hooks {\n        reverse_proxy 127.0.0.1:4001\n    }'
+    assert b.converge() is True and b.caddy == ['hooks']        # old form -> regenerated
+    assert b.converge() is True and b.caddy == ['hooks']        # now current: no second reload

@@ -49510,6 +49510,18 @@ def _etlrunner_hooks_converge(log=None):
             return bool(c.get('hooks_route'))
         want = int(((st.get('hooks') or {}).get('layers')) or 0) > 0
     if bool(c.get('hooks_route')) == want:
+        # Route already in the wanted state: still converge the live Caddyfile to the lines this
+        # code renders (an older box has the old lines, which put the secret in Caddy's logs).
+        try:
+            live = _read_priv(CADDYFILE_PATH)
+        except Exception:
+            return want
+        has = '\n'.join(_etl.caddy_hook_lines()) in live
+        if has != want or (not want and _etl.HOOK_PATH + '/*' in live):
+            generate_caddyfile(s)
+            ok, detail = _caddy_reload_if_changed(plog=log)
+            log(f"ETL webhooks route lines refreshed on the CloudTAK site"
+                f" ({'reloaded' if ok else 'reload FAILED: ' + str(detail)[:200]})")
         return want
     c['hooks_route'] = want
     s['etl_runner'] = c
