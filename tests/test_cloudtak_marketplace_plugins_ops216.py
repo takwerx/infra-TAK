@@ -45,6 +45,10 @@ from test_cloudtak_autorepair_ops197 import Box, PROFILE, _alerts, _repair_calls
 from test_cloudtak_marketplace_shield_gh252 import (APP_LINT, APP_PKG, OVERLAY, _git, _scripts,
                                                     _tree)
 from test_cloudtak_plugin_npm_deps_gh271 import _deps, _rubber_sheet
+import sys as _sys_etl
+_sys_etl.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
+from modules import etlrunner as _etl  # noqa: E402  (v10.4.0 W11: the ETL overlay seam)
+
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP_PATH = REPO / 'app.py'
@@ -66,7 +70,7 @@ def _assign(name):
 def _load(funcs, consts=(), **ns):
     """Compile the named app.py functions at their real line numbers under app.py's own file
     name, so inspect.getsource() (which the remote shield uses) reads them back as shipped."""
-    ns = {'os': os, 're': re, 'json': json, 'subprocess': subprocess, 'tempfile': tempfile, **ns}
+    ns = {'_etl': _etl, '_etlrunner_sync_overlay': lambda d, log: False, 'os': os, 're': re, 'json': json, 'subprocess': subprocess, 'tempfile': tempfile, **ns}
     for c in consts:
         exec(compile(_assign(c), str(APP_PATH), 'exec'), ns)
     for f in funcs:

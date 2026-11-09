@@ -41,6 +41,10 @@ import types
 from datetime import datetime
 
 import pytest
+import sys as _sys_etl
+_sys_etl.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
+from modules import etlrunner as _etl  # noqa: E402  (v10.4.0 W11: the ETL overlay seam)
+
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
@@ -163,6 +167,7 @@ class Box:
             Thread=lambda target, args=(), **k: types.SimpleNamespace(
                 start=lambda: self.threads.append((target, args))))
         ns = {
+            '_etl': _etl, '_etlrunner_sync_overlay': lambda d, log: False, 
             'os': os, 'json': json, 're': re, 'time': time, 'shlex': shlex, 'socket': socket,
             'datetime': datetime, 'threading': fake_threading,
             'subprocess': types.SimpleNamespace(run=self.run, PIPE=-1, STDOUT=-2),

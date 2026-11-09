@@ -44,6 +44,10 @@ import pytest
 
 from test_cloudtak_autorepair_ops197 import _alerts, _repair_calls, gd  # noqa: F401
 from test_cloudtak_marketplace_plugins_ops216 import PluginBox, _override
+import sys as _sys_etl
+_sys_etl.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
+from modules import etlrunner as _etl  # noqa: E402  (v10.4.0 W11: the ETL overlay seam)
+
 
 yaml = pytest.importorskip('yaml')
 
@@ -102,7 +106,7 @@ def _src(name):
 
 
 def _load(funcs, consts=(), **ns):
-    ns = {'os': os, 're': re, 'json': json, 'subprocess': subprocess, **ns}
+    ns = {'_etl': _etl, '_etlrunner_sync_overlay': lambda d, log: False, 'os': os, 're': re, 'json': json, 'subprocess': subprocess, **ns}
     for c in consts:
         exec(compile(_src(c), str(APP_PATH), 'exec'), ns)
     for f in funcs:

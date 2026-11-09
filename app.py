@@ -48998,7 +48998,8 @@ def _etlrunner_build_image(log):
     log(f"  Building {_etl.SHIM_IMAGE}…")
     r = subprocess.run(_sudo_wrap(['docker', 'build', '--label', f'{_etl.SHIM_HASH_LABEL}={want}',
                                    '-t', _etl.SHIM_IMAGE, _etl.SHIM_DIR]),
-                       capture_output=True, text=True, timeout=1800)
+                       capture_output=True, text=True, timeout=1800,
+                       env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '1800'})   # ops #160: else killed at 600 s
     if r.returncode != 0:
         log("  ✗ shim image build failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
         return False
@@ -49291,7 +49292,8 @@ def _etlcat_build(e, log):
         args = ['docker', 'build', '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
         if caps:
             args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
-        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600)
+        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600,
+                           env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '3600'})   # ops #160: else killed at 600 s
         # BuildKit keeps ~1 GB of cache per build; nothing reuses it (PLAN W3)
         subprocess.run(_sudo_wrap(['docker', 'builder', 'prune', '-f']), capture_output=True, text=True, timeout=600)
         if b.returncode != 0:

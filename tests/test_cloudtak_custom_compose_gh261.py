@@ -36,6 +36,10 @@ import stat
 import subprocess
 
 import pytest
+import sys as _sys_etl
+_sys_etl.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
+from modules import etlrunner as _etl  # noqa: E402  (v10.4.0 W11: the ETL overlay seam)
+
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
@@ -61,7 +65,7 @@ def _assign(name):
 
 
 def _helpers():
-    ns = {'os': os, 're': re, 'shlex': shlex}
+    ns = {'_etl': _etl, '_etlrunner_sync_overlay': lambda d, log: False, 'os': os, 're': re, 'shlex': shlex}
     src = '\n\n'.join([_assign('_CT_ENV_LINE_RE'), _assign('CLOUDTAK_CUSTOM_COMPOSE'),
                        _assign('_CLOUDTAK_CUSTOM_COMPOSE_SEED'),
                        _assign('_CLOUDTAK_TAKPORTAL_CSP_COMPOSE'),

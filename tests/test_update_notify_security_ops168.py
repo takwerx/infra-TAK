@@ -539,7 +539,7 @@ def _sweep(pending, state, unknown_keys=()):
         '_collect_patch_now_items': lambda feed, unknown, now=None: ([], feed),   # ops #377
     }
 
-    def collect(settings, seen=None, unknown=None):
+    def collect(settings, seen=None, unknown=None, etl=None):
         unknown.update(unknown_keys)
         seen['openssl=2'] = 1.0
         return json.loads(json.dumps(pending))
