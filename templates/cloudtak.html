@@ -334,6 +334,15 @@
       <span id="ct-etl-state" style="font-size:12px;color:var(--text-dim)">Checking…</span>
       <button class="btn btn-primary" id="ct-etl-toggle" style="font-size:12px;padding:7px 14px;display:none"></button>
     </div>
+    <div id="ct-etl-net" style="display:none;margin:-6px 0 16px;font-size:12px;line-height:1.6">
+      <span id="ct-etl-net-state"></span>
+      <a id="ct-etl-net-edit" style="color:var(--cyan);cursor:pointer;margin-left:8px">Allow a private network…</a>
+      <div id="ct-etl-net-form" style="display:none;margin-top:8px;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="ct-etl-net-allow" type="text" placeholder="e.g. 192.168.10.0/24, 10.20.0.5" style="flex:1;min-width:220px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:12px">
+        <button class="btn btn-primary" id="ct-etl-net-save" style="font-size:12px;padding:7px 14px">Save</button>
+        <div style="width:100%;color:var(--text-dim)">Only for an ETL that must reach a server on your own network. Private addresses only. This server itself and the cloud metadata address stay blocked.</div>
+      </div>
+    </div>
     <div id="ct-etl-filter-row" style="display:none;margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
       <input id="ct-etl-filter" type="search" placeholder="Search ETLs…" style="flex:1;min-width:200px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
       <div id="ct-etl-tabs" style="display:flex;gap:4px;flex-wrap:wrap"></div>
@@ -432,6 +441,23 @@
         stateEl.style.color = enabled ? 'var(--green)' : 'var(--text-dim)';
         toggle.style.display = ''; toggle.textContent = enabled ? 'Turn ETL off' : 'Turn ETL on';
         toggle.className = 'btn ' + (enabled ? 'btn-ghost' : 'btn-primary');
+        var net = document.getElementById('ct-etl-net'), ns = document.getElementById('ct-etl-net-state');
+        net.style.display = enabled ? '' : 'none';
+        if (enabled) {
+          var eg = st.egress || {}, allow = eg.allow || [];
+          if (!eg.enforced || !eg.v4) {
+            ns.textContent = 'Network block is NOT active — ETLs can reach this server and your network. Turn ETL off and on again.';
+            ns.style.color = 'var(--red)';
+          } else if ((st.net_missing || []).length) {
+            ns.textContent = 'ETLs cannot reach CloudTAK (' + st.net_missing.join(', ') + ' not on the ETL network). Turn ETL off and on again.';
+            ns.style.color = '#eab308';
+          } else {
+            ns.textContent = 'Network: ETLs reach the internet only — not this server, your network or the cloud metadata service'
+              + (allow.length ? ' (allowed: ' + allow.join(', ') + ')' : '') + '.';
+            ns.style.color = 'var(--text-dim)';
+          }
+          document.getElementById('ct-etl-net-allow').value = allow.join(', ');
+        }
         return fetch('/api/cloudtak/etl/catalog');
       }).then(function(r){ return r.json(); }).then(function(d){
         entries = d.entries || [];
@@ -462,6 +488,16 @@
       if (!confirm(enabled ? 'Turn ETL off? Running ETL layers stop; installed ETLs and layers are kept.' : 'Turn ETL on? CloudTAK restarts for about a minute.')) return;
       fetch('/api/cloudtak/etl/' + action, {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
         .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'turn ETL ' + (enabled ? 'off' : 'on')); });
+    };
+    document.getElementById('ct-etl-net-edit').onclick = function(){
+      var f = document.getElementById('ct-etl-net-form');
+      f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+    };
+    document.getElementById('ct-etl-net-save').onclick = function(){
+      fetch('/api/cloudtak/etl/egress', {method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({allow: document.getElementById('ct-etl-net-allow').value})})
+        .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); document.getElementById('ct-etl-net-form').style.display = 'none'; load(); });
     };
     filter.oninput = render;
     load();
