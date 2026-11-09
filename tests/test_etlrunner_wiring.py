@@ -108,7 +108,9 @@ def test_installable_gates(e):
     assert e.installable(dict(sched, reviewed=None))[0] is False          # unscanned never installs
     assert e.installable(dict(sched, reviewed=None), allow_unreviewed=True)[0] is True
     assert e.installable({'flags': {'email': True}, 'reviewed': {}}, True)[0] is False
-    assert e.installable({'flags': {'webhook': True}, 'reviewed': {}}, True)[0] is False
+    assert e.installable({'flags': {'webhook': True}, 'reviewed': {}}, True)[0] is True     # W7
+    assert e.installable({'flags': {'webhook': True}, 'reviewed': None})[0] is False       # still scanned first
+    assert e.installable({'flags': {}, 'reviewed': {}}, True)[0] is False
 
 
 def test_installed_versions_parses_docker_tags(e):

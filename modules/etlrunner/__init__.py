@@ -234,13 +234,13 @@ def load_catalog(path=CATALOG):
 
 
 def installable(e, allow_unreviewed=False):
-    """(ok, reason). Email ETLs need SES (parked); webhook-only ETLs need W7; an unreviewed
-    entry (new or bumped since its /module-scan) is refused unless the box opts in for testing."""
+    """(ok, reason). Email ETLs need SES (parked); webhook ETLs run behind the W7 box secret; an
+    unreviewed entry (new or bumped since its /module-scan) is refused unless the box opts in."""
     f = e.get('flags') or {}
     if f.get('email') and not f.get('schedule') and not f.get('webhook'):
         return False, 'Email delivery is not supported by the local runner yet'
-    if not f.get('schedule'):
-        return False, 'Webhook-only ETLs arrive with webhook support'
+    if not f.get('schedule') and not f.get('webhook'):
+        return False, 'This ETL has no way to run on the local runner'
     if not e.get('reviewed') and not allow_unreviewed:
         return False, 'Waiting for security review'
     return True, ''
