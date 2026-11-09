@@ -98270,6 +98270,8 @@ _DBSERVER_IRREVERSIBLE = (
 )
 _dbserver_lock = threading.Lock()
 _dbserver_start_lock = threading.Lock()
+# infra-TAK #442 / ops #585: one preflight over SSH at a time (see _dbserver_preflight_once).
+_dbserver_preflight_lock = threading.Lock()
 _dbserver_watch_active = False
 _dbserver_log_cache = {}
 
@@ -99109,6 +99111,24 @@ def _dbserver_log_tail(job, limit=12000):
     return val[1], val[2]
 
 
+def _dbserver_preflight_once():
+    """(http_status, payload) for the read-only preflight, one SSH probe at a time.
+
+    infra-TAK #442 / ops #585: since 10.3.9 the database server card runs this on every
+    dashboard load. The console has 8 request threads, and a slow database server holds
+    each probe for up to 4 minutes; test pair 2026-11-09 (PostgreSQL frozen on the database
+    server): 9 dashboard loads left the console answering nothing, not even its login page,
+    for about 3.5 minutes. A second caller now gets an immediate 'busy' answer instead of a
+    second probe, so at most one request thread ever waits on the database server here."""
+    if not _dbserver_preflight_lock.acquire(blocking=False):
+        return 429, {'ok': False, 'busy': True,
+                     'error': 'the console is already checking the database server; try again in a minute'}
+    try:
+        return 200, _dbserver_preflight()
+    finally:
+        _dbserver_preflight_lock.release()
+
+
 @app.route('/api/console/dbserver/preflight')
 @login_required
 def console_dbserver_preflight_api():
@@ -99116,7 +99136,8 @@ def console_dbserver_preflight_api():
     if not _dbserver_routes_available():
         return jsonify({'ok': False, 'error': 'not a split install'}), 404
     try:
-        return jsonify(_dbserver_preflight())
+        code, payload = _dbserver_preflight_once()
+        return jsonify(payload), code
     except Exception as e:
         return jsonify({'ok': False, 'error': f'preflight error: {str(e)[:200]}'}), 500
 
