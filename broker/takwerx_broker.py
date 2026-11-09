@@ -4190,6 +4190,11 @@ def _etl_egress_converge(allow):
             # Hooks. FORWARD goes through DOCKER-USER when Docker made it (Docker keeps that
             # jump first in FORWARD); otherwise FORWARD itself.
             hook = 'DOCKER-USER' if _ipt(ipt, '-S', 'DOCKER-USER').returncode == 0 else 'FORWARD'
+            if hook == 'DOCKER-USER':
+                # A boot where the broker beat Docker hooked FORWARD; DOCKER-USER now covers it.
+                for _ in range(8):
+                    if _ipt(ipt, '-D', 'FORWARD', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode != 0:
+                        break
             for parent, child in ((hook, ETL_EGRESS_CHAIN), ('INPUT', ETL_EGRESS_CHAIN_IN)):
                 jump = ['-i', ETL_BRIDGE, '-j', child]
                 if _ipt(ipt, '-C', parent, *jump).returncode != 0:

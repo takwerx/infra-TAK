@@ -173,6 +173,17 @@ def test_converge_without_docker_user_hooks_forward(m, monkeypatch):
     assert f.chains['FORWARD'][0] == ['-i', m.ETL_BRIDGE, '-j', m.ETL_EGRESS_CHAIN]
 
 
+def test_forward_hook_moves_to_docker_user(m, monkeypatch):
+    f = FakeIpt(docker_user=False)
+    monkeypatch.setattr(m, '_ipt', f)
+    monkeypatch.setattr(m, '_etl_egress_tools', lambda: [(4, 'iptables')])
+    m._etl_egress_converge([])                       # broker came up before Docker
+    f.chains['DOCKER-USER'] = []                     # Docker starts
+    m._etl_egress_converge([])
+    assert f.chains['DOCKER-USER'] == [['-i', m.ETL_BRIDGE, '-j', m.ETL_EGRESS_CHAIN]]
+    assert ['-i', m.ETL_BRIDGE, '-j', m.ETL_EGRESS_CHAIN] not in f.chains['FORWARD']
+
+
 def test_ipv4_failure_raises_ipv6_failure_reports(m, monkeypatch):
     f4, f6 = FakeIpt(), FakeIpt()
     f6.chains = {}                                   # no ip6 filter table
