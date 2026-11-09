@@ -321,6 +321,87 @@ is NOT required and will not help.
   fi
 fi
 
+# ── v10.4.0 W9: ETL Runner ──
+# Only where ETL is turned on: the console writes this overlay on enable and removes it on
+# disable. Runs before the cloudtak-api check below, which exits as soon as the API is Up.
+# Each alert goes out once per episode and its gate closes only on delivery (v10.1.58 W13).
+if [ -n "$CT_DIR" ] && [ -f "$CT_DIR/docker-compose.infratak-etl.yml" ]; then
+  _ETL_FAIL="$STATE_DIR/etl-shim.failcount"
+  _ETL_SENT="$STATE_DIR/etl-shim.alerted"
+  if [ "$(docker inspect -f '{{.State.Running}}' cloudtak-etl-shim-1 2>/dev/null)" = true ]; then
+    echo 0 > "$_ETL_FAIL"
+    [ -f "$_ETL_SENT" ] && _log "etl | ETL Runner is back up" && rm -f "$_ETL_SENT"
+    # Layers that keep failing: 5 failed runs in a row (fleet constant). Read from the shim's
+    # own status (loopback inside its container), one tab-separated line per failing layer.
+    _etl_bad="$(docker exec cloudtak-etl-shim-1 node -e '
+fetch("http://127.0.0.1:4000/_status").then((r) => r.json()).then((d) => {
+  for (const f of d.functions || []) if ((f.streak || 0) >= 5)
+    console.log([f.name, f.streak, f.failing_since || "", String((f.last && f.last.error) || "").replace(/\s+/g, " ").slice(0, 300)].join("\t"));
+}).catch(() => process.exit(3));' 2>/dev/null)"
+    _etl_rc=$?
+    if [ "$_etl_rc" = 0 ]; then
+      _etl_now=" "
+      while IFS="$(printf '\t')" read -r _ln _lstreak _lsince _lerr; do
+        [ -n "$_ln" ] || continue
+        _lkey="$(printf '%s' "$_ln" | tr -c 'A-Za-z0-9_-' '_')"
+        _etl_now="$_etl_now$_lkey "
+        [ -f "$STATE_DIR/etl-layer.$_lkey.alerted" ] && continue
+        _log "etl | layer $_ln failed $_lstreak runs in a row: $_lerr"
+        SUBJ_L="Guard Dog: CloudTAK ETL layer failing on $SERVER_IDENTIFIER"
+        BODY_L="The CloudTAK ETL layer $_ln failed $_lstreak runs in a row.
+
+Server: $SERVER_IDENTIFIER
+Failing since (UTC): ${_lsince:-unknown}
+Last error: ${_lerr:-none reported}
+
+Common causes are an expired API key or password in the layer's Environment, or the
+outside service being down. Open CloudTAK, then the layer, then Logs, to see each run.
+You get this email once. You get no more email about this layer until it runs successfully.
+"
+        if echo -e "$BODY_L" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_L" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null; then
+          touch "$STATE_DIR/etl-layer.$_lkey.alerted"
+        else
+          _log "etl | layer alert NOT delivered — will retry next check"
+        fi
+      done <<EOF_ETL
+$_etl_bad
+EOF_ETL
+      # A layer that ran successfully (or was deleted) closes its episode.
+      for _f in "$STATE_DIR"/etl-layer.*.alerted; do
+        [ -e "$_f" ] || continue
+        _k="${_f#$STATE_DIR/etl-layer.}"; _k="${_k%.alerted}"
+        case "$_etl_now" in *" $_k "*) ;; *) rm -f "$_f"; _log "etl | layer $_k recovered" ;; esac
+      done
+    fi
+  else
+    _etl_n=$(( $(cat "$_ETL_FAIL" 2>/dev/null || echo 0) + 1 ))
+    echo "$_etl_n" > "$_ETL_FAIL"
+    if [ "$_etl_n" -ge "$MAX_FAILS" ]; then
+      _log "etl | ETL Runner (cloudtak-etl-shim-1) not running for $_etl_n checks — starting it"
+      # No -f: compose reads COMPOSE_FILE from .env, which carries the ETL overlay.
+      (cd "$CT_DIR" && docker compose up -d etl-shim) >/dev/null 2>&1
+      echo 0 > "$_ETL_FAIL"
+      if [ ! -f "$_ETL_SENT" ]; then
+        SUBJ_E="Guard Dog: CloudTAK ETL Runner restarted on $SERVER_IDENTIFIER"
+        BODY_E="The CloudTAK ETL Runner was not running for $_etl_n consecutive checks.
+While it is down, no ETL layer runs.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $(_ts)
+Action: Started it again (docker compose up -d etl-shim).
+
+If this repeats, open the infra-TAK console, CloudTAK page, ETL section.
+"
+        if echo -e "$BODY_E" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ_E" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null; then
+          touch "$_ETL_SENT"
+        else
+          _log "etl | runner alert NOT delivered — will retry next check"
+        fi
+      fi
+    fi
+  fi
+fi
+
 # Health: cloudtak-api container running
 STATUS=$(docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null || true)
 if echo "$STATUS" | grep -q "Up"; then

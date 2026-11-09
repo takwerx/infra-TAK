@@ -175,7 +175,7 @@ function invoke(fnName, payload, type) {
 async function invokeNow(fnName, payload, type) {
     const s = Object.values(stacks).find((x) => x.fn.FunctionName === fnName);
     if (!s) { const e = new Error(`Function not found: ${fnName}`); e.code = 404; throw e; }
-    const fn = s.fn, t0 = Date.now(), st = (status[fnName] ||= { runs: 0, errors: 0, skipped: 0 });
+    const fn = s.fn, t0 = Date.now(), st = (status[fnName] ||= { runs: 0, errors: 0, skipped: 0, streak: 0 });
     await gate();
     let c = warm[fnName], cold = false, result, err;
     try {
@@ -195,7 +195,10 @@ async function invokeNow(fnName, payload, type) {
     // a timed-out or failed container is never reused
     if (c && (err || !keepWarm(fn, c))) await stopContainer(c);
     ungate();
-    st.runs++; if (err || fnError) st.errors++;
+    // `streak` = consecutive failed runs; Guard Dog alerts on it (one bad run is weather, five is a broken layer)
+    st.runs++;
+    if (err || fnError) { st.errors++; st.streak = (st.streak || 0) + 1; st.failing_since ||= new Date(t0).toISOString(); }
+    else { st.streak = 0; st.failing_since = null; }
     st.last = { at: new Date(t0).toISOString(), ms: Date.now() - t0, cold, type, ok: !err && !fnError, error: err?.message || fnError || null };
     log(`invoke ${fnName} type=${type} ${cold ? 'cold' : 'warm'} took=${Date.now() - t0}ms${err ? ` ERR ${err.message}` : ''}${fnError ? ` FNERR ${fnError.slice(0, 120)}` : ''}`);
     if (err) throw err;
