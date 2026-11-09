@@ -196,6 +196,8 @@ def test_failed_upgrade_restores_95_copy_and_old_compose():
     # only from the untouched copy, never deleting the copies or the upgrade log
     assert 'backup-9.5/PG_VERSION' in script and 'cp -a backup-9.5/. .' in script
     assert '! -name "backup-*"' in script and '! -name upgrade.log' in script
+    # the used copy is moved aside, so a later upgrade takes a fresh one (upstream reuses backup-9.5)
+    assert script.index('cp -a backup-9.5/. .') < script.index('mv backup-9.5 backup-9.5-restored-')
     assert box.compose == OLD and _images(box.running_images)['wo_webapp'].endswith(':3.3.1')
     # stop the stack before touching the data dir
     assert box.calls.index(('compose', 'stop')) < box.calls.index(restore[0])

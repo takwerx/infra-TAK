@@ -54667,9 +54667,12 @@ def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
     plog('Putting the previous WebODM version back…')
     _webodm_compose(wo_dir, 'stop', timeout=180)
     v = WEBODM_DB_VOLUME
+    # The copy is renamed once restored: the next upgrade reuses a `backup-9.5` it finds instead
+    # of copying again, and this one would miss whatever 3.x writes from now on.
     script = (f'set -e; cd {v}; if [ -s backup-9.5/PG_VERSION ]; then '
               f'find . -mindepth 1 -maxdepth 1 ! -name "backup-*" ! -name upgrade.log ! -name lost+found '
-              f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; fi; test "$(cat PG_VERSION)" = 9.5')
+              f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; mv backup-9.5 backup-9.5-restored-$(date +%Y%m%d%H%M%S); '
+              f'fi; test "$(cat PG_VERSION)" = 9.5')
     r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800)
     if r.returncode != 0:
         raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or "")[:300]}. '
