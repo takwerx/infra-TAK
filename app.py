@@ -27632,7 +27632,8 @@ def _console_pending_update(settings):
             local = ''
         if remote_full and not remote_full.startswith(local or 'XXXXXXXX'):
             return {'label': 'infra-TAK console', 'installed': f'v{VERSION} @ {local or "?"}',
-                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7]}
+                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7],
+                    'how': 'Console page → Update Now.'}
         return None
     req = urllib.request.Request(
         f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
@@ -27646,7 +27647,8 @@ def _console_pending_update(settings):
         if tag and _vt(tag) > _vt(VERSION):
             item = {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
                     'target': tag, 'identity': tag,
-                    'how': 'Console page → Update Now.'}
+                    'how': 'Console page → Update Now.',
+                    'release_url': f'https://github.com/{GITHUB_REPO}/releases/tag/{tag}'}
             # ops #168: name every security release between what runs here and the
             # target — skipping one (installed .20, security .22, latest .25) still
             # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
@@ -27657,6 +27659,7 @@ def _console_pending_update(settings):
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     rels = json.loads(resp.read().decode())
                 sec = []
+                notes = []
                 for rel in rels if isinstance(rels, list) else []:
                     rtag = (rel.get('tag_name') or '').strip()
                     if rel.get('draft') or not rtag:
@@ -27669,7 +27672,12 @@ def _console_pending_update(settings):
                     what = _release_security_summary(rel.get('body'))
                     if what:
                         sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
+                    line = _release_notes_line(rel.get('body'))
+                    if line:
+                        notes.append((_vt(rtag), f'{rtag}: {line}'))
                 item['security'] = [s for _, s in sorted(sec, reverse=True)]
+                # ops #547: one plain line per new release, newest first
+                item['release_notes'] = [n for _, n in sorted(notes, reverse=True)]
             except Exception as e:
                 item['security_unknown'] = True
                 print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
@@ -27727,6 +27735,28 @@ def _release_security_summary(body):
                 return m.group(1)[:240]
             break
     return _security_section_summary(lines)
+
+
+def _release_notes_line(body):
+    """ops #547: what a release means for users, as one plain line: the notes' headline
+    (the ship skill opens every release with a `## <what changed>` line), else the first
+    sentence of the first paragraph. Markdown stripped, capped. '' when there is nothing."""
+    for ln in (body or '').splitlines():
+        t = ln.strip()
+        if not t or t == '---' or t.startswith('<!--'):
+            continue
+        t = re.sub(r'^#{1,6}\s*', '', t)
+        t = re.sub(r'^[-*+]\s+', '', t)
+        t = _MD_MARKS_RE.sub('', t).strip()
+        # the mail relay turns ' " & < > into &#39; &quot; &amp; &lt; &gt; in plain text
+        t = re.sub(r'\s+', ' ', t.replace("'", '\u2019').replace('&', ' and ')
+                   .replace('"', '').replace('<', '').replace('>', '')).strip()
+        if not t:
+            continue
+        if len(t) > 240 and re.search(r'[.!?]\s', t):
+            t = re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0]
+        return t if len(t) <= 240 else t[:237].rstrip() + '...'
+    return ''
 
 
 def _semver_tuple(v):
@@ -28598,6 +28628,19 @@ def _update_notify_check_once(fast=False):
         except (TypeError, ValueError):
             return True
 
+    def _notes_lines(p):
+        # ops #547: what is in the update, in plain words: each new release's one line
+        # (newest first, at most 5), or a link when the notes could not be read.
+        notes = [n for n in (p.get('release_notes') or []) if n]
+        if notes:
+            out = ["      New in this update:"] + [f"        - {n}" for n in notes[:5]]
+            if len(notes) > 5:
+                out.append(f"        - (+{len(notes) - 5} older release{'s' if len(notes) != 6 else ''})")
+            return out
+        if p.get('release_url'):
+            return [f"      New in this update: {p['release_url']}"]
+        return []
+
     new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]
     emailed = False
     if new_items:
@@ -28615,6 +28658,7 @@ def _update_notify_check_once(fast=False):
             for p in pn_items:
                 lines.append(f"  • {p.get('summary') or p['label']}")
                 lines += [f"      {s}" for s in p.get('security') or []]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 rec = sent_pn.get(p['key'])
@@ -28632,6 +28676,7 @@ def _update_notify_check_once(fast=False):
             for p in sec_items:
                 lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
                 lines += [f"      {s}" for s in p['security']]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 lines.append('')
@@ -28642,6 +28687,9 @@ def _update_notify_check_once(fast=False):
             lines += [f"The following updates are pending on {server_id}:", '']
         for p in other:
             lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
+            lines += _notes_lines(p)
+            if p.get('how'):
+                lines.append(f"      To install: {p['how']}")
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
