@@ -172,7 +172,7 @@ def _sweep(pending, state):
         'time': time,
         'PATCH_NOW_REPEAT_S': 24 * 3600,
         '_collect_patch_now_items': lambda feed, unknown, now=None: ([], feed),
-        '_collect_pending_updates': lambda settings, seen=None, unknown=None: json.loads(json.dumps(pending)),
+        '_collect_pending_updates': lambda settings, seen=None, unknown=None, etl=None: json.loads(json.dumps(pending)),
     }
     _exec(n, '_carried_by_unknown', '_update_notify_check_once')
     return n['_update_notify_check_once'](), sent, saved
