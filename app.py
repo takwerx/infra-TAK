@@ -1237,7 +1237,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.9-alpha"
+VERSION = "10.3.10-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -9065,7 +9065,13 @@ def _diag_section_connectivity(settings):
                                               f'authentik.{fqdn}', _tak_name) if h):
             try:
                 ips = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
-                out.append(f"dns {host}: {', '.join(ips)}{'' if (not sip or sip in ips) else '   <-- not server_ip ' + sip}")
+                if not sip or sip in ips:
+                    note = ''
+                elif _box_local_ipv4s().intersection(ips):
+                    note = "   (this box's own address: split-horizon DNS)"
+                else:
+                    note = '   <-- not server_ip ' + sip
+                out.append(f"dns {host}: {', '.join(ips)}{note}")
             except Exception as e:
                 out.append(f"dns {host}: does not resolve ({str(e)[:60]})"
                            f"{'   (apex record — optional)' if host == fqdn else ''}")
@@ -12827,7 +12833,8 @@ _PGDG_GIS_PIN_BODY = (
 _PGDG_REMOTE_SETUP_SH = (
     'sudo mkdir -p /usr/share/keyrings && '
     f'if ! grep -rqs "{_PGDG_APT_HOST}" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then '
-    f'sudo curl -sL {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
+    # ops #563: -f so an error page is never saved as the key; retry any error (reset, timeout).
+    f'sudo curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 15 --max-time 60 {_PGDG_KEY_URL} --output {_PGDG_KEYRING} && '
     # v10.3.0 W1: codename from /etc/os-release, lsb_release fallback, and REFUSE on
     # empty — a bare $(lsb_release -cs) on a noble minimal image expands to nothing and
     # writes "apt -pgdg main", which apt then rejects for every source on the box.
@@ -33738,6 +33745,28 @@ def _dns_resolve_ipv4(host):
         return [], f'error: {e}'
 
 
+def _box_local_ipv4s():
+    """IPv4 addresses on this box's physical NICs (container, VPN and loopback interfaces
+    left out). A name that resolves to one of these is answered by THIS box. Behind NAT
+    that is the LAN address, which server_ip (the public one) never equals."""
+    out = set()
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show'], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[1].split('@')[0].startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        out.add(str(ipaddress.ip_interface(parts[i + 1]).ip))
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return out
+
+
 def _dns_precheck_hosts(settings, modules):
     """{host: needed_now} for every subdomain this box uses, in SERVICE_DOMAIN_DEFAULTS
     order. needed_now = Caddy serves it now, so it is about to ask Let's Encrypt for it:
@@ -33766,11 +33795,14 @@ def _dns_precheck_message(blocking, server_ip):
     return '\n'.join(lines)
 
 
-def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT):
+def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT, local_ips=None):
     """Compare each subdomain's A record to server_ip. Only names Caddy is about to request
     certificates for (needed_now) can block; the rest are reported so the operator sees a
     bad record before installing that module. A lookup that fails on this box, or an
-    unknown server_ip, is reported but never blocks — neither says the record is wrong."""
+    unknown server_ip, is reported but never blocks — neither says the record is wrong.
+    A name that resolves to an address on this box's own NIC (status 'local') is split-horizon
+    DNS: the router answers LAN clients with the private address while public DNS, which is
+    what Let's Encrypt reads, keeps the public one. That is not a mismatch (GH #434)."""
     resolve = resolve or _dns_resolve_ipv4
     sip = str(settings.get('server_ip') or '').strip()
     hosts = _dns_precheck_hosts(settings, modules)
@@ -33784,6 +33816,7 @@ def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT)
     deadline = time.time() + timeout
     for t in threads:
         t.join(max(0.0, deadline - time.time()))
+    local = set(_box_local_ipv4s() if local_ips is None else local_ips)
     rows = []
     for host, needed in hosts.items():
         ips, problem = answers.get(host) or ([], 'error: lookup timed out')
@@ -33795,6 +33828,8 @@ def _dns_precheck(settings, modules, resolve=None, timeout=DNS_PRECHECK_TIMEOUT)
             status = 'unknown'
         elif sip in ips:
             status = 'ok'
+        elif local.intersection(ips):
+            status = 'local'
         else:
             status = 'mismatch'
         rows.append({'host': host, 'needed': needed, 'ips': ips, 'status': status,
@@ -34352,6 +34387,34 @@ def _cloudtak_video_host_pin(settings):
     if not video or not (settings.get('fqdn') or '').strip():
         return ''
     host = video.split()[0].strip()
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return f'{host}:{ip}' if host and ip else ''
+
+
+def _cloudtak_stream_host_pin(settings):
+    """extra_hosts entry `stream.<fqdn>:<this box's address>` for CloudTAK's media container.
+
+    ops #560. A feed whose URL names this box's own MediaMTX (rtsp://stream.<fqdn>:8554/...) is
+    pulled by the media container. Resolved through public DNS, the pull leaves the box: on a
+    cloud box (AWS: checked on a fresh Ubuntu 22.04 box) the provider's NAT returns it with the box's
+    own public address as the source, which is not the Docker network the standalone MediaMTX lets
+    read without a password (ops #193), so MediaMTX answered 401 and every play ended "source of
+    path ... has timed out". On a home or office network with no NAT hairpin it never returns at
+    all. Pinning the name to the box's own address keeps the pull on the box, arriving from the
+    Docker network, so no new address is trusted. '' when there is nothing to pin (no local
+    MediaMTX, no domain, remote CloudTAK, no address). Same address as the video pin (ops #471).
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return ''
+    except Exception:
+        return ''
+    if not os.path.exists('/usr/local/bin/mediamtx'):
+        return ''
+    stream = (_get_service_domain(settings, 'mediamtx') or '').strip()
+    if not stream or not (settings.get('fqdn') or '').strip():
+        return ''
+    host = stream.split()[0].strip()
     ip = _cloudtak_caddy_bind_ip(settings)
     return f'{host}:{ip}' if host and ip else ''
 
@@ -47922,6 +47985,9 @@ def _cloudtak_build_override_yml(settings):
     # ops #471: only the api container calls the media server by its public name.
     video_pin = _cloudtak_video_host_pin(settings)
     api_hosts_block = hosts_block + (f'\n      - "{video_pin}"' if video_pin else '')
+    # ops #560: only the media container pulls feeds from the standalone MediaMTX by its public name.
+    stream_pin = _cloudtak_stream_host_pin(settings)
+    media_hosts_block = hosts_block + (f'\n      - "{stream_pin}"' if stream_pin else '')
     # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
     # CloudTAK's api container runs both nginx and Node in the same image;
     # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
@@ -48087,7 +48153,7 @@ services:
     # rtsp:// lease); W5e kept ARM on v9.1.1 while ≥v9.2 was amd64-only.
     image: {media_image}
     extra_hosts:
-{hosts_block}
+{media_hosts_block}
     environment:
       API_URL: "http://api:5000"
 {media_ca_env}{media_ca_vol_block}  postgis:
@@ -48099,12 +48165,25 @@ services:
 {_sim_networks_top}"""
 
 
+def _cloudtak_override_service_block(text, name, rest=False):
+    """The body of the `  <name>:` service block of a compose override ('' when absent); with
+    rest=True the override text WITHOUT that block instead."""
+    pat = r'(?ms)^  ' + re.escape(name) + r':\n(.*?)(?=^  \S|^\S|\Z)'
+    if rest:
+        return re.sub(pat, '', text or '')
+    m = re.search(pat, text or '')
+    return m.group(1) if m else ''
+
+
 def _cloudtak_refresh_override(plog=None):
     """v10.1.61 W10: rewrite CloudTAK's compose override from current settings and, when
-    it changed, recreate ONLY the api service (`up -d --no-deps api`). The simulator module
-    calls this on deploy and uninstall so the api container joins / leaves the infratak
-    network and gets / loses the engine URL + token. Local CloudTAK only; a no-op when it
-    is not installed here. Returns (changed, message)."""
+    it changed, recreate ONLY the services whose block changed (`up -d --no-deps api`; the
+    media service too when its block changed, ops #560, then its HLS heal, which a recreate
+    reverts). The simulator module calls this on deploy and uninstall so the api container
+    joins / leaves the infratak network and gets / loses the engine URL + token; the MediaMTX
+    link converge calls it so the media container's stream-name pin follows the standalone
+    MediaMTX. Local CloudTAK only; a no-op when it is not installed here.
+    Returns (changed, message)."""
     _log = plog or (lambda m: print(m, flush=True))
     ct_dir = os.path.expanduser('~/CloudTAK')
     if not (os.path.exists(os.path.join(ct_dir, 'docker-compose.yml'))
@@ -48135,10 +48214,24 @@ def _cloudtak_refresh_override(plog=None):
         os.chmod(override_path, 0o600)
     except OSError:
         pass
-    _log('  CloudTAK override rewritten — recreating the api container (no other service touched)...')
-    r = _broker_compose(ct_dir, 'up -d --no-deps api', timeout=240)
+    # ops #560: a change confined to the media block recreates media only (and leaves the api's
+    # icon self-heal watch below alone); anything else keeps the old api recreate.
+    media_changed = (_cloudtak_override_service_block(old, 'media')
+                     != _cloudtak_override_service_block(new, 'media'))
+    api_changed = not (media_changed and old.strip()
+                       and _cloudtak_override_service_block(old, 'media', rest=True)
+                       == _cloudtak_override_service_block(new, 'media', rest=True))
+    svcs = (['api'] if api_changed else []) + (['media'] if media_changed else [])
+    _log('  CloudTAK override rewritten — recreating %s (no other service touched)...'
+         % ' and '.join(f'the {x} container' for x in svcs))
+    r = _broker_compose(ct_dir, 'up -d --no-deps ' + ' '.join(svcs), timeout=240)
     if r.returncode != 0:
-        return True, f'override written but the api recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+        return True, f'override written but the {" and ".join(svcs)} recreate failed: {(r.stderr or r.stdout or "")[-300:]}'
+    if media_changed:
+        # a recreate puts the image's HLS profile back; converge it right away (check-first)
+        _cloudtak_media_hls_heal(_log, wait=True)
+    if not api_changed:
+        return True, 'CloudTAK media container recreated with the new override'
     # v10.1.62 T&E finding (nuc, 2026-09-09): recreating the api container from its image
     # wipes the sprite-regen guard the icon self-heal patches in, and a box carrying one
     # undecodable icon then crash-loops on `vipspng: libpng read error` at API boot
@@ -70184,6 +70277,67 @@ def _authentik_reconfigure_heal_tak_clients(plog, before=None):
         plog(f"  TAK LDAP recycle error (non-fatal): {str(e)[:120]}")
 
 
+# ops #565: the heal above runs only when something shows LDAP was down under TAK (an outpost
+# or Authentik restart, a pending request). nuc 2026-11-08: a phone enrolled and connected 3 s
+# later, TAK gave the connection no user and no groups (no outage anywhere; LDAP answered all
+# day), the phone left, and its relay kept the two sockets open. They sat on __ANON__ for 3 h
+# and Guard Dog mailed hourly that "the console reconnects these by itself". Nothing would
+# have: no outage, no heal. A connection TAK put neither a DN nor a username on is a failed
+# lookup (see _tak_heal_ldap_sessions), and a lookup that fails is never retried on that
+# connection. So the 10-min monitor drops one that has stayed that way this long; the client
+# reconnects and is looked up again. Only the drop, never a TAK restart: a client that comes
+# back the same way is not worth dropping everybody for, so it is retried at most hourly.
+_TAK_STUCK_UNNAMED_MIN_S = 600
+_TAK_STUCK_UNNAMED_COOLDOWN_S = 3600
+_tak_stuck_unnamed_seen = {}    # connection uid → epoch first seen with no user and no groups
+_tak_stuck_unnamed_dropped = {}  # device uid (else '' = any connection without one) → epoch of our last drop
+
+
+def _tak_drop_stuck_unnamed_sessions(plog):
+    """Drop the TAK client connections that have had no user and no groups for
+    `_TAK_STUCK_UNNAMED_MIN_S` (two monitor ticks), so the client reconnects and is looked up
+    again (ops #565). Needs LDAP answering. Returns the connection uids dropped."""
+    tag = 'TAK stuck-client check'
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        return []
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return []          # a busy API is not a verdict; keep what was seen
+    now = time.time()
+    stuck = {s['uid']: s for s in sessions if s['unnamed'] and not s['groups']}
+    for uid in list(_tak_stuck_unnamed_seen):
+        if uid not in stuck:
+            del _tak_stuck_unnamed_seen[uid]
+    for uid in stuck:
+        _tak_stuck_unnamed_seen.setdefault(uid, now)
+    # test12 2026-11-08: TAK gives a connection it never looked up no device uid either, and its
+    # number changes at every reconnect, so neither can hold the hourly limit. Without a device
+    # uid they all share one slot: a client that keeps coming back this way is dropped once an hour.
+    key = lambda s: s['client']
+    due = [s for uid, s in stuck.items()
+           if now - _tak_stuck_unnamed_seen[uid] >= _TAK_STUCK_UNNAMED_MIN_S
+           and now - _tak_stuck_unnamed_dropped.get(key(s), 0) >= _TAK_STUCK_UNNAMED_COOLDOWN_S]
+    if not due or _console_update_in_progress():
+        return []
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    if not ldap_pass or not _ensure_ldapsearch() or _ldap_users_tak_groups(ldap_pass, None) is None:
+        return []          # a drop into a broken LDAP only brings the same empty lookup back
+    dropped = []
+    for s in sorted(due, key=lambda s: _subscription_num(s['uid'])):
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                       timeout=20, method='DELETE')
+        _tak_stuck_unnamed_dropped[key(s)] = now
+        if ok is None:
+            plog(f"  {tag}: couldn't drop {s['uid']} ({s['callsign']}): {err}")
+            continue
+        _tak_stuck_unnamed_seen.pop(s['uid'], None)
+        dropped.append(s['uid'])
+    if dropped:
+        plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK gave no user and no groups for "
+             f"{_TAK_STUCK_UNNAMED_MIN_S // 60}+ min ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
+    return dropped
+
+
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
     """v0.9.27-alpha: deterministic-autotune pool sizing — fleet-uniform.
 
@@ -74447,6 +74601,11 @@ def _authentik_spiral_monitor():
                 _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
             except Exception as _tr_e:
                 print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
+            # ops #565: a client TAK never looked up (no outage to trigger the heal above)
+            try:
+                _tak_drop_stuck_unnamed_sessions(_mon_log)
+            except Exception as _su_e:
+                print(f"[spiral monitor] TAK stuck-client check error (non-fatal): {_su_e}", flush=True)
 
             s = load_settings()
 
@@ -92622,7 +92781,40 @@ def _apt_disable_dead_local_sources(log_fn=None):
     return done
 
 
-def _apt_update_capture(timeout=600):
+# ops #563: a Sunday scan box lost its whole TAK Server install to ONE connection reset
+# (curl exit 56) fetching the PGDG key. Network steps in the deploy get 3 tries,
+# 5 and 15 seconds apart, before they give up with their own clear message.
+_NET_RETRY_DELAYS = (5, 15)
+
+# apt's own words for "the network blinked". Deliberately narrow: an HTTP 4xx from a
+# dead repo (Cloudsmith 402, a 404 suite) is not transient and must reach the heal logic fast.
+_APT_TRANSIENT_RE = re.compile(
+    r'Temporary failure resolving|Could not resolve|Connection (?:reset|timed out|failed|refused)'
+    r'|Could not connect|Unable to connect|Network is unreachable|Undetermined Error'
+    r'|Error reading from server|Bad header line|Connection closed', re.I)
+
+
+def _apt_failure_is_transient(output):
+    return bool(_APT_TRANSIENT_RE.search(output or ''))
+
+
+def _retry_transient(attempt, done, what, log_fn=None, delays=_NET_RETRY_DELAYS, sleep=None):
+    """Call attempt() until done(result) is true, waiting delays[i] seconds between tries
+    (len(delays) + 1 tries in all). Returns the last result, good or bad, so the caller keeps
+    its own failure message. Raises only what attempt() raises."""
+    sleep = sleep or time.sleep
+    result = attempt()
+    for n, wait in enumerate(delays, start=2):
+        if done(result):
+            break
+        if log_fn:
+            log_fn(f"  ⚠ {what} failed — retrying in {wait}s (try {n} of {len(delays) + 1})")
+        sleep(wait)
+        result = attempt()
+    return result
+
+
+def _apt_update_capture(timeout=600, log_fn=None):
     """`apt-get update` with the output KEPT. Returns (ok, combined_output).
 
     The old call was `apt-get update -qq > /dev/null 2>&1`, which threw away the
@@ -92633,13 +92825,19 @@ def _apt_update_capture(timeout=600):
     That entry fails the update for reasons that have nothing to do with the repo
     the caller is actually configuring, so without this the caller misdiagnoses a
     USB-installed box as a broken PGDG/Docker/Caddy repo."""
-    def _run():
+    def _run_once():
         try:
             r = subprocess.run('apt-get update -qq', shell=True, capture_output=True, text=True,
                                timeout=timeout, env=_broker_shim_env())
             return r.returncode == 0, ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
         except Exception as e:
             return False, f'{type(e).__name__}: {e}'
+
+    # ops #563: one network reset must not kill the deploy. The retry is ours, not apt's
+    # `-o Acquire::Retries`: the non-root broker denies every apt `-o` option.
+    def _run():
+        return _retry_transient(_run_once, lambda res: res[0] or not _apt_failure_is_transient(res[1]),
+                                'apt-get update', log_fn=log_fn)
 
     ok, out = _run()
     # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
@@ -92677,6 +92875,26 @@ def _pgdg_gis_pin_ensure(log_fn=None):
         if log_fn:
             log_fn(f"  ⚠ could not write {_PGDG_GIS_PIN}: {type(e).__name__}: {e}")
         return False
+
+
+def _pgdg_key_ok(rc, key):
+    return rc == 0 and len(key) >= 100 and b'BEGIN PGP PUBLIC KEY BLOCK' in key
+
+
+def _pgdg_key_fetch(log_fn=None, sleep=None):
+    """Fetch the PGDG signing key, up to 3 tries (ops #563). Returns (curl rc, bytes) of the
+    last try; the caller judges it with _pgdg_key_ok and words the failure."""
+    def _once():
+        try:
+            k = subprocess.run(['curl', '-fsSL', '--connect-timeout', '15', '--max-time', '60',
+                                _PGDG_KEY_URL], capture_output=True, timeout=75)
+            return k.returncode, (k.stdout or b'')
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ✗ Key fetch raised: {type(e).__name__}: {e}")
+            return -1, b''
+    return _retry_transient(_once, lambda res: _pgdg_key_ok(*res), 'PostgreSQL key fetch',
+                            log_fn=log_fn, sleep=sleep)
 
 
 def _setup_pgdg_apt_source():
@@ -92719,16 +92937,10 @@ def _setup_pgdg_apt_source():
         log_step("  Adding PostgreSQL GPG key...")
         # v10.0.5 non-root: fetch the key as takwerx, then write key + list through
         # the broker into already-allowlisted dirs (/usr/share/keyrings, /etc/apt).
-        key = b''
-        rc = -1
-        try:
-            _k = subprocess.run(['curl', '-fsSL', _PGDG_KEY_URL], capture_output=True, timeout=60)
-            rc, key = _k.returncode, (_k.stdout or b'')
-        except Exception as e:
-            log_step(f"  ✗ Key fetch raised: {type(e).__name__}: {e}")
+        rc, key = _pgdg_key_fetch(log_step)
         # An unchecked curl used to write a 0-byte keyring here, and the next
         # apt-get update then failed with the useless "not signed" error.
-        if rc != 0 or len(key) < 100 or b'BEGIN PGP PUBLIC KEY BLOCK' not in key:
+        if not _pgdg_key_ok(rc, key):
             log_step("")
             log_step("✗ FATAL: could not fetch the PostgreSQL signing key")
             log_step(f"    URL: {_PGDG_KEY_URL}")
@@ -92762,7 +92974,7 @@ def _setup_pgdg_apt_source():
     _pgdg_gis_pin_ensure(log_step)
     wait_for_package_lock()
     log_step("  Updating package lists...")
-    ok, out = _apt_update_capture()
+    ok, out = _apt_update_capture(log_fn=log_step)
     if ok:
         log_step("✓ PostgreSQL repository configured (apt-get update clean)")
         return True
@@ -102242,6 +102454,12 @@ def _mediamtx_converge_cloudtak_read(log=None):
     container missing mid-deploy, or Docker not answering → no change. Restarts MediaMTX
     only when the file changed and the operator has not stopped it. Returns True if changed."""
     _log = log or (lambda m: print(m, flush=True))
+    # ops #560: the media container's stream-name pin follows the standalone MediaMTX (installed
+    # after CloudTAK, or CloudTAK updated from a release without the pin). A no-op when current.
+    try:
+        _cloudtak_refresh_override(_log)
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK override refresh skipped (non-fatal): {e}")
     cfg_path = '/usr/local/etc/mediamtx.yml'
     if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
         return False

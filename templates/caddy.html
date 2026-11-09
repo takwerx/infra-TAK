@@ -355,6 +355,7 @@ async function deployCaddy(opts){
 // Built with textContent (the IPs come from DNS) and listeners, no inline handlers.
 var _DNS_STATUS={
     ok:['✓ points here','var(--green)'],
+    local:['✓ points here (LAN address)','var(--green)'],
     mismatch:['✗ points elsewhere','var(--red)'],
     missing:['✗ no A record','var(--red)'],
     error:['? lookup failed on this server','var(--yellow)'],
