@@ -54634,6 +54634,18 @@ def _webodm_backup_db_95():
     return f'db/{name}.gz'
 
 
+def _webodm_answers():
+    """True when Django in the webapp container answers HTTP. WebODM 4.x answers /api/ with
+    403 to a caller that isn't signed in (3.x: 200), so `curl -f` reads a healthy 4.x as down."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
+                                       '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return r.returncode == 0 and (r.stdout or '').strip()[:1] in ('2', '3', '4')
+
+
 def _webodm_wait_upgraded(deadline_s):
     """Wait for the first 4.x start: (True, '') once the webapp answers, (False, why) when the
     DB upgrade reports a failure or the time runs out."""
@@ -54642,10 +54654,7 @@ def _webodm_wait_upgraded(deadline_s):
         r = subprocess.run(_sudo_wrap(['docker', 'logs', 'wo_db']), capture_output=True, text=True, timeout=30)
         if 'UPGRADE FAILED' in (r.stdout or '') + (r.stderr or ''):
             return False, 'the database upgrade failed (details: db/upgrade.log)'
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '5',
-                                       'http://localhost:8000/api/']),
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0:
+        if _webodm_answers():
             return True, ''
         time.sleep(15)
     return False, f'WebODM did not answer within {deadline_s // 60} minutes'
@@ -54783,14 +54792,8 @@ def webodm_ready():
         return jsonify({'ready': True, 'status': 'healthy', 'url': wo_url})
 
     # 2. Fallback: probe WebODM's internal API endpoint directly from the container
-    try:
-        r2 = _sp.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
-                      'http://localhost:8000/api/']),
-                     capture_output=True, text=True, timeout=8)
-        if r2.returncode == 0:
-            return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
-    except Exception:
-        pass
+    if _webodm_answers():
+        return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
 
     # 3. Not ready yet — figure out a useful status message
     try:

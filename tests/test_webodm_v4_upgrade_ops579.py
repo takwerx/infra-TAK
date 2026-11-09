@@ -52,7 +52,7 @@ OLD = '''services:
 
 WANT = {'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE_STRIP',
         '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S',
-        '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_db_room_check', '_webodm_backup_db_95',
+        '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_answers', '_webodm_db_room_check', '_webodm_backup_db_95',
         '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update'}
 
 
@@ -83,7 +83,11 @@ class Box:
         if argv[:3] == ['docker', 'logs', 'wo_db']:
             return self._r(out='UPGRADE FAILED. ...' if self.upgrade_fails else 'Upgrade complete.')
         if argv[:3] == ['docker', 'exec', 'webapp']:
-            return self._r(rc=0 if 'webodm_webapp:3.3.1' in (self.running_images or '') or not self.upgrade_fails else 7)
+            up = 'webodm_webapp:3.3.1' in (self.running_images or '') or not self.upgrade_fails
+            if not up:
+                return self._r(rc=7, out='000')
+            # 4.x answers an anonymous /api/ with 403 (seen on a Rocky 9 box, ops #579); 3.x with 200
+            return self._r(out='200' if 'webodm_webapp:3.3.1' in self.running_images else '403')
         return self._r()
 
     def compose_cmd(self, d, action, timeout=300):
@@ -195,3 +199,20 @@ def test_failed_upgrade_restores_95_copy_and_old_compose():
     assert box.compose == OLD and _images(box.running_images)['wo_webapp'].endswith(':3.3.1')
     # stop the stack before touching the data dir
     assert box.calls.index(('compose', 'stop')) < box.calls.index(restore[0])
+
+
+def test_a_4x_webapp_answering_403_counts_as_up():
+    # WebODM 4.x refuses an anonymous /api/ with 403. A `curl -f` probe read that as down, so a
+    # good upgrade waited 20 minutes and was rolled back (Rocky 9 box, ops #579).
+    box = Box()
+    status, _ = _run(box)
+    assert status['complete'], status['log']
+    assert not any(c[0] == 'compose' and c[1].startswith('run --rm') for c in box.calls)
+    probes = [c[1] for c in box.calls if c[0] == 'run' and c[1][:3] == ('docker', 'exec', 'webapp')]
+    assert probes and all('-sf' not in p and '%{http_code}' in p for p in probes)
+
+
+def test_console_ready_check_uses_the_same_probe():
+    body = ast.get_source_segment(APP, next(
+        n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'webodm_ready'))
+    assert '_webodm_answers()' in body and "'-sf'" not in body
