@@ -38436,6 +38436,8 @@ def generate_caddyfile(settings=None):
             lines += _etl.caddy_hook_lines()   # v10.4.0 W7
         lines.append(f"}}")
         lines.append("")
+        if _etlrunner_hooks_wanted(settings):
+            lines += _etl.caddy_hook_fallback_site()
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
         lines.append(f"# CloudTAK Tile Server")
         lines.append(f"{ct_tiles} {{")
@@ -49516,7 +49518,8 @@ def _etlrunner_hooks_converge(log=None):
             live = _read_priv(CADDYFILE_PATH)
         except Exception:
             return want
-        has = '\n'.join(_etl.caddy_hook_lines()) in live
+        has = ('\n'.join(_etl.caddy_hook_lines()) in live
+               and '\n'.join(_etl.caddy_hook_fallback_site()) in live)
         if has != want or (not want and _etl.HOOK_PATH + '/*' in live):
             generate_caddyfile(s)
             ok, detail = _caddy_reload_if_changed(plog=log)

@@ -111,6 +111,10 @@ def test_write_modes(tmp_path):
         os.umask(old)
 
 
+def _full():
+    return '\n'.join(etl.caddy_hook_lines()) + '\n}\n' + '\n'.join(etl.caddy_hook_fallback_site())
+
+
 class Box:
     def __init__(self, enabled=True, route=False, layers=0, readable=True):
         self.settings = {'etl_runner': {'enabled': enabled, 'hooks_route': route, 'hook_secret': SEC}}
@@ -124,7 +128,7 @@ class Box:
                         generate_caddyfile=self._gen,
                         _caddy_reload_if_changed=lambda plog=None: (True, ''),
                         _read_priv=lambda path: self.live, CADDYFILE_PATH='/etc/caddy/Caddyfile')
-        self.live = '\n'.join(etl.caddy_hook_lines()) if route else ''
+        self.live = _full() if route else ''
 
     def _save(self, s):
         self.settings = s
@@ -132,7 +136,7 @@ class Box:
     def _gen(self, s):
         on = self.ns['_etlrunner_hooks_wanted'](s)
         self.caddy.append('hooks' if on else 'none')
-        self.live = '\n'.join(etl.caddy_hook_lines()) if on else ''
+        self.live = _full() if on else ''
 
     def converge(self):
         return self.ns['_etlrunner_hooks_converge'](lambda m: None)
@@ -182,3 +186,11 @@ def test_an_open_route_with_old_lines_is_refreshed_once():
     b.live = '    @etl_hooks path /etl-hooks/*\n    handle @etl_hooks {\n        reverse_proxy 127.0.0.1:4001\n    }'
     assert b.converge() is True and b.caddy == ['hooks']        # old form -> regenerated
     assert b.converge() is True and b.caddy == ['hooks']        # now current: no second reload
+
+
+def test_fallback_upstream_and_loopback_site():
+    lines = '\n'.join(etl.caddy_hook_lines())
+    assert f'reverse_proxy 127.0.0.1:{etl.HOOK_LOOPBACK_PORT} 127.0.0.1:{etl.HOOK_FALLBACK_PORT} {{' in lines
+    assert 'lb_policy first' in lines and 'fail_duration' in lines
+    site = etl.caddy_hook_fallback_site()
+    assert site[1] == f'http://127.0.0.1:{etl.HOOK_FALLBACK_PORT} {{' and '    bind 127.0.0.1' in site

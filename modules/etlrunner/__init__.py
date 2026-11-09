@@ -199,6 +199,7 @@ def webhooks_base(api_url, secret):
     return f"https://{host}{f':{u.port}' if u.port else ''}{HOOK_PATH}/{secret}"
 
 
+HOOK_FALLBACK_PORT = 4009                      # Caddy's own loopback 503 site (see caddy_hook_lines)
 HOOK_COOKIE = 'infratak_hook'                  # shim/lib.mjs HOOK_COOKIE
 HOOK_PATH_MASK = '_'                           # what the URI carries after Caddy moves the secret
 
@@ -220,9 +221,31 @@ def caddy_hook_lines(port=HOOK_LOOPBACK_PORT):
         "        route {",
         f"            request_header Cookie \"{HOOK_COOKIE}={{http.request.uri.path.1}}\"",
         f"            uri path_regexp ^{HOOK_PATH}/[^/]* {HOOK_PATH}/{HOOK_PATH_MASK}",
-        f"            reverse_proxy 127.0.0.1:{int(port)}",
+        # Fallback upstream: when the shim is down, Caddy answers from its own loopback site
+        # instead of failing the proxy — a failed proxy is what Caddy's error logger writes,
+        # with the ORIGINAL request URI (secret included; seen live, Caddy 2.11).
+        f"            reverse_proxy 127.0.0.1:{int(port)} 127.0.0.1:{HOOK_FALLBACK_PORT} {{",
+        "                lb_policy first",
+        "                lb_try_duration 2s",
+        "                fail_duration 10s",
+        "            }",
         "        }",
         "    }",
+    ]
+
+
+def caddy_hook_fallback_site():
+    """A loopback-only Caddy site the hook route falls back to while the shim is down."""
+    return [
+        "# ETL Runner webhooks (W7): fallback while the shim is down (loopback only)",
+        f"http://127.0.0.1:{HOOK_FALLBACK_PORT} {{",
+        "    bind 127.0.0.1",
+        "    header Content-Type application/json",
+        "    header X-Content-Type-Options nosniff",
+        "    header Cache-Control no-store",
+        "    respond `{\"message\":\"Service Unavailable\"}` 503",
+        "}",
+        "",
     ]
 
 
