@@ -139,7 +139,7 @@ def test_new_catalog_etl_is_announced_once_with_a_short_description(e):
 
 
 def test_unreviewed_or_uninstallable_etl_is_not_announced(e):
-    cat = [_cat(prefix='etl-u', reviewed=None), _cat(prefix='etl-w', flags={'webhook': True})]
+    cat = [_cat(prefix='etl-u', reviewed=None), _cat(prefix='etl-m', flags={'email': True})]
     assert e.notify_items(cat, {}, [])[0] == []
     assert [i['key'] for i in e.notify_items(cat[:1], {}, [], allow_unreviewed=True)[0]] == ['etl-new:etl-u']
 
