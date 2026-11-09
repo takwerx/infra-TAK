@@ -70229,6 +70229,64 @@ def _authentik_reconfigure_heal_tak_clients(plog, before=None):
         plog(f"  TAK LDAP recycle error (non-fatal): {str(e)[:120]}")
 
 
+# ops #565: the heal above runs only when something shows LDAP was down under TAK (an outpost
+# or Authentik restart, a pending request). nuc 2026-11-08: a phone enrolled and connected 3 s
+# later, TAK gave the connection no user and no groups (no outage anywhere; LDAP answered all
+# day), the phone left, and its relay kept the two sockets open. They sat on __ANON__ for 3 h
+# and Guard Dog mailed hourly that "the console reconnects these by itself". Nothing would
+# have: no outage, no heal. A connection TAK put neither a DN nor a username on is a failed
+# lookup (see _tak_heal_ldap_sessions), and a lookup that fails is never retried on that
+# connection. So the 10-min monitor drops one that has stayed that way this long; the client
+# reconnects and is looked up again. Only the drop, never a TAK restart: a client that comes
+# back the same way is not worth dropping everybody for, so it is retried at most hourly.
+_TAK_STUCK_UNNAMED_MIN_S = 600
+_TAK_STUCK_UNNAMED_COOLDOWN_S = 3600
+_tak_stuck_unnamed_seen = {}    # connection uid → epoch first seen with no user and no groups
+_tak_stuck_unnamed_dropped = {}  # device uid (else connection uid) → epoch of our last drop
+
+
+def _tak_drop_stuck_unnamed_sessions(plog):
+    """Drop the TAK client connections that have had no user and no groups for
+    `_TAK_STUCK_UNNAMED_MIN_S` (two monitor ticks), so the client reconnects and is looked up
+    again (ops #565). Needs LDAP answering. Returns the connection uids dropped."""
+    tag = 'TAK stuck-client check'
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        return []
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return []          # a busy API is not a verdict; keep what was seen
+    now = time.time()
+    stuck = {s['uid']: s for s in sessions if s['unnamed'] and not s['groups']}
+    for uid in list(_tak_stuck_unnamed_seen):
+        if uid not in stuck:
+            del _tak_stuck_unnamed_seen[uid]
+    for uid in stuck:
+        _tak_stuck_unnamed_seen.setdefault(uid, now)
+    key = lambda s: s['client'] or s['uid']
+    due = [s for uid, s in stuck.items()
+           if now - _tak_stuck_unnamed_seen[uid] >= _TAK_STUCK_UNNAMED_MIN_S
+           and now - _tak_stuck_unnamed_dropped.get(key(s), 0) >= _TAK_STUCK_UNNAMED_COOLDOWN_S]
+    if not due or _console_update_in_progress():
+        return []
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    if not ldap_pass or not _ensure_ldapsearch() or _ldap_users_tak_groups(ldap_pass, None) is None:
+        return []          # a drop into a broken LDAP only brings the same empty lookup back
+    dropped = []
+    for s in sorted(due, key=lambda s: _subscription_num(s['uid'])):
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                       timeout=20, method='DELETE')
+        _tak_stuck_unnamed_dropped[key(s)] = now
+        if ok is None:
+            plog(f"  {tag}: couldn't drop {s['uid']} ({s['callsign']}): {err}")
+            continue
+        _tak_stuck_unnamed_seen.pop(s['uid'], None)
+        dropped.append(s['uid'])
+    if dropped:
+        plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK gave no user and no groups for "
+             f"{_TAK_STUCK_UNNAMED_MIN_S // 60}+ min ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
+    return dropped
+
+
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
     """v0.9.27-alpha: deterministic-autotune pool sizing — fleet-uniform.
 
@@ -74492,6 +74550,11 @@ def _authentik_spiral_monitor():
                 _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
             except Exception as _tr_e:
                 print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
+            # ops #565: a client TAK never looked up (no outage to trigger the heal above)
+            try:
+                _tak_drop_stuck_unnamed_sessions(_mon_log)
+            except Exception as _su_e:
+                print(f"[spiral monitor] TAK stuck-client check error (non-fatal): {_su_e}", flush=True)
 
             s = load_settings()
 
