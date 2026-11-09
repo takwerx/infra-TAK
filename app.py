@@ -539,6 +539,113 @@ def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True
                                  restart_on_error=restart_on_error)[0]
 
 
+# ops #580 — a module deploy used to reload Caddy, throw the result away and print
+# "Caddy config updated for <module>". Found in the 3:58 AM PT real-name fresh install of
+# 10.3.9: the TAK Portal name did not answer at the check because Caddy had no certificate for
+# it yet (it logged "obtaining certificate" 10 minutes later), and the deploy log had already
+# said "updated". The helpers below make the deploy log say only what was seen.
+CADDY_CERT_WAIT_S = 180     # how long a deploy waits for Caddy to serve a valid certificate
+CADDY_CERT_POLL_S = 5
+
+
+def _caddy_serves_cert(hostname, settings=None, timeout=5):
+    """Ask the local Caddy for `hostname` over TLS. Returns (ok, detail).
+
+    Connects to 127.0.0.1 and sends `hostname` as the SNI name, so the answer is what Caddy
+    itself holds for that name. Public DNS and a router with no NAT hairpin cannot change it.
+    The certificate must verify for the name. In custom-certificate mode (ssl_mode 'custom')
+    the operator's own chain may not be in this box's trust store, so there any certificate
+    counts: Caddy has the one it was given."""
+    custom = ((settings or {}).get('ssl_mode') or '').strip().lower() == 'custom'
+    try:
+        ctx = ssl.create_default_context()
+        if custom:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(('127.0.0.1', _caddy_https_port(settings)), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=hostname) as tls:
+                if not tls.getpeercert(binary_form=True):
+                    return False, 'Caddy sent no certificate'
+        return True, ''
+    except Exception as e:
+        return False, (str(e) or e.__class__.__name__)[:120]
+
+
+def _caddy_wait_for_cert(hostname, settings=None, max_wait=CADDY_CERT_WAIT_S,
+                         poll=CADDY_CERT_POLL_S, check=None, sleep=None, clock=None):
+    """Wait until Caddy serves a valid certificate for `hostname`. Returns (ok, detail, seconds).
+
+    Never raises. `detail` is the last failure when the wait ran out."""
+    check = check or (lambda h: _caddy_serves_cert(h, settings))
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    start = clock()
+    detail = ''
+    while True:
+        ok, detail = check(hostname)
+        if ok:
+            return True, '', int(clock() - start)
+        if clock() - start + poll > max_wait:
+            return False, detail, int(clock() - start)
+        sleep(poll)
+
+
+def _caddy_apply_and_verify(plog, label, hostnames=(), settings=None, wait_for_cert=True,
+                            max_wait=CADDY_CERT_WAIT_S, reload=None, read_caddyfile=None,
+                            wait=None):
+    """Reload Caddy after a module deploy rewrote the Caddyfile, then report what is true.
+
+    Returns 'ok', 'reload-failed', 'no-vhost' or 'no-cert'. The deploy log says
+    "Caddy config updated for <label>" only for 'ok': Caddy loaded the config, the file has
+    a vhost for every name in `hostnames`, and (when wait_for_cert) Caddy serves a valid
+    certificate for each of them. Never raises, so a Caddy problem cannot fail the deploy."""
+    reload = reload or _caddy_reload_checked
+    names = [h.split(':')[0] for h in hostnames if h]
+    try:
+        ok, detail = reload(plog)
+    except Exception as e:
+        ok, detail = False, str(e)[:160]
+    if not ok:
+        plog(f"  ✗ Caddy did not load the new config for {label}: {(detail or '').strip()[:160]}")
+        plog("    The running Caddy is still on its OLD config. Reload it from the Caddy page once fixed.")
+        return 'reload-failed'
+    if not names:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    try:
+        text = (read_caddyfile or (lambda: _read_priv(CADDYFILE_PATH)))()
+    except Exception as e:
+        text = None
+        plog(f"  ⚠ Could not read the Caddyfile to check the {label} vhost ({str(e)[:80]})")
+    if text is not None:
+        # Anchor on the leading newline: `tak.x` is a suffix of `infratak.x`.
+        missing = [n for n in names if ('\n%s {' % n) not in ('\n' + text)]
+        if missing:
+            plog(f"  ✗ Caddy was reloaded, but its config has no site for {', '.join(missing)}.")
+            plog(f"    Caddy is not serving {label} there, so no certificate will be issued for it.")
+            return 'no-vhost'
+    if not wait_for_cert:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    waiter = wait or (lambda h: _caddy_wait_for_cert(h, settings, max_wait=max_wait))
+    bad = []
+    for n in names:
+        plog(f"  Waiting for Caddy to serve a valid certificate for {n} (up to {max_wait}s)...")
+        w_ok, w_detail, secs = waiter(n)
+        if w_ok:
+            plog(f"  ✓ Certificate ready for {n} ({secs}s)")
+        else:
+            bad.append(n)
+            plog(f"  ⚠ No valid certificate for {n} after {secs}s: {w_detail}")
+    if bad:
+        plog(f"  ⚠ {label} is deployed and Caddy has its site, but {', '.join(bad)} has no valid")
+        plog("    certificate yet. Caddy keeps trying in the background. Check that the name points at this")
+        plog("    server, then look at: journalctl -u caddy | grep -i 'obtain\\|acme'")
+        return 'no-cert'
+    plog(f"  ✓ Caddy config updated for {label}")
+    return 'ok'
+
+
 def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
     """Load the on-disk Caddyfile ONLY if Caddy is not already running it. Returns (ok, detail).
 
@@ -43848,8 +43955,8 @@ def run_takportal_deploy():
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            plog(f"  \u2713 Caddy config updated for TAK Portal")
+            # ops #580: say "updated" only after Caddy loaded it and serves a valid certificate.
+            _caddy_apply_and_verify(plog, 'TAK Portal', [_get_service_domain(settings, 'takportal')], settings)
             plog(f"  Open: https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}")
         plog("=" * 50)
         plog("")
@@ -44719,13 +44826,15 @@ paths:
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
     if mtx_domain:
-        plog(f"✓ Caddyfile updated — {mtx_domain} → {host}:5080")
+        # ops #580: report what Caddy really did, not that the file was written.
+        if _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings) == 'ok':
+            plog(f"✓ {mtx_domain} → {host}:5080")
     else:
-        plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
+        if _caddy_reload(plog):
+            plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
 
     # Step 8: SSL cert sync for RTSPS / HLS encryption
     plog("")
@@ -45565,9 +45674,10 @@ WantedBy=multi-user.target
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
-            _caddy_reload()
             mtx_domain = _get_service_domain(settings, 'mediamtx')
-            plog(f"✓ Caddyfile updated — {mtx_domain}")
+            # ops #580: the cert wait just below is this step's own; only the reload and the
+            # vhost are checked here.
+            _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings, wait_for_cert=False)
 
             # Wait up to 60s for cert
             cert_base = _caddy_acme_cert_base(mtx_domain)
@@ -52104,11 +52214,9 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             if domain:
                 generate_caddyfile(settings)
-                try:
-                    _caddy_reload()
-                    plog("✓ Caddy reloaded")
-                except subprocess.TimeoutExpired:
-                    plog("⚠ Caddy reload timed out — reload manually if needed")
+                # ops #580: _caddy_reload() never raises, so the old except was dead code and
+                # "Caddy reloaded" printed even when the reload failed.
+                _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
@@ -52225,11 +52333,8 @@ def run_cloudtak_redeploy(cfg=None):
             plog("⚠ API did not respond in time — if map.<domain> stays on 'Loading CloudTAK', check Container Logs and ensure the api container is running")
         if domain:
             generate_caddyfile(settings)
-            try:
-                _caddy_reload()
-                plog("✓ Caddy reloaded")
-            except subprocess.TimeoutExpired:
-                plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
+            # ops #580: see the remote path above; report what Caddy really did.
+            _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
@@ -59242,8 +59347,8 @@ volumes:
     if domain:
         plog("  Updating Caddy...")
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog(f"✓ Caddy updated — https://nodered.{domain}")
+        # ops #580: say "updated" only when Caddy loaded it and serves a valid certificate.
+        _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings)
     else:
         # v10.1.85 (field report, 2026-09-21): a remote deploy from a console with no
         # domain silently produced no route and no certificate anywhere.
@@ -59554,11 +59659,10 @@ volumes:
         # other half, so a failure there is named instead of aborting the whole deploy.
         if domain:
             generate_caddyfile(settings)
-            if _caddy_reload(plog):
-                plog(f"✓ Caddy updated — open via https://nodered.{domain}")
+            if _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings) == 'ok':
+                plog(f"  Open via https://{_pub_hostport(_get_service_domain(settings, 'nodered'), settings)}")
             else:
-                plog(f"  ⚠ Caddy did not reload cleanly — nodered.{domain} may not be")
-                plog(f"    reachable yet. Node-RED itself is running on port 1880.")
+                plog("  Node-RED itself is running on port 1880.")
         else:
             plog("  No domain configured — access via http://<server>:1880")
         if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.expanduser('~/authentik/.env')):
@@ -63405,8 +63509,8 @@ networks:
     settings['authentik_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
-    plog("✓ Caddyfile updated")
+    # ops #580: report the reload result; Authentik's own TLS wait runs in its deploy.
+    _caddy_apply_and_verify(plog, 'Authentik', (), settings)
 
     # v0.9.12 — remote Authentik firewall (security-hardened):
     #   * 9090/9443 (Authentik HTTP/HTTPS): NOT opened publicly. Compose
@@ -85123,8 +85227,7 @@ def _sync_webadmin_after_authentik_reconfigure(plog):
         plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog("  ✓ Caddy reloaded.")
+        _caddy_apply_and_verify(plog, 'WebAdmin', (), settings)
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
@@ -93474,8 +93577,8 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             try:
                 generate_caddyfile(settings)
-                _caddy_reload()
-                log_step("  ✓ Caddy config updated for TAK Server")
+                # ops #580: print "updated" only when Caddy took the config.
+                _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
 
@@ -94629,8 +94732,8 @@ def run_takserver_deploy(config):
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            log_step(f"  ✓ Caddy config updated for TAK Server")
+            # ops #580: print "updated" only when Caddy took the config.
+            _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
 
         # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
         if webadmin_pass and _get_authentik_env_content(settings):
