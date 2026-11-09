@@ -18,6 +18,7 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
+    sqsReplay, sqsSnapshot, sqsBytes, SQS_MAX_PER_LAYER, SQS_MAX_DEAD, SQS_MAX_BYTES,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -25,6 +26,7 @@ const HOOK_PORT = 4001;                                       // webhooks — th
 const ETL_API = process.env.SHIM_ETL_API || 'http://api:5000';
 const BROKER_SOCK = process.env.SHIM_BROKER_SOCK || '/run/etl/broker.sock';
 const STATE = process.env.SHIM_STATE || '/data/stacks.json';
+const SQS_JOURNAL = process.env.SHIM_SQS_JOURNAL || STATE.replace(/[^/]*$/, 'sqs.journal');
 // W7: the box's webhook secret (infra-TAK's overlay). Absent or malformed = every webhook refused.
 const HOOK_SECRET = process.env.SHIM_HOOK_SECRET || '';
 const CAP_LABEL = 'com.cloudtak.capabilities';
@@ -208,42 +210,121 @@ async function invokeNow(fnName, payload, type) {
 }
 
 // ---- SQS outgoing: FIFO per layer, BatchSize 1, 3 tries then dead-letter (as the CloudTAK template asks) ----
-const queues = {};          // FunctionName -> { q: [], pumping, dead: [] }
+// Durable (W6 follow-on): see lib.mjs sqsReplay. SendMessage is answered only after fsync.
+let queues = {};            // FunctionName -> { q: [], pumping, dead: [] }
+let jfd = null, jPending = [], jWaiters = [], jTimer = null, jBytes = 0, qBytes = 0;
+function jOpen() {
+    const live = new Set(Object.values(stacks).map((s) => s.fn.FunctionName));
+    let text = '';
+    try { text = fs.readFileSync(SQS_JOURNAL, 'utf8'); } catch { /* fresh */ }
+    queues = sqsReplay(text, live);
+    for (const Q of Object.values(queues)) { Q.pumping = false; qBytes += Q.q.reduce((n, m) => n + sqsBytes(m), 0); }
+    jCompact();
+    const n = Object.values(queues).reduce((n, Q) => n + Q.q.length, 0);
+    if (n) log(`sqs: ${n} queued message(s) restored from the journal`);
+}
+function jCompact() {
+    const snap = sqsSnapshot(queues), tmp = `${SQS_JOURNAL}.tmp`;
+    const fd = fs.openSync(tmp, 'w', 0o600);
+    try { fs.writeSync(fd, snap); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, SQS_JOURNAL);
+    if (jfd !== null) fs.closeSync(jfd);
+    jfd = fs.openSync(SQS_JOURNAL, 'a', 0o600);
+    jBytes = Buffer.byteLength(snap);
+}
+function jFlush() {
+    jTimer = null;
+    const recs = jPending, waiters = jWaiters;
+    jPending = []; jWaiters = [];
+    let err = null;
+    try {
+        if (recs.length) {
+            const text = recs.join('');
+            fs.writeSync(jfd, text); fs.fsyncSync(jfd); jBytes += Buffer.byteLength(text);
+        }
+        if (jBytes > 4 * 1024 * 1024 && jBytes > 4 * (qBytes + 1)) jCompact();
+    } catch (e) { err = e; log(`sqs journal write failed: ${e.message}`); }
+    for (const w of waiters) w(err);
+}
+function journal(rec) {
+    jPending.push(JSON.stringify(rec) + '\n');
+    jTimer ||= setTimeout(jFlush, 5);
+}
+function jCommitted() {                       // resolves (with an error or null) after the next fsync
+    jTimer ||= setTimeout(jFlush, 5);
+    return new Promise((resolve) => jWaiters.push(resolve));
+}
 function enqueue(fnName, msg) {
     const Q = (queues[fnName] ||= { q: [], pumping: false, dead: [] });
-    Q.q.push(msg); if (!Q.pumping) pump(fnName);
+    Q.q.push(msg); qBytes += sqsBytes(msg);
+    journal({ o: 'a', f: fnName, m: msg });
 }
 async function pump(fnName) {
-    const Q = queues[fnName]; Q.pumping = true;
-    while (Q.q.length) {
-        const m = Q.q.shift();
+    const Q = queues[fnName];
+    if (!Q || Q.pumping) return;
+    Q.pumping = true;
+    while (queues[fnName] === Q && Q.q.length) {
+        const m = Q.q[0];                     // stays queued (and journaled) until delivery finished
         const event = { Records: [{ messageId: m.Id, receiptHandle: randomUUID(), body: m.MessageBody,
             attributes: { ApproximateReceiveCount: String(m.tries + 1), SentTimestamp: String(m.ts), MessageGroupId: m.MessageGroupId || '', MessageDeduplicationId: m.MessageDeduplicationId || '' },
             messageAttributes: {}, md5OfBody: createHash('md5').update(m.MessageBody || '').digest('hex'), eventSource: 'aws:sqs',
             eventSourceARN: `arn:aws:sqs:local:000000000000:${m.queue}`, awsRegion: 'local' }] };
         let ok = false;
         try { const r = await invoke(fnName, event, 'SQS'); ok = !r.fnError; } catch { ok = false; }
-        if (!ok) { m.tries++; if (m.tries < 3) Q.q.push(m); else { Q.dead.push(m); Q.dead = Q.dead.slice(-1000); log(`sqs ${m.queue}: message ${m.Id} dead-lettered`); } }
+        if (queues[fnName] !== Q || Q.q[0] !== m) break;          // purged while it ran
+        Q.q.shift();
+        if (ok) { qBytes -= sqsBytes(m); journal({ o: 'k', f: fnName, id: m.Id }); continue; }
+        m.tries++;
+        if (m.tries < 3) { Q.q.push(m); journal({ o: 'r', f: fnName, id: m.Id, t: m.tries }); continue; }
+        qBytes -= sqsBytes(m);
+        Q.dead.push(m); Q.dead = Q.dead.slice(-SQS_MAX_DEAD);
+        journal({ o: 'x', f: fnName, id: m.Id });
+        log(`sqs ${m.queue}: message ${m.Id} dead-lettered`);
     }
     Q.pumping = false;
 }
-function sqs(op, req, res) {
+function sqsPurge(fnName) {
+    const Q = queues[fnName];
+    if (!Q) return;
+    qBytes -= Q.q.reduce((n, m) => n + sqsBytes(m), 0);
+    delete queues[fnName];
+    journal({ o: 'p', f: fnName });
+}
+async function sqs(op, req, res) {
     const ct = 'application/x-amz-json-1.0';
     if (op !== 'SendMessageBatch' && op !== 'SendMessage') return json(res, 400, { __type: 'com.amazonaws.sqs#UnsupportedOperation', message: `shim: unsupported ${op}` }, ct);
     const queue = String(req.QueueUrl || '').split('/').pop();
     const stack = queue.replace(/-outgoing(-dead)?\.fifo$/, '');
     const s = stacks[stack];
     if (!s || !s.fn.Outgoing) return json(res, 400, { __type: 'com.amazonaws.sqs#QueueDoesNotExist', message: `The specified queue does not exist: ${queue}` }, ct);
-    const entries = op === 'SendMessage' ? [{ Id: '0', ...req }] : (req.Entries || []);
-    const Successful = [];
+    const entries = op === 'SendMessage' ? [{ Id: '0', ...req }] : (Array.isArray(req.Entries) ? req.Entries : []);
+    const fnName = s.fn.FunctionName;
+    const Successful = [], Failed = [];
     for (const e of entries) {
-        const MessageId = randomUUID();
-        enqueue(s.fn.FunctionName, { ...e, Id: MessageId, queue, tries: 0, ts: Date.now() });
-        Successful.push({ Id: e.Id, MessageId, MD5OfMessageBody: createHash('md5').update(e.MessageBody || '').digest('hex') });
+        const body = typeof e.MessageBody === 'string' ? e.MessageBody : '';
+        const m = { Id: randomUUID(), MessageBody: body, MessageGroupId: e.MessageGroupId, MessageDeduplicationId: e.MessageDeduplicationId,
+                    queue, tries: 0, ts: Date.now() };
+        if ((queues[fnName]?.q.length || 0) >= SQS_MAX_PER_LAYER || qBytes + sqsBytes(m) > SQS_MAX_BYTES) {
+            Failed.push({ Id: e.Id, SenderFault: false, Code: 'ServiceUnavailable', Message: 'shim: outgoing queue is full' });
+            continue;
+        }
+        enqueue(fnName, m);
+        Successful.push({ Id: e.Id, MessageId: m.Id, MD5OfMessageBody: createHash('md5').update(body).digest('hex') });
     }
+    if (Successful.length) {
+        const err = await jCommitted();       // group commit: on disk before we say yes
+        if (err) return json(res, 500, { __type: 'com.amazonaws.sqs#InternalError', message: 'shim: queue write failed' }, ct);
+        pump(fnName);
+    }
+    if (Failed.length) log(`SQS ${op} ${queue}: ${Failed.length} refused (queue full)`);
     log(`SQS ${op} ${queue} n=${entries.length}`);
-    return json(res, 200, op === 'SendMessage' ? Successful[0] : { Successful, Failed: [] }, ct);
+    if (op === 'SendMessage') {
+        return Successful.length ? json(res, 200, Successful[0], ct)
+            : json(res, 503, { __type: 'com.amazonaws.sqs#ServiceUnavailable', message: 'shim: outgoing queue is full' }, ct);
+    }
+    return json(res, 200, { Successful, Failed }, ct);
 }
+process.on('SIGTERM', () => { try { if (jTimer) { clearTimeout(jTimer); jFlush(); } } finally { process.exit(0); } });
 
 // ---- protocol helpers ----
 const xmlEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -304,7 +385,7 @@ async function query(form, res) {          // CloudFormation + STS (both AWS que
     if (action === 'DeleteStack') {
         disarm(name);
         const fnName = stacks[name]?.fn.FunctionName;
-        if (fnName) dropWarm(fnName);
+        if (fnName) { dropWarm(fnName); sqsPurge(fnName); }
         delete stacks[name]; save(); return cfnOk(res, action, '');
     }
     if (action === 'CancelUpdateStack') return cfnOk(res, action, '');
@@ -448,6 +529,7 @@ async function main() {
     const left = (await broker('list')).containers;
     for (const c of left) await broker('stop', { id: c.id }).catch((e) => log('reap fail', e.message));
     if (left.length) log(`reaped ${left.length} leftover ETL container(s)`);
+    jOpen();
 
     // The SQS SDK sends to the QueueUrl host (sqs.<region>.amazonaws.com) and ignores AWS_ENDPOINT_URL_SQS, so the
     // shim also answers that name over TLS — a network alias points it here and CloudTAK trusts the shim CA (W6).
@@ -458,6 +540,7 @@ async function main() {
     http.createServer(apiHandler).listen(PORT, () => {
         log(`etl-shim on :${PORT} api=${ETL_API} max=${MAX_CONCURRENT} keepwarm=${KEEPWARM_MS / 1000}s warm_budget=${WARM_BUDGET_MB}MiB broker=${BROKER_SOCK}`);
         Object.keys(stacks).forEach(arm);
+        Object.keys(queues).forEach(pump);           // redeliver what a previous shim had queued
     });
     http.createServer(webhookHandler).listen(HOOK_PORT, () => log(`etl-shim webhooks on :${HOOK_PORT}`));
 }

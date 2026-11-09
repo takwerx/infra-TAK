@@ -222,3 +222,52 @@ export function hookRoute(pathname, secret, timingSafeEqual) {
     if (rest.some((p) => p === '..' || p === '.')) return { refuse: 'bad path' };
     return { uid, rest, rawPath: '/' + [uid, ...rest].join('/') };
 }
+
+// ---- W6: the outgoing SQS queue survives a shim restart (append-only journal) ----
+// Real SQS keeps a message it acknowledged. The shim answers SendMessage only after the message
+// is in the journal (group commit + fsync), and a message leaves the queue only after its
+// delivery finished, so a restart redelivers it: at-least-once, as SQS is.
+// Records, one JSON object per line: {o:'a', f, m} add to queue; {o:'r', f, id, t} retry (moves
+// to the end with t tries); {o:'k', f, id} delivered; {o:'x', f, id} dead-lettered;
+// {o:'d', f, m} add straight to dead letters (compaction only); {o:'p', f} purge a function.
+export const SQS_MAX_PER_LAYER = 10000;
+export const SQS_MAX_DEAD = 1000;
+export const SQS_MAX_BYTES = 256 * 1024 * 1024;      // all queued bodies together, on disk and in memory
+
+export function sqsReplay(text, live) {
+    const Q = {};
+    const get = (f) => (Q[f] ||= { q: [], dead: [] });
+    for (const line of String(text || '').split('\n')) {
+        let r;
+        try { r = JSON.parse(line); } catch { continue; }       // a torn last line from a crash
+        if (!r || typeof r !== 'object' || typeof r.f !== 'string') continue;
+        const at = () => get(r.f).q.findIndex((m) => m.Id === r.id);
+        if (r.o === 'a' && r.m && typeof r.m.Id === 'string') get(r.f).q.push(r.m);
+        else if (r.o === 'd' && r.m && typeof r.m.Id === 'string') get(r.f).dead.push(r.m);
+        else if (r.o === 'p') delete Q[r.f];
+        else if (r.o === 'r' || r.o === 'k' || r.o === 'x') {
+            const i = at();
+            if (i < 0) continue;
+            const [m] = get(r.f).q.splice(i, 1);
+            if (r.o === 'r') get(r.f).q.push({ ...m, tries: Number(r.t) || 0 });
+            if (r.o === 'x') get(r.f).dead.push(m);
+        }
+    }
+    for (const f of Object.keys(Q)) {
+        if (live && !live.has(f)) { delete Q[f]; continue; }
+        Q[f].dead = Q[f].dead.slice(-SQS_MAX_DEAD);
+        if (!Q[f].q.length && !Q[f].dead.length) delete Q[f];
+    }
+    return Q;
+}
+
+export function sqsSnapshot(queues) {
+    const out = [];
+    for (const [f, Q] of Object.entries(queues)) {
+        for (const m of Q.dead || []) out.push(JSON.stringify({ o: 'd', f, m }));
+        for (const m of Q.q || []) out.push(JSON.stringify({ o: 'a', f, m }));
+    }
+    return out.length ? out.join('\n') + '\n' : '';
+}
+
+export const sqsBytes = (m) => Buffer.byteLength(m?.MessageBody || '') + 512;
