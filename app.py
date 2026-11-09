@@ -28364,11 +28364,12 @@ def _collect_patch_now_items(feed, unknown, now=None):
     return items, feed
 
 
-def _collect_pending_updates(settings, seen=None, unknown=None):
+def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
     source shielded so one failure never hides the rest. `seen`/`unknown`: see
-    _os_security_items."""
+    _os_security_items. `etl`: {'known': [...] | None}; the ETL catalog source writes the
+    prefixes it would mark as announced back into etl['known'] (see _etl.notify_items)."""
     seen = {} if seen is None else seen
     unknown = set() if unknown is None else unknown
     pending = []
@@ -28425,6 +28426,23 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
                                 'identity': ident})
     except Exception as e:
         print(f"[update-notify] plugin check failed: {e}", flush=True)
+    try:
+        # W3/W9: ETL catalog — updates for installed ETLs and new catalog ETLs. Only while the
+        # ETL Runner is on: a box that never turned ETL on is not told about ETLs.
+        if etl is not None and _etlrunner_cfg(settings).get('enabled'):
+            r = subprocess.run(_sudo_wrap(['docker', 'images', _etl.ETL_REPO, '--format', '{{.Tag}}']),
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or '').strip()[:200] or 'docker images failed')
+            known = etl.get('known')
+            items, etl['known'] = _etl.notify_items(
+                _etl.load_catalog(), _etl.installed_versions(r.stdout.splitlines()),
+                known if isinstance(known, list) else None,
+                bool(_etlrunner_cfg(settings).get('allow_unreviewed')))
+            pending.extend(items)
+    except Exception as e:
+        unknown.update({'etl', 'etl-new'})   # etl['known'] is left as it came in
+        print(f"[update-notify] ETL catalog check failed: {e}", flush=True)
     return pending
 
 
@@ -28463,7 +28481,9 @@ def _update_notify_check_once(fast=False):
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
     unknown = set()
-    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    etl_known_in = state.get('_etl_known')
+    etl = {'known': list(etl_known_in) if isinstance(etl_known_in, list) else None}
+    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown, etl=etl)
     feed = state.get('_patch_now_feed')
     try:
         pn_found, feed = _collect_patch_now_items(feed, unknown, now)
@@ -28528,7 +28548,8 @@ def _update_notify_check_once(fast=False):
         else:
             lines += [f"The following updates are pending on {server_id}:", '']
         for p in other:
-            lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
+            lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
+            lines += [f"      {d}" for d in p.get('detail') or []]
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
@@ -28543,6 +28564,9 @@ def _update_notify_check_once(fast=False):
                     + (' (reminder)' if reminder else ''))
         elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
+        elif all(p.get('etl_new') for p in new_items):
+            subj = (f"🆕 New ETL available on {server_id}" if len(new_items) == 1
+                    else f"🆕 {len(new_items)} new ETLs available on {server_id}")
         else:
             subj = (f"⬆ Update pending on {server_id}" if len(new_items) == 1
                     else f"⬆ {len(new_items)} updates pending on {server_id}")
@@ -28566,6 +28590,13 @@ def _update_notify_check_once(fast=False):
                 new_state[k] = state[k]
         if seen:
             new_state['_os_security_seen'] = seen
+        # W3/W9: announced ETL prefixes. A new ETL that was in this email joins the set only
+        # because the email went out; one that was not mailed stays out and is retried.
+        if etl.get('known') is not None:
+            sent_new = {p['key'].split(':', 1)[1] for p in new_items if p.get('etl_new')} if emailed else set()
+            new_state['_etl_known'] = sorted(set(etl['known']) | sent_new)
+        elif isinstance(etl_known_in, list):
+            new_state['_etl_known'] = etl_known_in
     # ops #377: patch-now reminders. Both modes run the same patch-now sources, so an item
     # missing here was verified fixed and stops; an unreadable source carries its entry.
     mailed_keys = {p['key'] for p in new_items} if emailed else set()

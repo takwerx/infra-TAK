@@ -184,3 +184,47 @@ def installed_versions(image_lines):
     for v in out.values():
         v.sort(key=lambda s: tuple(int(x) for x in s.split('.')))
     return out
+
+
+def _short(text, limit=200):
+    """First sentence of third-party text, one line, no control characters, at most `limit`."""
+    t = ' '.join(_re.sub(r'[\x00-\x1f\x7f]', ' ', text or '').split())
+    t = _re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0]
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + '…'
+
+
+def notify_items(catalog, installed, known, allow_unreviewed=False):
+    """Guard Dog update-email items for the ETL catalog -> (items, known).
+
+    * `etl:<prefix>` — an installed ETL whose catalog version is newer and installable here;
+      identity is the pinned SHA, so each new commit is mailed once.
+    * `etl-new:<prefix>` — an installable catalog ETL this box has not seen before.
+
+    `known` is the set of prefixes already announced (None on the first sweep). The first
+    sweep returns every current prefix as the baseline and announces nothing — a box that
+    turns ETL on must not get one email per catalog entry. The caller adds the announced
+    prefixes to `known` only after the email is sent."""
+    def vt(v):
+        return tuple(int(x) for x in v.split('.'))
+    baseline = known is None
+    known = set(e['prefix'] for e in catalog) if baseline else set(known)
+    items = []
+    for e in catalog:
+        p, have = e['prefix'], installed.get(e['prefix']) or []
+        can, _ = installable(e, allow_unreviewed)
+        if have:
+            known.add(p)       # installed before we announced it: nothing to announce
+            if can and vt(e['version']) > vt(have[-1]):
+                items.append({'key': f'etl:{p}', 'identity': e['sha'],
+                              'label': f"CloudTAK ETL “{e['name']}”",
+                              'installed': f"v{have[-1]}", 'target': f"v{e['version']}",
+                              'how': 'CloudTAK page → ETL → Update.'})
+        elif can and p not in known:
+            items.append({'key': f'etl-new:{p}', 'identity': e['sha'], 'etl_new': True,
+                          'label': f"CloudTAK ETL “{e['name']}”",
+                          'installed': 'not installed', 'target': f"v{e['version']}",
+                          'summary': f"New ETL available: {e['name']} v{e['version']}"
+                                     + (f" (community, by {e['author']})" if e.get('community') else ''),
+                          'detail': [d for d in (_short(e.get('description')),) if d],
+                          'how': 'CloudTAK page → ETL → Install.'})
+    return items, known
