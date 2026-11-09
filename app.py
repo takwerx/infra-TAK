@@ -28443,7 +28443,7 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
                 raise RuntimeError((r.stderr or '').strip()[:200] or 'docker images failed')
             known = etl.get('known')
             items, etl['known'] = _etl.notify_items(
-                _etl.load_catalog(), _etl.installed_versions(r.stdout.splitlines()),
+                _etl_catalog(), _etl.installed_versions(r.stdout.splitlines()),
                 known if isinstance(known, list) else None,
                 bool(_etlrunner_cfg(settings).get('allow_unreviewed')))
             pending.extend(items)
@@ -48901,6 +48901,101 @@ def _etlrunner_cfg(settings=None):
     return dict(c) if isinstance(c, dict) else {}
 
 
+# W3 phase 2: the signed catalog from takwerx/infratak-etl-catalog. modules/etlrunner checks the
+# signature; this side fetches (only while the runner is on), refuses rollback, and caches.
+_ETLCAT_CACHE = os.path.join(CONFIG_DIR, 'etl-catalog')
+_ETLCAT_REFRESH_LOCK = threading.Lock()
+
+
+def _etl_catalog():
+    return _etl.load_catalog(cache_dir=_ETLCAT_CACHE)
+
+
+def _etlcat_fetch(url, limit):
+    req = urllib.request.Request(url, headers={'User-Agent': 'infra-TAK-etl-catalog',
+                                               'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f'{url.rsplit("/", 1)[-1]} is larger than {limit} bytes')
+    return data
+
+
+def _etlcat_cache_write(name, data):
+    os.makedirs(_ETLCAT_CACHE, mode=0o700, exist_ok=True)
+    path = os.path.join(_ETLCAT_CACHE, name)
+    try:
+        if open(path, 'rb').read() == data:
+            return
+    except OSError:
+        pass
+    tmp = f'{path}.{os.getpid()}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _etlcat_refresh():
+    """Fetch the signed catalog at the current commit of its main branch. Returns the check
+    record that is also saved in settings (etl_runner.catalog_check)."""
+    if not _ETLCAT_REFRESH_LOCK.acquire(blocking=False):
+        return {'ok': False, 'error': 'a catalog check is already running'}
+    try:
+        rec = {'at': int(time.time()), 'ok': False}
+        try:
+            meta = json.loads(_etlcat_fetch(
+                f'https://api.github.com/repos/{_etl.CATALOG_REPO}/commits/{_etl.CATALOG_BRANCH}', 512 * 1024))
+            sha = str(meta.get('sha') or '') if isinstance(meta, dict) else ''
+            if not _etl.COMMIT_SHA_RE.fullmatch(sha):
+                raise ValueError('GitHub returned no commit for the catalog')
+            # both files at the same commit: a CDN never pairs a new catalog with an old signature
+            base = f'https://raw.githubusercontent.com/{_etl.CATALOG_REPO}/{sha}/{_etl.CATALOG_FILE}'
+            raw = _etlcat_fetch(base, _etl.CATALOG_MAX_BYTES)
+            sig = _etlcat_fetch(base + '.sig', 4096)
+            c = _etlrunner_cfg()
+            floor = max(_etl.catalog_serial(_etl.bundled_catalog()), int(c.get('catalog_serial') or 0))
+            d, why = _etl.accept_fetched(raw, sig, floor)
+            rec['commit'] = sha
+            if d is None:
+                rec['error'] = why
+                print(f"[etlrunner] catalog {sha[:12]} refused: {why}", flush=True)
+            else:
+                _etlcat_cache_write(_etl.CATALOG_FILE + '.sig', sig)
+                _etlcat_cache_write(_etl.CATALOG_FILE, raw)
+                rec.update(ok=True, serial=_etl.catalog_serial(d))
+        except Exception as e:
+            rec['error'] = str(e)[:200]
+        s = load_settings()
+        c = _etlrunner_cfg(s)
+        c['catalog_check'] = rec
+        if rec.get('ok'):
+            c['catalog_serial'] = max(int(c.get('catalog_serial') or 0), rec['serial'])
+        s['etl_runner'] = c
+        save_settings(s)
+        return rec
+    finally:
+        _ETLCAT_REFRESH_LOCK.release()
+
+
+def _etlcat_refresh_due(c, now=None):
+    rec = c.get('catalog_check') if isinstance(c.get('catalog_check'), dict) else {}
+    wait = _etl.CATALOG_CHECK_SEC if rec.get('ok') else 3600
+    return (now or time.time()) - int(rec.get('at') or 0) >= wait
+
+
+def _etlcat_catalog_info():
+    c = _etlrunner_cfg()
+    try:
+        d, src = _etl.active_catalog(_ETLCAT_CACHE)
+    except Exception:
+        d, src = {}, 'bundled'
+    rec = c.get('catalog_check') if isinstance(c.get('catalog_check'), dict) else {}
+    return {'source': src, 'serial': _etl.catalog_serial(d), 'repo': _etl.CATALOG_REPO,
+            'checked_at': rec.get('at'), 'ok': rec.get('ok'), 'error': rec.get('error'),
+            'commit': (rec.get('commit') or '')[:12] or None}
+
+
 def _etlrunner_ct_local(settings):
     try:
         return _get_cloudtak_deployment_config(settings).get('target_mode') != 'remote'
@@ -49135,6 +49230,12 @@ def _etlrunner_hooks_loop():
                 _etlrunner_hooks_converge()
         except Exception as e:
             print(f"[etlrunner] webhooks route check: {e}", flush=True)
+        try:
+            c = _etlrunner_cfg()
+            if c.get('enabled') and _etlcat_refresh_due(c):
+                _etlcat_refresh()
+        except Exception as e:
+            print(f"[etlrunner] catalog check: {e}", flush=True)
         time.sleep(60)
 
 
@@ -49406,7 +49507,7 @@ def _etlcat_job(action, prefix):
     log = lambda m: mod_registry.job_log(_ETLCAT_KEY, m.rstrip())
     ok = False
     try:
-        e = next((x for x in _etl.load_catalog() if x['prefix'] == prefix), None)
+        e = next((x for x in _etl_catalog() if x['prefix'] == prefix), None)
         s = load_settings()
         if action in ('install', 'update'):
             can, why = _etl.installable(e or {}, bool(_etlrunner_cfg(s).get('allow_unreviewed')))
@@ -49468,7 +49569,7 @@ def cloudtak_etl_catalog():
     inst = _etlcat_installed()
     reg = _etlcat_integrations() or {}
     out = []
-    for e in _etl.load_catalog():
+    for e in _etl_catalog():
         can, why = _etl.installable(e, allow)
         have = inst.get(e['prefix'], [])
         out.append({k: e.get(k) for k in ('prefix', 'name', 'description', 'version', 'author',
@@ -49478,16 +49579,22 @@ def cloudtak_etl_catalog():
                       'installable': can, 'reason': why})
     job = mod_registry.job_state(_ETLCAT_KEY)
     return jsonify({'entries': out, 'enabled': bool(_etlrunner_cfg(s).get('enabled')),
+                    'catalog': _etlcat_catalog_info(),
                     'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
 
 
 @app.route('/api/cloudtak/etl/catalog/<action>', methods=['POST'])
 @login_required
 def cloudtak_etl_catalog_action(action):
+    if action == 'refresh':
+        if not _etlrunner_cfg().get('enabled'):
+            return jsonify({'error': 'turn the ETL Runner on first'}), 409
+        rec = _etlcat_refresh()
+        return jsonify({'check': rec, 'catalog': _etlcat_catalog_info()}), (200 if rec.get('ok') else 502)
     if action not in ('install', 'update', 'remove'):
         return jsonify({'error': 'unknown action'}), 404
     prefix = str((request.get_json(silent=True) or {}).get('prefix') or '')
-    if not _etl.PREFIX_RE.fullmatch(prefix) or prefix not in {e['prefix'] for e in _etl.load_catalog()}:
+    if not _etl.PREFIX_RE.fullmatch(prefix) or prefix not in {e['prefix'] for e in _etl_catalog()}:
         return jsonify({'error': 'not a catalog ETL'}), 400
     if not mod_registry.job_start(_ETLCAT_KEY, action, _etlcat_job, (action, prefix)):
         return jsonify({'error': 'an ETL install is already running'}), 409

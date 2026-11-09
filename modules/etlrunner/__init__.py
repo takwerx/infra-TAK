@@ -227,10 +227,155 @@ def valid_entry(e):
             and SOURCE_RE.fullmatch(str(e.get('source', ''))) is not None)
 
 
-def load_catalog(path=CATALOG):
+# ── W3 phase 2: the signed catalog fetched from takwerx/infratak-etl-catalog ─────────────────
+# The catalog decides what a box builds and runs (source + sha + reviewed), so a fetched copy is
+# used only when it carries a valid Ed25519 signature from the offline key whose public half
+# ships here. Any failure falls back to the bundled catalog, which is trusted like code.
+CATALOG_SCHEMA = 1
+CATALOG_REPO = 'takwerx/infratak-etl-catalog'
+CATALOG_BRANCH = 'main'
+CATALOG_FILE = 'catalog.json'
+CATALOG_MAX_BYTES = 2 * 1024 * 1024
+CATALOG_MAX_ENTRIES = 500
+CATALOG_PUBKEY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'catalog_signing.pub')
+CATALOG_CHECK_SEC = 24 * 3600
+COMMIT_SHA_RE = SHA_RE
+
+
+def parse_catalog(raw):
+    """bytes -> dict, or ValueError. Checks shape only; the signature is checked apart."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > CATALOG_MAX_BYTES:
+        raise ValueError('catalog is too large')
+    try:
+        d = _json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError('catalog is not JSON')
+    if not isinstance(d, dict) or d.get('schema') != CATALOG_SCHEMA:
+        raise ValueError('catalog schema is not supported')
+    serial = d.get('serial')
+    if not isinstance(serial, int) or isinstance(serial, bool) or serial <= 0:
+        raise ValueError('catalog has no serial')
+    ents = d.get('entries')
+    if not isinstance(ents, list) or len(ents) > CATALOG_MAX_ENTRIES:
+        raise ValueError('catalog entries are not a list')
+    return d
+
+
+def catalog_serial(d):
+    s = d.get('serial') if isinstance(d, dict) else None
+    return s if isinstance(s, int) and not isinstance(s, bool) and s > 0 else 0
+
+
+def _pubkeys(path=CATALOG_PUBKEY):
+    try:
+        text = open(path).read()
+    except OSError:
+        return []
+    return _re.findall(r'-----BEGIN PUBLIC KEY-----[A-Za-z0-9+/=\s]+?-----END PUBLIC KEY-----', text)
+
+
+def verify_signature(raw, sig_text, pubkey_path=CATALOG_PUBKEY, openssl='openssl'):
+    """True only when `sig_text` (base64 of a 64-byte Ed25519 signature) verifies over the exact
+    bytes `raw` with a pinned public key. Uses the OpenSSL 3 CLI (a start.sh dependency on both
+    families), argv only, in a private temp dir."""
+    import base64
+    import binascii
+    import shutil
+    import subprocess
+    import tempfile
+    try:
+        sig = base64.b64decode((sig_text or b'').strip(), validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    keys = _pubkeys(pubkey_path)
+    if len(sig) != 64 or not keys or not isinstance(raw, (bytes, bytearray)):
+        return False
+    d = tempfile.mkdtemp(prefix='etlcat-')
+    try:
+        paths = {}
+        for name, data in (('msg', bytes(raw)), ('sig', sig)):
+            paths[name] = os.path.join(d, name)
+            with open(paths[name], 'wb') as f:
+                f.write(data)
+        for i, k in enumerate(keys):
+            kp = os.path.join(d, f'k{i}.pem')
+            with open(kp, 'w') as f:
+                f.write(k + '\n')
+            try:
+                r = subprocess.run([openssl, 'pkeyutl', '-verify', '-rawin', '-pubin', '-inkey', kp,
+                                    '-in', paths['msg'], '-sigfile', paths['sig']],
+                                   capture_output=True, text=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if r.returncode == 0 and 'Signature Verified Successfully' in r.stdout:
+                return True
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_VERIFIED = {}          # (path, mtime_ns, size) -> parsed dict, so a load does not re-run openssl
+
+
+def cached_catalog(cache_dir, pubkey_path=CATALOG_PUBKEY):
+    """The fetched catalog in `cache_dir`, or None unless its signature still verifies."""
+    if not cache_dir:
+        return None
+    cp, sp = os.path.join(cache_dir, CATALOG_FILE), os.path.join(cache_dir, CATALOG_FILE + '.sig')
+    try:
+        st = os.stat(cp)
+        key = (cp, st.st_mtime_ns, st.st_size, os.stat(sp).st_mtime_ns)
+        if key in _VERIFIED:
+            return _VERIFIED[key]
+        with open(cp, 'rb') as f:
+            raw = f.read(CATALOG_MAX_BYTES + 1)
+        with open(sp, 'rb') as f:
+            sig = f.read(4096)
+        d = parse_catalog(raw)
+    except (OSError, ValueError):
+        return None
+    if not verify_signature(raw, sig, pubkey_path):
+        return None
+    _VERIFIED.clear()
+    _VERIFIED[key] = d
+    return d
+
+
+def bundled_catalog(path=CATALOG):
     with open(path) as f:
-        d = _json.load(f)
+        return _json.load(f)
+
+
+def active_catalog(cache_dir=None, path=CATALOG, pubkey_path=CATALOG_PUBKEY):
+    """(dict, source): the verified fetched catalog when its serial is newer than the bundled
+    one, else the bundled catalog (on a tie the bundled file wins: it can carry local edits not
+    yet published, and it needs no openssl call). source is 'fetched' or 'bundled'."""
+    b = bundled_catalog(path)
+    if not cache_dir or not os.path.exists(os.path.join(cache_dir, CATALOG_FILE)):
+        return b, 'bundled'
+    c = cached_catalog(cache_dir, pubkey_path)
+    if c is not None and catalog_serial(c) > catalog_serial(b):
+        return c, 'fetched'
+    return b, 'bundled'
+
+
+def load_catalog(path=CATALOG, cache_dir=None, pubkey_path=CATALOG_PUBKEY):
+    d, _src = active_catalog(cache_dir, path, pubkey_path)
     return [e for e in d.get('entries', []) if valid_entry(e)]
+
+
+def accept_fetched(raw, sig, floor, pubkey_path=CATALOG_PUBKEY):
+    """(dict, '') when a fetched catalog may replace the cache, else (None, reason). `floor` is
+    the highest serial this box has accepted or bundled: anything lower is a rollback."""
+    try:
+        d = parse_catalog(raw)
+    except ValueError as e:
+        return None, str(e)
+    if not verify_signature(raw, sig, pubkey_path):
+        return None, 'signature does not verify'
+    if catalog_serial(d) < floor:
+        return None, f'serial {catalog_serial(d)} is older than {floor} (rollback refused)'
+    return d, ''
 
 
 def installable(e, allow_unreviewed=False):

@@ -166,8 +166,12 @@ def main():
     print('\n'.join(changes) if changes else 'catalog unchanged')
     if a.check:
         sys.exit(1 if changes else 0)
+    # `serial` is stamped by tools/etl_catalog_publish.py when the catalog is signed; keep it, so
+    # the bundled file stays byte-identical to the published one until the next publish.
+    serial = json.load(open(CATALOG)).get('serial') if os.path.exists(CATALOG) else None
+    doc = {'schema': 1, **({'serial': serial} if serial else {}), 'entries': new}
     with open(CATALOG, 'w') as f:
-        json.dump({'schema': 1, 'entries': new}, f, indent=2)
+        json.dump(doc, f, indent=2)
         f.write('\n')
     print(f'{len(new)} entries -> {os.path.relpath(CATALOG)}')
 

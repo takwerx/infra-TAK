@@ -346,6 +346,10 @@
         <span id="ct-etl-hooks-state"></span>
         <a id="ct-etl-hooks-rotate" style="color:var(--cyan);cursor:pointer;margin-left:8px">Change webhook password…</a>
       </div>
+      <div style="margin-top:6px">
+        <span id="ct-etl-cat-state"></span>
+        <a id="ct-etl-cat-check" style="color:var(--cyan);cursor:pointer;margin-left:8px">Check now</a>
+      </div>
     </div>
     <div id="ct-etl-filter-row" style="display:none;margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
       <input id="ct-etl-filter" type="search" placeholder="Search ETLs…" style="flex:1;min-width:200px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
@@ -470,6 +474,11 @@
         return fetch('/api/cloudtak/etl/catalog');
       }).then(function(r){ return r.json(); }).then(function(d){
         entries = d.entries || [];
+        var cs = document.getElementById('ct-etl-cat-state'), c = d.catalog || {};
+        document.getElementById('ct-etl-cat-check').style.display = enabled ? '' : 'none';
+        cs.style.color = (c.ok === false) ? '#eab308' : 'var(--text-dim)';
+        cs.textContent = 'ETL list: version ' + (c.serial || '—') + (c.source === 'fetched' ? ' (downloaded, signature checked)' : ' (built into this infra-TAK version)')
+          + (c.checked_at ? '. Last check ' + new Date(c.checked_at * 1000).toLocaleString() + (c.ok === false ? ' failed: ' + (c.error || 'unknown error') : '') : '') + '.';
         entries.sort(function(a, b){ return ((b.installed||[]).length>0) - ((a.installed||[]).length>0) || a.name.localeCompare(b.name); });
         document.getElementById('ct-etl-filter-row').style.display = 'flex';
         renderTabs(); render();
@@ -512,6 +521,11 @@
       if (!confirm('Change the webhook password? Every webhook URL you already gave to an outside service stops working. You must copy each new URL from the layer in CloudTAK. CloudTAK restarts for about a minute.')) return;
       fetch('/api/cloudtak/etl/rotate-hooks', {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
         .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'change webhook password'); });
+    };
+    document.getElementById('ct-etl-cat-check').onclick = function(){
+      var cs = document.getElementById('ct-etl-cat-state'); cs.textContent = 'Checking for new ETLs…';
+      fetch('/api/cloudtak/etl/catalog/refresh', {method: 'POST'}).then(function(r){ return r.json(); })
+        .then(function(){ load(); }).catch(function(){ load(); });
     };
     filter.oninput = render;
     load();
