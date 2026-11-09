@@ -115,6 +115,8 @@ def watch(fake):
               '_AK_DIR_CONFIRM_WAIT_S', '_AK_DIR_DROP_WINDOW_S',
               '_AK_DIR_DROP_COOLDOWN_S', '_AK_DIR_DROP_MAX'):
         ns[c] = _const(c)
+    ns['re'] = __import__('re')
+    exec(compile(_src('_ak_log_names'), 'app.py:_ak_log_names', 'exec'), ns)
     exec(compile(_src('_ak_directory_watch_tick'), 'app.py:_ak_directory_watch_tick', 'exec'), ns)
     tick_s = _const('_AK_DIR_WATCH_TICK_S')
 
@@ -287,12 +289,13 @@ def test_no_authentik_database_is_idle():
     assert fake.patches == []
 
 
-def test_snapshot_parses_psql_output_with_its_separators():
-    """nuc: str.splitlines() also splits on chr(30), which turned every row into nothing."""
+def test_snapshot_reads_json_so_no_name_can_split_a_row():
+    """nuc: str.splitlines() split on chr(30) and turned every row into nothing; names may hold any
+    character, so the query returns one JSON object."""
+    import json as _json
     import subprocess
-    raw = ('miketestfire\x1etak_FIRE1 Main\x1ftak_FIRE1 OPS\n'
-           'adm_ldapservice\x1e\n'
-           'ma-manhunt\x1etak_MA - Man HUNT\x1fauthentik Admins\n')
+    raw = _json.dumps({'miketestfire': ['tak_FIRE1 Main', 'tak_FIRE1 OPS'], 'adm_ldapservice': [],
+                       'odd\nname\x1e': ['tak_MA - Man HUNT', 'authentik Admins']}) + '\n'
     seen = {}
 
     def run(cmd, **kw):
@@ -300,12 +303,14 @@ def test_snapshot_parses_psql_output_with_its_separators():
         return types.SimpleNamespace(returncode=0, stdout=raw)
     ns = {'subprocess': types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired,
                                               DEVNULL=subprocess.DEVNULL),
-          '_sudo_wrap': lambda c: c}
+          '_sudo_wrap': lambda c: c, 'json': _json}
     exec(compile(_src('_ak_directory_snapshot'), 'app.py:_ak_directory_snapshot', 'exec'), ns)
     snap = ns['_ak_directory_snapshot']()
-    assert snap == {'miketestfire': frozenset({'FIRE1 Main', 'FIRE1 OPS'}),
-                    'adm_ldapservice': frozenset(), 'ma-manhunt': frozenset({'MA - Man HUNT'})}
+    assert snap == {'miketestfire': frozenset({'FIRE1 Main', 'FIRE1 OPS'}), 'adm_ldapservice': frozenset(),
+                    'odd\nname\x1e': frozenset({'MA - Man HUNT'})}
     assert seen.get('stdin') == subprocess.DEVNULL      # the broker shim waits on an open stdin
+    raw = 'not json'
+    assert ns['_ak_directory_snapshot']() is None
 
 
 def test_big_directory_waits_longer_between_reloads():
@@ -347,3 +352,35 @@ def test_unhealthy_authentik_gets_no_patch():
     exec(compile(_src('_ak_refresh_ldap_outposts'), 'app.py:_ak_refresh_ldap_outposts', 'exec'), ns)
     assert ns['_ak_refresh_ldap_outposts'](lambda m: None) is False
     assert calls == [('GET', 'http://127.0.0.1:9090/-/health/ready/')]
+
+
+def test_only_removals_open_no_drop_window():
+    fake = base()
+    tick, _ = watch(fake)
+    tick(0)
+    del fake.db['e-1fire']
+    fake.connect('tls:9', 'ANDROID-ghost', 'deleted-user')
+    did = tick()
+    assert did['refreshed'] == ['e-1fire'] and not did['confirmed'] and did['dropped'] == []
+    assert fake.deleted == []
+
+
+def test_repeated_changes_do_not_reset_the_drop_limit():
+    """An admin editing a membership every 20 s must not keep dropping the same clients."""
+    fake = base()
+    tick, _ = watch(fake)
+    tick(0)
+    fake.connect('tls:5', 'ANDROID-ghost', 'deleted-user')
+    for i in range(40):                     # ~10 min of changes, every tick
+        fake.db['e-1fire'] = {'FIRE1 OPS'} if i % 2 else {'FIRE1 OPS', 'FIRE1 Main'}
+        tick()
+    assert len(fake.deleted) == 2
+
+
+def test_names_in_logs_cannot_forge_lines():
+    fake = base()
+    tick, _ = watch(fake)
+    tick(0)
+    fake.db['evil\n[ak-directory-watch] forged'] = {'FIRE1 OPS'}
+    tick()
+    assert all('\n' not in l for l in fake.log)

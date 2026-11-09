@@ -70641,26 +70641,35 @@ def _ak_directory_snapshot():
     """{username: frozenset of its tak_ group names without the prefix} for every active
     Authentik user, read from Authentik's database (one query, no API, no LDAP). None when
     Authentik's database can't be read (no Authentik on this box, container down)."""
-    sql = ("SELECT u.username, coalesce(string_agg(g.name, chr(31)) FILTER (WHERE g.name LIKE 'tak\\_%'), '') "
+    # One JSON object, so no character in a user or group name can split a row.
+    sql = ("SELECT coalesce(json_object_agg(username, groups), '{}') FROM ("
+           "SELECT u.username, coalesce(json_agg(g.name) FILTER (WHERE g.name LIKE 'tak\\_%'), '[]') AS groups "
            "FROM authentik_core_user u "
            "LEFT JOIN authentik_core_user_groups ug ON ug.user_id = u.id "
            "LEFT JOIN authentik_core_group g ON g.group_uuid = ug.group_id "
-           "WHERE u.is_active GROUP BY u.username;")
+           "WHERE u.is_active GROUP BY u.username) d;")
     try:
         r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
-                                       '-d', 'authentik', '-tA', '-F', chr(30), '-c', sql]),
+                                       '-d', 'authentik', '-tA', '-c', sql]),
                            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
         return None
-    out = {}
-    for line in (r.stdout or '').split('\n'):   # not splitlines(): it also splits on chr(30)
-        if chr(30) not in line:
-            continue
-        user, groups = line.split(chr(30), 1)
-        out[user] = frozenset(g[4:] for g in groups.split(chr(31)) if g.startswith('tak_'))
-    return out
+    try:
+        data = json.loads((r.stdout or '').strip() or '{}')
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(u): frozenset(g[4:] for g in (gs or []) if isinstance(g, str) and g.startswith('tak_'))
+            for u, gs in data.items()}
+
+
+def _ak_log_names(names, n=10):
+    """Names for a log line: control characters out (no forged lines), at most n."""
+    names = [re.sub(r'[\x00-\x1f\x7f]', '?', str(x)) for x in names]
+    return ', '.join(names[:n]) + (' …' if len(names) > n else '')
 
 
 def _ak_refresh_ldap_outposts(plog):
@@ -70722,6 +70731,10 @@ def _ak_directory_watch_tick(plog):
         st['last_refresh'] = now
         did['refreshed'] = users
         want = {u: snap[u] for u in users if u in snap}    # removed users: nothing to wait for
+        if not want:
+            # Only removals / deactivations: nobody new to look up, so no drop window.
+            plog(f"  LDAP outpost refreshed (directory changed: {_ak_log_names(users)})")
+            return did
         removed = {u: (old or {}).get(u, frozenset()) - snap.get(u, frozenset()) for u in want}
         ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         t0 = time.time()
@@ -70733,15 +70746,14 @@ def _ak_directory_watch_tick(plog):
                        for u in want):
                     break
             if time.time() - t0 >= _AK_DIR_CONFIRM_WAIT_S:
-                plog(f"  LDAP outpost refresh: directory changed ({', '.join(users[:10])}) but LDAP "
+                plog(f"  LDAP outpost refresh: directory changed ({_ak_log_names(users)}) but LDAP "
                      f"didn't show it within {_AK_DIR_CONFIRM_WAIT_S} s; the 10-min check stays the safety net")
                 return did
             time.sleep(2)
         st['confirmed_at'] = time.time()
-        st['drops'] = {}
         did['confirmed'] = True
-        plog(f"  LDAP outpost refreshed (directory changed: {', '.join(users[:10])}"
-             f"{' …' if len(users) > 10 else ''}); LDAP answers in {st['confirmed_at'] - now:.0f} s")
+        plog(f"  LDAP outpost refreshed (directory changed: {_ak_log_names(users)}); "
+             f"LDAP answers in {st['confirmed_at'] - now:.0f} s")
     if not st['confirmed_at'] or time.time() - st['confirmed_at'] >= _AK_DIR_DROP_WINDOW_S:
         return did
     if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
@@ -70750,25 +70762,29 @@ def _ak_directory_watch_tick(plog):
     if not sessions:
         return did
     now = time.time()
+    # A client's drop count lasts one window from its first drop; a new directory change does
+    # not reset it (else a membership edited every 20 s would keep dropping the same clients).
+    for k in [k for k, (_n, first, _last) in st['drops'].items() if now - first >= _AK_DIR_DROP_WINDOW_S]:
+        del st['drops'][k]
     for s in sorted(sessions, key=lambda s: _subscription_num(s['uid'])):
         if not s['unnamed'] or s['groups']:
             continue
         _tak_stuck_unnamed_seen.setdefault(s['uid'], now)
-        n, last = st['drops'].get(s['client'], (0, 0.0))
+        n, first, last = st['drops'].get(s['client'], (0, now, 0.0))
         if n >= _AK_DIR_DROP_MAX or now - last < _AK_DIR_DROP_COOLDOWN_S:
             continue
         ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
                                        timeout=20, method='DELETE')
-        st['drops'][s['client']] = (n + 1, now)
+        st['drops'][s['client']] = (n + 1, first, now)
         _tak_stuck_unnamed_dropped[s['client']] = now
         if ok is None:
-            plog(f"  LDAP outpost refresh: couldn't drop {s['uid']} ({s['callsign']}): {err}")
+            plog(f"  LDAP outpost refresh: couldn't drop {_ak_log_names([s['uid'], s['callsign']])}: {err}")
             continue
         _tak_stuck_unnamed_seen.pop(s['uid'], None)
         did['dropped'].append(s['uid'])
     if did['dropped']:
         plog(f"  LDAP outpost refresh: dropped {len(did['dropped'])} connection(s) TAK gave no user and no "
-             f"groups ({', '.join(did['dropped'][:15])}); they reconnect and are looked up again")
+             f"groups ({_ak_log_names(did['dropped'], 15)}); they reconnect and are looked up again")
     return did
 
 
