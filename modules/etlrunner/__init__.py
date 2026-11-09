@@ -238,7 +238,7 @@ def caddy_hook_fallback_site():
     """A loopback-only Caddy site the hook route falls back to while the shim is down."""
     return [
         "# ETL Runner webhooks (W7): fallback while the shim is down (loopback only)",
-        f"http://127.0.0.1:{HOOK_FALLBACK_PORT} {{",
+        f"http://:{HOOK_FALLBACK_PORT} {{",   # any Host: the proxy keeps the map hostname
         "    bind 127.0.0.1",
         "    header Content-Type application/json",
         "    header X-Content-Type-Options nosniff",

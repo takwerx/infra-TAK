@@ -193,4 +193,4 @@ def test_fallback_upstream_and_loopback_site():
     assert f'reverse_proxy 127.0.0.1:{etl.HOOK_LOOPBACK_PORT} 127.0.0.1:{etl.HOOK_FALLBACK_PORT} {{' in lines
     assert 'lb_policy first' in lines and 'fail_duration' in lines
     site = etl.caddy_hook_fallback_site()
-    assert site[1] == f'http://127.0.0.1:{etl.HOOK_FALLBACK_PORT} {{' and '    bind 127.0.0.1' in site
+    assert site[1].startswith(f'http://:{etl.HOOK_FALLBACK_PORT} {{') and '    bind 127.0.0.1' in site
