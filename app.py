@@ -46056,7 +46056,32 @@ def _cloudtak_untrusted_user_certs(limit=100):
     return sum(1 for c in certs[:limit] if _cert_signed_by(c or '', bundle) is False)
 
 
+def _cloudtak_admin_users():
+    """Usernames of CloudTAK's system admins, read from CloudTAK's own profile table so it also
+    works on boxes set up before the page showed it. Disabled accounts are left out (`disabled`
+    is read through to_jsonb so an older CloudTAK without that column still answers). None when
+    the table can't be read: the page then shows nothing rather than a guess."""
+    names = _cloudtak_postgis_json(
+        "select coalesce(json_agg(username order by created, username), '[]') from profile "
+        "where system_admin and coalesce((to_jsonb(profile)->>'disabled')::boolean, false) = false")
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str) and n]
+
+
 def _cloudtak_connect_state(settings):
+    """The page's status line plus, once CloudTAK is set up, `admins`: its system admin
+    usernames. Before setup the only rows are a half-finished attempt's leftovers, and when the
+    table can't be read there is no `admins` key: the page shows nothing rather than a guess."""
+    state = _cloudtak_connect_state_core(settings)
+    if state.get('status') in ('connected', 'users_untrusted', 'refused_untrusted', 'down'):
+        admins = _cloudtak_admin_users()
+        if admins is not None:
+            state['admins'] = admins
+    return state
+
+
+def _cloudtak_connect_state_core(settings):
     """{'supported', 'status', 'connection_status', 'message'} for the CloudTAK page's line.
     status: unsupported / unreachable / unconfigured / connected / users_untrusted /
     refused_untrusted / down."""
@@ -60193,6 +60218,15 @@ window.ctLoadConnectState = function(retries) {
       var color = { connected: 'var(--green)', refused_untrusted: 'var(--red)', users_untrusted: 'var(--yellow)',
                     down: 'var(--yellow)', unconfigured: 'var(--yellow)', unreachable: 'var(--red)' }[d.status] || 'var(--text-dim)';
       st.innerHTML = '<span style="color:' + color + '">● ' + esc(d.message || d.status) + '</span>';
+      // Who CloudTAK's admin is (its system admin users). Only sent once CloudTAK is set up.
+      var adm = document.getElementById('ct-connect-admins');
+      if (adm) {
+        var admins = Array.isArray(d.admins) ? d.admins : [];
+        adm.style.display = admins.length ? '' : 'none';
+        adm.innerHTML = admins.length
+          ? 'CloudTAK admin' + (admins.length > 1 ? 's' : '') + ': <strong style="color:var(--text-primary)">' + admins.map(esc).join(', ') + '</strong>'
+          : '';
+      }
       if (btn) {
         btn.style.display = d.supported ? '' : 'none';
         btn.textContent = d.status === 'connected' ? 'Reconnect with a new certificate' : 'Connect CloudTAK to TAK Server';
