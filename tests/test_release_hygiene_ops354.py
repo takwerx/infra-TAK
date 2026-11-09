@@ -30,13 +30,17 @@ tag v10.3.3-alpha), so the rule is not "VERSION equals the newest tag". It is:
   * The newest section is written for users: it opens with a Headline and carries no commit hashes
     or branch names.
 
-A PR into `dev` is only held to the newest release that `dev` itself already acknowledges (ops #435).
-Release tags land on `main`, so for a while after a release the tag is newer than anything `dev` knows
-about; a good PR must not turn red in that window. A PR into `main`, or a run with no base branch
-(a local run, a release branch), is held to the newest tag, so a release whose notes lag still fails.
+A PR into `dev` is only held to the newest release that its own README already acknowledges (ops #435,
+ops #586). Release tags land on `main`, and dev's README and VERSION are bumped a little later, so for a
+while after a release the tag is newer than anything an older PR branch knows about; a good PR must not
+turn red in that window. The first fix (#435) read dev's live README, but a PR tree stays frozen at the
+commit it branched from, so a branch that was behind dev when a release went out failed every time
+(Nov 2 and Nov 9). Judging a tree only by its own contents makes the result independent of when dev
+moves. A PR into `main`, or a run with no base branch (a local run, a release branch), is held to the
+newest tag, so a release whose notes lag still fails.
 
-CI checks out without tags, so its pytest job fetches them (and the PR's base branch); with `CI` set
-and no tags the test fails instead of skipping, so a broken checkout cannot turn the check off.
+CI checks out without tags, so its pytest job fetches them; with `CI` set and no tags the test fails
+instead of skipping, so a broken checkout cannot turn the check off.
 """
 
 import os
@@ -104,26 +108,14 @@ def _newest_tag():
     return max(versions, key=_key) if versions else None
 
 
-def _base_current_release(base_ref, repo=REPO):
-    """The "Current release" version in README.md on origin/<base_ref>, or None if it can't be read."""
-    out = subprocess.run(
-        ['git', 'show', f'origin/{base_ref}:README.md'],
-        cwd=repo, capture_output=True, text=True, check=False,
-    )
-    if out.returncode != 0:
-        return None
-    m = _CURRENT_RE.search(out.stdout)
-    return m.group(1) if m else None
-
-
-def baseline_tag(newest, tags, base_ref, base_current):
-    """The tag a tree is held to. Strict (the newest tag) unless this is a PR into dev whose base README
+def baseline_tag(newest, tags, base_ref, tree_current):
+    """The tag a tree is held to. Strict (the newest tag) unless this is a PR into dev whose own README
     names a release: then the newest tag that is not newer than that release, so a release tagged on
-    main after the PR's base was cut can't fail a good PR."""
-    if base_ref in (None, '', 'main') or base_current is None:
+    main after the PR branched can't fail a good PR."""
+    if base_ref in (None, '', 'main') or tree_current is None:
         return newest
     try:
-        limit = _key(base_current)
+        limit = _key(tree_current)
     except ValueError:
         return newest
     older = [t for t in tags if _key(t) <= limit]
@@ -151,6 +143,13 @@ def release_problems(version, tag, notes_version, current_release):
             f'README "Current release" is v{current_release}; expected '
             + (f'v{version}' if v == t else f'v{tag} or v{version}'))
     return problems
+
+
+def tree_problems(version, notes_version, current_release, tags, base_ref):
+    """release_problems for a whole tree. Only the tree's own files and the tags are read, so the result
+    cannot change when dev moves on (ops #586)."""
+    tag = baseline_tag(max(tags, key=_key), tags, base_ref, current_release)
+    return release_problems(version, tag, notes_version, current_release)
 
 
 # ---- the rule itself --------------------------------------------------------------------------
@@ -189,18 +188,18 @@ def test_malformed_version_is_reported():
     assert release_problems('ten', '10.3.3-alpha', '10.3.3-alpha', '10.3.3-alpha')
 
 
-# ---- a release tagged on main must not turn good PRs into dev red (ops #435) --------------------
+# ---- a release tagged on main must not turn good PRs into dev red (ops #435, ops #586) ----------
 
 TAGS = ['10.3.2-alpha', '10.3.3-alpha', '10.3.4-alpha']
 
 
-def test_pr_into_dev_is_held_to_the_release_dev_already_has():
-    # 10.3.4-alpha was just tagged on main; dev's README still says 10.3.3-alpha. A PR branched from
-    # that dev (VERSION 10.3.4-alpha, notes not yet bumped) is fine.
+def test_pr_into_dev_is_held_to_the_release_its_own_readme_has():
+    # 10.3.4-alpha was just tagged on main; the PR's README still says 10.3.3-alpha. A PR branched from
+    # a dev like that (VERSION 10.3.4-alpha, notes not yet bumped) is fine.
     tag = baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.3-alpha')
     assert tag == '10.3.3-alpha'
     assert release_problems('10.3.4-alpha', tag, '10.3.3-alpha', '10.3.3-alpha') == []
-    # Without the base rule, the same tree is red: this is the bug.
+    # Without the rule, the same tree is red: this is the bug.
     assert release_problems('10.3.4-alpha', '10.3.4-alpha', '10.3.3-alpha', '10.3.3-alpha')
 
 
@@ -216,33 +215,46 @@ def test_no_base_branch_means_strict():
     assert baseline_tag('10.3.4-alpha', TAGS, '', '10.3.3-alpha') == '10.3.4-alpha'
 
 
-def test_unreadable_base_falls_back_to_strict():
+def test_unreadable_readme_falls_back_to_strict():
     assert baseline_tag('10.3.4-alpha', TAGS, 'dev', None) == '10.3.4-alpha'
     assert baseline_tag('10.3.4-alpha', TAGS, 'dev', 'garbage') == '10.3.4-alpha'
 
 
 def test_dev_ahead_of_every_tag_uses_the_newest_tag():
-    # dev already announced 10.3.5-alpha as current (tag not cut yet): newest tag it has is 10.3.4-alpha
+    # the README already announces 10.3.5-alpha as current (tag not cut yet): newest tag it has is 10.3.4-alpha
     assert baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.5-alpha') == '10.3.4-alpha'
 
 
-def test_a_pr_still_fails_when_it_is_behind_what_dev_has():
+def test_a_pr_still_fails_when_its_version_is_behind_its_own_readme():
     tag = baseline_tag('10.3.4-alpha', TAGS, 'dev', '10.3.4-alpha')
     assert tag == '10.3.4-alpha'
     assert release_problems('10.3.3-alpha', tag, '10.3.3-alpha', '10.3.3-alpha')
 
 
-def test_base_current_release_is_read_from_origin_branch(tmp_path):
-    def git(*a):
-        subprocess.run(['git', *a], cwd=tmp_path, check=True, capture_output=True)
-    git('init', '-q')
-    (tmp_path / 'README.md').write_text(
-        '**Current release: [v10.3.3-alpha](https://github.com/x/y/releases/tag/v10.3.3-alpha)**\n')
-    git('add', 'README.md')
-    git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x')
-    git('update-ref', 'refs/remotes/origin/dev', 'HEAD')
-    assert _base_current_release('dev', tmp_path) == '10.3.3-alpha'
-    assert _base_current_release('nope', tmp_path) is None
+def test_branch_behind_dev_after_a_release_stays_green():
+    # ops #586, Nov 9: v10.3.9-alpha was tagged, then dev's README went to 10.3.9 and VERSION to 10.3.10.
+    # A branch cut before that has VERSION 10.3.9-alpha and a README that still says 10.3.8-alpha. Its
+    # result must be the same whatever dev looks like now, because only its own README is read.
+    tags = ['10.3.7-alpha', '10.3.8-alpha', '10.3.9-alpha']
+    assert tree_problems('10.3.9-alpha', '10.3.8-alpha', '10.3.8-alpha', tags, 'dev') == []
+    # The #435 rule read dev's live README (now 10.3.9-alpha), which made this tree "a released tree
+    # with stale notes": this is what went red.
+    assert release_problems('10.3.9-alpha', baseline_tag('10.3.9-alpha', tags, 'dev', '10.3.9-alpha'),
+                            '10.3.8-alpha', '10.3.8-alpha')
+
+
+def test_branch_cut_after_the_release_is_still_checked():
+    tags = ['10.3.8-alpha', '10.3.9-alpha']
+    assert tree_problems('10.3.10-alpha', '10.3.9-alpha', '10.3.9-alpha', tags, 'dev') == []
+    # a tree whose README skipped ahead of VERSION is still a typo
+    assert tree_problems('10.3.9-alpha', '10.3.11-alpha', '10.3.9-alpha', tags, 'dev')
+    assert tree_problems('10.3.8-alpha', '10.3.9-alpha', '10.3.9-alpha', tags, 'dev')
+
+
+def test_release_pr_into_main_ignores_the_readme_baseline():
+    tags = ['10.3.8-alpha', '10.3.9-alpha']
+    assert tree_problems('10.3.9-alpha', '10.3.8-alpha', '10.3.8-alpha', tags, 'main')
+    assert tree_problems('10.3.9-alpha', '10.3.9-alpha', '10.3.9-alpha', tags, 'main') == []
 
 
 # ---- this tree -------------------------------------------------------------------------------
@@ -253,13 +265,12 @@ def test_this_tree_is_consistent_with_the_newest_tag():
         if os.environ.get('CI'):
             pytest.fail('CI checkout has no v* tags; the pytest job must fetch them (see pr-checks.yml)')
         pytest.skip('no v* tags in this checkout')
-    base_ref = os.environ.get('GITHUB_BASE_REF')
-    tag = baseline_tag(tag, _tags(), base_ref, _base_current_release(base_ref) if base_ref else None)
     readme = _readme()
     notes_version = _newest_section(readme)[0]
     current = _CURRENT_RE.search(readme)
     assert current, 'README.md lost its "**Current release: [vX.Y.Z-alpha](...)**" line'
-    assert release_problems(_app_version(), tag, notes_version, current.group(1)) == []
+    assert tree_problems(_app_version(), notes_version, current.group(1), _tags(),
+                         os.environ.get('GITHUB_BASE_REF')) == []
 
 
 def test_current_release_link_points_at_its_own_tag():
