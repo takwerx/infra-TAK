@@ -92,6 +92,7 @@ def _override(stream_pin, video_pin=''):
         '_host_arch': lambda: 'x86_64', '_container_ca_trust': lambda node=False: ('', ''),
         '_cloudtak_video_host_pin': lambda s: video_pin,
         '_cloudtak_stream_host_pin': lambda s: stream_pin,
+        '_cloudtak_takserver_host_pin': lambda s: None,   # infra-TAK #439: has its own tests
     }
     exec(compile(ast.get_source_segment(APP, _fn('_cloudtak_build_override_yml')), 'app.py', 'exec'), ns)
     socket.gethostbyname, real = (lambda h: '3.145.217.175'), socket.gethostbyname

@@ -178,12 +178,15 @@ class _CT:
         self.profiles = list(profiles)
         self.readable = profiles_readable
         self.patches, self.restarts, self.certs, self.resets = [], [], [], []
+        self.admins = []          # CloudTAK makes the named user a system admin in the setup PATCH
 
     def request(self, method, url, payload=None, timeout=25, headers=None):
         assert headers and headers['Authorization'].startswith('Bearer ')
         if method == 'PATCH':
             self.patches.append(payload)
             self.srv['status'] = 'configured'
+            if payload.get('username'):
+                self.admins.append(payload['username'])
             return True, 200, dict(self.srv)
         return True, 200, dict(self.srv)
 
@@ -201,7 +204,7 @@ def _connect_ns(ct):
                funcs=('_cloudtak_connect_urls', '_cloudtak_connect_tak'),
                jsonify=lambda d: d, _cloudtak_signing_secret=lambda: 'sekrit',
                _cloudtak_admin_token=lambda s: 'jwt', _cloudtak_request_json=ct.request,
-               _cloudtak_postgis_json=ct.postgis,
+               _cloudtak_postgis_json=ct.postgis, _cloudtak_admin_users=lambda: ct.admins,
                _local_bootstrap_cert_ensure=lambda s: (ct.certs.append(1), {'success': True, 'admin_flip_ok': True})[1],
                _read_priv_bytes=lambda p: b'p12', _get_tak_cert_password=lambda s: 'atakatak',
                _p12_bytes_to_pem=lambda b, pw: ('CERT', 'KEY'),
@@ -331,11 +334,12 @@ def test_unreadable_subjects_fall_back_to_the_alias_rule():
 # ── Status line: "connected" can still mean nobody can log in ────────────────────────
 
 def _state_ns(srv, user_certs, signed, bundle='B'):
-    return _ns(funcs=('_cloudtak_untrusted_user_certs', '_cloudtak_connect_state'),
+    return _ns(funcs=('_cloudtak_untrusted_user_certs', '_cloudtak_admin_users',
+                      '_cloudtak_admin_candidates', '_cloudtak_connect_state_core', '_cloudtak_connect_state'),
                _cloudtak_local_with_local_tak=lambda s: True, _cloudtak_signing_secret=lambda: 's',
                _cloudtak_admin_token=lambda s: 'jwt',
                _cloudtak_request_json=lambda *a, **k: (True, 200, srv),
-               _cloudtak_postgis_json=lambda sql: user_certs if 'from profile' in sql else '',
+               _cloudtak_postgis_json=lambda sql: [] if 'system_admin' in sql else user_certs if 'from profile' in sql else '',
                _tak_live_trust_bundle=lambda: bundle, _tak_ca_bundle=lambda: bundle,
                _cert_signed_by=lambda c, b: signed[c])
 

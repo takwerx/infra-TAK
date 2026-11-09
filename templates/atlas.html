@@ -1013,6 +1013,12 @@ function instanceRow(i){
   // and building it again — and every deployment that exists today has no name.
   row.appendChild(rowButton(i.agency_name ? 'Rename' : 'Name', 'btn-secondary',
                             function(){ openNameDeployment(i); }));
+  // Certificate renewal (W458): makes short TAK enrollment passwords so a
+  // device enrolled from a TAK Portal QR code renews without a new scan. Off
+  // deletes its Authentik account and token.
+  row.appendChild(rowButton(i.renewal_enabled ? 'Renewal: on' : 'Renewal: off',
+                            'btn-secondary',
+                            function(){ toggleRenewal(i); }));
   row.appendChild(rowButton('Update', 'btn-primary',
                             function(){ startUpdate(i.slug); }));
   row.appendChild(rowButton(i.running ? 'Restart' : 'Start', 'btn-secondary',
@@ -1044,6 +1050,27 @@ function controlInstance(i, action){
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (d.error) { alert(d.error); return; }
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){});
+}
+
+function toggleRenewal(i){
+  const on = !i.renewal_enabled;
+  const ask = on
+    ? 'Turn certificate renewal on? InfraTAK creates the atlas-renewal account in '
+      + 'Authentik and starts the renewal container, so devices enrolled from a '
+      + 'TAK Portal QR code renew their certificate with no new scan.'
+    : 'Turn certificate renewal off? The renewal container stops and its '
+      + 'Authentik account and token are deleted. Devices enrolled from a QR code '
+      + 'then need a new QR code when their certificate ends.';
+  if (!confirm(ask)) return;
+  fetch('/api/atlas/instances/' + encodeURIComponent(i.slug || 'atlas') + '/renewal',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({enabled: on})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.success) { alert(d.error || 'Could not change certificate renewal.'); return; }
       setTimeout(function(){ location.reload(); }, 1200);
     }).catch(function(){});
 }

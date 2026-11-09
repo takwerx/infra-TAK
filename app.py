@@ -540,6 +540,113 @@ def _caddy_reload(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True
                                  restart_on_error=restart_on_error)[0]
 
 
+# ops #580 — a module deploy used to reload Caddy, throw the result away and print
+# "Caddy config updated for <module>". Found in the 3:58 AM PT real-name fresh install of
+# 10.3.9: the TAK Portal name did not answer at the check because Caddy had no certificate for
+# it yet (it logged "obtaining certificate" 10 minutes later), and the deploy log had already
+# said "updated". The helpers below make the deploy log say only what was seen.
+CADDY_CERT_WAIT_S = 180     # how long a deploy waits for Caddy to serve a valid certificate
+CADDY_CERT_POLL_S = 5
+
+
+def _caddy_serves_cert(hostname, settings=None, timeout=5):
+    """Ask the local Caddy for `hostname` over TLS. Returns (ok, detail).
+
+    Connects to 127.0.0.1 and sends `hostname` as the SNI name, so the answer is what Caddy
+    itself holds for that name. Public DNS and a router with no NAT hairpin cannot change it.
+    The certificate must verify for the name. In custom-certificate mode (ssl_mode 'custom')
+    the operator's own chain may not be in this box's trust store, so there any certificate
+    counts: Caddy has the one it was given."""
+    custom = ((settings or {}).get('ssl_mode') or '').strip().lower() == 'custom'
+    try:
+        ctx = ssl.create_default_context()
+        if custom:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(('127.0.0.1', _caddy_https_port(settings)), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=hostname) as tls:
+                if not tls.getpeercert(binary_form=True):
+                    return False, 'Caddy sent no certificate'
+        return True, ''
+    except Exception as e:
+        return False, (str(e) or e.__class__.__name__)[:120]
+
+
+def _caddy_wait_for_cert(hostname, settings=None, max_wait=CADDY_CERT_WAIT_S,
+                         poll=CADDY_CERT_POLL_S, check=None, sleep=None, clock=None):
+    """Wait until Caddy serves a valid certificate for `hostname`. Returns (ok, detail, seconds).
+
+    Never raises. `detail` is the last failure when the wait ran out."""
+    check = check or (lambda h: _caddy_serves_cert(h, settings))
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    start = clock()
+    detail = ''
+    while True:
+        ok, detail = check(hostname)
+        if ok:
+            return True, '', int(clock() - start)
+        if clock() - start + poll > max_wait:
+            return False, detail, int(clock() - start)
+        sleep(poll)
+
+
+def _caddy_apply_and_verify(plog, label, hostnames=(), settings=None, wait_for_cert=True,
+                            max_wait=CADDY_CERT_WAIT_S, reload=None, read_caddyfile=None,
+                            wait=None):
+    """Reload Caddy after a module deploy rewrote the Caddyfile, then report what is true.
+
+    Returns 'ok', 'reload-failed', 'no-vhost' or 'no-cert'. The deploy log says
+    "Caddy config updated for <label>" only for 'ok': Caddy loaded the config, the file has
+    a vhost for every name in `hostnames`, and (when wait_for_cert) Caddy serves a valid
+    certificate for each of them. Never raises, so a Caddy problem cannot fail the deploy."""
+    reload = reload or _caddy_reload_checked
+    names = [h.split(':')[0] for h in hostnames if h]
+    try:
+        ok, detail = reload(plog)
+    except Exception as e:
+        ok, detail = False, str(e)[:160]
+    if not ok:
+        plog(f"  ✗ Caddy did not load the new config for {label}: {(detail or '').strip()[:160]}")
+        plog("    The running Caddy is still on its OLD config. Reload it from the Caddy page once fixed.")
+        return 'reload-failed'
+    if not names:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    try:
+        text = (read_caddyfile or (lambda: _read_priv(CADDYFILE_PATH)))()
+    except Exception as e:
+        text = None
+        plog(f"  ⚠ Could not read the Caddyfile to check the {label} vhost ({str(e)[:80]})")
+    if text is not None:
+        # Anchor on the leading newline: `tak.x` is a suffix of `infratak.x`.
+        missing = [n for n in names if ('\n%s {' % n) not in ('\n' + text)]
+        if missing:
+            plog(f"  ✗ Caddy was reloaded, but its config has no site for {', '.join(missing)}.")
+            plog(f"    Caddy is not serving {label} there, so no certificate will be issued for it.")
+            return 'no-vhost'
+    if not wait_for_cert:
+        plog(f"  ✓ Caddy config updated for {label}")
+        return 'ok'
+    waiter = wait or (lambda h: _caddy_wait_for_cert(h, settings, max_wait=max_wait))
+    bad = []
+    for n in names:
+        plog(f"  Waiting for Caddy to serve a valid certificate for {n} (up to {max_wait}s)...")
+        w_ok, w_detail, secs = waiter(n)
+        if w_ok:
+            plog(f"  ✓ Certificate ready for {n} ({secs}s)")
+        else:
+            bad.append(n)
+            plog(f"  ⚠ No valid certificate for {n} after {secs}s: {w_detail}")
+    if bad:
+        plog(f"  ⚠ {label} is deployed and Caddy has its site, but {', '.join(bad)} has no valid")
+        plog("    certificate yet. Caddy keeps trying in the background. Check that the name points at this")
+        plog("    server, then look at: journalctl -u caddy | grep -i 'obtain\\|acme'")
+        return 'no-cert'
+    plog(f"  ✓ Caddy config updated for {label}")
+    return 'ok'
+
+
 def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on_error=True):
     """Load the on-disk Caddyfile ONLY if Caddy is not already running it. Returns (ok, detail).
 
@@ -27526,7 +27633,8 @@ def _console_pending_update(settings):
             local = ''
         if remote_full and not remote_full.startswith(local or 'XXXXXXXX'):
             return {'label': 'infra-TAK console', 'installed': f'v{VERSION} @ {local or "?"}',
-                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7]}
+                    'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7],
+                    'how': 'Console page → Update Now.'}
         return None
     req = urllib.request.Request(
         f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
@@ -27540,7 +27648,8 @@ def _console_pending_update(settings):
         if tag and _vt(tag) > _vt(VERSION):
             item = {'label': 'infra-TAK console', 'installed': f'v{VERSION}',
                     'target': tag, 'identity': tag,
-                    'how': 'Console page → Update Now.'}
+                    'how': 'Console page → Update Now.',
+                    'release_url': f'https://github.com/{GITHUB_REPO}/releases/tag/{tag}'}
             # ops #168: name every security release between what runs here and the
             # target — skipping one (installed .20, security .22, latest .25) still
             # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
@@ -27551,6 +27660,7 @@ def _console_pending_update(settings):
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     rels = json.loads(resp.read().decode())
                 sec = []
+                notes = []
                 for rel in rels if isinstance(rels, list) else []:
                     rtag = (rel.get('tag_name') or '').strip()
                     if rel.get('draft') or not rtag:
@@ -27563,7 +27673,12 @@ def _console_pending_update(settings):
                     what = _release_security_summary(rel.get('body'))
                     if what:
                         sec.append((_vt(rtag), f'{rtag} is a security release: {what}'))
+                    line = _release_notes_line(rel.get('body'))
+                    if line:
+                        notes.append((_vt(rtag), f'{rtag}: {line}'))
                 item['security'] = [s for _, s in sorted(sec, reverse=True)]
+                # ops #547: one plain line per new release, newest first
+                item['release_notes'] = [n for _, n in sorted(notes, reverse=True)]
             except Exception as e:
                 item['security_unknown'] = True
                 print(f"[update-notify] infra-TAK release notes unreadable: {e}", flush=True)
@@ -27621,6 +27736,28 @@ def _release_security_summary(body):
                 return m.group(1)[:240]
             break
     return _security_section_summary(lines)
+
+
+def _release_notes_line(body):
+    """ops #547: what a release means for users, as one plain line: the notes' headline
+    (the ship skill opens every release with a `## <what changed>` line), else the first
+    sentence of the first paragraph. Markdown stripped, capped. '' when there is nothing."""
+    for ln in (body or '').splitlines():
+        t = ln.strip()
+        if not t or t == '---' or t.startswith('<!--'):
+            continue
+        t = re.sub(r'^#{1,6}\s*', '', t)
+        t = re.sub(r'^[-*+]\s+', '', t)
+        t = _MD_MARKS_RE.sub('', t).strip()
+        # the mail relay turns ' " & < > into &#39; &quot; &amp; &lt; &gt; in plain text
+        t = re.sub(r'\s+', ' ', t.replace("'", '\u2019').replace('&', ' and ')
+                   .replace('"', '').replace('<', '').replace('>', '')).strip()
+        if not t:
+            continue
+        if len(t) > 240 and re.search(r'[.!?]\s', t):
+            t = re.split(r'(?<=[.!?])\s', t, maxsplit=1)[0]
+        return t if len(t) <= 240 else t[:237].rstrip() + '...'
+    return ''
 
 
 def _semver_tuple(v):
@@ -28512,6 +28649,19 @@ def _update_notify_check_once(fast=False):
         except (TypeError, ValueError):
             return True
 
+    def _notes_lines(p):
+        # ops #547: what is in the update, in plain words: each new release's one line
+        # (newest first, at most 5), or a link when the notes could not be read.
+        notes = [n for n in (p.get('release_notes') or []) if n]
+        if notes:
+            out = ["      New in this update:"] + [f"        - {n}" for n in notes[:5]]
+            if len(notes) > 5:
+                out.append(f"        - (+{len(notes) - 5} older release{'s' if len(notes) != 6 else ''})")
+            return out
+        if p.get('release_url'):
+            return [f"      New in this update: {p['release_url']}"]
+        return []
+
     new_items = [p for p in pending if (_pn_due(p) if p.get('patch_now') else not _mailed(p))]
     emailed = False
     if new_items:
@@ -28529,6 +28679,7 @@ def _update_notify_check_once(fast=False):
             for p in pn_items:
                 lines.append(f"  • {p.get('summary') or p['label']}")
                 lines += [f"      {s}" for s in p.get('security') or []]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 rec = sent_pn.get(p['key'])
@@ -28546,6 +28697,7 @@ def _update_notify_check_once(fast=False):
             for p in sec_items:
                 lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
                 lines += [f"      {s}" for s in p['security']]
+                lines += _notes_lines(p)
                 if p.get('how'):
                     lines.append(f"      Fix it from the infra-TAK console: {p['how']}")
                 lines.append('')
@@ -28557,6 +28709,9 @@ def _update_notify_check_once(fast=False):
         for p in other:
             lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
             lines += [f"      {d}" for d in p.get('detail') or []]
+            lines += _notes_lines(p)
+            if p.get('how'):
+                lines.append(f"      To install: {p['how']}")
         fqdn = (settings.get('fqdn') or '').split(':')[0].strip() or (settings.get('server_ip') or '').strip()
         port = settings.get('console_port') or 5001
         lines += ['', f"Open the console (https://{fqdn}:{port}) to review and apply.",
@@ -34401,6 +34556,31 @@ def _cloudtak_stream_host_pin(settings):
     host = stream.split()[0].strip()
     ip = _cloudtak_caddy_bind_ip(settings)
     return f'{host}:{ip}' if host and ip else ''
+
+
+def _cloudtak_takserver_host_pin(settings):
+    """`(takserver host, this box's address)` for CloudTAK's api container, or None.
+
+    infra-TAK #439. CloudTAK dials TAK Server at ssl://<takserver host>:8089 (mutual TLS). The
+    override used to pin that name to whatever public DNS returned at deploy time. On a home or
+    office network that is the router's public address, so the call goes out and back in through
+    the router (and through a reverse proxy such as HAProxy if one fronts 8089). A proxy that
+    ends TLS never passes CloudTAK's client certificate on, so TAK Server logs "Certificate
+    error: peer not verified", resets the connection, and the api container restarts in a loop
+    (HTTP 502). Pinning the name to this box's own address keeps that hop on the box; TLS still
+    validates because the URL keeps its hostname. None when there is nothing to pin: no domain,
+    remote CloudTAK, TAK Server not on this box, or no usable local address.
+    """
+    try:
+        if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
+            return None
+    except Exception:
+        return None
+    if not _takserver_installed_local():
+        return None
+    host = (_get_takserver_host(settings) or '').strip().split()[0:1]
+    ip = _cloudtak_caddy_bind_ip(settings)
+    return (host[0], ip) if host and ip else None
 
 
 def _get_cloudtak_upstreams(settings):
@@ -43882,8 +44062,8 @@ def run_takportal_deploy():
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            plog(f"  \u2713 Caddy config updated for TAK Portal")
+            # ops #580: say "updated" only after Caddy loaded it and serves a valid certificate.
+            _caddy_apply_and_verify(plog, 'TAK Portal', [_get_service_domain(settings, 'takportal')], settings)
             plog(f"  Open: https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}")
         plog("=" * 50)
         plog("")
@@ -44753,13 +44933,15 @@ paths:
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
     if mtx_domain:
-        plog(f"✓ Caddyfile updated — {mtx_domain} → {host}:5080")
+        # ops #580: report what Caddy really did, not that the file was written.
+        if _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings) == 'ok':
+            plog(f"✓ {mtx_domain} → {host}:5080")
     else:
-        plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
+        if _caddy_reload(plog):
+            plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
 
     # Step 8: SSL cert sync for RTSPS / HLS encryption
     plog("")
@@ -45599,9 +45781,10 @@ WantedBy=multi-user.target
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
-            _caddy_reload()
             mtx_domain = _get_service_domain(settings, 'mediamtx')
-            plog(f"✓ Caddyfile updated — {mtx_domain}")
+            # ops #580: the cert wait just below is this step's own; only the reload and the
+            # vhost are checked here.
+            _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings, wait_for_cert=False)
 
             # Wait up to 60s for cert
             cert_base = _caddy_acme_cert_base(mtx_domain)
@@ -46090,7 +46273,52 @@ def _cloudtak_untrusted_user_certs(limit=100):
     return sum(1 for c in certs[:limit] if _cert_signed_by(c or '', bundle) is False)
 
 
+def _cloudtak_admin_users():
+    """Usernames of CloudTAK's system admins, read from CloudTAK's own profile table so it also
+    works on boxes set up before the page showed it. Disabled accounts are left out (`disabled`
+    is read through to_jsonb so an older CloudTAK without that column still answers). None when
+    the table can't be read: the page then shows nothing rather than a guess."""
+    names = _cloudtak_postgis_json(
+        "select coalesce(json_agg(username order by created, username), '[]') from profile "
+        "where system_admin and coalesce((to_jsonb(profile)->>'disabled')::boolean, false) = false")
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str) and n]
+
+
+def _cloudtak_admin_candidates(limit=100):
+    """Usernames that can be made CloudTAK's admin: every enabled account that is not one yet.
+    Names only, never credentials. None when the table can't be read."""
+    names = _cloudtak_postgis_json(
+        "select coalesce(json_agg(username order by username), '[]') from (select username from profile "
+        "where not system_admin "
+        "and coalesce((to_jsonb(profile)->>'disabled')::boolean, false) = false "
+        f"order by username limit {int(limit)}) p")
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str) and n]
+
+
 def _cloudtak_connect_state(settings):
+    """The page's status line plus, once CloudTAK is set up, `admins`: its system admin
+    usernames. Before setup the only rows are a half-finished attempt's leftovers, and when the
+    table can't be read there is no `admins` key: the page shows nothing rather than a guess."""
+    state = _cloudtak_connect_state_core(settings)
+    if state.get('status') in ('connected', 'users_untrusted', 'refused_untrusted', 'down'):
+        admins = _cloudtak_admin_users()
+        if admins is not None:
+            state['admins'] = admins
+            # ops #588: set up, working, and nobody can open CloudTAK's admin pages. CloudTAK
+            # itself makes the first admin, so this means that admin was later disabled or taken
+            # off, or the people signing in are not the user that setup named. The page warns and
+            # offers the users who can be made admin (only ever when there is no admin at all).
+            if not admins:
+                state['no_admin'] = True
+                state['admin_candidates'] = _cloudtak_admin_candidates() or []
+    return state
+
+
+def _cloudtak_connect_state_core(settings):
     """{'supported', 'status', 'connection_status', 'message'} for the CloudTAK page's line.
     status: unsupported / unreachable / unconfigured / connected / users_untrusted /
     refused_untrusted / down."""
@@ -46146,6 +46374,58 @@ def cloudtak_connect_tak_api():
         return _cloudtak_connect_tak(settings, request.get_json(silent=True) or {})
     finally:
         _CLOUDTAK_CONNECT_LOCK.release()
+
+
+@app.route('/api/cloudtak/make-admin', methods=['POST'])
+@login_required
+def cloudtak_make_admin_api():
+    """ops #588: the fix for "No admin created yet". Makes one existing CloudTAK user the admin,
+    and only while CloudTAK has no admin at all: it can never be used to add admins to a CloudTAK
+    that has one (that stays in CloudTAK's own Admin > Users page)."""
+    settings = load_settings()
+    if not _cloudtak_local_with_local_tak(settings):
+        return jsonify({'success': False, 'error': 'Not supported on a remote CloudTAK yet.'}), 400
+    if not _CLOUDTAK_CONNECT_LOCK.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'CloudTAK is busy, wait for it to finish.'}), 409
+    try:
+        return _cloudtak_make_admin(str((request.get_json(silent=True) or {}).get('username') or ''))
+    finally:
+        _CLOUDTAK_CONNECT_LOCK.release()
+
+
+def _cloudtak_make_admin(username):
+    ok, code, srv = _cloudtak_request_json(
+        'GET', 'http://127.0.0.1:5000/api/server', timeout=20,
+        headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(_cloudtak_signing_secret())})
+    if not ok or not isinstance(srv, dict) or srv.get('status') != 'configured':
+        return jsonify({'success': False, 'error': 'CloudTAK is not set up yet: connect it first.'}), 409
+    admins = _cloudtak_admin_users()
+    if admins is None:
+        return jsonify({'success': False, 'error': "Could not read CloudTAK's user list, so nothing was changed."}), 502
+    if admins:
+        return jsonify({'success': False, 'error': 'CloudTAK already has an admin: ' + ', '.join(admins)}), 409
+    # The name is compared against the list, never put in SQL or a path unchecked.
+    candidates = _cloudtak_admin_candidates()
+    if candidates is None:
+        return jsonify({'success': False, 'error': "Could not read CloudTAK's user list, so nothing was changed."}), 502
+    if username not in candidates:
+        return jsonify({'success': False,
+                        'error': 'That user is not on the list. Only an existing CloudTAK user who is not '
+                                 'disabled can be made admin.'}), 400
+    ok, code, out = _cloudtak_request_json(
+        'PATCH', 'http://127.0.0.1:5000/api/user/' + urllib.parse.quote(username, safe=''),
+        payload={'system_admin': True}, timeout=30,
+        headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(_cloudtak_signing_secret())})
+    if not ok:
+        msg = (out or {}).get('message') if isinstance(out, dict) else ''
+        return jsonify({'success': False, 'error': f'CloudTAK refused (HTTP {code}): {str(msg)[:300]}'}), 400
+    after = _cloudtak_admin_users()
+    if after is None or username not in after:
+        return jsonify({'success': False, 'error': f'CloudTAK accepted the change but {username} is not an admin '
+                                                   'yet. Reload the page and check.'}), 500
+    audit('cloudtak:make-admin', f'user={username}')
+    return jsonify({'success': True, 'message': f'{username} is now a CloudTAK admin. '
+                                                'Sign out of CloudTAK and back in to see the admin pages.'})
 
 
 def _cloudtak_connect_tak(settings, data):
@@ -46213,8 +46493,17 @@ def _cloudtak_connect_tak(settings, data):
         if not v_ok or not isinstance(v, dict) or v.get('status') != 'configured':
             return jsonify({'success': False, 'error': 'CloudTAK accepted the setup but does not report it as '
                                                        'configured. Reload the CloudTAK page and check.'}), 500
+        # ops #588: setup is only done when the named user really is a CloudTAK admin. CloudTAK
+        # makes it in the same call; read it back, so a setup that left nobody in charge says so
+        # here, not weeks later. (None = could not read: nothing to add.)
+        admins = _cloudtak_admin_users()
+        if admins is not None and username not in admins:
+            return jsonify({'success': False,
+                            'error': f'CloudTAK is connected, but {username} was not made a CloudTAK admin. '
+                                     'The CloudTAK page now offers to make an admin.'}), 500
         return jsonify({'success': True, 'mode': 'configured',
-                        'message': f'CloudTAK is connected to TAK Server. Log in to CloudTAK as {username}.' + note})
+                        'message': f'CloudTAK is connected to TAK Server. {username} is CloudTAK\'s admin: '
+                                   f'log in to CloudTAK as {username} for the admin pages.' + note})
 
     # Same as the heal: CloudTAK keeps the old connection's retry timer running with the old
     # cert until the API restarts (aws-arm 2026-10-09), and the connection was refused anyway.
@@ -47960,13 +48249,19 @@ def _cloudtak_build_override_yml(settings):
     extra_hosts = ['host.docker.internal:host-gateway']
     tak_fqdn = (_get_takserver_host(settings) or '').strip()
     if tak_fqdn:
-        try:
-            tak_ip = _sock.gethostbyname(tak_fqdn)
-            extra_hosts.append(f'{tak_fqdn}:{tak_ip}')
-        except Exception:
-            server_ip = (settings.get('server_ip') or '').strip()
-            if server_ip:
-                extra_hosts.append(f'{tak_fqdn}:{server_ip}')
+        # infra-TAK #439: TAK Server on this box is reached at this box's address, not through
+        # public DNS (a router or reverse proxy in that path breaks the 8089 client-cert handshake).
+        tak_pin = _cloudtak_takserver_host_pin(settings)
+        if tak_pin:
+            extra_hosts.append(f'{tak_pin[0]}:{tak_pin[1]}')
+        else:
+            try:
+                tak_ip = _sock.gethostbyname(tak_fqdn)
+                extra_hosts.append(f'{tak_fqdn}:{tak_ip}')
+            except Exception:
+                server_ip = (settings.get('server_ip') or '').strip()
+                if server_ip:
+                    extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
     # ops #471: only the api container calls the media server by its public name.
     video_pin = _cloudtak_video_host_pin(settings)
@@ -52867,11 +53162,9 @@ def run_cloudtak_redeploy(cfg=None):
                 return
             if domain:
                 generate_caddyfile(settings)
-                try:
-                    _caddy_reload()
-                    plog("✓ Caddy reloaded")
-                except subprocess.TimeoutExpired:
-                    plog("⚠ Caddy reload timed out — reload manually if needed")
+                # ops #580: _caddy_reload() never raises, so the old except was dead code and
+                # "Caddy reloaded" printed even when the reload failed.
+                _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
@@ -52988,11 +53281,8 @@ def run_cloudtak_redeploy(cfg=None):
             plog("⚠ API did not respond in time — if map.<domain> stays on 'Loading CloudTAK', check Container Logs and ensure the api container is running")
         if domain:
             generate_caddyfile(settings)
-            try:
-                _caddy_reload()
-                plog("✓ Caddy reloaded")
-            except subprocess.TimeoutExpired:
-                plog("⚠ Caddy reload timed out — reload it from the Caddy page if needed")
+            # ops #580: see the remote path above; report what Caddy really did.
+            _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
@@ -54624,16 +54914,25 @@ def _webodm_odm_limits(detected_cores, cfg):
 #   wo_broker  — upstream WebODM still ships redis:7.0.10, end of life with open CVEs
 #                (CVE-2025-49844 Lua use-after-free, CVE-2025-21605, CVE-2025-32023, …).
 #                WebODM's Celery 4.4 / kombu 4.6 / redis-py 3.2 client runs against 8.x.
-#   wo_db      — upstream publishes only :latest (PostgreSQL 9.5 / PostGIS 2.3, an upstream
-#                limitation), so it is pinned by digest.
-WEBODM_VERSION = '3.3.1'
+#   wo_db      — WebODM 4.0 moved to PostgreSQL 18 (ops #579; 3.x ran 9.5 / PostGIS 2.3). The
+#                :18 tag is pinned by digest. On its first start over a 9.5 data dir the image
+#                upgrades it in place (db-upgrade-9-to-18): it copies the 9.5 cluster to
+#                db/backup-9.5, turns PostGIS columns into GeoJSON, and loads a new cluster into
+#                db/18. A 4.x database cannot be opened by 3.x, so Update dumps the 9.5 database
+#                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
+#                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
+WEBODM_VERSION = '4.0.0'
 WEBODM_IMAGES = {
-    'wo_db':      'webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+    'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
     'wo_broker':  'redis:8.10.2-alpine',
     'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_nodeodm': 'webodm/nodeodx:2.4.0',
 }
+WEBODM_DB_VOLUME = '/var/lib/postgresql/data'   # the db/ bind mount inside wo_db
+# Inside the volume root so it needs no host path; the upgrade leaves `backup-*` names alone.
+WEBODM_DB_DUMP_PREFIX = 'backup-infratak-'
+WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are small (metadata only)
 
 
 def _webodm_pin_images(compose_txt, services=None):
@@ -55335,6 +55634,111 @@ def _webodm_compose(wo_dir, action, timeout=300):
     flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied)."""
     return _broker_compose(wo_dir, action, timeout=timeout)
 
+def _webodm_db_sh(cmd, timeout=60):
+    """Run `sh -c cmd` as postgres inside wo_db (through the broker on a non-root box)."""
+    return subprocess.run(_sudo_wrap(['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd]),
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _webodm_db_needs_upgrade(wo_dir):
+    """True when wo_db holds a PostgreSQL 9.5 data dir (WebODM 3.x) that the 4.x image will
+    upgrade, False when it is already on 18. Starts wo_db first if it is down. Raises when the
+    database can't be read: Update must not start a one-way upgrade it can't back up."""
+    v = WEBODM_DB_VOLUME
+    probe = f'if [ -s {v}/18/PG_VERSION ]; then echo 18; else cat {v}/PG_VERSION; fi'
+    for attempt in range(13):
+        r = _webodm_db_sh(probe, timeout=15)
+        ver = (r.stdout or '').strip()
+        if r.returncode == 0 and ver:
+            return ver == '9.5'
+        if attempt == 0:
+            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120)
+        time.sleep(5)
+    raise RuntimeError('could not read the WebODM database version (is wo_db running?). Nothing was changed.')
+
+
+def _webodm_db_room_check(plog):
+    """Before the 9.5 → 18 upgrade: raise (nothing changed yet) unless the db volume has room."""
+    v = WEBODM_DB_VOLUME
+    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120)
+    try:
+        lines = r.stdout.strip().splitlines()
+        used_kb, free_kb = int(lines[0].split()[0]), int(lines[-1].split()[3])
+    except (IndexError, ValueError):
+        raise RuntimeError(f'could not measure the WebODM database: {(r.stderr or r.stdout or "")[:200]}')
+    # The upgrade keeps a full 9.5 copy and builds the new cluster beside it (upstream checks
+    # for 3x); our dump is at most one more.
+    need_kb = used_kb * 4
+    plog(f'  Database {used_kb // 1024} MB, free disk {free_kb // 1024} MB, needed {need_kb // 1024} MB')
+    if free_kb < need_kb:
+        raise RuntimeError(f'not enough free disk for the WebODM database upgrade ({need_kb // 1024} MB '
+                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again.')
+
+
+def _webodm_backup_db_95():
+    """pg_dumpall the 9.5 database into the db volume root (the upgrade leaves `backup-*` names
+    in place) and check the dump holds WebODM's database. Returns its path under the WebODM dir."""
+    v = WEBODM_DB_VOLUME
+    name =f'{WEBODM_DB_DUMP_PREFIX}{time.strftime("%Y%m%d-%H%M%S")}-pg95.sql'
+    r = _webodm_db_sh(f'pg_dumpall -U postgres -f {v}/{name} && gzip {v}/{name} && '
+                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800)
+    if r.returncode != 0 or (r.stdout or '').strip() != '1':
+        raise RuntimeError(f'database backup failed: {(r.stderr or r.stdout or "")[:300]}')
+    return f'db/{name}.gz'
+
+
+def _webodm_answers():
+    """True when Django in the webapp container answers HTTP. WebODM 4.x answers /api/ with
+    403 to a caller that isn't signed in (3.x: 200), so `curl -f` reads a healthy 4.x as down."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
+                                       '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return r.returncode == 0 and (r.stdout or '').strip()[:1] in ('2', '3', '4')
+
+
+def _webodm_wait_upgraded(deadline_s):
+    """Wait for the first 4.x start: (True, '') once the webapp answers, (False, why) when the
+    DB upgrade reports a failure or the time runs out."""
+    end = time.time() + deadline_s
+    while time.time() < end:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', 'wo_db']), capture_output=True, text=True, timeout=30)
+        if 'UPGRADE FAILED' in (r.stdout or '') + (r.stderr or ''):
+            return False, 'the database upgrade failed (details: db/upgrade.log)'
+        if _webodm_answers():
+            return True, ''
+        time.sleep(15)
+    return False, f'WebODM did not answer within {deadline_s // 60} minutes'
+
+
+def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
+    """Undo a failed 3.x → 4.x Update: put the untouched 9.5 copy (db/backup-9.5) back in the
+    volume root, rewrite the old compose and start 3.x again. Runs in a one-off wo_db container
+    (the 18 image has bash) so the console never touches the uid-999 data dir itself."""
+    plog('Putting the previous WebODM version back…')
+    _webodm_compose(wo_dir, 'stop', timeout=180)
+    v = WEBODM_DB_VOLUME
+    # The copy is renamed once restored: the next upgrade reuses a `backup-9.5` it finds instead
+    # of copying again, and this one would miss whatever 3.x writes from now on.
+    script = (f'set -e; cd {v}; if [ -s backup-9.5/PG_VERSION ]; then '
+              f'find . -mindepth 1 -maxdepth 1 ! -name "backup-*" ! -name upgrade.log ! -name lost+found '
+              f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; mv backup-9.5 backup-9.5-restored-$(date +%Y%m%d%H%M%S); '
+              f'fi; test "$(cat PG_VERSION)" = 9.5')
+    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800)
+    if r.returncode != 0:
+        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or "")[:300]}. '
+                           f'The untouched copy is in db/backup-9.5 and the dump in db/{WEBODM_DB_DUMP_PREFIX}*.')
+    _write_priv(compose_path, old_compose)
+    r = _webodm_compose(wo_dir, 'up -d', timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+    ok, _why = _webodm_wait_upgraded(300)
+    plog('  ✓ Previous WebODM version is running again with its data' if ok else
+         '  ⚠ Previous WebODM version started but does not answer yet — check: docker logs webapp')
+
+
 def _run_webodm_update():
     global _webodm_update_status
     wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
@@ -55352,18 +55756,44 @@ def _run_webodm_update():
         stripped = _webodm_strip_olefile(pinned)
         if stripped != pinned:
             plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
+        # ops #579: WebODM 3.x → 4.x upgrades the database from PostgreSQL 9.5 to 18, one way.
+        db_upgrade = _webodm_db_needs_upgrade(wo_dir)
+        if db_upgrade:
+            plog('This update upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+            _webodm_db_room_check(plog)
         if stripped != compose_txt:
             _write_priv(compose_path, stripped)
         plog(f'Pulling WebODM {WEBODM_VERSION} images…')
         r = _webodm_compose(wo_dir, 'pull')
         plog(r.stdout[-500:] if r.stdout else '(no output)')
         if r.returncode != 0:
+            if stripped != compose_txt:
+                _write_priv(compose_path, compose_txt)   # leave the box on what it runs
             raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
+        if db_upgrade:
+            plog('Stopping WebODM and backing up its database…')
+            subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
+                           capture_output=True, text=True, timeout=180)
+            try:
+                dump = _webodm_backup_db_95()
+            except Exception:
+                _write_priv(compose_path, compose_txt)
+                _webodm_compose(wo_dir, 'up -d', timeout=180)
+                raise
+            plog(f'  ✓ Database backed up to {os.path.join(wo_dir, dump)}')
         plog('Restarting containers with new images…')
-        r = _webodm_compose(wo_dir, 'up -d', timeout=120)
+        r = _webodm_compose(wo_dir, 'up -d', timeout=180)
         plog(r.stdout[-300:] if r.stdout else '(no output)')
         if r.returncode != 0:
             raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+        if db_upgrade:
+            plog('Upgrading the database and starting WebODM (a few minutes)…')
+            ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
+            if not ok:
+                plog(f'  ✗ {why}')
+                _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
+                raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({why}); the previous version and its data are back.')
+            plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -55418,14 +55848,8 @@ def webodm_ready():
         return jsonify({'ready': True, 'status': 'healthy', 'url': wo_url})
 
     # 2. Fallback: probe WebODM's internal API endpoint directly from the container
-    try:
-        r2 = _sp.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
-                      'http://localhost:8000/api/']),
-                     capture_output=True, text=True, timeout=8)
-        if r2.returncode == 0:
-            return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
-    except Exception:
-        pass
+    if _webodm_answers():
+        return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
 
     # 3. Not ready yet — figure out a useful status message
     try:
@@ -60005,8 +60429,8 @@ volumes:
     if domain:
         plog("  Updating Caddy...")
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog(f"✓ Caddy updated — https://nodered.{domain}")
+        # ops #580: say "updated" only when Caddy loaded it and serves a valid certificate.
+        _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings)
     else:
         # v10.1.85 (field report, 2026-09-21): a remote deploy from a console with no
         # domain silently produced no route and no certificate anywhere.
@@ -60317,11 +60741,10 @@ volumes:
         # other half, so a failure there is named instead of aborting the whole deploy.
         if domain:
             generate_caddyfile(settings)
-            if _caddy_reload(plog):
-                plog(f"✓ Caddy updated — open via https://nodered.{domain}")
+            if _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings) == 'ok':
+                plog(f"  Open via https://{_pub_hostport(_get_service_domain(settings, 'nodered'), settings)}")
             else:
-                plog(f"  ⚠ Caddy did not reload cleanly — nodered.{domain} may not be")
-                plog(f"    reachable yet. Node-RED itself is running on port 1880.")
+                plog("  Node-RED itself is running on port 1880.")
         else:
             plog("  No domain configured — access via http://<server>:1880")
         if not nodered_deploy_status.get('cancelled') and domain and os.path.exists(os.path.expanduser('~/authentik/.env')):
@@ -60956,6 +61379,28 @@ window.ctLoadConnectState = function(retries) {
       var color = { connected: 'var(--green)', refused_untrusted: 'var(--red)', users_untrusted: 'var(--yellow)',
                     down: 'var(--yellow)', unconfigured: 'var(--yellow)', unreachable: 'var(--red)' }[d.status] || 'var(--text-dim)';
       st.innerHTML = '<span style="color:' + color + '">● ' + esc(d.message || d.status) + '</span>';
+      // Who CloudTAK's admin is (its system admin users). Only sent once CloudTAK is set up.
+      var adm = document.getElementById('ct-connect-admins');
+      if (adm) {
+        var admins = Array.isArray(d.admins) ? d.admins : [];
+        adm.style.display = (admins.length || d.no_admin) ? '' : 'none';
+        if (d.no_admin) {
+          // ops #588: set up and working, but nobody is a CloudTAK admin. One action fixes it.
+          var cands = Array.isArray(d.admin_candidates) ? d.admin_candidates : [];
+          adm.innerHTML = '<div style="color:var(--yellow);font-weight:600;margin-bottom:6px">⚠ No admin created yet</div>' +
+            '<div style="margin-bottom:8px">Nobody can open CloudTAK&#39;s admin pages (users, video, settings). ' +
+            (cands.length
+              ? 'Pick the user who should be admin:</div>' +
+                '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><select id="ct-make-admin-user" style="padding:7px 10px;background:rgba(6,182,212,0.08);border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);font-weight:600;font-size:13px">' +
+                cands.map(function(u) { return '<option value="' + esc(u) + '">' + esc(u) + '</option>'; }).join('') +
+                '</select><button class="btn btn-primary" style="font-size:12px" onclick="ctMakeAdmin(this)">Make admin</button></div>'
+              : 'CloudTAK has no users yet. Sign in to CloudTAK once as the person who should be admin, then reload this page.</div>');
+        } else {
+          adm.innerHTML = admins.length
+            ? 'CloudTAK admin' + (admins.length > 1 ? 's' : '') + ': <strong style="color:var(--text-primary)">' + admins.map(esc).join(', ') + '</strong>'
+            : '';
+        }
+      }
       if (btn) {
         btn.style.display = d.supported ? '' : 'none';
         btn.textContent = d.status === 'connected' ? 'Reconnect with a new certificate' : 'Connect CloudTAK to TAK Server';
@@ -60995,6 +61440,29 @@ window.ctConnectTak = function(btn) {
   }).catch(function(e) {
     btn.disabled = false; btn.textContent = orig;
     if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>';
+  });
+};
+window.ctMakeAdmin = function(btn) {
+  var out = document.getElementById('ct-connect-result');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var sel = document.getElementById('ct-make-admin-user');
+  if (!sel || !sel.value) return;
+  btn.disabled = true;
+  fetch('/api/cloudtak/make-admin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: sel.value }), credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false;
+    if (out) {
+      out.style.display = 'block';
+      out.innerHTML = d && d.success
+        ? '<span style="color:var(--green)">✓ ' + esc(d.message) + '</span>'
+        : '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Could not make admin') + '</span>';
+    }
+    window.ctLoadConnectState();
+  }).catch(function(e) {
+    btn.disabled = false;
+    if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>'; }
   });
 };
 document.addEventListener('DOMContentLoaded', function() { window.ctLoadConnectState(); });
@@ -64168,8 +64636,8 @@ networks:
     settings['authentik_deployment'] = cfg
     save_settings(settings)
     generate_caddyfile(settings)
-    _caddy_reload()
-    plog("✓ Caddyfile updated")
+    # ops #580: report the reload result; Authentik's own TLS wait runs in its deploy.
+    _caddy_apply_and_verify(plog, 'Authentik', (), settings)
 
     # v0.9.12 — remote Authentik firewall (security-hardened):
     #   * 9090/9443 (Authentik HTTP/HTTPS): NOT opened publicly. Compose
@@ -71051,6 +71519,194 @@ def _tak_drop_stuck_unnamed_sessions(plog):
         plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK gave no user and no groups for "
              f"{_TAK_STUCK_UNNAMED_MIN_S // 60}+ min ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
     return dropped
+
+
+# New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs
+# search_mode: cached, so the outpost answers TAK from an in-memory copy of the directory that it
+# reloads every 5 min (outpost refresh_interval default). Authentik does not push a reload when a
+# user or a group membership changes (authentik/outposts/signals.py: only Outpost / Provider /
+# cert / brand / session saves do). A phone enrolled right after TAK Portal created its user
+# connects to 8089 while the copy has no entry for it; TAK puts no user and no groups on the
+# connection and never looks it up again. nuc: TBOLT connected 2 min, TAKWERX-S22 35 s after
+# the user was created; both sat with no channels.
+# Fix: watch the directory (users and their tak_ groups) every 15 s; on a change, save the LDAP
+# outpost unchanged (outpost_post_save -> outpost_send_update; proven on nuc: new user visible
+# 4.2 s after the PATCH), confirm LDAP now answers with the new groups, then for a window drop
+# connections TAK gave no user and no groups so they reconnect and are looked up again.
+_AK_DIR_WATCH_TICK_S = 15
+_AK_DIR_REFRESH_MIN_GAP_S = 20
+# A reload makes the outpost fetch every user and group (nuc, 32 users / 55 groups: ~0.4 s of
+# Authentik API time, ~9 ms per user). The gap grows with the directory so a bulk import on a big
+# box keeps Authentik under ~10 % busy: 100 ms per user, 20 s to 300 s (300 s = the outpost's own
+# refresh; past that there is nothing to gain).
+_AK_DIR_REFRESH_GAP_PER_USER_MS = 100
+_AK_DIR_REFRESH_MAX_GAP_S = 300
+_AK_DIR_CONFIRM_WAIT_S = 30
+_AK_DIR_DROP_WINDOW_S = 900
+_AK_DIR_DROP_COOLDOWN_S = 120
+_AK_DIR_DROP_MAX = 2
+_ak_dir_watch = {'snap': None, 'pending': set(), 'last_refresh': 0.0, 'confirmed_at': 0.0, 'drops': {}}
+
+
+def _ak_directory_snapshot():
+    """{username: frozenset of its tak_ group names without the prefix} for every active
+    Authentik user, read from Authentik's database (one query, no API, no LDAP). None when
+    Authentik's database can't be read (no Authentik on this box, container down)."""
+    # One JSON object, so no character in a user or group name can split a row.
+    sql = ("SELECT coalesce(json_object_agg(username, groups), '{}') FROM ("
+           "SELECT u.username, coalesce(json_agg(g.name) FILTER (WHERE g.name LIKE 'tak\\_%'), '[]') AS groups "
+           "FROM authentik_core_user u "
+           "LEFT JOIN authentik_core_user_groups ug ON ug.user_id = u.id "
+           "LEFT JOIN authentik_core_group g ON g.group_uuid = ug.group_id "
+           "WHERE u.is_active GROUP BY u.username) d;")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                                       '-d', 'authentik', '-tA', '-c', sql]),
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads((r.stdout or '').strip() or '{}')
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(u): frozenset(g[4:] for g in (gs or []) if isinstance(g, str) and g.startswith('tak_'))
+            for u, gs in data.items()}
+
+
+def _ak_log_names(names, n=10):
+    """Names for a log line: control characters out (no forged lines), at most n."""
+    names = [re.sub(r'[\x00-\x1f\x7f]', '?', str(x)) for x in names]
+    return ', '.join(names[:n]) + (' …' if len(names) > n else '')
+
+
+def _ak_refresh_ldap_outposts(plog):
+    """Save every LDAP outpost unchanged, so Authentik tells it to reload users and groups
+    now. True when at least one was saved."""
+    settings = load_settings()
+    token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+             or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if not token:
+        return False
+    base = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        # Never add work to an Authentik that isn't answering (spiral, restart, update).
+        with _ak_api_call(f'{base}/-/health/ready/', max_retries=1, timeout=5) as r:
+            if r.status != 200:
+                return False
+    except Exception:
+        return False
+    try:
+        with _ak_api_call(f'{base}/api/v3/outposts/instances/?page_size=100', headers=headers, max_retries=1) as r:
+            outposts = json.loads(r.read().decode()).get('results', [])
+    except Exception as e:
+        plog(f"  LDAP outpost refresh: couldn't list outposts: {str(e)[:120]}")
+        return False
+    saved = 0
+    for o in outposts:
+        if o.get('type') != 'ldap' or not o.get('pk'):
+            continue
+        try:
+            with _ak_api_call(f"{base}/api/v3/outposts/instances/{o['pk']}/", method='PATCH', headers=headers,
+                              data=json.dumps({'name': o.get('name')}).encode(), max_retries=1):
+                saved += 1
+        except Exception as e:
+            plog(f"  LDAP outpost refresh: couldn't save outpost {o.get('name')}: {str(e)[:120]}")
+    return saved > 0
+
+
+def _ak_directory_watch_tick(plog):
+    """One pass of the directory watch (see the block comment above). Returns what it did:
+    {'refreshed': [users], 'confirmed': bool, 'dropped': [connection uids]}."""
+    st = _ak_dir_watch
+    did = {'refreshed': [], 'confirmed': False, 'dropped': []}
+    if _console_update_in_progress():
+        return did
+    snap = _ak_directory_snapshot()
+    if snap is not None:
+        old, st['snap'] = st['snap'], snap
+        if old is not None:
+            st['pending'] |= {u for u in set(old) | set(snap) if old.get(u) != snap.get(u)}
+    now = time.time()
+    gap = min(_AK_DIR_REFRESH_MAX_GAP_S,
+              max(_AK_DIR_REFRESH_MIN_GAP_S, len(snap or ()) * _AK_DIR_REFRESH_GAP_PER_USER_MS // 1000))
+    if st['pending'] and snap is not None and now - st['last_refresh'] >= gap:
+        users, st['pending'] = sorted(st['pending']), set()
+        if not _ak_refresh_ldap_outposts(plog):
+            st['pending'] |= set(users)       # try again next tick
+            return did
+        st['last_refresh'] = now
+        did['refreshed'] = users
+        want = {u: snap[u] for u in users if u in snap}    # removed users: nothing to wait for
+        if not want:
+            # Only removals / deactivations: nobody new to look up, so no drop window.
+            plog(f"  LDAP outpost refreshed (directory changed: {_ak_log_names(users)})")
+            return did
+        removed = {u: (old or {}).get(u, frozenset()) - snap.get(u, frozenset()) for u in want}
+        ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        t0 = time.time()
+        while True:
+            seen = _ldap_users_tak_groups(ldap_pass, list(want)) if (ldap_pass and want) else {}
+            if seen is not None:
+                low = {cn.lower(): set(g) for cn, g in seen.items()}
+                if all(u.lower() in low and want[u] <= low[u.lower()] and not (removed[u] & low[u.lower()])
+                       for u in want):
+                    break
+            if time.time() - t0 >= _AK_DIR_CONFIRM_WAIT_S:
+                plog(f"  LDAP outpost refresh: directory changed ({_ak_log_names(users)}) but LDAP "
+                     f"didn't show it within {_AK_DIR_CONFIRM_WAIT_S} s; the 10-min check stays the safety net")
+                return did
+            time.sleep(2)
+        st['confirmed_at'] = time.time()
+        did['confirmed'] = True
+        plog(f"  LDAP outpost refreshed (directory changed: {_ak_log_names(users)}); "
+             f"LDAP answers in {st['confirmed_at'] - now:.0f} s")
+    if not st['confirmed_at'] or time.time() - st['confirmed_at'] >= _AK_DIR_DROP_WINDOW_S:
+        return did
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        return did
+    sessions = _tak_client_sessions()
+    if not sessions:
+        return did
+    now = time.time()
+    # A client's drop count lasts one window from its first drop; a new directory change does
+    # not reset it (else a membership edited every 20 s would keep dropping the same clients).
+    for k in [k for k, (_n, first, _last) in st['drops'].items() if now - first >= _AK_DIR_DROP_WINDOW_S]:
+        del st['drops'][k]
+    for s in sorted(sessions, key=lambda s: _subscription_num(s['uid'])):
+        if not s['unnamed'] or s['groups']:
+            continue
+        _tak_stuck_unnamed_seen.setdefault(s['uid'], now)
+        n, first, last = st['drops'].get(s['client'], (0, now, 0.0))
+        if n >= _AK_DIR_DROP_MAX or now - last < _AK_DIR_DROP_COOLDOWN_S:
+            continue
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                       timeout=20, method='DELETE')
+        st['drops'][s['client']] = (n + 1, first, now)
+        _tak_stuck_unnamed_dropped[s['client']] = now
+        if ok is None:
+            plog(f"  LDAP outpost refresh: couldn't drop {_ak_log_names([s['uid'], s['callsign']])}: {err}")
+            continue
+        _tak_stuck_unnamed_seen.pop(s['uid'], None)
+        did['dropped'].append(s['uid'])
+    if did['dropped']:
+        plog(f"  LDAP outpost refresh: dropped {len(did['dropped'])} connection(s) TAK gave no user and no "
+             f"groups ({_ak_log_names(did['dropped'], 15)}); they reconnect and are looked up again")
+    return did
+
+
+def _ak_directory_watch_loop():
+    log = lambda m: print(f"[ak-directory-watch] {m}", flush=True)
+    while True:
+        try:
+            _ak_directory_watch_tick(log)
+        except Exception as e:
+            log(f"error (non-fatal): {str(e)[:200]}")
+        time.sleep(_AK_DIR_WATCH_TICK_S)
 
 
 def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
@@ -84158,6 +84814,14 @@ def _rotate_refresh_integrations(log):
         _cloudtak_tak_cert_heal(log=log)
     except Exception as e:
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+    # ATLAS W460: ATLAS lists only this TAK Server's CAs, from a copy this
+    # writes; a new intermediate is missing from it until refreshed here.
+    try:
+        _atlas_hook = (mod_registry.MODULES.get('atlas') or {}).get('tak_ca_changed')
+        if _atlas_hook:
+            _atlas_hook(mod_registry.get_ctx(), log)
+    except Exception as e:
+        log(f"  ⚠ ATLAS TAK Server CA list skipped: {str(e)[:160]}")
 
 
 def _rotate_sh(argv, timeout=120):
@@ -85886,8 +86550,7 @@ def _sync_webadmin_after_authentik_reconfigure(plog):
         plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
         generate_caddyfile(settings)
-        _caddy_reload()
-        plog("  ✓ Caddy reloaded.")
+        _caddy_apply_and_verify(plog, 'WebAdmin', (), settings)
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
@@ -94237,8 +94900,8 @@ def _deploy_takserver_container(config):
         if settings.get('fqdn'):
             try:
                 generate_caddyfile(settings)
-                _caddy_reload()
-                log_step("  ✓ Caddy config updated for TAK Server")
+                # ops #580: print "updated" only when Caddy took the config.
+                _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
             except Exception as _ce:
                 log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
 
@@ -95392,8 +96055,8 @@ def run_takserver_deploy(config):
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
-            _caddy_reload()
-            log_step(f"  ✓ Caddy config updated for TAK Server")
+            # ops #580: print "updated" only when Caddy took the config.
+            _caddy_apply_and_verify(log_step, 'TAK Server', (), settings)
 
         # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
         if webadmin_pass and _get_authentik_env_content(settings):
@@ -98706,6 +99369,8 @@ _DBSERVER_IRREVERSIBLE = (
 )
 _dbserver_lock = threading.Lock()
 _dbserver_start_lock = threading.Lock()
+# infra-TAK #442 / ops #585: one preflight over SSH at a time (see _dbserver_preflight_once).
+_dbserver_preflight_lock = threading.Lock()
 _dbserver_watch_active = False
 _dbserver_log_cache = {}
 
@@ -99545,6 +100210,24 @@ def _dbserver_log_tail(job, limit=12000):
     return val[1], val[2]
 
 
+def _dbserver_preflight_once():
+    """(http_status, payload) for the read-only preflight, one SSH probe at a time.
+
+    infra-TAK #442 / ops #585: since 10.3.9 the database server card runs this on every
+    dashboard load. The console has 8 request threads, and a slow database server holds
+    each probe for up to 4 minutes; test pair 2026-11-09 (PostgreSQL frozen on the database
+    server): 9 dashboard loads left the console answering nothing, not even its login page,
+    for about 3.5 minutes. A second caller now gets an immediate 'busy' answer instead of a
+    second probe, so at most one request thread ever waits on the database server here."""
+    if not _dbserver_preflight_lock.acquire(blocking=False):
+        return 429, {'ok': False, 'busy': True,
+                     'error': 'the console is already checking the database server; try again in a minute'}
+    try:
+        return 200, _dbserver_preflight()
+    finally:
+        _dbserver_preflight_lock.release()
+
+
 @app.route('/api/console/dbserver/preflight')
 @login_required
 def console_dbserver_preflight_api():
@@ -99552,7 +100235,8 @@ def console_dbserver_preflight_api():
     if not _dbserver_routes_available():
         return jsonify({'ok': False, 'error': 'not a split install'}), 404
     try:
-        return jsonify(_dbserver_preflight())
+        code, payload = _dbserver_preflight_once()
+        return jsonify(payload), code
     except Exception as e:
         return jsonify({'ok': False, 'error': f'preflight error: {str(e)[:200]}'}), 500
 
@@ -111405,6 +112089,13 @@ try:
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
 
+# New-user enrollment race (ops #565 root cause): reload the LDAP outpost when a user or a tak_
+# membership changes, and drop the TAK connections that came in before the reload with no user.
+try:
+    threading.Thread(target=_ak_directory_watch_loop, daemon=True, name='ak-directory-watch').start()
+except Exception as _e:
+    print(f"[startup] failed to start Authentik directory watch (non-fatal): {_e}", flush=True)
+
 # v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
 # timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when
 # TAK isn't installed.
@@ -111776,6 +112467,8 @@ _MODULE_CTX = {
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
+    # ATLAS W461: TAK Server's revoked certificates, for ATLAS's renewal.
+    '_cotdb_psql': _cotdb_psql,
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
