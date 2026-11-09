@@ -33,7 +33,7 @@ CATALOG = os.path.join(MOD, 'catalog.json')
 COMMUNITY = os.path.join(MOD, 'community.json')
 COE_ORG = 'dfpc-coe'
 NOT_ETLS = {'etl-base', 'etl-template'}          # libraries, not runnable ETLs
-HIDDEN = {'etl-santa', 'etl-drone-tag'}           # operator 2026-11-08: novelty / empty template
+HIDDEN = {'etl-drone-tag'}                       # operator 2026-11-08: empty template, posts nothing
 SEMVER = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)$')
 
 
