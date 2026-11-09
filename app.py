@@ -83395,6 +83395,14 @@ def _rotate_refresh_integrations(log):
         _cloudtak_tak_cert_heal(log=log)
     except Exception as e:
         log(f"  ⚠ CloudTAK cert check skipped: {str(e)[:160]}")
+    # ATLAS W460: ATLAS lists only this TAK Server's CAs, from a copy this
+    # writes; a new intermediate is missing from it until refreshed here.
+    try:
+        _atlas_hook = (mod_registry.MODULES.get('atlas') or {}).get('tak_ca_changed')
+        if _atlas_hook:
+            _atlas_hook(mod_registry.get_ctx(), log)
+    except Exception as e:
+        log(f"  ⚠ ATLAS TAK Server CA list skipped: {str(e)[:160]}")
 
 
 def _rotate_sh(argv, timeout=120):
@@ -111006,6 +111014,8 @@ _MODULE_CTX = {
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
+    # ATLAS W461: TAK Server's revoked certificates, for ATLAS's renewal.
+    '_cotdb_psql': _cotdb_psql,
     '_get_authentik_api_url': _get_authentik_api_url,
     '_ensure_infratak_docker_network': _ensure_infratak_docker_network,
     '_cloudtak_refresh_override': _cloudtak_refresh_override,
