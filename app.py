@@ -54170,6 +54170,7 @@ WEBODM_DB_VOLUME = '/var/lib/postgresql/data'   # the db/ bind mount inside wo_d
 # Inside the volume root so it needs no host path; the upgrade leaves `backup-*` names alone.
 WEBODM_DB_DUMP_PREFIX = 'backup-infratak-'
 WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are small (metadata only)
+WEBODM_PULL_TIMEOUT_S = 1800   # 3.x → 4.x pulls about 6 GB; 300 s ran out on test6 (10.3.10 T&E)
 
 
 def _webodm_pin_images(compose_txt, services=None):
@@ -55001,17 +55002,24 @@ def _run_webodm_update():
         if stripped != compose_txt:
             _write_priv(compose_path, stripped)
         plog(f'Pulling WebODM {WEBODM_VERSION} images…')
-        r = _webodm_compose(wo_dir, 'pull')
-        plog(r.stdout[-500:] if r.stdout else '(no output)')
-        if r.returncode != 0:
-            if stripped != compose_txt:
+        # However the pull ends short of success (a non-zero exit, or TimeoutExpired: test6 in
+        # the 10.3.10 T&E), the old compose goes back. Left on the new pins, the next `up -d`
+        # in this dir would start 4.x on the 9.5 data with no room check and no backup.
+        pulled = False
+        try:
+            r = _webodm_compose(wo_dir, 'pull', timeout=WEBODM_PULL_TIMEOUT_S)
+            pulled = r.returncode == 0
+        finally:
+            if not pulled and stripped != compose_txt:
                 _write_priv(compose_path, compose_txt)   # leave the box on what it runs
+        plog(r.stdout[-500:] if r.stdout else '(no output)')
+        if not pulled:
             raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
         if db_upgrade:
             plog('Stopping WebODM and backing up its database…')
-            subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
-                           capture_output=True, text=True, timeout=180)
             try:
+                subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
+                               capture_output=True, text=True, timeout=180)
                 dump = _webodm_backup_db_95()
             except Exception:
                 _write_priv(compose_path, compose_txt)
@@ -55019,17 +55027,25 @@ def _run_webodm_update():
                 raise
             plog(f'  ✓ Database backed up to {os.path.join(wo_dir, dump)}')
         plog('Restarting containers with new images…')
-        r = _webodm_compose(wo_dir, 'up -d', timeout=180)
-        plog(r.stdout[-300:] if r.stdout else '(no output)')
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+        try:
+            r = _webodm_compose(wo_dir, 'up -d', timeout=180)
+            plog(r.stdout[-300:] if r.stdout else '(no output)')
+            if r.returncode != 0:
+                raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
+            if db_upgrade:
+                plog('Upgrading the database and starting WebODM (a few minutes)…')
+                ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
+                if not ok:
+                    raise RuntimeError(why)
+        except Exception as e:
+            if not db_upgrade:
+                raise
+            # 4.x may already be upgrading the 9.5 data: any failure from here on, a time limit
+            # too, goes back to 3.x and the untouched 9.5 copy (upstream writes it atomically).
+            plog(f'  ✗ {e}')
+            _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
+            raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({e}); the previous version and its data are back.')
         if db_upgrade:
-            plog('Upgrading the database and starting WebODM (a few minutes)…')
-            ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
-            if not ok:
-                plog(f'  ✗ {why}')
-                _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
-                raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({why}); the previous version and its data are back.')
             plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
