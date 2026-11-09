@@ -49031,16 +49031,18 @@ def _etlrunner_egress(action, log, allow=None):
 def _etlrunner_net_migrate(log):
     """A cloudtak_etl network made before W5 has Docker's generated bridge name, so the egress
     rules would not match it. Remove it (detaching what is on it) and let compose recreate it
-    with the fixed name. Returns False only when it is wrong and could not be removed."""
+    with the fixed name. Returns 'ok' (nothing to do), 'migrated' (removed: the caller must
+    force-recreate what uses it — compose sees an unchanged config hash and would leave those
+    containers detached; seen on etlspike 2026-11-09) or False (wrong and could not be removed)."""
     r = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
                                    '{{ index .Options "com.docker.network.bridge.name" }}|'
                                    '{{ range .Containers }}{{ .Name }} {{ end }}', _etl.ETL_NETWORK]),
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
-        return True                      # absent: compose creates it right
+        return 'ok'                      # absent: compose creates it right
     name, _, members = r.stdout.strip().partition('|')
     if name == _etl.ETL_BRIDGE:
-        return True
+        return 'ok'
     log(f"  Recreating {_etl.ETL_NETWORK} with bridge {_etl.ETL_BRIDGE} (was {name or 'auto-named'})")
     for c in members.split():
         subprocess.run(_sudo_wrap(['docker', 'network', 'disconnect', '-f', _etl.ETL_NETWORK, c]),
@@ -49050,7 +49052,18 @@ def _etlrunner_net_migrate(log):
     if r.returncode != 0:
         log(f"  ✗ could not remove {_etl.ETL_NETWORK}: {(r.stderr or r.stdout).strip()[-200:]}")
         return False
-    return True
+    return 'migrated'
+
+
+def _etlrunner_net_missing():
+    """Compose services (api, the shim) that the overlay puts on the ETL network but are not
+    on it right now."""
+    want = {'api': 'cloudtak-api-1', _etl.SHIM_SERVICE: _ETLRUNNER_SHIM_CONTAINER}
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                   '{{ range .Containers }}{{ .Name }} {{ end }}', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=30)
+    have = set(r.stdout.split()) if r.returncode == 0 else set()
+    return [svc for svc, name in want.items() if name not in have]
 
 
 def _etlrunner_job(action):
@@ -49078,6 +49091,16 @@ def _etlrunner_job(action):
                 save_settings(s)
                 _cloudtak_ensure_custom_compose(ct_dir, log)
                 r = _broker_compose(ct_dir, f'up -d api events {_etl.SHIM_SERVICE}', timeout=900)
+                if r.returncode == 0:
+                    # compose does not re-attach a running container whose config hash did not
+                    # change, so after a network migration (or any detach) api/shim would stay
+                    # off the ETL network and every ETL would lose api:5000.
+                    missing = _etlrunner_net_missing()
+                    if missing:
+                        log(f"  Re-attaching {', '.join(missing)} to {_etl.ETL_NETWORK}")
+                        r = _broker_compose(ct_dir, 'up -d --force-recreate ' + ' '.join(missing), timeout=900)
+                        if r.returncode == 0 and _etlrunner_net_missing():
+                            log(f"  ✗ still not on {_etl.ETL_NETWORK}: {', '.join(_etlrunner_net_missing())}")
                 if r.returncode != 0:
                     log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
                 else:
@@ -49123,6 +49146,7 @@ def cloudtak_etl_status():
     return jsonify({'enabled': bool(c.get('enabled')), 'local_cloudtak': _etlrunner_ct_local(s),
                     'overlay': os.path.exists(os.path.join(os.path.expanduser('~/CloudTAK'), _etl.OVERLAY)),
                     'shim': st.stdout.strip() if st.returncode == 0 else 'absent',
+                    'net_missing': _etlrunner_net_missing() if c.get('enabled') else [],
                     'egress': {'enforced': bool(eg.get('enforced')), 'v4': bool(eg.get('v4')),
                                'v6': eg.get('v6'), 'allow': list(c.get('egress_allow') or [])},
                     'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
