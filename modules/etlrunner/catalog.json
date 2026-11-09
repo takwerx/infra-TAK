@@ -26,7 +26,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-adsbx",
@@ -53,7 +53,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-air-data",
@@ -80,7 +80,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-AlertWest",
@@ -107,7 +107,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-axon",
@@ -134,7 +134,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-brinc",
@@ -161,7 +161,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-buddi",
@@ -188,7 +188,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-caltopo",
@@ -215,7 +215,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-cellping",
@@ -242,7 +242,7 @@
         "installable": false
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-central-square",
@@ -269,7 +269,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-caic",
@@ -296,7 +296,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-cotrip-signs",
@@ -350,7 +350,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-cotrip-plows",
@@ -377,7 +377,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-cotrip-cameras",
@@ -404,7 +404,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-cotrip-weather",
@@ -458,7 +458,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-dji-flight-hub",
@@ -485,7 +485,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-drone-sense",
@@ -512,7 +512,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-drone-tag",
@@ -539,7 +539,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-ensurity",
@@ -566,7 +566,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-arcgis",
@@ -593,7 +593,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-everywhere-hub",
@@ -620,7 +620,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-first-due",
@@ -647,7 +647,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-inreach",
@@ -674,7 +674,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-geojson",
@@ -701,7 +701,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-geotab",
@@ -728,7 +728,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-jeffcom",
@@ -755,7 +755,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-nasa-acero",
@@ -782,7 +782,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-optimus",
@@ -809,7 +809,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-santa",
@@ -836,7 +836,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-shotover",
@@ -863,7 +863,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-skydio",
@@ -890,7 +890,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-skymira",
@@ -917,7 +917,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-slack-bsar",
@@ -944,7 +944,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-spider-tracks",
@@ -971,7 +971,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-spot",
@@ -998,7 +998,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-strato",
@@ -1025,7 +1025,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-usgs-gauges",
@@ -1052,7 +1052,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-verkada",
@@ -1079,7 +1079,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-waze",
@@ -1106,7 +1106,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-wildweb",
@@ -1133,7 +1133,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     },
     {
       "prefix": "etl-caltopo-clptak",
@@ -1161,7 +1161,7 @@
       },
       "has_capabilities": true,
       "note": "Fork of COE CalTopo: adds TAK->CalTopo Mission Sync, PLI forwarding to CalTopo Trackable Devices, and CalTopo App Tracks as live positions. Pinned to a branch SHA because the fork has no release tag yet.",
-      "reviewed": null
+      "reviewed": "2026-11-08 /module-scan"
     }
   ]
 }
