@@ -1648,6 +1648,14 @@ def _do_exec(req):
     # nothing legitimate. The child inherits the broker's own root env, plus only
     # the explicit apt non-interactive keys below.
     env = None
+    if _is_etl_build(argv):
+        # ETL images are third-party Dockerfiles: their RUN steps must sit behind the same W5
+        # egress block as ETL runs (no cloud metadata, no LAN, no host). BuildKit cannot attach
+        # a build to a custom network; the classic builder can. Fixed value, this argv only.
+        why = _etl_egress_gate()
+        if why:
+            raise Denied(f'docker build on {ETL_NETWORK}: {why}')
+        env = dict(os.environ, DOCKER_BUILDKIT='0')
     if os.path.basename(argv[0]) in ('apt', 'apt-get'):
         env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
@@ -3766,6 +3774,9 @@ ETL_ID_RE = re.compile(r'^[0-9a-f]{12,64}$')
 ETL_ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
 ETL_MEM_MIN_MB, ETL_MEM_MAX_MB = 128, 3008      # Lambda's classic range; above that is not an ETL
 ETL_MAX_CONTAINERS = 64                         # bounds what a runaway/compromised shim can start
+ETL_NANO_CPUS = 1_000_000_000                   # 1 CPU per run: a miner/fork-heavy ETL cannot starve TAK
+ETL_MEM_TOTAL_FRACTION = 0.5                    # all live ETL containers together: at most half the RAM
+_ETL_RUN_LOCK = threading.Lock()                # count + create are one step (parallel connections)
 ETL_MAX_ENV = 64
 ETL_MAX_ENV_BYTES = 64 * 1024
 ETL_MAX_LOG_BYTES = 1024 * 1024
@@ -3869,7 +3880,7 @@ def _check_etl(req):
 def _etl_host_config(mem_mb):
     """The hardened profile (W4). Built here, never taken from the request."""
     b = mem_mb * 1048576
-    return {'NetworkMode': ETL_NETWORK, 'Memory': b, 'MemorySwap': b,
+    return {'NetworkMode': ETL_NETWORK, 'Memory': b, 'MemorySwap': b, 'NanoCpus': ETL_NANO_CPUS,
             'ReadonlyRootfs': True, 'Tmpfs': {'/tmp': f'rw,noexec,nosuid,size={mem_mb}m'},
             'CapDrop': ['ALL'], 'SecurityOpt': ['no-new-privileges'], 'PidsLimit': 256,
             'Privileged': False, 'Binds': [], 'Mounts': [], 'Devices': [],
@@ -3911,21 +3922,36 @@ def _do_etl(req):
                                 'capabilities': (im.get('Labels') or {}).get('com.cloudtak.capabilities')})
         return {'ok': True, 'images': out}
     if a == 'run':
-        if len(_etl_list()) >= ETL_MAX_CONTAINERS:
-            return {'ok': False, 'code': 'LIMIT', 'error': f'{ETL_MAX_CONTAINERS} ETL containers already exist'}
-        name = f'etl-run-{req["fn"]}-{int(time.time() * 1000)}'
-        body = {'Image': req['image'], 'User': ETL_RUN_USER,
-                'Env': [f'{k}={v}' for k, v in (req.get('env') or {}).items()],
-                'Labels': {ETL_LABEL: '1', ETL_LABEL + '.fn': req['fn']},
-                'NetworkDisabled': False, 'HostConfig': _etl_host_config(req['memory_mb'])}
-        # Engine API create never pulls: an image that is not already local is a 404.
-        created = _docker_json('POST', f'/containers/create?name={urllib.parse.quote(name)}', body, ok=(201,))
+        why = _etl_egress_gate()
+        if why:
+            return {'ok': False, 'code': 'EGRESS_NOT_ENFORCED', 'error': why}
+        img = _docker_json('GET', f'/images/{urllib.parse.quote(req["image"], safe=":")}/json')
+        if (img.get('Config') or {}).get('Volumes'):
+            # A VOLUME would give a writable host-disk volume past ReadonlyRootfs (and outlive the run).
+            return {'ok': False, 'code': 'IMAGE_VOLUMES', 'error': 'etl: image declares VOLUMEs; refused'}
+        with _ETL_RUN_LOCK:
+            live = _etl_list()
+            if len(live) >= ETL_MAX_CONTAINERS:
+                return {'ok': False, 'code': 'LIMIT', 'error': f'{ETL_MAX_CONTAINERS} ETL containers already exist'}
+            used = sum(int((c.get('Labels') or {}).get(ETL_LABEL + '.mb') or ETL_MEM_MIN_MB) for c in live)
+            cap = _etl_mem_cap_mb()
+            if used + req['memory_mb'] > cap:
+                return {'ok': False, 'code': 'LIMIT',
+                        'error': f'ETL containers would use {used + req["memory_mb"]} MB (limit {cap} MB)'}
+            name = f'etl-run-{req["fn"]}-{int(time.time() * 1000)}'
+            body = {'Image': req['image'], 'User': ETL_RUN_USER,
+                    'Env': [f'{k}={v}' for k, v in (req.get('env') or {}).items()],
+                    'Labels': {ETL_LABEL: '1', ETL_LABEL + '.fn': req['fn'],
+                               ETL_LABEL + '.mb': str(req['memory_mb'])},
+                    'NetworkDisabled': False, 'HostConfig': _etl_host_config(req['memory_mb'])}
+            # Engine API create never pulls: an image that is not already local is a 404.
+            created = _docker_json('POST', f'/containers/create?name={urllib.parse.quote(name)}', body, ok=(201,))
         cid = created['Id']
         try:
             _docker_json('POST', f'/containers/{cid}/start', ok=(204, 304))
             info = _docker_json('GET', f'/containers/{cid}/json')
         except Exception:
-            _docker_api('DELETE', f'/containers/{cid}?force=1')
+            _docker_api('DELETE', f'/containers/{cid}?force=1&v=1')
             raise
         ip = (((info.get('NetworkSettings') or {}).get('Networks') or {}).get(ETL_NETWORK) or {}).get('IPAddress')
         return {'ok': True, 'id': cid, 'name': name, 'ip': ip}
@@ -3944,7 +3970,7 @@ def _do_etl(req):
         text = _etl_demux(buf)
         return {'ok': True, 'logs': text[-ETL_MAX_LOG_BYTES:], 'truncated': len(text) > ETL_MAX_LOG_BYTES}
     # stop: force-remove (an ETL run is throwaway; nothing to keep)
-    st, buf = _docker_api('DELETE', f'/containers/{cid}?force=1')
+    st, buf = _docker_api('DELETE', f'/containers/{info["Id"]}?force=1&v=1')
     if st not in (204, 404):
         raise RuntimeError(f'docker rm: {st} {buf[:200].decode(errors="replace")}')
     return {'ok': True}
@@ -4082,6 +4108,36 @@ def _etl_tls_ensure(etl_gid):
 # State: ETL_EGRESS_CONF (root 0600). Present = enforced; the egress-watch thread re-asserts
 # the rules every ETL_EGRESS_HEAL_SEC (reboot, docker restart, firewall reload).
 # ---------------------------------------------------------------------------
+def _etl_mem_cap_mb():
+    try:
+        with open('/proc/meminfo') as f:
+            kb = int(re.search(r'^MemTotal:\s+(\d+)\s+kB', f.read(), re.M).group(1))
+        return max(ETL_MEM_MAX_MB, int(kb / 1024 * ETL_MEM_TOTAL_FRACTION))
+    except (OSError, AttributeError, ValueError):
+        return ETL_MEM_MAX_MB
+
+
+def _etl_egress_gate():
+    """None when an ETL container may start, else the reason. No run without the egress block:
+    the conf must exist, the rules converge now (this also closes the boot window where Docker
+    put its own FORWARD rules above ours), the network must use the bridge the rules match, and
+    an IPv6-enabled network needs the IPv6 rules."""
+    allow = _etl_egress_conf_read()
+    if allow is None:
+        return 'egress block is not configured (turn ETL on from the console)'
+    try:
+        with _ETL_EGRESS_LOCK:
+            st = _etl_egress_converge(allow)
+        net = _docker_json('GET', f'/networks/{ETL_NETWORK}')
+    except Exception as e:  # noqa: BLE001 — any failure means not enforced
+        return f'egress block could not be verified: {e}'[:300]
+    if (net.get('Options') or {}).get('com.docker.network.bridge.name') != ETL_BRIDGE:
+        return f'{ETL_NETWORK} does not use bridge {ETL_BRIDGE}; the egress rules would not match it'
+    if net.get('EnableIPv6') and st.get('v6') not in ('applied', 'kept'):
+        return f'{ETL_NETWORK} has IPv6 but the IPv6 egress rules are not in place ({st.get("v6")})'
+    return None
+
+
 ETL_BRIDGE = 'br-cloudtak-etl'                  # 15 chars: the Linux IFNAMSIZ limit
 ETL_EGRESS_CHAIN = 'TAKWERX-ETL'
 ETL_EGRESS_CHAIN_IN = 'TAKWERX-ETL-IN'
@@ -4091,7 +4147,8 @@ ETL_EGRESS_MAX_ALLOW = 32
 ETL_EGRESS_BLOCK = {
     4: ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
         '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4',
-        '240.0.0.0/4'),
+        '240.0.0.0/4',
+        '168.63.129.16/32'),   # Azure WireServer: public address, VM goal state (DNS on 53 stays reachable)
     6: ('::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8'),
 }
 _ETL_EGRESS_LOCK = threading.Lock()
@@ -4114,8 +4171,9 @@ def _etl_egress_allow_norm(allow):
             n = ipaddress.ip_network(a, strict=False)
         except ValueError:
             raise Denied(f'etl_egress: bad CIDR: {a!r}')
-        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified:
-            raise Denied(f'etl_egress: {n} can never be allowed (loopback / link-local / multicast)')
+        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified or n.is_reserved \
+                or (n.version == 4 and n.overlaps(ipaddress.ip_network('0.0.0.0/8'))):
+            raise Denied(f'etl_egress: {n} can never be allowed (loopback / link-local / multicast / reserved)')
         if n.prefixlen < (8 if n.version == 4 else 16):
             raise Denied(f'etl_egress: {n} is too wide')
         if not (n.is_private or (n.version == 4 and n.subnet_of(cgnat))):
@@ -4195,6 +4253,14 @@ def _etl_egress_converge(allow):
                 for _ in range(8):
                     if _ipt(ipt, '-D', 'FORWARD', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode != 0:
                         break
+            if hook == 'FORWARD':
+                # Docker (started after us) inserts its own FORWARD rules at the top, which would
+                # ACCEPT ETL traffic before our jump. Keep our jump first until DOCKER-USER exists.
+                first = [ln for ln in _ipt(ipt, '-S', 'FORWARD').stdout.splitlines() if ln.startswith('-A ')][:1]
+                if first and f'-j {ETL_EGRESS_CHAIN}' not in first[0]:
+                    for _ in range(8):
+                        if _ipt(ipt, '-D', 'FORWARD', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode != 0:
+                            break
             for parent, child in ((hook, ETL_EGRESS_CHAIN), ('INPUT', ETL_EGRESS_CHAIN_IN)):
                 jump = ['-i', ETL_BRIDGE, '-j', child]
                 if _ipt(ipt, '-C', parent, *jump).returncode != 0:
@@ -4294,6 +4360,19 @@ def _do_etl_egress(req):
     with _ETL_EGRESS_LOCK:
         if action == 'apply':
             allow = _etl_egress_allow_norm(req.get('allow', []))
+            # An allow entry over a Docker network would open other stacks' containers (Postgres,
+            # Authentik, TAK) to every ETL. Refuse it; the ETL net reaches its own peers anyway.
+            for net in _docker_json('GET', '/networks'):
+                for c in (net.get('IPAM') or {}).get('Config') or []:
+                    try:
+                        dn = ipaddress.ip_network(c.get('Subnet') or '', strict=False)
+                    except ValueError:
+                        continue
+                    for a in allow:
+                        n = ipaddress.ip_network(a)
+                        if n.version == dn.version and n.overlaps(dn):
+                            raise Denied(f'etl_egress: {n} overlaps Docker network '
+                                         f'{str(net.get("Name"))[:64]} ({dn}); refused')
             _etl_egress_conf_write(allow)        # first: the watch enforces even if this pass fails
             try:
                 st = _etl_egress_converge(allow)
@@ -5224,6 +5303,18 @@ _DOCKER_VALUE_FLAGS = frozenset((
     '-c', '--context', '-H', '--host', '-l', '--log-level', '--config',          # docker
     '-f', '--file', '-p', '--project-name', '--profile', '--env-file',           # compose
     '--project-directory', '--progress', '--ansi', '--parallel'))
+
+
+def _is_etl_build(argv):
+    """True for `docker build ... --network cloudtak_etl ...` (also `--network=`)."""
+    if not argv or os.path.basename(argv[0]) != 'docker' or 'build' not in argv[1:2]:
+        return False
+    for i, a in enumerate(argv):
+        if a == '--network' and i + 1 < len(argv) and argv[i + 1] == ETL_NETWORK:
+            return True
+        if a == f'--network={ETL_NETWORK}':
+            return True
+    return False
 
 
 def default_timeout(argv):

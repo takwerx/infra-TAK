@@ -49314,7 +49314,11 @@ def _etlrunner_write(path, text, in_place=False, mode=0o644):
             f.write(text)
     else:
         tmp = path + '.infratak-tmp'
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)   # a 0600 file is never readable, even briefly
+        try:
+            os.unlink(tmp)          # a leftover tmp would keep its old (wider) mode
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)   # a 0600 file is never readable, even briefly
         with os.fdopen(fd, 'w') as f:
             f.write(text)
         os.replace(tmp, path)
@@ -49657,6 +49661,10 @@ def cloudtak_etl_egress():
         allow = [a.strip() for a in re.split(r'[\s,]+', allow) if a.strip()]
     if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
         return jsonify({'ok': False, 'error': 'allow must be a list of CIDRs'}), 400
+    try:
+        allow = _etl.egress_allow_norm(allow)      # the broker checks again and is the authority
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
     s = load_settings()
     c = _etlrunner_cfg(s)
     if c.get('enabled'):
@@ -49739,8 +49747,19 @@ def _etlcat_integrations():
 
 
 def _etlcat_git(args, cwd=None, timeout=300):
-    return subprocess.run(['git'] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    # https only, and no LFS smudge: a repo's .lfsconfig must not make this host fetch a URL
+    # the repo chooses (objects would be OID-pinned, but the request itself is the leak).
+    return subprocess.run(['git', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+                           '-c', 'filter.lfs.process=', '-c', 'filter.lfs.smudge=', '-c', 'filter.lfs.required=false']
+                          + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_LFS_SKIP_SMUDGE': '1'})
+
+
+def _etlcat_gh_url(u):
+    """A catalog URL CloudTAK may render: github.com / raw.githubusercontent.com over https
+    with a plain path, else ''."""
+    u = str(u or '')
+    return u if re.fullmatch(r'https://(github\.com|raw\.githubusercontent\.com)/[A-Za-z0-9._/-]{1,300}', u) else ''
 
 
 def _etlcat_build(e, log):
@@ -49781,7 +49800,11 @@ def _etlcat_build(e, log):
             with open(cp) as f:
                 caps = json.dumps(json.load(f), separators=(',', ':'))
         log(f"  Building {tag} (first build of an ETL takes a few minutes)…")
-        args = ['docker', 'build', '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
+        # On the ETL network: the third-party RUN steps get the W5 egress block (no cloud
+        # metadata, LAN or host); the broker runs it with the classic builder and refuses it
+        # when the block is not enforced. Proven: BuildKit's default bridge reached metadata.
+        args = ['docker', 'build', '--network', _etl.ETL_NETWORK, '--force-rm',
+                '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
         if caps:
             args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
         b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600,
@@ -49825,7 +49848,7 @@ def _etlcat_job(action, prefix):
                     else:
                         okr, code, d = _etlcat_ct('POST', '/integration', {
                             'name': e['name'][:120], 'prefix': prefix, 'favorite': False, 'logo': logo,
-                            'repo': e.get('repo_url') or '', 'readme': e.get('readme') or ''})
+                            'repo': _etlcat_gh_url(e.get('repo_url')), 'readme': _etlcat_gh_url(e.get('readme'))})
                         if okr:
                             log(f"  ✓ registered in CloudTAK — '{e['name']}' is now a card when you create a layer")
                             ok = True

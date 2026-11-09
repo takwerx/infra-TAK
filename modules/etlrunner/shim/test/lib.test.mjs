@@ -149,3 +149,53 @@ test('hookRoute: bad layer id and dot segments refused', () => {
     assert.ok(hookRoute(`${HOOK_PREFIX}/${SEC}/a$b`, SEC, timingSafeEqual).refuse);
     assert.ok(hookRoute(`${HOOK_PREFIX}/${SEC}/abc/../x`, SEC, timingSafeEqual).refuse);
 });
+
+// ---- security review fixes (2026-11-09) ----
+import { hookResponse, hookEventHeaders, rateMs as rate2, compile as compile2, RATE_MIN_MS } from '../lib.mjs';
+
+test('hookResponse: an ETL cannot serve HTML or set cookies on the CloudTAK origin', () => {
+    const r = hookResponse({ statusCode: 200, headers: { 'Content-Type': 'text/html', 'Set-Cookie': 'a=b', Location: 'https://evil' }, body: '<script>x</script>' });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers['Content-Type'], 'text/plain; charset=utf-8');
+    assert.equal(r.headers['X-Content-Type-Options'], 'nosniff');
+    assert.match(r.headers['Content-Security-Policy'], /^sandbox/);
+    assert.ok(!Object.keys(r.headers).some((k) => /set-cookie|location/i.test(k)));
+    assert.equal(hookResponse({ statusCode: 200, headers: { 'content-type': 'application/json; charset=utf-8' }, body: '{}' }).headers['Content-Type'], 'application/json; charset=utf-8');
+    for (const t of ['image/svg+xml', 'application/xml', 'text/html;x', 'application/json\r\nX: y']) {
+        assert.equal(hookResponse({ statusCode: 200, headers: { 'Content-Type': t }, body: '' }).headers['Content-Type'], 'text/plain; charset=utf-8', t);
+    }
+});
+
+test('hookResponse: bad shapes become 502 instead of crashing the shim', () => {
+    for (const r of [{ statusCode: 200, body: {} }, { statusCode: 'x' }, { statusCode: 99 }, { statusCode: 700 }, { statusCode: 200.5 }, { statusCode: 200, body: 5 }]) {
+        assert.equal(hookResponse(r).status, 502, JSON.stringify(r));
+    }
+    assert.equal(hookResponse({ statusCode: 201, body: 'aGk=', isBase64Encoded: true }).body.toString(), 'hi');
+    assert.equal(hookResponse('plain').body, 'plain');
+    assert.equal(hookResponse({ a: 1 }).body, '{"a":1}');
+    assert.equal(hookResponse(null).status, 200);
+});
+
+test('hookEventHeaders: the browser cookie never reaches an ETL; Authorization does', () => {
+    const h = hookEventHeaders({ cookie: 'session=1', Cookie: 'x', authorization: 'Bearer t', 'x-a': ['1', '2'] });
+    assert.deepEqual({ ...h }, { authorization: 'Bearer t', 'x-a': '1,2' });
+    assert.equal(Object.getPrototypeOf(h), null);
+});
+
+test('rateMs: clamped to one minute, no overflow', () => {
+    assert.equal(rate2('rate(1 second)'), RATE_MIN_MS);
+    assert.equal(rate2('rate(5 minutes)'), 300000);
+    assert.equal(rate2('rate(25 days)'), 25 * 864e5);
+    assert.equal(rate2('rate(99999999999999999 days)'), null);
+});
+
+test('compile: FunctionName must be the stack name; webhook UniqueID is checked', () => {
+    const t = (fnName, extra = {}) => JSON.stringify({
+        Parameters: { Task: { Default: 'etl-cot-v1.4.0' }, UniqueID: { Default: extra.uid ?? 'abc-123' } },
+        Resources: { F: { Type: 'AWS::Lambda::Function', Properties: { FunctionName: fnName } },
+            ...(extra.hook ? { WebHookResourceIntegration: { Type: 'AWS::ApiGatewayV2::Integration' } } : {}) } });
+    assert.equal(compile2('test-layer-9', t('test-layer-9'), [], 'http://api:5000').FunctionName, 'test-layer-9');
+    assert.throws(() => compile2('test-layer-9', t('test-layer-1'), [], 'http://api:5000'), ValidationError);
+    assert.throws(() => compile2('test-layer-9', t('test-layer-9', { hook: true, uid: '../x' }), [], 'http://api:5000'), ValidationError);
+    assert.equal(compile2('test-layer-9', t('test-layer-9', { hook: true }), [], 'http://api:5000').Webhook, 'abc-123');
+});

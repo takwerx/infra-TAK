@@ -19,6 +19,7 @@ import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
     sqsReplay, sqsSnapshot, sqsBytes, SQS_MAX_PER_LAYER, SQS_MAX_DEAD, SQS_MAX_BYTES,
+    hookResponse, hookEventHeaders,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -36,11 +37,12 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- state ----
-let stacks = {};            // StackName -> { id, status, created, desc, fn }
-try { stacks = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { /* fresh */ }
+// Every name-keyed map has no prototype: a name like "constructor" is only ever a key.
+let stacks = Object.create(null);   // StackName -> { id, status, created, desc, fn }
+try { stacks = Object.assign(Object.create(null), JSON.parse(fs.readFileSync(STATE, 'utf8'))); } catch { /* fresh */ }
 for (const [name, s] of Object.entries(stacks)) {
     const fn = normalizeFn(s?.fn);
-    if (fn) s.fn = fn; else { log(`state: dropping stack ${name} (not a runnable ETL function)`); delete stacks[name]; }
+    if (fn && fn.FunctionName === name) s.fn = fn; else { log(`state: dropping stack ${name} (not a runnable ETL function)`); delete stacks[name]; }
 }
 function save() {
     try {
@@ -49,11 +51,15 @@ function save() {
         fs.renameSync(tmp, STATE);
     } catch (e) { log('save fail', e.message); }
 }
-const runs = {};            // FunctionName -> [{ stream, ts, lines }]
-const status = {};          // FunctionName -> { runs, errors, skipped, last: {...} }
-const timers = {};
-const warm = {};            // FunctionName -> { id, ip, idle, image, mb, lastUsed }
-const busy = {};            // FunctionName -> Promise chain (one in-flight invoke per function, like a warm Lambda)
+const runs = Object.create(null);     // FunctionName -> [{ stream, ts, lines }]
+const status = Object.create(null);   // FunctionName -> { runs, errors, skipped, last: {...} }
+const timers = Object.create(null);
+const warm = Object.create(null);     // FunctionName -> { id, ip, idle, image, mb, lastUsed }
+const busy = Object.create(null);     // FunctionName -> Promise chain (one in-flight invoke per function, like a warm Lambda)
+const backlog = Object.create(null);  // FunctionName -> invokes waiting on `busy`
+const BACKLOG_MAX = 16;               // beyond this an invoke is refused (429), not queued in memory
+const RUN_LOG_MAX_LINES = 2000;       // per run kept in memory (20 runs per function)
+const RESULT_MAX_BYTES = 6 * 1024 * 1024;   // Lambda's synchronous response limit
 const running = new Set();  // FunctionName of scheduled runs in flight (skip-if-running)
 let WARM_BUDGET_MB = 0;
 try { WARM_BUDGET_MB = warmBudgetMb(fs.readFileSync('/proc/meminfo', 'utf8')); } catch { /* no warm */ }
@@ -100,7 +106,7 @@ async function localImages() {
 }
 
 // ---- schedules ----
-const crons = {};           // StackName -> parsed cron
+const crons = Object.create(null);           // StackName -> parsed cron
 function scheduled(name) {
     const s = stacks[name]; if (!s) return;
     const fn = s.fn.FunctionName;
@@ -117,7 +123,16 @@ function arm(name) {
     if (ms) {
         // stagger the first run so a restart does not fire every layer in the same second
         const jitter = Math.floor(Math.random() * Math.min(ms, 30000));
-        timers[name] = setTimeout(() => { scheduled(name); timers[name] = setInterval(() => scheduled(name), ms); }, jitter);
+        // setTimeout/setInterval above 2^31-1 ms fire after 1 ms: chain shorter steps instead.
+        const every = (wait) => {
+            let left = wait;
+            const step = () => {
+                if (left > 2 ** 31 - 1) { left -= 2 ** 31 - 1; timers[name] = setTimeout(step, 2 ** 31 - 1); return; }
+                timers[name] = setTimeout(() => { scheduled(name); left = ms; step(); }, left);
+            };
+            step();
+        };
+        every(jitter);
         log(`sched ${name}: every ${ms / 1000}s (first in ${jitter}ms)`); return;
     }
     try { const c = parseCron(s.fn.Schedule.expr); if (c) { crons[name] = c; log(`sched ${name}: ${s.fn.Schedule.expr}`); return; } }
@@ -146,7 +161,13 @@ function post(ip, body, timeoutMs) {
     return new Promise((res, rej) => {
         const r = http.request({ host: ip, port: 8080, method: 'POST', path: '/2015-03-31/functions/function/invocations',
             headers: { 'Content-Length': body.length }, timeout: timeoutMs }, (rr) => {
-            const ch = []; rr.on('data', (x) => ch.push(x)); rr.on('end', () => res(Buffer.concat(ch)));
+            const ch = []; let n = 0;
+            rr.on('data', (x) => {
+                n += x.length;
+                if (n > RESULT_MAX_BYTES) { r.destroy(Object.assign(new Error('ETL response is larger than 6 MiB'), { code: 'TOOBIG' })); return; }
+                ch.push(x);
+            });
+            rr.on('end', () => res(Buffer.concat(ch)));
         });
         r.on('error', rej);
         r.on('timeout', () => r.destroy(Object.assign(new Error('invoke timeout'), { code: 'TIMEOUT' })));
@@ -155,7 +176,8 @@ function post(ip, body, timeoutMs) {
 }
 async function collectLogs(fnName, c, sinceMs, t0) {
     const r = await broker('logs', { id: c.id, since: Math.floor(sinceMs / 1000) });
-    (runs[fnName] ||= []).unshift({ stream: `${new Date(t0).toISOString().slice(0, 10)}/[$LATEST]${c.cname}-${t0}`, ts: t0, lines: parseLogLines(r.logs) });
+    const lines = parseLogLines(r.logs).slice(-RUN_LOG_MAX_LINES);
+    (runs[fnName] ||= []).unshift({ stream: `${new Date(t0).toISOString().slice(0, 10)}/[$LATEST]${c.cname}-${t0}`, ts: t0, lines });
     runs[fnName] = runs[fnName].slice(0, 20);
 }
 // Keep `c` warm for `fn` if the layer qualifies and the budget allows (LRU eviction).
@@ -171,8 +193,13 @@ function keepWarm(fn, c) {
     return true;
 }
 function invoke(fnName, payload, type) {
+    if ((backlog[fnName] || 0) >= BACKLOG_MAX) {
+        return Promise.reject(Object.assign(new Error(`${fnName}: too many invocations waiting`), { code: 429 }));
+    }
+    backlog[fnName] = (backlog[fnName] || 0) + 1;
     const prev = busy[fnName] || Promise.resolve();
-    const p = prev.catch(() => {}).then(() => invokeNow(fnName, payload, type));
+    const p = prev.catch(() => {}).then(() => invokeNow(fnName, payload, type))
+        .finally(() => { backlog[fnName] -= 1; if (!backlog[fnName]) delete backlog[fnName]; });
     busy[fnName] = p.catch(() => {});
     return p;
 }
@@ -228,6 +255,7 @@ function jCompact() {
     const fd = fs.openSync(tmp, 'w', 0o600);
     try { fs.writeSync(fd, snap); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, SQS_JOURNAL);
+    try { const d = fs.openSync(SQS_JOURNAL.replace(/[^/]*$/, '') || '.', 'r'); fs.fsyncSync(d); fs.closeSync(d); } catch { /* best effort */ }
     if (jfd !== null) fs.closeSync(jfd);
     jfd = fs.openSync(SQS_JOURNAL, 'a', 0o600);
     jBytes = Buffer.byteLength(snap);
@@ -302,7 +330,12 @@ async function sqs(op, req, res) {
     const Successful = [], Failed = [];
     for (const e of entries) {
         const body = typeof e.MessageBody === 'string' ? e.MessageBody : '';
-        const m = { Id: randomUUID(), MessageBody: body, MessageGroupId: e.MessageGroupId, MessageDeduplicationId: e.MessageDeduplicationId,
+        const short = (v) => (typeof v === 'string' && v.length <= 128 ? v : undefined);
+        if (Buffer.byteLength(body) > 256 * 1024) {
+            Failed.push({ Id: e.Id, SenderFault: true, Code: 'InvalidParameterValue', Message: 'message is larger than 256 KiB' });
+            continue;
+        }
+        const m = { Id: randomUUID(), MessageBody: body, MessageGroupId: short(e.MessageGroupId), MessageDeduplicationId: short(e.MessageDeduplicationId),
                     queue, tries: 0, ts: Date.now() };
         if ((queues[fnName]?.q.length || 0) >= SQS_MAX_PER_LAYER || qBytes + sqsBytes(m) > SQS_MAX_BYTES) {
             Failed.push({ Id: e.Id, SenderFault: false, Code: 'ServiceUnavailable', Message: 'shim: outgoing queue is full' });
@@ -372,6 +405,9 @@ async function query(form, res) {          // CloudFormation + STS (both AWS que
         let fn;
         try { fn = compile(name, body, members(form, 'Parameters'), ETL_API); }
         catch (e) { if (e instanceof ValidationError) return cfnErr(res, 'ValidationError', e.message); throw e; }
+        if (fn.Webhook && Object.entries(stacks).some(([n, x]) => n !== name && x.fn.Webhook === fn.Webhook)) {
+            return cfnErr(res, 'ValidationError', 'webhook UniqueID is already used by another layer');
+        }
         const prev = stacks[name];
         let desc = ''; try { desc = JSON.parse(body).Description || ''; } catch { /* compile already parsed it */ }
         stacks[name] = { id: prev?.id || `arn:aws:cloudformation:local:000000000000:stack/${name}/${randomUUID()}`,
@@ -385,7 +421,7 @@ async function query(form, res) {          // CloudFormation + STS (both AWS que
     if (action === 'DeleteStack') {
         disarm(name);
         const fnName = stacks[name]?.fn.FunctionName;
-        if (fnName) { dropWarm(fnName); sqsPurge(fnName); }
+        if (fnName) { dropWarm(fnName); sqsPurge(fnName); delete runs[fnName]; delete status[fnName]; }
         delete stacks[name]; save(); return cfnOk(res, action, '');
     }
     if (action === 'CancelUpdateStack') return cfnOk(res, action, '');
@@ -452,15 +488,27 @@ function statusDoc() {
 }
 
 const MAX_BODY = 8 * 1024 * 1024;           // CloudFormation's own TemplateBody cap is 51,200 bytes; SQS 256 KiB
-function readBody(req, res, cb) {
-    const chunks = []; let n = 0;
-    req.on('data', (c) => { n += c.length; if (n > MAX_BODY) { res.writeHead(413); res.end(); req.destroy(); return; } chunks.push(c); });
-    req.on('end', () => { if (n <= MAX_BODY) cb(Buffer.concat(chunks)); });
+function readBody(req, res, cb, limit = MAX_BODY) {
+    const chunks = []; let n = 0, over = false;
+    req.on('data', (c) => {
+        if (over) return;
+        n += c.length;
+        if (n > limit) { over = true; if (!res.headersSent) { res.writeHead(413); res.end(); } req.destroy(); return; }
+        chunks.push(c);
+    });
+    req.on('end', () => {
+        if (over) return;
+        Promise.resolve().then(() => cb(Buffer.concat(chunks))).catch((e) => {
+            log('handler fail', e?.message);
+            if (!res.headersSent) { res.writeHead(500); res.end(); } else res.destroy();
+        });
+    });
 }
 function apiHandler(req, res) {
+    // Refuse the ETL subnet before reading a byte: a hostile ETL must not fill shim memory.
+    if (!etlNets || fromEtlNet(req.socket.remoteAddress)) { res.writeHead(403, { Connection: 'close' }); res.end(); return req.resume(); }
     readBody(req, res, async (body) => {
         try {
-            if (!etlNets || fromEtlNet(req.socket.remoteAddress)) { res.writeHead(403); return res.end(); }
             if (req.url === '/_status') return json(res, 200, statusDoc());
             const target = req.headers['x-amz-target'];
             if (target) return await jsonTarget(target, body, res);
@@ -468,7 +516,7 @@ function apiHandler(req, res) {
             if ((req.headers['content-type'] || '').includes('x-www-form-urlencoded')) return await query(new URLSearchParams(body.toString()), res);
             log(`UNHANDLED ${req.method} ${req.url.slice(0, 120)} ct=${req.headers['content-type']}`);
             json(res, 400, { message: 'shim: unhandled' });
-        } catch (e) { log('ERR', e.stack); json(res, 500, { message: e.message }); }
+        } catch (e) { log('ERR', e.stack); if (!res.headersSent) json(res, 500, { message: e.message }); }
     });
 }
 
@@ -483,7 +531,9 @@ function hookRefused(reason, ip) {
 
 function webhookHandler(req, res) {
     const notFound = () => { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end('{"message":"Not Found"}'); };
-    const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress;
+    // X-Forwarded-For is Caddy's (it replaces a client's); an ETL on the ETL net could forge it.
+    const peer = req.socket.remoteAddress;
+    const ip = (etlNets && !fromEtlNet(peer) && req.headers['x-forwarded-for']?.split(',')[0].trim()) || peer;
     let u;
     try { u = new URL(req.url, 'http://x'); } catch { hookRefused('bad url', ip); return notFound(); }
     // Check the secret BEFORE reading a byte of the body: a refused caller costs nothing.
@@ -499,7 +549,7 @@ function webhookHandler(req, res) {
         const bin = !/^(text\/|application\/(json|xml|x-www-form-urlencoded))/.test(req.headers['content-type'] || 'text/plain');
         const routeKey = rest.length ? `ANY /${uid}/{proxy+}` : `ANY /${uid}`;
         const event = { version: '2.0', routeKey, rawPath: route.rawPath, rawQueryString: u.search.slice(1),
-            headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, [].concat(v).join(',')])),
+            headers: hookEventHeaders(req.headers),
             queryStringParameters: u.search ? Object.fromEntries(u.searchParams) : undefined,
             pathParameters: rest.length ? { proxy: rest.join('/') } : undefined,
             requestContext: { accountId: '000000000000', apiId: 'etlshim', domainName: req.headers.host, http: { method: req.method, path: route.rawPath,
@@ -510,13 +560,15 @@ function webhookHandler(req, res) {
             const { result, fnError } = await invoke(s.fn.FunctionName, event, 'Webhook');
             if (fnError) { res.writeHead(500, { 'Content-Type': 'application/json' }); return res.end('{"message":"Internal Server Error"}'); }
             let r; try { r = JSON.parse(result.toString()); } catch { r = result.toString(); }
-            if (r && typeof r === 'object' && 'statusCode' in r) {
-                res.writeHead(r.statusCode, r.headers || {});
-                return res.end(r.body ? (r.isBase64Encoded ? Buffer.from(r.body, 'base64') : r.body) : '');
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(typeof r === 'string' ? r : JSON.stringify(r));
-        } catch (e) { log('webhook fail', e.message); res.writeHead(502); res.end(); }
-    });
+            const out = hookResponse(r);
+            res.writeHead(out.status, out.headers);
+            res.end(out.body);
+        } catch (e) {
+            log('webhook fail', e.message);
+            if (res.headersSent) return res.destroy();
+            res.writeHead(e.code === 429 ? 429 : 502); res.end();
+        }
+    }, HOOK_MAX_BODY);
 }
 
 // ---- start-up: learn the ETL subnet, reap leftovers, then serve ----

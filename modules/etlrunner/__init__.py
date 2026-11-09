@@ -163,8 +163,9 @@ def egress_allow_norm(allow):
             n = ipaddress.ip_network(str(a), strict=False)
         except ValueError:
             raise ValueError(f'bad CIDR: {str(a)[:60]!r}')
-        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified:
-            raise ValueError(f'{n} can never be allowed (loopback / link-local / multicast)')
+        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified or n.is_reserved \
+                or (n.version == 4 and n.overlaps(ipaddress.ip_network('0.0.0.0/8'))):
+            raise ValueError(f'{n} can never be allowed (loopback / link-local / multicast / reserved)')
         if n.prefixlen < (8 if n.version == 4 else 16):
             raise ValueError(f'{n} is too wide')
         if not (n.is_private or (n.version == 4 and n.subnet_of(cgnat))):

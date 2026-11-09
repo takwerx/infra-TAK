@@ -58,6 +58,12 @@ export function compile(name, templateBody, paramList, etlApi) {
     }
     const fp = resolve(fnRes.Properties, params, etlApi);
     if (!FN_RE.test(String(fp.FunctionName || ''))) throw new ValidationError(`bad FunctionName ${JSON.stringify(fp.FunctionName)}`);
+    // One function per stack, named after it (CloudTAK's template joins the StackName): a stack
+    // can never claim another layer's function, logs or queue.
+    if (String(fp.FunctionName) !== String(name)) throw new ValidationError(`FunctionName must equal the StackName ${name}`);
+    if (R.WebHookResourceIntegration && !/^[A-Za-z0-9-]{1,64}$/.test(String(params.UniqueID || ''))) {
+        throw new ValidationError('bad webhook UniqueID');
+    }
     const rule = Object.values(R).find((r) => r.Type === 'AWS::Events::Rule');
     const rp = rule ? resolve(rule.Properties, params, etlApi) : null;
     const env = {};
@@ -89,10 +95,13 @@ export function normalizeFn(fn) {
 }
 
 // ---- schedules: EventBridge semantics, UTC ----
+// EventBridge's floor is one minute; anything below is clamped up (a 1 ms loop is a DoS).
+export const RATE_MIN_MS = 60_000;
 export function rateMs(expr) {
     const m = /^rate\((\d+)\s+(second|minute|hour|day)s?\)$/.exec(String(expr).trim());
     if (!m || Number(m[1]) < 1) return null;
-    return Number(m[1]) * { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5 }[m[2]];
+    const ms = Number(m[1]) * { second: 1e3, minute: 6e4, hour: 36e5, day: 864e5 }[m[2]];
+    return Number.isSafeInteger(ms) ? Math.max(RATE_MIN_MS, ms) : null;
 }
 
 const MON = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6, JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
@@ -235,7 +244,7 @@ export const SQS_MAX_DEAD = 1000;
 export const SQS_MAX_BYTES = 256 * 1024 * 1024;      // all queued bodies together, on disk and in memory
 
 export function sqsReplay(text, live) {
-    const Q = {};
+    const Q = Object.create(null);
     const get = (f) => (Q[f] ||= { q: [], dead: [] });
     for (const line of String(text || '').split('\n')) {
         let r;
@@ -271,3 +280,45 @@ export function sqsSnapshot(queues) {
 }
 
 export const sqsBytes = (m) => Buffer.byteLength(m?.MessageBody || '') + 512;
+
+
+// ---- webhook responses are served on the CloudTAK map origin: never let an ETL decide that ----
+// A browser that opens a webhook URL must not run ETL-chosen script or take ETL-chosen cookies
+// on the CloudTAK origin. Status must be an integer 200-599; only JSON or plain text; nothing
+// else from the ETL's headers survives.
+export const HOOK_SAFE_TYPE = /^(application\/json|text\/plain)(\s*;[\w=\-\s."]*)?$/i;
+const HOOK_FIXED_HEADERS = {
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "sandbox; default-src 'none'",
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+};
+export function hookResponse(r) {
+    const fail = { status: 502, headers: { ...HOOK_FIXED_HEADERS, 'Content-Type': 'application/json' }, body: '{"message":"Bad Gateway"}' };
+    if (r === null || r === undefined) return { status: 200, headers: { ...HOOK_FIXED_HEADERS, 'Content-Type': 'application/json' }, body: 'null' };
+    if (typeof r !== 'object' || !('statusCode' in r)) {
+        const body = typeof r === 'string' ? r : JSON.stringify(r);
+        return { status: 200, headers: { ...HOOK_FIXED_HEADERS, 'Content-Type': 'application/json' }, body };
+    }
+    const status = Number(r.statusCode);
+    if (!Number.isInteger(status) || status < 200 || status > 599) return fail;
+    let body = r.body ?? '';
+    if (typeof body !== 'string') return fail;
+    if (r.isBase64Encoded) body = Buffer.from(body, 'base64');
+    let ct = '';
+    const h = r.headers && typeof r.headers === 'object' ? r.headers : {};
+    for (const [k, v] of Object.entries(h)) if (k.toLowerCase() === 'content-type' && typeof v === 'string') ct = v.trim();
+    if (!HOOK_SAFE_TYPE.test(ct)) ct = 'text/plain; charset=utf-8';
+    return { status, headers: { ...HOOK_FIXED_HEADERS, 'Content-Type': ct }, body };
+}
+
+// Request headers an ETL sees: never the browser's cookies (a visit from a signed-in CloudTAK user
+// would hand them over). Authorization stays: webhook ETLs authenticate callers with it.
+export function hookEventHeaders(headers) {
+    const out = Object.create(null);
+    for (const [k, v] of Object.entries(headers || {})) {
+        if (k.toLowerCase() === 'cookie') continue;
+        out[k] = [].concat(v).join(',');
+    }
+    return out;
+}

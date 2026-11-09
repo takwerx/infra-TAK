@@ -100,9 +100,12 @@ def test_hardened_profile_is_fixed(m):
 
 def test_run_sends_only_broker_built_fields(m, monkeypatch):
     calls = []
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
 
     def fake_json(method, path, body=None, ok=(200,)):
         calls.append((method, path, body))
+        if path.startswith('/images/'):
+            return {'Config': {'Volumes': None}}
         if path.startswith('/containers/json'):
             return []
         if path.startswith('/containers/create'):
@@ -118,15 +121,86 @@ def test_run_sends_only_broker_built_fields(m, monkeypatch):
     assert set(create) == {'Image', 'User', 'Env', 'Labels', 'NetworkDisabled', 'HostConfig'}
     assert create['Image'] == 'etl-local:etl-geojson-v2.13.0'
     assert create['User'] == '1000:1000'
-    assert create['Labels'] == {'etl-shim': '1', 'etl-shim.fn': 'test-layer-7'}
+    assert create['Labels'] == {'etl-shim': '1', 'etl-shim.fn': 'test-layer-7', 'etl-shim.mb': '512'}
+    assert create['HostConfig']['NanoCpus'] == m.ETL_NANO_CPUS
     assert create['HostConfig'] == m._etl_host_config(512)
     assert 'ETL_LAYER=7' in create['Env']
 
 
+def _no_create(path_ok=('/images/',)):
+    def f(method, path, body=None, ok=(200,)):
+        if path.startswith(path_ok):
+            return {'Config': {}}
+        pytest.fail(f'must not call {method} {path}')
+    return f
+
+
 def test_run_refuses_past_the_container_cap(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
     monkeypatch.setattr(m, '_etl_list', lambda: [{}] * m.ETL_MAX_CONTAINERS)
-    monkeypatch.setattr(m, '_docker_json', lambda *a, **k: pytest.fail('must not create'))
+    monkeypatch.setattr(m, '_docker_json', _no_create())
     assert m._do_etl(_run())['code'] == 'LIMIT'
+
+
+def test_run_refuses_past_the_memory_cap(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+    monkeypatch.setattr(m, '_etl_mem_cap_mb', lambda: 3500)
+    monkeypatch.setattr(m, '_etl_list', lambda: [{'Labels': {'etl-shim.mb': '3008'}}, {'Labels': {}}])
+    monkeypatch.setattr(m, '_docker_json', _no_create())
+    r = m._do_etl(_run())                       # 3008 + 128 (unlabelled) + 512 > 3500
+    assert r['code'] == 'LIMIT' and 'limit 3500' in r['error']
+
+
+def test_run_refuses_without_the_egress_block(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: 'egress block is not configured')
+    monkeypatch.setattr(m, '_docker_json', _no_create(()))
+    r = m._do_etl(_run())
+    assert r['code'] == 'EGRESS_NOT_ENFORCED'
+
+
+def test_run_refuses_an_image_with_volumes(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+
+    def f(method, path, body=None, ok=(200,)):
+        if path.startswith('/images/'):
+            return {'Config': {'Volumes': {'/data': {}}}}
+        pytest.fail('must not create')
+    monkeypatch.setattr(m, '_docker_json', f)
+    assert m._do_etl(_run())['code'] == 'IMAGE_VOLUMES'
+
+
+@pytest.mark.parametrize('conf,net,v6,why', [
+    (None, {}, 'kept', 'not configured'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-1234abcd'}}, 'kept', 'does not use bridge'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}, 'EnableIPv6': True}, 'error: x', 'IPv6'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}, 'EnableIPv6': True}, 'kept', None),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}}, 'error: no ip6', None),
+])
+def test_egress_gate(m, monkeypatch, conf, net, v6, why):
+    monkeypatch.setattr(m, '_etl_egress_conf_read', lambda: conf)
+    monkeypatch.setattr(m, '_etl_egress_converge', lambda allow: {'v4': 'kept', 'v6': v6})
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): net)
+    r = m._etl_egress_gate()
+    assert (r is None) if why is None else (why in r)
+
+
+def test_egress_gate_fails_closed_when_converge_fails(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_conf_read', lambda: [])
+
+    def boom(allow):
+        raise RuntimeError('IPv4: iptables locked')
+    monkeypatch.setattr(m, '_etl_egress_converge', boom)
+    assert 'could not be verified' in m._etl_egress_gate()
+
+
+def test_stop_deletes_by_full_id_with_volumes(m, monkeypatch):
+    full = 'a' * 64
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,):
+                        {'Id': full, 'Config': {'Labels': {'etl-shim': '1'}}})
+    seen = []
+    monkeypatch.setattr(m, '_docker_api', lambda method, path, *a, **k: (seen.append((method, path)) or (204, b'')))
+    assert m._do_etl({'op': 'etl', 'action': 'stop', 'id': 'a' * 12})['ok']
+    assert seen == [('DELETE', f'/containers/{full}?force=1&v=1')]
 
 
 def test_stop_refuses_a_container_it_did_not_start(m, monkeypatch):
@@ -240,6 +314,8 @@ def test_a_docker_failure_is_audited_once_with_the_summary(m, monkeypatch):
 
     def boom(*a, **k):
         raise RuntimeError('docker down')
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): {'Config': {}})
     monkeypatch.setattr(m, '_etl_list', boom)
     with pytest.raises(m._EtlAudited):
         m._etl_dispatch(_run(), (1, 997, 996))

@@ -206,6 +206,7 @@ def test_teardown_leaves_nothing(m, fake):
 
 def test_apply_remove_status(m, fake, tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'ETL_EGRESS_CONF', str(tmp_path / 'egress.json'))
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): [])
     r = m._do_etl_egress({'op': 'etl_egress', 'action': 'apply', 'allow': ['10.9.0.0/16']})
     assert r['ok'] and r['allow'] == ['10.9.0.0/16']
     assert (tmp_path / 'egress.json').stat().st_mode & 0o777 == 0o600
@@ -251,3 +252,39 @@ def test_overlay_pins_bridge_name(m):
                         '/var/lib/takwerx-etl-tls')
     assert f'com.docker.network.bridge.name: "{m.ETL_BRIDGE}"' in y
     assert etl.ETL_BRIDGE == m.ETL_BRIDGE and len(m.ETL_BRIDGE) <= 15
+
+
+def test_apply_refuses_an_allow_over_a_docker_network(m, fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(m, 'ETL_EGRESS_CONF', str(tmp_path / 'egress.json'))
+    nets = [{'Name': 'authentik_default', 'IPAM': {'Config': [{'Subnet': '172.19.0.0/16'}]}},
+            {'Name': 'v6only', 'IPAM': {'Config': [{'Subnet': 'fd00:dead::/64'}]}}]
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): nets)
+    with pytest.raises(m.Denied, match='authentik_default'):
+        m._do_etl_egress({'op': 'etl_egress', 'action': 'apply', 'allow': ['172.16.0.0/12']})
+    assert not (tmp_path / 'egress.json').exists()
+    assert m._do_etl_egress({'op': 'etl_egress', 'action': 'apply', 'allow': ['192.168.7.0/24']})['ok']
+
+
+@pytest.mark.parametrize('bad', ['0.0.0.0/8', '0.1.2.3/32', '240.0.0.0/4'])
+def test_allow_refuses_reserved(m, bad):
+    with pytest.raises(m.Denied):
+        m._etl_egress_allow_norm([bad])
+
+
+def test_azure_wireserver_is_blocked_but_dns_first(m):
+    fwd, _inp, _tag = m._etl_egress_specs(4, [])
+    flat = [' '.join(r) for r in fwd]
+    i_dns = flat.index('-p udp --dport 53 -j RETURN')
+    i_wire = next(i for i, r in enumerate(flat) if r.startswith('-d 168.63.129.16/32 -j REJECT'))
+    assert i_dns < i_wire
+
+
+def test_forward_hook_is_moved_back_to_first(m, monkeypatch):
+    f = FakeIpt(docker_user=False)
+    monkeypatch.setattr(m, '_ipt', f)
+    monkeypatch.setattr(m, '_etl_egress_tools', lambda: [(4, 'iptables')])
+    m._etl_egress_converge([])
+    f.chains['FORWARD'].insert(0, ['-j', 'DOCKER-FORWARD'])     # Docker started after us
+    assert m._etl_egress_converge([])['v4'] == 'applied'
+    assert f.chains['FORWARD'][0] == ['-i', m.ETL_BRIDGE, '-j', m.ETL_EGRESS_CHAIN]
+    assert f.chains['FORWARD'].count(['-i', m.ETL_BRIDGE, '-j', m.ETL_EGRESS_CHAIN]) == 1
