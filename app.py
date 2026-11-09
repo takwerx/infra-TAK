@@ -46070,12 +46070,11 @@ def _cloudtak_admin_users():
 
 
 def _cloudtak_admin_candidates(limit=100):
-    """Usernames that can be made CloudTAK's admin: enabled accounts that already signed in once
-    (they hold a TAK certificate). Names only, never credentials. None when the table can't be
-    read."""
+    """Usernames that can be made CloudTAK's admin: every enabled account that is not one yet.
+    Names only, never credentials. None when the table can't be read."""
     names = _cloudtak_postgis_json(
         "select coalesce(json_agg(username order by username), '[]') from (select username from profile "
-        "where not system_admin and coalesce(auth->>'cert', '') <> '' "
+        "where not system_admin "
         "and coalesce((to_jsonb(profile)->>'disabled')::boolean, false) = false "
         f"order by username limit {int(limit)}) p")
     if not isinstance(names, list):
@@ -46194,8 +46193,8 @@ def _cloudtak_make_admin(username):
         return jsonify({'success': False, 'error': "Could not read CloudTAK's user list, so nothing was changed."}), 502
     if username not in candidates:
         return jsonify({'success': False,
-                        'error': 'That user is not on the list. Only a CloudTAK user who has signed in once '
-                                 'and is not disabled can be made admin.'}), 400
+                        'error': 'That user is not on the list. Only an existing CloudTAK user who is not '
+                                 'disabled can be made admin.'}), 400
     ok, code, out = _cloudtak_request_json(
         'PATCH', 'http://127.0.0.1:5000/api/user/' + urllib.parse.quote(username, safe=''),
         payload={'system_admin': True}, timeout=30,
@@ -60315,7 +60314,7 @@ window.ctLoadConnectState = function(retries) {
                 '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><select id="ct-make-admin-user" style="padding:7px 10px;background:rgba(6,182,212,0.08);border:1px solid var(--cyan);border-radius:6px;color:var(--cyan);font-weight:600;font-size:13px">' +
                 cands.map(function(u) { return '<option value="' + esc(u) + '">' + esc(u) + '</option>'; }).join('') +
                 '</select><button class="btn btn-primary" style="font-size:12px" onclick="ctMakeAdmin(this)">Make admin</button></div>'
-              : 'No user has signed in to CloudTAK yet. Sign in to CloudTAK once as the person who should be admin, then reload this page.</div>');
+              : 'CloudTAK has no users yet. Sign in to CloudTAK once as the person who should be admin, then reload this page.</div>');
         } else {
           adm.innerHTML = admins.length
             ? 'CloudTAK admin' + (admins.length > 1 ? 's' : '') + ': <strong style="color:var(--text-primary)">' + admins.map(esc).join(', ') + '</strong>'

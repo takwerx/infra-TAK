@@ -64,7 +64,7 @@ class _Box:
         if 'where system_admin' in sql:
             return [n for n, p in live.items() if p['admin']]
         if 'where not system_admin' in sql:
-            return sorted(n for n, p in live.items() if not p['admin'] and p['cert'])
+            return sorted(n for n, p in live.items() if not p['admin'])
         return ''
 
 
@@ -91,10 +91,11 @@ def _p(admin=False, cert=True, disabled=False):
 # ── The warning ─────────────────────────────────────────────────────────────────────────
 
 def test_a_set_up_cloudtak_with_no_admin_says_so_and_lists_who_can_be_made_admin():
-    box = _Box(profiles={'alice': _p(), 'bob': _p(), 'never-signed-in': _p(cert=False)})
+    # A user who has not signed in yet (no TAK certificate) can be made admin too.
+    box = _Box(profiles={'alice': _p(), 'bob': _p(), 'not-yet-signed-in': _p(cert=False)})
     st = _ns(box)['_cloudtak_connect_state']({})
     assert st['status'] == 'connected' and st['no_admin'] is True and st['admins'] == []
-    assert st['admin_candidates'] == ['alice', 'bob']
+    assert st['admin_candidates'] == ['alice', 'bob', 'not-yet-signed-in']
 
 
 def test_a_disabled_admin_is_no_admin():
@@ -130,8 +131,8 @@ def test_make_admin_refuses_when_cloudtak_already_has_an_admin():
 
 
 def test_make_admin_refuses_unlisted_names_and_odd_input():
-    box = _Box(profiles={'alice': _p(), 'ghost': _p(cert=False), 'off': _p(disabled=True)})
-    for bad in ('ghost', 'off', 'nobody', 'ALICE', '../../server', "alice' or 1=1 --", ''):
+    box = _Box(profiles={'alice': _p(), 'off': _p(disabled=True)})
+    for bad in ('off', 'nobody', 'ALICE', '../../server', "alice' or 1=1 --", ''):
         r = _ns(box)['_cloudtak_make_admin'](bad)
         assert r[1] == 400, bad
     assert box.patches == []
@@ -198,7 +199,7 @@ def test_the_page_shows_the_warning_and_the_one_action_and_escapes_names():
     assert 'cands.map(function(u)' in JS and 'esc(u)' in JS
     assert "fetch('/api/cloudtak/make-admin'" in JS and "method: 'POST'" in JS
     # With nobody signed in yet it says what to do instead of showing an empty list.
-    assert 'Sign in to CloudTAK once as the person who should be admin' in JS
+    assert 'CloudTAK has no users yet. Sign in to CloudTAK once as the person who should be admin' in JS
 
 
 def test_setup_text_says_only_that_user_sees_the_admin_pages():
