@@ -70624,6 +70624,12 @@ def _tak_drop_stuck_unnamed_sessions(plog):
 # connections TAK gave no user and no groups so they reconnect and are looked up again.
 _AK_DIR_WATCH_TICK_S = 15
 _AK_DIR_REFRESH_MIN_GAP_S = 20
+# A reload makes the outpost fetch every user and group (nuc, 32 users / 55 groups: ~0.4 s of
+# Authentik API time, ~9 ms per user). The gap grows with the directory so a bulk import on a big
+# box keeps Authentik under ~10 % busy: 100 ms per user, 20 s to 300 s (300 s = the outpost's own
+# refresh; past that there is nothing to gain).
+_AK_DIR_REFRESH_GAP_PER_USER_MS = 100
+_AK_DIR_REFRESH_MAX_GAP_S = 300
 _AK_DIR_CONFIRM_WAIT_S = 30
 _AK_DIR_DROP_WINDOW_S = 900
 _AK_DIR_DROP_COOLDOWN_S = 120
@@ -70668,6 +70674,13 @@ def _ak_refresh_ldap_outposts(plog):
     base = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     try:
+        # Never add work to an Authentik that isn't answering (spiral, restart, update).
+        with _ak_api_call(f'{base}/-/health/ready/', max_retries=1, timeout=5) as r:
+            if r.status != 200:
+                return False
+    except Exception:
+        return False
+    try:
         with _ak_api_call(f'{base}/api/v3/outposts/instances/?page_size=100', headers=headers, max_retries=1) as r:
             outposts = json.loads(r.read().decode()).get('results', [])
     except Exception as e:
@@ -70699,7 +70712,9 @@ def _ak_directory_watch_tick(plog):
         if old is not None:
             st['pending'] |= {u for u in set(old) | set(snap) if old.get(u) != snap.get(u)}
     now = time.time()
-    if st['pending'] and snap is not None and now - st['last_refresh'] >= _AK_DIR_REFRESH_MIN_GAP_S:
+    gap = min(_AK_DIR_REFRESH_MAX_GAP_S,
+              max(_AK_DIR_REFRESH_MIN_GAP_S, len(snap or ()) * _AK_DIR_REFRESH_GAP_PER_USER_MS // 1000))
+    if st['pending'] and snap is not None and now - st['last_refresh'] >= gap:
         users, st['pending'] = sorted(st['pending']), set()
         if not _ak_refresh_ldap_outposts(plog):
             st['pending'] |= set(users)       # try again next tick

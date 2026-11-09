@@ -111,7 +111,8 @@ def watch(fake):
         '_tak_stuck_unnamed_dropped': {},
         '_ak_dir_watch': {'snap': None, 'pending': set(), 'last_refresh': 0.0, 'confirmed_at': 0.0, 'drops': {}},
     }
-    for c in ('_AK_DIR_REFRESH_MIN_GAP_S', '_AK_DIR_CONFIRM_WAIT_S', '_AK_DIR_DROP_WINDOW_S',
+    for c in ('_AK_DIR_REFRESH_MIN_GAP_S', '_AK_DIR_REFRESH_GAP_PER_USER_MS', '_AK_DIR_REFRESH_MAX_GAP_S',
+              '_AK_DIR_CONFIRM_WAIT_S', '_AK_DIR_DROP_WINDOW_S',
               '_AK_DIR_DROP_COOLDOWN_S', '_AK_DIR_DROP_MAX'):
         ns[c] = _const(c)
     exec(compile(_src('_ak_directory_watch_tick'), 'app.py:_ak_directory_watch_tick', 'exec'), ns)
@@ -305,3 +306,44 @@ def test_snapshot_parses_psql_output_with_its_separators():
     assert snap == {'miketestfire': frozenset({'FIRE1 Main', 'FIRE1 OPS'}),
                     'adm_ldapservice': frozenset(), 'ma-manhunt': frozenset({'MA - Man HUNT'})}
     assert seen.get('stdin') == subprocess.DEVNULL      # the broker shim waits on an open stdin
+
+
+def test_big_directory_waits_longer_between_reloads():
+    """1,000 users: a reload costs ~9 s of Authentik API time, so reloads are >= 100 s apart."""
+    fake = Fake({f'u{i}': {'OPS'} for i in range(1000)})
+    tick, _ = watch(fake)
+    tick(0)
+    fake.db['new1'] = {'OPS'}
+    assert tick()['refreshed'] == ['new1']
+    first = fake.patches[-1]
+    fake.db['new2'] = {'OPS'}
+    while fake.t + _const('_AK_DIR_WATCH_TICK_S') - first < 100:
+        assert tick()['refreshed'] == []
+    fake.t = first + 100
+    assert tick(0)['refreshed'] == ['new2']
+
+
+def test_huge_directory_gap_is_capped_at_the_outposts_own_refresh():
+    fake = Fake({f'u{i}': {'OPS'} for i in range(20000)})
+    tick, _ = watch(fake)
+    tick(0)
+    fake.db['a'] = {'OPS'}
+    tick()
+    first = fake.patches[-1]
+    fake.db['b'] = {'OPS'}
+    fake.t = first + _const('_AK_DIR_REFRESH_MAX_GAP_S')
+    assert tick(0)['refreshed'] == ['b']
+
+
+def test_unhealthy_authentik_gets_no_patch():
+    """_ak_refresh_ldap_outposts: /-/health/ready/ not answering -> no list, no PATCH."""
+    calls = []
+
+    def api(url, data=None, method='GET', headers=None, max_retries=3, timeout=15):
+        calls.append((method, url))
+        raise OSError('connection refused')
+    ns = {'load_settings': lambda: {}, '_get_authentik_env_value': lambda s, k: 'tok',
+          '_get_authentik_api_url': lambda s: 'http://127.0.0.1:9090', '_ak_api_call': api, 'json': __import__('json')}
+    exec(compile(_src('_ak_refresh_ldap_outposts'), 'app.py:_ak_refresh_ldap_outposts', 'exec'), ns)
+    assert ns['_ak_refresh_ldap_outposts'](lambda m: None) is False
+    assert calls == [('GET', 'http://127.0.0.1:9090/-/health/ready/')]
