@@ -1,0 +1,483 @@
+#!/bin/bash
+# TAK Portal CloudTAK marketplace helper - fixed verbs only (least privilege).
+# Installed to /usr/local/libexec/tak-portal/marketplace-helper and granted in sudoers.
+# Do not add shell/eval; validate every argument.
+set -euo pipefail
+
+HELPER_VERSION=4
+CADDY_SITES_D="${TAK_PORTAL_CADDY_SITES_D:-/etc/caddy/sites.d}"
+
+die() {
+  echo "marketplace-helper: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF' >&2
+Usage: marketplace-helper <verb> [args...]
+
+Verbs:
+  version
+  cleanup-sudoers
+  reclaim <cloudtak_path> <user> <group>
+  install-plugin <cloudtak_path> <plugin_id> <dest> <staging_dir>
+  rebuild <cloudtak_path> [compose_service]
+  write-caddy-route <map_host> <plugin_id>   (Caddy snippet on stdin)
+  apply-caddyfile <caddyfile_path>           (full Caddyfile on stdin; backup+validate+reload)
+  rm-plugin <cloudtak_path> <dest>
+EOF
+  exit 2
+}
+
+is_safe_id() {
+  [[ "${1:-}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]
+}
+
+is_safe_user() {
+  [[ "${1:-}" =~ ^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$ ]]
+}
+
+is_abs_no_dotdot() {
+  case "${1:-}" in
+    "" | *..* | *[[:space:]]* | *[\`\$]* | *[\|\&\;\<\>\(\)]*) return 1 ;;
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_safe_host() {
+  [[ "${1:-}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,252}[a-zA-Z0-9])?$ ]]
+}
+
+is_safe_dest() {
+  [[ "${1:-}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]
+}
+
+cmd_version() {
+  echo "tak-portal-marketplace-helper $HELPER_VERSION"
+}
+
+cmd_cleanup_sudoers() {
+  local f=/etc/sudoers.d/tak-portal-marketplace
+  if [ -e "$f" ]; then
+    rm -f "$f"
+    echo "removed $f"
+  else
+    echo "no leftover $f"
+  fi
+}
+
+cmd_reclaim() {
+  local ct="${1:-}" user="${2:-}" group="${3:-}"
+  is_abs_no_dotdot "$ct" || die "invalid cloudtak path"
+  is_safe_user "$user" || die "invalid user"
+  is_safe_user "$group" || die "invalid group"
+  [ -d "$ct" ] || die "cloudtak path missing: $ct"
+
+  mkdir -p \
+    "$ct/app/plugins" "$ct/api/web/plugins" \
+    "$ct/app/src/plugins" "$ct/api/web/src/plugins" \
+    "$ct/api/stateless/routes" \
+    "$ct/api/stateless/lib" "$ct/api/stateful/lib" "$ct/api/test" \
+    "$ct/cloudtak-marketplace-plugins"
+
+  chown -R "$user:$group" \
+    "$ct/app/plugins" "$ct/api/web/plugins" \
+    "$ct/app/src/plugins" "$ct/api/web/src/plugins" \
+    "$ct/api/stateless/routes" \
+    "$ct/api/stateless/lib" "$ct/api/stateful/lib" "$ct/api/test" \
+    "$ct/cloudtak-marketplace-plugins"
+  chmod -R u+rwX \
+    "$ct/app/plugins" "$ct/api/web/plugins" \
+    "$ct/app/src/plugins" "$ct/api/web/src/plugins" \
+    "$ct/api/stateless/routes" \
+    "$ct/api/stateless/lib" "$ct/api/stateful/lib" "$ct/api/test" \
+    "$ct/cloudtak-marketplace-plugins"
+  chown "$user:$group" "$ct"/docker-compose.plugin-*.yml "$ct"/docker-compose.marketplace.yml 2>/dev/null || true
+  echo "reclaim ok"
+}
+
+# Normalize one COMPOSE_FILE entry to a path relative to $ct.
+# infra-TAK writes absolute paths under the checkout (gh261); TAK Portal pins
+# relative names like docker-compose.marketplace.yml. Accept both.
+compose_file_rel() {
+  local ct="$1" f="$2" ct_abs=""
+  [ -n "$f" ] || return 1
+  case "$f" in
+    *..*) die "refusing traversal compose file: $f" ;;
+  esac
+  ct_abs=$(cd "$ct" 2>/dev/null && pwd -P || printf '%s' "$ct")
+  case "$f" in
+    "$ct_abs"/*) f="${f#"$ct_abs"/}" ;;
+    "$ct"/*) f="${f#"$ct"/}" ;;
+  esac
+  case "$f" in
+    /*) die "refusing compose file outside CloudTAK checkout: $f" ;;
+  esac
+  [ -f "$ct/$f" ] || die "COMPOSE_FILE entry missing: $f"
+  printf '%s\n' "$f"
+}
+
+# Build docker compose -f args: honour COMPOSE_FILE from .env when set (infra-TAK overlays).
+compose_file_args() {
+  local ct="$1"
+  local envf="$ct/.env"
+  local current="" f rel
+  if [ -f "$envf" ]; then
+    current=$(grep -E '^[[:space:]]*COMPOSE_FILE=' "$envf" | tail -n 1 | cut -d= -f2- || true)
+    current=$(printf '%s' "$current" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  fi
+  if [ -n "$current" ]; then
+    local IFS=':'
+    # shellcheck disable=SC2086
+    for f in $current; do
+      [ -n "$f" ] || continue
+      rel=$(compose_file_rel "$ct" "$f") || die "invalid COMPOSE_FILE entry: $f"
+      printf '%s\n' "-f" "$rel"
+    done
+    return 0
+  fi
+  if [ -f "$ct/docker-compose.yml" ]; then printf '%s\n' "-f" "docker-compose.yml"
+  elif [ -f "$ct/docker-compose.yaml" ]; then printf '%s\n' "-f" "docker-compose.yaml"
+  elif [ -f "$ct/compose.yml" ]; then printf '%s\n' "-f" "compose.yml"
+  elif [ -f "$ct/compose.yaml" ]; then printf '%s\n' "-f" "compose.yaml"
+  else die "no compose file in $ct"
+  fi
+  if [ -f "$ct/docker-compose.marketplace.yml" ]; then
+    printf '%s\n' "-f" "docker-compose.marketplace.yml"
+  fi
+}
+
+# BEGIN docker_pull_retry
+# Retry a Docker Hub layer that dropped or came back 5xx. Do not retry a 429.
+# DOCKER_PULL_RETRY_SLEEP is seconds between tries (default 5; tests use 0).
+docker_pull_failure_kind() {
+  local line prev="" window transient=0
+  transient=0
+  prev=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    window="$prev $line"
+    if grep -qiE 'toomanyrequests|too many requests|pull rate limit|rate limit exceeded|429 Too Many Requests' <<<"$window"; then
+      printf '%s\n' ratelimit
+      return 0
+    fi
+    if grep -qiE 'docker|registry|manifest|blob|pull' <<<"$window" && grep -qE ':[[:space:]]*429([^0-9]|$)' <<<"$window"; then
+      printf '%s\n' ratelimit
+      return 0
+    fi
+    if grep -qiE 'docker|registry|failed to copy|failed to fetch|error pulling|blob|manifest' <<<"$window" \
+      && grep -qiE 'unexpected EOF|(^|[^A-Za-z0-9])EOF([^A-Za-z0-9]|$)|connection reset by peer|broken pipe|i/o timeout|TLS handshake timeout|Client\.Timeout exceeded|use of closed network connection|short read|http2: server sent GOAWAY|:[[:space:]]*5[0-9][0-9]([^0-9]|$)|status( code)?:?[[:space:]]*5[0-9][0-9]([^0-9]|$)|(^|[^0-9])5[0-9][0-9] (Bad Gateway|Service Unavailable|Internal Server Error|Gateway Timeout)' <<<"$window"; then
+      transient=1
+    fi
+    prev="$line"
+  done
+  if [ "$transient" -eq 1 ]; then
+    printf '%s\n' transient
+  else
+    printf '%s\n' other
+  fi
+  return 0
+}
+
+docker_compose_with_pull_retry() {
+  local attempt=1 max=3 log ec kind sleep_s pipefail_on=0 errexit_on=0
+  sleep_s="${DOCKER_PULL_RETRY_SLEEP:-5}"
+  case "$sleep_s" in
+    ''|*[!0-9]*) sleep_s=5 ;;
+  esac
+  case $- in *e*) errexit_on=1 ;; esac
+  if set -o | grep -Eq '^pipefail[[:space:]]+on$'; then
+    pipefail_on=1
+  fi
+  while [ "$attempt" -le "$max" ]; do
+    log=$(mktemp)
+    set +e
+    set +o pipefail
+    if command -v stdbuf >/dev/null 2>&1; then
+      "$@" < /dev/null 2>&1 | stdbuf -oL -eL tee "$log"
+    else
+      "$@" < /dev/null 2>&1 | tee "$log"
+    fi
+    ec=${PIPESTATUS[0]}
+    if [ "$pipefail_on" -eq 1 ]; then
+      set -o pipefail
+    fi
+    if [ "$errexit_on" -eq 1 ]; then
+      set -e
+    else
+      set +e
+    fi
+    if [ "$ec" -eq 0 ]; then
+      rm -f "$log"
+      return 0
+    fi
+    kind=$(docker_pull_failure_kind < "$log")
+    rm -f "$log"
+    if [ "$kind" = ratelimit ]; then
+      echo "Docker Hub is limiting pulls from this address, try again later." >&2
+      return "$ec"
+    fi
+    if [ "$kind" = transient ] && [ "$attempt" -lt "$max" ]; then
+      echo "Docker image pull failed (server error or dropped connection); retrying (attempt $attempt of $max)." >&2
+      attempt=$((attempt + 1))
+      if [ "$sleep_s" != 0 ]; then
+        sleep "$sleep_s"
+      fi
+      continue
+    fi
+    return "$ec"
+  done
+  return 1
+}
+# END docker_pull_retry
+
+cmd_rebuild() {
+  local ct="${1:-}" svc="${2:-api}"
+  is_abs_no_dotdot "$ct" || die "invalid cloudtak path"
+  is_safe_id "$svc" || die "invalid compose service"
+  [ -d "$ct" ] || die "cloudtak path missing: $ct"
+  command -v docker >/dev/null 2>&1 || die "docker not found"
+
+  cd "$ct"
+  local args=()
+  while IFS= read -r line; do
+    args+=("$line")
+  done < <(compose_file_args "$ct")
+
+  export BUILDKIT_PROGRESS=plain
+  export COMPOSE_ANSI=never
+  export COMPOSE_PROGRESS=plain
+  export DOCKER_BUILDKIT=1
+  echo "=== CloudTAK rebuild: docker compose build --no-cache (live output below) ==="
+  docker_compose_with_pull_retry docker compose --progress=plain "${args[@]}" build --no-cache "$svc"
+  echo "CloudTAK image build finished."
+  echo "=== CloudTAK rebuild: recreating containers ==="
+  docker_compose_with_pull_retry docker compose --progress=plain "${args[@]}" up -d --force-recreate "$svc"
+  echo "CloudTAK container recreate finished."
+  echo "REBUILD_OK"
+}
+
+cmd_write_caddy_route() {
+  local host="${1:-}" plugin="${2:-}"
+  is_safe_host "$host" || die "invalid map host"
+  is_safe_id "$plugin" || die "invalid plugin id"
+  local dir="$CADDY_SITES_D/$host"
+  mkdir -p "$dir"
+  local dest="$dir/${plugin}.caddy"
+  cat >"$dest"
+  chmod 644 "$dest"
+  echo "wrote $dest"
+}
+
+is_allowed_caddyfile() {
+  case "${1:-}" in
+    /etc/caddy/Caddyfile) return 0 ;;
+    /etc/caddy/*/Caddyfile) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# BEGIN caddy_validate_permission_inconclusive
+# Return 0 when every error/fatal line is permission-denied on a Caddy log or
+# data path. Info/warn lines are ignored. Any other error returns 1 (#76, #81).
+caddy_validate_permission_inconclusive() {
+  local out="${1-}"
+  local filtered
+  filtered=$(printf '%s\n' "$out" | grep -Ei '"level"[[:space:]]*:[[:space:]]*"(error|fatal)"|^[[:space:]]*error' || true)
+  [ -n "$filtered" ] || return 1
+  if printf '%s\n' "$filtered" | grep -Eiv 'permission denied|EACCES|operation not permitted' >/dev/null; then
+    return 1
+  fi
+  if printf '%s\n' "$filtered" | grep -Eiv '/var/log/caddy|/var/lib/caddy' >/dev/null; then
+    return 1
+  fi
+  return 0
+}
+# END caddy_validate_permission_inconclusive
+
+# Summarize validate failures without echoing raw privileged output (path contents / root reads).
+caddy_validate_fail_msg() {
+  local out="${1:-}"
+  local line
+  line=$(printf '%s\n' "$out" | sed -nE 's/.*[Cc]addyfile:([0-9]+):.*/\1/p' | head -n 1)
+  if [ -n "$line" ]; then
+    echo "Caddy rejected the file (near line $line)"
+  else
+    echo "Caddy rejected the file"
+  fi
+}
+
+# Run caddy validate as the caddy user when possible so validate cannot read root-only
+# files (e.g. import /etc/shadow) or create root-owned log files at caller-chosen paths.
+# Prints "as_user" or "as_root" to the path in $2; validate stdout/stderr on stdout.
+run_caddy_validate() {
+  local config="$1"
+  local mode_file="$2"
+  local rc=0
+  # mktemp is 0600; caddy user must be able to read the candidate file.
+  chmod 0644 "$config" || true
+  if id -u caddy >/dev/null 2>&1; then
+    echo as_user >"$mode_file"
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u caddy -- caddy validate --config "$config" --adapter caddyfile 2>&1 || rc=$?
+      return "$rc"
+    fi
+    if command -v setpriv >/dev/null 2>&1; then
+      setpriv --reuid=caddy --regid=caddy --clear-groups -- caddy validate --config "$config" --adapter caddyfile 2>&1 || rc=$?
+      return "$rc"
+    fi
+    # Last resort: su with a quoted path (no shell interpolation of config content).
+    su -s /bin/sh caddy -c "caddy validate --config $(printf '%q' "$config") --adapter caddyfile" 2>&1 || rc=$?
+    return "$rc"
+  fi
+  echo as_root >"$mode_file"
+  caddy validate --config "$config" --adapter caddyfile 2>&1 || rc=$?
+  return "$rc"
+}
+
+# Host/systemd Caddy (infra-TAK takwerx): write the main Caddyfile with backup + validate + reload.
+# Content on stdin. Avoids broad `sudo cp` which prompts for a password for non-root SSH users.
+cmd_apply_caddyfile() {
+  local dest="${1:-}"
+  is_abs_no_dotdot "$dest" || die "invalid caddyfile path"
+  is_allowed_caddyfile "$dest" || die "refusing caddyfile path outside /etc/caddy: $dest"
+  [ -f "$dest" ] || die "caddyfile missing: $dest"
+
+  local new bak
+  new=$(mktemp)
+  bak="${dest}.bak-marketplace"
+  cat >"$new" || {
+    rm -f "$new"
+    die "could not read updated Caddyfile from stdin"
+  }
+  if command -v caddy >/dev/null 2>&1; then
+    local _caddy_out _caddy_rc=0 _caddy_mode=as_root _mode_file
+    _mode_file=$(mktemp)
+    _caddy_out=$(run_caddy_validate "$new" "$_mode_file") || _caddy_rc=$?
+    _caddy_mode=$(cat "$_mode_file" 2>/dev/null || echo as_root)
+    rm -f "$_mode_file"
+    if [ "$_caddy_rc" -ne 0 ]; then
+      # As the caddy user, permission denied is a real reject (e.g. import /etc/shadow).
+      # As root only: ignore permission denied on /var/log/caddy and /var/lib/caddy (#76).
+      # Info/warn lines must not keep that check from matching. Other paths still reject (#81).
+      if [ "$_caddy_mode" = "as_root" ] && caddy_validate_permission_inconclusive "$_caddy_out"; then
+        echo "caddy validate inconclusive (permission denied on log/data paths); continuing." >&2
+      else
+        caddy_validate_fail_msg "$_caddy_out" >&2
+        rm -f "$new"
+        die "caddy rejected the updated file; original left in place"
+      fi
+    fi
+  fi
+  cp -a "$dest" "$bak" || {
+    rm -f "$new"
+    die "could not back up $dest"
+  }
+  if ! cp "$new" "$dest"; then
+    rm -f "$new"
+    die "could not write $dest"
+  fi
+  rm -f "$new"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet caddy 2>/dev/null; then
+    if ! systemctl reload caddy; then
+      cp -a "$bak" "$dest" || true
+      systemctl reload caddy >/dev/null 2>&1 || true
+      die "caddy reload failed; original file was restored"
+    fi
+  elif command -v caddy >/dev/null 2>&1; then
+    if ! caddy reload --config "$dest" --adapter caddyfile; then
+      cp -a "$bak" "$dest" || true
+      caddy reload --config "$dest" --adapter caddyfile >/dev/null 2>&1 || true
+      die "caddy reload failed; original file was restored"
+    fi
+  fi
+  echo APPLY_OK
+  echo "Backed up to $bak"
+}
+
+cmd_rm_plugin() {
+  local ct="${1:-}" dest="${2:-}"
+  is_abs_no_dotdot "$ct" || die "invalid cloudtak path"
+  is_safe_dest "$dest" || die "invalid plugin dest"
+  [ -d "$ct" ] || die "cloudtak path missing: $ct"
+  local target
+  for target in \
+    "$ct/app/plugins/$dest" \
+    "$ct/api/web/plugins/$dest" \
+    "$ct/app/src/plugins/$dest" \
+    "$ct/api/web/src/plugins/$dest"
+  do
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      rm -rf "$target"
+      echo "removed $target"
+    fi
+  done
+}
+
+# Copy a pre-fetched plugin tree into CloudTAK plugin dirs. Staging must be the
+# marketplace cache for this plugin id (no arbitrary paths / shell).
+cmd_install_plugin() {
+  local ct="${1:-}" plugin_id="${2:-}" dest="${3:-}" staging="${4:-}"
+  is_abs_no_dotdot "$ct" || die "invalid cloudtak path"
+  is_safe_id "$plugin_id" || die "invalid plugin id"
+  is_safe_dest "$dest" || die "invalid plugin dest"
+  is_abs_no_dotdot "$staging" || die "invalid staging path"
+  [ -d "$ct" ] || die "cloudtak path missing: $ct"
+  [ -d "$staging" ] || die "staging missing: $staging"
+  case "$staging" in
+    */.cache/cloudtak-marketplace/"$plugin_id") ;;
+    *) die "staging must be .../.cache/cloudtak-marketplace/$plugin_id" ;;
+  esac
+
+  local web_rel="app"
+  if [ -d "$ct/app/plugins" ] || [ -d "$ct/app/src" ]; then
+    web_rel="app"
+  elif [ -d "$ct/api/web/plugins" ] || [ -d "$ct/api/web" ]; then
+    web_rel="api/web"
+  fi
+  local target="$ct/$web_rel/plugins/$dest"
+  mkdir -p "$(dirname "$target")"
+  rm -rf "$target"
+  mkdir -p "$target"
+  cp -a "$staging"/. "$target"/
+  rm -rf "$target/.git" "$target/.ctak-normalize-plugin.sh" "$target/.ctak-runtime-plugin.sh" 2>/dev/null || true
+  echo "installed $plugin_id -> $target"
+}
+
+main() {
+  local verb="${1:-}"
+  [ -n "$verb" ] || usage
+  shift || true
+  case "$verb" in
+    version) cmd_version "$@" ;;
+    cleanup-sudoers) cmd_cleanup_sudoers "$@" ;;
+    reclaim)
+      [ "$#" -eq 3 ] || die "reclaim requires <cloudtak_path> <user> <group>"
+      cmd_reclaim "$@"
+      ;;
+    install-plugin)
+      [ "$#" -eq 4 ] || die "install-plugin requires <cloudtak_path> <plugin_id> <dest> <staging_dir>"
+      cmd_install_plugin "$@"
+      ;;
+    rebuild)
+      [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "rebuild requires <cloudtak_path> [compose_service]"
+      cmd_rebuild "$@"
+      ;;
+    write-caddy-route)
+      [ "$#" -eq 2 ] || die "write-caddy-route requires <map_host> <plugin_id>"
+      cmd_write_caddy_route "$@"
+      ;;
+    apply-caddyfile)
+      [ "$#" -eq 1 ] || die "apply-caddyfile requires <caddyfile_path>"
+      cmd_apply_caddyfile "$@"
+      ;;
+    rm-plugin)
+      [ "$#" -eq 2 ] || die "rm-plugin requires <cloudtak_path> <dest>"
+      cmd_rm_plugin "$@"
+      ;;
+    -h | --help | help) usage ;;
+    *) die "unknown verb: $verb (ask your admin to enable marketplace installs)" ;;
+  esac
+}
+
+main "$@"

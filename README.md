@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.8-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.8-alpha)**
+**Current release: [v10.3.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.9-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,25 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.9-alpha — 2026-11-09 — Database server updates from its own card; CloudTAK plays this server's video on cloud servers; stuck phone connections clear by themselves
+
+**Headline: The database server's card has one "Updates needed" button that installs its updates, instead of opening the Ubuntu 24.04 upgrade. Video from this server's own MediaMTX plays in CloudTAK on cloud servers with a real domain. The console drops phone connections that TAK Server left with no user and no groups, so they reconnect and sign in again.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.9-alpha))
+
+**Two-server setups.**
+- The database server's card shows an "Updates needed" button only when updates are waiting. It asks first, then installs the updates. Reboot stays on the card.
+- The OS upgrade check no longer says "no local PostgreSQL cluster found" when the database listing itself fails (for example, a stale PostgreSQL 15 entry with no data folder). It now shows the error and the next step.
+
+**CloudTAK and video.**
+- On cloud servers with a real domain, CloudTAK's media service now reaches this server's own MediaMTX inside the server, so the feed plays instead of timing out.
+
+**TAK Portal.**
+- TAK Portal 2.0.31 and 2.0.32 marketplace updates are accepted.
+
+**TAK Server.**
+- A fresh TAK Server install survives one network reset while it fetches the PostgreSQL signing key and package list. It retries before it stops.
+- The DNS check before a deploy accepts a name that points at this server's own LAN address (home networks with router DNS). Any other address still stops the deploy.
+- Phone connections that TAK Server left with no user and no groups for 10 minutes are dropped, so the phone reconnects and is looked up again. TAK Server is never restarted for this.
 
 ### v10.3.8-alpha — 2026-11-06 — CloudTAK Update keeps its database working; TAK Portal shows the right state after an update; Ubuntu 24.04 upgrade fix
 
