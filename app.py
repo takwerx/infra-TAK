@@ -46078,7 +46078,22 @@ def _cloudtak_connect_state(settings):
         admins = _cloudtak_admin_users()
         if admins is not None:
             state['admins'] = admins
+            if not admins:
+                # Set up (CloudTAK has a cert) but nobody is an admin (ops #587). CloudTAK lets any
+                # TAK user log in once it has a cert, as a plain user, so this goes unnoticed.
+                state['no_admin'] = True
+                state['profiles'] = _cloudtak_profile_names() or []
     return state
+
+
+def _cloudtak_profile_names(limit=100):
+    """Usernames CloudTAK already has a profile for (first `limit`), or None when unreadable."""
+    names = _cloudtak_postgis_json(
+        f"select coalesce(json_agg(username order by last_login desc nulls last, username), '[]') "
+        f"from (select username, last_login from profile order by last_login desc nulls last limit {int(limit)}) p")
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str) and n]
 
 
 def _cloudtak_connect_state_core(settings):
@@ -46135,6 +46150,66 @@ def cloudtak_connect_tak_api():
         return jsonify({'success': False, 'error': 'Already connecting CloudTAK, wait for it to finish.'}), 409
     try:
         return _cloudtak_connect_tak(settings, request.get_json(silent=True) or {})
+    finally:
+        _CLOUDTAK_CONNECT_LOCK.release()
+
+
+@app.route('/api/cloudtak/make-admin', methods=['POST'])
+@login_required
+def cloudtak_make_admin_api():
+    """Give CloudTAK an admin when it has none (ops #587). CloudTAK is set up (it has a cert) but
+    no profile is a system admin, so nobody can manage it. Only that state is accepted: with an
+    admin present this refuses, so it can't be used to add admins. The user must already have a
+    CloudTAK profile (logged in once); the change is made through CloudTAK's own user API."""
+    settings = load_settings()
+    if not _cloudtak_local_with_local_tak(settings):
+        return jsonify({'success': False,
+                        'error': 'Not supported on a remote CloudTAK yet: use the manual steps on this page.'}), 400
+    username = str((request.get_json(silent=True) or {}).get('username') or '').strip()
+    if not username or not _CLOUDTAK_USERNAME_RE.match(username):
+        return jsonify({'success': False, 'error': 'Enter the TAK username of the person who should be '
+                                                   "CloudTAK's admin."}), 400
+    if not _CLOUDTAK_CONNECT_LOCK.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'CloudTAK is being connected, wait for it to finish.'}), 409
+    try:
+        base = 'http://127.0.0.1:5000'
+        hdr = {'Authorization': 'Bearer ' + _cloudtak_admin_token(_cloudtak_signing_secret())}
+        ok, code, srv = _cloudtak_request_json('GET', base + '/api/server', timeout=20, headers=hdr)
+        if not ok or not isinstance(srv, dict):
+            return jsonify({'success': False, 'error': f'CloudTAK API not answering (HTTP {code}).'}), 502
+        if srv.get('status') != 'configured':
+            return jsonify({'success': False, 'error': 'CloudTAK is not set up yet: use Connect CloudTAK to '
+                                                       'TAK Server, it makes the first admin.'}), 409
+        admins = _cloudtak_admin_users()
+        names = _cloudtak_profile_names(500)
+        if admins is None or names is None:
+            return jsonify({'success': False, 'error': "Could not read CloudTAK's user list, so nothing was "
+                                                       'changed. Is cloudtak-postgis-1 running?'}), 502
+        if admins:
+            return jsonify({'success': False, 'error': 'CloudTAK already has an admin (' + ', '.join(admins[:5]) +
+                                                       '). Add more inside CloudTAK, under Admin, Users.'}), 409
+        # The name goes to CloudTAK's API only, and only as a name CloudTAK already has: compared
+        # here, case-insensitively (a person types it as they like; the stored name is exact).
+        match = [n for n in names if n == username] or [n for n in names if n.lower() == username.lower()]
+        if len(match) != 1:
+            return jsonify({'success': False, 'error': f'CloudTAK has no user named {username} yet. Log in to '
+                                                       'CloudTAK once with that TAK user, then try again.'}), 404
+        target = match[0]
+        ok, code, out = _cloudtak_request_json('PATCH', base + '/api/user/' + urllib.parse.quote(target, safe=''),
+                                               payload={'system_admin': True}, timeout=30, headers=hdr)
+        if not ok:
+            msg = (out or {}).get('message') if isinstance(out, dict) else ''
+            return jsonify({'success': False, 'error': f'CloudTAK refused (HTTP {code}): {str(msg)[:300]}'}), 400
+        after = _cloudtak_admin_users()
+        if after is None or target not in after:
+            return jsonify({'success': False, 'error': f'CloudTAK accepted the change but {target} does not '
+                                                       'show as an admin yet. Reload the page and check.'}), 500
+        # Granting admin is always audited, hardened posture or not.
+        audit('cloudtak:make-admin', f'{target} is now a CloudTAK system admin', force=True)
+        print(f'CloudTAK make-admin: {target} is now a CloudTAK system admin', flush=True)
+        return jsonify({'success': True, 'username': target,
+                        'message': f'{target} is now CloudTAK\'s admin. Log out of CloudTAK and back in to see '
+                                   'the Admin menu.'})
     finally:
         _CLOUDTAK_CONNECT_LOCK.release()
 
@@ -46204,6 +46279,14 @@ def _cloudtak_connect_tak(settings, data):
         if not v_ok or not isinstance(v, dict) or v.get('status') != 'configured':
             return jsonify({'success': False, 'error': 'CloudTAK accepted the setup but does not report it as '
                                                        'configured. Reload the CloudTAK page and check.'}), 500
+        # CloudTAK counts as set up once it has a cert, and makes the first admin in the same
+        # request. Check that admin is there before saying done (ops #587): without one any TAK
+        # user could log in, as a plain user, and nobody could manage CloudTAK.
+        admins = _cloudtak_admin_users()
+        if admins is not None and username not in admins:
+            return jsonify({'success': False,
+                            'error': f'CloudTAK is connected, but {username} did not become its admin. The page '
+                                     'now shows a "No CloudTAK admin yet" fix: use it.'}), 500
         return jsonify({'success': True, 'mode': 'configured',
                         'message': f'CloudTAK is connected to TAK Server. Log in to CloudTAK as {username}.' + note})
 
@@ -60227,6 +60310,13 @@ window.ctLoadConnectState = function(retries) {
           ? 'CloudTAK admin' + (admins.length > 1 ? 's' : '') + ': <strong style="color:var(--text-primary)">' + admins.map(esc).join(', ') + '</strong>'
           : '';
       }
+      // Set up but nobody is its admin (ops #587): warn, with the one step that fixes it.
+      var noadm = document.getElementById('ct-noadmin');
+      if (noadm) {
+        noadm.style.display = d.no_admin ? '' : 'none';
+        var dl = document.getElementById('ct-noadmin-names');
+        if (dl) dl.innerHTML = (d.no_admin && Array.isArray(d.profiles) ? d.profiles : []).map(function(n) { return '<option value="' + esc(n) + '">'; }).join('');
+      }
       if (btn) {
         btn.style.display = d.supported ? '' : 'none';
         btn.textContent = d.status === 'connected' ? 'Reconnect with a new certificate' : 'Connect CloudTAK to TAK Server';
@@ -60266,6 +60356,33 @@ window.ctConnectTak = function(btn) {
   }).catch(function(e) {
     btn.disabled = false; btn.textContent = orig;
     if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>';
+  });
+};
+window.ctMakeAdmin = function(btn) {
+  var out = document.getElementById('ct-noadmin-result');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var name = (document.getElementById('ct-noadmin-user').value || '').trim();
+  if (!name) {
+    if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--yellow)">Enter the TAK username first.</span>'; }
+    return;
+  }
+  var orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Working…';
+  fetch('/api/cloudtak/make-admin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: name }), credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false; btn.textContent = orig;
+    if (out) {
+      out.style.display = 'block';
+      out.innerHTML = d && d.success
+        ? '<span style="color:var(--green)">✓ ' + esc(d.message) + '</span>'
+        : '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Failed') + '</span>';
+    }
+    if (d && d.success) window.ctLoadConnectState();
+  }).catch(function(e) {
+    btn.disabled = false; btn.textContent = orig;
+    if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + esc(e && e.message ? e.message : String(e)) + '</span>'; }
   });
 };
 document.addEventListener('DOMContentLoaded', function() { window.ctLoadConnectState(); });

@@ -46,7 +46,7 @@ def _ns(srv, admins, local=True):
           '_tak_ca_bundle': lambda: '', '_cert_signed_by': lambda c, b: None}
     for n in TREE.body:
         if isinstance(n, ast.FunctionDef) and n.name in (
-                '_cloudtak_untrusted_user_certs', '_cloudtak_admin_users',
+                '_cloudtak_untrusted_user_certs', '_cloudtak_admin_users', '_cloudtak_profile_names',
                 '_cloudtak_connect_state_core', '_cloudtak_connect_state'):
             exec(ast.get_source_segment(APP, n), ns)
     ns['sql_seen'] = sql_seen

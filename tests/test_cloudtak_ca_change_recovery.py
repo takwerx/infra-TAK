@@ -178,17 +178,22 @@ class _CT:
         self.profiles = list(profiles)
         self.readable = profiles_readable
         self.patches, self.restarts, self.certs, self.resets = [], [], [], []
+        self.admins = []
 
     def request(self, method, url, payload=None, timeout=25, headers=None):
         assert headers and headers['Authorization'].startswith('Bearer ')
         if method == 'PATCH':
             self.patches.append(payload)
             self.srv['status'] = 'configured'
+            if payload.get('username'):
+                self.admins = [payload['username']]       # CloudTAK makes the first admin in the same request
             return True, 200, dict(self.srv)
         return True, 200, dict(self.srv)
 
     def postgis(self, sql):
-        assert 'select coalesce(json_agg(username)' in sql
+        assert 'select coalesce(json_agg(username' in sql
+        if 'system_admin' in sql:
+            return list(self.admins) if self.readable else None
         return list(self.profiles) if self.readable else None
 
     def run(self, cmd, **k):
@@ -198,7 +203,7 @@ class _CT:
 
 def _connect_ns(ct):
     return _ns(consts=('_CLOUDTAK_USERNAME_RE', 'CLOUDTAK_BOOTSTRAP_CERT_CN'),
-               funcs=('_cloudtak_connect_urls', '_cloudtak_connect_tak'),
+               funcs=('_cloudtak_connect_urls', '_cloudtak_connect_tak', '_cloudtak_admin_users'),
                jsonify=lambda d: d, _cloudtak_signing_secret=lambda: 'sekrit',
                _cloudtak_admin_token=lambda s: 'jwt', _cloudtak_request_json=ct.request,
                _cloudtak_postgis_json=ct.postgis,
@@ -331,7 +336,7 @@ def test_unreadable_subjects_fall_back_to_the_alias_rule():
 # ── Status line: "connected" can still mean nobody can log in ────────────────────────
 
 def _state_ns(srv, user_certs, signed, bundle='B'):
-    return _ns(funcs=('_cloudtak_untrusted_user_certs', '_cloudtak_admin_users',
+    return _ns(funcs=('_cloudtak_untrusted_user_certs', '_cloudtak_admin_users', '_cloudtak_profile_names',
                       '_cloudtak_connect_state_core', '_cloudtak_connect_state'),
                _cloudtak_local_with_local_tak=lambda s: True, _cloudtak_signing_secret=lambda: 's',
                _cloudtak_admin_token=lambda s: 'jwt',
