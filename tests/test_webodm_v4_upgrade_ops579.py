@@ -24,6 +24,7 @@ previous version and its data back by itself when the upgrade or the first start
 import ast
 import pathlib
 import re
+import subprocess
 import types
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -51,7 +52,7 @@ OLD = '''services:
 '''
 
 WANT = {'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE_STRIP',
-        '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S',
+        '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S', 'WEBODM_PULL_TIMEOUT_S',
         '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_answers', '_webodm_db_room_check', '_webodm_backup_db_95',
         '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update'}
 
@@ -60,17 +61,26 @@ class Box:
     """A fake WebODM box: the compose file, the db volume state and every command run."""
 
     def __init__(self, pg='9.5', used_kb=40_000, free_kb=10_000_000, dump_ok=True,
-                 upgrade_fails=False, pull_ok=True):
+                 upgrade_fails=False, pull_ok=True, times_out=()):
         self.compose = OLD
         self.pg, self.used_kb, self.free_kb = pg, used_kb, free_kb
         self.dump_ok, self.upgrade_fails, self.pull_ok = dump_ok, upgrade_fails, pull_ok
-        self.calls, self.writes, self.running_images = [], [], None
+        # steps that hit the console's time limit once ('pull', 'up -d', 'docker stop')
+        self.times_out = set(times_out)
+        self.calls, self.writes, self.running_images, self.timeouts = [], [], None, {}
 
     def _r(self, rc=0, out='', err=''):
         return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
 
+    def _maybe_time_out(self, step, argv, timeout):
+        if step in self.times_out:
+            self.times_out.discard(step)
+            raise subprocess.TimeoutExpired(argv, timeout)
+
     def run(self, argv, **kw):
         self.calls.append(('run', tuple(argv)))
+        if argv[:2] == ['docker', 'stop']:
+            self._maybe_time_out('docker stop', argv, kw.get('timeout'))
         if argv[:5] == ['docker', 'exec', '-u', 'postgres', 'wo_db']:
             cmd = argv[-1]
             if 'PG_VERSION' in cmd:
@@ -92,6 +102,8 @@ class Box:
 
     def compose_cmd(self, d, action, timeout=300):
         self.calls.append(('compose', action))
+        self.timeouts[action] = timeout
+        self._maybe_time_out(action, ['docker', 'compose', action], timeout)
         if action == 'pull':
             return self._r(0 if self.pull_ok else 1, err='' if self.pull_ok else 'pull access denied')
         if action == 'up -d':
@@ -218,3 +230,47 @@ def test_console_ready_check_uses_the_same_probe():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'webodm_ready'))
     assert '_webodm_answers()' in body and "'-sf'" not in body
+
+
+def test_pull_that_times_out_puts_the_old_compose_back():
+    # 10.3.10 T&E, test6: the pull hit the console's 300 s limit. TimeoutExpired skipped the
+    # "put the old compose back" step, so the box kept 4.0.0 pins over 3.3.1 containers on 9.5
+    # data, and any later `up -d` would have upgraded with no room check and no backup.
+    box = Box(times_out={'pull'})
+    status, _ = _run(box)
+    assert status['error'] and 'timed out' in status['error'], status
+    assert box.compose == OLD
+    assert ('compose', 'up -d') not in box.calls and box.running_images is None
+    assert not any('pg_dumpall' in ' '.join(c[1]) for c in box.calls)
+
+
+def test_pull_gets_a_long_time_limit():
+    box = Box()
+    _, ns = _run(box)
+    assert ns['WEBODM_PULL_TIMEOUT_S'] >= 1800
+    assert box.timeouts['pull'] == ns['WEBODM_PULL_TIMEOUT_S']
+
+
+def test_stop_that_times_out_before_the_backup_starts_3x_again():
+    box = Box(times_out={'docker stop'})
+    status, _ = _run(box)
+    assert status['error'] and 'timed out' in status['error']
+    assert not any('pg_dumpall' in ' '.join(c[1]) for c in box.calls)
+    assert box.compose == OLD and _images(box.running_images)['wo_webapp'].endswith(':3.3.1')
+
+
+def test_first_4x_start_that_times_out_restores_3x_and_its_data():
+    # `up -d` on the new pins may already have started the one-way 9.5 → 18 upgrade: a time
+    # limit there is a failed update, not a stop with 4.0.0 pins left in the compose file.
+    box = Box(times_out={'up -d'})
+    status, _ = _run(box)
+    assert status['error'] and 'previous version and its data are back' in status['error'], status
+    assert any(c[0] == 'compose' and c[1].startswith('run --rm --no-deps') for c in box.calls)
+    assert box.compose == OLD and _images(box.running_images)['wo_webapp'].endswith(':3.3.1')
+
+
+def test_failed_up_on_a_box_already_on_18_does_not_roll_back():
+    box = Box(pg='18', times_out={'up -d'})
+    status, _ = _run(box)
+    assert status['error'] and 'timed out' in status['error']
+    assert not any(c[0] == 'compose' and c[1].startswith('run --rm') for c in box.calls)

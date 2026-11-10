@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.9-alpha)**
+**Current release: [v10.3.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.10-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,33 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.10-alpha — 2026-11-10 — New users can sign in on a phone right away; CloudTAK keeps its TAK Server connection behind a home router; WebODM 4.0.0
+
+**Headline: A phone enrolled right after its user was made in TAK Portal now gets its user and groups, instead of connecting with none. CloudTAK reaches TAK Server on the same server directly, so a router or proxy in front of port 8089 no longer breaks it. WebODM moves to 4.0.0 (the old Django was end of life), with a backup before its database upgrade.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.10-alpha))
+
+**Users and phones.**
+- When a user or a `tak_` group changes in Authentik, the console makes the LDAP outpost reload at once, instead of after up to 5 minutes. A phone that connected in that gap is dropped once so it reconnects and gets its groups.
+
+**CloudTAK.**
+- When CloudTAK and TAK Server are on the same server, CloudTAK reaches TAK Server at this server's own address. Behind a home or office router, the connection no longer goes out through the router and a proxy that drops CloudTAK's certificate (HTTP 502 and restart loop).
+- The CloudTAK page shows who CloudTAK's admin user is. If CloudTAK is set up with no admin, it says "No admin created yet" and has a **Make admin** button.
+
+**WebODM.**
+- WebODM 4.0.0 (Django 5.2, PostgreSQL 18). Press **Update** on the WebODM page after the console update. It checks for room, backs up the database, and puts the old version back if the upgrade fails or a download times out.
+
+**Installs and deploys.**
+- A fresh install no longer stops at a 2-minute limit while Caddy's packages download from a slow mirror. Each step waits for the package manager and allows up to 15 minutes.
+- Module deploys say "Caddy config updated" only after Caddy loaded the config and serves a certificate for the name.
+
+**Two-server setups.**
+- The database server card runs one check over SSH at a time. A slow database server can no longer use up the console and stop it from answering.
+
+**ATLAS.**
+- ATLAS gets a certificate renewal account, lists only this server's certificate authorities, and never renews a revoked certificate. Thanks to @cfd2474.
+
+**Guard Dog.**
+- The "Update pending" email now says what each new release fixes and where to press (Console page → Update Now).
 
 ### v10.3.9-alpha — 2026-11-09 — Database server updates from its own card; CloudTAK plays this server's video on cloud servers; stuck phone connections clear by themselves
 
