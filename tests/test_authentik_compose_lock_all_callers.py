@@ -36,6 +36,10 @@ import pytest
 
 from test_authentik_compose_lock_paths import APP, FUNCS, TREE, _locked_spans, console  # noqa: F401
 
+# ops #632: module .env writes go through app.py's _open_secret_w (0600 at creation).
+_OPEN_SECRET_W = {'os': os}
+exec(re.search(r'^def _open_secret_w\(.*?(?=^\S)', APP, re.S | re.M).group(0), _OPEN_SECRET_W)
+
 _MUTATING = {'up', 'down', 'restart', 'stop', 'start', 'rm', 'pull', 'kill', 'create'}
 _REMOTE_ONLY = {'_run_authentik_deploy_remote', '_run_authentik_reconfigure_remote',
                 '_configure_authentik_smtp_and_recovery_remote'}
@@ -266,6 +270,7 @@ def test_gunicorn_timeout_puts_the_env_back_when_the_lock_is_busy(tmp_path, monk
     logged = []
     busy = subprocess.CompletedProcess([], 75, stdout='not run: busy', stderr='not run: busy')
     ns = {'os': os, 'subprocess': subprocess, '_sudo_wrap': list, '_AK_COMPOSE_LOCK_BUSY_RC': 75,
+          '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
           '_ak_compose_subprocess': lambda *a, **k: busy}
     exec(compile(ast.get_source_segment(APP, FUNCS['_ensure_authentik_gunicorn_timeout']), 'app.py', 'exec'), ns)
     ns['_ensure_authentik_gunicorn_timeout'](logged.append)

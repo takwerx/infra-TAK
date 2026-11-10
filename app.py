@@ -859,6 +859,21 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _open_secret_w(path):
+    """open(path, 'w') for a file that holds secrets (module .env files).
+
+    ops #632: a plain open() creates the file at the umask default (0644), and the
+    startup converge only tightened it to 600 at the NEXT console start — until then
+    every local user (tak, postgres) could read the Authentik/CloudTAK passwords.
+    Create it 0600, and tighten an existing one BEFORE the new content goes in."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass                    # not ours (pre-flip root-owned) — the converge heals it
+    return os.fdopen(fd, 'w')
+
+
 def _read_own_or_priv(path):
     """Read a file the console may well own itself; go to the broker only when it cannot.
 
@@ -18017,7 +18032,7 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
         f'PHONEDB_TLS_INSECURE=false',
     ]
     env_path = os.path.join(ra_dir, '.env')
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(env_lines) + '\n')
     os.chmod(env_path, 0o600)
 
@@ -32999,7 +33014,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
             if not found_cookie:
                 new_lines.append(f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}\n')
                 env_changed = True
-            with open(env_path, 'w') as _f:
+            with _open_secret_w(env_path) as _f:
                 _f.writelines(new_lines)
             _log(f"✓ .env: AUTHENTIK_HOST={_pub_url(ak_host, settings)}/ AUTHENTIK_COOKIE_DOMAIN={cookie_domain}")
         except Exception as e:
@@ -35784,6 +35799,20 @@ def _cloudtak_request_json(method, url, payload=None, timeout=25, headers=None):
         return False, 0, {'status': 0, 'message': str(e)}
 
 
+_OPENSSL_PASS_ENV = 'INFRATAK_P12_PASS'
+
+
+def _openssl_pass_env(password):
+    """(`-passin`/`-passout`/`-password` value, env) for an openssl child.
+
+    ops #632: never `pass:<secret>` — argv is world-readable in `ps` and
+    /proc/<pid>/cmdline, so every local user (tak, postgres) saw the TAK cert
+    password. The environment of a process is readable only by its own uid and
+    root. Only for openssl run directly by the console: a broker-routed
+    (_sudo_wrap) command drops the caller's env."""
+    return f'env:{_OPENSSL_PASS_ENV}', dict(os.environ, **{_OPENSSL_PASS_ENV: password or ''})
+
+
 def _p12_bytes_to_pem(p12_bytes, password=''):
     """Convert P12/PFX bytes to PEM cert/key using openssl. Raises RuntimeError on failure."""
     tmp_dir = tempfile.mkdtemp(prefix='cloudtak-p12-')
@@ -35791,10 +35820,10 @@ def _p12_bytes_to_pem(p12_bytes, password=''):
         p12_path = os.path.join(tmp_dir, 'bundle.p12')
         with open(p12_path, 'wb') as f:
             f.write(p12_bytes)
-        passin = f'pass:{password or ""}'
+        passin, _pass_env = _openssl_pass_env(password)
 
         def _run_openssl(args):
-            r = subprocess.run(args, capture_output=True, text=True, timeout=25)
+            r = subprocess.run(args, capture_output=True, text=True, timeout=25, env=_pass_env)
             ok = r.returncode == 0
             return (r.stdout or '').strip() if ok else '', (r.stderr or '').strip()
 
@@ -40006,10 +40035,11 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # 2026-11-02: "PKCS12 conversion failed:" every minute, 8446 never got the LE cert).
     _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
     _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
+    _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
-        shell=True, capture_output=True, text=True)
+        ['openssl', 'pkcs12', '-export', '-in', local_crt, '-inkey', local_key,
+         '-out', _tmp_p12, '-name', takserver_host, '-password', _pw_arg],
+        capture_output=True, text=True, env=_pw_env)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
         shutil.rmtree(_tmp_dir, ignore_errors=True); return False
@@ -40260,10 +40290,11 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
     _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
     _tmp_jks = os.path.join(_tmp_dir, 'takserver-le.jks')
+    _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
-        shell=True, capture_output=True, text=True)
+        ['openssl', 'pkcs12', '-export', '-in', local_crt, '-inkey', local_key,
+         '-out', _tmp_p12, '-name', takserver_host, '-password', _pw_arg],
+        capture_output=True, text=True, env=_pw_env)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
         shutil.rmtree(_tmp_dir, ignore_errors=True)
@@ -44465,7 +44496,7 @@ def run_takportal_deploy():
         env_path = os.path.join(portal_dir, '.env')
         if not os.path.exists(env_path):
             plog("  Creating default .env...")
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write("WEB_UI_PORT=3000\n")
             plog("\u2713 Default .env created (port 3000)")
         else:
@@ -45696,6 +45727,7 @@ paths:
     # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''
+    remote_secret_env = ''
     if ak_installed:
         overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
         if os.path.exists(overlay_src):
@@ -45762,16 +45794,37 @@ paths:
                     if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token_val = _line.strip().split('=', 1)[1].strip()
         ak_public_url = f'https://{_pub_hostport(_get_authentik_host(settings))}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
+        # ops #632: the token goes to a 600 root env file on the remote, not into the
+        # 0644 unit (the main box's Authentik admin token, readable by every user there).
+        remote_secret_env = _mediamtx_editor_secret_env_text(ak_token_val)
         ldap_env_lines = (
             f'Environment=LDAP_ENABLED=1\n'
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
-            f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
             # Split box: the editor binds 0.0.0.0 for Caddy on the console, so the
             # console's address must be trusted for the overlay's header auth.
             f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
             f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}\n'
+            f'{_MEDIAMTX_EDITOR_ENVFILE_LINE}\n'
         )
     editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
+    if remote_secret_env:
+        # 0600 mkstemp here; scp carries the mode to the remote /tmp copy, and install
+        # puts it in place root:root 600 before the unit that reads it.
+        _se_fd, _se_tmp = tempfile.mkstemp(prefix='mediamtx-webeditor-env-')
+        try:
+            with os.fdopen(_se_fd, 'w') as f:
+                f.write(remote_secret_env)
+            _module_copy(deploy_cfg, _se_tmp, '/tmp/mediamtx-webeditor.env', log_fn=plog)
+        finally:
+            try:
+                os.remove(_se_tmp)
+            except OSError:
+                pass
+        _dst = _MEDIAMTX_EDITOR_SECRET_ENV
+        _module_run(deploy_cfg,
+                    f'sudo install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst} 2>/dev/null'
+                    f' || install -m 600 /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
+                    timeout=10)
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
@@ -46514,14 +46567,16 @@ WantedBy=multi-user.target
                     for _line in _f:
                         if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                             ak_token_val = _line.strip().split('=', 1)[1].strip()
+            # ops #632: the token goes to the 600 env file, not into the 0644 unit.
+            _write_mediamtx_editor_secret_env(ak_token_val)
             ldap_env_lines = (
                 f'Environment=LDAP_ENABLED=1\n'
                 f'Environment=AUTHENTIK_API_URL=http://127.0.0.1:9090\n'
-                f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
                 # Local box: the editor is loopback-bound, so loopback is the whole
                 # trusted set — written explicitly so the unit states the policy.
                 f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
                 f'{_mediamtx_editor_trusted_proxies(settings)}\n'
+                f'{_MEDIAMTX_EDITOR_ENVFILE_LINE}\n'
             )
 
         # Write self-healing overlay script — runs before every service start
@@ -49900,7 +49955,7 @@ def _cloudtak_env_set(env_path, updates=None, remove=()):
     for k, v in updates.items():
         if k not in seen:
             out.append(f'{k}={v}')
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(out) + '\n')
 
 
@@ -52318,7 +52373,7 @@ def run_cloudtak_deploy(cfg=None):
             try:
                 env_tmp = os.path.join(tmp_dir, '.env')
                 ov_tmp = os.path.join(tmp_dir, 'docker-compose.override.yml')
-                with open(env_tmp, 'w') as f:
+                with _open_secret_w(env_tmp) as f:   # 0600: scp carries the mode to the remote (ops #632)
                     f.write(env_content)
                 with open(ov_tmp, 'w') as f:
                     f.write(override_yml)
@@ -52329,7 +52384,7 @@ def run_cloudtak_deploy(cfg=None):
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
                 mv_cmd = (
-                    "mv /tmp/.env ~/CloudTAK/.env && "
+                    "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                     "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
                     "( " + _cloudtak_remote_custom_compose_sh() + " )"   # GH #261
                 )
@@ -52658,7 +52713,7 @@ def run_cloudtak_deploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
         # never delete a key CloudTAK grew that we know nothing about (GARAGE_RPC_SECRET above all)
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_content)
         try:
             _pwfile = os.path.join(cloudtak_dir, '.postgres-password')
@@ -53269,7 +53324,7 @@ def run_cloudtak_redeploy(cfg=None):
             try:
                 env_tmp = os.path.join(tmp_dir, '.env')
                 ov_tmp = os.path.join(tmp_dir, 'docker-compose.override.yml')
-                with open(env_tmp, 'w') as f:
+                with _open_secret_w(env_tmp) as f:   # 0600: scp carries the mode to the remote (ops #632)
                     f.write(env_content)
                 with open(ov_tmp, 'w') as f:
                     f.write(override_yml)
@@ -53288,7 +53343,7 @@ def run_cloudtak_redeploy(cfg=None):
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 _g_sh = '( ' + _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)) + ' ) && '
             cmd = (
-                "mv /tmp/.env ~/CloudTAK/.env && "
+                "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
                 "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
                 + _g_sh +
@@ -53354,7 +53409,7 @@ def run_cloudtak_redeploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
         # never delete a key CloudTAK grew that we know nothing about (e.g. a store cluster secret)
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_content)
 
         # v10.2.7: a Garage-based CloudTAK (>= 13.102.0) cannot start without GARAGE_RPC_SECRET,
@@ -53517,12 +53572,16 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         # over the trusted local socket is idempotent and works regardless of the old
         # password; the verify below targets the container's own network IP, which
         # pg_hba matches with `host all all all scram-sha-256` — a REAL password test.
-        a = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'psql', '-U', 'docker', '-d', 'gis',
-                                       '-c', f"ALTER USER docker WITH PASSWORD '{pw}'"]),
+        # ops #632: the password goes over stdin, never argv — every local user sees the
+        # broker's `docker exec` command line in ps.
+        a = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', cid, 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-v', 'ON_ERROR_STOP=1']),
+                           input=f"ALTER USER docker WITH PASSWORD '{pw}';\n",
                            capture_output=True, text=True, timeout=20)
-        v = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid, 'sh', '-c',
+        v = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', cid, 'sh', '-c',
+                                       'IFS= read -r PGPASSWORD; export PGPASSWORD; '
                                        'psql -h "$(hostname -i)" -U docker -d gis -tAc "SELECT 1"']),
-                           capture_output=True, text=True, timeout=20)
+                           input=pw + '\n', capture_output=True, text=True, timeout=20)
         if v.returncode == 0:
             _log("  ✓ postgis role password converged to .env and verified over the network path")
             return True
@@ -56503,7 +56562,7 @@ def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     if lines and lines[-1].strip() != '':
         lines.append('')
     lines.extend(email_block)
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(lines) + '\n')
     _log("  Wrote SMTP settings to Authentik .env")
 
@@ -60808,7 +60867,10 @@ volumes:
         f.write(settings_js)
     with open('/tmp/nodered_docker-compose.yml', 'w') as f:
         f.write(compose_yml)
-    with open('/tmp/nodered_env', 'w') as f:
+    # ops #632: the env template is a secrets file — a private mkstemp (0600, no fixed
+    # /tmp name another local user could pre-create), and scp carries the 0600 across.
+    _nr_fd, _nr_env_tmp = tempfile.mkstemp(prefix='nodered-env-')
+    with os.fdopen(_nr_fd, 'w') as f:
         f.write(env_template)
     ok1, _ = _module_copy(deploy_cfg, '/tmp/nodered_settings.js', '~/node-red/settings.js', log_fn=plog)
     ok2, _ = _module_copy(deploy_cfg, '/tmp/nodered_docker-compose.yml', '~/node-red/docker-compose.yml', log_fn=plog)
@@ -60816,14 +60878,14 @@ volumes:
     try:
         _ok_check, _out_check = _module_run(deploy_cfg, 'test -f ~/node-red/.env && echo present || echo missing', timeout=5)
         if 'missing' in (_out_check or ''):
-            _module_copy(deploy_cfg, '/tmp/nodered_env', '~/node-red/.env', log_fn=plog)
+            _module_copy(deploy_cfg, _nr_env_tmp, '~/node-red/.env', log_fn=plog)
             _module_run(deploy_cfg, 'chmod 600 ~/node-red/.env', timeout=5)
     except Exception:
         pass
     try:
         os.remove('/tmp/nodered_settings.js')
         os.remove('/tmp/nodered_docker-compose.yml')
-        os.remove('/tmp/nodered_env')
+        os.remove(_nr_env_tmp)
     except Exception:
         pass
     if not ok1 or not ok2:
@@ -61023,7 +61085,7 @@ def run_nodered_deploy():
         # Bootstrap an empty .env file (gitignored on operator hosts) so docker compose env_file: doesn't fail.
         # Operators opt into adminAuth by adding NR_ADMIN_USER/NR_ADMIN_PASSWORD_HASH/NR_CREDENTIAL_SECRET here.
         if not os.path.exists(env_file):
-            with open(env_file, 'w') as f:
+            with _open_secret_w(env_file) as f:
                 f.write("""# infra-TAK Node-RED env file
 # Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
 # Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
@@ -64554,12 +64616,15 @@ AUTHENTIK_TOKEN={bootstrap_token}
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS={_trusted_cidrs}{cookie_line}
 """
 
-    with open('/tmp/authentik_remote.env', 'w') as f:
+    # ops #632: 0600 here (scp carries the mode to the remote's /tmp copy) and on the
+    # final .env — it holds the Authentik secret key and Postgres password.
+    _ak_fd, _ak_env_tmp = tempfile.mkstemp(prefix='authentik-remote-env-')
+    with os.fdopen(_ak_fd, 'w') as f:
         f.write(env_content)
-    ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote.env', '/tmp/authentik.env', log_fn=plog)
-    _module_run(deploy_cfg, 'mv /tmp/authentik.env ~/authentik/.env', timeout=10)
+    ok, _ = _module_copy(deploy_cfg, _ak_env_tmp, '/tmp/authentik.env', log_fn=plog)
+    _module_run(deploy_cfg, 'mv /tmp/authentik.env ~/authentik/.env && chmod 600 ~/authentik/.env', timeout=10)
     try:
-        os.remove('/tmp/authentik_remote.env')
+        os.remove(_ak_env_tmp)
     except Exception:
         pass
     plog("✓ .env created")
@@ -66498,7 +66563,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
         sep = '' if env_text.endswith('\n') or not env_text else '\n'
         new_text = env_text + sep + new_line
-        with open(env_path, 'w') as _f:
+        with _open_secret_w(env_path) as _f:
             _f.write(new_text)
         plog(f"  gunicorn timeout: appended GUNICORN_CMD_ARGS=--timeout={int(value)} to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
 
@@ -66510,7 +66575,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         if _r.returncode == _AK_COMPOSE_LOCK_BUSY_RC:
             # Undo the .env line, or the next run would see it and skip as "already set"
             # while the running server never got it.
-            with open(env_path, 'w') as _f:
+            with _open_secret_w(env_path) as _f:
                 _f.write(env_text)
             plog(f"  gunicorn timeout: server recreate {_r.stdout} — .env restored, next run retries")
             return
@@ -66628,7 +66693,7 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
         sep = '' if env_text.endswith('\n') or not env_text else '\n'
         header = '\n# v0.9.20: Django persistent DB connections — cuts handshake churn ~95% under heavy load.\n# Both keys use DOUBLE underscore between segments per Authentik docs (single is silently ignored).\n'
         new_text = env_text + sep + header + '\n'.join(appended) + '\n'
-        with open(env_path, 'w') as _f:
+        with _open_secret_w(env_path) as _f:
             _f.write(new_text)
         plog(f"  pg persistent connections: appended {len(appended)} var(s) to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
         for line in appended:
@@ -66743,7 +66808,7 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
             'CONN_MAX_AGE=60',
             'CONN_MAX_AGE=10'
         )
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(new_text)
         plog(f"  ✓ conn_max_age: lowered CONN_MAX_AGE 60→10 in ~/authentik/.env (backup: {os.path.basename(backup_path)})")
         plog("    Reason: enterprise license cache miss creates 1 idle PG conn/2s; at 60s retention → exhausts max_connections=500 in ~20 min")
@@ -66861,7 +66926,7 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
             )
             _changes.append("MAX_REQUESTS_JITTER=0→50")
 
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(new_text)
 
         plog(f"  ✓ max_requests: re-enabled gunicorn worker recycling ({', '.join(_changes)})")
@@ -67025,7 +67090,7 @@ def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
                 pass
             return False
 
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(_new_text)
 
         _saved_recreates = max(0, _estimate_cascade_recreates(_cur_max, _baseline))
@@ -68527,7 +68592,7 @@ def _authentik_apply_official_tunings(plog):
         return False
 
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog("  authentik tunings: .env updated:")
         for action in actions:
@@ -69701,7 +69766,7 @@ def _ensure_authentik_pgbouncer(plog):
     try:
         with open(compose_bak, 'w') as f:
             f.write(raw_compose)
-        with open(env_bak, 'w') as f:
+        with _open_secret_w(env_bak) as f:
             f.write(env_content)
         plog(f"  pgbouncer install: backups written ({compose_bak}, {env_bak})")
     except Exception as e:
@@ -69859,7 +69924,7 @@ def _ensure_authentik_pgbouncer(plog):
     new_env_content = '\n'.join(new_env_lines).rstrip('\n') + '\n'
 
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_env_content)
         plog("  pgbouncer install: .env updated (5 keys: HOST→pgbouncer, PORT, "
              "DISABLE_SERVER_SIDE_CURSORS=true, CONN_HEALTH_CHECKS=true, CONN_MAX_AGE=0)")
@@ -69868,7 +69933,7 @@ def _ensure_authentik_pgbouncer(plog):
         try:
             with open(compose_path, 'w') as f:
                 f.write(raw_compose)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(env_content)
         except Exception:
             pass
@@ -69895,7 +69960,7 @@ def _ensure_authentik_pgbouncer(plog):
         try:
             with open(compose_path, 'w') as f:
                 f.write(raw_compose)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(env_content)
             if started:
                 _ak_compose_subprocess(
@@ -70026,7 +70091,7 @@ def _ensure_authentik_pgbouncer(plog):
                     _new.append('AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50')
                 else:
                     _new.append(ln)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write('\n'.join(_new).rstrip('\n') + '\n')
             plog("  pgbouncer install: reset MAX_REQUESTS to baseline=1000, JITTER=50 "
                  "(autotune floor=100 is no longer load-bearing with PgBouncer in place)")
@@ -70420,7 +70485,7 @@ def _ensure_authentik_server_direct_listen(plog):
             'server-direct-listen', plog, cwd=ak_dir, capture_output=True, text=True, timeout=180)
 
     def _restore_env():
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_text)
 
     plog("  server direct-listen: setting AUTHENTIK_POSTGRESQL__DIRECT__HOST/CONN_OPTIONS and recreating "
@@ -70430,10 +70495,10 @@ def _ensure_authentik_server_direct_listen(plog):
             plog("  server direct-listen: compose lock busy — skipped, next console boot retries")
             return None
         try:
-            with open(env_bak, 'w') as f:
+            with _open_secret_w(env_bak) as f:
                 f.write(env_text)
             os.chmod(env_bak, 0o600)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(new_text)
         except Exception as e:
             plog(f"  ✗ server direct-listen: .env write failed ({e}) — restoring")
@@ -73724,7 +73789,7 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
             f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={new_jitter}',
             _new_txt, flags=re.MULTILINE
         )
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(_new_txt)
 
         plog(
@@ -75495,7 +75560,7 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
 
     new_content = content.rstrip('\n') + f'\n{key}={value}\n'
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog(f"  trusted proxy CIDRs: appended {key}={value}")
         plog(f"    Authentik will now record real client IPs (not Docker bridge 172.18.0.1)")
@@ -76602,7 +76667,7 @@ def run_authentik_deploy(reconfigure=False):
                     env_lines = f.readlines()
                 has_cookie_domain = any(line.strip().startswith('AUTHENTIK_COOKIE_DOMAIN=') for line in env_lines)
                 if not has_cookie_domain:
-                    with open(env_path, 'w') as f:
+                    with _open_secret_w(env_path) as f:
                         for line in env_lines:
                             f.write(line)
                         f.write(f"# Cookie domain — session shared across subdomains (avoids stream. redirect loop)\nAUTHENTIK_COOKIE_DOMAIN={cookie_domain_val}\n")
@@ -76683,7 +76748,7 @@ def run_authentik_deploy(reconfigure=False):
                                 if not seen:
                                     new_env.append(f'AUTHENTIK_HOST={ak_base}\n')
                                 if new_env != env_lines:
-                                    with open(env_path, 'w') as f:
+                                    with _open_secret_w(env_path) as f:
                                         f.writelines(new_env)
                                     restart_why.append('AUTHENTIK_HOST in .env')
                                 elif _ak_container_env_value('authentik-server-1', 'AUTHENTIK_HOST') not in (None, '', ak_base):
@@ -76854,7 +76919,7 @@ AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
 # AUTHENTIK_EMAIL__USE_TLS=true
 # AUTHENTIK_EMAIL__FROM=authentik@example.com
 """
-                with open(env_path, 'w') as f:
+                with _open_secret_w(env_path) as f:
                     f.write(env_content)
                 plog("  Generated PostgreSQL password")
                 plog("  Generated secret key")
@@ -84097,35 +84162,39 @@ def takserver_groups():
     admin_p12 = os.path.join(cert_dir, 'admin.p12')
     if not os.path.exists(admin_p12):
         return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
+    # ops #632: the unencrypted admin key used to go to the FIXED path
+    # /tmp/tak-admin-curl.key through a shell `>` (umask 022 → 0644), so any local user
+    # could copy TAK's admin identity while the route ran. Everything now lives in a
+    # per-request 0700 mkdtemp dir that the finally removes, and the cert password goes
+    # through openssl's environment, not argv.
+    import tempfile as _tf
+    _work = _tf.mkdtemp(prefix='tak-admin-curl-')
     try:
         # TAK Server generates legacy PKCS12 (RC2-40-CBC) that modern curl/OpenSSL 3.x
         # rejects (exit 58). Extract PEM cert+key with -legacy flag for curl.
-        admin_pem = '/tmp/tak-admin-curl.pem'
-        admin_key = '/tmp/tak-admin-curl.key'
+        admin_pem = os.path.join(_work, 'admin.pem')
+        admin_key = os.path.join(_work, 'admin.key')
         # v10.0.5 non-root: admin.p12 is 0600 tak:tak — cat it via the broker into a temp so
         # openssl can read it (raw openssl as takwerx -> empty PEM -> "Failed to extract").
-        import tempfile as _tf
-        _src_p12, _tmp_src = admin_p12, None
+        _src_p12 = admin_p12
         try:
             _cat = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=10)
             if _cat.returncode == 0 and _cat.stdout:
-                _fd, _tmp_src = _tf.mkstemp(suffix='.p12')
+                _src_p12 = os.path.join(_work, 'admin.p12')
+                _fd = os.open(_src_p12, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(_fd, 'wb') as _f:
                     _f.write(_cat.stdout)
-                _src_p12 = _tmp_src
         except Exception:
             pass
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _src_p12, '-passin', _pw_arg,
+             '-clcerts', '-nokeys', '-legacy', '-out', admin_pem],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         subprocess.run(
-            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
-            shell=True, capture_output=True, text=True, timeout=10)
-        if _tmp_src:
-            try:
-                os.remove(_tmp_src)
-            except Exception:
-                pass
+            ['openssl', 'pkcs12', '-in', _src_p12, '-passin', _pw_arg,
+             '-nocerts', '-nodes', '-legacy', '-out', admin_key],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
         import json as _json
@@ -84239,11 +84308,7 @@ def takserver_groups():
     except Exception as e:
         return jsonify({'error': str(e)[:200], 'groups': []})
     finally:
-        for f in ['/tmp/tak-admin-curl.pem', '/tmp/tak-admin-curl.key']:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+        shutil.rmtree(_work, ignore_errors=True)
 
 
 @app.route('/api/takserver/ca-info')
@@ -88873,12 +88938,25 @@ def _tak58_container_run_detached(container, pw, shell_cmd, tag, say, progress=N
     Returns the command's exit code, or None on timeout.
     """
     rc_path = f'/tmp/{tag}.rc'
+    pw_path = f'/tmp/{tag}.pw'
     subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', rc_path]),
                    capture_output=True, timeout=60)
+    # ops #632: a detached exec has no stdin, and `-e PGPASSWORD=<pw>` put the martiuser
+    # password in the broker's argv (ps, every local user). Hand it over on stdin into a
+    # 600 file INSIDE the container; the detached command reads and deletes it first.
+    w = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', container, 'sh', '-c',
+                                   f'umask 077; cat > {pw_path}']),
+                       input=pw or '', capture_output=True, text=True, timeout=60)
+    if w.returncode != 0:
+        say(f'  Could not start {tag} in {container}: {(w.stderr or "").strip()[:200]}')
+        return None
     r = subprocess.run(_sudo_wrap([
-        'docker', 'exec', '-d', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+        'docker', 'exec', '-d', container, 'sh', '-c',
+        f'PGPASSWORD="$(cat {pw_path})"; rm -f {pw_path}; export PGPASSWORD; '
         f'{shell_cmd}; echo $? > {rc_path}']), capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
+        subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', pw_path]),
+                       capture_output=True, timeout=60)
         say(f'  Could not start {tag} in {container}: {(r.stderr or "").strip()[:200]}')
         return None
     t0 = time.time()
@@ -88924,10 +89002,13 @@ def _tak58_container_psql(container, pgbin, pw, sql, timeout=300):
     """One console-authored SQL statement as martiuser over TCP inside `container`.
     Returns stdout, or None when psql failed. Never pass request-derived SQL here."""
     try:
+        # Password on stdin, not argv (ops #632); psql then gets its args via "$@".
         r = subprocess.run(_sudo_wrap([
-            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+            'docker', 'exec', '-i', container, 'sh', '-c',
+            'IFS= read -r PGPASSWORD; export PGPASSWORD; exec "$0" "$@"',
             f'{pgbin}/psql', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
-            '-tAX', '-c', sql]), capture_output=True, text=True, timeout=timeout)
+            '-tAX', '-c', sql]), input=(pw or '') + '\n',
+            capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
     return r.stdout if r.returncode == 0 else None
@@ -96832,12 +96913,17 @@ def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
         os.close(_fdp)
         _fdk, _key = tempfile.mkstemp(suffix='.key', prefix='tak-marti-key-')
         os.close(_fdk)
+        # -out onto the 0600 mkstemp files (openssl truncates, the mode stays); the
+        # password goes through the environment, not argv (ops #632).
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {shlex.quote(_pem)}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _tmp_src, '-passin', _pw_arg,
+             '-clcerts', '-nokeys', '-legacy', '-out', _pem],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {shlex.quote(_key)}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _tmp_src, '-passin', _pw_arg,
+             '-nocerts', '-nodes', '-legacy', '-out', _key],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
         _body_file = None
@@ -97343,13 +97429,17 @@ def _takportal_sync_certs(plog=None, restart=False):
         # p12 — the real reason the portal could never read its client cert.
         # -legacy is required to READ TAK's RC2-40-CBC admin.p12; the export stage
         # defaults to modern AES, which the portal's Node 22 / OpenSSL 3 can read.
+        # Password through the environment, not argv (ops #632).
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_local_admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=30)
+            ['openssl', 'pkcs12', '-in', _local_admin_p12, '-passin', _pw_arg,
+             '-nodes', '-legacy', '-out', tmp_pem],
+            capture_output=True, text=True, timeout=30, env=_pw_env)
         if os.path.exists(tmp_pem) and os.path.getsize(tmp_pem) > 0:
             subprocess.run(
-                f'openssl pkcs12 -export -in {shlex.quote(tmp_pem)} -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)} 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=30)
+                ['openssl', 'pkcs12', '-export', '-in', tmp_pem, '-passout', _pw_arg,
+                 '-out', modern_p12],
+                capture_output=True, text=True, timeout=30, env=_pw_env)
         try:
             os.remove(tmp_pem)
         except OSError:
@@ -104655,6 +104745,26 @@ def _mediamtx_editor_trusted_proxies(settings=None, deploy_cfg=None):
     return ','.join(peers)
 
 
+# ops #632: the MediaMTX editor's Authentik token lives here, mode 600 root, never as
+# Environment= in the unit. The unit is 0644, and systemd hands Environment= values to
+# any local user (`systemctl show -p Environment`); an EnvironmentFile's contents it
+# does not. The `-` keeps the editor starting on a box with no Authentik (no file).
+_MEDIAMTX_EDITOR_SECRET_ENV = '/usr/local/etc/mediamtx-webeditor.env'
+_MEDIAMTX_EDITOR_ENVFILE_LINE = f'EnvironmentFile=-{_MEDIAMTX_EDITOR_SECRET_ENV}'
+
+
+def _mediamtx_editor_secret_env_text(token):
+    return ('# Written by infra-TAK. Mode 600: the Authentik token is kept out of the\n'
+            '# mediamtx-webeditor unit file, which every local user can read.\n'
+            f'AUTHENTIK_TOKEN={token}\n')
+
+
+def _write_mediamtx_editor_secret_env(token):
+    """Write the editor's token file on THIS box: empty at 600 first, then the token."""
+    _write_priv(_MEDIAMTX_EDITOR_SECRET_ENV, '', perm=0o600)
+    _write_priv(_MEDIAMTX_EDITOR_SECRET_ENV, _mediamtx_editor_secret_env_text(token), perm=0o600)
+
+
 def _unit_text_with_env(txt, key, value):
     """Return `txt` with exactly one `Environment=key=value` line in [Service].
 
@@ -104777,6 +104887,35 @@ def _mediamtx_remote_fw_alert(settings, host, state, failed):
     return ok
 
 
+def _unit_text_token_to_envfile(txt):
+    """Return (txt, token): the MediaMTX editor unit with its Authentik token moved out.
+
+    Drops every `Environment=AUTHENTIK_TOKEN=` line and makes sure the unit reads
+    _MEDIAMTX_EDITOR_SECRET_ENV instead. `token` is the value that was in the unit
+    (None when there was none). Unchanged text when there is nothing to move."""
+    lines = txt.split('\n')
+    token = None
+    out = []
+    for ln in lines:
+        if ln.startswith('Environment=AUTHENTIK_TOKEN='):
+            if token is None:
+                token = ln.split('=', 2)[2].strip()
+            continue
+        out.append(ln)
+    if token is None:
+        return txt, None
+    if _MEDIAMTX_EDITOR_ENVFILE_LINE not in out:
+        last_env = max((i for i, ln in enumerate(out) if ln.startswith('Environment=')),
+                       default=None)
+        if last_env is None:
+            try:
+                last_env = out.index('[Service]')
+            except ValueError:
+                return txt, None  # not a unit file we recognise — leave it alone
+        out.insert(last_env + 1, _MEDIAMTX_EDITOR_ENVFILE_LINE)
+    return '\n'.join(out), token
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -104837,6 +104976,25 @@ def _startup_converge_mediamtx_overlay():
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
                 changed = True
                 print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
+            # ops #632: the Authentik token sat in the 0644 unit as Environment=, readable
+            # by every local user (the file, and `systemctl show -p Environment`). Move it
+            # to the 0600 EnvironmentFile. File first, then the unit, so the editor never
+            # restarts without its token.
+            if txt and 'Environment=AUTHENTIK_TOKEN=' in txt:
+                _moved, _tok = _unit_text_token_to_envfile(txt)
+                if _tok is not None:
+                    try:
+                        _write_mediamtx_editor_secret_env(_tok)
+                        _write_priv(unit, _moved)
+                        txt = _moved
+                        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                       capture_output=True, timeout=30)
+                        changed = True
+                        print("Startup migration: moved the MediaMTX editor's Authentik token "
+                              "out of its unit file into a 600 env file", flush=True)
+                    except Exception as _te:
+                        print(f"Startup migration: could not move the MediaMTX editor token "
+                              f"({str(_te)[:120]})", flush=True)
             # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
             # unpinned peer. Converge the unit in the SAME pass that ships the file, so
             # an existing box never runs new overlay + old unit. This is a local editor
@@ -111131,7 +111289,7 @@ def _post_update_auto_deploy():
                             env_path = os.path.join(nr_dir, '.env')
                             if not os.path.exists(env_path):
                                 try:
-                                    with open(env_path, 'w') as ef:
+                                    with _open_secret_w(env_path) as ef:
                                         ef.write("""# infra-TAK Node-RED env file
 # Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
 # Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
