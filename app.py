@@ -27845,6 +27845,10 @@ KNOWN_SECURITY_RELEASES = (
     # ops #606: WebODM 4.0.0 replaces the end-of-life Django 2.2 that 3.x runs.
     {'component': 'webodm', 'fixed_in': '4.0.0',
      'reason': 'an end-of-life Django with known flaws'},
+    # ops #608 (from the pin notes, ops #202/#207): 2026.8.5 ships a certificate bundle that
+    # drops a distrusted root the container still trusted in 2026.8.4.
+    {'component': 'authentik', 'fixed_in': '2026.8.5',
+     'reason': 'a certificate bundle that still trusted a distrusted root (eMudhra)'},
 )
 
 
@@ -28510,6 +28514,128 @@ def _collect_patch_now_items(feed, unknown, now=None):
     return items, feed
 
 
+# ops #608: components with a console Update button that the sweep did not read. Per row:
+# module key (as in detect_modules), label, GitHub repo whose security advisories apply (or
+# None), `gated` and the step the operator takes. Gated components are pinned (Authentik,
+# NetBird, TAK Server, Federation Hub): they are mailed only for the version infra-TAK pins,
+# so nobody is told to move to a version we have not tested. Node-RED is not listed on
+# purpose: the console update moves it onto NODERED_IMAGE by itself (Post-update step), and
+# a new Node.js is already mailed through NODE_SECURITY_RELEASES.
+_MODULE_UPDATE_ROWS = (
+    ('takportal', 'TAK Portal', 'ValleyTacticalSolutions/TAK-Portal', False,
+     'TAK Portal page → Update.'),
+    ('atlas', 'ATLAS', None, False, 'ATLAS page → Update (or Update all deployments).'),
+    ('authentik', 'Authentik', 'goauthentik/authentik', True, 'Authentik page → Update.'),
+    ('mediamtx', 'MediaMTX', 'bluenviron/mediamtx', False,
+     'MediaMTX page → open the web editor and update there (the console does not update '
+     'MediaMTX itself).'),
+    ('takserver', 'TAK Server', None, True, 'TAK Server page → Update TAK Server.'),
+    ('fedhub', 'Federation Hub', None, True, 'Federation Hub page → Update Federation Hub.'),
+    ('netbird', 'NetBird', 'netbirdio/netbird', True, 'NetBird page → Update.'),
+    ('remote_assist', 'Remote Assist', None, False, 'Remote Assist page → Update.'),
+    ('tak_video_restreamer', 'TAK Video Restreamer', None, False,
+     'TAK Video Restreamer page → Update Now.'),
+    ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
+)
+
+
+def _module_update_info(key):
+    """The console's own version helper for one module, as the card reads it."""
+    if key == 'takportal':
+        return _get_takportal_version_info()
+    if key == 'atlas':
+        return mod_registry.atlas.get_version_info(mod_registry.get_ctx())
+    if key == 'authentik':
+        return _get_authentik_version_info()
+    if key == 'mediamtx':
+        return _get_mediamtx_version_info()
+    if key == 'takserver':
+        return _get_takserver_version_info()
+    if key == 'fedhub':
+        return _get_fedhub_version_info()
+    if key == 'netbird':
+        return _get_netbird_version_info()
+    if key == 'remote_assist':
+        return _get_remote_assist_version_info()
+    if key == 'tak_video_restreamer':
+        return mod_registry.tvr.get_version_info(mod_registry.get_ctx())
+    if key == 'simulator':
+        return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
+    return {}
+
+
+def _module_update_candidates(key, label, info, how):
+    """[{key, label, installed, target, identity, how, raw_installed, raw_target}] for one
+    module's pending update. Empty when the module has no update, or `info` does not say what
+    it would move to. MediaMTX can hold two: the binary and its web editor."""
+    def one(k, lbl, cur, tgt, hw, plain=False):
+        fmt = (lambda s: s) if plain else (lambda s: 'v' + s if re.match(r'^\d', s or '') else s)
+        num = re.search(r'\d+(?:\.\d+)+', str(cur) + ' ')
+        tnum = re.search(r'\d+(?:\.\d+)+', str(tgt) + ' ')
+        return {'key': k, 'label': lbl, 'installed': fmt(str(cur)), 'target': fmt(str(tgt)),
+                'identity': str(tgt), 'how': hw,
+                'raw_installed': num.group(0) if num else '', 'raw_target': tnum.group(0) if tnum else ''}
+    if key == 'mediamtx':
+        out = []
+        if info.get('binary_update_available') and info.get('version') and info.get('latest'):
+            out.append(one('mediamtx', 'MediaMTX', info['version'], info['latest'], how))
+        if info.get('editor_update_available') and info.get('editor_version') and info.get('editor_latest'):
+            out.append(one('mediamtx-editor', 'MediaMTX web editor', info['editor_version'],
+                           info['editor_latest'], how))
+        return out
+    if not (info.get('update_available') and info.get('version') and info.get('latest')):
+        return []
+    return [one(key, label, info['version'], info['latest'], how,
+                plain=key in ('tak_video_restreamer', 'takserver', 'fedhub'))]
+
+
+def _module_update_items(unknown):
+    """ops #608: pending updates for the components in _MODULE_UPDATE_ROWS, as
+    _collect_pending_updates items. Each module is read on its own, so one that fails never
+    hides the rest. A module that is installed but cannot be read is put in `unknown` (it is
+    not "up to date": its dedup state is carried, never re-mailed on a guess)."""
+    items = []
+    try:
+        modules = detect_modules()
+    except Exception as e:
+        for r in _MODULE_UPDATE_ROWS:
+            unknown.update({r[0], r[0] + '-editor'})
+        print(f"[update-notify] module detection failed: {e}", flush=True)
+        return items
+    for key, label, repo, gated, how in _MODULE_UPDATE_ROWS:
+        if not modules.get(key, {}).get('installed'):
+            continue
+        try:
+            info = _module_update_info(key) or {}
+            if not info.get('version'):
+                unknown.add(key)
+                unknown.add(key + '-editor')
+                continue
+            if gated and (info.get('channel') or 'main') != 'main':
+                continue
+            for c in _module_update_candidates(key, label, info, how):
+                raw_i, raw_t = c.pop('raw_installed'), c.pop('raw_target')
+                known = ['Fixes ' + k for k in _known_security_fixed_by(key, raw_i, raw_t)]
+                sec = list(known)
+                if repo and c['key'] == key:
+                    try:
+                        sec = ['Fixes ' + a for a in _gh_advisories_fixed_by(repo, raw_i, raw_t)] + known
+                    except Exception as e:
+                        c['security_unknown'] = True
+                        print(f"[update-notify] {label} advisories unreadable: {e}", flush=True)
+                if key == 'tak_video_restreamer' and info.get('security_update'):
+                    sec.append('Fixes the restreamer’s publish login and its pinned MediaMTX and '
+                               'Python components')
+                if sec:
+                    c['security'] = sec
+                items.append(_apply_security_identity(c))
+        except Exception as e:
+            unknown.add(key)
+            unknown.add(key + '-editor')
+            print(f"[update-notify] {label} check failed: {e}", flush=True)
+    return items
+
+
 def _collect_pending_updates(settings, seen=None, unknown=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
@@ -28564,6 +28690,11 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
                 pending.append(_apply_security_identity(wo))
     except Exception as e:
         print(f"[update-notify] WebODM check failed: {e}", flush=True)
+    try:
+        # ops #608: the other modules with a console Update button.
+        pending.extend(_module_update_items(unknown))
+    except Exception as e:
+        print(f"[update-notify] module update check failed: {e}", flush=True)
     try:
         pending.extend(_os_security_items(seen, unknown))
     except Exception as e:
