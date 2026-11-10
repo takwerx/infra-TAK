@@ -285,11 +285,11 @@ def test_every_mediamtx_pip_install_upgrades_certifi():
     # retried with --ignore-installed); certifi goes through the same helper with the same flag.
     r = APP.index('def _mediamtx_editor_remote_py_deps(')
     remote = APP[r:APP.index('\ndef ', r + 1)]
-    assert "f'_pi {_pkgs} && _pi -U certifi')" in remote
+    assert "f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')" in remote   # ops #637: a named certifi
     assert 'pip3 install "$@" {flag} 2>&1' in remote
     assert "_pip('--break-system-packages')" in remote and "_pip('')" in remote   # + old-pip fallback
     i = APP.index('def _mediamtx_editor_install_py_deps(')
     body = APP[i:APP.index('\ndef ', i + 1)]
-    assert "_pip(['pip3', 'install', '-U', 'certifi'] + _flag)" in body
+    assert "_pip(['pip3', 'install', '-U', _MEDIAMTX_EDITOR_CERTIFI] + _flag)" in body
     assert "_flag = []" in body                 # old pip: certifi without the flag too
     assert "if 'pip3 install Flask" not in APP
