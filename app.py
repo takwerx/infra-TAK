@@ -33364,15 +33364,55 @@ def _apt_wait_for_lock(max_wait=300, log_fn=None):
     return True
 
 
-def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None):
+def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None, **kw):
     """Run one privileged apt argv, waiting (bounded) for the apt lock first and retrying once
-    if apt still lost the race for it. Returns the CompletedProcess."""
+    if apt still lost the race for it. Returns the CompletedProcess. Extra kwargs (env=) pass on."""
     _apt_wait_for_lock(max_wait, log_fn)
-    r = _run_priv_chain([argv], 'and', timeout=timeout)
+    r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
     out = (r.stdout or '') + (r.stderr or '')
     if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
         _apt_wait_for_lock(max_wait, log_fn)
-        r = _run_priv_chain([argv], 'and', timeout=timeout)
+        r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
+    return r
+
+
+# ops #605: the Caddy deploy ran every apt line with a fixed timeout=120. On Ubuntu 22.04 the
+# first line (debian-keyring, a large package) took longer than that on a slow mirror in two
+# fresh installs, and the deploy stopped with no Caddy and no way forward. Each apt line now
+# waits for the apt lock again right before it runs and has a limit sized for a slow mirror.
+# The wait is in Python, not `-o DPkg::Lock::Timeout`: the non-root broker denies `-o`.
+CADDY_APT_TIMEOUT = 900       # seconds for one apt-get line of the Caddy deploy
+CADDY_APT_LOCK_WAIT = 300     # seconds to wait for the apt lock before each apt line
+
+
+def _caddy_apt_shell(cmd, plog, timeout=None):
+    """Run one shell string of the Caddy apt-repo setup. apt-get lines wait (bounded) for the apt
+    lock first, get the slow-mirror limit and are retried once if apt still lost the race for the
+    lock. Other lines (curl | gpg) keep the short limit. Never raises on a timeout: returns a
+    CompletedProcess with returncode 124 and the reason in stderr."""
+    is_apt = cmd.lstrip().startswith('apt-get')
+    if timeout is None:
+        timeout = CADDY_APT_TIMEOUT if is_apt else 120
+    env = _broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+
+    def _once():
+        try:
+            return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                  timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                cmd, 124, '', f"timed out after {timeout} seconds (slow package mirror or a stuck package manager)")
+
+    if not is_apt:
+        return _once()
+    if not _apt_wait_for_lock(CADDY_APT_LOCK_WAIT, plog):
+        plog(f"  ⚠ The package manager lock is still held after {CADDY_APT_LOCK_WAIT}s; trying anyway.")
+    plog(f"  Running {cmd[:48]}… (up to {timeout // 60} min on a slow mirror)")
+    r = _once()
+    if r.returncode != 0 and any(m in (r.stdout or '') + (r.stderr or '') for m in _APT_LOCK_MSGS):
+        plog("  Another package run took the lock first. Waiting, then trying once more...")
+        _apt_wait_for_lock(CADDY_APT_LOCK_WAIT, plog)
+        r = _once()
     return r
 
 
@@ -39826,9 +39866,9 @@ def run_caddy_deploy(domain):
             for cmd in cmds:
                 # shell strings (apt-get / curl|gpg->keyring / curl|tee->sources.list):
                 # the non-root console routes their privileged binaries through the
-                # broker via the shim PATH (env). No-op env as root.
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120,
-                    env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
+                # broker via the shim PATH (env). No-op env as root. ops #605: apt lines
+                # wait for the apt lock and get a slow-mirror limit (_caddy_apt_shell).
+                r = _caddy_apt_shell(cmd, plog)
                 if r.returncode != 0:
                     err = (r.stderr.strip() or r.stdout.strip())[:300]
                     plog(f"✗ Caddy install failed at: {cmd[:60]}")
@@ -39838,22 +39878,14 @@ def run_caddy_deploy(domain):
             # Re-check lock before apt-get install caddy (unattended-upgrades may have started meanwhile)
             plog("  Checking package manager lock again before installing Caddy...")
             wait_for_apt_lock(plog, caddy_deploy_log)
-            install_caddy_cmd = 'apt-get install -y caddy 2>&1'
-            r = subprocess.run(install_caddy_cmd, shell=True, capture_output=True, text=True, timeout=120,
-                env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
+            # _caddy_apt_shell waits for the lock again and retries once if apt lost the race.
+            r = _caddy_apt_shell('apt-get install -y caddy 2>&1', plog)
             if r.returncode != 0:
                 err = (r.stderr.strip() or r.stdout.strip())[:300]
-                if 'lock' in err.lower() or 'unattended-upgr' in err or 'unable to acquire' in err.lower():
-                    plog("  System updates are using the package manager. Waiting 60s then retrying...")
-                    time.sleep(60)
-                    r = subprocess.run(install_caddy_cmd, shell=True, capture_output=True, text=True, timeout=120,
-                        env=_broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'}))
-                if r.returncode != 0:
-                    err = (r.stderr.strip() or r.stdout.strip())[:300]
-                    plog(f"✗ Caddy install failed at: apt-get install -y caddy")
-                    plog(f"  Error: {err}")
-                    caddy_deploy_status.update({'running': False, 'error': True})
-                    return
+                plog(f"✗ Caddy install failed at: apt-get install -y caddy")
+                plog(f"  Error: {err}")
+                caddy_deploy_status.update({'running': False, 'error': True})
+                return
         else:
             plog("  Installing Caddy via dnf...")
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-command(copr)']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
@@ -39868,7 +39900,9 @@ def run_caddy_deploy(domain):
         r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         if r.returncode != 0 and pkg_mgr == 'apt':
             plog("  Binary missing after install; reinstalling package...")
-            subprocess.run(_sudo_wrap(['apt-get', 'install', '--reinstall', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+            _apt_run_waiting(['apt-get', 'install', '--reinstall', '-y', 'caddy'], timeout=CADDY_APT_TIMEOUT,
+                             max_wait=CADDY_APT_LOCK_WAIT, log_fn=plog,
+                             env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
             r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         elif r.returncode != 0 and pkg_mgr == 'dnf':
             # v10.0.1 (RHEL): on some EL9 boxes the @caddy/caddy COPR rpm reports a
@@ -39927,7 +39961,8 @@ def run_caddy_deploy(domain):
                 # apt-get). _pkg_install runs DEBIAN_FRONTEND=noninteractive, under which
                 # dpkg keeps the existing conffile instead of stopping on the
                 # /etc/caddy/Caddyfile prompt — the upgrade gotcha in the GH #59 handoff.
-                _pkg_install('caddy', log_fn=plog, timeout=300)
+                _apt_wait_for_lock(CADDY_APT_LOCK_WAIT, plog)
+                _pkg_install('caddy', log_fn=plog, timeout=CADDY_APT_TIMEOUT)
                 _caddy_version_cache['ver'] = None
             else:
                 # dnf: the @caddy/caddy COPR can lag behind 2.7, so take the official build.
