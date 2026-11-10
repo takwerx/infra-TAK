@@ -1530,6 +1530,10 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
 # access_logs.db next to store.db (SQLite), MySQL store removed (we never configure an engine, so
 # the default sqlite store is used), SSH-server hardening we don't expose. Dashboard on Next.js 16.
 # Rollback: re-pin the dev pair to 0.81.4 / v2.95.0; the pin-restore heal converges boxes back.
+# Authentik's redis service (legacy: Authentik itself stopped needing Redis in 2025.10, but the compose
+# keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
+# whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
+AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
 NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.0"  # UNDER TRIAL (ops #427)
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
 
@@ -1545,9 +1549,12 @@ def _get_netbird_target_images(settings=None):
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
-MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9 W3: Public-toggle
-                              # fix + embedded hls.js are on installer dev awaiting tag) — an
-                              # unpinned ref is a supply-chain gap our own /module-scan rule bans.
+# Pinned to a release tag AND its commit (ops #637), like every other external source we install.
+# The tag picks the release; MEDIAMTX_EDITOR_SHA is what every fetch is checked against.
+# Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
+# fails if either goes back to a branch name.
+MEDIAMTX_EDITOR_REF = "v2.1.14"
+MEDIAMTX_EDITOR_SHA = "8d39e26d81601e107873ca8c81b4a8076bb2e028"  # commit of tag v2.1.14 (was main's tip)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
@@ -3850,28 +3857,68 @@ def _selinux_sync_caddy_ports(log=None):
     return n
 
 
-def _docker_install_cmd():
-    """Shell command that installs Docker Engine for THIS host's distro family.
-      Debian/Ubuntu → the get.docker.com convenience script (works as-is).
-      RHEL family   → get.docker.com adds Docker's linux/rocky/$releasever repo,
-                      which ships NO docker-ce packages ("Unable to find a match");
-                      use Docker's CentOS repo — the supported repo for the
-                      RHEL-compatible family (Rocky/Alma/RHEL). The `rm -f` clears
-                      any empty rocky repo a prior get.docker.com run left behind.
-    Returns a string for `subprocess.run(..., shell=True)` (run as root, matching
-    the existing get.docker.com sites). NON-ROOT-COMMANDS: dnf, dnf config-manager,
-    systemctl. Validated on Rocky 9.8: installs docker-ce 29.x + starts it.
-    Note: distro family is the LOCAL box; remote/two-server docker installs are
-    NOT routed here (they target a remote host)."""
-    if _distro_family() == 'rhel':
-        return (
-            'dnf -y install dnf-plugins-core && '
-            'rm -f /etc/yum.repos.d/docker-ce.repo && '
-            'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && '
-            'dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin && '
-            'systemctl enable --now docker'
-        )
-    return 'curl -fsSL https://get.docker.com | sh'
+# Docker's apt repo signing key (docs.docker.com/engine/install/ubuntu: "9DC8 5822 9FC7 DD38 854A
+# E2D8 8D81 803C 0EBF CD88"). ops #637: the key we download is checked against this fingerprint
+# before the repo is added.
+# start.sh carries the same value (tests/test_pinned_third_party_ops637.py keeps them equal).
+DOCKER_APT_KEY_FPR = '9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
+
+
+def _docker_install_script():
+    """POSIX sh script (run as root) that installs Docker Engine from Docker's own signed package
+    repo — never the get.docker.com convenience script piped to a shell (ops #637: unpinned remote code run as root).
+      Debian/Ubuntu → download.docker.com/linux/{debian,ubuntu} apt repo; the signing key must match
+                      DOCKER_APT_KEY_FPR before it is trusted.
+      RHEL family   → Docker's CentOS repo (the supported repo for Rocky/Alma/RHEL; get.docker.com adds
+                      a linux/rocky repo that ships NO docker-ce packages). The `rm -f` clears an empty
+                      repo file a prior get.docker.com run left behind. dnf verifies the repo's
+                      gpgcheck signature on every package.
+    The script picks the branch on the box it runs on, so the same text serves the local box and a
+    remote host. Packages match what get.docker.com installed (docker-ce, not distro docker.io)."""
+    return (
+        'set -e\n'
+        'if [ -f /etc/debian_version ]; then\n'
+        '  . /etc/os-release\n'
+        '  case "$ID" in debian) _d=debian;; *) _d=ubuntu;; esac\n'
+        '  _c="${UBUNTU_CODENAME:-$VERSION_CODENAME}"\n'
+        '  [ -n "$_c" ] || { echo "Docker install: cannot read the distro codename" >&2; exit 1; }\n'
+        '  export DEBIAN_FRONTEND=noninteractive\n'
+        '  _apt="apt-get -o DPkg::Lock::Timeout=300 -qq"\n'
+        '  $_apt update && $_apt install -y ca-certificates curl gnupg\n'
+        '  install -m 0755 -d /etc/apt/keyrings\n'
+        '  curl -fsSL "https://download.docker.com/linux/$_d/gpg" -o /etc/apt/keyrings/docker.asc\n'
+        '  _fpr=$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.asc 2>/dev/null'
+        " | awk -F: '$1==\"fpr\"{print $10; exit}')\n"
+        f'  if [ "$_fpr" != "{DOCKER_APT_KEY_FPR}" ]; then\n'
+        '    rm -f /etc/apt/keyrings/docker.asc\n'
+        '    echo "Docker install refused: signing key fingerprint is [$_fpr]" >&2; exit 1\n'
+        '  fi\n'
+        '  chmod a+r /etc/apt/keyrings/docker.asc\n'
+        '  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] '
+        'https://download.docker.com/linux/$_d $_c stable" > /etc/apt/sources.list.d/docker.list\n'
+        '  $_apt update\n'
+        '  $_apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n'
+        'elif command -v dnf >/dev/null 2>&1; then\n'
+        '  dnf -y install dnf-plugins-core\n'
+        '  rm -f /etc/yum.repos.d/docker-ce.repo\n'
+        '  dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo\n'
+        '  dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n'
+        'else\n'
+        '  echo "Docker install: unsupported distro (need apt or dnf)" >&2; exit 1\n'
+        'fi\n'
+        'systemctl enable --now docker\n'
+    )
+
+
+def _docker_install_cmd(sudo_fallback=False):
+    """Shell command string that runs _docker_install_script() as root: for a root shell, the local
+    root console, or a remote root SSH session (the default). `sudo_fallback=True` adds
+    `sudo -n` when the remote SSH user is not root. NON-ROOT-COMMANDS: apt-get, dnf, systemctl.
+    Validated on Rocky 9.8 (docker-ce 29.x) and Ubuntu 22.04/24.04 and ARM64 (see PR for ops #637)."""
+    cmd = 'sh -c ' + shlex.quote(_docker_install_script())
+    if sudo_fallback:
+        return f'if [ "$(id -u)" = 0 ]; then {cmd}; else sudo -n {cmd}; fi'
+    return cmd
 
 
 def _docker_probe():
@@ -3890,6 +3937,24 @@ def _docker_probe():
         return 127, ''
     except Exception:
         return 1, ''
+
+
+def _docker_key_fingerprint(armored_key):
+    """Primary-key fingerprint of an ASCII-armored PGP key (gpg --show-keys, throwaway homedir so
+    the console user's own keyring is never touched), or '' if gpg is missing or cannot read it."""
+    import tempfile as _tf
+    try:
+        with _tf.TemporaryDirectory() as home:
+            os.chmod(home, 0o700)
+            r = subprocess.run(['gpg', '--batch', '--homedir', home, '--with-colons', '--show-keys'],
+                               input=armored_key, capture_output=True, text=True, timeout=30)
+        for line in (r.stdout or '').splitlines():
+            f = line.split(':')
+            if f[0] == 'fpr' and len(f) > 9:
+                return f[9].strip().upper()
+    except Exception:
+        pass
+    return ''
 
 
 def _install_docker_nonroot(_log):
@@ -3943,6 +4008,13 @@ def _install_docker_nonroot(_log):
         if rk.returncode != 0 or 'BEGIN PGP PUBLIC KEY' not in (rk.stdout or ''):
             _log('  ⚠ could not download Docker apt signing key')
             return
+        _fpr = _docker_key_fingerprint(rk.stdout)
+        if not _fpr:
+            _pkg_install(['gnupg'], log_fn=_log, timeout=300)
+            _fpr = _docker_key_fingerprint(rk.stdout)
+        if _fpr != DOCKER_APT_KEY_FPR:
+            _log(f'  ⚠ Docker apt signing key refused: fingerprint is {_fpr or "unreadable"}, expected {DOCKER_APT_KEY_FPR}')
+            return
         subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/apt/keyrings']),
                        capture_output=True, text=True, timeout=30)
         _write_priv('/etc/apt/keyrings/docker.asc', rk.stdout)
@@ -3966,8 +4038,8 @@ def _install_docker_nonroot(_log):
 
 def _install_docker_engine(plog=None):
     """Install Docker Engine and verify. Returns True when `docker --version` works
-    afterwards. As root: _docker_install_cmd() (get.docker.com / dnf), unchanged
-    legacy behavior. Non-root console: broker-safe repo + package path — the
+    afterwards. As root: _docker_install_cmd() (Docker's signed apt/dnf repo; ops #637
+    retired the get.docker.com script). Non-root console: broker-safe repo + package path — the
     convenience script's internal sudo cannot work without a TTY (v10.1.5 WS2).
     Never raises: the old per-site calls used timeout=300, and subprocess.run
     RAISES TimeoutExpired (it doesn't return rc) — a slow fresh VM's
@@ -10927,14 +10999,22 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-    # Ensure git works on repos owned by other users (e.g. takwerx-owned
-    # ~/TAK-Portal and ~/CloudTAK when the console process HOME differs from
-    # the repo owner). --system writes to /etc/gitconfig — applies to every
-    # user on the machine, which is correct for a single-tenant server.
-    subprocess.run(
-        ['git', 'config', '--system', '--replace-all', 'safe.directory', '*'],
-        capture_output=True, timeout=5
-    )
+    # ops #637: git trusts the console's own checkout BY NAME (not a wildcard). An older release
+    # wrote a wildcard entry to /etc/gitconfig; it is removed here.
+    # The other checkouts the console touches (TAK-Portal, CloudTAK, plugin caches) pass their own
+    # `-c safe.directory=<path>` at each call.
+    try:
+        _sd = subprocess.run(['git', 'config', '--system', '--get-all', 'safe.directory'],
+                             capture_output=True, text=True, timeout=5)
+        _sd_have = [_l.strip() for _l in (_sd.stdout or '').splitlines()]
+        if '*' in _sd_have:
+            subprocess.run(['git', 'config', '--system', '--unset-all', 'safe.directory', r'^\*$'],
+                           capture_output=True, timeout=5)
+        if console_dir not in _sd_have:
+            subprocess.run(['git', 'config', '--system', '--add', 'safe.directory', console_dir],
+                           capture_output=True, timeout=5)
+    except Exception as _sd_err:
+        print(f"Update Now: could not update safe.directory (continuing): {_sd_err}", flush=True)
     # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
     # `git fetch origin +refs/tags/foo:refs/tags/foo` still updates heads/tags per origin.fetch
     # and can hit "would clobber existing tag" on field installs.
@@ -44350,7 +44430,17 @@ def mediamtx_control():
     return jsonify({'success': True, 'running': running})
 
 
-MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_REF}/config-editor/mediamtx_config_editor.py'
+# Raw files are fetched by COMMIT, never by branch or tag name (ops #637).
+MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_SHA}/config-editor/mediamtx_config_editor.py'
+MEDIAMTX_EDITOR_TEST_VIDEO_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_SHA}/config-editor/truck_60.ts'
+
+
+def _mediamtx_editor_clone_cmd(dest):
+    """Shell command: shallow-clone the editor at MEDIAMTX_EDITOR_REF into `dest` and fail
+    unless HEAD is exactly MEDIAMTX_EDITOR_SHA (ops #637)."""
+    d = shlex.quote(dest)
+    return (f'git clone --depth 1 --branch {shlex.quote(MEDIAMTX_EDITOR_REF)} {shlex.quote(MEDIAMTX_EDITOR_REPO)} {d} && '
+            f'[ "$(git -C {d} rev-parse HEAD)" = {shlex.quote(MEDIAMTX_EDITOR_SHA)} ]')
 
 
 @app.route('/api/mediamtx/recovery', methods=['POST'])
@@ -44926,7 +45016,7 @@ paths:
     _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
     # Web editor: clone on remote and install
     _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
+    ok, _ = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
@@ -45053,7 +45143,7 @@ paths:
     plog("✓ Services started")
 
     # Step 5b: Test video
-    test_video_url = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/truck_60.ts'
+    test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
     plog("  Downloading test video (truck_60.ts)...")
     ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
     if ok_tv:
@@ -45612,8 +45702,15 @@ WantedBy=multi-user.target
                 # meets in the field: a satellite / Ku-band / degraded-LTE link where EVERY
                 # attempt takes 70-80s. Both retries fail identically there; only a longer
                 # per-attempt ceiling helps.
-                r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                    shell=True, capture_output=True, text=True, timeout=90)
+                r = subprocess.run(['git', 'clone', '--depth', '1', '--branch', MEDIAMTX_EDITOR_REF,
+                                    MEDIAMTX_EDITOR_REPO, clone_dir],
+                                   capture_output=True, text=True, timeout=90)
+                if r.returncode == 0:
+                    # ops #637: the clone must be exactly MEDIAMTX_EDITOR_SHA (same check as the remote clone)
+                    _eh = subprocess.run(['git', '-C', clone_dir, 'rev-parse', 'HEAD'],
+                                         capture_output=True, text=True, timeout=15).stdout.strip()
+                    if _eh != MEDIAMTX_EDITOR_SHA:
+                        r = subprocess.CompletedProcess([], 1, '', f'editor tag {MEDIAMTX_EDITOR_REF} is at {_eh[:12] or "?"}, expected {MEDIAMTX_EDITOR_SHA[:12]}')
                 if r.returncode == 0:
                     candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
                     if os.path.exists(candidate):
@@ -45797,7 +45894,7 @@ WantedBy=multi-user.target
         # Download test video
         test_video_dir = f'{webeditor_dir}/test_videos'
         os.makedirs(test_video_dir, exist_ok=True)
-        test_video_url = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/truck_60.ts'
+        test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
         plog("  Downloading test video (truck_60.ts)...")
         r = subprocess.run(f'wget -q -O {test_video_dir}/truck_60.ts "{test_video_url}"',
             shell=True, capture_output=True, text=True, timeout=60)
@@ -51546,7 +51643,7 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 2/6: Ensuring Docker on remote ━━━")
             docker_cmd = (
                 "if ! command -v docker >/dev/null 2>&1; then "
-                "curl -fsSL https://get.docker.com | sh; "
+                + _docker_install_cmd(sudo_fallback=True) + "; "
                 "fi; "
                 "(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); "
                 "(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true); "
@@ -54363,6 +54460,13 @@ def _webodm_odm_limits(detected_cores, cfg):
 #                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
 #                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
 WEBODM_VERSION = '4.0.0'
+# TAK overlay plugin (a personal GitHub account's repo, loaded INTO the WebODM container). ops #637:
+# pinned to a release tag and its commit. The clone is refused unless HEAD is exactly
+# WEBODM_OVERLAY_SHA. Reviewed whole-tree at this ref (module-scan). Bump both together after a
+# deploy + Update on a test box.
+WEBODM_OVERLAY_REPO = 'https://github.com/Humble-Helper-96/webodm-tak-overlay.git'
+WEBODM_OVERLAY_REF = 'v0.8.9'
+WEBODM_OVERLAY_SHA = '3f0efb383a9f1bd022eac15ac4b3da83e643fccc'  # commit of tag v0.8.9 (was the default branch's tip)
 WEBODM_IMAGES = {
     'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
     'wo_broker':  'redis:8.10.2-alpine',
@@ -54623,7 +54727,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog('  Docker not found — installing...')
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog(f'✗ Docker install failed: {(out or "")[-300:]}')
             _webodm_deploy_status.update({'running': False, 'error': True})
@@ -54650,8 +54754,9 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog('━━━ Installing TAK overlay plugin (remote) ━━━')
     ok, out = _module_run(deploy_cfg,
         f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
-        f'git clone --depth=1 https://github.com/Humble-Helper-96/webodm-tak-overlay.git '
+        f'git clone --depth=1 --branch {WEBODM_OVERLAY_REF} {WEBODM_OVERLAY_REPO} '
         f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
+        f'[ "$(git -C {wo_dir_remote}/plugins/webodm-tak-overlay rev-parse HEAD)" = {WEBODM_OVERLAY_SHA} ] && '
         # Upstream ships an empty __init__.py; WebODM needs Plugin re-exported
         # at package level or the plugin never loads (GH #50).
         f'{{ grep -q Plugin {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py 2>/dev/null || '
@@ -54830,11 +54935,14 @@ def _run_webodm_deploy(settings):
             # under the non-root console (reapply path; fresh deploys never hit it).
             subprocess.run(_sudo_wrap(['rm', '-rf', plugin_dir]),
                            capture_output=True, timeout=60, check=True)
-        r = _sp.run(['git', 'clone', '--depth=1',
-                     'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
-                     plugin_dir], capture_output=True, text=True, timeout=60)
+        r = _sp.run(['git', 'clone', '--depth=1', '--branch', WEBODM_OVERLAY_REF,
+                     WEBODM_OVERLAY_REPO, plugin_dir], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
+        _head = _sp.run(['git', '-C', plugin_dir, 'rev-parse', 'HEAD'],
+                        capture_output=True, text=True, timeout=15).stdout.strip()
+        if _head != WEBODM_OVERLAY_SHA:
+            raise RuntimeError(f'Plugin clone refused: {WEBODM_OVERLAY_REF} is at {_head[:12] or "?"}, expected {WEBODM_OVERLAY_SHA[:12]}')
         plog(f'Plugin cloned: {plugin_dir}')
         # The plugin repo ships an EMPTY __init__.py, but WebODM's loader does
         # getattr(<package>, "Plugin") — without a package-level re-export the
@@ -59825,7 +59933,7 @@ volumes:
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker on remote")
             nodered_deploy_status.update({'running': False, 'error': True})
@@ -63465,7 +63573,7 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker")
             authentik_deploy_status.update({'running': False, 'error': True})
@@ -63768,7 +63876,7 @@ entries:
       POSTGRES_USER: ${PG_USER:-authentik}
       POSTGRES_DB: ${PG_DB:-authentik}
   redis:
-    image: docker.io/library/redis:alpine
+    image: AK_REDIS_IMAGE_PLACEHOLDER
     command: --save 60 1 --loglevel warning
     restart: unless-stopped
     healthcheck:
@@ -63885,6 +63993,7 @@ networks:
     external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
+    compose_content = compose_content.replace('AK_REDIS_IMAGE_PLACEHOLDER', AUTHENTIK_REDIS_IMAGE)
     # Adaptive PG tuning: probe remote host RAM and select appropriate settings.
     # v0.9.28 enterprise settings (12GB shared_buffers) crash PG on anything < 48GB.
     _ok_ram, _ram_out = _module_run(deploy_cfg, "free -m 2>/dev/null | awk '/^Mem:/{print $2}'", timeout=10)
@@ -64484,7 +64593,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         if not _has_redis_svc:
             _redis_svc = (
                 '  redis:\n'
-                '    image: docker.io/library/redis:alpine\n'
+                f'    image: {AUTHENTIK_REDIS_IMAGE}\n'
                 '    command: --save 60 1 --loglevel warning\n'
                 '    restart: unless-stopped\n'
                 '    healthcheck:\n'
@@ -64657,7 +64766,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     # v0.9.17: old installs are missing the redis: service (Authentik worker burned CPU retrying localhost:6379)
     if 'redis' not in services:
         services['redis'] = {
-            'image': 'docker.io/library/redis:alpine',
+            'image': AUTHENTIK_REDIS_IMAGE,
             'command': '--save 60 1 --loglevel warning',
             'restart': 'unless-stopped',
             'healthcheck': {
@@ -106837,7 +106946,13 @@ def _mediamtx_editor_grant_journal_access():
 # after the Python version, so an Ubuntu 22.04 -> 24.04 upgrade (3.10 -> 3.12) leaves the
 # editor unable to import Flask and it never starts. One package list and one installer for
 # deploy, Patch, the remote deploy and the heal below.
-_MEDIAMTX_EDITOR_PY_PKGS = ('Flask', 'ruamel.yaml', 'requests', 'psutil')
+# ops #637: exact versions, so every box gets the same packages. requests is held at 2.32.5, the
+# newest release that still runs on Rocky/RHEL 9's Python 3.9 (2.34 needs 3.10). Bump together,
+# after a deploy on Ubuntu and Rocky.
+_MEDIAMTX_EDITOR_PY_PKGS = ('Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2')
+# ops #202: certifi is moved forward on every install so the host python drops roots the OS removed;
+# since ops #637 that means a named version, raised on purpose when a root is distrusted.
+_MEDIAMTX_EDITOR_CERTIFI = 'certifi==2026.10.23'
 _MEDIAMTX_EDITOR_PY_IMPORTS = 'import flask, ruamel.yaml, requests, psutil'
 _MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
 _MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
@@ -106883,7 +106998,7 @@ def _mediamtx_editor_install_py_deps(timeout=120):
     if r.returncode == 0:
         # ops #202: certifi -U every time — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
-        _pip(['pip3', 'install', '-U', 'certifi'] + _flag)
+        _pip(['pip3', 'install', '-U', _MEDIAMTX_EDITOR_CERTIFI] + _flag)
     return r.returncode == 0, (r.stdout or '')
 
 
@@ -106992,7 +107107,7 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
         return (f'export PYTHONNOUSERSITE=1; _pi() {{ o=$(pip3 install "$@" {flag} 2>&1); rc=$?; '
                 f'echo "$o"; if [ $rc -ne 0 ] && echo "$o" | grep -q {shlex.quote(_MEDIAMTX_PIP_DISTRO_OWNED)}; '
                 f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
-                f'_pi {_pkgs} && _pi -U certifi')
+                f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')
 
     ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
     if not ok and 'no such option' in (out or ''):
