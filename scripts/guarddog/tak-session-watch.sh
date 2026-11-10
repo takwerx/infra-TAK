@@ -208,9 +208,17 @@ fi
 # number. Device identity is already read here (takClient / takVersion); their ABSENCE is
 # the signal. Counted separately and reported, never silently dropped — if the
 # classification is ever wrong, the log shows it.
+#
+# ops #628: some fields below come from text a TAK client sends (clientUid, takClient,
+# takVersion), and `read` splits the line on whitespace. So text fields are cut to one
+# plain word and numbers are printed as int, and the shell checks both again after the
+# read and fails closed. Client text must never reach $(( )) or a test.
 read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS KEYS <<EOF
 $(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" python3 -c '
-import json, os, sys, collections
+import json, os, re, sys, collections
+_UNSAFE = re.compile(r"[^A-Za-z0-9._:-]")
+def safe(x, n):           # one shell word, never anything bash can expand
+    return _UNSAFE.sub("-", str(x))[:n] or "-"
 def out(*a): print(" ".join(str(x) for x in a))
 try:
     rows = json.load(sys.stdin).get("data") or []
@@ -253,8 +261,8 @@ for r in rows:
             #
             # Deliberately NOT keyed on a name or uid allowlist — that would fix one product
             # and break for the next thing that connects the same way.
-            _uid  = (r.get("clientUid") or "").strip()
-            _meta = (r.get("takClient") or "").strip() or (r.get("takVersion") or "").strip()
+            _uid  = str(r.get("clientUid") or "").strip()
+            _meta = str(r.get("takClient") or "").strip() or str(r.get("takVersion") or "").strip()
             if not _uid and not _meta:
                 service += 1      # server-side service with no channel: expected, not a fault
             else:
@@ -262,15 +270,16 @@ for r in rows:
     else:
         unknown += 1              # not the pinned shape at all
 
-    uid = (r.get("clientUid") or "").strip()
+    uid = str(r.get("clientUid") or "").strip()
     if uid:                       # empty uid is never device identity
         uid_subs[uid] += 1
-        ip = (r.get("ipAddress") or "").strip()
+        ip = str(r.get("ipAddress") or "").strip()
         if ip:
             ip_uids[ip].add(uid)
         if uid not in uid_meta:
-            uid_meta[uid] = ((r.get("takClient") or "-").replace(" ", "_") or "-",
-                             (r.get("takVersion") or "-").split()[0] or "-")
+            # A blank takVersion used to raise here and blind the whole check (SKIP).
+            uid_meta[uid] = (str(r.get("takClient") or "-").replace(" ", "_") or "-",
+                             (str(r.get("takVersion") or "-").split() or ["-"])[0])
 
 top_uid, top_n = ("-", 0)
 if uid_subs:
@@ -287,10 +296,10 @@ if sock:
     top_ip, top_sock = sock.most_common(1)[0]
     top_ipuids = len(ip_uids.get(top_ip, ()))
 
-out(len(rows), groupless, service, unknown,
-    top_uid[:64] or "-", top_n, tc[:24] or "-", tv[:24] or "-",
-    top_ip, top_sock, top_ipuids,
-    ",".join(sorted(keys)) or "-")
+out(int(len(rows)), int(groupless), int(service), int(unknown),
+    safe(top_uid, 64), int(top_n), safe(tc, 24), safe(tv, 24),
+    safe(top_ip.strip("[]"), 64), int(top_sock), int(top_ipuids),
+    ",".join(safe(k, 64) for k in sorted(keys, key=str)) or "-")
 ' 2>/dev/null)
 EOF
 [ -z "$SUBS" ] && SUBS=ERR
@@ -298,6 +307,20 @@ if [ "$SUBS" = "ERR" ]; then
   _log "SKIP | could not parse subscriptions payload"
   exit 0
 fi
+# ops #628: never trust the split. Every count must be digits only before it reaches
+# $(( )) or a test; anything else fails closed. Text fields go into the log and the
+# email only, and must be one plain word. Only the field NAME is logged, never the value.
+for _v in SUBS GROUPLESS SERVICE UNKNOWN TOPUIDN TOPIPSOCK TOPIPUIDS; do
+  case "${!_v}" in
+    ''|*[!0-9]*) _log "SKIP | subscriptions helper gave a non-number for $_v — not evaluating"; exit 0 ;;
+  esac
+done
+for _v in TOPUID TOPCLIENT TOPVER TOPIP KEYS; do
+  case "${!_v}" in
+    ''|*[!A-Za-z0-9._:,-]*) printf -v "$_v" '%s' '-' ;;
+  esac
+done
+case "$EXTERNAL" in ''|*[!0-9]*) EXTERNAL=0 ;; esac
 
 # Record the schema once so a future release can stop guessing at the group key.
 if [ ! -f "$STATE_DIR/session.schema" ] && [ "$KEYS" != "-" ]; then
