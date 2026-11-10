@@ -3673,6 +3673,65 @@ def _fw_deny(port, proto='tcp'):
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
 
+# Older start.sh runs on RHEL seeded firewalld from every TCP listener with a blanket
+# `--add-port`. These internal ports are console-only and never take a blanket allow:
+# each module scopes its own by source (Guard Dog 8080 → console IP, Email Relay 25 →
+# Docker networks / remote Authentik host as rich rules, Fed Hub UI → Caddy on
+# localhost) or keeps it on the box (TAK's PostgreSQL). Removing the blanket allow
+# leaves those rich rules in place. TAK's 8444/9000/9001 are not here: mTLS
+# connectors an operator may have opened on purpose for federation.
+_FW_CONSOLE_ONLY_TCP = (
+    (25, 'Email Relay (Postfix)'),
+    (5432, 'TAK Server database (PostgreSQL)'),
+    (8080, 'Guard Dog health agent / Federation Hub UI'),
+    (9100, 'Federation Hub UI'),
+)
+
+
+def _fw_remove_blanket_internal_ports(log=None):
+    """Remove a blanket firewalld allow for any port in _FW_CONSOLE_ONLY_TCP, in
+    the public zone and the default zone (start.sh added its seeds without --zone).
+    Runs on every console start, so a box heals on update and after any older start.sh
+    re-run. firewalld only: ufw boxes never ran the seed. Logs each port it closes and
+    returns them as ['zone:port/tcp', ...]. Never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    closed = []
+    try:
+        if _fw_backend() != 'firewalld':
+            return closed
+        zones = ['public']
+        r = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
+                           capture_output=True, text=True, timeout=20)
+        dz = (r.stdout or '').strip()
+        if r.returncode == 0 and re.fullmatch(r'[A-Za-z0-9_-]+', dz or '') and dz not in zones:
+            zones.append(dz)
+        for zone in zones:
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}', '--list-ports']),
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                continue
+            listed = set((r.stdout or '').split())
+            for port, label in _FW_CONSOLE_ONLY_TCP:
+                if f'{port}/tcp' not in listed:
+                    continue
+                rr = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}',
+                                                f'--remove-port={port}/tcp']),
+                                    capture_output=True, text=True, timeout=20)
+                if rr.returncode == 0:
+                    closed.append(f'{zone}:{port}/tcp')
+                    _log(f'Startup migration: firewalld: removed blanket allow for {port}/tcp in zone {zone} '
+                         f'({label}; an older start.sh added it). Source-scoped rules are kept.')
+                else:
+                    _log(f'Startup migration: firewalld: could not close {port}/tcp in zone {zone}: '
+                         f'{((rr.stderr or "") + (rr.stdout or "")).strip()[:120]}')
+        if closed:
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _log(f'Startup migration: firewalld internal-port cleanup error (non-fatal): {str(e)[:160]}')
+    return closed
+
+
 def _selinux_allow_caddy_port(port, log=None):
     """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
     non-standard port by labeling it http_port_t for BOTH tcp AND udp. No-op on
@@ -102355,6 +102414,7 @@ def _start_guarddog_background_at_boot():
 
 
 _start_guarddog_background_at_boot()
+_fw_remove_blanket_internal_ports()   # before the 8080 source-scope below
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
 
