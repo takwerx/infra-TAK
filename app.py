@@ -37235,27 +37235,72 @@ def _caddy_rescue_html_oneline(root_url):
     )
 
 
+def _caddy_fetch_release_binary(dest, log_fn=None):
+    """Fetch the newest Caddy release for this CPU from GitHub, SHA-512 checked, into dest.
+
+    Returns the version string (e.g. '2.11.9') on success, None otherwise (the reason is
+    logged). The tarball and the release's own caddy_<ver>_checksums.txt come from the same
+    GitHub release page that _caddy_install_github_deb() uses; the binary is only written
+    when the tarball's SHA-512 matches that file. Only the member named `caddy` is read out
+    of the archive, in memory (never extractall). Nothing is written to dest on a failure."""
+    import io as _io
+    import tarfile as _tarfile
+    _log = log_fn or (lambda m: None)
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    try:
+        with urllib.request.urlopen('https://github.com/caddyserver/caddy/releases/latest', timeout=30) as r:
+            m = re.search(r'/tag/v(\d+\.\d+\.\d+)$', r.geturl())
+        if not m:
+            _log('  \u2717 could not determine the latest Caddy release from GitHub')
+            return None
+        ver = m.group(1)
+        base = f'https://github.com/caddyserver/caddy/releases/download/v{ver}'
+        tar_name = f'caddy_{ver}_linux_{_arch}.tar.gz'
+        with urllib.request.urlopen(f'{base}/caddy_{ver}_checksums.txt', timeout=30) as r:
+            sums = r.read().decode('utf-8', 'replace')
+        want = next((ln.split()[0] for ln in sums.splitlines()
+                     if len(ln.split()) == 2 and ln.split()[1] == tar_name), None)
+        if not want:
+            _log(f'  \u2717 {tar_name} is not listed in the Caddy v{ver} checksums file')
+            return None
+        with urllib.request.urlopen(f'{base}/{tar_name}', timeout=300) as r:
+            data = r.read()
+        if hashlib.sha512(data).hexdigest() != want.lower():
+            _log(f'  \u2717 {tar_name} failed its SHA-512 check \u2014 not installing it')
+            return None
+        with _tarfile.open(fileobj=_io.BytesIO(data), mode='r:gz') as tf:
+            member = next((t for t in tf.getmembers() if t.name == 'caddy' and t.isfile()), None)
+            if member is None:
+                _log(f'  \u2717 {tar_name} has no caddy binary in it')
+                return None
+            binary = tf.extractfile(member).read()
+        with open(dest, 'wb') as f:
+            f.write(binary)
+        return ver
+    except (OSError, ValueError, _tarfile.TarError) as e:
+        _log(f'  \u2717 Caddy release download failed: {type(e).__name__}: {str(e)[:200]}')
+        return None
+
+
 def _caddy_install_official_static(plog=None):
     """Install the official static Caddy build over the current one. Returns True on success.
 
     Used by the deploy version gate on the dnf side: the RHEL COPR package is the family's
     usual source but can lag, and there is no `--only-upgrade` equivalent there that
-    reliably lands >= 2.7. Verifies the download RUNS before installing it \u2014 a partial
+    reliably lands >= 2.7. The build comes from Caddy's GitHub release, SHA-512 checked
+    against the release's checksums file (_caddy_fetch_release_binary), the same check the
+    .deb path has. Then it verifies the download RUNS before installing it \u2014 a partial
     fetch would otherwise pass a mere presence check and then fail caddy.service with
     203/EXEC. Mirrors the existing EL9 COPR payload-quirk path."""
     _log = plog or (lambda m: print(m, flush=True))
-    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-    _dl = '/tmp/caddy.upgrade.download'
-    _url = f'https://caddyserver.com/api/download?os=linux&arch={_arch}'
+    tmpd = None
     try:
-        # argv throughout — no shell string carries an interpolated value (Dependency Rule).
-        try:
-            os.remove(_dl)
-        except OSError:
-            pass
-        subprocess.run(['curl', '-fsSL', '--retry', '3', '--retry-delay', '2', _url, '-o', _dl],
-                       capture_output=True, text=True, timeout=300)
-        subprocess.run(_sudo_wrap(['chmod', '+x', _dl]), capture_output=True, text=True)
+        tmpd = tempfile.mkdtemp(prefix='caddy-static-')   # 0700, ours: no predictable /tmp path
+        _dl = os.path.join(tmpd, 'caddy')
+        if not _caddy_fetch_release_binary(_dl, _log):
+            return False
+        os.chmod(_dl, 0o755)
+        # argv throughout \u2014 no shell string carries an interpolated value (Dependency Rule).
         ver = subprocess.run([_dl, 'version'], capture_output=True, text=True, timeout=20)
         if ver.returncode != 0:
             _log(f"  \u2717 official static caddy download did not validate: {((ver.stderr or ver.stdout) or 'no output').strip()[:160]}")
@@ -37265,16 +37310,14 @@ def _caddy_install_official_static(plog=None):
         # RHEL: keep the httpd_exec_t label the rpm scriptlet set, else systemd refuses it.
         _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'],
                          ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
-        _log(f"  \u2713 official static caddy {(ver.stdout or '').split()[0] if ver.stdout else ''} installed")
+        _log(f"  \u2713 official static caddy {(ver.stdout or '').split()[0] if ver.stdout else ''} installed (SHA-512 verified)")
         return True
     except (subprocess.TimeoutExpired, OSError) as e:
         _log(f"  \u2717 official static caddy install failed: {str(e)[:160]}")
         return False
     finally:
-        try:
-            os.remove(_dl)
-        except OSError:
-            pass
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
         _caddy_version_cache['ver'] = None
 
 
@@ -40073,25 +40116,10 @@ def run_caddy_deploy(domain):
             # atomically install + apply the fcontext the scriptlet set. Arch-aware.
             # Validated on Rocky 9.6 under SELinux Enforcing.
             plog("  Binary missing after dnf install (known EL9 COPR payload quirk) — installing official static binary...")
-            _caddy_arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-            _caddy_dl = '/tmp/caddy.download'
-            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
-            subprocess.run(
-                f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o {_caddy_dl}',
-                shell=True, capture_output=True, text=True, timeout=300)
-            subprocess.run(_sudo_wrap(['chmod', '+x', _caddy_dl]), capture_output=True, text=True)
-            # verify the downloaded binary actually executes before trusting it
-            _caddy_ver = subprocess.run(f'{_caddy_dl} version', shell=True, capture_output=True, text=True, timeout=20)
-            if _caddy_ver.returncode == 0:
-                subprocess.run(_sudo_wrap(['install', '-m', '0755', _caddy_dl, '/usr/bin/caddy']), capture_output=True, text=True, timeout=30)
-                # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
-                # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
-                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
+            # The same helper the version gate uses: GitHub release tarball, SHA-512 checked,
+            # verified to run, installed with the fcontext. Then make sure /etc/caddy exists.
+            if _caddy_install_official_static(plog):
                 subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/caddy']), capture_output=True, text=True)
-                plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
-            else:
-                plog(f"  ✗ static caddy download did not validate: {((_caddy_ver.stderr or _caddy_ver.stdout) or 'no output').strip()[:160]}")
-            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
             # functional final check (not mere presence) so we never false-report success
             r = subprocess.run('caddy version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
@@ -40172,22 +40200,7 @@ def run_caddy_deploy(domain):
         # static binary, so a missing/broken binary can never reach systemd. Idempotent.
         if pkg_mgr == 'dnf' and subprocess.run('caddy version', shell=True, capture_output=True).returncode != 0:
             plog("  Caddy binary missing/non-functional before start — installing official static binary…")
-            _ca = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
-            subprocess.run(f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_ca}" -o /tmp/caddy.download',
-                           shell=True, capture_output=True, timeout=300)
-            try:
-                os.chmod('/tmp/caddy.download', 0o755)  # console-owned /tmp scratch; direct
-            except OSError:
-                pass
-            _cv = subprocess.run('/tmp/caddy.download version', shell=True, capture_output=True, text=True, timeout=20)
-            if _cv.returncode == 0:
-                subprocess.run(_sudo_wrap(['install', '-m', '0755', '/tmp/caddy.download', '/usr/bin/caddy']), capture_output=True, timeout=30)
-                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
-                plog(f"  ✓ official static caddy {(_cv.stdout or '').split()[0] if _cv.stdout else ''} installed")
-            else:
-                plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
-            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
+            _caddy_install_official_static(plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True)
         r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if r.returncode != 0:
