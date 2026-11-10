@@ -1,12 +1,11 @@
 # Security
 
-## Reporting a vulnerability
+## Reporting a security problem
 
-Please report it privately: open this repository's **Security** tab and choose
-**Report a vulnerability**
-([direct link](https://github.com/takwerx/infra-TAK/security/advisories/new)).
-Do not open a public issue, and do not post details, logs or proof-of-concept
-data where others can read them.
+Do not report vulnerabilities, CVEs, exploits, leaked keys or passwords in
+public issues, discussions or pull requests. Email **takwerx@gmail.com**
+instead. Include what is affected, the version, and how to reproduce it. If you
+have a fix, attach or describe it.
 
 ## Supported versions
 
@@ -14,9 +13,10 @@ Only the latest release gets security fixes. Update before reporting.
 
 ## What to expect
 
-We acknowledge a report within 3 working days, tell you whether we can
-reproduce it, and keep you updated until a fix ships. Confirmed issues are
-fixed in a new release and credited to you if you want.
+We reply within 3 working days, work with you privately until a fix ships, and
+credit you if you want.
+
+Please do not disclose it publicly until a fix is released.
 
 ## Scope
 
