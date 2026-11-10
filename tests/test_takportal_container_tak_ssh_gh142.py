@@ -69,6 +69,7 @@ def _setup_ssh(monkeypatch, tmp_path, container, probe='direct'):
         'os': os,
         'subprocess': types.SimpleNamespace(run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='', stderr='')),
         '_takportal_ref': lambda: 'tak-portal',
+        '_takportal_trust_portal_key': lambda pub, log_fn=None: 'written',  # ops #644
         '_sudo_wrap': lambda c: c,
         '_takportal_push_settings': lambda restart=False: None,
         '_takportal_install_sudoers': lambda log_fn=None: (True, 'skipped'),
