@@ -14,7 +14,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Caddy security floor (2.11.8 on apt, 2.11.7 on dnf; ops #487).
+"""Caddy security floor (2.11.8 on apt and dnf; ops #487, ops #609).
 
 Caddy is not pinned: a box keeps whatever version it was installed at. The fleet
 was mixed (2.11.4 on most boxes, 2.11.7 on one), and the only version gate was
@@ -26,8 +26,12 @@ gRPC streams (measured: a 90 s quiet HTTP/2 body is cut at 60.0 s through 2.11.7
 completes through 2.11.4 and through 2.11.7 with `read_body_idle -1s`).
 
 ops #487: 2.11.8 closes the Go HTTP/2 denial-of-service batch. Cloudsmith apt had it on
-2026-11-04, the @caddy/caddy COPR (Rocky/RHEL) still only 2.11.7-1, so the floor is per
-package manager: one shared floor would leave every dnf box short for good.
+2026-11-04, the @caddy/caddy COPR (Rocky/RHEL) still only 2.11.7-1, so the floor was per
+package manager and the dnf floor stayed at 2.11.7.
+
+ops #609: the COPR was still on 2.11.7-1 on 2026-11-10, which left every Rocky/RHEL box below the
+security update. The dnf floor is now 2.11.8: the COPR is asked first and, while
+it lags, the official static build is taken. The constants stay per package manager.
 
 app.py cannot be imported in a test, so the helper is cut out of it and run
 against stubs: the code under test is the shipped text.
@@ -60,7 +64,7 @@ class _Box:
     def __init__(self, version, pm='apt', repo_ok=True, pkg_gives=None,
                  fallback_gives=None, validate=('ok', '')):
         self.version, self.pm, self.repo_ok = version, pm, repo_ok
-        # What the sources serve. Unset = the newest each one carried on 2026-11-04:
+        # What the sources serve. Unset = the newest each one carried on 2026-11-10:
         # Cloudsmith apt 2.11.8, the COPR 2.11.7. `False` = the source gives nothing.
         newest = (2, 11, 7) if pm == 'dnf' else (2, 11, 8)
         self.pkg_gives = newest if pkg_gives is None else (pkg_gives or None)
@@ -119,15 +123,16 @@ class _Box:
         return [c for c in self.calls if 'restart' in c]
 
 
-def test_the_floor_is_2_11_8_on_apt_and_2_11_7_on_dnf():
+def test_the_floor_is_2_11_8_on_apt_and_on_dnf():
+    """ops #609: a dnf floor below 2.11.8 leaves Rocky/RHEL below the Caddy security update."""
     ns = {'_pkg_mgr': lambda: 'apt'}
     exec(_segment('_CADDY_MIN_SECURE') + '\n' + _segment('_CADDY_MIN_SECURE_DNF') + '\n'
          + _segment('_caddy_min_secure'), ns)
     assert ns['_CADDY_MIN_SECURE'] == (2, 11, 8)
     assert ns['_caddy_min_secure']() == (2, 11, 8)
     ns['_pkg_mgr'] = lambda: 'dnf'
-    assert ns['_CADDY_MIN_SECURE_DNF'] == (2, 11, 7)
-    assert ns['_caddy_min_secure']() == (2, 11, 7)
+    assert ns['_CADDY_MIN_SECURE_DNF'] >= (2, 11, 8)
+    assert ns['_caddy_min_secure']() >= (2, 11, 8)
 
 
 @pytest.mark.parametrize('version', [(2, 11, 8), (2, 12, 0), (3, 0, 0)])
@@ -143,11 +148,29 @@ def test_apt_2_11_7_is_lifted_to_2_11_8():
     assert box.did('pkg_install') and len(box.restarts) == 1
 
 
-def test_dnf_2_11_7_is_at_the_floor_while_the_copr_is_still_on_it():
-    """The ops #487 trap: a shared 2.11.8 floor would send this box to the static build on every start."""
+def test_dnf_2_11_7_is_lifted_to_2_11_8_by_the_static_build_while_the_copr_lags():
+    """ops #609: the COPR still serves 2.11.7, so a Rocky/RHEL box on 2.11.7 takes the official build."""
     box = _Box((2, 11, 7), pm='dnf')
-    assert box.lift() == ((2, 11, 7), (2, 11, 7))
+    assert box.lift() == ((2, 11, 7), (2, 11, 8))
+    assert ('pkg_install', 'caddy') in box.calls
+    assert box.did('static') and len(box.restarts) == 1
+    assert not box.did('ensure_repo') and not box.did('github_deb')
+
+
+def test_dnf_box_lifted_by_the_static_build_is_left_alone_on_the_next_start():
+    """The static build is not a loop: the next console start reads 2.11.8 and does nothing."""
+    box = _Box((2, 11, 7), pm='dnf')
+    box.lift()
+    box.calls.clear()
+    assert box.lift() == ((2, 11, 8), (2, 11, 8))
     assert box.calls == []
+
+
+def test_dnf_2_11_7_takes_the_copr_build_and_no_static_once_the_copr_has_2_11_8():
+    """If the COPR catches up, nothing breaks: dnf supplies the floor and the static build is skipped."""
+    box = _Box((2, 11, 7), pm='dnf', pkg_gives=(2, 11, 9))
+    assert box.lift() == ((2, 11, 7), (2, 11, 9))
+    assert not box.did('static')
 
 
 def test_an_unreadable_version_is_left_alone():
@@ -180,8 +203,8 @@ def test_apt_falls_back_when_the_repo_is_behind():
 
 
 def test_dnf_lifts_from_the_copr():
-    box = _Box((2, 11, 4), pm='dnf')
-    assert box.lift()[1] == (2, 11, 7)
+    box = _Box((2, 11, 4), pm='dnf', pkg_gives=(2, 11, 8))
+    assert box.lift()[1] == (2, 11, 8)
     assert ('pkg_install', 'caddy') in box.calls
     assert not box.did('static')
     assert not box.did('ensure_repo')
@@ -191,6 +214,20 @@ def test_dnf_falls_back_to_the_static_build_when_the_copr_lags():
     box = _Box((2, 11, 4), pm='dnf', pkg_gives=False)
     assert box.lift()[1] == (2, 11, 8)
     assert box.did('static')
+
+
+def test_dnf_falls_back_to_the_static_build_when_the_copr_is_behind_the_floor():
+    """The COPR answers but with 2.11.7 (ops #609): still short, so the static build."""
+    box = _Box((2, 11, 4), pm='dnf')
+    assert box.lift()[1] == (2, 11, 8)
+    assert ('pkg_install', 'caddy') in box.calls and box.did('static')
+
+
+def test_dnf_with_no_source_reachable_says_so_and_does_not_restart():
+    box = _Box((2, 11, 7), pm='dnf', fallback_gives=False)
+    assert box.lift() == ((2, 11, 7), (2, 11, 7))
+    assert any('still 2.11.7' in m for m in box.log)
+    assert box.restarts == []
 
 
 def test_still_short_is_said_out_loud_and_not_restarted_into():

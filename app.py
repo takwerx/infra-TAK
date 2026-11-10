@@ -36983,8 +36983,12 @@ _CADDY_MIN_TRUST_POOL = (2, 8)
 # verified 2026-11-04 Cloudsmith apt carries 2.11.8 while the @caddy/caddy COPR is still on
 # 2.11.7-1. One floor for both would leave every dnf box permanently short, falling back to
 # the static build on each console start. Raise _CADDY_MIN_SECURE_DNF once the COPR has it.
+# ops #609: the COPR still only had 2.11.7-1 on 2026-11-10 (upstream 2.11.9 since 2026-11-05),
+# so Rocky/RHEL stayed below the security update. The dnf floor is now 2.11.8 too: _caddy_lift_to_secure_floor asks the COPR first and, when it is still
+# short, takes the official static build. A COPR that catches up later changes nothing here:
+# dnf serves the same or a newer version, and the floor is met either way.
 _CADDY_MIN_SECURE = (2, 11, 8)
-_CADDY_MIN_SECURE_DNF = (2, 11, 7)
+_CADDY_MIN_SECURE_DNF = (2, 11, 8)
 # `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
 _CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
 
