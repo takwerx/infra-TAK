@@ -54019,6 +54019,87 @@ def emailrelay_retry_queue():
     return jsonify({'success': True})
 
 
+# ── Safe archive extraction (shared) ─────────────────────────────────────────
+# Every place that unpacks an archive a person uploaded goes through these two
+# helpers. An entry name is data from outside: it must never decide where a file
+# lands. Nothing is written when any entry is refused.
+
+def _safe_archive_name(name):
+    """The entry name as a list of path parts, or raise ValueError if it is absolute,
+    holds a NUL byte, or climbs out with '..' (a backslash counts as a separator too)."""
+    if '\x00' in name:
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    flat = name.replace('\\', '/')
+    if flat.startswith('/') or re.match(r'^[A-Za-z]:', flat):
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    parts = [p for p in flat.split('/') if p not in ('', '.')]
+    if '..' in parts:
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    return parts
+
+
+def _safe_extract_zip(zf, dest_dir, strip_prefix='', apply_modes=False):
+    """Extract an open ZipFile under dest_dir and never anywhere else.
+
+    Refuses (ValueError, before anything is written): absolute names, '..', symlink
+    and other non-file entries, and any target whose real path is outside dest_dir.
+    strip_prefix drops one wrapping top folder (entries outside it are refused).
+    apply_modes re-applies the rwx bits the zip records (never setuid/setgid/sticky).
+    Returns the list of file paths written."""
+    real_dest = os.path.realpath(dest_dir)
+    plan = []
+    for info in zf.infolist():
+        parts = _safe_archive_name(info.filename)
+        kind = (info.external_attr >> 16) & 0o170000
+        if kind not in (0, 0o100000, 0o040000):
+            raise ValueError(f'unsafe entry type in archive (link or special file): {info.filename!r}')
+        if strip_prefix:
+            if parts[:1] != [strip_prefix]:
+                raise ValueError(f'unexpected path in archive: {info.filename!r}')
+            parts = parts[1:]
+        if not parts:
+            continue
+        target = os.path.realpath(os.path.join(real_dest, *parts))
+        if target != real_dest and not target.startswith(real_dest + os.sep):
+            raise ValueError(f'unsafe path in archive: {info.filename!r}')
+        plan.append((info, target))
+    written = []
+    for info, target in plan:
+        if info.is_dir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(info) as src, open(target, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        written.append(target)
+        mode = (info.external_attr >> 16) & 0o777
+        if apply_modes and mode:
+            try:
+                os.chmod(target, mode)
+            except OSError:
+                pass
+    return written
+
+
+def _safe_tar_check(tf, dest_dir):
+    """Raise ValueError unless extracting this open TarFile under dest_dir stays inside
+    it: no absolute names, no '..', no device/fifo entries, and every symlink or hard
+    link must point inside dest_dir. Call it before `tar -x` or tf.extract*."""
+    real_dest = os.path.realpath(dest_dir)
+    for m in tf.getmembers():
+        parts = _safe_archive_name(m.name)
+        if m.isdev() or m.isfifo():
+            raise ValueError(f'unsafe entry type in archive (special file): {m.name!r}')
+        if m.issym() or m.islnk():
+            link = m.linkname or ''
+            if link.startswith('/') or '\x00' in link:
+                raise ValueError(f'unsafe link in archive: {m.name!r}')
+            base = parts[:-1] if m.issym() else []     # a hard link is relative to the archive root
+            tgt = os.path.normpath(os.path.join(real_dest, *base, link))
+            if tgt != real_dest and not tgt.startswith(real_dest + os.sep):
+                raise ValueError(f'unsafe link in archive: {m.name!r}')
+
+
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
 def _cesium_dir():
@@ -54211,27 +54292,14 @@ def cesium_tiles_upload():
             if not has_tileset:
                 return jsonify({'success': False, 'error': 'Zip does not contain a tileset.json — make sure you zipped the dataset folder itself, not just its contents'})
             # Detect if there is a single top-level directory wrapping everything
-            top_dirs = {n.split('/')[0] for n in names if n}
+            # (normalised names; a refused name raises ValueError and nothing is written)
+            top_dirs = {_safe_archive_name(n)[0] for n in names if _safe_archive_name(n)}
             single_wrap = (len(top_dirs) == 1 and not any(
                 n == 'tileset.json' for n in names
             ))
             os.makedirs(dest_dir, exist_ok=True)
-            if single_wrap:
-                # Strip the wrapping directory when extracting
-                wrap = list(top_dirs)[0]
-                for member in zf.infolist():
-                    rel = member.filename[len(wrap):].lstrip('/')
-                    if not rel:
-                        continue
-                    target = os.path.join(dest_dir, rel)
-                    if member.filename.endswith('/'):
-                        os.makedirs(target, exist_ok=True)
-                    else:
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        with zf.open(member) as src, open(target, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
-            else:
-                zf.extractall(dest_dir)
+            # Strip the wrapping directory (if any) while extracting; never write outside dest_dir
+            _safe_extract_zip(zf, dest_dir, strip_prefix=list(top_dirs)[0] if single_wrap else '')
     except zipfile.BadZipFile:
         return jsonify({'success': False, 'error': 'File is not a valid zip archive'})
     except Exception as e:
@@ -91493,6 +91561,14 @@ def takserver_snapshot_upload_api():
         if not has_core and not has_pgdump:
             return jsonify({'ok': False, 'error': 'Archive does not appear to be a TAK Server snapshot (missing CoreConfig.xml and cot.pgdump)'}), 400
 
+        # Refuse an archive that would write outside SNAPSHOT_DIR (../, absolute names,
+        # links pointing out, device files) before anything is extracted
+        try:
+            with _tarfile.open(tmp_path, 'r:gz') as tf:
+                _safe_tar_check(tf, SNAPSHOT_DIR)
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': f'Unsafe archive: {e}'}), 400
+
         # Extract — honour the top-level directory inside the archive (tar -C SNAPSHOT_DIR)
         result = subprocess.run(
             ['tar', '-xzf', tmp_path, '-C', SNAPSHOT_DIR],
@@ -91948,12 +92024,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
-                for info in zf.infolist():
-                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if mode and not info.is_dir():
-                        try: os.chmod(out_path, mode)
-                        except OSError: pass
+                _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as e:
             return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
         _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
@@ -94041,14 +94112,7 @@ def _deploy_takserver_container(config):
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
-                for info in zf.infolist():
-                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if mode and not info.is_dir():
-                        try:
-                            os.chmod(out_path, mode)
-                        except OSError:
-                            pass
+                _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as _ze:
             log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
             deploy_status.update({'error': True, 'running': False}); return
