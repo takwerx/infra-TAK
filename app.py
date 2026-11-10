@@ -27842,6 +27842,9 @@ KNOWN_SECURITY_RELEASES = (
     {'component': 'cloudtak', 'fixed_in': '13.113.0',
      'reason': 'body-parser security fix GHSA-27r3-jxmh-p828 (an unauthenticated request '
                'could crash the API)'},
+    # ops #606: WebODM 4.0.0 replaces the end-of-life Django 2.2 that 3.x runs.
+    {'component': 'webodm', 'fixed_in': '4.0.0',
+     'reason': 'an end-of-life Django with known flaws'},
 )
 
 
@@ -28543,6 +28546,24 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
                 pending.append(_apply_security_identity(ct))
     except Exception as e:
         print(f"[update-notify] CloudTAK check failed: {e}", flush=True)
+    try:
+        # ops #606: WebODM's Update is the operator's to press after the console update, so
+        # it needs its own mail line. Its Update backs up the database first.
+        if detect_modules().get('webodm', {}).get('installed'):
+            info = _get_webodm_version_info()
+            if info.get('version') and info.get('update_available') and info.get('latest'):
+                wo = {'key': 'webodm', 'label': 'WebODM',
+                      'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
+                      'identity': str(info['latest']),
+                      'how': 'WebODM page → Update (makes a backup first; the database upgrade '
+                             'cannot be undone without the backup).'}
+                known = ['Fixes ' + k for k in _known_security_fixed_by(
+                    'webodm', info['version'], info['latest'])]
+                if known:
+                    wo['security'] = known
+                pending.append(_apply_security_identity(wo))
+    except Exception as e:
+        print(f"[update-notify] WebODM check failed: {e}", flush=True)
     try:
         pending.extend(_os_security_items(seen, unknown))
     except Exception as e:
