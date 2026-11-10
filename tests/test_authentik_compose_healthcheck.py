@@ -42,7 +42,7 @@ yaml = pytest.importorskip('yaml')
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
-_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches'}
+_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches', '_authentik_loopback_port'}
 
 # goauthentik.io/docker-compose.yml as served 2026-10-07 (2026.8.3 template): no healthcheck
 # on server or worker — exactly what a fresh deploy downloads.
