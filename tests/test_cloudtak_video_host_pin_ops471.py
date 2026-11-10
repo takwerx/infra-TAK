@@ -96,6 +96,7 @@ def _override(pin):
         '_host_arch': lambda: 'x86_64', '_container_ca_trust': lambda node=False: ('', ''),
         '_cloudtak_video_host_pin': lambda s: pin,
         '_cloudtak_stream_host_pin': lambda s: '',
+        '_cloudtak_takserver_host_pin': lambda s: None,   # infra-TAK #439: has its own tests
     }
     ns['_sock'] = None
     src = _fn('_cloudtak_build_override_yml')

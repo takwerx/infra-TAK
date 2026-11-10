@@ -125,6 +125,7 @@ def _override(tmp_path, mode='local', bundle=HOST):
         '_get_takserver_host': lambda s: '',
         '_cloudtak_video_host_pin': lambda s: '',        # ops #471: the pin has its own tests
         '_cloudtak_stream_host_pin': lambda s: '',       # ops #560: the pin has its own tests
+        '_cloudtak_takserver_host_pin': lambda s: None,   # infra-TAK #439: has its own tests
         '_get_cloudtak_deployment_config': lambda s: {'target_mode': mode},
         '_host_arch': lambda: 'amd64', '_ensure_infratak_docker_network': lambda: None,
         'INFRATAK_DOCKER_NETWORK': 'infratak',

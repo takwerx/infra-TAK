@@ -174,7 +174,7 @@ def test_startup_migration_skips_a_root_box_without_webodm():
 def test_update_writes_the_pins_before_pulling():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update'))
-    assert body.index('_webodm_pin_images(') < body.index("_webodm_compose(wo_dir, 'pull')")
+    assert body.index('_webodm_pin_images(') < body.index("_webodm_compose(wo_dir, 'pull'")
     assert '_write_priv(compose_path' in body
 
 
