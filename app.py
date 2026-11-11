@@ -901,6 +901,42 @@ def _atomic_replace_local(path, data, perm=None):
             os.close(dfd)
     except OSError:
         pass
+
+
+# ops #645 W2 part 2a: Guard Dog scripts are root-run, so on a broker that runs from its
+# root-owned copy of infra-TAK, root fills in the template itself (broker op gd_render)
+# and the console sends only the values. One pass, same as the broker's _gd_fill (a test
+# keeps the two patterns equal).
+_GD_PLACEHOLDER_RE = re.compile(r'\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b')
+
+
+def _gd_fill(template, values):
+    return _GD_PLACEHOLDER_RE.sub(lambda m: values.get(m.group(0), m.group(0)), template)
+
+
+def _gd_install_script(name, template, values, perm=0o755):
+    """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
+    file changed. A broker on the root-owned layout renders it from ITS copy of the
+    template (the console cannot choose the code root runs); an older broker, or a
+    root console, gets the old fill-here-and-write. Raises if the broker refuses."""
+    values = {k: '' if v is None else str(v) for k, v in values.items()}
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'gd_render', 'name': name, 'values': values})
+        if resp.get('ok'):
+            return bool(resp.get('changed'))
+        err = str(resp.get('error') or '')
+        if not (err.startswith('unknown op') or 'root-owned copy' in err):
+            raise BrokerError(f'Guard Dog script {name} not installed: {err}')
+    content = _gd_fill(template, values)
+    dest = os.path.join('/opt/tak-guarddog', name)
+    try:
+        if _read_priv(dest) == content:
+            if perm is not None:
+                _chmod_priv(dest, perm)   # repair a lost +x; chmod leaves mtime alone
+            return False
+    except Exception:
+        pass
+    _write_priv(dest, content, perm=perm)
     return True
 
 
@@ -20035,27 +20071,21 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         if not os.path.isfile(src):
             continue
         try:
-            content = open(src, 'r', encoding='utf-8').read()
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
-                .replace('EXTERNAL_DB_PLACEHOLDER', external_db_flag))
-            content = (content
-                .replace('DB_HOST_PLACEHOLDER', db_host)
-                .replace('DB_PORT_PLACEHOLDER', db_port)
-                .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
-                .replace('SSH_USER_PLACEHOLDER', s1_user))
-            # This runs on every console start: leave an identical script alone (re-assert +x
-            # only), same as run_guarddog_deploy(), so mtimes only move when content does.
-            try:
-                if _read_priv(dest) == content:
-                    _chmod_priv(dest, 0o755)
-                    continue
-            except Exception:
-                pass
-            _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
+            template = open(src, 'r', encoding='utf-8').read()
+            # This runs on every console start: an identical script is left alone (+x
+            # re-asserted), same as run_guarddog_deploy(), so mtimes only move when content
+            # does. ops #645 W2 part 2a: root renders it from its own copy (gd_render).
+            _gd_install_script(name, template, {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
+                'EXTERNAL_DB_PLACEHOLDER': external_db_flag,
+                'DB_HOST_PLACEHOLDER': db_host,
+                'DB_PORT_PLACEHOLDER': db_port,
+                'SSH_KEY_PLACEHOLDER': ssh_key_path,
+                'SSH_USER_PLACEHOLDER': s1_user,
+            })
         except Exception as e:
             return False, f'{name}: {e}'
     try:
@@ -30370,50 +30400,43 @@ def run_guarddog_deploy(alert_email):
                 plog(f"✗ Missing script: {name}")
                 guarddog_deploy_status.update({'running': False, 'error': True})
                 return
-            content = open(src, 'r').read()
+            template = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+            vals = {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': alert_sms or '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
                 # v10.1.40: the updates watcher must compare Authentik against what THIS
                 # box's console will actually offer, not upstream latest — see
                 # scripts/guarddog/tak-updates-watch.sh.
-                .replace('UPDATE_CHANNEL_PLACEHOLDER',
-                         (settings.get('update_channel') or 'main').strip().lower())
-                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
+                'UPDATE_CHANNEL_PLACEHOLDER': (settings.get('update_channel') or 'main').strip().lower(),
+                'AK_VETTED_PLACEHOLDER': AUTHENTIK_VETTED_RELEASE,
+            }
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
-                content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
-                content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
-                content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
-                # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
-                # Leaving the placeholder in made the two renders differ, so every Update Now
-                # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')
+                vals.update({
+                    'DB_HOST_PLACEHOLDER': s1_host,
+                    'DB_PORT_PLACEHOLDER': db_port,
+                    'SSH_KEY_PLACEHOLDER': ssh_key_path,
+                    'SSH_USER_PLACEHOLDER': s1_user,
+                    # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
+                    # Leaving the placeholder in made the two renders differ, so every Update Now
+                    # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
+                    'EXTERNAL_DB_PLACEHOLDER': '',
+                })
             if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
                 fh_remote = fh_cfg.get('remote', {})
-                fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
-                fh_ssh_user = (fh_remote.get('username') or 'root').strip()
-                content = content.replace('FEDHUB_HOST_PLACEHOLDER', fh_host)
-                content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
-                content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
-            dest = os.path.join('/opt/tak-guarddog', name)
-            _perm = 0o755 if name.endswith('.sh') else None
-            try:
-                _unchanged = _read_priv(dest) == content
-            except Exception:
-                _unchanged = False
-            if _unchanged and _perm is not None:
-                try:
-                    _chmod_priv(dest, _perm)   # still repair a lost +x; chmod leaves mtime alone
-                except Exception:
-                    _unchanged = False         # legacy non-root: let _write_priv's sudo chmod do it
-            if _unchanged:
-                continue
-            _write_priv(dest, content, perm=_perm)
-            changed.append(name)
+                vals.update({
+                    'FEDHUB_HOST_PLACEHOLDER': fh_host,
+                    'SSH_KEY_PLACEHOLDER': (fh_remote.get('ssh_key_path') or '').strip(),
+                    'SSH_USER_PLACEHOLDER': (fh_remote.get('username') or 'root').strip(),
+                })
+            # ops #645 W2 part 2a: root renders it from its own copy (gd_render). An
+            # identical script is left alone (+x re-asserted), so mtimes only move when
+            # the content does.
+            if _gd_install_script(name, template, vals,
+                                  perm=0o755 if name.endswith('.sh') else None):
+                changed.append(name)
         if changed:
             plog(f"✓ Scripts installed: {len(changed)} changed ({', '.join(sorted(changed))}), "
                  f"{len(script_files) - len(changed)} already current")
@@ -104334,42 +104357,40 @@ def _auto_update_guarddog():
                 if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
                     continue
             with open(src) as f:
-                content = f.read()
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                template = f.read()
+            vals = {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
                 # v10.1.40: the updates watcher must compare Authentik against what THIS
                 # box's console will actually offer, not upstream latest — see
                 # scripts/guarddog/tak-updates-watch.sh.
-                .replace('UPDATE_CHANNEL_PLACEHOLDER',
-                         (settings.get('update_channel') or 'main').strip().lower())
-                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
+                'UPDATE_CHANNEL_PLACEHOLDER': (settings.get('update_channel') or 'main').strip().lower(),
+                'AK_VETTED_PLACEHOLDER': AUTHENTIK_VETTED_RELEASE,
+            }
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
-                content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
-                content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
-                content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # as run_guarddog_deploy() and the startup sync
+                vals.update({
+                    'DB_HOST_PLACEHOLDER': s1_host,
+                    'DB_PORT_PLACEHOLDER': db_port,
+                    'SSH_KEY_PLACEHOLDER': ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'),
+                    'SSH_USER_PLACEHOLDER': s1_user,
+                    'EXTERNAL_DB_PLACEHOLDER': '',   # as run_guarddog_deploy() and the startup sync
+                })
             if baked:
-                for _k, _v in baked.items():
-                    content = content.replace(f'{_k}_PLACEHOLDER', _v)
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # an install that never filled it: two-server
+                vals.update({f'{_k}_PLACEHOLDER': _v for _k, _v in baked.items()})
+                vals.setdefault('EXTERNAL_DB_PLACEHOLDER', '')   # an install that never filled it: two-server
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
                 _fh_remote = _fh_cfg.get('remote', {})
-                content = content.replace('FEDHUB_HOST_PLACEHOLDER', (_fh_remote.get('host') or '').strip())
-                content = content.replace('SSH_KEY_PLACEHOLDER', (_fh_remote.get('ssh_key_path') or '').strip())
-                content = content.replace('SSH_USER_PLACEHOLDER', (_fh_remote.get('username') or 'root').strip())
-            dest = os.path.join('/opt/tak-guarddog', name)
-            try:
-                if _read_priv(dest) == content:   # v10.0.5 non-root: /opt/tak-guarddog root-owned
-                    continue
-            except Exception:
-                pass
-            _write_priv(dest, content, perm=0o755)
-            updated += 1
+                vals.update({
+                    'FEDHUB_HOST_PLACEHOLDER': (_fh_remote.get('host') or '').strip(),
+                    'SSH_KEY_PLACEHOLDER': (_fh_remote.get('ssh_key_path') or '').strip(),
+                    'SSH_USER_PLACEHOLDER': (_fh_remote.get('username') or 'root').strip(),
+                })
+            # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
+            if _gd_install_script(name, template, vals):
+                updated += 1
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
@@ -104796,6 +104817,14 @@ def _startup_ensure_broker():
             if _ln.strip().startswith('Environment=TAKWERX_BROKER_ENFORCE='):
                 enforce_line = _ln.strip() + '\n'
                 break
+        # ops #645 W1: once the broker moved itself to its root-owned code, keep that
+        # ExecStart. Writing the repo path back would run console-owned code as root.
+        exec_line = f'ExecStart={venv_py} {broker_py} serve\n'
+        for _ln in existing.splitlines():
+            if (_ln.strip().startswith('ExecStart=')
+                    and ' /usr/local/lib/infratak-broker/current/' in _ln):
+                exec_line = _ln.strip() + '\n'
+                break
         unit = (
             '[Unit]\n'
             'Description=infra-TAK privileged broker (least-privilege console mediation)\n'
@@ -104804,7 +104833,7 @@ def _startup_ensure_broker():
             '[Service]\n'
             'Type=simple\n'
             f'{selinux_line}'
-            f'ExecStart={venv_py} {broker_py} serve\n'
+            f'{exec_line}'
             'Restart=always\n'
             'RestartSec=2\n'
             # v10.2.8 W3: NO RuntimeMaxSec. systemd's stop SIGTERMs the whole cgroup, so
@@ -107821,7 +107850,7 @@ def _startup_ensure_metrics_collector():
         if want == have and active:
             return  # current version already applied AND running — no churn on every boot
         # (re)install: script
-        _write_priv('/opt/tak-guarddog/tak-metrics-collector.py', new_src)
+        _gd_install_script('tak-metrics-collector.py', new_src, {}, perm=None)   # ops #645 W2 part 2a
         # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Through the
         # one writer: the open() read here failed on a non-root console (root-owned, 600), fell
         # back to {}, and replaced the whole file with just the cert pass (GH #101).
@@ -114536,6 +114565,52 @@ def _post_update_auto_deploy():
 # its own refresh. Synchronous and bounded (~20s worst case) — it MUST complete
 # before _startup_migrations()/_post_update_auto_deploy() start issuing broker
 # ops, so the restart can never kill an in-flight migration operation.
+def _console_head_commit():
+    try:
+        r = subprocess.run(['git', '-C', BASE_DIR, 'rev-parse', 'HEAD'],
+                           capture_output=True, text=True, timeout=20)
+        c = (r.stdout or '').strip()
+        return c if r.returncode == 0 and re.match(r'^[0-9a-f]{40}$', c) else ''
+    except Exception:
+        return ''
+
+
+def _broker_converge_root_commit(resp, _ping, _log, sleep=None, head=None):
+    """ops #645 W1: the broker runs from /usr/local/lib/infratak-broker/<commit>.
+    When this checkout is on another commit, ask the broker to fetch, verify and
+    install it (op broker_update), then wait for it to come back on that commit.
+    A refusal (commit not on GitHub, or an older broker security level) keeps the
+    running broker and is logged; it is not an error for the console."""
+    import time as _tm
+    sleep = sleep or _tm.sleep
+    have = (resp.get('installed_commit') or '').strip()
+    want = head if head is not None else _console_head_commit()
+    if not want or want == have:
+        return False
+    _log(f"[broker-converge] broker runs {have[:12]}, console is on {want[:12]} "
+         f"— asking the broker to install {want[:12]} from GitHub")
+    try:
+        r = subprocess.run([_sys.executable, _BROKER_SCRIPT, 'update', want],
+                           capture_output=True, text=True, timeout=1300)
+        out = json.loads((r.stdout or '').strip() or '{}')
+    except Exception as e:
+        _log(f"[broker-converge] update request failed (non-fatal): {e}")
+        return False
+    if not out.get('ok'):
+        _log(f"[broker-converge] broker kept {have[:12]}: {out.get('error') or 'refused'}")
+        return False
+    if not out.get('changed'):
+        return False
+    for _ in range(15):
+        sleep(2)
+        r2 = _ping(timeout=20)
+        if r2 and r2.get('pong') and (r2.get('installed_commit') or '') == want:
+            _log(f"[broker-converge] ✓ broker restarted on {want[:12]} (root-owned copy)")
+            return True
+    _log("[broker-converge] ⚠ broker did not come back on the new commit within 30s (non-fatal)")
+    return True
+
+
 def _broker_converge_running_source(plog=None):
     _log = plog or (lambda m: print(m, flush=True))
     sock_path = '/run/takwerx-broker.sock'
@@ -114567,6 +114642,12 @@ def _broker_converge_running_source(plog=None):
     if not resp or not resp.get('pong'):
         _log("[broker-converge] broker did not answer ping — skipping this boot (retries next restart)")
         return False
+    # ops #645 W1: a broker on the root-owned layout runs code root fetched from
+    # GitHub, so a restart can never load this repo's file. Converge by COMMIT:
+    # ask the broker to install this checkout's commit (it refuses one that is not
+    # on GitHub main/dev/a release tag, or is below its security level).
+    if (resp.get('installed_commit') or '').strip():
+        return _broker_converge_root_commit(resp, _ping, _log)
     have = (resp.get('src_sha') or '').strip()
     if have == want:
         return False

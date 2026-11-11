@@ -39,6 +39,8 @@ SYNC_SRC = APP[APP.index("GUARDDOG_CONF_PATH = '/opt/tak-guarddog/guarddog.conf'
                APP.index('def _remotedb_host_port_from_tak_settings(')]
 STARTUP_SRC = APP[APP.index('def _auto_update_guarddog():'):
                   APP.index('def _start_guarddog_background_at_boot(')]
+# ops #645 W2 part 2a: every fill-in goes through _gd_install_script (old path: no broker).
+GD_HELPER_SRC = APP[APP.index('_GD_PLACEHOLDER_RE = re.compile('):APP.index('def _write_priv(')]
 GD = '/opt/tak-guarddog'
 DB_SCRIPTS = ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh',
               'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh')
@@ -91,7 +93,9 @@ def h(tmp_path, monkeypatch):
         '_guarddog_alert_recipient_warning': lambda s: '',
         '_safe_alert_email_list': lambda e: e or '',
         '_get_tak_cert_password': lambda s: 'atakatak',
+        '_broker_should_route': lambda: False,
     }
+    exec(GD_HELPER_SRC, ns)
     exec(DEPLOY_SRC, ns)
     exec(SYNC_SRC, ns)
     exec(STARTUP_SRC, ns)

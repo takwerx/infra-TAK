@@ -91,7 +91,7 @@ def scan_file(path):
                     slots, dyn = _list_slots(inner)
                     cmds.append((path, line, slots, dyn))
         else:  # _write_priv / _read_priv / _makedirs_priv / _chmod_priv
-            writes.append((path, line, _const_str(node.args[0])))
+            writes.append((path, line, _const_str(node.args[0]), fn))
     return cmds, writes
 
 
@@ -174,12 +174,14 @@ def main(argv):
             bypass.append(rec)
 
     path_gaps, path_dyn = [], []
-    for path, line, p in all_writes:
+    for path, line, p, fn in all_writes:
         if p is None:
             path_dyn.append((os.path.basename(path), line))
             continue
         try:
-            B._path_allowed(p)
+            # a read goes through the broker `read` op, which also admits the
+            # read-only prefixes (ops #645 W2: /etc/os-release is read-only)
+            B._path_allowed(p, readonly=(fn == '_read_priv'))
         except B.Denied as d:
             path_gaps.append((os.path.basename(path), line, p, str(d)))
 

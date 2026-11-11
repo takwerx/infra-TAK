@@ -46,6 +46,21 @@ git remote set-url origin https://github.com/takwerx/infra-TAK.git
 
 **Why:** Older builds used **`git pull --rebase`** or bulk **`git fetch --tags`**, which break on many field installs. Current **Update Now** (v0.4.1+) is safer, but recovery over SSH must **not** trust a wrong **`origin`** — always use the **`https://github.com/takwerx/infra-TAK.git`** fetch above.
 
+### If the privilege broker does not start after an update (non-root boxes)
+
+On a non-root box, root runs the privilege broker from its own copy of the code, one folder per version in **`/usr/local/lib/infratak-broker/`**. The link **`current`** points at the copy in use, and the last 3 copies stay on disk. The console user cannot change these files, so the fix needs root over SSH.
+
+Use this when console actions fail with "broker not answering" after an update, and **`systemctl status takwerx-broker`** shows the broker failing or restarting over and over. Go back to the previous copy:
+
+```bash
+sudo ls -lt /usr/local/lib/infratak-broker/
+sudo ln -sfn /usr/local/lib/infratak-broker/<previous folder> /usr/local/lib/infratak-broker/current
+sudo systemctl restart takwerx-broker
+sudo systemctl status takwerx-broker --no-pager
+```
+
+**`ls -lt`** shows the newest folder first; **`current ->`** names the copy that fails. Use the folder just below it. Then open a GitHub issue with the output of **`sudo journalctl -u takwerx-broker -n 50 --no-pager`**. The next update that installs a fixed broker moves **`current`** again by itself.
+
 ## What Is This?
 
 A unified web console for deploying and managing TAK ecosystem infrastructure:
