@@ -36,6 +36,7 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$INSTALL_DIR/.config"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
+CONSOLE_PASSWORD_MIN_LEN=12   # ops #638: = app.py CONSOLE_PASSWORD_MIN_LEN
 
 # Only clear an interactive screen. Headless callers (e.g. the in-console
 # "Switch to non-root" button, which runs start.sh detached via systemd-run with
@@ -642,15 +643,23 @@ first_time_setup() {
     echo -e "${BOLD}  First-time setup${NC}"
     echo ""
 
-    # Set admin password
+    # Set admin password. ops #638: at least CONSOLE_PASSWORD_MIN_LEN characters (the same
+    # floor as app.py and reset-console-password.sh): the console is root, and its login
+    # page can be reached from the internet.
+    echo -e "  The admin password needs at least ${CONSOLE_PASSWORD_MIN_LEN} characters."
     while true; do
-        read -s -p "  Set admin password: " ADMIN_PASS
+        read -rs -p "  Set admin password: " ADMIN_PASS
         echo ""
-        read -s -p "  Confirm password:   " ADMIN_PASS_CONFIRM
+        read -rs -p "  Confirm password:   " ADMIN_PASS_CONFIRM
         echo ""
 
         if [ -z "$ADMIN_PASS" ]; then
             echo -e "  ${RED}Password cannot be empty${NC}"
+            continue
+        fi
+
+        if [ "${#ADMIN_PASS}" -lt "$CONSOLE_PASSWORD_MIN_LEN" ]; then
+            echo -e "  ${RED}Password must be at least ${CONSOLE_PASSWORD_MIN_LEN} characters${NC}"
             continue
         fi
 
@@ -664,16 +673,21 @@ first_time_setup() {
 
     # Hash the password using Python. pbkdf2:sha256 = app.py PASSWORD_HASH_METHOD (GH #137):
     # werkzeug's default, scrypt, is missing from FIPS-mode OpenSSL.
-    PASS_HASH=$("$INSTALL_DIR/.venv/bin/python3" -c "
+    # ops #638: the password goes in on stdin (printf is a bash builtin, so no process
+    # ever carries it in argv); as an argument any local user could read it in `ps`.
+    PASS_HASH=$(printf '%s' "$ADMIN_PASS" | "$INSTALL_DIR/.venv/bin/python3" -c "
 from werkzeug.security import generate_password_hash
 import sys
-print(generate_password_hash(sys.argv[1], method='pbkdf2:sha256'))
-" "$ADMIN_PASS")
+pw = sys.stdin.read()
+print(generate_password_hash(pw, method='pbkdf2:sha256'))
+")
+    unset ADMIN_PASS ADMIN_PASS_CONFIRM
 
     # Save auth config
     cat > "$AUTH_FILE" << EOF
 {
     "password_hash": "$PASS_HASH",
+    "password_min_len_ok": true,
     "created": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 EOF

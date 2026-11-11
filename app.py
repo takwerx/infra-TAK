@@ -6697,6 +6697,63 @@ def _safe_next_path():
         return nxt
     return ''
 
+# ops #638: the console password is the way in to a root service, so it has a floor, and
+# a wrong one leaves a trace. Every failed password login is written (with the real
+# client address) to CONSOLE_LOGIN_FAIL_LOG for the `infratak-console` fail2ban jail, to
+# the journal for the operator, and to the W3 audit log on a Hardened box. The file is
+# the jail's source, not the journal: only this function writes it, so a request that
+# gets text into some other console log line cannot make fail2ban ban an address.
+CONSOLE_PASSWORD_MIN_LEN = 12
+CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
+CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
+
+
+def _console_log_failed_login(where):
+    """Record one failed console password login. The password is NEVER written. Never raises.
+
+    Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
+    disk this file takes. fail2ban keeps reading the live file after a roll."""
+    try:
+        ip = _client_ip()
+        ipaddress.ip_address(ip)
+    except Exception:
+        ip = (request.remote_addr or 'unknown').strip()
+    try:
+        try:
+            if os.path.getsize(CONSOLE_LOGIN_FAIL_LOG) > CONSOLE_LOGIN_FAIL_LOG_MAX:
+                os.replace(CONSOLE_LOGIN_FAIL_LOG, CONSOLE_LOGIN_FAIL_LOG + '.1')
+        except OSError:
+            pass
+        with open(CONSOLE_LOGIN_FAIL_LOG, 'a') as f:
+            f.write('%s console: failed login from %s\n'
+                    % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), ip))
+        os.chmod(CONSOLE_LOGIN_FAIL_LOG, 0o600)
+    except Exception:
+        pass
+    print(f"[auth] failed console password login from {ip} ({where})", flush=True)
+    audit('auth:login-failed', 'console password via %s' % where)
+
+
+def _note_password_length(password):
+    """After a good password login: record whether the stored password meets the floor.
+    Only a yes/no is kept (never the length). Drives the console's change-password
+    banner. Reloads auth.json, because _upgrade_password_hash may have just saved it."""
+    try:
+        ok = len(password or '') >= CONSOLE_PASSWORD_MIN_LEN
+        auth = load_auth()
+        if auth.get('password_hash') and auth.get('password_min_len_ok') is not ok:
+            auth['password_min_len_ok'] = ok
+            save_auth(auth)
+    except Exception as e:
+        print(f"[auth] password length note skipped: {str(e)[:120]}", flush=True)
+
+
+def _console_password_needs_change():
+    """True when the console password is not known to meet the floor: it was set before
+    ops #638 and nobody has logged in with it since, or a login showed it is short."""
+    auth = load_auth()
+    return bool(auth.get('password_hash')) and auth.get('password_min_len_ok') is not True
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET' and _apply_authentik_session():
@@ -6711,11 +6768,13 @@ def login():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
+            _note_password_length(request.form.get('password', ''))   # ops #638
             session.clear()
             session['authenticated'] = True
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
+        _console_log_failed_login('/login')   # ops #638
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
     return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
@@ -6741,10 +6800,12 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
+            _note_password_length(request.form.get('password', ''))   # ops #638
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
+        _console_log_failed_login('/')   # ops #638
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
@@ -6795,7 +6856,9 @@ def console_page():
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
-        srv_update_available=_srv_update, srv_latest=_srv_latest)
+        srv_update_available=_srv_update, srv_latest=_srv_latest,
+        console_password_needs_change=_console_password_needs_change(),
+        console_password_min_len=CONSOLE_PASSWORD_MIN_LEN)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -21506,6 +21569,19 @@ _F2B_OWNED_FILTERS = {
         "ignoreregex =\n"
         "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
     ),
+    'infratak-console': (
+        "[Definition]\n"
+        "# ops #638 — failed console password logins. The producer is\n"
+        "# _console_log_failed_login() in app.py, the only writer of this file, which\n"
+        "# writes exactly one shape:\n"
+        "#     2026-11-10 21:54:43 console: failed login from 1.2.3.4\n"
+        "# The password is NEVER written. The address is the real client: behind Caddy,\n"
+        "# _client_ip() unwraps X-Forwarded-For when remote_addr is loopback.\n"
+        "# The 'jail armed' seed line does not match.\n"
+        "failregex = ^\\s*(?:\\S+ \\S+ )?console: failed login from <HOST>\\s*$\n"
+        "ignoreregex =\n"
+        "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
+    ),
     'authentik': (
         "[Definition]\n"
         "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
@@ -24364,6 +24440,157 @@ def _f2b_disarm_clientfeed_jail():
         return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
+# ops #638 — the console password login jail. Fleet constants, not a UI knob (same rule as
+# the clientfeed jail). The login route already answers 429 past 12 tries per 5 minutes per
+# address, so 10 failures in 10 minutes is reachable by a guesser and not by a typo or two.
+CONSOLE_F2B_JAIL = 'infratak-console'
+CONSOLE_F2B_JAIL_PATH = '/etc/fail2ban/jail.d/infratak-console.conf'
+CONSOLE_F2B_FILTER_PATH = '/etc/fail2ban/filter.d/infratak-console.conf'
+CONSOLE_F2B_MAXRETRY = 10
+CONSOLE_F2B_FINDTIME = 600
+CONSOLE_F2B_BANTIME = 3600
+
+
+def _f2b_banaction_console():
+    """Ban action for the console jail: the console's own port and Caddy's web ports only.
+
+    Not all ports, on purpose (the same reasoning as _f2b_banaction_media/_tak): a ban
+    here must not take a guessed-at admin's TAK clients (8089/8443/8446) or SSH with it.
+    The web ports are included because Caddy serves the console's login on them."""
+    s = load_settings()
+    ports = []
+    for p in (_caddy_http_port(s), _caddy_https_port(s), s.get('console_port') or 5001):
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= 65535 and p not in ports:
+            ports.append(p)
+    return ('iptables-multiport[name=infratak-console, port="%s", protocol=tcp]'
+            % ','.join(str(p) for p in ports))
+
+
+# SELinux types fail2ban_t may read a file of (Rocky 9, selinux-policy-targeted 38.1.75:
+# `allow domain base_ro_file_type:file read` covers usr_t, `allow fail2ban_t logfile:file
+# read` covers the log types). A root install keeps .config under /root (admin_home_t)
+# and a home install under /home (user_home_t): fail2ban_t can read neither.
+_F2B_READABLE_SELINUX_TYPES = ('usr_t', 'var_log_t', 'fail2ban_log_t')
+
+
+def _f2b_console_log_selinux_block():
+    """'' when fail2ban can read CONSOLE_LOGIN_FAIL_LOG, else why it cannot.
+
+    Matters because a jail whose log fail2ban cannot see makes fail2ban abort config
+    parsing for EVERY jail (see _f2b_guard_jail_logpaths), and the console itself (not
+    confined the same way) would see the file and call it fine."""
+    try:
+        enf = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ''                                   # no SELinux on this box
+    if (enf.stdout or '').strip() != 'Enforcing':
+        return ''
+    try:
+        label = os.getxattr(CONSOLE_LOGIN_FAIL_LOG, 'security.selinux').decode().rstrip('\x00')
+        typ = label.split(':')[2]
+    except Exception as e:
+        return 'could not read the SELinux label of %s (%s)' % (CONSOLE_LOGIN_FAIL_LOG, str(e)[:80])
+    if typ in _F2B_READABLE_SELINUX_TYPES:
+        return ''
+    return ('SELinux is enforcing and fail2ban cannot read %s (type %s; the install is in a '
+            'home folder)' % (CONSOLE_LOGIN_FAIL_LOG, typ))
+
+
+def _f2b_console_jail_text(extra_ignoreip=''):
+    guarddog_action = ''
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = '\n         infratak-guarddog'
+    return (
+        f"[{CONSOLE_F2B_JAIL}]\n"
+        "enabled  = true\n"
+        f"filter   = {CONSOLE_F2B_JAIL}\n"
+        f"logpath  = {CONSOLE_LOGIN_FAIL_LOG}\n"
+        "backend  = auto\n"
+        f"maxretry = {CONSOLE_F2B_MAXRETRY}\n"
+        f"findtime = {CONSOLE_F2B_FINDTIME}\n"
+        f"bantime  = {CONSOLE_F2B_BANTIME}\n"
+        f"ignoreip = {_f2b_trusted_ignoreip(extra_ignoreip)}\n"
+        f"action   = {_f2b_banaction_console()}{guarddog_action}\n"
+    )
+
+
+def _f2b_arm_console_jail(log_fn=None):
+    """Write the console login filter + jail when they differ, reload, and check the jail
+    LOADED. Returns (ok, message). Idempotent: called from the fail2ban install, every
+    console start (so an update arms it on boxes that already run fail2ban), and the
+    trusted-CIDR rewrite. No fail2ban = not an error: failures are still logged."""
+    _log = log_fn or (lambda m: None)
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — failed console logins are logged but '
+                       'not banned. Deploy the fail2ban module to ban them.')
+    try:
+        # Seed the log so the jail is never born on a missing or 0-byte file (a missing
+        # logpath aborts the WHOLE daemon at config parse; 0 bytes reads as a dead jail).
+        try:
+            if not os.path.exists(CONSOLE_LOGIN_FAIL_LOG) or os.path.getsize(CONSOLE_LOGIN_FAIL_LOG) == 0:
+                with open(CONSOLE_LOGIN_FAIL_LOG, 'a') as f:
+                    f.write('%s console: jail armed (no failed logins yet)\n'
+                            % datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+            os.chmod(CONSOLE_LOGIN_FAIL_LOG, 0o600)
+        except Exception:
+            pass
+
+        blocked = _f2b_console_log_selinux_block()
+        if blocked:
+            if _f2b_read_text(CONSOLE_F2B_JAIL_PATH) is not None:
+                _f2b_remove_jail(os.path.basename(CONSOLE_F2B_JAIL_PATH), blocked, _log)
+            return (False, 'console login jail not armed: %s. Failed logins are still logged.'
+                    % blocked)
+
+        changed = False
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        want_filter = _F2B_OWNED_FILTERS[CONSOLE_F2B_JAIL]
+        if _f2b_read_text(CONSOLE_F2B_FILTER_PATH) != want_filter:
+            _write_priv(CONSOLE_F2B_FILTER_PATH, want_filter)
+            changed = True
+        cur = _f2b_read_text(CONSOLE_F2B_JAIL_PATH)
+        stored = ''
+        m = re.search(r'^\s*ignoreip\s*=\s*(.*)$', cur or '', re.M)
+        if m:
+            stored = m.group(1).strip()
+        want = _f2b_console_jail_text(_f2b_operator_extra(stored))
+        existed = bool(cur)
+        if cur != want:
+            _write_priv(CONSOLE_F2B_JAIL_PATH, want)
+            changed = True
+
+        loaded = _f2b_loaded_jails()
+        if not changed and CONSOLE_F2B_JAIL in loaded:
+            return (True, 'jail already armed and loaded')
+        # A changed jail that already ran needs `reload --restart` to pick up a new action
+        # (fail2ban 0.11.2 keeps the old one on a plain reload; see the takserver converge).
+        if existed and changed and CONSOLE_F2B_JAIL in loaded:
+            cmd = ['fail2ban-client', 'reload', '--restart', CONSOLE_F2B_JAIL]
+        else:
+            cmd = ['fail2ban-client', 'reload']
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s'
+                    % ((r.stderr or r.stdout or '')[:160]))
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', CONSOLE_F2B_JAIL]),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        msg = ('console login jail %s (%d failed logins / %ds → %ds ban on the console and web ports)'
+               % ('updated' if existed else 'armed', CONSOLE_F2B_MAXRETRY,
+                  CONSOLE_F2B_FINDTIME, CONSOLE_F2B_BANTIME))
+        _log(msg)
+        return (True, msg)
+    except Exception as e:
+        return (False, 'console login jail setup failed: %s' % str(e)[:200])
+
+
 @app.route('/api/fail2ban/mediamtx/status')
 @login_required
 def fail2ban_mediamtx_status_api():
@@ -24837,6 +25064,9 @@ def _f2b_rewrite_all_jails():
     if os.path.exists(_F2B_MANUAL_JAIL_PATH):
         _f2b_manual_ensure_jail()
         done.append(_F2B_MANUAL_JAIL)
+    if os.path.exists(CONSOLE_F2B_JAIL_PATH):
+        _f2b_arm_console_jail()
+        done.append(CONSOLE_F2B_JAIL)
     return done
 
 
@@ -25622,6 +25852,8 @@ def fail2ban_install_api():
                 return
             _fail2ban_add_guarddog_hook(_plog)
             _fail2ban_takserver_filter(_plog)
+            _ok_c, _msg_c = _f2b_arm_console_jail()   # ops #638
+            _plog(_msg_c if _ok_c else f"console login jail: {_msg_c}")
             # v10.1.68: a two-server build has a SECOND machine. Protect it in the same
             # action rather than leaving it exposed with nothing saying so.
             try:
@@ -25685,6 +25917,8 @@ def fail2ban_uninstall_api():
             _F2B_TAK_BADCERT_ACTION_PATH,
             _F2B_MANUAL_JAIL_PATH,
             _F2B_MANUAL_FILTER_PATH,
+            CONSOLE_F2B_JAIL_PATH,
+            CONSOLE_F2B_FILTER_PATH,
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
@@ -101414,12 +101648,14 @@ def console_password_reset():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], current):
         return jsonify({'success': False, 'error': 'Current password is wrong'}), 403
-    if not new_pw or len(new_pw) < 8:
-        return jsonify({'success': False, 'error': 'New password must be at least 8 characters'}), 400
+    if not new_pw or len(new_pw) < CONSOLE_PASSWORD_MIN_LEN:   # ops #638 (was 8)
+        return jsonify({'success': False, 'error': 'New password must be at least %d characters'
+                        % CONSOLE_PASSWORD_MIN_LEN}), 400
     if new_pw != confirm:
         return jsonify({'success': False, 'error': 'New password and confirmation do not match'}), 400
     auth['password_hash'] = generate_password_hash(new_pw)
     auth['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    auth['password_min_len_ok'] = True
     save_auth(auth)
     _detached_console_restart()
     return jsonify({'success': True, 'message': 'Password updated. Console will restart in a few seconds.'})
@@ -107763,6 +107999,15 @@ def _startup_migrations():
             _startup_converge_recidive_tak_exempt()
         except Exception as _f2b_e3f:
             print(f"Startup migration: recidive takserver-exempt converge error (non-fatal): {_f2b_e3f}", flush=True)
+        # ops #638 — every box that runs fail2ban gets the console login jail on its next
+        # start, so failed console password logins are banned, not just logged.
+        try:
+            if _f2b_is_available():
+                _ok_cj, _msg_cj = _f2b_arm_console_jail()
+                if not _ok_cj or 'already' not in _msg_cj:
+                    print(f"Startup migration: {'✓ ' if _ok_cj else ''}{_msg_cj}", flush=True)
+        except Exception as _f2b_e3h:
+            print(f"Startup migration: console login jail error (non-fatal): {_f2b_e3h}", flush=True)
 
         # ops #200 — Ubuntu's Java CA keystore never drops a root the OS distrusts. Here and
         # not at import time: on a non-root box it is a broker op.

@@ -38,8 +38,13 @@ fi
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
+# ops #638: same floor as app.py CONSOLE_PASSWORD_MIN_LEN and start.sh. The console is
+# root and its login page can be reached from the internet.
+CONSOLE_PASSWORD_MIN_LEN=12
+
 echo ""
 echo "Reset console admin password (install: $INSTALL_DIR)"
+echo "The password needs at least $CONSOLE_PASSWORD_MIN_LEN characters."
 echo ""
 
 read -rs -p "New password: " NEW_PASS
@@ -51,6 +56,10 @@ if [ -z "$NEW_PASS" ]; then
     echo "Password cannot be empty."
     exit 1
 fi
+if [ "${#NEW_PASS}" -lt "$CONSOLE_PASSWORD_MIN_LEN" ]; then
+    echo "Password must be at least $CONSOLE_PASSWORD_MIN_LEN characters."
+    exit 1
+fi
 if [ "$NEW_PASS" != "$NEW_PASS_CONFIRM" ]; then
     echo "Passwords do not match."
     exit 1
@@ -58,15 +67,20 @@ fi
 
 # pbkdf2:sha256 = app.py PASSWORD_HASH_METHOD (GH #137). werkzeug's default, scrypt, is
 # missing from FIPS-mode OpenSSL — this script is the way out for a box stuck on one.
-PASS_HASH=$("$INSTALL_DIR/.venv/bin/python3" -c "
+# ops #638: the password goes in on stdin (printf is a bash builtin, so no process ever
+# carries it in argv); as an argument any local user could read it in `ps`.
+PASS_HASH=$(printf '%s' "$NEW_PASS" | "$INSTALL_DIR/.venv/bin/python3" -c "
 from werkzeug.security import generate_password_hash
 import sys
-print(generate_password_hash(sys.argv[1], method='pbkdf2:sha256'))
-" "$NEW_PASS")
+pw = sys.stdin.read()
+print(generate_password_hash(pw, method='pbkdf2:sha256'))
+")
+unset NEW_PASS NEW_PASS_CONFIRM
 
 cat > "$AUTH_FILE" << EOF
 {
     "password_hash": "$PASS_HASH",
+    "password_min_len_ok": true,
     "created": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 EOF
