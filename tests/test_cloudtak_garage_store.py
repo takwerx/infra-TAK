@@ -44,6 +44,7 @@ _FUNCS = {
     '_cloudtak_env_set', '_cloudtak_migrate_minio_to_garage', '_cloudtak_garage_converge',
     '_cloudtak_garage_rollback', '_cloudtak_web_dir', '_cloudtak_plugins_dir',
     '_cloudtak_remote_garage_sh',
+    '_open_secret_w',   # ops #632: .env writes go through it
 }
 
 GARAGE_COMPOSE = """services:

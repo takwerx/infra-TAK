@@ -133,12 +133,12 @@ sudo systemctl restart takwerx-console</pre>
 <div class="help-card-body">
 <p>This is the password you set when you ran <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">start.sh</code>. The <strong>same password</strong> is used to log in at the backdoor (above) and for <strong>Uninstall all services</strong> on the Console page. We don't store the plaintext, so it can't be shown here. Forgot it? Use the form below if you're logged in; for a full lockout you need the CLI — see the README on the GitHub repo.</p>
 </div></div>
-<div class="help-card">
+<div class="help-card" id="reset-console-password">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Reset console password</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
-<p>Enter your current password and choose a new one. The console will restart and you'll use the new password for 5001 and Uninstall all. <em>Only works when you're already logged in.</em> For a full lockout, use the CLI (README has the commands).</p>
+<p>Enter your current password and choose a new one of at least 12 characters. The console will restart and you'll use the new password for 5001 and Uninstall all. <em>Only works when you're already logged in.</em> For a full lockout, use the CLI (README has the commands).</p>
 <div class="form-field"><label>Current password</label><input type="password" id="reset-current" placeholder="Current console password"></div>
-<div class="form-field"><label>New password</label><input type="password" id="reset-new" placeholder="At least 8 characters"></div>
+<div class="form-field"><label>New password</label><input type="password" id="reset-new" placeholder="At least 12 characters"></div>
 <div class="form-field"><label>Confirm new password</label><input type="password" id="reset-confirm" placeholder="Same as above"></div>
 <button type="button" class="btn btn-primary" onclick="doResetPassword()">Reset password</button>
 <div id="reset-msg"></div>
@@ -184,6 +184,7 @@ sudo systemctl restart takwerx-console</pre>
 <script>initLogToolbar('full-uninstall-log');</script>
 <script>
 function helpToggle(header){var body=header.nextElementSibling;var icon=header.querySelector('.help-card-toggle');if(!body)return;if(body.style.display==='block'){body.style.display='none';icon.style.transform='rotate(0deg)';}else{body.style.display='block';icon.style.transform='rotate(180deg)';}}
+document.addEventListener('DOMContentLoaded',function(){if(location.hash!=='#reset-console-password')return;var c=document.getElementById('reset-console-password');var h=c&&c.querySelector('.help-card-header');if(!h)return;helpToggle(h);c.scrollIntoView();});
 function closeFullUninstallModal(){document.getElementById('full-uninstall-modal').classList.remove('open');}
 var fullUninstallPwValidateTimer=null;
 function fullUninstallPasswordInput(){var c=document.getElementById('full-uninstall-pw-check');if(c)c.style.display='none';clearTimeout(fullUninstallPwValidateTimer);var p=document.getElementById('full-uninstall-password');if(!p||!p.value.trim())return;fullUninstallPwValidateTimer=setTimeout(fullUninstallValidatePassword,400);}
@@ -200,7 +201,7 @@ async function doResetPassword(){
     var msg=document.getElementById('reset-msg');
     msg.textContent='';
     if(!cur){msg.style.color='var(--red)';msg.textContent='Enter current password';return;}
-    if(!neu||neu.length<8){msg.style.color='var(--red)';msg.textContent='New password must be at least 8 characters';return;}
+    if(!neu||neu.length<12){msg.style.color='var(--red)';msg.textContent='New password must be at least 12 characters';return;}
     if(neu!==conf){msg.style.color='var(--red)';msg.textContent='New password and confirmation do not match';return;}
     msg.style.color='var(--cyan)';msg.textContent='Updating...';
     try{

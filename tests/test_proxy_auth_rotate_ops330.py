@@ -288,7 +288,8 @@ class _Req:
 def _apply(state, headers):
     session = {}
     ns = {'request': _Req(headers), 'session': session, 'hmac': hmac, 'time': __import__('time'),
-          '_proxy_auth_state': lambda create=False: state}
+          '_proxy_auth_state': lambda create=False: state,
+          '_stamp_session_login': lambda: session.__setitem__('login_token', 't')}   # ops #634
     exec(compile(_fn('_apply_authentik_session'), 'app.py', 'exec'), ns)
     return ns['_apply_authentik_session'](), session
 

@@ -71,7 +71,7 @@ No action needed. Clients can reach the box through the relay again.
 "
     echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
     if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-      TMPF="/tmp/gd-sms-$$.txt"
+      TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
       printf '%s' "$BODY" > "$TMPF"
       /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
       rm -f "$TMPF"
@@ -145,7 +145,7 @@ recovery notice is sent when it comes back.
 
     echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
     if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-      TMPF="/tmp/gd-sms-$$.txt"
+      TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
       printf '%s' "$BODY" > "$TMPF"
       /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
       rm -f "$TMPF"

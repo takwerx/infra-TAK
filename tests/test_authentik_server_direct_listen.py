@@ -123,6 +123,10 @@ def _run(tmp_path, env=ENV, compose=None, live=None, up_rc=0, loads=True, health
         '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False: recycle.append(reason),
     }
     ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
+    # ops #632: .env writes go through _open_secret_w; give it the real os (ns['os'] is a stub).
+    _real = {'os': os}
+    exec(compile(_src('_open_secret_w'), 'app.py:_open_secret_w', 'exec'), _real)
+    ns['_open_secret_w'] = _real['_open_secret_w']
     exec(compile(re.search(r'^_AK_DIRECT_ENV = \(.*?^\]\n', APP, re.S | re.M).group(0), 'app.py:consts', 'exec'), ns)
     for name in ('_ak_compose_service_env', '_authentik_server_direct_live', '_authentik_server_direct_current',
                  '_ensure_authentik_server_direct_listen'):

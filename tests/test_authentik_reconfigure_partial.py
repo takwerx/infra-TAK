@@ -80,6 +80,7 @@ def _run(step_warnings=(), status=None, heal_lines=()):
         'load_settings': lambda: {'fqdn': 'example.com', 'webodm_enabled': True},
         '_get_module_deployment_config': lambda s, k: {'target_mode': 'remote', 'remote': {'host': 'ak.example'}},
         '_module_run': lambda *a, **k: None,
+        '_remote_authentik_port_guard': lambda *a, **k: (True, False),   # ops #631
         '_get_authentik_env_value': lambda s, k: 'tok',
         '_get_authentik_api_url': lambda s: 'http://ak',
         '_wait_for_authentik_api': lambda *a, **k: True,

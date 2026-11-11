@@ -65,8 +65,10 @@ if [ -z "$COT_SIZE" ] || [ "$COT_SIZE" = "" ]; then
   COT_SIZE=0
 fi
 
-# Ensure numeric
-COT_SIZE=$((COT_SIZE + 0))
+# Ensure numeric. ops #628: digits only BEFORE any $(( )). This text comes from psql (the
+# postgres account, the DB container or the remote DB host), not from us.
+COT_SIZE=$(printf '%s' "$COT_SIZE" | tr -d '[:space:]')
+case "$COT_SIZE" in ''|*[!0-9]*) COT_SIZE=0 ;; esac
 
 # ===========================================================================
 # v10.1.29 (W8) — shared helpers + the two conditions that actually predict a
@@ -102,7 +104,7 @@ send_cot_alert() {
   local subj="$1"; local body="$2"
   echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER"
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-    local tmpf="/tmp/gd-sms-$$.txt"
+    local tmpf="$(mktemp /tmp/gd-sms.XXXXXX)"
     printf '%s' "$body" > "$tmpf"
     /opt/tak-guarddog/sms_send.sh "$subj" "$tmpf" 2>/dev/null || true
     rm -f "$tmpf"
@@ -314,7 +316,7 @@ Things to check:
 
 echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-  TMPF="/tmp/gd-sms-$$.txt"
+  TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
   printf '%s' "$BODY" > "$TMPF"
   /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
   rm -f "$TMPF"

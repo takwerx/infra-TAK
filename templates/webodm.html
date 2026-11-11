@@ -287,8 +287,8 @@ function woTestSsh(){
 <div class="info-grid">
 <span class="info-label">WebODM URL</span>
 <span class="info-value">{{ wo_url or 'Configure FQDN in Settings first' }}</span>
-<span class="info-label">Default login</span>
-<span class="info-value">admin / admin (change after first login)</span>
+<span class="info-label">Admin login</span>
+<span class="info-value">{% if wo_deploy_cfg.get('target_mode') == 'remote' %}Generated at deploy and shown once in the deploy log. Save it then.{% else %}Generated at deploy and shown once in the deploy log. 🔑 Account Recovery resets it.{% endif %}</span>
 <span class="info-label">Processing node</span>
 <span class="info-value">wo_nodeodm:3000 (auto-registered)</span>
 <span class="info-label">Plugin</span>

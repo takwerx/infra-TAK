@@ -129,7 +129,7 @@ Check from this host:
 
 echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-  TMPF="/tmp/gd-sms-$$.txt"
+  TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
   printf '%s' "$BODY" > "$TMPF"
   /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
   rm -f "$TMPF"

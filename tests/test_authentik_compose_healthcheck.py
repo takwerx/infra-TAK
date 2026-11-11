@@ -42,7 +42,7 @@ yaml = pytest.importorskip('yaml')
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
-_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches'}
+_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches', '_authentik_loopback_port'}
 
 # goauthentik.io/docker-compose.yml as served 2026-10-07 (2026.8.3 template): no healthcheck
 # on server or worker — exactly what a fresh deploy downloads.
@@ -119,6 +119,7 @@ def _load():
         're': re,
         '_authentik_pg_command_for_ram': lambda ram: (PG_CMD, 'test-tier'),
         '_local_ram_mb': lambda: 16000,
+        'AUTHENTIK_REDIS_IMAGE': 'docker.io/library/redis:8.10.2-alpine',   # ops #637
         '_ensure_authentik_compose_patches_legacy': lambda *a, **k: pytest.fail('legacy patcher reached'),
     }
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)

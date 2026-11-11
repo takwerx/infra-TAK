@@ -327,6 +327,8 @@ def _fn(name, tree=None):
 
 
 def _load(name, ns):
+    # an editor still on takwerx (ops #643 not applied yet): the broker op path
+    ns.setdefault('_mediamtx_editor_uses_pylib', lambda: False)
     exec(compile(ast.get_source_segment(APP, _fn(name)), 'app.py', 'exec'), ns)
     return ns[name]
 

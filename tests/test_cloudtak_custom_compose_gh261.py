@@ -65,6 +65,7 @@ def _helpers():
     src = '\n\n'.join([_assign('_CT_ENV_LINE_RE'), _assign('CLOUDTAK_CUSTOM_COMPOSE'),
                        _assign('_CLOUDTAK_CUSTOM_COMPOSE_SEED'),
                        _assign('_CLOUDTAK_TAKPORTAL_CSP_COMPOSE'),
+                       _fn('_open_secret_w'),   # ops #632
                        _fn('_cloudtak_env_read'), _fn('_cloudtak_env_set'),
                        _fn('_cloudtak_compose_file_value'), _fn('_cloudtak_ensure_custom_compose'),
                        _fn('_cloudtak_remote_custom_compose_sh')])
@@ -409,7 +410,7 @@ def test_console_restart_migration_sets_it_up_before_the_recreate():
 
 def test_deploy_restores_it_after_writing_env_and_before_pull_and_up():
     src = _fn('run_cloudtak_deploy')
-    _before(src, "with open(env_path, 'w')", '_cloudtak_ensure_custom_compose(cloudtak_dir')
+    _before(src, "with _open_secret_w(env_path)", '_cloudtak_ensure_custom_compose(cloudtak_dir')
     _before(src, '_cloudtak_ensure_custom_compose(cloudtak_dir', '_docker_compose_pull(None, cloudtak_dir')
     _before(src, '_cloudtak_ensure_custom_compose(cloudtak_dir', "'up', '-d', '--force-recreate'")
     _before(src, 'mv /tmp/docker-compose.override.yml', '_cloudtak_remote_custom_compose_sh()')
@@ -417,7 +418,7 @@ def test_deploy_restores_it_after_writing_env_and_before_pull_and_up():
 
 def test_update_config_and_restart_sets_it_up_before_up():
     src = _fn('run_cloudtak_redeploy')
-    _before(src, "with open(env_path, 'w')", '_cloudtak_ensure_custom_compose(cloudtak_dir')
+    _before(src, "with _open_secret_w(env_path)", '_cloudtak_ensure_custom_compose(cloudtak_dir')
     _before(src, '_cloudtak_ensure_custom_compose(cloudtak_dir', 'up -d --force-recreate')
     _before(src, '_cloudtak_remote_custom_compose_sh()', 'docker compose up -d')
 

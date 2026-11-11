@@ -420,22 +420,62 @@ gd_keytool() {
 # $1 = stack dir name (authentik | CloudTAK | node-red | TAK-Portal)
 # $2 = optional container name; its compose label is authoritative when present.
 # Prints the directory and returns 0, or returns 1.
+#
+# ops #633: every caller runs `docker compose` in the directory found here, so the
+# /home/*/ search only accepts stacks infra-TAK installed. A directory is
+# used only when it (its real target) and its docker-compose.yml are owned by root or
+# by the console account (takwerx: it writes every stack, and already has the broker),
+# the compose file is not a symlink, neither is world-writable, and group-writable only
+# for root's or that account's group. GD_STACK_OWNER exists for the tests.
+GD_STACK_OWNER="${GD_STACK_OWNER:-takwerx}"
+
+# gd_trusted_path <path> -> 0 when the path passes the owner/mode rule above.
+gd_trusted_path() {
+  local _p="$1" _uid _gid
+  [ -n "$_p" ] && [ -e "$_p" ] && [ ! -L "$_p" ] || return 1
+  case "$GD_STACK_OWNER" in
+    ''|*[!0-9]*) _uid=$(id -u "$GD_STACK_OWNER" 2>/dev/null)
+                 _gid=$(id -g "$GD_STACK_OWNER" 2>/dev/null) ;;
+    *)           _uid="$GD_STACK_OWNER"; _gid=0 ;;     # a bare uid (tests)
+  esac
+  # No such account: root only.
+  case "$_uid" in ''|*[!0-9]*) _uid=0 ;; esac
+  case "$_gid" in ''|*[!0-9]*) _gid=0 ;; esac
+  [ -n "$(find "$_p" -maxdepth 0 \( -uid 0 -o -uid "$_uid" \) ! -perm -0002 \
+            \( ! -perm -0020 -o -gid 0 -o -gid "$_gid" \) -print 2>/dev/null)" ]
+}
+
+# gd_trusted_stack_dir <dir> -> 0 when the dir and its docker-compose.yml are trusted.
+# An untrusted one is named in the journal (takguard-stack), never used.
+# The DIR is judged by its real target: non-root boxes keep /root/<stack> as a root-made
+# symlink to /home/takwerx/<stack> (test12, Nov 10 2026); the compose file itself must
+# not be a symlink.
+gd_trusted_stack_dir() {
+  local _real
+  [ -f "$1/docker-compose.yml" ] || return 1
+  _real=$(cd -P "$1" 2>/dev/null && pwd -P) || _real=""
+  [ -n "$_real" ] && gd_trusted_path "$_real" && gd_trusted_path "$_real/docker-compose.yml" && return 0
+  logger -t takguard-stack "not using $1/docker-compose.yml: not owned by root or $GD_STACK_OWNER, a symlink, or writable by other users" 2>/dev/null
+  return 1
+}
+
 gd_find_stack_dir() {
   local _name="$1" _ctr="$2" _d _wd
   # 1. Authoritative: ask a container of this stack where its project lives.
-  #    Works regardless of which user owns it or where it was installed.
+  #    Works regardless of where it was installed (owner rule above still applies).
   if [ -n "$_ctr" ]; then
     _wd=$(docker inspect "$_ctr" \
             --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' \
             2>/dev/null)
-    if [ -n "$_wd" ] && [ -f "$_wd/docker-compose.yml" ]; then
+    if [ -n "$_wd" ] && gd_trusted_stack_dir "$_wd"; then
       printf '%s' "$_wd"; return 0
     fi
   fi
   # 2. Explicit search list. $HOME is used when SET but never relied on:
   #    ${HOME:+...} yields empty (not a bogus path) when it is unset.
   for _d in "${HOME:+$HOME/$_name}" "/root/$_name" /home/*/"$_name"; do
-    [ -n "$_d" ] && [ -f "$_d/docker-compose.yml" ] && { printf '%s' "$_d"; return 0; }
+    [ -n "$_d" ] && [ -f "$_d/docker-compose.yml" ] && gd_trusted_stack_dir "$_d" \
+      && { printf '%s' "$_d"; return 0; }
   done
   return 1
 }

@@ -194,6 +194,7 @@ class Box:
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
             + [_fn(n) for n in (
+                '_open_secret_w',   # ops #632: _cloudtak_env_set writes the .env through it
                 '_cloudtak_env_read', '_cloudtak_env_set', '_cloudtak_compose_file_value',
                 '_cloudtak_ensure_custom_compose', '_ct_media_converged',
                 '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',

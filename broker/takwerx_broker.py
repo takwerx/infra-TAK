@@ -430,7 +430,8 @@ PATH_ALLOW = (
     # Root-owned; the console mkdirs it, writes the baseline + seeds the status,
     # and reads the status back after each console restart/reboot.
     '/var/lib/infratak-os-upgrade/',
-    '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (chown to takwerx)
+    '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (owned by the mediamtx account, ops #643)
+    '/opt/mediamtx-webeditor-pylib/',  # its Python packages: console-owned, read-only to the editor (ops #643)
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
     '/var/lib/takwerx-console/',  # console state dir (mkdir/chown at startup)
@@ -473,6 +474,9 @@ PATH_ALLOW_EXACT = (
     # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
     '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
+    '/usr/local/sbin/takserver-renew-letsencrypt.sh',  # ops #633: daily LE renewal
+                                                 # (takserver-cert-renewal.service); moved
+                                                 # here from /opt/tak
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
     '/var/lib/infratak-os-upgrade.sh',           # v10.3.0 W4: OS-upgrade job script (same
@@ -570,7 +574,14 @@ def _within_realpath(path, root):
 # allowlist and the console can `ln -s` inside it — so it gets realpath containment
 # too, or a planted link would turn a root cp/write into the backup tree into a
 # write anywhere.
-_CONSOLE_OWNED_PREFIXES = (TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS + ('/var/lib/infratak-backups/',)
+# ops #643: the same goes for the MediaMTX account's dirs. MediaMTX and its
+# internet-facing editor own the editor dir and can write MediaMTX's config dir
+# (the editor saves with `sed -i`, which needs dir write), so a root write or read
+# there must not follow a link they planted.
+_MEDIAMTX_OWNED_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
+_CONSOLE_OWNED_PREFIXES = ((TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
+                           + ('/var/lib/infratak-backups/', '/opt/mediamtx-webeditor-pylib/')
+                           + _MEDIAMTX_OWNED_PREFIXES)
 
 
 def _path_allowed(path, readonly=False):
@@ -1082,6 +1093,15 @@ def _check_runuser(argv):
                 if tok in blob:
                     raise Denied(f'runuser: psql primitive denied as postgres: {tok!r}')
         return
+    if target == 'mediamtx':
+        # ops #643 + #649: the console replaces the web editor's admin/admin in users.json.
+        # That file and its dir belong to the `mediamtx` account, so the script runs AS that
+        # account (never as root in a dir it can plant links in). Exactly one shape: the
+        # script comes on stdin and may only name users.json. The caller (the console) is
+        # already more trusted than `mediamtx`: this hands it nothing it could not do.
+        if argv[4:] == ['python3', '-I', '-', '/opt/mediamtx-webeditor/users.json']:
+            return
+        raise Denied(f'runuser: command not allowed as mediamtx: {argv[4:]}')
     raise Denied(f'runuser: target user not allowed: {target}')
 
 
@@ -2749,8 +2769,9 @@ TAKPORTAL_TAK_USER = 'tak'
 #     touching the file;
 #   * the marketplace helper is installed from a PINNED sha256 and granted by
 #     exact path.
-# Boxes whose TAK Portal is older than 2.0.19 keep the legacy text (their
-# marketplace needs it) until the portal is updated.
+# Every box gets this grant (ops #644). A TAK Portal older than 2.0.19 used to
+# keep the v10.1.53 legacy text; its marketplace and cert
+# repair now need a TAK Portal update instead.
 TAKPORTAL_LIBEXEC = '/usr/local/libexec/infratak'
 TAKPORTAL_WRAP_DIR = TAKPORTAL_LIBEXEC + '/portal-bin'
 TAKPORTAL_WRAPPED = ('cat', 'tee')
@@ -2832,13 +2853,14 @@ def _sudoers_safe_binaries(name):
     return out
 
 
-def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
+def _takportal_sudoers_text(user=BROKER_USER, variant='hardened', helper=False):
     """The ONE definition of the grant.
 
-    variant 'legacy'   — the v10.1.53 text, for a TAK Portal older than 2.0.19.
     variant 'hardened' — ops #217: no script rules, CoreConfig cat/tee through
                          root-owned wrappers that drop to `tak`, and (helper=True)
                          the pinned marketplace helper.
+    The v10.1.53 'legacy' text is gone (ops #644). A TAK Portal older than 2.0.19 gets the hardened
+    grant too; its marketplace and cert repair need a TAK Portal update.
 
     app.py imports THIS function for the root-console path rather than keeping its
     own copy, so the two can never drift — a drifted sudoers template is a
@@ -2849,38 +2871,9 @@ def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
     binaries)."""
     if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
-    if variant == 'hardened':
-        return _takportal_hardened_text(user, helper)
-    if variant != 'legacy':
+    if variant != 'hardened':
         raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
-    lines = [
-        '# Managed by infra-TAK (v10.1.53). Do not edit by hand.',
-        '#',
-        '# Lets TAK Portal, over its container->host SSH channel, do the four',
-        '# privileged things it needs on a native TAK Server install. Deliberately',
-        '# NARROWER than the file TAK Portal installs for itself: no `tail` (that',
-        '# is an unrestricted root read of every file on this box) and no `reboot`',
-        '# (the infra-TAK console owns power controls). See docs/PLAN-v10.1.53.md.',
-        f'Defaults:{user} !requiretty',
-    ]
-    need = {}
-    for b in ('cat', 'tee', 'bash', 'systemctl'):
-        paths = _sudoers_safe_binaries(b)
-        if not paths:
-            raise Denied(f'takportal_sudoers: cannot resolve a root-owned {b} in {_SUDOERS_BIN_DIRS}')
-        need[b] = paths
-    for p in need['cat']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
-    for p in need['tee']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
-    for p in need['bash']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
-    for p in need['systemctl']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
-    # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
-    lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
-    return '\n'.join(lines) + '\n'
+    return _takportal_hardened_text(user, helper)
 
 
 def _takportal_hardened_text(user, helper):
@@ -3044,10 +3037,12 @@ def _takportal_decide(user=BROKER_USER):
     (config hooks run code), O_NOFOLLOW, size-capped, and the helper bytes are
     only ever USED if they hash to a pinned value.
 
-    The checkout is operator-writable, so this selects between two grants, it is
-    not an authority: a box where the portal is old stays on the legacy text by
-    design (AJ, ops #16), and the status row says so."""
+    The checkout is operator-writable, so it only picks which pinned helper to
+    grant and what the status row says; the variant is always 'hardened' (ops #644
+    removed the legacy text). portal_old: TAK Portal is older than
+    2.0.19, so its marketplace and cert repair need a TAK Portal update."""
     out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
+           'portal_old': False,
            'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found',
            'helper_unreviewed': False}
     try:
@@ -3081,10 +3076,10 @@ def _takportal_decide(user=BROKER_USER):
     # The helper file only exists from 2.0.19, so it also proves "new enough"
     # when package.json lags (upstream has shipped a release without bumping it).
     if data is None and tup is not None and tup < TAKPORTAL_HARDENED_MIN_VERSION:
-        out['variant'] = 'legacy'
+        out['portal_old'] = True
         out['reason'] = (f'TAK Portal {ver} is older than '
                          f'{".".join(map(str, TAKPORTAL_HARDENED_MIN_VERSION))} — its marketplace '
-                         'still needs the legacy grant; update TAK Portal to tighten it')
+                         'and cert repair need a TAK Portal update')
     else:
         out['reason'] = f'TAK Portal {ver or "version unknown"}'
     return out
@@ -3190,6 +3185,7 @@ def _do_takportal_sudoers(req):
         return {'ok': True, 'present': present, 'matches': matches, 'mode': mode,
                 'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH,
                 'variant': variant, 'variant_reason': decision['reason'],
+                'portal_old': bool(decision.get('portal_old')),
                 'wrappers_ok': wrappers_ok,
                 'helper': {'granted': bool(hardened and helper_ok),
                            'installed': helper_ok, 'reason': decision['helper_reason'],
@@ -3777,6 +3773,8 @@ def _evaluate(req):
             _check_certifi_upgrade(req)
         elif op == 'pg_old_cluster':
             _check_pg_old_cluster(req)
+        elif op == 'mediamtx_account':
+            _check_mediamtx_account(req)
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -3869,7 +3867,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster'):
+              'pg_old_cluster', 'mediamtx_account'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -3883,6 +3881,8 @@ def _dispatch(req, peer):
             summary = f"{req.get('container')} {'->' if op == 'stack_pg_dump' else '<-'} {req.get('path')}"
         elif op == 'pg_old_cluster':
             summary = f"action={req.get('action')} major={_PG_OLD_MAJOR}"
+        elif op == 'mediamtx_account':
+            summary = MEDIAMTX_USER
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -3922,6 +3922,8 @@ def _dispatch(req, peer):
             return _do_certifi_upgrade(req)
         if op == 'pg_old_cluster':
             return _do_pg_old_cluster(req)
+        if op == 'mediamtx_account':
+            return _do_mediamtx_account(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
@@ -3942,6 +3944,356 @@ def _dispatch(req, peer):
         return _do_read(req)
     audit(peer, str(op), '', 'DENY', 'unknown op')
     return {'ok': False, 'code': 'DENIED', 'error': f'unknown op: {op}'}
+
+
+# ---------------------------------------------------------------------------
+# MediaMTX profile (ops #643)
+# ---------------------------------------------------------------------------
+# MediaMTX and its web editor (internet-facing) run as their own account, not the
+# console's. They used to share `takwerx`, so an editor bug could edit the console's
+# code in /opt/infratak or send the broker anything the console may. They still need
+# a few root actions (upgrade/rollback the MediaMTX binary, restart their own units,
+# install codec packages, open their stream ports), so they get their OWN socket and
+# only the argv shapes the editor actually sends (mediamtx-installer
+# config-editor/mediamtx_config_editor.py: _mtx_broker_exec / mtx_copy_priv /
+# mtx_install_binary / _firewall_exec / deps install). Always enforced: there is no
+# permissive mode on this socket, and every request is audited with the peer uid.
+MEDIAMTX_USER = 'mediamtx'
+MEDIAMTX_SOCKET_PATH = os.environ.get('TAKWERX_BROKER_MEDIAMTX_SOCKET',
+                                      '/run/takwerx-broker-mediamtx.sock')
+_MTX_BIN = '/usr/local/bin/mediamtx'
+_MTX_CONF = '/usr/local/etc/mediamtx.yml'
+_MTX_CONF_BACKUPS = '/usr/local/etc/mediamtx_backups/'
+_MTX_EDITOR_DIR = '/opt/mediamtx-webeditor/'
+_MTX_BIN_STAGED = '/opt/mediamtx-webeditor/binstage/mediamtx'
+_MTX_UNITS = frozenset(('mediamtx', 'mediamtx.service',
+                        'mediamtx-webeditor', 'mediamtx-webeditor.service'))
+_MTX_SYSTEMCTL_VERBS = frozenset(('is-active', 'is-enabled', 'status',
+                                  'start', 'stop', 'restart'))
+# The editor's own DEPS_PACKAGES (Dependencies tab), nothing else.
+_MTX_PKGS = {
+    'apt': frozenset(('ffmpeg', 'gstreamer1.0-tools', 'gstreamer1.0-plugins-base',
+                      'gstreamer1.0-plugins-good', 'gstreamer1.0-plugins-bad',
+                      'gstreamer1.0-libav', 'gstreamer1.0-rtsp')),
+    'dnf': frozenset(('ffmpeg', 'gstreamer1', 'gstreamer1-plugins-base',
+                      'gstreamer1-plugins-good', 'gstreamer1-plugins-bad-free',
+                      'gstreamer1-plugins-ugly-free', 'gstreamer1-libav',
+                      'gstreamer1-plugins-bad-freeworld', 'gstreamer1-plugins-ugly',
+                      'gstreamer1-rtsp-server')),
+}
+# Stream ports are the operator's choice in the editor, so any port may be opened or
+# closed EXCEPT these: SSH/HTTP(S) access to the box and the loopback-only admin
+# surfaces of infra-TAK and its modules. Opening one of those to the internet, or
+# closing SSH or 443, is not something a streaming editor ever needs to do.
+_MTX_FW_PROTECTED_PORTS = frozenset((
+    22, 80, 443,
+    5001,                     # infra-TAK console
+    5080, 9898, 8888,         # MediaMTX web editor, MediaMTX API, HLS (Caddy only)
+    9996, 9997, 9998, 9999,   # MediaMTX playback/CloudTAK media API/metrics/pprof
+    8080, 8443, 8444, 8446, 8089, 9001,   # TAK Server
+    9000, 9090, 9443,         # Authentik
+    5432, 6432,               # Postgres, pgbouncer
+    1880,                     # Node-RED
+))
+_MTX_PORT_RE = re.compile(r'^([0-9]{1,5})/(tcp|udp)$')
+_MTX_BACKUP_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+_ELF_MAGIC = b'\x7fELF'
+
+
+def _mtx_uid():
+    try:
+        return pwd.getpwnam(MEDIAMTX_USER).pw_uid
+    except KeyError:
+        return None
+
+
+def _mtx_clean_path(p):
+    """Absolute, normalised, no NUL and no `..` — else Denied."""
+    if not isinstance(p, str) or not p.startswith('/') or '\x00' in p:
+        raise Denied(f'mediamtx: bad path {p!r}')
+    if os.path.normpath(p) != p.rstrip('/') or '/../' in p + '/':
+        raise Denied(f'mediamtx: path not normalised: {p}')
+    return p
+
+
+def _mtx_own_path(p):
+    """True for paths that belong to MediaMTX itself: the editor dir, the config file
+    and its backups. A copy between these runs AS the mediamtx account, so a symlink
+    it planted can only reach what it could already read or write."""
+    return (p.startswith(_MTX_EDITOR_DIR) or p.startswith(_MTX_CONF_BACKUPS)
+            or p == _MTX_CONF or (p.startswith(_MTX_CONF + '.')
+                                  and _MTX_BACKUP_NAME_RE.match(os.path.basename(p))))
+
+
+def _mtx_port_ok(spec):
+    m = _MTX_PORT_RE.match(spec or '')
+    if not m:
+        raise Denied(f'mediamtx: bad port spec {spec!r}')
+    port = int(m.group(1))
+    if not 1 <= port <= 65535:
+        raise Denied(f'mediamtx: bad port {port}')
+    if port in _MTX_FW_PROTECTED_PORTS:
+        raise Denied(f'mediamtx: port {port} is not a stream port')
+    return True
+
+
+def check_mediamtx_exec(argv):
+    """Classify one exec request from the mediamtx account.
+
+    Returns 'root' (run as root, exact shape checked here), 'user' (run as the
+    mediamtx account) or 'install' (the staged-binary swap, done in-process by
+    _mtx_install_binary). Raises Denied for everything else."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        raise Denied('mediamtx: argv must be a non-empty list of strings')
+    if any('\x00' in a for a in argv):
+        raise Denied('mediamtx: NUL in argv')
+    cmd, args = argv[0], argv[1:]
+    if '/' in cmd:
+        raise Denied(f'mediamtx: bare command names only: {cmd}')
+    if cmd == 'systemctl':
+        if len(args) == 2 and args[0] == 'is-active' and args[1] == 'takwerx-broker':
+            return 'root'                       # the editor's "is the broker there" probe
+        if len(args) == 2 and args[0] in _MTX_SYSTEMCTL_VERBS and args[1] in _MTX_UNITS:
+            return 'root'
+        raise Denied(f'mediamtx: systemctl {" ".join(args)[:80]} not allowed')
+    if cmd == 'test':
+        # Cert-file existence check (resolve_existing_cert): only cert/key names.
+        if (len(args) == 2 and args[0] == '-f'
+                and _mtx_clean_path(args[1]).endswith(('.crt', '.key', '.pem', '.cer'))):
+            return 'root'
+        raise Denied('mediamtx: test only as `test -f <cert or key file>`')
+    if cmd == 'cp':
+        if len(args) != 2:
+            raise Denied('mediamtx: cp takes exactly SRC DST (no flags)')
+        src, dst = _mtx_clean_path(args[0]), _mtx_clean_path(args[1])
+        if src == _MTX_BIN_STAGED and dst == _MTX_BIN:
+            return 'install'
+        if dst == _MTX_BIN:
+            raise Denied(f'mediamtx: the binary is installed only from {_MTX_BIN_STAGED}')
+        if (src == _MTX_BIN or _mtx_own_path(src)) and _mtx_own_path(dst):
+            return 'user'
+        raise Denied(f'mediamtx: cp {src} -> {dst} not allowed')
+    if cmd == 'chmod':
+        if args == ['755', _MTX_BIN]:
+            return 'root'
+        raise Denied('mediamtx: chmod only as `chmod 755 /usr/local/bin/mediamtx`')
+    if cmd == 'restorecon':
+        if args == [_MTX_BIN]:
+            return 'root'
+        raise Denied('mediamtx: restorecon only on /usr/local/bin/mediamtx')
+    if cmd in ('apt-get', 'dnf'):
+        pm = 'apt' if cmd == 'apt-get' else 'dnf'
+        if args == (['update', '-qq'] if pm == 'apt' else ['-q', 'makecache']):
+            return 'root'
+        fixed = ['install', '-y', '-q'] if pm == 'apt' else ['install', '-y']
+        if args[:len(fixed)] == fixed:
+            pkgs = args[len(fixed):]
+            if pkgs and all(p in _MTX_PKGS[pm] for p in pkgs):
+                return 'root'
+        raise Denied(f'mediamtx: {cmd} {" ".join(args)[:120]} not allowed')
+    if cmd == 'ufw':
+        if args == ['status']:
+            return 'root'
+        if len(args) == 2 and args[0] == 'allow' and _mtx_port_ok(args[1]):
+            return 'root'
+        if len(args) == 3 and args[:2] == ['delete', 'allow'] and _mtx_port_ok(args[2]):
+            return 'root'
+        raise Denied(f'mediamtx: ufw {" ".join(args)[:80]} not allowed')
+    if cmd == 'firewall-cmd':
+        if args == ['--list-ports']:
+            return 'root'
+        rest = args[1:] if args[:1] == ['--permanent'] else args
+        if len(rest) == 1:
+            for flag in ('--add-port=', '--remove-port='):
+                if rest[0].startswith(flag) and _mtx_port_ok(rest[0][len(flag):]):
+                    return 'root'
+        raise Denied(f'mediamtx: firewall-cmd {" ".join(args)[:80]} not allowed')
+    raise Denied(f'mediamtx: command not allowed: {cmd}')
+
+
+def _mtx_install_binary():
+    """Swap the staged MediaMTX binary into /usr/local/bin as root, without ever
+    following a link the mediamtx account could plant: the staged file is opened
+    O_NOFOLLOW from a dir whose real path is checked, must be a regular file owned by
+    the mediamtx account, and must be an ELF. Written to a temp file next to the
+    target (root-owned dir) and renamed over it. The binary is never run here."""
+    uid = _mtx_uid()
+    if uid is None:
+        raise Denied('mediamtx: account missing')
+    stage_dir = os.path.dirname(_MTX_BIN_STAGED)
+    if os.path.realpath(stage_dir) != stage_dir:
+        raise Denied('mediamtx: staging dir is a link')
+    fd = os.open(_MTX_BIN_STAGED, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+            raise Denied('mediamtx: staged binary must be a regular file owned by mediamtx')
+        if st.st_size > 512 * 1024 * 1024:
+            raise Denied('mediamtx: staged binary too large')
+        with os.fdopen(os.dup(fd), 'rb') as src:
+            head = src.read(4)
+            if head != _ELF_MAGIC:
+                raise Denied('mediamtx: staged file is not an ELF binary')
+            tmp_fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_MTX_BIN), prefix='.mediamtx-new-')
+            try:
+                with os.fdopen(tmp_fd, 'wb') as out:
+                    out.write(head)
+                    shutil.copyfileobj(src, out, 1024 * 1024)
+                    os.fchmod(out.fileno(), 0o755)
+                os.replace(tmp, _MTX_BIN)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+    finally:
+        os.close(fd)
+    return {'ok': True, 'returncode': 0, 'stdout_b64': '', 'stderr_b64': ''}
+
+
+def _mtx_run(argv, timeout, as_user):
+    """Run an already-classified argv. `as_user` drops to the mediamtx account."""
+    resolved = shutil.which(argv[0], path=BROKER_TRUSTED_PATH)
+    if not resolved:
+        raise Denied(f'mediamtx: {argv[0]} not on the trusted PATH')
+    kw = {}
+    env = None
+    if as_user:
+        uid = _mtx_uid()
+        if uid is None:
+            raise Denied('mediamtx: account missing')
+        pw = pwd.getpwuid(uid)
+        kw = {'user': uid, 'group': pw.pw_gid, 'extra_groups': []}
+        env = {'PATH': BROKER_TRUSTED_PATH, 'HOME': '/', 'LC_ALL': 'C'}
+    elif os.path.basename(resolved) == 'apt-get':
+        env = dict(os.environ)
+        env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
+        env.setdefault('NEEDRESTART_MODE', 'l')
+        env.setdefault('DPKG_FORCE', 'confdef,confold')
+    proc = subprocess.run([resolved] + list(argv[1:]), capture_output=True,
+                          timeout=timeout, cwd='/', env=env, **kw)
+    return {
+        'ok': True,
+        'returncode': proc.returncode,
+        'stdout_b64': base64.b64encode(proc.stdout or b'').decode(),
+        'stderr_b64': base64.b64encode(proc.stderr or b'').decode(),
+    }
+
+
+def _dispatch_mediamtx(req, peer):
+    """The whole rulebook for the mediamtx socket. Fail closed in every mode."""
+    op = req.get('op') if isinstance(req, dict) else None
+    if op != 'exec':
+        audit(peer, f'mediamtx:{op}', '', 'DENY', 'only exec is served to mediamtx')
+        return {'ok': False, 'code': 'DENIED', 'error': f'op not allowed for mediamtx: {op}'}
+    argv = req.get('argv')
+    summary = _summary(req)
+    try:
+        kind = check_mediamtx_exec(argv)
+    except Denied as d:
+        audit(peer, 'mediamtx:exec', summary, 'DENY', str(d))
+        return {'ok': False, 'code': 'DENIED', 'error': str(d)}
+    audit(peer, 'mediamtx:exec', summary, 'ALLOW', kind)
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), MAX_TIMEOUT)
+    if kind == 'install':
+        return _mtx_install_binary()
+    return _mtx_run(argv, timeout, as_user=(kind == 'user'))
+
+
+def _allowed_mediamtx_peer(uid):
+    """The mediamtx socket serves the mediamtx account (and root, for checks) only.
+    The console account is refused here: it has its own socket and rulebook."""
+    return uid == 0 or (uid is not None and uid >= 0 and uid == _mtx_uid())
+
+
+_MTX_SRV = None
+_MTX_SRV_LOCK = threading.Lock()
+
+
+def _check_mediamtx_account(req):
+    """Fixed-shape op: no arguments are read, so there is nothing to validate."""
+    extra = set(req) - {'op'}
+    if extra:
+        raise Denied(f'mediamtx_account takes no arguments: {sorted(extra)}')
+
+
+def _mtx_account_problem():
+    """Why an existing `mediamtx` account is unfit to run MediaMTX, or ''."""
+    try:
+        pw = pwd.getpwnam(MEDIAMTX_USER)
+    except KeyError:
+        return 'missing'
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return 'mediamtx account is uid/gid 0'
+    try:
+        if MEDIAMTX_USER in grp.getgrnam(BROKER_USER).gr_mem:
+            return f'mediamtx account is in group {BROKER_USER}'
+        if pw.pw_gid == grp.getgrnam(BROKER_USER).gr_gid:
+            return f'mediamtx account has primary group {BROKER_USER}'
+    except KeyError:
+        pass
+    return ''
+
+
+def _do_mediamtx_account(req):
+    """Create the `mediamtx` system account (own group, no home, no shell) when it is
+    missing, then serve the mediamtx socket. The console asks for this before it moves
+    the MediaMTX units off its own account. Never adds groups to an existing account."""
+    global _MTX_SRV
+    created = False
+    if _mtx_account_problem() == 'missing':
+        groupadd = shutil.which('groupadd', path=BROKER_TRUSTED_PATH)
+        useradd = shutil.which('useradd', path=BROKER_TRUSTED_PATH)
+        if not groupadd or not useradd:
+            return {'ok': False, 'code': 'ERROR', 'error': 'groupadd/useradd not found'}
+        try:
+            grp.getgrnam(MEDIAMTX_USER)
+        except KeyError:
+            subprocess.run([groupadd, '--system', MEDIAMTX_USER],
+                           capture_output=True, timeout=30)
+        nologin = '/usr/sbin/nologin' if os.path.exists('/usr/sbin/nologin') else '/sbin/nologin'
+        r = subprocess.run([useradd, '--system', '-g', MEDIAMTX_USER, '-M', '-d', '/nonexistent',
+                            '-s', nologin, MEDIAMTX_USER], capture_output=True, timeout=30)
+        if r.returncode != 0 and _mtx_account_problem() == 'missing':
+            return {'ok': False, 'code': 'ERROR',
+                    'error': 'useradd failed: ' + (r.stderr or b'').decode(errors='replace')[-200:]}
+        created = True
+    problem = _mtx_account_problem()
+    if problem:
+        return {'ok': False, 'code': 'ERROR', 'error': problem}
+    with _MTX_SRV_LOCK:
+        if _MTX_SRV is None or not os.path.exists(MEDIAMTX_SOCKET_PATH):
+            _MTX_SRV = _start_mediamtx_listener()
+    return {'ok': True, 'created': created, 'uid': _mtx_uid(),
+            'socket': MEDIAMTX_SOCKET_PATH if _MTX_SRV is not None else ''}
+
+
+def _unlink_mediamtx_socket():
+    try:
+        os.unlink(MEDIAMTX_SOCKET_PATH)
+    except OSError:
+        pass
+
+
+def _start_mediamtx_listener():
+    """Serve the mediamtx socket in a daemon thread when the account exists.
+    Returns the server, or None (no fit account yet, so nothing to serve)."""
+    if _mtx_account_problem():
+        return None
+    gid = pwd.getpwnam(MEDIAMTX_USER).pw_gid
+    _unlink_mediamtx_socket()
+    srv = _Server(MEDIAMTX_SOCKET_PATH, _MediamtxHandler)
+    try:
+        os.chown(MEDIAMTX_SOCKET_PATH, 0, gid)
+        os.chmod(MEDIAMTX_SOCKET_PATH, 0o660)
+    except OSError as e:
+        srv.server_close()
+        _unlink_mediamtx_socket()
+        sys.stderr.write(f'takwerx-broker: mediamtx socket perms failed, not serving it: {e}\n')
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True, name='mediamtx-socket').start()
+    return srv
 
 
 class _Handler(socketserver.BaseRequestHandler):
@@ -3988,6 +4340,50 @@ class _Handler(socketserver.BaseRequestHandler):
             if len(data) > MAX_MSG:
                 audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR',
                       'response exceeds MAX_MSG')
+                data = json.dumps({'ok': False, 'code': 'ERROR',
+                                   'error': 'response exceeds MAX_MSG'}).encode()
+            conn.sendall(data)
+        except OSError:
+            pass
+
+
+class _MediamtxHandler(socketserver.BaseRequestHandler):
+    """The mediamtx socket (ops #643): same framing as _Handler, its own rulebook."""
+
+    def handle(self):
+        _inflight_add(1)
+        try:
+            self._handle()
+        finally:
+            _inflight_add(-1)
+
+    def _handle(self):
+        conn = self.request
+        peer = _peercred(conn)
+        if not _allowed_mediamtx_peer(peer[1]):
+            audit(peer, 'mediamtx:connect', '', 'DENY', 'unauthorized peer uid')
+            try:
+                conn.sendall(json.dumps({'ok': False, 'code': 'DENIED',
+                                         'error': 'unauthorized peer'}).encode())
+            except OSError:
+                pass
+            return
+        req = {}
+        try:
+            req = json.loads(_recv_all(conn).decode())
+            resp = _dispatch_mediamtx(req, peer)
+        except Denied as d:
+            resp = {'ok': False, 'code': 'DENIED', 'error': str(d)}
+            audit(peer, 'mediamtx:exec', _summary_safe(req), 'DENY', str(d))
+        except subprocess.TimeoutExpired:
+            resp = {'ok': False, 'code': 'TIMEOUT', 'error': 'command timed out'}
+            audit(peer, 'mediamtx:exec', _summary_safe(req), 'ERROR', 'command timed out')
+        except Exception as e:  # noqa: BLE001 — never crash a worker thread
+            resp = {'ok': False, 'code': 'ERROR', 'error': f'{type(e).__name__}: {e}'}
+            audit(peer, 'mediamtx:exec', _summary_safe(req), 'ERROR', f'{type(e).__name__}: {e}')
+        try:
+            data = json.dumps(resp).encode()
+            if len(data) > MAX_MSG:
                 data = json.dumps({'ok': False, 'code': 'ERROR',
                                    'error': 'response exceeds MAX_MSG'}).encode()
             conn.sendall(data)
@@ -4431,7 +4827,7 @@ def _drain(max_secs=RECYCLE_DRAIN_MAX_SECS, clock=time.monotonic, sleep=time.sle
 
 
 def serve():
-    global AUDIT, ENFORCE, ENFORCE_INFO
+    global AUDIT, ENFORCE, ENFORCE_INFO, _MTX_SRV
     if os.geteuid() != 0:
         sys.stderr.write('takwerx-broker: serve must run as root\n')
         return 2
@@ -4465,6 +4861,16 @@ def serve():
         sys.stderr.write(f'takwerx-broker: socket perms warning: {e}\n')
     AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
                            'summary': f'listening on {SOCKET_PATH}'}))
+    # ops #643: MediaMTX + its editor get their own socket and short list (only once
+    # their account exists; the console's startup migration creates it).
+    try:
+        with _MTX_SRV_LOCK:
+            _MTX_SRV = _start_mediamtx_listener()
+    except Exception as e:  # noqa: BLE001 — never let this stop the main socket
+        sys.stderr.write(f'takwerx-broker: mediamtx socket not started: {e}\n')
+    if _MTX_SRV is not None:
+        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                               'summary': f'listening on {MEDIAMTX_SOCKET_PATH} (mediamtx list)'}))
     # SELinux module refresh runs AFTER the socket is up (a policy rebuild can
     # take tens of seconds; the console's boot ping must not wait on it).
     threading.Thread(target=_selinux_policy_converge, daemon=True,
@@ -4499,6 +4905,13 @@ def serve():
             srv.server_close()
         except OSError:
             pass
+        if _MTX_SRV is not None:
+            _unlink_mediamtx_socket()
+            try:
+                _MTX_SRV.shutdown()
+                _MTX_SRV.server_close()
+            except OSError:
+                pass
         if not _drain():
             AUDIT.info(json.dumps({'op': 'recycle', 'verdict': 'ERROR',
                                    'summary': 'recycle: %d request(s) still running after '

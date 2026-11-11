@@ -67,8 +67,10 @@ DEGRADED_FILE="/var/lib/takguard/diskio_degraded"
 mkdir -p /var/lib/takguard
 
 # ── 1. Run benchmark (10 MB sync write — takes <1s on healthy disk) ──
-RAW=$(dd if=/dev/zero of=/tmp/.gd_diskio_test bs=1M count=$TEST_SIZE_MB oflag=dsync 2>&1)
-rm -f /tmp/.gd_diskio_test
+# ops #633: a fresh mktemp file each run, not a fixed /tmp name.
+_DIO_F="$(mktemp /tmp/.gd_diskio.XXXXXX)"
+RAW=$(dd if=/dev/zero of="$_DIO_F" bs=1M count=$TEST_SIZE_MB oflag=dsync 2>&1)
+rm -f "$_DIO_F"
 
 # GNU dd prints rates under 1 MB/s as "kB/s" (lowercase k) — the class must include it.
 SPEED=$(echo "$RAW" | grep -oP '[\d.]+ [kKMGT]?B/s' | tail -1)
@@ -94,8 +96,9 @@ MB_S=$(echo "$SPEED" | awk '{
 # locale-sensitive "copied, X s" parse and reuses the proven speed-parse path.
 LAT_KB_S=""
 MS_PER_COMMIT=""
-LRAW=$(dd if=/dev/zero of=/tmp/.gd_diskio_lat bs=4k count=$LAT_OPS oflag=dsync 2>&1)
-rm -f /tmp/.gd_diskio_lat
+_DIO_F="$(mktemp /tmp/.gd_diskio.XXXXXX)"
+LRAW=$(dd if=/dev/zero of="$_DIO_F" bs=4k count=$LAT_OPS oflag=dsync 2>&1)
+rm -f "$_DIO_F"
 # ops #229: this used to be [KMGT], so every probe slower than ~3.9 ms/commit (under
 # 1 MB/s, which dd prints as "kB/s") was dropped as "probe failed". The series kept
 # only the fast readings and the WARN_MS_PER_COMMIT gate below could never trip.
@@ -303,7 +306,7 @@ VPS provider.
 
     echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
     if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-      TMPF="/tmp/gd-sms-$$.txt"
+      TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
       printf '%s' "$BODY" > "$TMPF"
       /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
       rm -f "$TMPF"
