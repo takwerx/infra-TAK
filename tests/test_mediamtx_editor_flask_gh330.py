@@ -79,6 +79,8 @@ class Box:
             '_MEDIAMTX_EDITOR_CERTIFI': 'certifi==2026.10.23',
             '_MEDIAMTX_EDITOR_PY_IMPORTS': 'import flask, ruamel.yaml, requests, psutil',
             '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
+            # an editor still on takwerx (ops #643 not applied yet): the GH #330 path
+            '_mediamtx_editor_uses_pylib': lambda: False,
         }
         for name in ('_mediamtx_editor_home', '_mediamtx_editor_python_ok', '_mediamtx_editor_pin_home',
                      '_mediamtx_editor_install_py_deps', '_mediamtx_editor_ensure_py_deps'):

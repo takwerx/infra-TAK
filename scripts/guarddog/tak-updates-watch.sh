@@ -109,7 +109,9 @@ fi
 
 # MediaMTX binary (only if present)
 if [ -x "/usr/local/bin/mediamtx" ]; then
-  cur_mtx=$(/usr/local/bin/mediamtx -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')
+  # ops #643: MediaMTX's own account can replace this binary (the web editor's upgrade
+  # button), so root never runs it: ask as `nobody`, which can change nothing.
+  cur_mtx=$(runuser -u nobody -- /usr/local/bin/mediamtx -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')
   [ -z "$cur_mtx" ] && cur_mtx=$(strings /usr/local/bin/mediamtx 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
   latest_mtx=$(latest_tag "bluenviron/mediamtx")
   if need_update "$cur_mtx" "$latest_mtx"; then
