@@ -30,6 +30,7 @@ import ast
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -39,9 +40,10 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
-_NAMES = ('_emit_mediamtx_site', '_mediamtx_vhost_block', '_mediamtx_edge_uses_sso',
+_NAMES = ('_emit_mediamtx_site', '_caddy_vhost_block', '_vhost_uses_sso',
           '_mediamtx_vhost_is_safe', '_mediamtx_vhost_needs_regen')
-_CONSTS = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT')
+_CONSTS = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
+           'CADDYFILE_USER_BLOCKS_MARKER', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT')
 AK_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
               'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
 HOST = 'stream.example.com'
@@ -49,7 +51,7 @@ EDITOR = '127.0.0.1:5080'
 
 
 def _ns():
-    ns = {'_pub_url': lambda h, s=None: f'https://{h}' if h else ''}
+    ns = {'_pub_url': lambda h, s=None: f'https://{h}' if h else '', 're': re}
     for node in TREE.body:
         if isinstance(node, ast.FunctionDef) and node.name in _NAMES:
             exec(ast.get_source_segment(APP, node), ns)
@@ -97,7 +99,8 @@ def test_no_authentik_never_publishes_a_bare_editor(mtx_up):
         text = site(mtx_up=mtx_up, **kw)
         for ln, before in _editor_routes(text, mtx_up):
             assert ln.startswith('        '), f'top-level (bare) editor proxy: {text}'
-            assert [b.strip() for b in before[1:]] == [f'request_header -{h}' for h in AK_HEADERS], text
+            assert [b.strip() for b in before[1:]] == (['request_header -X-Authentik-*']
+                                                       + [f'request_header -{h}' for h in AK_HEADERS]), text
 
 
 def test_login_not_checked_means_503_and_no_editor():
@@ -140,7 +143,9 @@ def test_startup_converge_opens_exactly_when_the_login_is_good():
 
 
 def test_failed_authentik_probe_keeps_the_authentik_block_on_disk():
-    uses = NS['_mediamtx_edge_uses_sso']
+    def uses(ak, caddyfile):
+        return NS['_vhost_uses_sso'](ak, caddyfile, NS['_MEDIAMTX_VHOST_MARKER'])
+
     with_ak = site(ak_up='127.0.0.1:9090', hls=None)
     assert uses({'installed': True, 'probe_ok': True}, '') is True
     assert uses({'installed': False, 'probe_ok': True}, with_ak) is False
@@ -214,7 +219,7 @@ def _src(name):
 
 def test_generate_caddyfile_uses_the_probe_rule_and_the_login_gate():
     src = _src('generate_caddyfile')
-    assert '_mtx_ak = _mediamtx_edge_uses_sso(ak, _mtx_existing)' in src
+    assert '_mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)' in src
     assert 'login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings)' in src
 
 

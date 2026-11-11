@@ -35707,6 +35707,7 @@ def _get_mediamtx_hls_upstream(settings):
 # (the editor checks it) and a /watch/ page is only HTML; its video is /hls-proxy/, which
 # needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
 MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
+_MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
 
 
 def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
@@ -35737,8 +35738,10 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     emit_strip(indent) / emit_rescue(root_url): generate_caddyfile's own emitters.
     login_ok: no Authentik only. True when the console has made sure the editor no longer
            answers admin/admin (ops #649); False answers 503 instead of the editor.
+    Every route starts with _CADDY_STRIP_AUTHENTIK_HEADERS (ops #648/#649): no client
+    X-Authentik-* header of any name reaches the editor.
     """
-    lines.append("# MediaMTX Web Console")
+    lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
     if hls:
         mtx_hls, hls_enc = hls
@@ -35758,10 +35761,12 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     if ak_up:
         for path in MEDIAMTX_OPEN_PATHS:
             lines.append(f"    route {path} {{")
+            lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append("    }")
         lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
@@ -35779,6 +35784,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         # was replaced, see _mediamtx_editor_secure_login), and client X-Authentik-* is
         # stripped on every route, same as with Authentik.
         lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
         lines.append(f"        reverse_proxy {mtx_up}")
         lines.append("    }")
@@ -35921,32 +35927,10 @@ def _mediamtx_editor_secure_login(settings, log_fn=None):
     return 'fail'
 
 
-def _mediamtx_vhost_block(text):
-    i = (text or '').find('# MediaMTX Web Console')
-    if i < 0:
-        return ''
-    j = text.find('\n}\n', i)
-    return text[i:j if j > 0 else len(text)]
-
-
-def _mediamtx_edge_uses_sso(ak, existing_caddyfile):
-    """ops #649: should the MediaMTX vhost be built with Authentik forward_auth?
-
-    Same rule as _nodered_edge_uses_sso: a FAILED Authentik probe is unknown, not "no
-    Authentik". Keep the Authentik block if the Caddyfile on disk has one; otherwise the
-    no-Authentik vhost, which strips client X-Authentik-* and needs the editor's login."""
-    ak = ak or {}
-    if ak.get('installed'):
-        return True
-    if ak and ak.get('probe_ok', True):
-        return False
-    return 'forward_auth' in _mediamtx_vhost_block(existing_caddyfile or '')
-
-
 def _mediamtx_vhost_is_safe(generated):
     """True when the MediaMTX vhost in a Caddyfile cannot hand a forged X-Authentik-* header or
     an admin/admin editor to the internet (no vhost at all counts as safe). ops #649."""
-    blk = _mediamtx_vhost_block(generated)
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
     if not blk:
         return True
     return 'request_header -X-Authentik-Groups' in blk or ' 503' in blk
@@ -35956,7 +35940,7 @@ def _mediamtx_vhost_needs_regen(generated, login_ok):
     """ops #649: without Authentik the vhost is open exactly when the login is known good.
     True when it is unsafe, or open/closed (503) the wrong way round: closed by an earlier
     regen this boot, or open while the login could not be checked."""
-    blk = _mediamtx_vhost_block(generated)
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
     if not _mediamtx_vhost_is_safe(generated):
         return True
     if not blk or 'forward_auth' in blk:
@@ -39711,13 +39695,14 @@ def generate_caddyfile(settings=None):
     if mtx.get('installed'):
         mtx_host = sd['mediamtx']
         mtx_up = _get_mediamtx_upstream(settings)
-        # ops #649: an unknown Authentik probe keeps the Authentik block already on disk;
-        # without Authentik the editor is published only once its admin/admin is gone.
+        # ops #649: an unknown Authentik probe keeps the Authentik block already on disk
+        # (_vhost_uses_sso, ops #648); without Authentik the editor is published only once
+        # its admin/admin is gone.
         try:
             _mtx_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
         except Exception:
             _mtx_existing = ''
-        _mtx_ak = _mediamtx_edge_uses_sso(ak, _mtx_existing)
+        _mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)
         # /hls-proxy/ through the login to the local editor only — see _emit_mediamtx_site.
         _mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'
         _emit_mediamtx_site(
