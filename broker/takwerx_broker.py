@@ -44,6 +44,7 @@ a later step (the thin console is far easier to confine than a root monolith).
 """
 
 import base64
+import errno
 import grp
 import hashlib
 import json
@@ -1692,6 +1693,82 @@ def _is_console_owned(path):
     return any(path == p.rstrip('/') or path.startswith(p) for p in _CONSOLE_OWNED_PREFIXES)
 
 
+def _write_all(fd, data):
+    """os.write() until every byte is out (one call may write less than asked)."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _atomic_replace(path, content, perm):
+    """Write `content` to `path` by temp file + rename, so a process that already has
+    the old file open (a running bash script reads its source as it goes) keeps the OLD
+    inode and finishes cleanly. ops #666 / infra-TAK #473: the in-place O_TRUNC write
+    in _do_write rewrote tak-post-start.sh under a running unit and the unit died with
+    exit 2.
+
+    Returns True when done. Returns False, having changed nothing, when the target is a
+    kind of file that must keep being written in place: a symlink, a non-regular file,
+    a file with other hard links, or a mount point (rename gives EBUSY/EXDEV). Any other
+    failure (disk full...) raises with the target untouched. It never falls back after a
+    failed write: truncating the target then would be the very bug this fixes."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+        return False
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, '.%s.tmp-%d-%s' % (base, os.getpid(), os.urandom(4).hex()))
+    # 0o600 until the final mode is set, so a secret never sits readable in the temp file.
+    # A new file with no perm keeps the old 0o644 (subject to umask) via the open mode.
+    create_mode = 0o644 if (st is None and perm is None) else 0o600
+    # O_EXCL|O_NOFOLLOW: a planted link at the temp name can never be written through.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, create_mode)
+    try:
+        try:
+            if perm is not None:
+                os.fchmod(fd, int(perm))
+            elif st is not None:
+                os.fchmod(fd, stat.S_IMODE(st.st_mode))
+            if st is not None:
+                try:
+                    os.fchown(fd, st.st_uid, st.st_gid)
+                except OSError:
+                    pass
+                try:   # keep the SELinux label an in-place write would have kept (Rocky)
+                    os.setxattr(tmp, 'security.selinux', os.getxattr(path, 'security.selinux'))
+                except (OSError, AttributeError):
+                    pass
+            _write_all(fd, content)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, path)
+        except OSError as e:
+            if e.errno in (errno.EBUSY, errno.EXDEV):
+                os.unlink(tmp)
+                return False
+            raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:   # make the rename itself durable; best effort
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+    return True
+
+
 def _do_write(req):
     # Decision made in _dispatch; here only normalize (reject NUL/traversal) so
     # permissive mode can still execute an off-allowlist write (console is root).
@@ -1705,6 +1782,13 @@ def _do_write(req):
     content = base64.b64decode(req.get('content_b64') or '')
     mode = req.get('mode', 'w')
     append = mode in ('a', 'ab')
+    # ops #666: `atomic` is the console asking for temp file + rename (scripts a running
+    # process may be reading). Full-file writes only; append stays in place. Opt-in per
+    # request because a rename breaks a single-file bind mount into a container and a log
+    # a running process holds open, and in-place writes keep both working.
+    if req.get('atomic') is True and not append:
+        if _atomic_replace(path, content, req.get('perm')):
+            return {'ok': True}
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
     if _is_console_owned(path):
         flags |= os.O_NOFOLLOW

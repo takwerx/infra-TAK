@@ -129,6 +129,13 @@ Official: [docs.docker.com](https://docs.docker.com/)
 - Confirm what a container really runs with `docker inspect` (image digest, mounts, env, compose working directory label `com.docker.compose.project.working_dir`), not with the compose file. Do not guess where Authentik's compose project lives.
 - Container logs fill disks; Guard Dog caps them.
 
+## Shell scripts and systemd units that are rewritten while they run
+
+Official: [bash manual, shell scripts](https://www.gnu.org/software/bash/manual/html_node/Shell-Scripts.html), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+
+- **bash reads a script file as it runs, not all at once.** If the file is rewritten in place (open with truncate, then write), a running script carries on from its old byte offset in the new content and ends with a syntax error or a random command, exit 2. Writing a temp file in the same directory and renaming it over the old one is safe: the running script keeps the old file. The console does this for `/opt/tak-guarddog/` and `/etc/systemd/system/` (ops #666). ✅ verified 2026-11-11, `tak-post-start.service` on an Ubuntu 22.04 dev box: console restarted while the unit ran, in-place rewrite gave `Result=exit-code`, `ExecMainStatus=2` and no "Boot sequence complete"; with the rename write the unit ended `Result=success`.
+- **A rename is not always right.** It breaks a single-file bind mount into a container (the container keeps the old file) and a log file that a running process holds open. Files like those stay written in place. ⚠ not re-tested for ops #666; the bind-mount case was seen with the NetBird CA bundle (ops #433).
+
 ## Node.js in the module images
 
 Official: [nodejs.org/en/about/previous-releases](https://nodejs.org/en/about/previous-releases)
