@@ -43468,9 +43468,9 @@ def _takportal_install_sudoers(log_fn=None):
         return False, str(r)
     if log_fn:
         _r = r if isinstance(r, dict) else {}
-        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'legacy'})")
-        if _r.get('variant') == 'legacy':
-            log_fn(f"  ⚠ legacy (root-equivalent) grant kept: {_r.get('variant_reason')}")
+        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'hardened'})")
+        if 'older than' in (_r.get('variant_reason') or ''):
+            log_fn(f"  ⚠ {_r.get('variant_reason')}")
         if _r.get('removed_leftover'):
             log_fn("  ✓ removed leftover /etc/sudoers.d/tak-portal-marketplace (NOPASSWD: ALL from TAK Portal <2.0.19)")
         if _r.get('variant') == 'hardened' and not _r.get('helper_granted'):
@@ -43605,6 +43605,192 @@ def _takportal_install_caddy_validate_shim(log_fn=None):
         return 'error'
 
 
+# ops #644: the portal key's line in the console user's authorized_keys is limited to what
+# TAK Portal needs. `restrict` turns off
+# port/agent/X11 forwarding, pty and ~/.ssh/rc; `from=` admits only the TAK Portal containers'
+# Docker networks (the container reaches sshd via host.docker.internal from there; test6 logs
+# show the infratak address) and loopback (our own _takportal_ssh_probe). TAK Portal 2.0.33's
+# TAK SSH channel (services/takSsh.service.js) uses only exec without a pty and the sftp
+# subsystem, and `restrict` blocks neither (sshd(8) AUTHORIZED_KEYS FILE FORMAT,
+# https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT). No forced command=: the portal
+# sends many generated `bash -lc` scripts, so a wrapper would have to re-parse shell.
+TAKPORTAL_SSH_KEY_COMMENT = 'tak-portal-auto'
+_AUTHKEY_TYPE_RE = re.compile(r'^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+)$')
+
+
+def _authorized_keys_split(line):
+    """(options, keytype, blob, comment) for one authorized_keys line, or None for a blank,
+    comment or unparseable line. Options may hold quoted values with spaces and commas."""
+    s = line.strip()
+    if not s or s.startswith('#'):
+        return None
+    opts = ''
+    if not _AUTHKEY_TYPE_RE.match(s.split(None, 1)[0]):
+        i, q = 0, False
+        while i < len(s):
+            c = s[i]
+            if c == '\\' and q and i + 1 < len(s):
+                i += 2
+                continue
+            if c == '"':
+                q = not q
+            elif c in ' \t' and not q:
+                break
+            i += 1
+        opts, s = s[:i], s[i:].strip()
+    parts = s.split(None, 2)
+    if len(parts) < 2 or not _AUTHKEY_TYPE_RE.match(parts[0]):
+        return None
+    return opts, parts[0], parts[1], (parts[2] if len(parts) > 2 else '')
+
+
+def _takportal_ssh_from_sources():
+    """CIDRs TAK Portal's SSH logins can come from: the subnets of every Docker network a
+    running TAK Portal app container is on, plus the two networks _write_takportal_override
+    always attaches (infratak and the project default), so a container caught between
+    recreates still matches. Private ranges only; [] when Docker cannot answer."""
+    names = {INFRATAK_DOCKER_NETWORK, f'{_takportal_project_name()}_default'}
+    try:
+        app_svcs = set(_takportal_app_services())
+        ids = [c['id'] for c in _takportal_project_containers(all_states=False)
+               if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal')]
+        if ids:
+            r = _probe_run(_sudo_wrap(['docker', 'inspect', '-f', '{{json .NetworkSettings.Networks}}'] + ids),
+                           capture_output=True, text=True, timeout=15)
+            for line in (r.stdout or '').splitlines():
+                try:
+                    names.update((json.loads(line) or {}).keys())
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    nets = set()
+    for name in sorted(names):
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$', name):
+            continue
+        try:
+            r = _probe_run(_sudo_wrap(['docker', 'network', 'inspect', '-f', '{{json .IPAM.Config}}', name]),
+                           capture_output=True, text=True, timeout=10)
+            cfg = json.loads((r.stdout or '').strip() or 'null') if r.returncode == 0 else None
+        except Exception:
+            continue
+        for c in (cfg or []):
+            try:
+                n = ipaddress.ip_network(str((c or {}).get('Subnet') or ''), strict=False)
+            except ValueError:
+                continue
+            # Never widen to a public or huge range, whatever Docker reports.
+            if n.is_private and not n.is_loopback and n.prefixlen >= (8 if n.version == 4 else 32):
+                nets.add(str(n))
+    return sorted(nets)
+
+
+def _takportal_ssh_key_options(sources):
+    """The options for the portal key line. No sources = `restrict` alone (the next heal adds
+    from= once Docker answers), never a from= that would lock the portal out."""
+    if not sources:
+        return 'restrict'
+    return 'restrict,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
+
+
+def _takportal_authorized_keys_text(existing, pub_content, sources):
+    """New authorized_keys text with the portal key restricted. Returns (text, changed, removed).
+
+    The line holding the portal key gets the options from _takportal_ssh_key_options (added
+    once if missing). Other lines that carry our keygen comment (`tak-portal-auto`) are older
+    portal keys the portal no longer uses (e.g. one a non-root flip carried over):
+    they are dropped. Every other line is kept byte for byte. With no sources, a portal line
+    that already has a from= keeps it."""
+    pub = _authorized_keys_split(pub_content)
+    if not pub:
+        raise ValueError('portal public key is not a valid key line')
+    _, ktype, blob, comment = pub
+    want_opts = _takportal_ssh_key_options(sources)
+    lines = existing.splitlines()
+    out, removed, have = [], 0, False
+    for line in lines:
+        p = _authorized_keys_split(line)
+        if p and p[2] == blob:
+            if have:
+                removed += 1      # a duplicate of the portal key: one line is enough
+                continue
+            have = True
+            opts = want_opts
+            if not sources and 'from=' in p[0] and p[0].startswith('restrict'):
+                opts = p[0]
+            out.append(f'{opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
+            continue
+        if p and p[3].strip() == TAKPORTAL_SSH_KEY_COMMENT:
+            removed += 1
+            continue
+        out.append(line)
+    if not have:
+        while out and not out[-1].strip():
+            out.pop()
+        out.append(f'{want_opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
+    text = '\n'.join(out) + '\n'
+    return text, text != existing, removed
+
+
+def _takportal_trust_portal_key(pub_content, log_fn=None, only_if_present=False):
+    """Write the portal key into ~/.ssh/authorized_keys, restricted (see above). Atomic, 0600.
+    only_if_present: the console-start heal rewrites an existing line, never adds trust.
+    Returns 'written' | 'current' | 'absent'; raises on I/O errors."""
+    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
+    os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
+    existing = ''
+    if os.path.exists(auth_keys):
+        with open(auth_keys, 'r') as f:
+            existing = f.read()
+    blob = (_authorized_keys_split(pub_content) or ('', '', '', ''))[2]
+    if only_if_present and not (blob and any((_authorized_keys_split(l) or ('', '', ''))[2] == blob
+                                             for l in existing.splitlines())):
+        return 'absent'
+    sources = _takportal_ssh_from_sources()
+    text, changed, removed = _takportal_authorized_keys_text(existing, pub_content, sources)
+    if not changed:
+        if log_fn:
+            log_fn("  ✓ Public key already in authorized_keys (restricted)")
+        return 'current'
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys), prefix='.authorized_keys-')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, auth_keys)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if log_fn:
+        log_fn("  ✓ Public key in ~/.ssh/authorized_keys, restricted to "
+               + (', '.join(sources) + ' and loopback' if sources else
+                  'no forwarding (Docker networks not readable yet; from= added on the next heal)'))
+        if removed:
+            log_fn(f"  ✓ Removed {removed} older TAK Portal key line(s) from authorized_keys")
+    return 'written'
+
+
+def _heal_takportal_ssh_key(plog=None):
+    """ops #644: on console start, restrict the portal key line on boxes that already trust it
+    (written before this release with no options), and refresh from= when TAK Portal's Docker
+    networks change. Never adds trust. Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        pub = os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519.pub')
+        if not os.path.isdir('/opt/tak') or not os.path.exists(pub) or not _takportal_web_running():
+            return False
+        with open(pub) as f:
+            pub_content = f.read().strip()
+        return _takportal_trust_portal_key(pub_content, log_fn=_log, only_if_present=True) == 'written'
+    except Exception as e:
+        _log(f"  takportal: SSH key restriction heal error (non-fatal): {e}")
+        return False
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -43620,7 +43806,6 @@ def _takportal_setup_ssh(log_fn=None):
     key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
     priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
     pub_key = priv_key + '.pub'
-    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
 
     try:
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
@@ -43640,23 +43825,10 @@ def _takportal_setup_ssh(log_fn=None):
             if log_fn:
                 log_fn("  ✓ SSH keypair already exists")
 
-        # Install public key in host authorized_keys
+        # Install public key in host authorized_keys, restricted (ops #644)
         with open(pub_key, 'r') as f:
             pub_content = f.read().strip()
-        os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
-        existing_keys = ''
-        if os.path.exists(auth_keys):
-            with open(auth_keys, 'r') as f:
-                existing_keys = f.read()
-        if pub_content not in existing_keys:
-            with open(auth_keys, 'a') as f:
-                f.write(f'\n{pub_content}\n')
-            os.chmod(auth_keys, 0o600)
-            if log_fn:
-                log_fn("  ✓ Public key added to ~/.ssh/authorized_keys")
-        else:
-            if log_fn:
-                log_fn("  ✓ Public key already in authorized_keys")
+        _takportal_trust_portal_key(pub_content, log_fn=log_fn)
 
         # Copy keypair into running container
         _web = _takportal_ref()  # v10.1.59: the WEB service's container, resolved — not a name guess
@@ -44308,28 +44480,39 @@ def takportal_ssh_status():
     row('Keypair (container)', 'ok' if in_container else 'bad',
         'present' if in_container else 'missing')
 
-    trusted = False
+    trusted, key_opts = False, ''
     try:
         pub = key + '.pub'
         ak = os.path.expanduser('~/.ssh/authorized_keys')
         if os.path.exists(pub) and os.path.exists(ak):
             with open(pub) as f:
-                pk = f.read().strip()
+                blob = (_authorized_keys_split(f.read()) or ('', '', '', ''))[2]
             with open(ak) as f:
-                trusted = bool(pk) and pk in f.read()
+                for _l in f.read().splitlines():
+                    _p = _authorized_keys_split(_l)
+                    if blob and _p and _p[2] == blob:
+                        trusted, key_opts = True, _p[0]
+                        break
     except Exception:
         pass
-    row('Host trust', 'ok' if trusted else 'bad',
-        f'portal key {"in" if trusted else "NOT in"} ~{console_user}/.ssh/authorized_keys')
+    if not trusted:
+        row('Host trust', 'bad', f'portal key NOT in ~{console_user}/.ssh/authorized_keys')
+    elif key_opts.startswith('restrict') and 'from=' in key_opts:
+        row('Host trust', 'ok', f'portal key in ~{console_user}/.ssh/authorized_keys, '
+            "restricted to TAK Portal's Docker networks")
+    else:
+        row('Host trust', 'warn', f'portal key in ~{console_user}/.ssh/authorized_keys, not restricted',
+            'Any host holding the portal key can log in. Run Repair to restrict it.')
 
     ok, grant = _takportal_sudoers('status')
     if ok and isinstance(grant, dict):
         if not grant.get('supported'):
             row('Sudo grant', 'na', grant.get('reason') or 'not supported here')
-        elif grant.get('present') and grant.get('matches') and grant.get('variant') == 'legacy':
-            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (legacy, root-equivalent)',
+        elif grant.get('present') and grant.get('matches') and grant.get('portal_old'):
+            # ops #644: TAK Portal < 2.0.19 gets the hardened grant too; it needs an update.
+            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (hardened; TAK Portal too old for it)',
                 (grant.get('variant_reason') or 'TAK Portal is older than 2.0.19') +
-                '. Update TAK Portal, then run Repair.')
+                '. Update TAK Portal to bring back the Marketplace and cert repair.')
         elif grant.get('present') and grant.get('matches'):
             _h = (grant.get('helper') or {})
             row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
@@ -110006,6 +110189,10 @@ def _startup_migrations():
                 )
         except Exception as tp_shim_err:
             print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
+
+        # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
+        # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
+        _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
 
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key

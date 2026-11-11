@@ -18,8 +18,8 @@
 
 The hardened grant has no rule for a script in a tak-owned directory, runs the
 CoreConfig cat/tee as `tak` through root-owned wrappers, and grants only a
-hash-pinned marketplace helper. The legacy text is kept byte-for-byte for older
-portals.
+hash-pinned marketplace helper. Since ops #644 every box gets it: the legacy
+text for TAK Portal < 2.0.19 is gone (see test_takportal_ssh_key_restrict_ops644.py).
 """
 
 import hashlib
@@ -53,14 +53,6 @@ def _grant_lines(text):
 
 
 # --------------------------------------------------------------------------- text
-def test_legacy_text_is_unchanged_for_old_portals(b):
-    t = b._takportal_sudoers_text(user='takwerx')
-    assert t == b._takportal_sudoers_text(user='takwerx', variant='legacy')
-    assert 'NOPASSWD: /usr/bin/tee /opt/tak/utils/tak-portal-repair-certs.sh' in t
-    assert 'NOPASSWD: /usr/bin/bash /opt/tak/utils/tak-portal-repair-certs.sh' in t
-    assert 'NOPASSWD: /usr/bin/cat /opt/tak/CoreConfig.xml' in t
-
-
 def test_hardened_has_no_script_rules_and_no_root_cat_tee(b):
     t = b._takportal_sudoers_text(user='takwerx', variant='hardened', helper=True)
     body = '\n'.join(_grant_lines(t))
@@ -148,10 +140,10 @@ def _portal(tmp_path, monkeypatch, b, version=None, helper=None):
     return d
 
 
-def test_old_portal_stays_on_legacy(b, tmp_path, monkeypatch):
+def test_old_portal_gets_hardened_and_an_update_note(b, tmp_path, monkeypatch):
     _portal(tmp_path, monkeypatch, b, version='2.0.18')
     d = b._takportal_decide()
-    assert d['variant'] == 'legacy' and '2.0.19' in d['reason']
+    assert d['variant'] == 'hardened' and d['portal_old'] is True and '2.0.19' in d['reason']
 
 
 def test_new_portal_with_pinned_helper_is_hardened(b, tmp_path, monkeypatch):
@@ -267,7 +259,7 @@ def test_leftover_marketplace_dropin_removed_only_when_regular_file(b, tmp_path,
     assert b._takportal_remove_leftover() is False and target.exists()
 
 
-def test_status_reports_variant_and_legacy_row_in_console():
+def test_status_reports_old_portal_row_in_console():
     app = (REPO / 'app.py').read_text()
-    assert "grant.get('variant') == 'legacy'" in app
+    assert "grant.get('portal_old')" in app
     assert 'removed leftover /etc/sudoers.d/tak-portal-marketplace' in app

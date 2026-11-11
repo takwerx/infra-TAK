@@ -2752,8 +2752,9 @@ TAKPORTAL_TAK_USER = 'tak'
 #     touching the file;
 #   * the marketplace helper is installed from a PINNED sha256 and granted by
 #     exact path.
-# Boxes whose TAK Portal is older than 2.0.19 keep the legacy text (their
-# marketplace needs it) until the portal is updated.
+# Every box gets this grant (ops #644). A TAK Portal older than 2.0.19 used to
+# keep the v10.1.53 legacy text; its marketplace and cert
+# repair now need a TAK Portal update instead.
 TAKPORTAL_LIBEXEC = '/usr/local/libexec/infratak'
 TAKPORTAL_WRAP_DIR = TAKPORTAL_LIBEXEC + '/portal-bin'
 TAKPORTAL_WRAPPED = ('cat', 'tee')
@@ -2835,13 +2836,14 @@ def _sudoers_safe_binaries(name):
     return out
 
 
-def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
+def _takportal_sudoers_text(user=BROKER_USER, variant='hardened', helper=False):
     """The ONE definition of the grant.
 
-    variant 'legacy'   — the v10.1.53 text, for a TAK Portal older than 2.0.19.
     variant 'hardened' — ops #217: no script rules, CoreConfig cat/tee through
                          root-owned wrappers that drop to `tak`, and (helper=True)
                          the pinned marketplace helper.
+    The v10.1.53 'legacy' text is gone (ops #644). A TAK Portal older than 2.0.19 gets the hardened
+    grant too; its marketplace and cert repair need a TAK Portal update.
 
     app.py imports THIS function for the root-console path rather than keeping its
     own copy, so the two can never drift — a drifted sudoers template is a
@@ -2852,38 +2854,9 @@ def _takportal_sudoers_text(user=BROKER_USER, variant='legacy', helper=False):
     binaries)."""
     if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
-    if variant == 'hardened':
-        return _takportal_hardened_text(user, helper)
-    if variant != 'legacy':
+    if variant != 'hardened':
         raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
-    lines = [
-        '# Managed by infra-TAK (v10.1.53). Do not edit by hand.',
-        '#',
-        '# Lets TAK Portal, over its container->host SSH channel, do the four',
-        '# privileged things it needs on a native TAK Server install. Deliberately',
-        '# NARROWER than the file TAK Portal installs for itself: no `tail` (that',
-        '# is an unrestricted root read of every file on this box) and no `reboot`',
-        '# (the infra-TAK console owns power controls). See docs/PLAN-v10.1.53.md.',
-        f'Defaults:{user} !requiretty',
-    ]
-    need = {}
-    for b in ('cat', 'tee', 'bash', 'systemctl'):
-        paths = _sudoers_safe_binaries(b)
-        if not paths:
-            raise Denied(f'takportal_sudoers: cannot resolve a root-owned {b} in {_SUDOERS_BIN_DIRS}')
-        need[b] = paths
-    for p in need['cat']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
-    for p in need['tee']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_CORECONFIG}')
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
-    for p in need['bash']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} {TAKPORTAL_REPAIR_SCRIPT}')
-    for p in need['systemctl']:
-        lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
-    # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
-    lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
-    return '\n'.join(lines) + '\n'
+    return _takportal_hardened_text(user, helper)
 
 
 def _takportal_hardened_text(user, helper):
@@ -3047,10 +3020,12 @@ def _takportal_decide(user=BROKER_USER):
     (config hooks run code), O_NOFOLLOW, size-capped, and the helper bytes are
     only ever USED if they hash to a pinned value.
 
-    The checkout is operator-writable, so this selects between two grants, it is
-    not an authority: a box where the portal is old stays on the legacy text by
-    design (AJ, ops #16), and the status row says so."""
+    The checkout is operator-writable, so it only picks which pinned helper to
+    grant and what the status row says; the variant is always 'hardened' (ops #644
+    removed the legacy text). portal_old: TAK Portal is older than
+    2.0.19, so its marketplace and cert repair need a TAK Portal update."""
     out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
+           'portal_old': False,
            'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found',
            'helper_unreviewed': False}
     try:
@@ -3084,10 +3059,10 @@ def _takportal_decide(user=BROKER_USER):
     # The helper file only exists from 2.0.19, so it also proves "new enough"
     # when package.json lags (upstream has shipped a release without bumping it).
     if data is None and tup is not None and tup < TAKPORTAL_HARDENED_MIN_VERSION:
-        out['variant'] = 'legacy'
+        out['portal_old'] = True
         out['reason'] = (f'TAK Portal {ver} is older than '
                          f'{".".join(map(str, TAKPORTAL_HARDENED_MIN_VERSION))} — its marketplace '
-                         'still needs the legacy grant; update TAK Portal to tighten it')
+                         'and cert repair need a TAK Portal update')
     else:
         out['reason'] = f'TAK Portal {ver or "version unknown"}'
     return out
@@ -3193,6 +3168,7 @@ def _do_takportal_sudoers(req):
         return {'ok': True, 'present': present, 'matches': matches, 'mode': mode,
                 'supported': ok, 'reason': why, 'path': TAKPORTAL_SUDOERS_PATH,
                 'variant': variant, 'variant_reason': decision['reason'],
+                'portal_old': bool(decision.get('portal_old')),
                 'wrappers_ok': wrappers_ok,
                 'helper': {'granted': bool(hardened and helper_ok),
                            'installed': helper_ok, 'reason': decision['helper_reason'],
