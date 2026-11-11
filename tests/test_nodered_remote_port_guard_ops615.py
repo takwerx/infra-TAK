@@ -101,7 +101,9 @@ def test_bad_input_never_reaches_the_script(name, ports, ips):
 def test_script_runs_and_is_idempotent(tmp_path):
     """Run the real script under sh with a fake iptables that logs and knows which rules exist."""
     script, _ = _ns()['_docker_port_guard_files']('nodered', [1880], ['203.0.113.10'])
-    (tmp_path / 'guard.sh').write_text(script)
+    # this test is about the IPv4 rules: take the kernel's IPv6 marker out of the picture
+    # (the IPv6 half is covered in test_docker_port_guard_ipv6_ops672.py)
+    (tmp_path / 'guard.sh').write_text(script.replace('/proc/net/if_inet6', str(tmp_path / 'no-ipv6')))
     fake = tmp_path / 'bin' / 'iptables'
     fake.parent.mkdir()
     fake.write_text('#!/bin/sh\n'

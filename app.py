@@ -61864,6 +61864,7 @@ def _docker_port_guard_files(name, ports, allow_ips):
     https://docs.docker.com/engine/network/packet-filtering-firewalls/
     Containers on the box's own Docker bridges keep access. The unit is WantedBy + PartOf
     docker.service, so the rules come back on every boot and every Docker restart.
+    ops #672: IPv6 is covered too (INPUT, where Docker's [::] proxy traffic enters).
     """
     if not _PORT_GUARD_NAME_RE.match(name or ''):
         raise ValueError(f'bad port guard name: {name!r}')
@@ -61901,6 +61902,41 @@ def _docker_port_guard_files(name, ports, allow_ips):
         'for p in $(iptables -w -S DOCKER-USER | sed -n "/ -j $C\\$/s/.*--ctorigdstport \\([0-9][0-9]*\\).*/\\1/p"); do',
         '  case "$KEEP" in *" $p "*) ;; *) iptables -w -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j "$C" || exit 1;; esac',
         'done',
+    ]
+    # ops #672: Docker also publishes each port on IPv6 ([::]:PORT, through docker-proxy). That
+    # traffic enters through INPUT, not DOCKER-USER, so the IPv4 rules above do not apply to it.
+    # The console reaches these ports over IPv4 (the allow list above is IPv4), so over IPv6 refuse
+    # everyone except this box's own interfaces. REJECT with a TCP reset, not DROP: a client that
+    # tries IPv6 first (a name with an AAAA record) falls back to IPv4 at once instead of waiting
+    # for a timeout. The same jump goes into ip6tables DOCKER-USER for a Docker whose bridges have
+    # IPv6 on (that path is forwarded, not proxied). Skipped only when the kernel has no IPv6.
+    lines += [
+        'if [ -e /proc/net/if_inet6 ]; then',
+        '  command -v ip6tables >/dev/null 2>&1 || { echo "infratak-port-guard: ip6tables not found" >&2; exit 1; }',
+        '  ip6tables -w -N "$C" 2>/dev/null || ip6tables -w -F "$C" || exit 1',
+        '  ip6tables -w -A "$C" -i lo -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -i docker0 -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -i br-+ -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -p tcp -j REJECT --reject-with tcp-reset || exit 1',
+    ]
+    for p in _ports:
+        m = f'-p tcp --dport {p} -j "$C"'
+        lines.append(f'  ip6tables -w -C INPUT {m} 2>/dev/null || ip6tables -w -I INPUT {m} || exit 1')
+    lines += [
+        '  if ip6tables -w -S DOCKER-USER >/dev/null 2>&1; then',
+    ]
+    for p in _ports:
+        m = f'-p tcp -m conntrack --ctorigdstport {p} --ctdir ORIGINAL -j "$C"'
+        lines.append(f'    ip6tables -w -C DOCKER-USER {m} 2>/dev/null || ip6tables -w -I DOCKER-USER {m} || exit 1')
+    lines += [
+        '    for p in $(ip6tables -w -S DOCKER-USER | sed -n "/ -j $C\\$/s/.*--ctorigdstport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '      case "$KEEP" in *" $p "*) ;; *) ip6tables -w -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j "$C" || exit 1;; esac',
+        '    done',
+        '  fi',
+        '  for p in $(ip6tables -w -S INPUT | sed -n "/ -j $C\\$/s/.*--dport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '    case "$KEEP" in *" $p "*) ;; *) ip6tables -w -D INPUT -p tcp --dport "$p" -j "$C" || exit 1;; esac',
+        '  done',
+        'fi',
     ]
     script = '\n'.join(lines) + '\n'
     unit = (
@@ -61955,6 +61991,8 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, ex
         f'echo {_b64.b64encode(unit.encode()).decode()} | base64 -d | $S tee /etc/systemd/system/{_unit} >/dev/null && '
         f'$S systemctl daemon-reload && $S systemctl enable {_unit} 2>&1 && $S systemctl restart {_unit} 2>&1 && '
         f'$S iptables -w -C DOCKER-USER -p tcp -m conntrack --ctorigdstport {_p0} --ctdir ORIGINAL -j {_chain} && '
+        # ops #672: and the IPv6 jump, on a kernel that has IPv6 (the script skips it otherwise)
+        f'{{ [ ! -e /proc/net/if_inet6 ] || $S ip6tables -w -C INPUT -p tcp --dport {_p0} -j {_chain}; }} && '
         'echo "GUARD_OK had=$had"'
     )
     ok, out = _module_run(deploy_cfg, cmd, timeout=60)
@@ -61962,7 +62000,7 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, ex
     ports_txt = '/'.join(str(p) for p in ports)
     if good:
         if _ips:
-            _log(f"  ✓ Port {ports_txt} locked to the console ({', '.join(_ips)}) in DOCKER-USER (kept across reboot)")
+            _log(f"  ✓ Port {ports_txt} locked to the console ({', '.join(_ips)}) in DOCKER-USER, IPv6 refused (kept across reboot)")
         else:
             _log(f"  ⚠ Port {ports_txt} dropped for every source: no console IP found. Set Settings → Server IP.")
     else:

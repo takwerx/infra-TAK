@@ -102,7 +102,10 @@ def fake_iptables(tmp_path):
 
     def run(name, ports):
         script = tmp_path / f'guard-{name}.sh'
-        script.write_text(_guard_script(name, ports, ['203.0.113.10']))
+        # these tests are about the IPv4 rules: take the kernel's IPv6 marker out of the picture
+        # (the IPv6 half is covered in test_docker_port_guard_ipv6_ops672.py)
+        script.write_text(_guard_script(name, ports, ['203.0.113.10']).replace(
+            '/proc/net/if_inet6', str(tmp_path / 'no-ipv6')))
         r = subprocess.run(['sh', str(script)], env=env, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         return state.read_text().splitlines()
