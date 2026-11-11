@@ -36,7 +36,7 @@ TREE = ast.parse(APP)
 TEMPLATE = (REPO / 'templates' / 'webodm.html').read_text(encoding='utf-8')
 
 _FUNCS = ('_docker_port_guard_files', '_remote_docker_port_guard',
-          '_webodm_admin_cmd', '_webodm_admin_parse', '_webodm_ensure_admin')
+          '_webodm_admin_cmd', '_webodm_shell_cmd', '_webodm_admin_parse', '_webodm_ensure_admin')
 _ASSIGNS = ('_PORT_GUARD_NAME_RE', '_WEBODM_ADMIN_PY')
 
 
@@ -110,7 +110,8 @@ def test_existing_remote_boxes_get_the_guard_and_an_admin_check_on_console_start
 
 def test_deploy_makes_the_admin_after_migrations():
     src = _func_src('_run_webodm_deploy_remote')
-    assert src.index('manage.py showmigrations') < src.index('_webodm_ensure_admin(deploy_cfg, plog)')
+    # ops #650: the migration wait moved into _webodm_wait_migrations (shared with the local deploy)
+    assert src.index('_webodm_wait_migrations(deploy_cfg, plog)') < src.index('_webodm_ensure_admin(deploy_cfg, plog)')
 
 
 def test_admin_code_creates_or_replaces_and_never_sets_admin_admin():

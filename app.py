@@ -38607,6 +38607,69 @@ def _nodered_edge_uses_sso(ak, existing_caddyfile):
     return _nodered_vhost_has_forward_auth(existing_caddyfile or '')
 
 
+# ops #650: WebODM's /welcome page makes the first admin while none exists (upstream
+# app/views/app.py `welcome`, no login needed). infra-TAK makes the admin at deploy, so the
+# page is never needed: Caddy closes it, with or without Authentik.
+_WEBODM_VHOST_MARKER = '# WebODM — drone photogrammetry + TAK overlay'
+_WEBODM_WELCOME_MATCHER = '@wo_welcome'
+
+
+def _webodm_vhost_closed(caddyfile):
+    """True when there is no WebODM vhost, or it keeps the /welcome setup page closed.
+    The vhost is found with _caddy_vhost_block (ops #648), so operator blocks never count."""
+    block = _caddy_vhost_block(caddyfile, _WEBODM_VHOST_MARKER)
+    return not block or _WEBODM_WELCOME_MATCHER in block
+
+
+def _webodm_proxy_lines(wo_up):
+    """Last lines inside the WebODM `route`: /welcome answers 403, everything else goes to WebODM."""
+    return [f'        {_WEBODM_WELCOME_MATCHER} {{',
+            '            path /welcome /welcome/*',
+            '        }',
+            f'        respond {_WEBODM_WELCOME_MATCHER} "WebODM setup is done in the infra-TAK console: '
+            'WebODM page, Account Recovery." 403',
+            f'        reverse_proxy {wo_up}']
+
+
+def _webodm_no_sso_lines(wo_up):
+    """WebODM vhost body when Authentik is not installed: WebODM's own login, /welcome closed."""
+    return ['    route {'] + _webodm_proxy_lines(wo_up) + ['    }']
+
+
+def _startup_caddy_webodm_welcome_converge():
+    """ops #650 — an existing box whose WebODM vhost still passes /welcome through gets it
+    closed on the console update. Same shape as _startup_caddy_nodered_login_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: WebODM setup-page converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if _webodm_vhost_closed(generated):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    print('Startup migration: closing the WebODM first-visit setup page in Caddy (ops #650)', flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: WebODM setup-page close queued — written with the post-registry '
+              'Caddyfile regen (ops #650).', flush=True)
+        return
+    try:
+        if not _webodm_vhost_closed(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ WebODM setup-page converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back (ops #650).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ WebODM setup page closed and Caddy %s (ops #650).'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _startup_caddy_nodered_login_converge():
     """ops #613 — an existing box whose Node-RED vhost is a bare reverse_proxy (no Authentik)
     gets a login from Caddy on the console update. The password is shown once on the
@@ -39900,20 +39963,27 @@ def generate_caddyfile(settings=None):
             wo_up = f'{_wo_remote_host}:{wo_port}' if _wo_remote_host else f'127.0.0.1:{wo_port}'
         else:
             wo_up = f'127.0.0.1:{wo_port}'
-        lines.append(f"# WebODM — drone photogrammetry + TAK overlay")
+        lines.append(_WEBODM_VHOST_MARKER)
         lines.append(f"{wo_host} {{")
-        if ak.get('installed'):
+        # ops #650: an unknown Authentik probe keeps the block already on disk; /welcome is
+        # closed either way, so the first visitor can never make the WebODM admin.
+        try:
+            _wo_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _wo_existing = ''
+        if _vhost_uses_sso(ak, _wo_existing, _WEBODM_VHOST_MARKER):
             lines.append(f"    route {{")
+            lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             _emit_outpost_callback_rescue(f"{_pub_url(wo_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
-            lines.append(f"        reverse_proxy {wo_up}")
+            lines += _webodm_proxy_lines(wo_up)
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy {wo_up}")
+            lines += _webodm_no_sso_lines(wo_up)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'webodm'), wo_host)
@@ -56138,14 +56208,35 @@ print('WOADMIN DONE')
 
 def _webodm_admin_cmd(fix):
     """Shell command that checks (fix=False) or makes safe (fix=True) the WebODM admin."""
-    code = _WEBODM_ADMIN_PY.format(fix='True' if fix else 'False')
+    return _webodm_shell_cmd(_WEBODM_ADMIN_PY.format(fix='True' if fix else 'False'))
+
+
+def _webodm_shell_cmd(code):
+    """`manage.py shell -c <code>` in the webapp container, the code passed as base64."""
     return ('docker exec webapp python manage.py shell -c '
             f'"$(echo {_b64.b64encode(code.encode()).decode()} | base64 -d)" 2>&1')
 
 
+# ops #650: a box that never got an admin (local deploys before ops #650) still shows WebODM's
+# first-visit setup page. The console start makes the admin with NO usable password, so there
+# is nothing to print to the journal; the operator sets one with Account Recovery.
+_WEBODM_ADMIN_LOCK_PY = '''from django.contrib.auth.models import User
+su = list(User.objects.filter(is_superuser=True))
+if not su:
+    name = 'admin' if not User.objects.filter(username='admin').exists() else 'infratak-admin'
+    User.objects.create_superuser(name, name + '@localhost', None)
+    print('WOADMIN LOCKED ' + name)
+for u in su:
+    if u.check_password('admin') or u.check_password(u.username):
+        print('WOADMIN WEAK ' + u.username)
+print('WOADMIN DONE')
+'''
+
+
 def _webodm_admin_parse(out):
-    """WOADMIN lines → {'done': bool, 'new': [(user, pw)], 'reset': [(user, pw)], 'none': bool, 'weak': [user]}."""
-    r = {'done': False, 'new': [], 'reset': [], 'none': False, 'weak': []}
+    """WOADMIN lines → {'done': bool, 'new': [(user, pw)], 'reset': [(user, pw)], 'none': bool,
+    'weak': [user], 'locked': [user]}."""
+    r = {'done': False, 'new': [], 'reset': [], 'none': False, 'weak': [], 'locked': []}
     for ln in (out or '').splitlines():
         f = ln.strip().split(' ')
         if not f or f[0] != 'WOADMIN' or len(f) < 2:
@@ -56154,8 +56245,8 @@ def _webodm_admin_parse(out):
             r['done'] = True
         elif f[1] == 'NONE':
             r['none'] = True
-        elif f[1] == 'WEAK' and len(f) == 3:
-            r['weak'].append(f[2])
+        elif f[1] in ('WEAK', 'LOCKED') and len(f) == 3:
+            r[f[1].lower()].append(f[2])
         elif f[1] in ('NEW', 'RESET') and len(f) == 4:
             r['new' if f[1] == 'NEW' else 'reset'].append((f[2], f[3]))
     return r
@@ -56178,6 +56269,68 @@ def _webodm_ensure_admin(deploy_cfg, plog):
     if not r['new'] and not r['reset']:
         plog('  ✓ WebODM admin account exists with a non-default password')
     return True
+
+
+def _webodm_migrations_pending(deploy_cfg):
+    """How many WebODM Django migrations are not applied yet; 99 when that is unknown.
+    ops #650: counted here. The old `grep -c "[ ]" || echo 99` printed "0" then "99" when none
+    were pending (grep -c exits 1 on no match), so it never read 0 and the steps after it never ran."""
+    ok, out = _module_run(deploy_cfg, 'docker exec webapp python manage.py showmigrations 2>&1',
+                          timeout=30)
+    if not ok or '[X]' not in (out or ''):
+        return 99
+    return sum(1 for ln in out.splitlines() if ln.strip().startswith('[ ]'))
+
+
+def _webodm_wait_migrations(deploy_cfg, plog, tries=24):
+    """Wait (15 s steps, 6 min by default) until WebODM's migrations are done. True when done."""
+    import time as _time
+    pending = 99
+    for i in range(tries):
+        pending = _webodm_migrations_pending(deploy_cfg)
+        if pending == 0:
+            plog(f"  ✓ Migrations complete ({i * 15}s)")
+            return True
+        if i % 2 == 1:
+            plog(f"  ⏳ Waiting for migrations... ({(i + 1) * 15}s, {pending} pending)")
+        _time.sleep(15)
+    return False
+
+
+def _startup_webodm_local_admin():
+    """ops #650: a local WebODM with no admin shows its first-visit setup page to whoever opens
+    it first. On every console boot (Update Now restarts it), make the admin with no usable
+    password if there is none, and report a default one. Never prints a password.
+    Daemon thread: retries while Docker and WebODM come up."""
+    import time as _time
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return
+        wo_dir = _webodm_dir()
+        if wo_dir != '/root/webodm' and not os.path.exists(os.path.join(wo_dir, 'docker-compose.yml')):
+            return
+        for _ in range(10):
+            ok, out = _module_run(cfg, _webodm_shell_cmd(_WEBODM_ADMIN_LOCK_PY), timeout=60)
+            r = _webodm_admin_parse(out)
+            if ok and r['done']:
+                break
+            _time.sleep(30)
+        else:
+            print("Startup migration: ⚠ could not check the WebODM admin account (WebODM not running?). "
+                  "If WebODM asks a visitor to create an admin, press Reapply Plugin & Config on the WebODM page.")
+            return
+        for name in r['locked']:
+            print(f"Startup migration: ⚠ WebODM had no admin account, so the first visitor could make one "
+                  f"(ops #650). Made '{name}' with no password: set it with Account Recovery on the WebODM "
+                  "page. If you find a project, user or plugin in WebODM you did not add, treat the box "
+                  "as taken over.")
+        if r['weak']:
+            print(f"Startup migration: ⚠ WebODM admin with a default password ({', '.join(r['weak'])}). "
+                  "Press Reapply Plugin & Config on the WebODM page: it sets a generated password and shows it once.")
+    except Exception as _e:
+        print(f"Startup migration: WebODM admin check error (non-fatal): {_e}")
 
 
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
@@ -56342,36 +56495,21 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog('━━━ Registering NodeODM node (remote) ━━━')
     # Wait for Django migrations to complete before registering NodeODM (fresh host pulls ~1.5GB)
     plog("  Waiting for WebODM Django migrations to complete...")
-    _node_registered = False
-    _pending = 99
-    for _nr_attempt in range(24):  # 24 × 15s = 6 minutes
-        _ok_mig, _mig_out = _module_run(deploy_cfg,
-            'docker exec webapp python manage.py showmigrations 2>/dev/null | grep -c "\\[ \\]" || echo 99',
-            timeout=20)
-        try:
-            _pending = int((_mig_out or '99').strip())
-        except Exception:
-            pass
-        if _ok_mig and _pending == 0:
-            plog(f"  ✓ Migrations complete ({_nr_attempt * 15}s)")
-            ok_node, out_node = _module_run(deploy_cfg,
-                'docker exec webapp python manage.py addnode wo_nodeodm 3000 --label NodeODX 2>&1',
-                timeout=30)
-            if ok_node:
-                plog("  ✓ NodeODM processing node registered")
-                _node_registered = True
-            else:
-                plog(f"  ⚠ Node registration skipped (add manually: wo_nodeodm:3000): {(out_node or '')[:120]}")
-            break
-        if _nr_attempt % 2 == 1:
-            plog(f"  ⏳ Waiting for migrations... ({(_nr_attempt + 1) * 15}s, {_pending} pending)")
-        _time.sleep(15)
-    if not _node_registered and _pending != 0:
+    _migrated = _webodm_wait_migrations(deploy_cfg, plog)  # 24 × 15s = 6 minutes
+    if _migrated:
+        ok_node, out_node = _module_run(deploy_cfg,
+            'docker exec webapp python manage.py addnode wo_nodeodm 3000 --label NodeODX 2>&1',
+            timeout=30)
+        if ok_node:
+            plog("  ✓ NodeODM processing node registered")
+        else:
+            plog(f"  ⚠ Node registration skipped (add manually: wo_nodeodm:3000): {(out_node or '')[:120]}")
+    else:
         plog("  ⚠ Migrations did not complete in 6 min — NodeODM not registered. Add manually: wo_nodeodm:3000")
 
     # ops #629: never leave WebODM without an admin or on a default password.
     plog('━━━ WebODM admin account (remote) ━━━')
-    if _pending == 0:
+    if _migrated:
         _webodm_ensure_admin(deploy_cfg, plog)
     else:
         plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
@@ -56517,6 +56655,11 @@ def _run_webodm_deploy(settings):
         else:
             plog('WebODM did not respond in time — check logs with: docker logs webapp')
 
+        plog('Waiting for WebODM Django migrations to complete…')
+        _migrated = _webodm_wait_migrations(deploy_cfg, plog)
+        if not _migrated:
+            plog('  ⚠ Migrations did not complete in 6 min.')
+
         plog('Registering NodeODM processing node…')
         import time as _t2
         _t2.sleep(5)
@@ -56533,6 +56676,13 @@ def _run_webodm_deploy(settings):
                 plog(f'Node registration skipped (add manually: wo_nodeodm:3000): {_r_node.stderr[:200]}')
         except Exception as e:
             plog(f'Auto node registration skipped: {e}')
+
+        # ops #650: the deploy makes the admin, so WebODM's first-visit setup page never opens.
+        plog('WebODM admin account…')
+        if _migrated:
+            _webodm_ensure_admin(deploy_cfg, plog)
+        else:
+            plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
 
         s = load_settings()
         s['webodm_enabled'] = True
@@ -106923,6 +107073,7 @@ def _startup_guard_remote_webodm_port():
         print(f"Startup migration: remote WebODM port guard error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_guard_remote_webodm_port, daemon=True).start()
+threading.Thread(target=_startup_webodm_local_admin, daemon=True).start()
 
 
 def _startup_ensure_metrics_collector():
@@ -111102,6 +111253,11 @@ def _startup_migrations():
             _startup_mediamtx_editor_login_converge()
         except Exception as _ml_err:
             print(f"Startup migration: MediaMTX editor login converge error (non-fatal): {_ml_err}",
+                  flush=True)
+        try:
+            _startup_caddy_webodm_welcome_converge()
+        except Exception as _ww_err:
+            print(f"Startup migration: WebODM setup-page converge error (non-fatal): {_ww_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
