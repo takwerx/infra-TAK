@@ -113,8 +113,38 @@ def evaluate_cmd(slots, dyn):
         try:
             B.check_exec(list(combo))
         except B.Denied as d:
+            # ops #645: shape-checked binaries (fail2ban-client IPs, docker cp
+            # container:path) refuse the neutral filler itself. If some other
+            # plausible value for the variable slots passes, the call site is
+            # DYNAMIC (spot-check live), not a known gap.
+            if base in _SHAPE_CHECKED and _alt_fillers_allow(slots, combo):
+                return 'DYNAMIC', 'variable arg; allowed for a plausible value'
             return 'DENY', str(d)
     return 'ALLOW', ''
+
+
+_SHAPE_CHECKED = {'fail2ban-client', 'docker', 'ip', 'dpkg', 'postconf', 'semanage'}
+_ALT_FILLERS = ('PKGorUNIT', '192.0.2.1', 'c:/x', '/tmp/x', '-', 'tcp', '8443',
+                B.SEMANAGE_FCONTEXT_CESIUM)
+
+
+def _alt_fillers_allow(slots, combo):
+    """True if replacing the variable slots (max 3) with other typical values
+    gives a command the rulebook allows."""
+    import itertools
+    dyn_idx = [i for i, s in enumerate(slots[:24]) if not s][:3]
+    if not dyn_idx:
+        return False
+    for vals in itertools.product(_ALT_FILLERS, repeat=len(dyn_idx)):
+        trial = list(combo)
+        for i, v in zip(dyn_idx, vals):
+            trial[i] = v
+        try:
+            B.check_exec(trial)
+            return True
+        except B.Denied:
+            continue
+    return False
 
 
 def main(argv):

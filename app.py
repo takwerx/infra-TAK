@@ -88872,7 +88872,9 @@ def upload_takserver_package():
     results = {'packages': [], 'gpg_key': None, 'policy': None}
     for f in files:
         raw_name = f.filename or ''
-        fn = secure_filename(raw_name)
+        # ops #645: secure_filename keeps a leading '-', which the root broker's
+        # package-file name rule refuses (a name must start with a letter or digit).
+        fn = secure_filename(raw_name).lstrip('-._')
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
         # Normalize the EXTENSION to lower case before anything looks at it.
