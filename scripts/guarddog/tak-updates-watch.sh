@@ -195,7 +195,7 @@ $(printf '%b' "$UPDATES")
     log_msg "Updates email FAILED (console/relay unreachable - check the Guard Dog page)"
   fi
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-    TMPF="/tmp/gd-updates-$$.txt"
+    TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
     printf '%s' "$BODY" > "$TMPF"
     /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
     rm -f "$TMPF"

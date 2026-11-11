@@ -116,8 +116,9 @@ def box(tmp_path):
         sp.write_text(src)
         if calls.exists():
             calls.unlink()
+        # GD_STACK_OWNER: the fake stack dirs belong to the test user, not root/takwerx (ops #633).
         env = {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs, 'HOME': str(home),
-               'JAVA_HOME': str(tmp_path / 'nojava')}
+               'JAVA_HOME': str(tmp_path / 'nojava'), 'GD_STACK_OWNER': str(os.getuid())}
         r = subprocess.run(['bash', str(sp)], capture_output=True, text=True, env=env, timeout=60)
         assert r.returncode == 0, r.stderr
         return r.stdout, (calls.read_text() if calls.exists() else '')

@@ -29056,8 +29056,9 @@ def _guarddog_spiral_correlation_check(cl_waiting):
             print(f"[ak-pg-watchdog] spiral-incoming email failed: {_e}", flush=True)
     if os.path.exists('/opt/tak-guarddog/sms_send.sh'):
         try:
-            _tmp = f'/tmp/gd-spiral-sms-{os.getpid()}.txt'
-            with open(_tmp, 'w') as f:
+            # ops #633: mkstemp, a fresh private temp file each time.
+            _fd, _tmp = tempfile.mkstemp(prefix='gd-spiral-sms.', dir='/tmp')
+            with os.fdopen(_fd, 'w') as f:
                 f.write(body)
             subprocess.run(['/opt/tak-guarddog/sms_send.sh', subj, _tmp], capture_output=True, timeout=20)
             os.remove(_tmp)
@@ -39697,17 +39698,17 @@ docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
     try:
-        _write_priv('/opt/tak/renew-letsencrypt.sh', renewal)
-        subprocess.run(_sudo_wrap(['chmod', '+x', '/opt/tak/renew-letsencrypt.sh']))
+        _le_renew_write(renewal)
         svc = ('[Unit]\nDescription=TAK Server LE Cert Renewal (container)\n'
                'After=network.target docker.service\n\n[Service]\nType=oneshot\n'
-               'ExecStart=/opt/tak/renew-letsencrypt.sh\n')
+               f'ExecStart={LE_RENEW_SCRIPT}\n')
         timer = ('[Unit]\nDescription=TAK Server Certificate Renewal Timer\n'
                  'Requires=takserver-cert-renewal.service\n\n[Timer]\nOnCalendar=daily\n'
                  'Persistent=true\n\n[Install]\nWantedBy=timers.target\n')
         _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
         _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
         _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
+        _le_renew_drop_old()
         log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
     except Exception as _re:
         log_fn(f"  ⚠ renewal timer setup skipped: {str(_re)[:120]}")
@@ -39715,6 +39716,69 @@ log "TAK keystore refreshed and container restarted."
     subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=120)
     log_fn("  ✓ TAK Server (container) restarted — 8446 now serving the trusted cert")
     return True
+
+
+# ops #633: the daily renewal script (takserver-cert-renewal.service) holds the keystore
+# password. It lives with the other system-managed scripts in /usr/local/sbin, mode 0700,
+# not in /opt/tak (the TAK Server data folder). _startup_move_le_renewal_script() moves it
+# on existing boxes. Broker: exact path in PATH_ALLOW_EXACT, paired with the unit the
+# console already writes.
+LE_RENEW_SCRIPT = '/usr/local/sbin/takserver-renew-letsencrypt.sh'
+LE_RENEW_SCRIPT_OLD = '/opt/tak/renew-letsencrypt.sh'
+LE_RENEW_UNIT = '/etc/systemd/system/takserver-cert-renewal.service'
+
+
+def _le_renew_write(content):
+    """Write LE_RENEW_SCRIPT root 0700. An empty 0700 file first: a new file is created
+    0644 and only then chmod'd, and the script holds the keystore password."""
+    _write_priv(LE_RENEW_SCRIPT, '', perm=0o700)
+    _write_priv(LE_RENEW_SCRIPT, content, perm=0o700)
+
+
+def _le_renew_drop_old():
+    """Remove the old /opt/tak copy once the unit points at LE_RENEW_SCRIPT. Non-fatal."""
+    try:
+        if os.path.lexists(LE_RENEW_SCRIPT_OLD):
+            subprocess.run(_sudo_wrap(['rm', '-f', LE_RENEW_SCRIPT_OLD]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _startup_move_le_renewal_script():
+    """ops #633: move an existing box's renewal script from /opt/tak to LE_RENEW_SCRIPT.
+
+    The script is generated at cert setup with the keystore password in it; this boot path
+    does not have that password, so it copies the installed text (the same file the unit
+    runs today) to LE_RENEW_SCRIPT as 0700, points the unit at
+    it, and only then removes the old file. Every step is checked; on any failure the old
+    file and unit stay as they were, so renewal never breaks. Idempotent: no old file, or a
+    unit that does not name it, is a no-op apart from removing a leftover old copy."""
+    try:
+        if not os.path.exists(LE_RENEW_UNIT):
+            return
+        unit = _read_priv(LE_RENEW_UNIT) or ''
+        if LE_RENEW_SCRIPT_OLD not in unit:
+            if os.path.exists(LE_RENEW_SCRIPT) and LE_RENEW_SCRIPT in unit:
+                _le_renew_drop_old()
+            return
+        src = _read_priv(LE_RENEW_SCRIPT_OLD) or ''
+        if not src.startswith('#!'):
+            print('Startup migration: LE renewal script not moved (old file missing or '
+                  'unreadable) — unit left as is', flush=True)
+            return
+        _le_renew_write(src)
+        if (_read_priv(LE_RENEW_SCRIPT) or '') != src:
+            print('Startup migration: LE renewal script not moved (copy did not verify)', flush=True)
+            return
+        _write_priv(LE_RENEW_UNIT, unit.replace(LE_RENEW_SCRIPT_OLD, LE_RENEW_SCRIPT))
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                       capture_output=True, text=True, timeout=30)
+        _le_renew_drop_old()
+        print(f'Startup migration: LE renewal script moved to {LE_RENEW_SCRIPT} '
+              '(root-owned, 0700; was in the tak-owned /opt/tak)', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: LE renewal script move error (non-fatal): {_e}', flush=True)
 
 
 def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
@@ -39932,17 +39996,17 @@ chown tak:tak /opt/tak/certs/files/takserver-le.jks
 systemctl restart takserver
 log "TAK keystore refreshed and TAK Server restarted."
 '''
-    _write_priv('/opt/tak/renew-letsencrypt.sh', renewal_script, perm=0o755)
-    log_fn("  ✓ Renewal script created at /opt/tak/renew-letsencrypt.sh")
+    _le_renew_write(renewal_script)
+    log_fn(f"  ✓ Renewal script created at {LE_RENEW_SCRIPT}")
 
     # Step E: Create systemd service + timer
-    svc = '''[Unit]
+    svc = f'''[Unit]
 Description=TAK Server Let's Encrypt Certificate Renewal
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/tak/renew-letsencrypt.sh
+ExecStart={LE_RENEW_SCRIPT}
 '''
     timer = '''[Unit]
 Description=TAK Server Certificate Renewal Timer
@@ -39958,6 +40022,7 @@ WantedBy=timers.target
     _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
     _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
     _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
+    _le_renew_drop_old()
     log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
@@ -40043,9 +40108,9 @@ def _selfheal_takserver_le_cert(plog=None):
         else:
             print(m, flush=True)
     try:
-        _renew_script = '/opt/tak/renew-letsencrypt.sh'
-        _renew_unit   = '/etc/systemd/system/takserver-cert-renewal.service'
-        script_present = os.path.exists(_renew_script)
+        _renew_unit   = LE_RENEW_UNIT
+        # ops #633: the old /opt/tak path still counts until _startup_move_le_renewal_script ran.
+        script_present = os.path.exists(LE_RENEW_SCRIPT) or os.path.exists(LE_RENEW_SCRIPT_OLD)
         unit_present   = os.path.exists(_renew_unit)
         if not script_present and not unit_present:
             # v10.2.15: "no renewal script/unit" used to mean "box never had LE on 8446" and
@@ -107053,7 +107118,8 @@ def _startup_heal_le_renewal_script():
     delivery ([[feedback-console-path-delivery]]): existing boxes must not have to re-run
     cert setup to stop carrying a latent outage. Idempotent and non-fatal.
     """
-    path = '/opt/tak/renew-letsencrypt.sh'
+    # ops #633: the script now lives at LE_RENEW_SCRIPT; the old path only until it is moved.
+    path = LE_RENEW_SCRIPT if os.path.exists(LE_RENEW_SCRIPT) else LE_RENEW_SCRIPT_OLD
     try:
         if not os.path.exists(path):
             return
@@ -107086,8 +107152,11 @@ def _startup_heal_le_renewal_script():
 
         if out == src:
             return
-        _write_priv(path, out)
-        subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
+        if path == LE_RENEW_SCRIPT:
+            _le_renew_write(out)
+        else:
+            _write_priv(path, out)
+            subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
         print('Startup migration: LE renewal script healed — imports to a temp keystore and '
               'no longer deletes the live one before a fallible import', flush=True)
     except Exception as _e:
@@ -107113,7 +107182,7 @@ def _startup_heal_missing_le_keystore():
     box. Threaded, because it restarts TAK and must not hold up console startup.
     """
     try:
-        script = '/opt/tak/renew-letsencrypt.sh'
+        script = LE_RENEW_SCRIPT if os.path.exists(LE_RENEW_SCRIPT) else LE_RENEW_SCRIPT_OLD
         jks = '/opt/tak/certs/files/takserver-le.jks'
         core = '/opt/tak/CoreConfig.xml'
         if not (os.path.exists(script) and os.path.exists(core)):
@@ -109421,6 +109490,13 @@ def _startup_migrations():
             _startup_caddy_selfheal()
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
+
+        # ops #633: move the renewal script from /opt/tak to LE_RENEW_SCRIPT first,
+        # so the heal below patches the copy that will actually run.
+        try:
+            _startup_move_le_renewal_script()
+        except Exception as _lm_err:
+            print(f"Startup migration: LE renewal script move error (non-fatal): {_lm_err}", flush=True)
 
         # v10.1.67: heal an LE renewal script that deletes TAK's keystore before a
         # fallible import (latent total outage until the next restart).

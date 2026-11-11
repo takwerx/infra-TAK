@@ -13,7 +13,7 @@ CERT_PASS="CERT_PASS_PLACEHOLDER"
 
 JKS="/opt/tak/certs/files/takserver-le.jks"
 if [ -f "$JKS" ]; then
-  TEMP_CERT="/tmp/takserver-le-temp.pem"
+  TEMP_CERT="$(mktemp /tmp/gd-certwatch.XXXXXX)"
   # install_le_cert_on_8446() creates the LE JKS with alias = TAK hostname (e.g. takserver.example.com),
   # not the literal string "takserver". Wrong alias => empty export => bogus DAYS_LEFT and false alert emails.
   ALIAS=$(gd_keytool -list -keystore "$JKS" -storepass "$CERT_PASS" | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')
@@ -49,14 +49,14 @@ Action Required:
    systemctl status takserver-cert-renewal.timer
 
 2. Manual renewal if needed:
-   sudo /opt/tak/renew-letsencrypt.sh
+   sudo systemctl start takserver-cert-renewal.service
 
 If renewal fails, clients will be unable to connect after expiration.
 "
 
         echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
         if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-          TMPF="/tmp/gd-sms-$$.txt"
+          TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
           printf '%s' "$BODY" > "$TMPF"
           /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
           rm -f "$TMPF"
