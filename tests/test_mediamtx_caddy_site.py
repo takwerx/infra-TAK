@@ -153,11 +153,19 @@ def test_every_route_strips_before_it_proxies_and_the_open_ones_sit_before_forwa
 
 
 @pytest.mark.parametrize('enc', [True, False])
-def test_without_authentik_the_vhost_is_exactly_what_it_was(enc):
-    # No overlay deciding anything -> byte-identical to v10.2.5.
+def test_without_authentik_the_vhost_strips_and_needs_the_editor_login(enc):
+    # ops #649: never a bare reverse_proxy. Login checked: strip, then the editor.
+    lines = []
+
+    def strip(indent):
+        lines.extend(f'{indent}request_header -{h}' for h in AK_HEADERS)
+    emit_site(lines, HOST, '127.0.0.1:5080', None, ('127.0.0.1:8888', enc), strip, None, login_ok=True)
+    assert '\n'.join(lines) == '\n'.join(['# MediaMTX Web Console', f'{HOST} {{',
+                                          *_direct('127.0.0.1:8888', enc), '    route {', STRIP8,
+                                          '        reverse_proxy 127.0.0.1:5080', '    }', '}', ''])
+    # Login not checked: 503, the editor is not reachable.
     out = site(ak_up=None, hls=('127.0.0.1:8888', enc))
-    assert out == '\n'.join(['# MediaMTX Web Console', f'{HOST} {{', *_direct('127.0.0.1:8888', enc),
-                             '    reverse_proxy 127.0.0.1:5080', '}', ''])
+    assert 'reverse_proxy 127.0.0.1:5080' not in out and '" 503' in out
 
 
 # ── how app.py uses it ──────────────────────────────────────────────────────────
@@ -179,7 +187,8 @@ def test_generate_caddyfile_passes_its_real_strip_and_authentik_only_when_instal
     assert 'ak_up if _mtx_ak else None' in call
     assert '_get_mediamtx_hls_upstream(settings) if _mtx_direct else None' in call
     assert '_emit_ak_header_strip, _emit_outpost_callback_rescue' in call
-    assert "_mtx_ak = ak.get('installed')" in src
+    # ops #649: a failed Authentik probe keeps the Authentik block already on disk.
+    assert "_mtx_ak = _mediamtx_edge_uses_sso(ak, _mtx_existing)" in src
     # Straight to MediaMTX without Authentik or when the editor is not the local one.
     assert "_mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'" in src
 
