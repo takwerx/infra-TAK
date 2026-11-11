@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.10-alpha)**
+**Current release: [v10.3.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.11-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,21 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.11-alpha — 2026-11-10 — Security update: the Node-RED editor always has a login
+
+**Headline: Security update for Node-RED exposure. The Node-RED editor could be reached without a login on some setups. It now always has a login, and on a second server the Node-RED port is closed to everyone except the console. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.11-alpha))
+
+**Security.**
+- The Node-RED site always has a login in front of the editor. With Authentik, Authentik's login stays. Without Authentik, the console makes a password (shown once on the Node-RED page). If the console cannot tell whether Authentik is installed, it keeps the login it has and never leaves the editor open. The public KML and icon links stay open, as before.
+- Node-RED on a second server: port 1880 is closed to everyone except the console, also after a reboot or a Docker restart.
+- Servers that are already set up get both fixes when the console restarts after the update.
+
+**Caddy on Rocky and RHEL.**
+- Caddy moves to 2.11.8 (a security release). The download now comes from Caddy's GitHub release and is checked against its published checksums before it is installed.
+
+**Guard Dog.**
+- The "Update pending" email now also covers WebODM, TAK Portal, ATLAS, Authentik, MediaMTX, TAK Server, Federation Hub, NetBird, Remote Assist, TAK Video Restreamer and the Simulator, so an Update button that is waiting is never missed. A WebODM below 4.0.0 is flagged as a security fix.
 
 ### v10.3.10-alpha — 2026-11-10 — New users can sign in on a phone right away; CloudTAK keeps its TAK Server connection behind a home router; WebODM 4.0.0
 
