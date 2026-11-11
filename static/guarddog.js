@@ -71,8 +71,10 @@ gdCotApplyFacts(d.facts||{});gdCotHighlight(d.recommend);
 var lines=[d.headline,'',d.detail];
 var f=d.facts||{};
 lines.push('');
-lines.push('Database '+(f.db_human||'-')+' · free disk '+(f.fs_free_human||'-')+(f.fs_pct!==null&&f.fs_pct!==undefined?' ('+f.fs_pct+'%)':'')+' on '+(f.data_directory||'the data directory'));
-lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'-')+' · compacting needs about '+(f.compact_needed_human||'-')+' free');
+if(f.managed_db){lines.push('Database '+(f.db_human||'-')+' · storage: '+(f.fs_free_human||'provider-managed')+' (managed database)');
+lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'-'));}
+else{lines.push('Database '+(f.db_human||'-')+' · free disk '+(f.fs_free_human||'-')+(f.fs_pct!==null&&f.fs_pct!==undefined?' ('+f.fs_pct+'%)':'')+' on '+(f.data_directory||'the data directory'));
+lines.push('Largest table '+(f.largest_table||'-')+' '+(f.largest_table_human||'-')+' · compacting needs about '+(f.compact_needed_human||'-')+' free');}
 // Name the file we ACTUALLY read (retention-policy.yml). Saying CoreConfig.xml
 // here sends the next person debugging to the wrong file — the exact wrong turn
 // that cost a session on 2026-08-10. And don't quote a dead-tuple count the tile
@@ -97,9 +99,9 @@ var fd=document.getElementById('gd-cot-free-disk');if(fd){var p=f.fs_pct;fd.text
 var od=document.getElementById('gd-cot-oldest');if(od){od.textContent=f.oldest_age_human||'—';od.style.color=f.retention_stalled?'var(--red)':(f.oldest_age_secs?'var(--green)':'');}
 var lt=document.getElementById('gd-cot-largest');if(lt)lt.textContent=(f.largest_table?f.largest_table+' · ':'')+(f.largest_table_human||'—');
 var rt=document.getElementById('gd-cot-retention');if(rt){var txt,col;
-if(!f.guard_timer_ok){txt='timer '+(f.guard_timer_enabled||'unknown');col='var(--red)';}
+if(!f.guard_timer_ok&&!f.managed_db){txt='timer '+(f.guard_timer_enabled||'unknown');col='var(--red)';}
 else if(f.retention_stalled){txt='STALLED';col='var(--red)';}
-else{txt=(f.retention_hours?f.retention_hours+' h':'TTL not set')+(f.guard_timer_last_human?' · guard '+f.guard_timer_last_human:'');col=f.retention_hours?'var(--green)':'var(--red)';}
+else{txt=(f.retention_hours?f.retention_hours+' h':'TTL not set')+(f.managed_db?' · TAK Server retention (managed database)':(f.guard_timer_last_human?' · guard '+f.guard_timer_last_human:''));col=f.retention_hours?'var(--green)':'var(--red)';}
 rt.textContent=txt;rt.style.color=col;}}
 // v10.1.29 W6 — run Guard Dog's retention guard on demand. The unit is oneshot
 // and started --no-block, so progress comes from polling its unit state plus the

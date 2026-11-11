@@ -74,7 +74,10 @@ def _run(versions, install_rc, held=True):
         'load_settings': dict,
         'TAK_PG_MAJOR': 18,
         '_TAK58_UPGRADE_DB_SH': '/nonexistent/upgrade-db.sh',
+        '_TAK58_MANAGED_STORAGE': 'provider-managed',
     }
+    for helper in ('_tak58_fmt_measured', '_tak58_preflight_summary_line'):
+        exec(compile(_cut(helper), 'app.py:' + helper, 'exec'), n)
     exec(compile(_cut('run_takserver_58_migration'), 'app.py:run_takserver_58_migration',
                  'exec'), n)
     n['run_takserver_58_migration']('/tmp/takserver_5.8-RELEASE92_all.deb', log=log,
