@@ -53264,6 +53264,18 @@ def run_cloudtak_deploy(cfg=None):
             if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
                 plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
 
+            # ops #631: limit the published API, tiles, video, PostGIS and store ports to the
+            # console BEFORE the containers start (Docker-published ports are filtered in
+            # DOCKER-USER, see _docker_port_guard_files). No lock = no start.
+            plog("")
+            plog("━━━ Locking CloudTAK ports to the console (remote) ━━━")
+            _ct_guard_ok, _ = _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)
+            if not _ct_guard_ok:
+                plog("✗ CloudTAK was not started: its ports could not be limited to the console.")
+                plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
             run_cmd = (
@@ -53288,16 +53300,8 @@ def run_cloudtak_deploy(cfg=None):
                 save_settings(settings)
             except Exception as _e:
                 plog(f"  ⚠ Could not persist deployment flag: {_e}")
-            fw_cmd = (
-                "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
-                "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
-                "command -v firewall-cmd >/dev/null 2>&1 && "
-                "(sudo firewall-cmd --permanent --add-port=5000/tcp >/dev/null 2>&1 || true); "
-                "command -v firewall-cmd >/dev/null 2>&1 && "
-                "(sudo firewall-cmd --permanent --add-port=5002/tcp >/dev/null 2>&1 || true); "
-                "command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --reload >/dev/null 2>&1 || true)"
-            )
-            _ssh_probe(remote_cfg, fw_cmd, timeout=40)
+            # ops #631: no ufw/firewalld rule for 5000/5002 here. Who may reach the published
+            # ports is set by the DOCKER-USER port guard above.
             # Probe /api/server (returns 200 even on unconfigured installs — see Step 6 comment).
             # /api/connections is auth-gated and not a reliable readiness signal on a fresh install.
             ready_cmd = (
@@ -61666,12 +61670,13 @@ def _docker_port_guard_files(name, ports, allow_ips):
     return script, unit
 
 
-def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
+def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, extra_allow=()):
     """Install + start the port guard on a remote module host. Returns (ok, first_time).
 
     Allowed sources: the console as the remote box sees it over SSH ($SSH_CLIENT, right for a
-    console that reaches it on a private address) and Settings → Server IP. Neither found:
-    the ports are dropped for everyone (fail closed). No-op for a local target."""
+    console that reaches it on a private address), Settings → Server IP and `extra_allow`
+    (IPv4s). None found: the ports are dropped for everyone (fail closed). No-op for a local
+    target."""
     if deploy_cfg.get('target_mode') != 'remote':
         return True, False
     _log = log_fn or (lambda _m: None)
@@ -61681,6 +61686,7 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
         if _ln.startswith('SSHSRC '):
             allow.append(_ln[7:].strip())
     allow.append(_fedhub_caddy_source_ip(settings) or '')
+    allow.extend(extra_allow or ())
     _ips = []
     for _a in allow:
         try:
@@ -61712,6 +61718,77 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
     else:
         _log(f"  ✗ Could not lock port {ports_txt} to the console: {(out or '').strip()[-300:]}")
     return good, good and 'had=no' in (out or '')
+
+
+# ops #631: the ports a remote Authentik or CloudTAK publishes that only the console may reach,
+# enforced by the DOCKER-USER port guard (_docker_port_guard_files).
+# Authentik: 9090 is Caddy's forward_auth/auth upstream and the console's API
+# (_get_authentik_upstream), 389/636 the LDAP outpost TAK Server binds to. 9443 is bound to
+# 127.0.0.1 since v0.9.12; guarded too for a box deployed before that.
+REMOTE_AUTHENTIK_GUARD_PORTS = (9090, 389, 636, 9443)
+# CloudTAK: 5000/5002 (map/tiles) and 9997/18888 (video) are Caddy's upstreams
+# (_get_cloudtak_upstreams). The rest are upstream compose defaults that stay published on a
+# remote host (_patch_cloudtak_compose_ports edits only a local checkout): events 5003,
+# PostGIS 5433, MinIO 9000/9002, Garage 3900-3903, HLS 8888. The RTSP/RTMP/SRT stream ports
+# stay public on purpose (ATAK and other clients play them directly).
+REMOTE_CLOUDTAK_GUARD_PORTS = (5000, 5002, 5003, 5433, 9000, 9002, 3900, 3901, 3902, 3903,
+                               9997, 18888, 8888)
+_REMOTE_MODULE_DEPLOYMENT_KEYS = ('authentik_deployment', 'cloudtak_deployment', 'takportal_deployment',
+                                  'mediamtx_deployment', 'nodered_deployment', 'webodm_deployment',
+                                  'fedhub_deployment')
+
+
+def _remote_module_peer_ips(settings, own_key):
+    """IPv4s of the operator's OTHER remote module hosts, for a port guard's allow list.
+
+    ops #631: a remote TAK Portal calls a remote Authentik straight at host:9090
+    (_takportal_build_settings_dict), not through the console, so when the two sit on
+    different boxes the portal's box has to pass the Authentik guard too. A host name is
+    resolved here, on the console; best effort, an unresolvable one is left out."""
+    own = (_get_module_deployment_config(settings, own_key).get('remote', {}).get('host') or '').strip()
+    out = set()
+    for key in _REMOTE_MODULE_DEPLOYMENT_KEYS:
+        if key == own_key:
+            continue
+        cfg = _get_module_deployment_config(settings, key)
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not host or host == own:
+            continue
+        try:
+            out.add(str(ipaddress.IPv4Address(host)))
+        except ValueError:
+            try:
+                out.add(str(ipaddress.IPv4Address(socket.gethostbyname(host))))
+            except (OSError, ValueError):
+                pass
+    return sorted(out)
+
+
+def _remote_authentik_port_guard(deploy_cfg, settings, log_fn=None):
+    """ops #631: lock a remote Authentik's published ports to the console (+ peer module hosts)."""
+    return _remote_docker_port_guard(deploy_cfg, settings, 'authentik', REMOTE_AUTHENTIK_GUARD_PORTS,
+                                     log_fn=log_fn,
+                                     extra_allow=_remote_module_peer_ips(settings, 'authentik_deployment'))
+
+
+def _remote_cloudtak_guard_ports(settings):
+    """Ports the remote CloudTAK guard locks. With no domain, CloudTAK's own env sends the
+    browser straight to http://<remote>:5000 and :5002 (_cloudtak_build_env_content), so those
+    two stay open to everyone; with a domain, Caddy on the console is the only way in."""
+    ports = list(REMOTE_CLOUDTAK_GUARD_PORTS)
+    behind_caddy = bool((settings.get('fqdn') or '').strip()) or all(
+        (_get_service_domain(settings, k) or '').strip()
+        for k in ('cloudtak_map', 'cloudtak_tiles', 'cloudtak_video'))
+    if not behind_caddy:
+        ports = [p for p in ports if p not in (5000, 5002)]
+    return ports
+
+
+def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
+    """ops #631: lock a remote CloudTAK's published ports to the console (+ peer module hosts)."""
+    return _remote_docker_port_guard(deploy_cfg, settings, 'cloudtak', _remote_cloudtak_guard_ports(settings),
+                                     log_fn=log_fn,
+                                     extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
 
 
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
@@ -65883,8 +65960,8 @@ entries:
     image: ghcr.io/goauthentik/ldap:${AUTHENTIK_TAG:-2026.2.0}
     # v0.9.12: LDAP outpost stays on 0.0.0.0 for REMOTE Authentik installs —
     # TAK Server on the console host has to reach this at remote_host:389.
-    # Tier 5 (source-scoped): the deploy step source-scopes UFW to the console
-    # IP only, so 389/636 are NOT reachable from the general internet.
+    # Tier 5 (source-scoped): the DOCKER-USER port guard admits only the console
+    # (ops #631).
     ports:
       - 389:3389
       - 636:6636
@@ -65937,7 +66014,8 @@ networks:
         'command: ' + _pg_cmd_remote,
     )
     # Remote: bind port 9090 on 0.0.0.0 so Caddy on the console can reach
-    # forward_auth. UFW in Step 8 restricts this to the console IP only.
+    # forward_auth. The DOCKER-USER port guard below scopes it to the console
+    # (ops #631).
     compose_content = compose_content.replace(
         '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
         '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
@@ -65951,6 +66029,18 @@ networks:
     except Exception:
         pass
     plog("✓ docker-compose.yml created")
+
+    # ops #631: limit 9090 and LDAP 389/636 to the console BEFORE the containers start
+    # (Docker-published ports are filtered in DOCKER-USER, see _docker_port_guard_files).
+    # No lock = no start.
+    plog("")
+    plog("━━━ Locking Authentik ports to the console (remote) ━━━")
+    _ak_guard_ok, _ = _remote_authentik_port_guard(deploy_cfg, settings, log_fn=plog)
+    if not _ak_guard_ok:
+        plog("✗ Authentik was not started: its ports could not be limited to the console.")
+        plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
+        authentik_deploy_status.update({'running': False, 'error': True})
+        return
 
     # Step 6: Docker Compose up
     plog("")
@@ -66223,6 +66313,8 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, n
         return
     plog("\u2501\u2501\u2501 Reconfigure: Remote Authentik (no local ~/authentik) \u2501\u2501\u2501")
     plog(f"  Target: {host}")
+    # ops #631: (re)lock 9090 and LDAP 389/636 to the console before compose up.
+    _remote_authentik_port_guard(deploy_cfg, settings, log_fn=plog)
     _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=120, log_fn=plog)
     plog("  Ensured containers are up on remote")
     fqdn = settings.get('fqdn', '')
@@ -66579,6 +66671,31 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         return False
 
 
+def _authentik_loopback_port(entry):
+    """One compose `ports:` entry of the local Authentik, published on 127.0.0.1 only.
+
+    Short syntax `[HOST_IP:][HOST_PORT:]CONTAINER_PORT[/PROTO]`; `${VAR:-x}` defaults hold
+    colons of their own, so count colons with them blanked out. A wildcard host IP
+    (0.0.0.0, ::) becomes 127.0.0.1; any other host IP is the operator's and stays. Long
+    syntax gets host_ip. https://docs.docker.com/reference/compose-file/services/#ports"""
+    if isinstance(entry, dict):
+        if str(entry.get('host_ip') or '').strip() in ('', '0.0.0.0', '::', '[::]'):
+            return {**entry, 'host_ip': '127.0.0.1'}
+        return entry
+    if not isinstance(entry, str):
+        return entry   # an unquoted YAML int: nothing to bind
+    s = entry.strip()
+    for _wild in ('0.0.0.0:', '[::]:'):
+        if s.startswith(_wild):
+            return '127.0.0.1:' + s[len(_wild):]
+    colons = re.sub(r'\$\{[^}]*\}', 'X', s).split('/')[0].count(':')
+    if colons == 1:
+        return '127.0.0.1:' + s
+    if colons == 0:
+        return '127.0.0.1::' + s
+    return entry
+
+
 def _ensure_authentik_compose_patches(compose_path, plog=None):
     """Ensure docker-compose.yml has PostgreSQL tuning and proper healthchecks.
     Safe to call multiple times (idempotent). Returns True if file was modified.
@@ -66731,6 +66848,21 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             changed = True
             if plog:
                 plog("  ✓ Added redis: to top-level volumes section")
+
+    # ── Published ports → 127.0.0.1 (ops #631) ────────────────────────────────
+    # This file is always the LOCAL Authentik (~/authentik); Caddy reaches it at
+    # 127.0.0.1:9090 and containers over the infratak network. Upstream's compose publishes
+    # ${COMPOSE_PORT_HTTP}/${COMPOSE_PORT_HTTPS} with no host IP; bind them to loopback here,
+    # at deploy time, the same as the post-update _auto_authentik_ports does.
+    for _svc_name, _svc in services.items():
+        if not isinstance(_svc, dict) or not isinstance(_svc.get('ports'), list):
+            continue
+        _new_ports = [_authentik_loopback_port(_p) for _p in _svc['ports']]
+        if _new_ports != _svc['ports']:
+            _svc['ports'] = _new_ports
+            changed = True
+            if plog:
+                plog(f"  ✓ Bound {_svc_name} published ports to 127.0.0.1")
 
     if not changed:
         return False
@@ -107183,6 +107315,36 @@ def _startup_guard_remote_webodm_port():
 
 threading.Thread(target=_startup_guard_remote_webodm_port, daemon=True).start()
 threading.Thread(target=_startup_webodm_local_admin, daemon=True).start()
+
+
+def _startup_guard_remote_authentik_cloudtak_ports():
+    """ops #631: on every console boot (Update Now restarts it), (re)install the DOCKER-USER
+    port guard on a remote Authentik (9090, LDAP 389/636) and a remote CloudTAK (API, tiles,
+    video, PostGIS, store) host, so their published ports answer only the console. Idempotent.
+    Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+    except Exception as _e:
+        print(f"Startup migration: remote Authentik/CloudTAK port guard error (non-fatal): {_e}")
+        return
+    for _label, _key, _guard, _page in (
+            ('Authentik', 'authentik_deployment', _remote_authentik_port_guard, 'Authentik page > Update config'),
+            ('CloudTAK', 'cloudtak_deployment', _remote_cloudtak_port_guard, 'CloudTAK page > Deploy')):
+        try:
+            cfg = _get_module_deployment_config(settings, _key)
+            if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                    and (cfg.get('remote', {}).get('host') or '').strip()):
+                continue
+            ok, first = _guard(cfg, settings, log_fn=print)
+            if ok and first:
+                print(f"Startup migration: remote {_label} ports are now limited to the console.")
+            elif not ok:
+                print(f"Startup migration: ⚠ remote {_label} ports could NOT be locked to the console "
+                      f"and may not be limited to the console. Run {_page} to see why.")
+        except Exception as _e:
+            print(f"Startup migration: remote {_label} port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_authentik_cloudtak_ports, daemon=True).start()
 
 
 def _startup_ensure_metrics_collector():
