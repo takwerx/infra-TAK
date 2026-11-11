@@ -161,9 +161,12 @@ KILLED=0
 if [ -n "$STUCK_PIDS" ]; then
   for pid in $STUCK_PIDS; do
     pid_clean=$(echo "$pid" | tr -d '[:space:]')
-    [ -z "$pid_clean" ] && continue
+    # ops #628: digits only. This text comes from psql and goes back into SQL and $(( )).
+    case "$pid_clean" in ''|*[!0-9]*) continue ;; esac
     runtime=$(psql_scalar "SELECT EXTRACT(EPOCH FROM now() - query_start)::int FROM pg_stat_activity WHERE pid = ${pid_clean};")
-    runtime_min=$(( (${runtime:-0} + 0) / 60 ))
+    runtime=$(printf '%s' "$runtime" | tr -d '[:space:]')
+    case "$runtime" in ''|*[!0-9]*) runtime=0 ;; esac
+    runtime_min=$(( runtime / 60 ))
     psql_raw "SELECT pg_terminate_backend(${pid_clean});" >/dev/null 2>&1
     log_line "RETENTION-GUARD: killed stuck DELETE pid ${pid_clean} (running ${runtime_min}min)"
     KILLED=$((KILLED + 1))
@@ -201,7 +204,8 @@ fi
 # safety net had never once performed a delete on any box. (Step 1 is immune only
 # because its 30-minute age bound excludes a query that just started.)
 ACTIVE_DELETES=$(psql_scalar "SELECT COUNT(*) FROM pg_stat_activity WHERE query ILIKE '%delete%cot_router%' AND state = 'active' AND pid != pg_backend_pid();")
-ACTIVE_DELETES=$((${ACTIVE_DELETES:-0} + 0))
+ACTIVE_DELETES=$(printf '%s' "$ACTIVE_DELETES" | tr -d '[:space:]')
+case "$ACTIVE_DELETES" in ''|*[!0-9]*) ACTIVE_DELETES=0 ;; esac   # ops #628: digits only before any test
 
 if [ "$ACTIVE_DELETES" -gt 0 ]; then
   log_line "RETENTION-GUARD: ${ACTIVE_DELETES} active DELETE(s) running (under ${KILL_THRESHOLD_MIN}min threshold), skipping batched cleanup"

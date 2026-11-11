@@ -165,8 +165,13 @@ if [ -z "$DEAD_RAW" ]; then
   exit 1
 fi
 
-# Ensure numeric
-DEAD_COUNT=$((DEAD_RAW + 0))
+# Ensure numeric. ops #628: digits only BEFORE any $(( )). This text comes from psql (the
+# postgres account, the DB container or the remote DB host), not from us.
+DEAD_RAW=$(printf '%s' "$DEAD_RAW" | tr -d '[:space:]')
+case "$DEAD_RAW" in
+  ''|*[!0-9]*) log_line "Auto-VACUUM: dead tuple count is not a number, skipped"; exit 1 ;;
+esac
+DEAD_COUNT=$DEAD_RAW
 
 if [ "$DEAD_COUNT" -gt "$DEAD_TUP_THRESHOLD" ]; then
   if ! psql_exec "VACUUM ANALYZE;"; then
@@ -176,7 +181,9 @@ if [ "$DEAD_COUNT" -gt "$DEAD_TUP_THRESHOLD" ]; then
   log_line "Auto-VACUUM: ${DEAD_COUNT} dead tuples found, ran VACUUM ANALYZE"
 
   COT_BYTES_RAW=$(psql_scalar "$SIZE_SQL")
-  COT_BYTES=$((COT_BYTES_RAW + 0))
+  COT_BYTES_RAW=$(printf '%s' "$COT_BYTES_RAW" | tr -d '[:space:]')
+  case "$COT_BYTES_RAW" in ''|*[!0-9]*) COT_BYTES_RAW=0 ;; esac   # ops #628
+  COT_BYTES=$COT_BYTES_RAW
   if [ "$COT_BYTES" -gt "$SIZE_THRESHOLD_BYTES" ]; then
     COT_GB=$((COT_BYTES / 1024 / 1024 / 1024))
     TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

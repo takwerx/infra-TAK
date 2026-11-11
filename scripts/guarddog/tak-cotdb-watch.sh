@@ -65,8 +65,10 @@ if [ -z "$COT_SIZE" ] || [ "$COT_SIZE" = "" ]; then
   COT_SIZE=0
 fi
 
-# Ensure numeric
-COT_SIZE=$((COT_SIZE + 0))
+# Ensure numeric. ops #628: digits only BEFORE any $(( )). This text comes from psql (the
+# postgres account, the DB container or the remote DB host), not from us.
+COT_SIZE=$(printf '%s' "$COT_SIZE" | tr -d '[:space:]')
+case "$COT_SIZE" in ''|*[!0-9]*) COT_SIZE=0 ;; esac
 
 # ===========================================================================
 # v10.1.29 (W8) — shared helpers + the two conditions that actually predict a
