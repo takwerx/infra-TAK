@@ -78815,31 +78815,11 @@ entries:
                         if not auth_flow_pk or not inv_flow_pk:
                             plog(f"  ✗ Missing flows — auth={auth_flow_pk} inv={inv_flow_pk}")
                         else:
-                            # Create LDAP provider
-                            ldap_provider_pk = None
+                            # Create LDAP provider (ops #663: retries a 5xx from a busy API)
                             ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
                             ldap_bind_flow = ldap_flow_pk or auth_flow_pk
-                            try:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
-                                    data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
-                                        'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
-                                        'base_dn': 'DC=takldap', 'bind_mode': 'cached',
-                                        'search_mode': 'cached', 'mfa_support': False}).encode(),
-                                    headers=ak_headers, method='POST')
-                                resp = urllib.request.urlopen(req, timeout=10)
-                                ldap_provider_pk = json.loads(resp.read().decode())['pk']
-                                plog(f"  ✓ Created LDAP provider (pk={ldap_provider_pk})")
-                            except urllib.error.HTTPError as e:
-                                err = e.read().decode()[:200]
-                                if e.code == 400:
-                                    req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/?search=LDAP',
-                                        headers=ak_headers)
-                                    resp = urllib.request.urlopen(req, timeout=10)
-                                    results = json.loads(resp.read().decode())['results']
-                                    ldap_provider_pk = results[0]['pk'] if results else None
-                                    plog(f"  ✓ LDAP provider already exists (pk={ldap_provider_pk})")
-                                else:
-                                    plog(f"  ✗ LDAP provider creation failed: {e.code} {err}")
+                            ldap_provider_pk = _ak_ldap_provider_ensure(
+                                ak_url, ak_headers, ldap_bind_flow, inv_flow_pk, plog=plog)
     
                             # Create LDAP application
                             if ldap_provider_pk:
@@ -80243,12 +80223,37 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
     # .env (memory: authentik-ldapservice-password-mismatch-fresh-deploy). Retesting fixes
     # neither, so the loop heals both, and only green-lights on a real live bind.
     healed_routing = False
+    healed_token = False
     healed = False
     for i in range(1, attempts + 1):
         plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  ✓ LDAP service-account bind verified via live ldapsearch (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
+        # Heal 0 — TOKEN (ops #663): an outpost the Authentik API refuses with
+        # `403 Token invalid/expired` never loads its provider, so no bind can pass and
+        # neither routing nor the password is the cause. This gate used to name it at the
+        # very end ("Fix LDAP token ... repairs this") and leave the repair to someone
+        # else; on a fresh Rocky 9 install nobody did, for 70 minutes. Repair it here.
+        if not healed_token and i >= 2:
+            try:
+                _rejected = _ldap_outpost_token_rejected()
+            except Exception:
+                _rejected = False
+            if _rejected:
+                healed_token = True
+                plog("  ⏳ LDAP outpost is refused by the Authentik API (token) — repairing its token…")
+                try:
+                    _tok_ok, _tok_msg = _repair_ldap_outpost_token(plog_fn=plog)
+                except Exception as _tke:
+                    _tok_ok, _tok_msg = False, str(_tke)[:120]
+                plog(f"     LDAP outpost token: {str(_tok_msg)[:140]}")
+                if _tok_ok:
+                    for _w in range(6):
+                        time.sleep(delay_sec)
+                        if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                            plog("  ✓ LDAP SA bind verified via live ldapsearch after token repair. Safe to proceed.")
+                            return True
         # Heal 1 — ROUTING (the usual fresh-deploy disease, field-confirmed 2026-07-08 NUC):
         # a fresh deploy ships the outpost on internal routing (http://authentik-server-1:9000),
         # which exposes the Authentik 2026.x flow recursion — the FIRST bind dies with
@@ -80673,6 +80678,88 @@ def _ldap_outpost_token_rejected(since='180s'):
             and ('token invalid' in low or '403 forbidden' in low))
 
 
+def _ak_ldap_provider_ensure(ak_url, headers, bind_flow_pk, inv_flow_pk, plog=None,
+                             attempts=6, delay=10):
+    """ops #663: find or create the Authentik LDAP provider, and ride out a busy API.
+
+    Fresh deploy, Rocky 9, 2026-11-11: the POST to /providers/ldap/ came back 500 while
+    Authentik was still settling. The old code only knew 400 ("already exists"), logged
+    "LDAP provider creation failed" and skipped everything after it: no application, no
+    outpost, no token. The compose file kept AUTHENTIK_TOKEN: placeholder, the outpost
+    sat on `403 Forbidden (Token invalid/expired)` for 70 minutes, and TAK Server got no
+    LDAP groups. A 5xx or a dropped connection is not a final answer: look first (the
+    provider may exist despite the 500), then retry. Returns the provider pk, or None.
+    """
+    import urllib.request as _req
+    import urllib.error as _uerr
+    _log = plog or (lambda m: None)
+
+    def _find():
+        r = json.loads(_req.urlopen(_req.Request(
+            f'{ak_url}/api/v3/providers/ldap/?search=LDAP', headers=headers),
+            timeout=10).read().decode()).get('results', [])
+        hit = next((x for x in r if x.get('name') == 'LDAP'), r[0] if r else None)
+        return hit['pk'] if hit else None
+
+    last = ''
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            pk = _find()
+            if pk:
+                _log(f"  \u2713 LDAP provider already exists (pk={pk})")
+                return pk
+            body = json.dumps({'name': 'LDAP', 'authentication_flow': bind_flow_pk,
+                               'authorization_flow': bind_flow_pk, 'invalidation_flow': inv_flow_pk,
+                               'base_dn': 'DC=takldap', 'bind_mode': 'cached',
+                               'search_mode': 'cached', 'mfa_support': False}).encode()
+            resp = _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/ldap/', data=body,
+                                             headers=headers, method='POST'), timeout=10)
+            pk = json.loads(resp.read().decode())['pk']
+            _log(f"  \u2713 Created LDAP provider (pk={pk})")
+            return pk
+        except _uerr.HTTPError as e:
+            try:
+                err = e.read().decode()[:120]
+            except Exception:
+                err = ''
+            if e.code == 400:
+                try:
+                    pk = _find()
+                except Exception:
+                    pk = None
+                if pk:
+                    _log(f"  \u2713 LDAP provider already exists (pk={pk})")
+                    return pk
+            if e.code < 500 and e.code != 400:
+                _log(f"  \u2717 LDAP provider creation failed: {e.code} {err}")
+                return None
+            last = f'{e.code} {err}'
+        except Exception as e:  # dropped connection, timeout, bad JSON from a restarting API
+            last = str(e)[:120]
+        if attempt < attempts:
+            _log(f"  \u23f3 LDAP provider not created yet ({last[:80]}) — retrying ({attempt}/{attempts - 1})...")
+            time.sleep(delay)
+    _log(f"  \u2717 LDAP provider creation failed after {attempts} tries: {last}")
+    return None
+
+
+def _ak_ldap_flow_pks(ak_url, headers):
+    """ops #663: (bind_flow_pk, invalidation_flow_pk) for a new LDAP provider; None where missing."""
+    import urllib.request as _req
+
+    def _get(path):
+        return json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/{path}', headers=headers),
+                                       timeout=10).read().decode()).get('results', [])
+    auth = _get('flows/instances/?designation=authentication')
+    ldap_flow = next((f['pk'] for f in auth if f.get('slug') == 'ldap-authentication-flow'), None)
+    default = next((f['pk'] for f in auth if f.get('slug') == 'default-authentication-flow'),
+                   auth[0]['pk'] if auth else None)
+    inv = _get('flows/instances/?designation=invalidation')
+    inv_pk = next((f['pk'] for f in inv if 'invalidation' in f.get('slug', '')
+                   and 'provider' not in f.get('slug', '')), inv[0]['pk'] if inv else None)
+    return (ldap_flow or default), inv_pk
+
+
 def _repair_ldap_outpost_token(plog_fn=None):
     """v10.1.76: re-read the LDAP outpost's real token from Authentik, write it
     into docker-compose.yml, and recreate the outpost container.
@@ -80709,7 +80796,28 @@ def _repair_ldap_outpost_token(plog_fn=None):
         outpost = next((o for o in results
                         if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
         if not outpost:
-            return False, 'LDAP outpost not found in Authentik'
+            # ops #663: a deploy whose provider step failed leaves NO outpost, and the
+            # container keeps the placeholder token. Build what is missing, then go on.
+            _bind_flow, _inv_flow = _ak_ldap_flow_pks(url, headers)
+            if not (_bind_flow and _inv_flow):
+                return False, 'LDAP outpost not found in Authentik, and its flows are not ready'
+            _prov = _ak_ldap_provider_ensure(url, headers, _bind_flow, _inv_flow, plog=_log)
+            if not _prov:
+                return False, 'LDAP outpost not found in Authentik, and the LDAP provider could not be created'
+            try:
+                _req.urlopen(_req.Request(f'{url}/api/v3/core/applications/', data=json.dumps(
+                    {'name': 'LDAP', 'slug': 'ldap', 'provider': _prov,
+                     'open_in_new_tab': True}).encode(), headers=headers, method='POST'), timeout=10)
+            except _uerr.HTTPError as _ae:
+                if _ae.code != 400:  # 400 = the application exists already
+                    _log(f'LDAP application not created ({_ae.code}); continuing')
+            _resp = _req.urlopen(_req.Request(f'{url}/api/v3/outposts/instances/', data=json.dumps(
+                {'name': 'LDAP', 'type': 'ldap', 'providers': [_prov],
+                 'config': {'authentik_host': 'http://authentik-server-1:9000/',
+                            'authentik_host_insecure': True}}).encode(),
+                headers=headers, method='POST'), timeout=30)
+            outpost = json.loads(_resp.read().decode())
+            _log('LDAP provider and outpost were missing in Authentik; created them')
         tok_id = outpost.get('token_identifier') or outpost.get('token')
         if not tok_id:
             tok_id = (_get(f"outposts/instances/{outpost['pk']}/").get('token_identifier')
