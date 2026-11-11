@@ -96,6 +96,7 @@ def _ns(settings, **stubs):
         '_get_cloudtak_target_release_tag': lambda use_cache=True: 'v13.113.0',
         '_cloudtak_release_cache': {'tag': None, 'ts': 0},
         '_REMOTE_DOCKER_GROUP_SH': 'true',   # row 5: remote step 2 joins the SSH user to docker
+        '_docker_install_cmd': lambda sudo_fallback=False: 'true',   # ops #637: not under test here
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
         '_cpu_preflight_local': lambda what, plog: True,          # ops #360: not under test here
         '_cpu_preflight_remote': lambda cfg, what, plog: True,

@@ -966,7 +966,7 @@ finalize_nonroot_ownership() {
 # with a `docker --version` check (broker-mediated → runs as root); if Docker is
 # present that check passes and the deploy proceeds. The non-root console CANNOT
 # install Docker itself (the install is dnf/systemctl/curl|sh as root), so a fresh
-# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_cmd
+# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_script
 # (multiplatform). takwerx is deliberately NOT added to the docker group — every
 # docker op the console runs is mediated by the root broker.
 ensure_docker_nonroot() {
@@ -983,7 +983,29 @@ ensure_docker_nonroot() {
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1
         dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
     else
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+        # ops #637: Docker's own signed apt repo, key checked against the published fingerprint
+        # (same value as DOCKER_APT_KEY_FPR in app.py) — never the get.docker.com script piped to a shell as root.
+        . /etc/os-release
+        case "$ID" in debian) _dk_d=debian ;; *) _dk_d=ubuntu ;; esac
+        _dk_c="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+        DOCKER_APT_KEY_FPR="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+        if [ -n "$_dk_c" ]; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -o DPkg::Lock::Timeout=300 -qq update >/dev/null 2>&1
+            apt-get -o DPkg::Lock::Timeout=300 -qq install -y ca-certificates curl gnupg >/dev/null 2>&1
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL "https://download.docker.com/linux/$_dk_d/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null
+            _dk_fpr=$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.asc 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')
+            if [ "$_dk_fpr" = "$DOCKER_APT_KEY_FPR" ]; then
+                chmod a+r /etc/apt/keyrings/docker.asc
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$_dk_d $_dk_c stable" > /etc/apt/sources.list.d/docker.list
+                apt-get -o DPkg::Lock::Timeout=300 -qq update >/dev/null 2>&1
+                apt-get -o DPkg::Lock::Timeout=300 -qq install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
+            else
+                rm -f /etc/apt/keyrings/docker.asc
+                echo -e "${YELLOW}  ⚠ Docker signing key fingerprint did not match; Docker was not installed${NC}"
+            fi
+        fi
     fi
     systemctl enable --now docker >/dev/null 2>&1 || true
     if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then

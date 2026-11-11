@@ -119,6 +119,7 @@ def _load():
         're': re,
         '_authentik_pg_command_for_ram': lambda ram: (PG_CMD, 'test-tier'),
         '_local_ram_mb': lambda: 16000,
+        'AUTHENTIK_REDIS_IMAGE': 'docker.io/library/redis:8.10.2-alpine',   # ops #637
         '_ensure_authentik_compose_patches_legacy': lambda *a, **k: pytest.fail('legacy patcher reached'),
     }
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
