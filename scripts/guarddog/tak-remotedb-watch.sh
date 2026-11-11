@@ -204,7 +204,7 @@ send_alert() {  # $1=subject  $2=body  $3=dedupe_file
   touch "$3"
   echo -e "$2" | /opt/tak-guarddog/send-alert-email.sh "$1" "ALERT_EMAIL_PLACEHOLDER"
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-    TMPF="/tmp/gd-sms-$$.txt"; printf '%s' "$2" > "$TMPF"
+    TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"; printf '%s' "$2" > "$TMPF"
     /opt/tak-guarddog/sms_send.sh "$1" "$TMPF" 2>/dev/null || true; rm -f "$TMPF"
   fi
 }

@@ -474,6 +474,12 @@ EOF
         ip link set "$IFACE" down; ip link set "$IFACE" up
         ip addr add "${AP_IP}/${AP_CIDR}" dev "$IFACE"
 
+        # ops #633: both files sit at fixed names in /tmp (the hostapd one holds the
+        # Wi-Fi password). Remove, then create fresh with O_EXCL (set -C) and umask 077,
+        # so the file is new and readable only by its owner; if the name is taken, the
+        # write fails and set -e stops here.
+        rm -f "$HOSTAPD_CONF" "$DNSMASQ_CONF"
+        set -C; _ap_umask=$(umask); umask 077
         cat > "$HOSTAPD_CONF" <<EOF
 interface=$IFACE
 driver=nl80211
@@ -502,13 +508,14 @@ no-resolv
 no-hosts
 EOF
         chmod 600 "$DNSMASQ_CONF"
+        set +C; umask "$_ap_umask"
 
         # hostapd FIRST (brings the radio into AP mode + starts beaconing), give it
         # a moment to settle, THEN dnsmasq binds DHCP/DNS to the now-live AP
         # interface. Starting dnsmasq before the AP was a latent ordering bug.
         hostapd -B "$HOSTAPD_CONF" >>"$LOG" 2>&1
         sleep 2
-        dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/tmp/takwerx-dnsmasq-ap.pid
+        dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/run/takwerx-dnsmasq-ap.pid
         set +e
     fi
 

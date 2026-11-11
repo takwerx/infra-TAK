@@ -64,7 +64,7 @@ Diagnose: journalctl -u mediamtx-webeditor -n 50
 "
       echo -e "$ED_BODY" | /opt/tak-guarddog/send-alert-email.sh "$ED_SUBJ" "ALERT_EMAIL_PLACEHOLDER"
       if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-        ED_TMPF="/tmp/gd-sms-ed-$$.txt"
+        ED_TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
         printf '%s' "$ED_BODY" > "$ED_TMPF"
         /opt/tak-guarddog/sms_send.sh "$ED_SUBJ" "$ED_TMPF" 2>/dev/null || true
         rm -f "$ED_TMPF"
@@ -136,7 +136,7 @@ Otherwise diagnose: journalctl -u mediamtx -n 50
 "
     echo -e "$CAP_BODY" | /opt/tak-guarddog/send-alert-email.sh "$CAP_SUBJ" "ALERT_EMAIL_PLACEHOLDER"
     if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-      CAP_TMPF="/tmp/gd-sms-cap-$$.txt"
+      CAP_TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
       printf '%s' "$CAP_BODY" > "$CAP_TMPF"
       /opt/tak-guarddog/sms_send.sh "$CAP_SUBJ" "$CAP_TMPF" 2>/dev/null || true
       rm -f "$CAP_TMPF"
@@ -162,7 +162,7 @@ Check /var/log/takguard/restarts.log for history.
 "
 echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-  TMPF="/tmp/gd-sms-$$.txt"
+  TMPF="$(mktemp /tmp/gd-sms.XXXXXX)"
   printf '%s' "$BODY" > "$TMPF"
   /opt/tak-guarddog/sms_send.sh "$SUBJ" "$TMPF" 2>/dev/null || true
   rm -f "$TMPF"

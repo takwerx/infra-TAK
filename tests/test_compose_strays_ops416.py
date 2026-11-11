@@ -32,6 +32,7 @@ test_boot_scripts_compose_lock_ops180.py, so this runs on macOS too.
 
 import fcntl
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -169,7 +170,9 @@ def box(tmp_path):
         return {c['name']: c['state'] for c in json.loads(state.read_text())}
 
     def env():
-        return {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs, 'HOME': str(home)}
+        # GD_STACK_OWNER: the fake stack dirs belong to the test user, not root/takwerx (ops #633).
+        return {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs, 'HOME': str(home),
+                'GD_STACK_OWNER': str(os.getuid())}
 
     def lib(fn_call):
         """Run one lib call with the real library sourced."""

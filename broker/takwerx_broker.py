@@ -473,6 +473,9 @@ PATH_ALLOW_EXACT = (
     # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
     '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
+    '/usr/local/sbin/takserver-renew-letsencrypt.sh',  # ops #633: daily LE renewal
+                                                 # (takserver-cert-renewal.service); moved
+                                                 # here from /opt/tak
     '/var/lib/infratak-kernel-patch.sh',         # kernel-patch job script (written by
                                                  # the console, run by the gated systemd-run)
     '/var/lib/infratak-os-upgrade.sh',           # v10.3.0 W4: OS-upgrade job script (same
