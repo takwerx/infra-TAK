@@ -31,6 +31,7 @@ import errno
 import importlib.util
 import os
 import pathlib
+import re
 import secrets
 import stat as _stat
 import subprocess
@@ -75,7 +76,7 @@ def _app_ns(prefixes, sent=None, broker=False, uid=0):
     src = src.replace("_ATOMIC_WRITE_PREFIXES = ('/opt/tak-guarddog/', '/etc/systemd/system/')",
                       '_ATOMIC_WRITE_PREFIXES = %r' % (tuple(prefixes),))
     ns = {
-        'os': _Os(uid), 'secrets': secrets, 'errno': errno, '_stat': _stat,
+        'os': _Os(uid), 'secrets': secrets, 'errno': errno, '_stat': _stat, 're': re,
         'subprocess': subprocess, '_b64': __import__('base64'),
         'BrokerError': BrokerError,
         '_MEDIAMTX_NOFOLLOW_PREFIXES': ('/nonexistent/',),

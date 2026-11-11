@@ -736,6 +736,7 @@ PATH_CLASS = {
     '/var/lib/takguard/': DEST_VALIDATED,        # Guard Dog state root scripts read
     '/var/lib/infratak-os-upgrade/': DEST_VALIDATED,
     '/opt/mediamtx-webeditor/': DEST_DATA,       # runs as the console user
+    '/opt/mediamtx-webeditor-pylib/': DEST_DATA, # editor's Python packages: run by the mediamtx account, never by root
     '/var/log/': DEST_DATA,                      # broker audit log deny-listed (W0)
     '/var/lib/takwerx-console/': DEST_DATA,
     '/var/lib/caddy/': DEST_DATA,

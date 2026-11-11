@@ -373,7 +373,10 @@ def test_app_fills_guarddog_templates_only_through_the_helper():
     """Every fill-in goes through _gd_install_script (gd_render on the root layout).
     A new `.replace('X_PLACEHOLDER', …)` would write a root script from console bytes."""
     src = (REPO / 'app.py').read_text()
-    assert not re.findall(r"\.replace\(f?'[A-Z_{}]*_PLACEHOLDER'", src)
+    # Not Guard Dog: the Authentik compose file's Redis image, filled from a code constant.
+    not_guarddog = {'AK_REDIS_IMAGE_PLACEHOLDER'}
+    found = re.findall(r"\.replace\(f?'([A-Z_{}]*_PLACEHOLDER)'", src)
+    assert not set(found) - not_guarddog, sorted(set(found) - not_guarddog)
     assert src.count('_gd_install_script(') >= 5          # def + the four call sites
 
 
