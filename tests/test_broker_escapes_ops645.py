@@ -496,7 +496,7 @@ def test_do_exec_routes_off_allowlist_cp_through_staging(monkeypatch):
 
 # --- the coverage scanner runs in CI and gains no new gap -----------------------------
 
-def test_enforce_coverage_scan_has_no_new_gaps():
+def test_enforce_coverage_scan_has_no_new_gaps(monkeypatch):
     """broker/scan_enforce_coverage.py had no test, so a rulebook change could break a
     real call site in ENFORCE without anyone noticing. Its gap list may only shrink."""
     import sys
@@ -508,15 +508,23 @@ def test_enforce_coverage_scan_has_no_new_gaps():
         spec.loader.exec_module(scan)
     finally:
         sys.path.pop(0)
-    gaps = set()
+    # This test judges argv SHAPES. The apply-selinux trust check reads the real owners
+    # of /opt/tak on the machine running the test, so its verdict depends on that machine
+    # (CI refused the shape, the Studio did not). It has its own test above
+    # (test_tak_selinux_script_must_be_as_installed), so the shape scan leaves it out.
+    monkeypatch.setattr(scan.B, '_check_tak_script_trusted', lambda path: None)
+    gaps, why = set(), {}
     for f in (REPO / 'app.py', REPO / 'selfheal_ip.py'):
         cmds, _ = scan.scan_file(str(f))
         for _, _, slots, dyn in cmds:
-            verdict, _ = scan.evaluate_cmd(slots, dyn)
+            verdict, reason = scan.evaluate_cmd(slots, dyn)
             if verdict == 'DENY':
-                gaps.add(' '.join('|'.join(s) if s else '<var>' for s in slots))
+                key = ' '.join('|'.join(s) if s else '<var>' for s in slots)
+                gaps.add(key)
+                why.setdefault(key, reason)
     new = gaps - KNOWN_GAPS
-    assert not new, 'rulebook now denies a console call site: %s' % sorted(new)
+    assert not new, 'rulebook now denies a console call site: %s' % sorted(
+        (k, why[k]) for k in new)
 
 
 # Fully-literal call sites the rulebook already denied before ops #645 (dev a763f42).
