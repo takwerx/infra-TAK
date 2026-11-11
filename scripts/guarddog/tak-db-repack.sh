@@ -151,7 +151,13 @@ if [ -z "$COT_SIZE_RAW" ]; then
   log_line "DB-REPACK: could not read database size (database not reachable yet), skipped (clean)"
   exit 0
 fi
-COT_SIZE=$((COT_SIZE_RAW + 0))
+# ops #628: digits only BEFORE any $(( )). This text comes from psql (the postgres account,
+# the DB container or the remote DB host), not from us.
+COT_SIZE_RAW=$(printf '%s' "$COT_SIZE_RAW" | tr -d '[:space:]')
+case "$COT_SIZE_RAW" in
+  ''|*[!0-9]*) log_line "DB-REPACK: database size is not a number, skipped (clean)"; exit 0 ;;
+esac
+COT_SIZE=$COT_SIZE_RAW
 COT_GB=$((COT_SIZE / 1024 / 1024 / 1024))
 
 # v10.1.29 (W4c): the size threshold exists so the WEEKLY TIMER doesn't repack a
@@ -303,6 +309,10 @@ fi
 
 # Measure size after
 COT_AFTER_RAW=$(psql_scalar "$SIZE_SQL")
+COT_AFTER_RAW=$(printf '%s' "$COT_AFTER_RAW" | tr -d '[:space:]')
+case "$COT_AFTER_RAW" in   # ops #628: digits only before $(( ))
+  ''|*[!0-9]*) log_line "DB-REPACK: completed — before: ${SIZE_BEFORE}GB, size after could not be read"; exit 0 ;;
+esac
 COT_AFTER=$((COT_AFTER_RAW / 1024 / 1024 / 1024))
 RECLAIMED=$((SIZE_BEFORE - COT_AFTER))
 

@@ -40,6 +40,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
+# ops #632: module .env writes go through app.py's _open_secret_w (0600 at creation).
+_OPEN_SECRET_W = {'os': os}
+exec(re.search(r'^def _open_secret_w\(.*?(?=^\S)', APP, re.S | re.M).group(0), _OPEN_SECRET_W)
 TREE = ast.parse(APP)
 
 GARAGE_COMPOSE = """services:
@@ -84,6 +87,7 @@ def _ns(settings, **stubs):
         run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='true\n', stderr=''),
         TimeoutExpired=TimeoutError)
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'os': os, 're': re, 'json': json, 'shlex': shlex, 'shutil': shutil, 'tempfile': tempfile,
         'time': __import__('time'), 'datetime': datetime.datetime, 'subprocess': fake_sub,
         'load_settings': lambda: settings, 'save_settings': lambda s: None,
@@ -92,6 +96,7 @@ def _ns(settings, **stubs):
         '_get_cloudtak_target_release_tag': lambda use_cache=True: 'v13.113.0',
         '_cloudtak_release_cache': {'tag': None, 'ts': 0},
         '_REMOTE_DOCKER_GROUP_SH': 'true',   # row 5: remote step 2 joins the SSH user to docker
+        '_docker_install_cmd': lambda sudo_fallback=False: 'true',   # ops #637: not under test here
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
         '_cpu_preflight_local': lambda what, plog: True,          # ops #360: not under test here
         '_cpu_preflight_remote': lambda cfg, what, plog: True,

@@ -40,6 +40,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
+# ops #632: module .env writes go through app.py's _open_secret_w (0600 at creation).
+_OPEN_SECRET_W = {'os': __import__('os')}
+exec(re.search(r'^def _open_secret_w\(.*?(?=^\S)', APP, re.S | re.M).group(0), _OPEN_SECRET_W)
 
 _FUNCS = ('_deep_merge_dict', '_cloudtak_deployment_defaults', '_normalize_cloudtak_deployment_config',
           '_get_cloudtak_deployment_config', '_cloudtak_cfg_for_installed_action',
@@ -83,6 +86,7 @@ def _ns(settings, body):
 
     _Thread.started = []
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'copy': copy,
         'request': types.SimpleNamespace(get_json=lambda *a, **k: body, json=body),
         'jsonify': lambda *a, **k: (a[0] if a else k),
@@ -240,6 +244,7 @@ def _redeploy_ns(remote_env, env_read_ok=True):
 
     status = {'running': True}
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'os': __import__('os'), 'shutil': shutil, 'tempfile': __import__('tempfile'),
         'datetime': __import__('datetime').datetime, 'subprocess': subprocess,
         'load_settings': lambda: {'fqdn': 'example.com',

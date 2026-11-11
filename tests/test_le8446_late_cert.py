@@ -86,7 +86,10 @@ def _heal(files, settings, keystore_fp=None, caddy_has_cert=True, install_result
           '_get_tak_cert_password': lambda s: 'atakatak',
           '_tak_is_container': lambda: False,
           '_sudo_wrap': lambda c: ['sudo', '-n'] + c,
-          'install_le_cert_on_8446': install}
+          'install_le_cert_on_8446': install,
+          'LE_RENEW_SCRIPT': '/usr/local/sbin/takserver-renew-letsencrypt.sh',
+          'LE_RENEW_SCRIPT_OLD': '/opt/tak/renew-letsencrypt.sh',
+          'LE_RENEW_UNIT': '/etc/systemd/system/takserver-cert-renewal.service'}
     exec(compile(_fn('_selfheal_takserver_le_cert'), 'app.py', 'exec'), ns)
     return ns['_selfheal_takserver_le_cert'], installs
 
@@ -122,7 +125,15 @@ def test_no_domain_means_nothing_to_set_up():
 
 # ── unchanged behavior on boxes that already have LE on 8446 ───────────────────────────────────
 
-RENEW = {'/opt/tak/renew-letsencrypt.sh', '/etc/systemd/system/takserver-cert-renewal.service', CORE, JKS}
+RENEW = {'/usr/local/sbin/takserver-renew-letsencrypt.sh', '/etc/systemd/system/takserver-cert-renewal.service', CORE, JKS}
+# ops #633: a box whose script has not been moved out of /opt/tak yet behaves the same.
+RENEW_OLD = {'/opt/tak/renew-letsencrypt.sh', '/etc/systemd/system/takserver-cert-renewal.service', CORE, JKS}
+
+
+def test_not_yet_moved_script_still_counts_as_present():
+    heal, installs = _heal(files=RENEW_OLD, settings=LE, keystore_fp='sha256 Fingerprint=CADDY\n')
+    assert heal(lambda m: None) is True
+    assert installs == []
 
 
 def test_matching_keystore_is_left_alone_and_reports_true():

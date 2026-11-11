@@ -36,6 +36,7 @@ INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$INSTALL_DIR/.config"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
+CONSOLE_PASSWORD_MIN_LEN=12   # ops #638: = app.py CONSOLE_PASSWORD_MIN_LEN
 
 # Only clear an interactive screen. Headless callers (e.g. the in-console
 # "Switch to non-root" button, which runs start.sh detached via systemd-run with
@@ -642,15 +643,23 @@ first_time_setup() {
     echo -e "${BOLD}  First-time setup${NC}"
     echo ""
 
-    # Set admin password
+    # Set admin password. ops #638: at least CONSOLE_PASSWORD_MIN_LEN characters (the same
+    # floor as app.py and reset-console-password.sh): the console is root, and its login
+    # page can be reached from the internet.
+    echo -e "  The admin password needs at least ${CONSOLE_PASSWORD_MIN_LEN} characters."
     while true; do
-        read -s -p "  Set admin password: " ADMIN_PASS
+        read -rs -p "  Set admin password: " ADMIN_PASS
         echo ""
-        read -s -p "  Confirm password:   " ADMIN_PASS_CONFIRM
+        read -rs -p "  Confirm password:   " ADMIN_PASS_CONFIRM
         echo ""
 
         if [ -z "$ADMIN_PASS" ]; then
             echo -e "  ${RED}Password cannot be empty${NC}"
+            continue
+        fi
+
+        if [ "${#ADMIN_PASS}" -lt "$CONSOLE_PASSWORD_MIN_LEN" ]; then
+            echo -e "  ${RED}Password must be at least ${CONSOLE_PASSWORD_MIN_LEN} characters${NC}"
             continue
         fi
 
@@ -664,16 +673,21 @@ first_time_setup() {
 
     # Hash the password using Python. pbkdf2:sha256 = app.py PASSWORD_HASH_METHOD (GH #137):
     # werkzeug's default, scrypt, is missing from FIPS-mode OpenSSL.
-    PASS_HASH=$("$INSTALL_DIR/.venv/bin/python3" -c "
+    # ops #638: the password goes in on stdin (printf is a bash builtin, so no process
+    # ever carries it in argv); as an argument any local user could read it in `ps`.
+    PASS_HASH=$(printf '%s' "$ADMIN_PASS" | "$INSTALL_DIR/.venv/bin/python3" -c "
 from werkzeug.security import generate_password_hash
 import sys
-print(generate_password_hash(sys.argv[1], method='pbkdf2:sha256'))
-" "$ADMIN_PASS")
+pw = sys.stdin.read()
+print(generate_password_hash(pw, method='pbkdf2:sha256'))
+")
+    unset ADMIN_PASS ADMIN_PASS_CONFIRM
 
     # Save auth config
     cat > "$AUTH_FILE" << EOF
 {
     "password_hash": "$PASS_HASH",
+    "password_min_len_ok": true,
     "created": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 EOF
@@ -952,7 +966,7 @@ finalize_nonroot_ownership() {
 # with a `docker --version` check (broker-mediated → runs as root); if Docker is
 # present that check passes and the deploy proceeds. The non-root console CANNOT
 # install Docker itself (the install is dnf/systemctl/curl|sh as root), so a fresh
-# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_cmd
+# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_script
 # (multiplatform). takwerx is deliberately NOT added to the docker group — every
 # docker op the console runs is mediated by the root broker.
 ensure_docker_nonroot() {
@@ -969,7 +983,29 @@ ensure_docker_nonroot() {
         dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1
         dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
     else
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+        # ops #637: Docker's own signed apt repo, key checked against the published fingerprint
+        # (same value as DOCKER_APT_KEY_FPR in app.py) — never the get.docker.com script piped to a shell as root.
+        . /etc/os-release
+        case "$ID" in debian) _dk_d=debian ;; *) _dk_d=ubuntu ;; esac
+        _dk_c="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+        DOCKER_APT_KEY_FPR="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+        if [ -n "$_dk_c" ]; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -o DPkg::Lock::Timeout=300 -qq update >/dev/null 2>&1
+            apt-get -o DPkg::Lock::Timeout=300 -qq install -y ca-certificates curl gnupg >/dev/null 2>&1
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL "https://download.docker.com/linux/$_dk_d/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null
+            _dk_fpr=$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.asc 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')
+            if [ "$_dk_fpr" = "$DOCKER_APT_KEY_FPR" ]; then
+                chmod a+r /etc/apt/keyrings/docker.asc
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$_dk_d $_dk_c stable" > /etc/apt/sources.list.d/docker.list
+                apt-get -o DPkg::Lock::Timeout=300 -qq update >/dev/null 2>&1
+                apt-get -o DPkg::Lock::Timeout=300 -qq install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
+            else
+                rm -f /etc/apt/keyrings/docker.asc
+                echo -e "${YELLOW}  ⚠ Docker signing key fingerprint did not match; Docker was not installed${NC}"
+            fi
+        fi
     fi
     systemctl enable --now docker >/dev/null 2>&1 || true
     if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
@@ -1252,33 +1288,50 @@ finalize_nonroot_ownership
 # Create and start systemd service
 create_service
 
-# Stop existing instance if running
-systemctl stop takwerx-console 2>/dev/null || true
-sleep 1
-
-# Start the console
-systemctl start takwerx-console
-
 # Host firewall: keep the console + SSH reachable, and on RHEL bring up ALWAYS-ON
 # firewalld (operator decision 2026-06-21 — many deploys aren't in a cloud with a
 # security group, and the Cyber-Controls W4 checks need a host firewall to assert
 # against). On Debian, ufw is enabled later by the TAK Server deploy; just open 5001.
+# Runs BEFORE the console starts so the console's startup convergence (hardening
+# posture closing 5001, Guard Dog 8080 source-scope, internal-port cleanup) has the
+# last word — it used to run after, and undid them until the next console restart.
 if [ "$PKG_MGR" = "dnf" ]; then
     # Install firewalld if the image didn't ship it (cloud RHEL AMIs often strip it).
     command -v firewall-cmd >/dev/null 2>&1 || dnf install -y firewalld >/dev/null 2>&1
     if command -v firewall-cmd >/dev/null 2>&1; then
+        _fwd_was_active=0
+        systemctl is-active --quiet firewalld 2>/dev/null && _fwd_was_active=1
         # Start firewalld FIRST — `firewall-cmd` (even --permanent) needs the daemon
         # running, and the default `public` zone already allows ssh, so SSH survives.
         systemctl enable --now firewalld >/dev/null 2>&1 || true
-        # Now add console + SSH explicitly, then seed from current PUBLIC listeners so a
-        # re-run on a box that already has modules doesn't strand their ports (a fresh box
-        # only has SSH + console here). Module deploys open their ports later via the shim.
         firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
-        for _p in $(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.0\.0\.1:|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
-            [ "$_p" = "111" ] && continue   # rpcbind — never expose
+        # SSH moved off 22 (Security → SSH port): keep every port sshd listens on, so
+        # turning firewalld on never locks the operator out.
+        for _p in $(ss -ltnpH 2>/dev/null | awk '/"sshd"/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
+            [ "$_p" = "22" ] && continue
             firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
         done
+        # Console: a blanket allow beats a rich rule, so leave 5001 alone when the
+        # operator has source-scoped it.
+        if ! firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -q 'port="5001"'; then
+            firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
+        fi
+        # Seed module ports ONLY when firewalld is being turned on for the first time
+        # (an older box with modules must not have them stranded), and ONLY ports that
+        # are public by design. Never seed from `ss` alone: internal listeners (Guard Dog
+        # 8080, Postfix 25, PostgreSQL 5432, Fed Hub UI 9100, TAK 8444/9000/9001) are
+        # source-scoped by their modules. Once firewalld runs, module deploys open their
+        # own ports, and the permanent rules already hold them.
+        # Public-by-design TCP: Caddy 80/443, TAK 8089/8443/8446, MediaMTX RTSP/RTSPS
+        # 8554/8322, Video Restreamer 1935/8555, CoTURN 3478/3479, Remote Assist 8448,
+        # ATLAS 8449, CloudTAK video/stream 9997/18554/11935, Fed Hub federation 9101-9103.
+        if [ "$_fwd_was_active" = "0" ]; then
+            _public_listen=$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un)
+            for _p in 80 443 8089 8443 8446 8554 8322 1935 8555 3478 3479 8448 8449 9997 18554 11935 9101 9102 9103; do
+                printf '%s\n' "$_public_listen" | grep -qx "$_p" || continue
+                firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
+            done
+        fi
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 else
@@ -1291,6 +1344,13 @@ else
         ufw allow 5001/tcp >/dev/null 2>&1 || true
     fi
 fi
+
+# Stop existing instance if running
+systemctl stop takwerx-console 2>/dev/null || true
+sleep 1
+
+# Start the console
+systemctl start takwerx-console
 
 # Get access URL — on cloud VMs the public IP genuinely reaches the box (1:1 NAT), so
 # it's a real access URL. On home/hotspot/CGNAT networks the "public" IP is NOT reachable

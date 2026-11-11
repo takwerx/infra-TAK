@@ -143,33 +143,72 @@ class _SurrogateSafeResponse(app.response_class):
 
 app.response_class = _SurrogateSafeResponse
 # Persist the secret key so session cookies survive console restarts.
-_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
+# ops #634: the key lives in `session_key`, not the old `secret_key` file. A box that
+# updates mints a fresh key on its first start, so every cookie signed before the
+# update stops working; the old file is removed. Created 0600 from the first byte.
+_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'session_key')
+_OLD_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
 try:
     os.makedirs(os.path.dirname(_SECRET_KEY_FILE), exist_ok=True)
+    _key = ''
     if os.path.exists(_SECRET_KEY_FILE):
-        app.secret_key = open(_SECRET_KEY_FILE).read().strip()
-    else:
-        _new_key = secrets.token_hex(32)
-        with open(_SECRET_KEY_FILE, 'w') as _f:
-            _f.write(_new_key)
-        os.chmod(_SECRET_KEY_FILE, 0o600)
-        app.secret_key = _new_key
+        with open(_SECRET_KEY_FILE) as _f:
+            _key = _f.read().strip()
+    if not _key:
+        _key = secrets.token_hex(32)
+        _tmp = _SECRET_KEY_FILE + '.tmp'
+        _fd = os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, 'w') as _f:
+            _f.write(_key)
+        os.replace(_tmp, _SECRET_KEY_FILE)
+    app.secret_key = _key
+    try:
+        os.remove(_OLD_SECRET_KEY_FILE)
+    except OSError:
+        pass   # gone already, or not ours to remove: the key above is still the one in use
 except Exception:
     app.secret_key = secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024
-# When using domain (infratak.*) set cookie domain for session; when using IP (backdoor) use no domain so cookie is sent
-def _set_session_cookie_domain():
-    try:
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'settings.json')
-        if os.path.exists(p) and (not app.config.get('SESSION_COOKIE_DOMAIN')):
-            _s = json.load(open(p))
-            if _s.get('fqdn'):
-                app.config['SESSION_COOKIE_DOMAIN'] = '.' + _s['fqdn'].split(':')[0]
-    except Exception:
-        pass
-_set_session_cookie_domain()
+
+# ops #634: the console session cookie belongs to the console's own host only.
+# It used to be scoped to `.<fqdn>`, so the browser sent the admin session to every
+# module site (Node-RED, TAK Portal, CloudTAK, ...) and, with no Secure flag, over
+# plain HTTP too. Nothing outside the console needs it: module sites log in through
+# Authentik's own cookie. Now: no Domain (host-only), Secure on HTTPS, and on HTTPS
+# the `__Host-` name, which the browser refuses to accept with a Domain or from a
+# sibling host. The new name also keeps the old `.<fqdn>` cookie called `session`
+# (still in browsers after the update) from shadowing the new one.
+LEGACY_SESSION_COOKIE = 'session'
+
+
+def _request_is_https():
+    from flask import has_request_context
+    if not has_request_context():
+        return False
+    if request.is_secure:
+        return True
+    # Only Caddy on this box may say the client used HTTPS.
+    return (request.remote_addr in ('127.0.0.1', '::1')
+            and (request.headers.get('X-Forwarded-Proto') or '').lower() == 'https')
+
+
+from flask.sessions import SecureCookieSessionInterface as _SecureCookieSessionInterface
+
+
+class _ConsoleSessionInterface(_SecureCookieSessionInterface):
+    def get_cookie_name(self, app):
+        return '__Host-infratak_session' if _request_is_https() else 'infratak_session'
+
+    def get_cookie_domain(self, app):
+        return None
+
+    def get_cookie_secure(self, app):
+        return _request_is_https()
+
+
+app.session_interface = _ConsoleSessionInterface()
 
 # In-memory rate limiter (per-process). Good baseline protection without extra deps.
 _RATE_LOCK = threading.Lock()
@@ -783,6 +822,10 @@ def _priv_write_denied_by_design(path):
     return any(p.startswith(prefix) for prefix in _BROKER_NEVER_ASK_PREFIXES)
 
 
+# Dirs the MediaMTX account can write (ops #643): never written through a link.
+_MEDIAMTX_NOFOLLOW_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -812,6 +855,16 @@ def _write_priv(path, content, mode='w', perm=None):
     is_bytes = isinstance(content, (bytes, bytearray))
     if os.getuid() == 0:
         fmode = mode + 'b' if is_bytes else mode
+        if str(path).startswith(_MEDIAMTX_NOFOLLOW_PREFIXES):
+            # ops #643: MediaMTX's own account can plant links in these dirs; a root
+            # console must not write through one (the broker does the same, O_NOFOLLOW).
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                         | (os.O_APPEND if 'a' in mode else os.O_TRUNC), 0o644)
+            with os.fdopen(fd, fmode) as f:
+                f.write(content)
+                if perm is not None:
+                    os.fchmod(f.fileno(), int(perm))
+            return
         with open(path, fmode) as f:
             f.write(content)
         if perm is not None:
@@ -858,6 +911,21 @@ def _read_priv(path):
             return f.read()
     proc = subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, text=True, check=True)
     return proc.stdout
+
+
+def _open_secret_w(path):
+    """open(path, 'w') for a file that holds secrets (module .env files).
+
+    ops #632: a plain open() creates the file at the umask default (0644), and the
+    startup converge only tightened it to 600 at the NEXT console start — until then
+    every local user (tak, postgres) could read the Authentik/CloudTAK passwords.
+    Create it 0600, and tighten an existing one BEFORE the new content goes in."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass                    # not ours (pre-flip root-owned) — the converge heals it
+    return os.fdopen(fd, 'w')
 
 
 def _read_own_or_priv(path):
@@ -1279,24 +1347,12 @@ def _request_host_is_ip():
         return True
 
 @app.before_request
-def ensure_session_cookie_domain():
-    """Pin the session cookie to the FQDN ONLY when the request actually arrives on the FQDN
-    (SSO at infratak.<fqdn>, which needs the cross-subdomain cookie). For ANY other host — a bare
-    IP, `localhost`, or the SSH-tunnel break-glass path — use a host-only cookie. Otherwise the
-    browser silently drops a `.<fqdn>`-scoped cookie that was set over localhost/IP, the session
-    never persists, and the break-glass login bounces back to /login ('flash'). The earlier code
-    only special-cased a literal IP, so `https://localhost:5001` break-glass was broken on every
-    box that has an FQDN configured. (Found 2026-06-13 validating W-IDLE break-glass on test6.)"""
-    host = (request.host or '').split(':')[0].lower()
-    fqdn = ''
-    try:
-        fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
-    except Exception:
-        fqdn = ''
-    if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
-        app.config['SESSION_COOKIE_DOMAIN'] = '.' + fqdn
-    else:
-        app.config['SESSION_COOKIE_DOMAIN'] = False
+def ensure_session_valid():
+    """End a session whose login token no longer matches (password changed, logged out
+    elsewhere, or signed before ops #634). The cookie itself is host-only on every host now
+    (see _ConsoleSessionInterface), so the IP / localhost break-glass path needs no special
+    case."""
+    _drop_stale_session()
 
     # Baseline rate limiting
     ip = _client_ip()
@@ -1345,7 +1401,26 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.12-alpha"
+
+
+@app.after_request
+def clear_legacy_session_cookie(response):
+    """ops #634: a browser that logged in before the update still holds the old `session`
+    cookie scoped to `.<fqdn>` and keeps sending it to every module site. It is dead (no
+    login token, old key), but expire it so the browser stops sending it at all."""
+    if LEGACY_SESSION_COOKIE in request.cookies:
+        host = (request.host or '').split(':')[0].lower()
+        try:
+            fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
+        except Exception:
+            fqdn = ''
+        response.delete_cookie(LEGACY_SESSION_COOKIE, path='/')
+        if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
+            response.delete_cookie(LEGACY_SESSION_COOKIE, path='/', domain='.' + fqdn)
+    return response
+
+
+VERSION = "10.3.13-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1531,6 +1606,10 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
 # access_logs.db next to store.db (SQLite), MySQL store removed (we never configure an engine, so
 # the default sqlite store is used), SSH-server hardening we don't expose. Dashboard on Next.js 16.
 # Rollback: re-pin the dev pair to 0.81.4 / v2.95.0; the pin-restore heal converges boxes back.
+# Authentik's redis service (legacy: Authentik itself stopped needing Redis in 2025.10, but the compose
+# keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
+# whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
+AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
 NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.0"  # UNDER TRIAL (ops #427)
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
 
@@ -1546,9 +1625,12 @@ def _get_netbird_target_images(settings=None):
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
-MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9 W3: Public-toggle
-                              # fix + embedded hls.js are on installer dev awaiting tag) — an
-                              # unpinned ref is a supply-chain gap our own /module-scan rule bans.
+# Pinned to a release tag AND its commit (ops #637), like every other external source we install.
+# The tag picks the release; MEDIAMTX_EDITOR_SHA is what every fetch is checked against.
+# Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
+# fails if either goes back to a branch name.
+MEDIAMTX_EDITOR_REF = "v2.1.14"
+MEDIAMTX_EDITOR_SHA = "8d39e26d81601e107873ca8c81b4a8076bb2e028"  # commit of tag v2.1.14 (was main's tip)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
@@ -2636,6 +2718,54 @@ def save_auth(auth_dict):
     with open(p, 'w') as f:
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
+    _session_token_cache['key'] = None
+
+
+# ops #634: every authenticated session carries a login token. It is an HMAC (keyed with
+# the session secret, so the cookie reveals nothing) over the stored password hash and
+# auth.json's `session_gen`. A password change (console page, reset-console-password.sh,
+# or a hash upgrade) or a logout changes it, and every other session ends on its next
+# request. A session from before this change has no token and ends too.
+SESSION_TOKEN_KEY = 'login_token'
+_session_token_cache = {'key': None, 'token': ''}
+
+
+def _session_auth_token():
+    p = os.path.join(CONFIG_DIR, 'auth.json')
+    try:
+        st = os.stat(p)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = ('missing',)
+    if _session_token_cache['key'] != key:
+        auth = load_auth()
+        raw = '%s|%s' % (auth.get('password_hash') or '', auth.get('session_gen') or '')
+        _session_token_cache['token'] = hmac.new(
+            (app.secret_key or '').encode(), raw.encode(), hashlib.sha256).hexdigest()
+        _session_token_cache['key'] = key
+    return _session_token_cache['token']
+
+
+def _stamp_session_login():
+    session[SESSION_TOKEN_KEY] = _session_auth_token()
+
+
+def _drop_stale_session():
+    if not session.get('authenticated'):
+        return
+    if not hmac.compare_digest(str(session.get(SESSION_TOKEN_KEY) or ''), _session_auth_token()):
+        session.clear()
+
+
+def _end_all_sessions():
+    """Bump session_gen so every existing console session ends. Never raises."""
+    try:
+        auth = load_auth()
+        if auth.get('password_hash'):   # save_auth needs it; no password = no password sessions
+            auth['session_gen'] = secrets.token_hex(16)
+            save_auth(auth)
+    except Exception as e:
+        print(f"[auth] could not end other sessions: {str(e)[:120]}", flush=True)
 
 
 # GH #137: werkzeug's default hash is scrypt, and an OpenSSL without scrypt (FIPS mode
@@ -3674,6 +3804,65 @@ def _fw_deny(port, proto='tcp'):
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
 
+# Older start.sh runs on RHEL seeded firewalld from every TCP listener with a blanket
+# `--add-port`. These internal ports are console-only and never take a blanket allow:
+# each module scopes its own by source (Guard Dog 8080 → console IP, Email Relay 25 →
+# Docker networks / remote Authentik host as rich rules, Fed Hub UI → Caddy on
+# localhost) or keeps it on the box (TAK's PostgreSQL). Removing the blanket allow
+# leaves those rich rules in place. TAK's 8444/9000/9001 are not here: mTLS
+# connectors an operator may have opened on purpose for federation.
+_FW_CONSOLE_ONLY_TCP = (
+    (25, 'Email Relay (Postfix)'),
+    (5432, 'TAK Server database (PostgreSQL)'),
+    (8080, 'Guard Dog health agent / Federation Hub UI'),
+    (9100, 'Federation Hub UI'),
+)
+
+
+def _fw_remove_blanket_internal_ports(log=None):
+    """Remove a blanket firewalld allow for any port in _FW_CONSOLE_ONLY_TCP, in
+    the public zone and the default zone (start.sh added its seeds without --zone).
+    Runs on every console start, so a box heals on update and after any older start.sh
+    re-run. firewalld only: ufw boxes never ran the seed. Logs each port it closes and
+    returns them as ['zone:port/tcp', ...]. Never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    closed = []
+    try:
+        if _fw_backend() != 'firewalld':
+            return closed
+        zones = ['public']
+        r = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
+                           capture_output=True, text=True, timeout=20)
+        dz = (r.stdout or '').strip()
+        if r.returncode == 0 and re.fullmatch(r'[A-Za-z0-9_-]+', dz or '') and dz not in zones:
+            zones.append(dz)
+        for zone in zones:
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}', '--list-ports']),
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                continue
+            listed = set((r.stdout or '').split())
+            for port, label in _FW_CONSOLE_ONLY_TCP:
+                if f'{port}/tcp' not in listed:
+                    continue
+                rr = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}',
+                                                f'--remove-port={port}/tcp']),
+                                    capture_output=True, text=True, timeout=20)
+                if rr.returncode == 0:
+                    closed.append(f'{zone}:{port}/tcp')
+                    _log(f'Startup migration: firewalld: removed blanket allow for {port}/tcp in zone {zone} '
+                         f'({label}; an older start.sh added it). Source-scoped rules are kept.')
+                else:
+                    _log(f'Startup migration: firewalld: could not close {port}/tcp in zone {zone}: '
+                         f'{((rr.stderr or "") + (rr.stdout or "")).strip()[:120]}')
+        if closed:
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _log(f'Startup migration: firewalld internal-port cleanup error (non-fatal): {str(e)[:160]}')
+    return closed
+
+
 def _selinux_allow_caddy_port(port, log=None):
     """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
     non-standard port by labeling it http_port_t for BOTH tcp AND udp. No-op on
@@ -3851,28 +4040,68 @@ def _selinux_sync_caddy_ports(log=None):
     return n
 
 
-def _docker_install_cmd():
-    """Shell command that installs Docker Engine for THIS host's distro family.
-      Debian/Ubuntu → the get.docker.com convenience script (works as-is).
-      RHEL family   → get.docker.com adds Docker's linux/rocky/$releasever repo,
-                      which ships NO docker-ce packages ("Unable to find a match");
-                      use Docker's CentOS repo — the supported repo for the
-                      RHEL-compatible family (Rocky/Alma/RHEL). The `rm -f` clears
-                      any empty rocky repo a prior get.docker.com run left behind.
-    Returns a string for `subprocess.run(..., shell=True)` (run as root, matching
-    the existing get.docker.com sites). NON-ROOT-COMMANDS: dnf, dnf config-manager,
-    systemctl. Validated on Rocky 9.8: installs docker-ce 29.x + starts it.
-    Note: distro family is the LOCAL box; remote/two-server docker installs are
-    NOT routed here (they target a remote host)."""
-    if _distro_family() == 'rhel':
-        return (
-            'dnf -y install dnf-plugins-core && '
-            'rm -f /etc/yum.repos.d/docker-ce.repo && '
-            'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && '
-            'dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin && '
-            'systemctl enable --now docker'
-        )
-    return 'curl -fsSL https://get.docker.com | sh'
+# Docker's apt repo signing key (docs.docker.com/engine/install/ubuntu: "9DC8 5822 9FC7 DD38 854A
+# E2D8 8D81 803C 0EBF CD88"). ops #637: the key we download is checked against this fingerprint
+# before the repo is added.
+# start.sh carries the same value (tests/test_pinned_third_party_ops637.py keeps them equal).
+DOCKER_APT_KEY_FPR = '9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
+
+
+def _docker_install_script():
+    """POSIX sh script (run as root) that installs Docker Engine from Docker's own signed package
+    repo — never the get.docker.com convenience script piped to a shell (ops #637: unpinned remote code run as root).
+      Debian/Ubuntu → download.docker.com/linux/{debian,ubuntu} apt repo; the signing key must match
+                      DOCKER_APT_KEY_FPR before it is trusted.
+      RHEL family   → Docker's CentOS repo (the supported repo for Rocky/Alma/RHEL; get.docker.com adds
+                      a linux/rocky repo that ships NO docker-ce packages). The `rm -f` clears an empty
+                      repo file a prior get.docker.com run left behind. dnf verifies the repo's
+                      gpgcheck signature on every package.
+    The script picks the branch on the box it runs on, so the same text serves the local box and a
+    remote host. Packages match what get.docker.com installed (docker-ce, not distro docker.io)."""
+    return (
+        'set -e\n'
+        'if [ -f /etc/debian_version ]; then\n'
+        '  . /etc/os-release\n'
+        '  case "$ID" in debian) _d=debian;; *) _d=ubuntu;; esac\n'
+        '  _c="${UBUNTU_CODENAME:-$VERSION_CODENAME}"\n'
+        '  [ -n "$_c" ] || { echo "Docker install: cannot read the distro codename" >&2; exit 1; }\n'
+        '  export DEBIAN_FRONTEND=noninteractive\n'
+        '  _apt="apt-get -o DPkg::Lock::Timeout=300 -qq"\n'
+        '  $_apt update && $_apt install -y ca-certificates curl gnupg\n'
+        '  install -m 0755 -d /etc/apt/keyrings\n'
+        '  curl -fsSL "https://download.docker.com/linux/$_d/gpg" -o /etc/apt/keyrings/docker.asc\n'
+        '  _fpr=$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/docker.asc 2>/dev/null'
+        " | awk -F: '$1==\"fpr\"{print $10; exit}')\n"
+        f'  if [ "$_fpr" != "{DOCKER_APT_KEY_FPR}" ]; then\n'
+        '    rm -f /etc/apt/keyrings/docker.asc\n'
+        '    echo "Docker install refused: signing key fingerprint is [$_fpr]" >&2; exit 1\n'
+        '  fi\n'
+        '  chmod a+r /etc/apt/keyrings/docker.asc\n'
+        '  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] '
+        'https://download.docker.com/linux/$_d $_c stable" > /etc/apt/sources.list.d/docker.list\n'
+        '  $_apt update\n'
+        '  $_apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n'
+        'elif command -v dnf >/dev/null 2>&1; then\n'
+        '  dnf -y install dnf-plugins-core\n'
+        '  rm -f /etc/yum.repos.d/docker-ce.repo\n'
+        '  dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo\n'
+        '  dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n'
+        'else\n'
+        '  echo "Docker install: unsupported distro (need apt or dnf)" >&2; exit 1\n'
+        'fi\n'
+        'systemctl enable --now docker\n'
+    )
+
+
+def _docker_install_cmd(sudo_fallback=False):
+    """Shell command string that runs _docker_install_script() as root: for a root shell, the local
+    root console, or a remote root SSH session (the default). `sudo_fallback=True` adds
+    `sudo -n` when the remote SSH user is not root. NON-ROOT-COMMANDS: apt-get, dnf, systemctl.
+    Validated on Rocky 9.8 (docker-ce 29.x) and Ubuntu 22.04/24.04 and ARM64 (see PR for ops #637)."""
+    cmd = 'sh -c ' + shlex.quote(_docker_install_script())
+    if sudo_fallback:
+        return f'if [ "$(id -u)" = 0 ]; then {cmd}; else sudo -n {cmd}; fi'
+    return cmd
 
 
 def _docker_probe():
@@ -3891,6 +4120,24 @@ def _docker_probe():
         return 127, ''
     except Exception:
         return 1, ''
+
+
+def _docker_key_fingerprint(armored_key):
+    """Primary-key fingerprint of an ASCII-armored PGP key (gpg --show-keys, throwaway homedir so
+    the console user's own keyring is never touched), or '' if gpg is missing or cannot read it."""
+    import tempfile as _tf
+    try:
+        with _tf.TemporaryDirectory() as home:
+            os.chmod(home, 0o700)
+            r = subprocess.run(['gpg', '--batch', '--homedir', home, '--with-colons', '--show-keys'],
+                               input=armored_key, capture_output=True, text=True, timeout=30)
+        for line in (r.stdout or '').splitlines():
+            f = line.split(':')
+            if f[0] == 'fpr' and len(f) > 9:
+                return f[9].strip().upper()
+    except Exception:
+        pass
+    return ''
 
 
 def _install_docker_nonroot(_log):
@@ -3944,6 +4191,13 @@ def _install_docker_nonroot(_log):
         if rk.returncode != 0 or 'BEGIN PGP PUBLIC KEY' not in (rk.stdout or ''):
             _log('  ⚠ could not download Docker apt signing key')
             return
+        _fpr = _docker_key_fingerprint(rk.stdout)
+        if not _fpr:
+            _pkg_install(['gnupg'], log_fn=_log, timeout=300)
+            _fpr = _docker_key_fingerprint(rk.stdout)
+        if _fpr != DOCKER_APT_KEY_FPR:
+            _log(f'  ⚠ Docker apt signing key refused: fingerprint is {_fpr or "unreadable"}, expected {DOCKER_APT_KEY_FPR}')
+            return
         subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/apt/keyrings']),
                        capture_output=True, text=True, timeout=30)
         _write_priv('/etc/apt/keyrings/docker.asc', rk.stdout)
@@ -3967,8 +4221,8 @@ def _install_docker_nonroot(_log):
 
 def _install_docker_engine(plog=None):
     """Install Docker Engine and verify. Returns True when `docker --version` works
-    afterwards. As root: _docker_install_cmd() (get.docker.com / dnf), unchanged
-    legacy behavior. Non-root console: broker-safe repo + package path — the
+    afterwards. As root: _docker_install_cmd() (Docker's signed apt/dnf repo; ops #637
+    retired the get.docker.com script). Non-root console: broker-safe repo + package path — the
     convenience script's internal sudo cannot work without a TTY (v10.1.5 WS2).
     Never raises: the old per-site calls used timeout=300, and subprocess.run
     RAISES TimeoutExpired (it doesn't return rc) — a slow fresh VM's
@@ -4109,6 +4363,7 @@ def _apply_authentik_session():
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
+    _stamp_session_login()   # ops #634
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
@@ -6698,6 +6953,63 @@ def _safe_next_path():
         return nxt
     return ''
 
+# ops #638: the console password is the way in to a root service, so it has a floor, and
+# a wrong one leaves a trace. Every failed password login is written (with the real
+# client address) to CONSOLE_LOGIN_FAIL_LOG for the `infratak-console` fail2ban jail, to
+# the journal for the operator, and to the W3 audit log on a Hardened box. The file is
+# the jail's source, not the journal: only this function writes it, so a request that
+# gets text into some other console log line cannot make fail2ban ban an address.
+CONSOLE_PASSWORD_MIN_LEN = 12
+CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
+CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
+
+
+def _console_log_failed_login(where):
+    """Record one failed console password login. The password is NEVER written. Never raises.
+
+    Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
+    disk this file takes. fail2ban keeps reading the live file after a roll."""
+    try:
+        ip = _client_ip()
+        ipaddress.ip_address(ip)
+    except Exception:
+        ip = (request.remote_addr or 'unknown').strip()
+    try:
+        try:
+            if os.path.getsize(CONSOLE_LOGIN_FAIL_LOG) > CONSOLE_LOGIN_FAIL_LOG_MAX:
+                os.replace(CONSOLE_LOGIN_FAIL_LOG, CONSOLE_LOGIN_FAIL_LOG + '.1')
+        except OSError:
+            pass
+        with open(CONSOLE_LOGIN_FAIL_LOG, 'a') as f:
+            f.write('%s console: failed login from %s\n'
+                    % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), ip))
+        os.chmod(CONSOLE_LOGIN_FAIL_LOG, 0o600)
+    except Exception:
+        pass
+    print(f"[auth] failed console password login from {ip} ({where})", flush=True)
+    audit('auth:login-failed', 'console password via %s' % where)
+
+
+def _note_password_length(password):
+    """After a good password login: record whether the stored password meets the floor.
+    Only a yes/no is kept (never the length). Drives the console's change-password
+    banner. Reloads auth.json, because _upgrade_password_hash may have just saved it."""
+    try:
+        ok = len(password or '') >= CONSOLE_PASSWORD_MIN_LEN
+        auth = load_auth()
+        if auth.get('password_hash') and auth.get('password_min_len_ok') is not ok:
+            auth['password_min_len_ok'] = ok
+            save_auth(auth)
+    except Exception as e:
+        print(f"[auth] password length note skipped: {str(e)[:120]}", flush=True)
+
+
+def _console_password_needs_change():
+    """True when the console password is not known to meet the floor: it was set before
+    ops #638 and nobody has logged in with it since, or a login showed it is short."""
+    auth = load_auth()
+    return bool(auth.get('password_hash')) and auth.get('password_min_len_ok') is not True
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET' and _apply_authentik_session():
@@ -6712,11 +7024,14 @@ def login():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
+            _note_password_length(request.form.get('password', ''))   # ops #638
             session.clear()
             session['authenticated'] = True
+            _stamp_session_login()   # ops #634
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
+        _console_log_failed_login('/login')   # ops #638
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
     return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
@@ -6724,6 +7039,11 @@ def login():
 @app.route('/logout', methods=['POST'])
 def logout():
     audit('auth:logout', '')
+    # ops #634: logout ends every console session, not just this browser's, so a
+    # copied cookie dies with it. Only a logged-in caller may do that: /logout has no
+    # login check, and anyone could otherwise log every admin out, over and over.
+    if session.get('authenticated'):
+        _end_all_sessions()
     session.clear()
     return redirect(url_for('index'))
 
@@ -6742,10 +7062,13 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
+            _note_password_length(request.form.get('password', ''))   # ops #638
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
+            _stamp_session_login()   # ops #634
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
+        _console_log_failed_login('/')   # ops #638
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
@@ -6796,7 +7119,9 @@ def console_page():
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
-        srv_update_available=_srv_update, srv_latest=_srv_latest)
+        srv_update_available=_srv_update, srv_latest=_srv_latest,
+        console_password_needs_change=_console_password_needs_change(),
+        console_password_min_len=CONSOLE_PASSWORD_MIN_LEN)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -10931,14 +11256,22 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-    # Ensure git works on repos owned by other users (e.g. takwerx-owned
-    # ~/TAK-Portal and ~/CloudTAK when the console process HOME differs from
-    # the repo owner). --system writes to /etc/gitconfig — applies to every
-    # user on the machine, which is correct for a single-tenant server.
-    subprocess.run(
-        ['git', 'config', '--system', '--replace-all', 'safe.directory', '*'],
-        capture_output=True, timeout=5
-    )
+    # ops #637: git trusts the console's own checkout BY NAME (not a wildcard). An older release
+    # wrote a wildcard entry to /etc/gitconfig; it is removed here.
+    # The other checkouts the console touches (TAK-Portal, CloudTAK, plugin caches) pass their own
+    # `-c safe.directory=<path>` at each call.
+    try:
+        _sd = subprocess.run(['git', 'config', '--system', '--get-all', 'safe.directory'],
+                             capture_output=True, text=True, timeout=5)
+        _sd_have = [_l.strip() for _l in (_sd.stdout or '').splitlines()]
+        if '*' in _sd_have:
+            subprocess.run(['git', 'config', '--system', '--unset-all', 'safe.directory', r'^\*$'],
+                           capture_output=True, timeout=5)
+        if console_dir not in _sd_have:
+            subprocess.run(['git', 'config', '--system', '--add', 'safe.directory', console_dir],
+                           capture_output=True, timeout=5)
+    except Exception as _sd_err:
+        print(f"Update Now: could not update safe.directory (continuing): {_sd_err}", flush=True)
     # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
     # `git fetch origin +refs/tags/foo:refs/tags/foo` still updates heads/tags per origin.fetch
     # and can hit "would clobber existing tag" on field installs.
@@ -12788,15 +13121,38 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     log.append(f'PostgreSQL configured: listen_addresses=*, pg_hba host {core_ip}, service active.')
 
     # Step 5: firewalld — open db_port FROM the core IP only (+ ssh); drop any broad port-open.
+    # ops #630: Postgres now listens on every address, so this firewall is the only thing
+    # between it and the internet. It used to `enable --now firewalld || true` on a box that
+    # might not have firewalld at all (minimal and cloud Rocky images) and print FW_DONE
+    # regardless. Install it like _fw_ensure_installed(), keep SSH open (the configured port
+    # and the one this session came in on) before it goes default-deny, and stop the deploy
+    # unless `firewall-cmd --state` says running.
+    try:
+        _s1_ssh_port = int(s1.get('ssh_port') or 22)
+    except (TypeError, ValueError):
+        _s1_ssh_port = 22
     fw_cmd = (
+        'command -v firewall-cmd >/dev/null 2>&1 || sudo dnf -y install firewalld >/dev/null 2>&1; '
+        'if ! sudo firewall-cmd --state >/dev/null 2>&1; then '
+        '  sudo firewall-offline-cmd --add-service=ssh >/dev/null 2>&1; '
+        f'  for P in {_s1_ssh_port} ${{SSH_CONNECTION##* }}; do case "$P" in ""|*[!0-9]*) continue;; esac; '
+        '    sudo firewall-offline-cmd --add-port=$P/tcp >/dev/null 2>&1; done; '
+        'fi; '
         'sudo systemctl enable --now firewalld 2>/dev/null || true; '
         'sudo firewall-cmd --permanent --add-service=ssh 2>/dev/null || true; '
         f'sudo firewall-cmd --permanent --add-rich-rule="rule family=\'ipv4\' source address=\'{core_ip}\' port protocol=\'tcp\' port=\'{db_port}\' accept" 2>&1 || true; '
         f'sudo firewall-cmd --permanent --remove-port={db_port}/tcp 2>/dev/null || true; '
-        'sudo firewall-cmd --reload 2>&1; echo FW_DONE'
+        'sudo firewall-cmd --reload 2>&1; '
+        'sudo firewall-cmd --state >/dev/null 2>&1 && echo FW_STATE=running || echo FW_STATE=off'
     )
-    _, fout = _ssh_probe(s1, fw_cmd, timeout=40)
-    log.append('firewalld: ' + ('db port scoped to core, ssh allowed.' if 'FW_DONE' in (fout or '') else (fout or '')[:200]))
+    _, fout = _ssh_probe(s1, fw_cmd, timeout=300)
+    if 'FW_STATE=running' not in (fout or ''):
+        log.append('✗ firewalld is NOT running on Server One, and PostgreSQL now listens on every '
+                   f'address: port {db_port} would be reachable from any address. Stopping here. Install '
+                   'and start firewalld on Server One (sudo dnf -y install firewalld && sudo '
+                   'systemctl enable --now firewalld), then deploy again. ' + (fout or '')[-200:])
+        return False, log, ''
+    log.append('firewalld: running; db port scoped to core, ssh allowed.')
 
     # Step 5b: make sure the cot DB and martiuser actually EXIST.
     #
@@ -15024,6 +15380,51 @@ def mediamtx_page():
         # defect this replaced.
         mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
         mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
+
+
+@app.route('/api/mediamtx/editor-login')
+@login_required
+def mediamtx_editor_login_status():
+    """ops #649: is the web editor's default admin/admin gone? Never returns the password."""
+    modules = detect_modules()
+    if not modules.get('mediamtx', {}).get('installed'):
+        return jsonify({'mode': 'none'})
+    settings = load_settings()
+    st = _mediamtx_editor_login_load()
+    ok = _mediamtx_editor_login_ok(settings)
+    return jsonify({'mode': 'ok' if ok else 'blocked',
+                    'authentik': bool(modules.get('authentik', {}).get('installed')),
+                    'user': st.get('user') or 'admin',
+                    'password_pending': bool(ok and st.get('reveal'))})
+
+
+@app.route('/api/mediamtx/editor-login/reveal', methods=['POST'])
+@login_required
+def mediamtx_editor_login_reveal():
+    """Hand out the generated editor password once, then forget the plaintext."""
+    settings = load_settings()
+    st = _mediamtx_editor_login_load()
+    pw = st.get('reveal') if _mediamtx_editor_login_ok(settings) else None
+    if not pw:
+        return jsonify({'error': 'The password was already shown. Change it in the web console '
+                                 '(Change Password) if you lost it.'}), 404
+    st.pop('reveal', None)
+    _mediamtx_editor_login_save(st)
+    return jsonify({'user': st.get('user') or 'admin', 'password': pw})
+
+
+@app.route('/api/mediamtx/editor-login/check', methods=['POST'])
+@login_required
+def mediamtx_editor_login_check():
+    """Check the editor login again (replaces admin/admin if it is back) and rewrite Caddy."""
+    settings = load_settings()
+    res = _mediamtx_editor_secure_login(settings)
+    caddy_ok = None
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        caddy_ok, _ = _caddy_reload_if_changed(timeout=60)
+    return jsonify({'result': res, 'ok': _mediamtx_editor_login_ok(settings),
+                    'caddy_reloaded': caddy_ok})
 
 
 # ── NetBird VPN ─────────────────────────────────────────────────────────────
@@ -17873,7 +18274,7 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
         f'PHONEDB_TLS_INSECURE=false',
     ]
     env_path = os.path.join(ra_dir, '.env')
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(env_lines) + '\n')
     os.chmod(env_path, 0o600)
 
@@ -21507,6 +21908,19 @@ _F2B_OWNED_FILTERS = {
         "ignoreregex =\n"
         "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
     ),
+    'infratak-console': (
+        "[Definition]\n"
+        "# ops #638 — failed console password logins. The producer is\n"
+        "# _console_log_failed_login() in app.py, the only writer of this file, which\n"
+        "# writes exactly one shape:\n"
+        "#     2026-11-10 21:54:43 console: failed login from 1.2.3.4\n"
+        "# The password is NEVER written. The address is the real client: behind Caddy,\n"
+        "# _client_ip() unwraps X-Forwarded-For when remote_addr is loopback.\n"
+        "# The 'jail armed' seed line does not match.\n"
+        "failregex = ^\\s*(?:\\S+ \\S+ )?console: failed login from <HOST>\\s*$\n"
+        "ignoreregex =\n"
+        "datepattern = ^%%Y-%%m-%%d %%H:%%M:%%S\n"
+    ),
     'authentik': (
         "[Definition]\n"
         "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
@@ -24365,6 +24779,157 @@ def _f2b_disarm_clientfeed_jail():
         return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
+# ops #638 — the console password login jail. Fleet constants, not a UI knob (same rule as
+# the clientfeed jail). The login route already answers 429 past 12 tries per 5 minutes per
+# address, so 10 failures in 10 minutes is reachable by a guesser and not by a typo or two.
+CONSOLE_F2B_JAIL = 'infratak-console'
+CONSOLE_F2B_JAIL_PATH = '/etc/fail2ban/jail.d/infratak-console.conf'
+CONSOLE_F2B_FILTER_PATH = '/etc/fail2ban/filter.d/infratak-console.conf'
+CONSOLE_F2B_MAXRETRY = 10
+CONSOLE_F2B_FINDTIME = 600
+CONSOLE_F2B_BANTIME = 3600
+
+
+def _f2b_banaction_console():
+    """Ban action for the console jail: the console's own port and Caddy's web ports only.
+
+    Not all ports, on purpose (the same reasoning as _f2b_banaction_media/_tak): a ban
+    here must not take a guessed-at admin's TAK clients (8089/8443/8446) or SSH with it.
+    The web ports are included because Caddy serves the console's login on them."""
+    s = load_settings()
+    ports = []
+    for p in (_caddy_http_port(s), _caddy_https_port(s), s.get('console_port') or 5001):
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= 65535 and p not in ports:
+            ports.append(p)
+    return ('iptables-multiport[name=infratak-console, port="%s", protocol=tcp]'
+            % ','.join(str(p) for p in ports))
+
+
+# SELinux types fail2ban_t may read a file of (Rocky 9, selinux-policy-targeted 38.1.75:
+# `allow domain base_ro_file_type:file read` covers usr_t, `allow fail2ban_t logfile:file
+# read` covers the log types). A root install keeps .config under /root (admin_home_t)
+# and a home install under /home (user_home_t): fail2ban_t can read neither.
+_F2B_READABLE_SELINUX_TYPES = ('usr_t', 'var_log_t', 'fail2ban_log_t')
+
+
+def _f2b_console_log_selinux_block():
+    """'' when fail2ban can read CONSOLE_LOGIN_FAIL_LOG, else why it cannot.
+
+    Matters because a jail whose log fail2ban cannot see makes fail2ban abort config
+    parsing for EVERY jail (see _f2b_guard_jail_logpaths), and the console itself (not
+    confined the same way) would see the file and call it fine."""
+    try:
+        enf = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ''                                   # no SELinux on this box
+    if (enf.stdout or '').strip() != 'Enforcing':
+        return ''
+    try:
+        label = os.getxattr(CONSOLE_LOGIN_FAIL_LOG, 'security.selinux').decode().rstrip('\x00')
+        typ = label.split(':')[2]
+    except Exception as e:
+        return 'could not read the SELinux label of %s (%s)' % (CONSOLE_LOGIN_FAIL_LOG, str(e)[:80])
+    if typ in _F2B_READABLE_SELINUX_TYPES:
+        return ''
+    return ('SELinux is enforcing and fail2ban cannot read %s (type %s; the install is in a '
+            'home folder)' % (CONSOLE_LOGIN_FAIL_LOG, typ))
+
+
+def _f2b_console_jail_text(extra_ignoreip=''):
+    guarddog_action = ''
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = '\n         infratak-guarddog'
+    return (
+        f"[{CONSOLE_F2B_JAIL}]\n"
+        "enabled  = true\n"
+        f"filter   = {CONSOLE_F2B_JAIL}\n"
+        f"logpath  = {CONSOLE_LOGIN_FAIL_LOG}\n"
+        "backend  = auto\n"
+        f"maxretry = {CONSOLE_F2B_MAXRETRY}\n"
+        f"findtime = {CONSOLE_F2B_FINDTIME}\n"
+        f"bantime  = {CONSOLE_F2B_BANTIME}\n"
+        f"ignoreip = {_f2b_trusted_ignoreip(extra_ignoreip)}\n"
+        f"action   = {_f2b_banaction_console()}{guarddog_action}\n"
+    )
+
+
+def _f2b_arm_console_jail(log_fn=None):
+    """Write the console login filter + jail when they differ, reload, and check the jail
+    LOADED. Returns (ok, message). Idempotent: called from the fail2ban install, every
+    console start (so an update arms it on boxes that already run fail2ban), and the
+    trusted-CIDR rewrite. No fail2ban = not an error: failures are still logged."""
+    _log = log_fn or (lambda m: None)
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — failed console logins are logged but '
+                       'not banned. Deploy the fail2ban module to ban them.')
+    try:
+        # Seed the log so the jail is never born on a missing or 0-byte file (a missing
+        # logpath aborts the WHOLE daemon at config parse; 0 bytes reads as a dead jail).
+        try:
+            if not os.path.exists(CONSOLE_LOGIN_FAIL_LOG) or os.path.getsize(CONSOLE_LOGIN_FAIL_LOG) == 0:
+                with open(CONSOLE_LOGIN_FAIL_LOG, 'a') as f:
+                    f.write('%s console: jail armed (no failed logins yet)\n'
+                            % datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'))
+            os.chmod(CONSOLE_LOGIN_FAIL_LOG, 0o600)
+        except Exception:
+            pass
+
+        blocked = _f2b_console_log_selinux_block()
+        if blocked:
+            if _f2b_read_text(CONSOLE_F2B_JAIL_PATH) is not None:
+                _f2b_remove_jail(os.path.basename(CONSOLE_F2B_JAIL_PATH), blocked, _log)
+            return (False, 'console login jail not armed: %s. Failed logins are still logged.'
+                    % blocked)
+
+        changed = False
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        want_filter = _F2B_OWNED_FILTERS[CONSOLE_F2B_JAIL]
+        if _f2b_read_text(CONSOLE_F2B_FILTER_PATH) != want_filter:
+            _write_priv(CONSOLE_F2B_FILTER_PATH, want_filter)
+            changed = True
+        cur = _f2b_read_text(CONSOLE_F2B_JAIL_PATH)
+        stored = ''
+        m = re.search(r'^\s*ignoreip\s*=\s*(.*)$', cur or '', re.M)
+        if m:
+            stored = m.group(1).strip()
+        want = _f2b_console_jail_text(_f2b_operator_extra(stored))
+        existed = bool(cur)
+        if cur != want:
+            _write_priv(CONSOLE_F2B_JAIL_PATH, want)
+            changed = True
+
+        loaded = _f2b_loaded_jails()
+        if not changed and CONSOLE_F2B_JAIL in loaded:
+            return (True, 'jail already armed and loaded')
+        # A changed jail that already ran needs `reload --restart` to pick up a new action
+        # (fail2ban 0.11.2 keeps the old one on a plain reload; see the takserver converge).
+        if existed and changed and CONSOLE_F2B_JAIL in loaded:
+            cmd = ['fail2ban-client', 'reload', '--restart', CONSOLE_F2B_JAIL]
+        else:
+            cmd = ['fail2ban-client', 'reload']
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s'
+                    % ((r.stderr or r.stdout or '')[:160]))
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', CONSOLE_F2B_JAIL]),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        msg = ('console login jail %s (%d failed logins / %ds → %ds ban on the console and web ports)'
+               % ('updated' if existed else 'armed', CONSOLE_F2B_MAXRETRY,
+                  CONSOLE_F2B_FINDTIME, CONSOLE_F2B_BANTIME))
+        _log(msg)
+        return (True, msg)
+    except Exception as e:
+        return (False, 'console login jail setup failed: %s' % str(e)[:200])
+
+
 @app.route('/api/fail2ban/mediamtx/status')
 @login_required
 def fail2ban_mediamtx_status_api():
@@ -24838,6 +25403,9 @@ def _f2b_rewrite_all_jails():
     if os.path.exists(_F2B_MANUAL_JAIL_PATH):
         _f2b_manual_ensure_jail()
         done.append(_F2B_MANUAL_JAIL)
+    if os.path.exists(CONSOLE_F2B_JAIL_PATH):
+        _f2b_arm_console_jail()
+        done.append(CONSOLE_F2B_JAIL)
     return done
 
 
@@ -25623,6 +26191,8 @@ def fail2ban_install_api():
                 return
             _fail2ban_add_guarddog_hook(_plog)
             _fail2ban_takserver_filter(_plog)
+            _ok_c, _msg_c = _f2b_arm_console_jail()   # ops #638
+            _plog(_msg_c if _ok_c else f"console login jail: {_msg_c}")
             # v10.1.68: a two-server build has a SECOND machine. Protect it in the same
             # action rather than leaving it exposed with nothing saying so.
             try:
@@ -25686,6 +26256,8 @@ def fail2ban_uninstall_api():
             _F2B_TAK_BADCERT_ACTION_PATH,
             _F2B_MANUAL_JAIL_PATH,
             _F2B_MANUAL_FILTER_PATH,
+            CONSOLE_F2B_JAIL_PATH,
+            CONSOLE_F2B_FILTER_PATH,
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
@@ -29088,8 +29660,9 @@ def _guarddog_spiral_correlation_check(cl_waiting):
             print(f"[ak-pg-watchdog] spiral-incoming email failed: {_e}", flush=True)
     if os.path.exists('/opt/tak-guarddog/sms_send.sh'):
         try:
-            _tmp = f'/tmp/gd-spiral-sms-{os.getpid()}.txt'
-            with open(_tmp, 'w') as f:
+            # ops #633: mkstemp, a fresh private temp file each time.
+            _fd, _tmp = tempfile.mkstemp(prefix='gd-spiral-sms.', dir='/tmp')
+            with os.fdopen(_fd, 'w') as f:
                 f.write(body)
             subprocess.run(['/opt/tak-guarddog/sms_send.sh', subj, _tmp], capture_output=True, timeout=20)
             os.remove(_tmp)
@@ -32714,7 +33287,7 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
             if not found_cookie:
                 new_lines.append(f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}\n')
                 env_changed = True
-            with open(env_path, 'w') as _f:
+            with _open_secret_w(env_path) as _f:
                 _f.writelines(new_lines)
             _log(f"✓ .env: AUTHENTIK_HOST={_pub_url(ak_host, settings)}/ AUTHENTIK_COOKIE_DOMAIN={cookie_domain}")
         except Exception as e:
@@ -34322,6 +34895,11 @@ def _normalize_module_deployment_config(cfg):
     r['username'] = r['ssh_user']
     r['port'] = r['ssh_port']
     c['remote'] = r
+    # ops #630: per-deploy firewall caches (_module_fw_backend / _module_fw_ensure_active)
+    # must not be saved. A stored "active" would skip the next deploy's check on a box
+    # whose firewall was turned off since; a stored "none" would hide a later install.
+    c.pop(_MODULE_FW_BACKEND_KEY, None)
+    c.pop(_MODULE_FW_ACTIVE_KEY, None)
     return c
 
 
@@ -34489,24 +35067,121 @@ def _module_fw(deploy_cfg, verb, port, proto='tcp', log_fn=None):
             return _fw_deny(port, proto)
         return _fw_remove(port, proto)
 
-    be = _module_fw_backend(deploy_cfg, log_fn=log_fn)
+    if verb in ('allow', 'deny'):
+        # ops #630: a rule in an INACTIVE firewall does nothing. Stock Ubuntu cloud images
+        # ship ufw installed but off, so `ufw deny 5080` succeeded and the deploy printed
+        # "closed" over a port the firewall did not filter.
+        act_ok, be, act_msg = _module_fw_ensure_active(deploy_cfg, log_fn=log_fn)
+        if not act_ok:
+            return False, f'firewall not active on target, rule would do nothing ({act_msg})'
+    else:
+        be = _module_fw_backend(deploy_cfg, log_fn=log_fn)
     if be is None:
-        # Say it. A target with no firewall is a real posture fact, not a no-op to
-        # swallow — especially for the deny verbs.
+        # Only 'remove' gets here: nothing to remove from a firewall that is not there.
         return True, 'no firewall present on target'
     if be == 'firewalld':
         flag = '--add-port' if verb == 'allow' else '--remove-port'
-        cmd = (f"firewall-cmd --zone=public --permanent {flag}={port}/{proto} "
-               f"&& firewall-cmd --reload")
+        cmd = (f"$S firewall-cmd --zone=public --permanent {flag}={port}/{proto} "
+               f"&& $S firewall-cmd --reload")
     else:
         if verb == 'allow':
-            cmd = f"ufw allow {port}/{proto}"
+            cmd = f"$S ufw allow {port}/{proto}"
         elif verb == 'deny':
-            cmd = f"ufw deny {port}/{proto}"
+            cmd = f"$S ufw deny {port}/{proto}"
         else:
-            cmd = f"ufw --force delete allow {port}/{proto}"
-    ok, out = _module_run(deploy_cfg, cmd, timeout=30)
+            cmd = f"$S ufw --force delete allow {port}/{proto}"
+    ok, out = _module_run(deploy_cfg, _REMOTE_SUDO_SH + cmd, timeout=30)
     return ok, (out or '').strip()[:300]
+
+
+# Remote snippets run as the SSH user. Root needs no sudo; a cloud image's sudo user
+# (azureuser/ubuntu/rocky) does, and must never sit at a password prompt.
+_REMOTE_SUDO_SH = 'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+
+_MODULE_FW_ACTIVE_KEY = '_infratak_fw_active'
+
+
+def _remote_fw_ensure_sh(ssh_port=22):
+    """Shell for a remote target: make its host firewall ACTIVE, keeping SSH open. ops #630.
+
+    Prints one line, `FW_STATE=<active|inactive> BE=<ufw|firewalld|none> NOW=<0|1>`
+    (NOW=1 means this run turned the firewall on). Backend choice mirrors
+    _module_fw_backend(): the family-native tool first, installed when neither exists.
+
+    An already-active firewall is left exactly as it is. Only when we turn it on do we
+    first allow SSH: the configured port AND the port this very session arrived on
+    (the last field of $SSH_CONNECTION), so a NAT port-forward (2222 outside, 22 inside)
+    cannot lock the console out. Same lockout guard as _fw_ensure_installed()."""
+    sp = int(ssh_port or 22)
+    return (
+        _REMOTE_SUDO_SH +
+        f'P1={sp}; P2=${{SSH_CONNECTION##* }}; '
+        'case "$P2" in ""|*[!0-9]*) P2=$P1;; esac; '
+        'PORTS=$P1; [ "$P2" = "$P1" ] || PORTS="$P1 $P2"; '
+        'U=; command -v ufw >/dev/null 2>&1 && U=1; '
+        'F=; command -v firewall-cmd >/dev/null 2>&1 && F=1; '
+        'BE=; '
+        'if [ -f /etc/redhat-release ]; then '
+        '  if [ -z "$F$U" ]; then $S dnf -y install firewalld >/dev/null 2>&1; '
+        '    command -v firewall-cmd >/dev/null 2>&1 && F=1; fi; '
+        '  if [ -n "$F" ]; then BE=firewalld; elif [ -n "$U" ]; then BE=ufw; fi; '
+        'else '
+        '  if [ -z "$F$U" ]; then $S env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove ufw >/dev/null 2>&1; '
+        '    command -v ufw >/dev/null 2>&1 && U=1; fi; '
+        '  if [ -n "$U" ]; then BE=ufw; elif [ -n "$F" ]; then BE=firewalld; fi; '
+        'fi; '
+        'NOW=0; ST=inactive; '
+        'if [ "$BE" = firewalld ]; then '
+        '  if ! $S firewall-cmd --state >/dev/null 2>&1; then NOW=1; '
+        '    $S firewall-offline-cmd --add-service=ssh >/dev/null 2>&1; '
+        '    for P in $PORTS; do $S firewall-offline-cmd --add-port=$P/tcp >/dev/null 2>&1; done; '
+        '    $S systemctl enable --now firewalld >/dev/null 2>&1; '
+        '  fi; '
+        '  $S firewall-cmd --state >/dev/null 2>&1 && ST=active; '
+        'elif [ "$BE" = ufw ]; then '
+        '  if ! $S ufw status 2>/dev/null | grep -q "^Status: active"; then NOW=1; '
+        '    for P in $PORTS; do $S ufw allow $P/tcp >/dev/null 2>&1; done; '
+        '    $S ufw --force enable >/dev/null 2>&1; '
+        '  fi; '
+        '  $S ufw status 2>/dev/null | grep -q "^Status: active" && ST=active; '
+        'else BE=none; fi; '
+        'echo "FW_STATE=$ST BE=$BE NOW=$NOW"'
+    )
+
+
+def _module_fw_ensure_active(deploy_cfg, log_fn=None):
+    """Make sure the TARGET's host firewall is on before trusting a rule in it. ops #630.
+
+    Returns (ok, backend, msg). Local targets answer for the console's own box, whose
+    firewall the console manages itself. Remote: turn it on if it is off (SSH allowed
+    first, see _remote_fw_ensure_sh), or say plainly that it could not. Cached for the
+    deploy on `deploy_cfg`; _normalize_module_deployment_config() drops the cache, so
+    a saved config never carries "active" into the next deploy."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return True, _fw_backend(), 'local target'
+    cached = deploy_cfg.get(_MODULE_FW_ACTIVE_KEY)
+    if cached:
+        return True, cached, 'active'
+    try:
+        sp = int((deploy_cfg.get('remote') or {}).get('ssh_port') or 22)
+    except (TypeError, ValueError):
+        sp = 22
+    ok, out = _module_run(deploy_cfg, _remote_fw_ensure_sh(sp), timeout=300)
+    m = re.search(r'FW_STATE=(\w+) BE=(\w+) NOW=(\d)', out or '')
+    if not ok or not m:
+        return False, None, f'could not check the firewall on the target: {(out or "")[-200:]}'
+    state, be, now = m.groups()
+    if state != 'active':
+        if be == 'none':
+            return False, None, 'no firewall on the target and ufw/firewalld could not be installed'
+        return False, be, (f'{be} is installed but off and could not be turned on '
+                           f'(the SSH user needs root or passwordless sudo)')
+    deploy_cfg[_MODULE_FW_BACKEND_KEY] = be
+    deploy_cfg[_MODULE_FW_ACTIVE_KEY] = be
+    if log_fn:
+        log_fn(f"  firewall on target: {be}, active" +
+               (" (it was OFF: turned it on, SSH kept open)" if now == '1' else ''))
+    return True, be, ('turned on' if now == '1' else 'active')
 
 
 def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
@@ -35260,9 +35935,10 @@ def _get_mediamtx_hls_upstream(settings):
 # (the editor checks it) and a /watch/ page is only HTML; its video is /hls-proxy/, which
 # needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
 MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
+_MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
 
 
-def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue):
+def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
     """Append the MediaMTX stream-domain vhost to `lines` (called by generate_caddyfile).
 
     v10.2.6: with Authentik, /hls-proxy/* goes through the login to the web editor, whose
@@ -35288,8 +35964,12 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
            on a split box, whose remote overlay a console update cannot reach. None
            sends it through the login to the local editor.
     emit_strip(indent) / emit_rescue(root_url): generate_caddyfile's own emitters.
+    login_ok: no Authentik only. True when the console has made sure the editor no longer
+           answers admin/admin (ops #649); False answers 503 instead of the editor.
+    Every route starts with _CADDY_STRIP_AUTHENTIK_HEADERS (ops #648/#649): no client
+    X-Authentik-* header of any name reaches the editor.
     """
-    lines.append("# MediaMTX Web Console")
+    lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
     if hls:
         mtx_hls, hls_enc = hls
@@ -35309,10 +35989,12 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     if ak_up:
         for path in MEDIAMTX_OPEN_PATHS:
             lines.append(f"    route {path} {{")
+            lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append("    }")
         lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
@@ -35325,10 +36007,233 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         lines.append("        }")
         lines.append(f"        reverse_proxy {mtx_up}")
         lines.append("    }")
+    elif login_ok:
+        # ops #649: no Authentik. The editor's own login stands in front (its default login
+        # was replaced, see _mediamtx_editor_secure_login), and client X-Authentik-* is
+        # stripped on every route, same as with Authentik.
+        lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
+        emit_strip("        ")
+        lines.append(f"        reverse_proxy {mtx_up}")
+        lines.append("    }")
     else:
-        lines.append(f"    reverse_proxy {mtx_up}")
+        # ops #649: the editor may still answer admin/admin, so it is not published.
+        lines.append('    respond "The MediaMTX web console is not available: its login is not set up. '
+                     'Open the infra-TAK console, MediaMTX page." 503')
     lines.append("}")
     lines.append("")
+
+
+# ops #649: the MediaMTX web editor (mediamtx-installer) seeds users.json with admin/admin and
+# prints that on its login page. Without Authentik nothing else stands in front of it, so the
+# console replaces admin/admin with a random password (shown once on the MediaMTX page) and
+# Caddy publishes the editor only after that is done. The editor reads users.json on every
+# login, so no restart is needed. The password is made ON the editor's box and comes back on
+# stdout: it is never on a command line. Run as `python3 -I - <users.json path>`.
+_MEDIAMTX_EDITOR_USERS_FILE = '/opt/mediamtx-webeditor/users.json'
+_MEDIAMTX_EDITOR_LOGIN_FILE = os.path.join(CONFIG_DIR, 'mediamtx_editor_login.json')
+_MEDIAMTX_EDITOR_LOGIN_SCRIPT = r'''
+import json, os, secrets, sys
+F = sys.argv[1]
+try:
+    try:
+        with open(F) as f:
+            users = json.load(f)
+        st = os.stat(F)
+    except FileNotFoundError:
+        users = [{'username': 'admin', 'password': 'admin', 'role': 'admin'}]
+        st = os.stat(os.path.dirname(F))
+    if not isinstance(users, list):
+        raise ValueError('users.json is not a list')
+    hit = [u for u in users if isinstance(u, dict)
+           and u.get('username') == 'admin' and u.get('password') == 'admin']
+    if not hit:
+        print('MTXLOGIN keep')
+        sys.exit(0)
+    pw = secrets.token_urlsafe(15)
+    for u in hit:
+        u['password'] = pw
+    tmp = F + '.infratak-tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(users, f, indent=2)
+    if os.geteuid() == 0:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, F)
+    print('MTXLOGIN set ' + pw)
+except SystemExit:
+    raise
+except Exception as e:
+    print('MTXLOGIN fail ' + type(e).__name__)
+'''
+
+
+def _mediamtx_editor_login_target(settings):
+    """Where the editor runs: 'local', or the remote host. The login state is per target."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if cfg.get('target_mode') == 'remote':
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if host:
+            return host
+    return 'local'
+
+
+def _mediamtx_editor_login_load():
+    try:
+        with open(_MEDIAMTX_EDITOR_LOGIN_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mediamtx_editor_login_save(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _MEDIAMTX_EDITOR_LOGIN_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, _MEDIAMTX_EDITOR_LOGIN_FILE)
+
+
+def _mediamtx_editor_login_ok(settings):
+    """True when the console has checked that this box's editor no longer has admin/admin."""
+    st = _mediamtx_editor_login_load()
+    return bool(st.get('ok')) and st.get('target') == _mediamtx_editor_login_target(settings)
+
+
+def _mediamtx_editor_run_login_script(settings):
+    """Run _MEDIAMTX_EDITOR_LOGIN_SCRIPT where the editor runs. Returns its MTXLOGIN line or ''."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    path = _MEDIAMTX_EDITOR_USERS_FILE
+    if _mediamtx_editor_login_target(settings) != 'local':
+        b64 = _b64.b64encode(_MEDIAMTX_EDITOR_LOGIN_SCRIPT.encode()).decode()
+        ok, out = _module_run(cfg, _REMOTE_SUDO_SH + f'echo {b64} | base64 -d | $S python3 -I - {path}',
+                              timeout=45)
+    else:
+        argv = ['python3', '-I', '-', path]
+        if _mediamtx_owner() == _MEDIAMTX_RUN_USER:
+            # ops #643: the editor's dir belongs to the `mediamtx` account. Run the script AS
+            # that account (the broker allows exactly this argv): as root it would write in a
+            # dir that account can plant links in, and takwerx cannot write there at all.
+            argv = _sudo_wrap(['runuser', '-u', _MEDIAMTX_RUN_USER, '--'] + argv)
+        elif not os.access(os.path.dirname(path), os.W_OK):
+            argv = ['sudo', '-n'] + argv
+        try:
+            r = subprocess.run(argv, input=_MEDIAMTX_EDITOR_LOGIN_SCRIPT, capture_output=True,
+                               text=True, timeout=45)
+            out = r.stdout or ''
+        except Exception:
+            out = ''
+    for ln in (out or '').splitlines():
+        if ln.startswith('MTXLOGIN '):
+            return ln.strip()
+    return ''
+
+
+def _mediamtx_editor_secure_login(settings, log_fn=None):
+    """ops #649: make sure the MediaMTX editor does not answer admin/admin.
+
+    Replaces admin/admin with a random password (kept in .config/mediamtx_editor_login.json,
+    0600, until the MediaMTX page has shown it once). Returns 'set' (replaced now), 'keep'
+    (no admin/admin there) or 'fail' (could not check). A failed check never clears an
+    earlier good one for the same target: an SSH blip must not take the site down."""
+    _log = log_fn or (lambda _m: None)
+    target = _mediamtx_editor_login_target(settings)
+    res = _mediamtx_editor_run_login_script(settings)
+    st = _mediamtx_editor_login_load()
+    if st.get('target') != target:
+        st = {'target': target}
+    if res.startswith('MTXLOGIN set ') and len(res) > 20:
+        st.update({'ok': True, 'user': 'admin', 'reveal': res[len('MTXLOGIN set '):],
+                   'set': int(time.time())})
+        _mediamtx_editor_login_save(st)
+        _log("  ✓ Web editor: the default admin/admin login was replaced with a random password.")
+        _log("    Open the MediaMTX page in this console to see it (shown once).")
+        return 'set'
+    if res == 'MTXLOGIN keep':
+        st.update({'ok': True, 'checked': int(time.time())})
+        _mediamtx_editor_login_save(st)
+        return 'keep'
+    _log(f"  ✗ Web editor login could not be checked ({res or 'no answer'}). The web console")
+    _log("    stays closed (503) until it is. Deploy MediaMTX again to retry.")
+    return 'fail'
+
+
+def _mediamtx_vhost_is_safe(generated):
+    """True when the MediaMTX vhost in a Caddyfile cannot hand a forged X-Authentik-* header or
+    an admin/admin editor to the internet (no vhost at all counts as safe). ops #649."""
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
+    if not blk:
+        return True
+    return 'request_header -X-Authentik-Groups' in blk or ' 503' in blk
+
+
+def _mediamtx_vhost_needs_regen(generated, login_ok):
+    """ops #649: without Authentik the vhost is open exactly when the login is known good.
+    True when it is unsafe, or open/closed (503) the wrong way round: closed by an earlier
+    regen this boot, or open while the login could not be checked."""
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
+    if not _mediamtx_vhost_is_safe(generated):
+        return True
+    if not blk or 'forward_auth' in blk:
+        return False
+    return (' 503' not in blk) != bool(login_ok)
+
+
+def _startup_mediamtx_editor_login_converge():
+    """ops #649 — on the console update: replace admin/admin in the MediaMTX editor (local or
+    remote) and make sure Caddy never publishes it without a login or with client
+    X-Authentik-* headers passed through. Same shape as _startup_caddy_nodered_login_converge.
+    A remote editor is reached over SSH, so that case runs in a daemon thread: an unreachable
+    host never holds up boot."""
+    s = load_settings()
+    if not detect_modules().get('mediamtx', {}).get('installed'):
+        return
+    if _mediamtx_editor_login_target(s) != 'local':
+        threading.Thread(target=_mediamtx_editor_login_converge_run, args=(s,), daemon=True).start()
+        return
+    _mediamtx_editor_login_converge_run(s)
+
+
+def _mediamtx_editor_login_converge_run(s):
+    res = _mediamtx_editor_secure_login(s)
+    if res == 'set':
+        print('Startup migration: ⚠ the MediaMTX web editor still had the default admin/admin '
+              'login (ops #649). It now has a random password: the MediaMTX page shows it once. '
+              'If you find a path, user or share link you did not add, treat the box as taken '
+              'over and rebuild it.', flush=True)
+    elif res == 'fail':
+        print('Startup migration: ⚠ could not check the MediaMTX web editor login (ops #649). '
+              'Without Authentik the web console stays closed (503) until it is.', flush=True)
+    if not os.path.exists(CADDYFILE_PATH) or not (s.get('fqdn') or '').strip():
+        return
+    try:
+        before = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: MediaMTX vhost converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if not _mediamtx_vhost_needs_regen(before, _mediamtx_editor_login_ok(s)):
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: MediaMTX vhost queued — written with the post-registry '
+              'Caddyfile regen (ops #649).', flush=True)
+        return
+    try:
+        if not _mediamtx_vhost_is_safe(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ MediaMTX vhost converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. The web console is STILL open '
+                  'without a login check on this box (ops #649).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ MediaMTX web console vhost secured and Caddy %s (ops #649). '
+          'If you find a path, user or share link you did not add, treat the box as taken '
+          'over and rebuild it.' % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
+          flush=True)
 
 
 def _get_nodered_upstream(settings):
@@ -35397,6 +36302,20 @@ def _cloudtak_request_json(method, url, payload=None, timeout=25, headers=None):
         return False, 0, {'status': 0, 'message': str(e)}
 
 
+_OPENSSL_PASS_ENV = 'INFRATAK_P12_PASS'
+
+
+def _openssl_pass_env(password):
+    """(`-passin`/`-passout`/`-password` value, env) for an openssl child.
+
+    ops #632: never `pass:<secret>` — argv is world-readable in `ps` and
+    /proc/<pid>/cmdline, so every local user (tak, postgres) saw the TAK cert
+    password. The environment of a process is readable only by its own uid and
+    root. Only for openssl run directly by the console: a broker-routed
+    (_sudo_wrap) command drops the caller's env."""
+    return f'env:{_OPENSSL_PASS_ENV}', dict(os.environ, **{_OPENSSL_PASS_ENV: password or ''})
+
+
 def _p12_bytes_to_pem(p12_bytes, password=''):
     """Convert P12/PFX bytes to PEM cert/key using openssl. Raises RuntimeError on failure."""
     tmp_dir = tempfile.mkdtemp(prefix='cloudtak-p12-')
@@ -35404,10 +36323,10 @@ def _p12_bytes_to_pem(p12_bytes, password=''):
         p12_path = os.path.join(tmp_dir, 'bundle.p12')
         with open(p12_path, 'wb') as f:
             f.write(p12_bytes)
-        passin = f'pass:{password or ""}'
+        passin, _pass_env = _openssl_pass_env(password)
 
         def _run_openssl(args):
-            r = subprocess.run(args, capture_output=True, text=True, timeout=25)
+            r = subprocess.run(args, capture_output=True, text=True, timeout=25, env=_pass_env)
             ok = r.returncode == 0
             return (r.stdout or '').strip() if ok else '', (r.stderr or '').strip()
 
@@ -37819,6 +38738,69 @@ def _nodered_edge_uses_sso(ak, existing_caddyfile):
     return _nodered_vhost_has_forward_auth(existing_caddyfile or '')
 
 
+# ops #650: WebODM's /welcome page makes the first admin while none exists (upstream
+# app/views/app.py `welcome`, no login needed). infra-TAK makes the admin at deploy, so the
+# page is never needed: Caddy closes it, with or without Authentik.
+_WEBODM_VHOST_MARKER = '# WebODM — drone photogrammetry + TAK overlay'
+_WEBODM_WELCOME_MATCHER = '@wo_welcome'
+
+
+def _webodm_vhost_closed(caddyfile):
+    """True when there is no WebODM vhost, or it keeps the /welcome setup page closed.
+    The vhost is found with _caddy_vhost_block (ops #648), so operator blocks never count."""
+    block = _caddy_vhost_block(caddyfile, _WEBODM_VHOST_MARKER)
+    return not block or _WEBODM_WELCOME_MATCHER in block
+
+
+def _webodm_proxy_lines(wo_up):
+    """Last lines inside the WebODM `route`: /welcome answers 403, everything else goes to WebODM."""
+    return [f'        {_WEBODM_WELCOME_MATCHER} {{',
+            '            path /welcome /welcome/*',
+            '        }',
+            f'        respond {_WEBODM_WELCOME_MATCHER} "WebODM setup is done in the infra-TAK console: '
+            'WebODM page, Account Recovery." 403',
+            f'        reverse_proxy {wo_up}']
+
+
+def _webodm_no_sso_lines(wo_up):
+    """WebODM vhost body when Authentik is not installed: WebODM's own login, /welcome closed."""
+    return ['    route {'] + _webodm_proxy_lines(wo_up) + ['    }']
+
+
+def _startup_caddy_webodm_welcome_converge():
+    """ops #650 — an existing box whose WebODM vhost still passes /welcome through gets it
+    closed on the console update. Same shape as _startup_caddy_nodered_login_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: WebODM setup-page converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if _webodm_vhost_closed(generated):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    print('Startup migration: closing the WebODM first-visit setup page in Caddy (ops #650)', flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: WebODM setup-page close queued — written with the post-registry '
+              'Caddyfile regen (ops #650).', flush=True)
+        return
+    try:
+        if not _webodm_vhost_closed(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ WebODM setup-page converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back (ops #650).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ WebODM setup page closed and Caddy %s (ops #650).'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _startup_caddy_nodered_login_converge():
     """ops #613 — an existing box whose Node-RED vhost is a bare reverse_proxy (no Authentik)
     gets a login from Caddy on the console update. The password is shown once on the
@@ -37857,6 +38839,126 @@ def _startup_caddy_nodered_login_converge():
           'the password once) and Caddy %s (ops #613). Check your flows: if you find one you '
           'did not write, delete it and rebuild this box.'
           % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
+# ops #648: TAK Portal has no login of its own; Authentik in front of it is the login. TAK
+# Portal reads who the user is from the X-Authentik-* headers that forward_auth sets, so those
+# headers may only ever come from Authentik. The TAK Portal vhost is therefore Authentik
+# forward_auth, or a 503 — never a bare reverse_proxy — and every client-sent X-Authentik-*
+# header is removed first, on every path of the vhost (the public paths too).
+_TAKPORTAL_VHOST_MARKER = '# TAK Portal'
+_TAKPORTAL_PUBLIC_PATHS = '/request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*'
+_CADDY_STRIP_AUTHENTIK_HEADERS = 'request_header -X-Authentik-*'
+_TAKPORTAL_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements '
+                              'X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt '
+                              'X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider '
+                              'X-Authentik-Meta-App X-Authentik-Meta-Version')
+
+
+def _caddy_vhost_block(caddyfile, marker):
+    """Text of the generated vhost whose comment line is exactly `marker` ('' when there is
+    none). Only the infra-TAK part of the file is read: operator blocks never count."""
+    gen = (caddyfile or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    m = re.search(r'(?m)^' + re.escape(marker) + r'$', gen)
+    if not m:
+        return ''
+    j = gen.find('\n}\n', m.start())
+    return gen[m.start():j + 2 if j > 0 else len(gen)]
+
+
+def _vhost_uses_sso(ak, existing_caddyfile, marker):
+    """ops #648, the rule of _nodered_edge_uses_sso (ops #613) for any vhost: build it with
+    Authentik forward_auth? Yes when Authentik is installed. A failed Authentik probe (or no
+    answer at all) is unknown, not "no Authentik": keep forward_auth when the vhost already
+    on disk has it. The caller must fail closed when this returns False."""
+    ak = ak or {}
+    if ak.get('installed'):
+        return True
+    if ak and ak.get('probe_ok', True):
+        return False
+    return 'forward_auth' in _caddy_vhost_block(existing_caddyfile, marker)
+
+
+def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=()):
+    """Caddy lines for the TAK Portal vhost after its log / encoding lines. Fails closed:
+    without Authentik the vhost answers 503 and nothing reaches TAK Portal."""
+    if not use_sso:
+        return ['    # ops #648: TAK Portal has no login of its own, so it is published only behind Authentik',
+                '    respond "TAK Portal needs Authentik. Open the infra-TAK console and deploy Authentik." 503']
+    return (['    route {',
+             f'        {_CADDY_STRIP_AUTHENTIK_HEADERS}']
+            + list(rescue_lines)
+            + [f'        reverse_proxy /outpost.goauthentik.io/* {ak_up}',
+               '',
+               '        @public {',
+               f'            path {_TAKPORTAL_PUBLIC_PATHS}',
+               '        }',
+               '',
+               '        handle @public {',
+               f'            reverse_proxy {portal_up}',
+               '        }',
+               '',
+               f'        forward_auth {ak_up} {{',
+               '            uri /outpost.goauthentik.io/auth/caddy',
+               f'            copy_headers {_TAKPORTAL_AK_COPY_HEADERS}',
+               '            trusted_proxies private_ranges',
+               '        }',
+               '',
+               f'        reverse_proxy {portal_up}',
+               '    }'])
+
+
+def _takportal_vhost_is_closed(block):
+    """True when a TAK Portal vhost text is safe: no vhost, a 503 with nothing proxied, or
+    forward_auth with the client X-Authentik-* headers removed first."""
+    if not block:
+        return True
+    if 'reverse_proxy' not in block:
+        return ' 503' in block
+    return 'forward_auth' in block and _CADDY_STRIP_AUTHENTIK_HEADERS in block
+
+
+def _startup_caddy_takportal_login_converge():
+    """ops #648 — an existing box whose TAK Portal vhost is a bare reverse_proxy, or an
+    Authentik one that passes client X-Authentik-* headers through, is rebuilt on the console
+    update. Same shape as _startup_caddy_nodered_login_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        block = _caddy_vhost_block(_read_priv(CADDYFILE_PATH), _TAKPORTAL_VHOST_MARKER)
+    except Exception as e:
+        print('Startup migration: TAK Portal login converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if _takportal_vhost_is_closed(block):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    bare = 'forward_auth' not in block
+    check = (' Check TAK Portal: if you find a user, agency or certificate you did not create, '
+             'treat this box as taken over.' if bare else '')
+    print('Startup migration: ⚠ TAK Portal %s (ops #648) — rebuilding its Caddy site now'
+          % ('is published with NO login in front of it' if bare
+             else 'login headers are not cleaned at the edge'), flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: TAK Portal site queued — written with the post-registry '
+              'Caddyfile regen (ops #648).' + check, flush=True)
+        return
+    try:
+        if not _takportal_vhost_is_closed(_caddy_vhost_block(_read_priv(CADDYFILE_PATH),
+                                                             _TAKPORTAL_VHOST_MARKER)):
+            print('Startup migration: ⚠ TAK Portal login converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. TAK Portal is STILL open on this '
+                  'box (ops #648).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Portal is now only reachable through Authentik (or closed '
+          'with a 503 when there is no Authentik) and Caddy %s (ops #648).'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]) + check, flush=True)
 
 
 def _startup_caddy_selfheal():
@@ -38781,29 +39883,20 @@ def generate_caddyfile(settings=None):
             lines.append(f"        }}")
             lines.append(f"    }}")
         lines += _caddy_drop_request_encoding_lines()
-        if ak.get('installed'):
-            lines.append(f"    route {{")
+        # ops #648: Authentik, or (Authentik probe failed) the Authentik block already on
+        # disk, or a 503. Never a bare reverse_proxy.
+        try:
+            _tp_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _tp_existing = ''
+        _tp_sso = _vhost_uses_sso(ak, _tp_existing, _TAKPORTAL_VHOST_MARKER)
+        _tp_rescue = []
+        if _tp_sso:
+            _n = len(lines)
             _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
-            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.append(f"")
-            lines.append(f"        @public {{")
-            lines.append(f"            path /request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        handle @public {{")
-            lines.append(f"            reverse_proxy {portal_up}")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        reverse_proxy {portal_up}")
-            lines.append(f"    }}")
-        else:
-            lines.append(f"    reverse_proxy {portal_up}")
+            _tp_rescue = lines[_n:]
+            del lines[_n:]
+        lines += _takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'takportal'), portal_host)
@@ -38902,14 +39995,22 @@ def generate_caddyfile(settings=None):
     if mtx.get('installed'):
         mtx_host = sd['mediamtx']
         mtx_up = _get_mediamtx_upstream(settings)
-        _mtx_ak = ak.get('installed')
+        # ops #649: an unknown Authentik probe keeps the Authentik block already on disk
+        # (_vhost_uses_sso, ops #648); without Authentik the editor is published only once
+        # its admin/admin is gone.
+        try:
+            _mtx_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _mtx_existing = ''
+        _mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)
         # /hls-proxy/ through the login to the local editor only — see _emit_mediamtx_site.
         _mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'
         _emit_mediamtx_site(
             lines, mtx_host, mtx_up,
             ak_up if _mtx_ak else None,
             _get_mediamtx_hls_upstream(settings) if _mtx_direct else None,
-            _emit_ak_header_strip, _emit_outpost_callback_rescue)
+            _emit_ak_header_strip, _emit_outpost_callback_rescue,
+            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings))
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
 
     fedhub = modules.get('fedhub', {})
@@ -38997,20 +40098,27 @@ def generate_caddyfile(settings=None):
             wo_up = f'{_wo_remote_host}:{wo_port}' if _wo_remote_host else f'127.0.0.1:{wo_port}'
         else:
             wo_up = f'127.0.0.1:{wo_port}'
-        lines.append(f"# WebODM — drone photogrammetry + TAK overlay")
+        lines.append(_WEBODM_VHOST_MARKER)
         lines.append(f"{wo_host} {{")
-        if ak.get('installed'):
+        # ops #650: an unknown Authentik probe keeps the block already on disk; /welcome is
+        # closed either way, so the first visitor can never make the WebODM admin.
+        try:
+            _wo_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _wo_existing = ''
+        if _vhost_uses_sso(ak, _wo_existing, _WEBODM_VHOST_MARKER):
             lines.append(f"    route {{")
+            lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             _emit_outpost_callback_rescue(f"{_pub_url(wo_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
-            lines.append(f"        reverse_proxy {wo_up}")
+            lines += _webodm_proxy_lines(wo_up)
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy {wo_up}")
+            lines += _webodm_no_sso_lines(wo_up)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'webodm'), wo_host)
@@ -39623,10 +40731,11 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # 2026-11-02: "PKCS12 conversion failed:" every minute, 8446 never got the LE cert).
     _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
     _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
+    _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
-        shell=True, capture_output=True, text=True)
+        ['openssl', 'pkcs12', '-export', '-in', local_crt, '-inkey', local_key,
+         '-out', _tmp_p12, '-name', takserver_host, '-password', _pw_arg],
+        capture_output=True, text=True, env=_pw_env)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
         shutil.rmtree(_tmp_dir, ignore_errors=True); return False
@@ -39733,17 +40842,17 @@ docker restart {TAK_CONTAINER}
 log "TAK keystore refreshed and container restarted."
 '''
     try:
-        _write_priv('/opt/tak/renew-letsencrypt.sh', renewal)
-        subprocess.run(_sudo_wrap(['chmod', '+x', '/opt/tak/renew-letsencrypt.sh']))
+        _le_renew_write(renewal)
         svc = ('[Unit]\nDescription=TAK Server LE Cert Renewal (container)\n'
                'After=network.target docker.service\n\n[Service]\nType=oneshot\n'
-               'ExecStart=/opt/tak/renew-letsencrypt.sh\n')
+               f'ExecStart={LE_RENEW_SCRIPT}\n')
         timer = ('[Unit]\nDescription=TAK Server Certificate Renewal Timer\n'
                  'Requires=takserver-cert-renewal.service\n\n[Timer]\nOnCalendar=daily\n'
                  'Persistent=true\n\n[Install]\nWantedBy=timers.target\n')
         _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
         _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
         _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
+        _le_renew_drop_old()
         log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
     except Exception as _re:
         log_fn(f"  ⚠ renewal timer setup skipped: {str(_re)[:120]}")
@@ -39751,6 +40860,69 @@ log "TAK keystore refreshed and container restarted."
     subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=120)
     log_fn("  ✓ TAK Server (container) restarted — 8446 now serving the trusted cert")
     return True
+
+
+# ops #633: the daily renewal script (takserver-cert-renewal.service) holds the keystore
+# password. It lives with the other system-managed scripts in /usr/local/sbin, mode 0700,
+# not in /opt/tak (the TAK Server data folder). _startup_move_le_renewal_script() moves it
+# on existing boxes. Broker: exact path in PATH_ALLOW_EXACT, paired with the unit the
+# console already writes.
+LE_RENEW_SCRIPT = '/usr/local/sbin/takserver-renew-letsencrypt.sh'
+LE_RENEW_SCRIPT_OLD = '/opt/tak/renew-letsencrypt.sh'
+LE_RENEW_UNIT = '/etc/systemd/system/takserver-cert-renewal.service'
+
+
+def _le_renew_write(content):
+    """Write LE_RENEW_SCRIPT root 0700. An empty 0700 file first: a new file is created
+    0644 and only then chmod'd, and the script holds the keystore password."""
+    _write_priv(LE_RENEW_SCRIPT, '', perm=0o700)
+    _write_priv(LE_RENEW_SCRIPT, content, perm=0o700)
+
+
+def _le_renew_drop_old():
+    """Remove the old /opt/tak copy once the unit points at LE_RENEW_SCRIPT. Non-fatal."""
+    try:
+        if os.path.lexists(LE_RENEW_SCRIPT_OLD):
+            subprocess.run(_sudo_wrap(['rm', '-f', LE_RENEW_SCRIPT_OLD]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _startup_move_le_renewal_script():
+    """ops #633: move an existing box's renewal script from /opt/tak to LE_RENEW_SCRIPT.
+
+    The script is generated at cert setup with the keystore password in it; this boot path
+    does not have that password, so it copies the installed text (the same file the unit
+    runs today) to LE_RENEW_SCRIPT as 0700, points the unit at
+    it, and only then removes the old file. Every step is checked; on any failure the old
+    file and unit stay as they were, so renewal never breaks. Idempotent: no old file, or a
+    unit that does not name it, is a no-op apart from removing a leftover old copy."""
+    try:
+        if not os.path.exists(LE_RENEW_UNIT):
+            return
+        unit = _read_priv(LE_RENEW_UNIT) or ''
+        if LE_RENEW_SCRIPT_OLD not in unit:
+            if os.path.exists(LE_RENEW_SCRIPT) and LE_RENEW_SCRIPT in unit:
+                _le_renew_drop_old()
+            return
+        src = _read_priv(LE_RENEW_SCRIPT_OLD) or ''
+        if not src.startswith('#!'):
+            print('Startup migration: LE renewal script not moved (old file missing or '
+                  'unreadable) — unit left as is', flush=True)
+            return
+        _le_renew_write(src)
+        if (_read_priv(LE_RENEW_SCRIPT) or '') != src:
+            print('Startup migration: LE renewal script not moved (copy did not verify)', flush=True)
+            return
+        _write_priv(LE_RENEW_UNIT, unit.replace(LE_RENEW_SCRIPT_OLD, LE_RENEW_SCRIPT))
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                       capture_output=True, text=True, timeout=30)
+        _le_renew_drop_old()
+        print(f'Startup migration: LE renewal script moved to {LE_RENEW_SCRIPT} '
+              '(root-owned, 0700; was in the tak-owned /opt/tak)', flush=True)
+    except Exception as _e:
+        print(f'Startup migration: LE renewal script move error (non-fatal): {_e}', flush=True)
 
 
 def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
@@ -39814,10 +40986,11 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     _tmp_dir = tempfile.mkdtemp(prefix='le8446p12-')
     _tmp_p12 = os.path.join(_tmp_dir, 'takserver-le.p12')
     _tmp_jks = os.path.join(_tmp_dir, 'takserver-le.jks')
+    _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
     r = subprocess.run(
-        f'openssl pkcs12 -export -in {shlex.quote(local_crt)} -inkey {shlex.quote(local_key)} '
-        f'-out {shlex.quote(_tmp_p12)} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
-        shell=True, capture_output=True, text=True)
+        ['openssl', 'pkcs12', '-export', '-in', local_crt, '-inkey', local_key,
+         '-out', _tmp_p12, '-name', takserver_host, '-password', _pw_arg],
+        capture_output=True, text=True, env=_pw_env)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {(r.stdout or r.stderr).strip()[:200]}")
         shutil.rmtree(_tmp_dir, ignore_errors=True)
@@ -39968,17 +41141,17 @@ chown tak:tak /opt/tak/certs/files/takserver-le.jks
 systemctl restart takserver
 log "TAK keystore refreshed and TAK Server restarted."
 '''
-    _write_priv('/opt/tak/renew-letsencrypt.sh', renewal_script, perm=0o755)
-    log_fn("  ✓ Renewal script created at /opt/tak/renew-letsencrypt.sh")
+    _le_renew_write(renewal_script)
+    log_fn(f"  ✓ Renewal script created at {LE_RENEW_SCRIPT}")
 
     # Step E: Create systemd service + timer
-    svc = '''[Unit]
+    svc = f'''[Unit]
 Description=TAK Server Let's Encrypt Certificate Renewal
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/tak/renew-letsencrypt.sh
+ExecStart={LE_RENEW_SCRIPT}
 '''
     timer = '''[Unit]
 Description=TAK Server Certificate Renewal Timer
@@ -39994,6 +41167,7 @@ WantedBy=timers.target
     _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
     _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
     _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'takserver-cert-renewal.timer']], 'and')
+    _le_renew_drop_old()
     log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
@@ -40079,9 +41253,9 @@ def _selfheal_takserver_le_cert(plog=None):
         else:
             print(m, flush=True)
     try:
-        _renew_script = '/opt/tak/renew-letsencrypt.sh'
-        _renew_unit   = '/etc/systemd/system/takserver-cert-renewal.service'
-        script_present = os.path.exists(_renew_script)
+        _renew_unit   = LE_RENEW_UNIT
+        # ops #633: the old /opt/tak path still counts until _startup_move_le_renewal_script ran.
+        script_present = os.path.exists(LE_RENEW_SCRIPT) or os.path.exists(LE_RENEW_SCRIPT_OLD)
         unit_present   = os.path.exists(_renew_unit)
         if not script_present and not unit_present:
             # v10.2.15: "no renewal script/unit" used to mean "box never had LE on 8446" and
@@ -41351,13 +42525,14 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
         editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
         if os.path.isfile(editor_path):
             try:
-                with open(editor_path) as f:
-                    for line in f:
-                        if 'CURRENT_VERSION' in line:
-                            m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
-                            if m:
-                                out['version'] = m.group(1).lstrip('vV')
-                            break
+                # ops #643: the editor's own account owns this file; read it via the broker
+                # when the console cannot.
+                for line in (_read_own_or_priv(editor_path) or '').splitlines():
+                    if 'CURRENT_VERSION' in line:
+                        m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
+                        if m:
+                            out['version'] = m.group(1).lstrip('vV')
+                        break
             except Exception:
                 pass
     # Latest from takwerx/mediamtx-installer, via TWO independent sources.
@@ -41421,7 +42596,24 @@ def _get_mediamtx_version_info():
             if m:
                 out['version'] = m.group(1)
     else:
-        # Local: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
+        # ops #643: on its own account MediaMTX (through the web editor's upgrade button) can
+        # replace /usr/local/bin/mediamtx, so the console must not RUN it — that would run
+        # the editor's choice of code as the console. Ask the running server instead:
+        # GET /v3/info on the loopback API (MediaMTX api/openapi.yaml, v1.21.3: `version`).
+        if _mediamtx_owner() != 'takwerx':
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen('http://127.0.0.1:9898/v3/info', timeout=5) as _r:
+                    _v = json.loads(_r.read(4096).decode(errors='replace')).get('version') or ''
+                m = _re.search(r'v?(\d+\.\d+\.\d+)', str(_v))
+                if m:
+                    out['version'] = m.group(1)
+            except Exception:
+                pass
+    if not out['version'] and not (deploy_cfg.get('target_mode') == 'remote'
+                                   and (deploy_cfg.get('remote', {}).get('host') or '').strip()) \
+            and _mediamtx_owner() == 'takwerx':
+        # Local, still on the console's account: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
         def _run_ver(cmd):
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
             combined = (r.stdout or '') + (r.stderr or '')
@@ -42910,9 +44102,9 @@ def _takportal_install_sudoers(log_fn=None):
         return False, str(r)
     if log_fn:
         _r = r if isinstance(r, dict) else {}
-        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'legacy'})")
-        if _r.get('variant') == 'legacy':
-            log_fn(f"  ⚠ legacy (root-equivalent) grant kept: {_r.get('variant_reason')}")
+        log_fn(f"  ✓ TAK Portal sudo grant installed (/etc/sudoers.d/tak-portal, {_r.get('variant') or 'hardened'})")
+        if 'older than' in (_r.get('variant_reason') or ''):
+            log_fn(f"  ⚠ {_r.get('variant_reason')}")
         if _r.get('removed_leftover'):
             log_fn("  ✓ removed leftover /etc/sudoers.d/tak-portal-marketplace (NOPASSWD: ALL from TAK Portal <2.0.19)")
         if _r.get('variant') == 'hardened' and not _r.get('helper_granted'):
@@ -43047,6 +44239,192 @@ def _takportal_install_caddy_validate_shim(log_fn=None):
         return 'error'
 
 
+# ops #644: the portal key's line in the console user's authorized_keys is limited to what
+# TAK Portal needs. `restrict` turns off
+# port/agent/X11 forwarding, pty and ~/.ssh/rc; `from=` admits only the TAK Portal containers'
+# Docker networks (the container reaches sshd via host.docker.internal from there; test6 logs
+# show the infratak address) and loopback (our own _takportal_ssh_probe). TAK Portal 2.0.33's
+# TAK SSH channel (services/takSsh.service.js) uses only exec without a pty and the sftp
+# subsystem, and `restrict` blocks neither (sshd(8) AUTHORIZED_KEYS FILE FORMAT,
+# https://man.openbsd.org/sshd#AUTHORIZED_KEYS_FILE_FORMAT). No forced command=: the portal
+# sends many generated `bash -lc` scripts, so a wrapper would have to re-parse shell.
+TAKPORTAL_SSH_KEY_COMMENT = 'tak-portal-auto'
+_AUTHKEY_TYPE_RE = re.compile(r'^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+)$')
+
+
+def _authorized_keys_split(line):
+    """(options, keytype, blob, comment) for one authorized_keys line, or None for a blank,
+    comment or unparseable line. Options may hold quoted values with spaces and commas."""
+    s = line.strip()
+    if not s or s.startswith('#'):
+        return None
+    opts = ''
+    if not _AUTHKEY_TYPE_RE.match(s.split(None, 1)[0]):
+        i, q = 0, False
+        while i < len(s):
+            c = s[i]
+            if c == '\\' and q and i + 1 < len(s):
+                i += 2
+                continue
+            if c == '"':
+                q = not q
+            elif c in ' \t' and not q:
+                break
+            i += 1
+        opts, s = s[:i], s[i:].strip()
+    parts = s.split(None, 2)
+    if len(parts) < 2 or not _AUTHKEY_TYPE_RE.match(parts[0]):
+        return None
+    return opts, parts[0], parts[1], (parts[2] if len(parts) > 2 else '')
+
+
+def _takportal_ssh_from_sources():
+    """CIDRs TAK Portal's SSH logins can come from: the subnets of every Docker network a
+    running TAK Portal app container is on, plus the two networks _write_takportal_override
+    always attaches (infratak and the project default), so a container caught between
+    recreates still matches. Private ranges only; [] when Docker cannot answer."""
+    names = {INFRATAK_DOCKER_NETWORK, f'{_takportal_project_name()}_default'}
+    try:
+        app_svcs = set(_takportal_app_services())
+        ids = [c['id'] for c in _takportal_project_containers(all_states=False)
+               if c['service'] in app_svcs or (not c['service'] and c['name'] == 'tak-portal')]
+        if ids:
+            r = _probe_run(_sudo_wrap(['docker', 'inspect', '-f', '{{json .NetworkSettings.Networks}}'] + ids),
+                           capture_output=True, text=True, timeout=15)
+            for line in (r.stdout or '').splitlines():
+                try:
+                    names.update((json.loads(line) or {}).keys())
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    nets = set()
+    for name in sorted(names):
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$', name):
+            continue
+        try:
+            r = _probe_run(_sudo_wrap(['docker', 'network', 'inspect', '-f', '{{json .IPAM.Config}}', name]),
+                           capture_output=True, text=True, timeout=10)
+            cfg = json.loads((r.stdout or '').strip() or 'null') if r.returncode == 0 else None
+        except Exception:
+            continue
+        for c in (cfg or []):
+            try:
+                n = ipaddress.ip_network(str((c or {}).get('Subnet') or ''), strict=False)
+            except ValueError:
+                continue
+            # Never widen to a public or huge range, whatever Docker reports.
+            if n.is_private and not n.is_loopback and n.prefixlen >= (8 if n.version == 4 else 32):
+                nets.add(str(n))
+    return sorted(nets)
+
+
+def _takportal_ssh_key_options(sources):
+    """The options for the portal key line. No sources = `restrict` alone (the next heal adds
+    from= once Docker answers), never a from= that would lock the portal out."""
+    if not sources:
+        return 'restrict'
+    return 'restrict,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
+
+
+def _takportal_authorized_keys_text(existing, pub_content, sources):
+    """New authorized_keys text with the portal key restricted. Returns (text, changed, removed).
+
+    The line holding the portal key gets the options from _takportal_ssh_key_options (added
+    once if missing). Other lines that carry our keygen comment (`tak-portal-auto`) are older
+    portal keys the portal no longer uses (e.g. one a non-root flip carried over):
+    they are dropped. Every other line is kept byte for byte. With no sources, a portal line
+    that already has a from= keeps it."""
+    pub = _authorized_keys_split(pub_content)
+    if not pub:
+        raise ValueError('portal public key is not a valid key line')
+    _, ktype, blob, comment = pub
+    want_opts = _takportal_ssh_key_options(sources)
+    lines = existing.splitlines()
+    out, removed, have = [], 0, False
+    for line in lines:
+        p = _authorized_keys_split(line)
+        if p and p[2] == blob:
+            if have:
+                removed += 1      # a duplicate of the portal key: one line is enough
+                continue
+            have = True
+            opts = want_opts
+            if not sources and 'from=' in p[0] and p[0].startswith('restrict'):
+                opts = p[0]
+            out.append(f'{opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
+            continue
+        if p and p[3].strip() == TAKPORTAL_SSH_KEY_COMMENT:
+            removed += 1
+            continue
+        out.append(line)
+    if not have:
+        while out and not out[-1].strip():
+            out.pop()
+        out.append(f'{want_opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
+    text = '\n'.join(out) + '\n'
+    return text, text != existing, removed
+
+
+def _takportal_trust_portal_key(pub_content, log_fn=None, only_if_present=False):
+    """Write the portal key into ~/.ssh/authorized_keys, restricted (see above). Atomic, 0600.
+    only_if_present: the console-start heal rewrites an existing line, never adds trust.
+    Returns 'written' | 'current' | 'absent'; raises on I/O errors."""
+    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
+    os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
+    existing = ''
+    if os.path.exists(auth_keys):
+        with open(auth_keys, 'r') as f:
+            existing = f.read()
+    blob = (_authorized_keys_split(pub_content) or ('', '', '', ''))[2]
+    if only_if_present and not (blob and any((_authorized_keys_split(l) or ('', '', ''))[2] == blob
+                                             for l in existing.splitlines())):
+        return 'absent'
+    sources = _takportal_ssh_from_sources()
+    text, changed, removed = _takportal_authorized_keys_text(existing, pub_content, sources)
+    if not changed:
+        if log_fn:
+            log_fn("  ✓ Public key already in authorized_keys (restricted)")
+        return 'current'
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(auth_keys), prefix='.authorized_keys-')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, auth_keys)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if log_fn:
+        log_fn("  ✓ Public key in ~/.ssh/authorized_keys, restricted to "
+               + (', '.join(sources) + ' and loopback' if sources else
+                  'no forwarding (Docker networks not readable yet; from= added on the next heal)'))
+        if removed:
+            log_fn(f"  ✓ Removed {removed} older TAK Portal key line(s) from authorized_keys")
+    return 'written'
+
+
+def _heal_takportal_ssh_key(plog=None):
+    """ops #644: on console start, restrict the portal key line on boxes that already trust it
+    (written before this release with no options), and refresh from= when TAK Portal's Docker
+    networks change. Never adds trust. Best-effort; never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        pub = os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519.pub')
+        if not os.path.isdir('/opt/tak') or not os.path.exists(pub) or not _takportal_web_running():
+            return False
+        with open(pub) as f:
+            pub_content = f.read().strip()
+        return _takportal_trust_portal_key(pub_content, log_fn=_log, only_if_present=True) == 'written'
+    except Exception as e:
+        _log(f"  takportal: SSH key restriction heal error (non-fatal): {e}")
+        return False
+
+
 def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
@@ -43062,7 +44440,6 @@ def _takportal_setup_ssh(log_fn=None):
     key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
     priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
     pub_key = priv_key + '.pub'
-    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
 
     try:
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
@@ -43082,23 +44459,10 @@ def _takportal_setup_ssh(log_fn=None):
             if log_fn:
                 log_fn("  ✓ SSH keypair already exists")
 
-        # Install public key in host authorized_keys
+        # Install public key in host authorized_keys, restricted (ops #644)
         with open(pub_key, 'r') as f:
             pub_content = f.read().strip()
-        os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
-        existing_keys = ''
-        if os.path.exists(auth_keys):
-            with open(auth_keys, 'r') as f:
-                existing_keys = f.read()
-        if pub_content not in existing_keys:
-            with open(auth_keys, 'a') as f:
-                f.write(f'\n{pub_content}\n')
-            os.chmod(auth_keys, 0o600)
-            if log_fn:
-                log_fn("  ✓ Public key added to ~/.ssh/authorized_keys")
-        else:
-            if log_fn:
-                log_fn("  ✓ Public key already in authorized_keys")
+        _takportal_trust_portal_key(pub_content, log_fn=log_fn)
 
         # Copy keypair into running container
         _web = _takportal_ref()  # v10.1.59: the WEB service's container, resolved — not a name guess
@@ -43635,6 +44999,10 @@ def takportal_update_status():
 def takportal_deploy():
     if takportal_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    # ops #648: TAK Portal has no login of its own; Authentik is its login. No Authentik, no deploy.
+    if not detect_modules(fresh=True).get('authentik', {}).get('installed'):
+        return jsonify({'error': 'TAK Portal needs Authentik for its login. Deploy Authentik '
+                                 'first, then deploy TAK Portal.'}), 409
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_takportal_deploy, daemon=True).start()
@@ -43746,28 +45114,39 @@ def takportal_ssh_status():
     row('Keypair (container)', 'ok' if in_container else 'bad',
         'present' if in_container else 'missing')
 
-    trusted = False
+    trusted, key_opts = False, ''
     try:
         pub = key + '.pub'
         ak = os.path.expanduser('~/.ssh/authorized_keys')
         if os.path.exists(pub) and os.path.exists(ak):
             with open(pub) as f:
-                pk = f.read().strip()
+                blob = (_authorized_keys_split(f.read()) or ('', '', '', ''))[2]
             with open(ak) as f:
-                trusted = bool(pk) and pk in f.read()
+                for _l in f.read().splitlines():
+                    _p = _authorized_keys_split(_l)
+                    if blob and _p and _p[2] == blob:
+                        trusted, key_opts = True, _p[0]
+                        break
     except Exception:
         pass
-    row('Host trust', 'ok' if trusted else 'bad',
-        f'portal key {"in" if trusted else "NOT in"} ~{console_user}/.ssh/authorized_keys')
+    if not trusted:
+        row('Host trust', 'bad', f'portal key NOT in ~{console_user}/.ssh/authorized_keys')
+    elif key_opts.startswith('restrict') and 'from=' in key_opts:
+        row('Host trust', 'ok', f'portal key in ~{console_user}/.ssh/authorized_keys, '
+            "restricted to TAK Portal's Docker networks")
+    else:
+        row('Host trust', 'warn', f'portal key in ~{console_user}/.ssh/authorized_keys, not restricted',
+            'Any host holding the portal key can log in. Run Repair to restrict it.')
 
     ok, grant = _takportal_sudoers('status')
     if ok and isinstance(grant, dict):
         if not grant.get('supported'):
             row('Sudo grant', 'na', grant.get('reason') or 'not supported here')
-        elif grant.get('present') and grant.get('matches') and grant.get('variant') == 'legacy':
-            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (legacy, root-equivalent)',
+        elif grant.get('present') and grant.get('matches') and grant.get('portal_old'):
+            # ops #644: TAK Portal < 2.0.19 gets the hardened grant too; it needs an update.
+            row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (hardened; TAK Portal too old for it)',
                 (grant.get('variant_reason') or 'TAK Portal is older than 2.0.19') +
-                '. Update TAK Portal, then run Repair.')
+                '. Update TAK Portal to bring back the Marketplace and cert repair.')
         elif grant.get('present') and grant.get('matches'):
             _h = (grant.get('helper') or {})
             row('Sudo grant', 'ok', '/etc/sudoers.d/tak-portal (current, hardened)',
@@ -44018,7 +45397,7 @@ def run_takportal_deploy():
         env_path = os.path.join(portal_dir, '.env')
         if not os.path.exists(env_path):
             plog("  Creating default .env...")
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write("WEB_UI_PORT=3000\n")
             plog("\u2713 Default .env created (port 3000)")
         else:
@@ -44558,7 +45937,17 @@ def mediamtx_control():
     return jsonify({'success': True, 'running': running})
 
 
-MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_REF}/config-editor/mediamtx_config_editor.py'
+# Raw files are fetched by COMMIT, never by branch or tag name (ops #637).
+MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_SHA}/config-editor/mediamtx_config_editor.py'
+MEDIAMTX_EDITOR_TEST_VIDEO_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_SHA}/config-editor/truck_60.ts'
+
+
+def _mediamtx_editor_clone_cmd(dest):
+    """Shell command: shallow-clone the editor at MEDIAMTX_EDITOR_REF into `dest` and fail
+    unless HEAD is exactly MEDIAMTX_EDITOR_SHA (ops #637)."""
+    d = shlex.quote(dest)
+    return (f'git clone --depth 1 --branch {shlex.quote(MEDIAMTX_EDITOR_REF)} {shlex.quote(MEDIAMTX_EDITOR_REPO)} {d} && '
+            f'[ "$(git -C {d} rev-parse HEAD)" = {shlex.quote(MEDIAMTX_EDITOR_SHA)} ]')
 
 
 @app.route('/api/mediamtx/recovery', methods=['POST'])
@@ -44571,7 +45960,14 @@ def mediamtx_recovery():
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     tmp_f = None
     editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    _is_remote = (deploy_cfg.get('target_mode') == 'remote'
+                  and (deploy_cfg.get('remote', {}).get('host') or '').strip())
+    _restart_after = []
     try:
+        # ops #643: the editor dir belongs to the editor's own account here. Take it back
+        # (services stopped, planted links dropped) before writing into it.
+        if not _is_remote:
+            _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             _module_run(
@@ -44630,7 +46026,10 @@ def mediamtx_recovery():
         # This prevents stale overlay scripts on existing installs from injecting old UI logic.
         try:
             overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
-            if os.path.exists(overlay_src):
+            if os.path.exists(overlay_src) and not _is_remote:
+                with open(overlay_src) as _of:
+                    _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
+            elif os.path.exists(overlay_src):
                 _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
                 _module_copy(
                     deploy_cfg,
@@ -44640,12 +46039,18 @@ def mediamtx_recovery():
                 )
         except Exception:
             pass
-        tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
-        tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
-        tmp_f.close()
-        copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
-        if not copy_ok:
-            return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        if _is_remote:
+            tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+            tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+            tmp_f.close()
+            copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+            if not copy_ok:
+                return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        else:
+            # ops #643: straight into place through the broker (no link followed), no
+            # fixed /tmp name another local account could take first.
+            _write_priv('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT,
+                        perm=0o755)
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
         # v10.1.48: this path ships a new overlay but used to leave the unit alone.
         # The overlay now refuses X-Authentik-* from an unpinned peer, so on a SPLIT
@@ -44675,8 +46080,15 @@ def mediamtx_recovery():
                 deps_ok, deps_detail = _mediamtx_editor_ensure_py_deps()
         except Exception as _de:
             deps_ok, deps_detail = False, str(_de)[:200]
+        if not _is_remote:
+            # The editor's files go back to the account it runs as before it restarts.
+            _mediamtx_hand_over_files(_mediamtx_owner())
+            for _svc in _restart_after:
+                if _svc != 'mediamtx-webeditor':
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
         cmd = (
-            'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            ('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+             if _is_remote else '') +
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
             f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
             f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
@@ -44705,6 +46117,12 @@ def mediamtx_recovery():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     finally:
+        # ops #643: never leave MediaMTX stopped because a step above failed.
+        for _svc in _restart_after:
+            try:
+                subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
+            except Exception:
+                pass
         if tmp_f and os.path.exists(tmp_f.name):
             try:
                 os.unlink(tmp_f.name)
@@ -44899,15 +46317,22 @@ def _mediamtx_grant_config_dir_write(plog=None):
         if plog:
             plog(m)
     try:
+        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        owner = _mediamtx_owner()
+        if owner != 'takwerx':
+            # ops #643: MediaMTX on its own account owns the dir (2775, group takwerx so the
+            # console still reads the yml). Never hand it back to the console's account.
+            _mediamtx_hand_over_files(owner)
+            subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
+            return True
         # `chown root:takwerx`, not `chgrp` — chgrp is not in the broker allowlist and
         # would be denied on a routed box; chown is, and does the same job.
         subprocess.run(_sudo_wrap(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR]),
                        capture_output=True, timeout=15)
         subprocess.run(_sudo_wrap(['chmod', '775', _MEDIAMTX_CONF_DIR]),
                        capture_output=True, timeout=15)
-        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
         if _caddy_cert_pair_ready(yml, yml):        # cheap privileged existence test
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+            subprocess.run(_sudo_wrap(['chown', '-h', 'takwerx:takwerx', yml]),
                            capture_output=True, timeout=15)
             subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
         return True
@@ -44921,6 +46346,83 @@ _MEDIAMTX_REMOTE_CERT_PERMS = (
     'chown root:takwerx /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key && '
     'chmod 640 /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key'
 )
+
+
+# Remote MediaMTX firewall. Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890
+# (UDP; this opened 8890/tcp until v10.1.10). The API (9898) is loopback-only and denied
+# outright. The web editor (5080) and HLS (8888) bind 0.0.0.0 so Caddy on the CONSOLE can
+# reach them, so they are open to the console only: _mediamtx_remote_console_scope_sh().
+_MEDIAMTX_REMOTE_FW_RULES = (('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'),
+                             ('allow', 8890, 'udp'), ('deny', 9898, 'tcp'))
+_MEDIAMTX_REMOTE_CONSOLE_PORTS = (5080, 8888)
+
+
+def _mediamtx_remote_console_scope_sh(console_ip=None):
+    """Shell: only the console may reach the remote editor (5080) and HLS (8888). ops #630.
+
+    Sources: the console's address as the remote sees it ($SSH_CLIENT, right on a
+    private-LAN split) plus Settings → Server IP (validated IPv4 by the caller), the same
+    union _remote_healthagent_fw_step uses. Prints SCOPE_SRCS=... and SCOPE_RC=0|1.
+
+    ORDER on ufw (first match wins, new rules append): delete the old deny and any broad
+    allow FIRST, add the scoped allows, re-add the deny LAST. The pre-#630 deploy put the
+    deny in before the allow, so with ufw on, the console's own Caddy was blocked."""
+    extra = console_ip or ''
+    ports = ' '.join(str(p) for p in _MEDIAMTX_REMOTE_CONSOLE_PORTS)
+    return (
+        _REMOTE_SUDO_SH +
+        'SRCS=; for A in "${SSH_CLIENT%% *}" "' + extra + '"; do '
+        'case "$A" in ""|*[!0-9a-fA-F:.]*) continue;; esac; '
+        'case " $SRCS " in *" $A "*) ;; *) SRCS="$SRCS $A";; esac; done; '
+        'echo "SCOPE_SRCS=$SRCS"; RC=0; '
+        'if command -v firewall-cmd >/dev/null 2>&1 && $S firewall-cmd --state >/dev/null 2>&1; then '
+        f'  for P in {ports}; do for A in $SRCS; do FAM=ipv4; case "$A" in *:*) FAM=ipv6;; esac; '
+        '    $S firewall-cmd --permanent --add-rich-rule="rule family=\'$FAM\' source address=\'$A\' '
+        'port port=\'$P\' protocol=\'tcp\' accept" >/dev/null 2>&1 || RC=1; done; '
+        '    $S firewall-cmd --permanent --remove-port=$P/tcp >/dev/null 2>&1; done; '
+        '  $S firewall-cmd --reload >/dev/null 2>&1 || RC=1; '
+        'elif command -v ufw >/dev/null 2>&1; then '
+        f'  for P in {ports}; do '
+        '    $S ufw --force delete deny $P/tcp >/dev/null 2>&1; '
+        '    $S ufw --force delete allow $P/tcp >/dev/null 2>&1; '
+        '    for A in $SRCS; do $S ufw allow from $A to any port $P proto tcp >/dev/null 2>&1 || RC=1; done; '
+        '    $S ufw deny $P/tcp >/dev/null 2>&1 || RC=1; done; '
+        'else RC=1; fi; '
+        'echo "SCOPE_RC=$RC"'
+    )
+
+
+def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
+    """Firewall a remote MediaMTX box. Returns (state, failed). ops #630.
+
+    state: 'on' (active, rules applied), 'off' (reachable, but no active firewall and
+    it could not be turned on), 'unknown' (could not ask). failed: rules that did not
+    apply. Never reports a port closed unless the firewall holding the rule is on."""
+    host = ((deploy_cfg.get('remote') or {}).get('host') or '').strip()
+    act_ok, _be, act_msg = _module_fw_ensure_active(deploy_cfg, log_fn=plog)
+    if not act_ok:
+        plog(f"✗ Firewall on {host} is NOT on: {act_msg}")
+        plog("  With it off, the web editor (5080) and HLS (8888) are reachable from any address.")
+        return ('unknown' if act_msg.startswith('could not check') else 'off'), []
+    failed = []
+    for verb, port, proto in _MEDIAMTX_REMOTE_FW_RULES:
+        ok, msg = _module_fw(deploy_cfg, verb, port, proto, log_fn=plog)
+        if not ok:
+            failed.append(f'{verb} {port}/{proto}: {msg[:120]}')
+    console_ip = _fedhub_caddy_source_ip(settings)
+    ok, out = _module_run(deploy_cfg, _mediamtx_remote_console_scope_sh(console_ip), timeout=60)
+    srcs = (re.search(r'SCOPE_SRCS=([^\n]*)', out or '') or [None, ''])[1].split()
+    if not ok or 'SCOPE_RC=0' not in (out or ''):
+        failed.append(f'console-only 5080/8888: {(out or "")[-160:]}')
+    if failed:
+        plog("✗ Firewall is on, but these rules did NOT apply on the target:")
+        for f in failed:
+            plog(f"    {f}")
+        plog("  Fix the target's firewall before using this box.")
+    else:
+        plog("✓ Firewall on. RTSP/RTSPS/SRT public; web editor and HLS open to the console only "
+             f"({', '.join(srcs) or 'no console address found: closed to all'}); API closed")
+    return 'on', failed
 
 
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
@@ -45134,7 +46636,7 @@ paths:
     _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
     # Web editor: clone on remote and install
     _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
+    ok, _ = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
@@ -45172,6 +46674,7 @@ paths:
     # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''
+    remote_secret_env = ''
     if ak_installed:
         overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
         if os.path.exists(overlay_src):
@@ -45238,16 +46741,37 @@ paths:
                     if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token_val = _line.strip().split('=', 1)[1].strip()
         ak_public_url = f'https://{_pub_hostport(_get_authentik_host(settings))}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
+        # ops #632: the token goes to a 600 root env file on the remote, not into the
+        # 0644 unit (the main box's Authentik admin token, readable by every user there).
+        remote_secret_env = _mediamtx_editor_secret_env_text(ak_token_val)
         ldap_env_lines = (
             f'Environment=LDAP_ENABLED=1\n'
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
-            f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
             # Split box: the editor binds 0.0.0.0 for Caddy on the console, so the
             # console's address must be trusted for the overlay's header auth.
             f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
             f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}\n'
+            f'{_MEDIAMTX_EDITOR_ENVFILE_LINE}\n'
         )
     editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
+    if remote_secret_env:
+        # 0600 mkstemp here; scp carries the mode to the remote /tmp copy, and install
+        # puts it in place root:root 600 before the unit that reads it.
+        _se_fd, _se_tmp = tempfile.mkstemp(prefix='mediamtx-webeditor-env-')
+        try:
+            with os.fdopen(_se_fd, 'w') as f:
+                f.write(remote_secret_env)
+            _module_copy(deploy_cfg, _se_tmp, '/tmp/mediamtx-webeditor.env', log_fn=plog)
+        finally:
+            try:
+                os.remove(_se_tmp)
+            except OSError:
+                pass
+        _dst = _MEDIAMTX_EDITOR_SECRET_ENV
+        _module_run(deploy_cfg,
+                    f'sudo install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst} 2>/dev/null'
+                    f' || install -m 600 /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
+                    timeout=10)
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
@@ -45257,11 +46781,26 @@ paths:
     except Exception:
         pass
     plog("✓ Services created")
+
+    # Step 6: Firewall, BEFORE the services start (ops #630). The editor binds 0.0.0.0:5080
+    # and is meant for the console only. This step used to come after the
+    # start and trusted a firewall it never checked was on (stock Ubuntu cloud: ufw off).
+    # No active firewall = the editor does not start.
+    plog("")
+    plog("━━━ Step 6/8: Firewall (remote) ━━━")
+    _fw_state, _fw_failed = _mediamtx_remote_firewall(settings, deploy_cfg, plog)
+    if _fw_state != 'on':
+        _module_run(deploy_cfg, _REMOTE_SUDO_SH + '$S systemctl disable --now mediamtx-webeditor 2>/dev/null; true', timeout=30)
+        plog("✗ Deploy stopped: the web editor was NOT started, because nothing would keep it")
+        plog("  off the internet. Turn on ufw (or firewalld) on the remote box, or give the SSH")
+        plog("  user passwordless sudo, then deploy again.")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
     plog("✓ Services started")
 
     # Step 5b: Test video
-    test_video_url = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/truck_60.ts'
+    test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
     plog("  Downloading test video (truck_60.ts)...")
     ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
     if ok_tv:
@@ -45269,39 +46808,7 @@ paths:
     else:
         plog("⚠ Test video download failed — you can upload it manually via the web console")
 
-    # Step 6: Firewall
-    plog("")
-    plog("━━━ Step 6/8: Firewall (remote) ━━━")
-    # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890.
-    # Webedit 5080 / API 9898 / HLS 8888 are Tier 3 (Caddy-loopback) — explicitly
-    # DENIED here so a regressed bind can't leak the admin surface. Browsers
-    # reach the webedit + HLS through Caddy on 443.
-    # v10.1.49 W1: these six rules used to be one bare-`ufw` shell string ending in
-    # `; true`, with every command silenced by 2>/dev/null. On a RHEL/Rocky target
-    # ufw does not exist, so all six failed, the block still exited 0, and the line
-    # below printed a tick over a firewall that had never been touched. The three
-    # DENY rules are the MediaMTX admin surface, and v10.1.48's overlay header-pin
-    # names this firewall rule as its residual control on split boxes — so on a RHEL
-    # remote that control was silently absent. Route through the family-aware helper
-    # and report what actually happened.
-    # 8890 is SRT — UDP. This opened 8890/tcp until v10.1.10, which held a hole
-    # open on a port nothing listens on while leaving SRT's real port closed.
-    _fw_public = [('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'), ('allow', 8890, 'udp')]
-    _fw_closed = [('deny', 8888, 'tcp'), ('deny', 5080, 'tcp'), ('deny', 9898, 'tcp')]
-    _fw_failed = []
-    for _verb, _port, _proto in _fw_public + _fw_closed:
-        _ok, _msg = _module_fw(deploy_cfg, _verb, _port, _proto, log_fn=plog)
-        if not _ok:
-            _fw_failed.append(f'{_verb} {_port}/{_proto}: {_msg[:120]}')
-    if _fw_failed:
-        # Do NOT claim the ports are set. The deny rules are the admin surface.
-        plog("✗ Firewall rules did NOT all apply on the target:")
-        for _f in _fw_failed:
-            plog(f"    {_f}")
-        plog("  RTSP/RTSPS/SRT may be closed, and — more importantly — the webedit/API/HLS")
-        plog("  admin ports may be REACHABLE. Fix the target's firewall before using this box.")
-    else:
-        plog("✓ Ports set (RTSP/RTSPS/SRT public; webedit/API/HLS closed to the network)")
+    # Step 6 (firewall) runs before the services start, above.
 
     # Step 7: Caddy on infra-TAK (point stream.* to remote)
     plog("")
@@ -45310,6 +46817,8 @@ paths:
     cfg['deployed'] = True
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
+    # ops #649: never leave the remote editor on admin/admin. Before Caddy publishes it.
+    _mediamtx_editor_secure_login(settings, log_fn=plog)
     generate_caddyfile(settings)
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
@@ -45442,23 +46951,6 @@ paths:
             _ensure_authentik_console_app(domain, _ak_token, plog)
             _repair_embedded_outpost_all_apps(_ak_url, _ak_headers, settings, plog)
 
-    # Harden MediaMTX ports: webedit (5080) and HLS (8888) only from console IP
-    _mtx_console_ip = _fedhub_caddy_source_ip(settings)
-    if _mtx_console_ip:
-        _module_run(deploy_cfg,
-            f'command -v ufw >/dev/null 2>&1 && ('
-            f'sudo ufw allow from {_mtx_console_ip} to any port 5080 proto tcp 2>/dev/null; '
-            f'sudo ufw allow from {_mtx_console_ip} to any port 8888 proto tcp 2>/dev/null; '
-            f'sudo ufw deny 5080/tcp 2>/dev/null; sudo ufw deny 8888/tcp 2>/dev/null; '
-            f'sudo ufw reload 2>/dev/null); true',
-            timeout=15)
-        plog(f"  UFW: ports 5080/8888 source-scoped to console IP {_mtx_console_ip}")
-    else:
-        _module_run(deploy_cfg,
-            'command -v ufw >/dev/null 2>&1 && (sudo ufw deny 5080/tcp 2>/dev/null; sudo ufw deny 8888/tcp 2>/dev/null; sudo ufw reload 2>/dev/null); true',
-            timeout=15)
-        plog("  ⚠ No console IP set — ports 5080/8888 denied publicly. Set Settings → Server IP.")
-
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     plog(f"🎉 MediaMTX v{version} deployed on remote host {host}!")
@@ -45558,6 +47050,15 @@ def run_mediamtx_deploy():
         created = _ensure_takwerx_system_user(plog=plog)
         if not created:
             plog("  ✓ takwerx system user already present")
+        # ops #643: MediaMTX + its web editor run as their own account, not the console's.
+        # Falls back to takwerx (as before) only when the account or its broker socket
+        # cannot be had. A redeploy takes the editor dir back first (services stopped,
+        # planted links dropped) because the console writes into it directly below.
+        _ensure_mediamtx_account(plog=plog)
+        _mediamtx_editor_reclaim(plog=plog)
+        _run_user = _mediamtx_run_user()
+        if _run_user != _MEDIAMTX_RUN_USER:
+            plog("  ⚠ MediaMTX will run as takwerx: the mediamtx account or its broker socket is not ready")
 
         # Step 2: Detect architecture, select the vetted version
         plog("")
@@ -45778,6 +47279,7 @@ WantedBy=multi-user.target
         # names a missing group dies with 216/GROUP (ops #313). Caddy installed later
         # gets the line from _mediamtx_unit_ensure_caddy_group() when the cert is wired.
         mediamtx_svc = _mediamtx_unit_with_caddy_group(mediamtx_svc) if _caddy_group_exists() else mediamtx_svc
+        mediamtx_svc = _mediamtx_unit_text_as(mediamtx_svc, _run_user)   # ops #643
         _write_priv('/etc/systemd/system/mediamtx.service', mediamtx_svc)
         plog("✓ mediamtx.service created")
 
@@ -45820,8 +47322,15 @@ WantedBy=multi-user.target
                 # meets in the field: a satellite / Ku-band / degraded-LTE link where EVERY
                 # attempt takes 70-80s. Both retries fail identically there; only a longer
                 # per-attempt ceiling helps.
-                r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                    shell=True, capture_output=True, text=True, timeout=90)
+                r = subprocess.run(['git', 'clone', '--depth', '1', '--branch', MEDIAMTX_EDITOR_REF,
+                                    MEDIAMTX_EDITOR_REPO, clone_dir],
+                                   capture_output=True, text=True, timeout=90)
+                if r.returncode == 0:
+                    # ops #637: the clone must be exactly MEDIAMTX_EDITOR_SHA (same check as the remote clone)
+                    _eh = subprocess.run(['git', '-C', clone_dir, 'rev-parse', 'HEAD'],
+                                         capture_output=True, text=True, timeout=15).stdout.strip()
+                    if _eh != MEDIAMTX_EDITOR_SHA:
+                        r = subprocess.CompletedProcess([], 1, '', f'editor tag {MEDIAMTX_EDITOR_REF} is at {_eh[:12] or "?"}, expected {MEDIAMTX_EDITOR_SHA[:12]}')
                 if r.returncode == 0:
                     candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
                     if os.path.exists(candidate):
@@ -46005,7 +47514,7 @@ WantedBy=multi-user.target
         # Download test video
         test_video_dir = f'{webeditor_dir}/test_videos'
         os.makedirs(test_video_dir, exist_ok=True)
-        test_video_url = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/truck_60.ts'
+        test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
         plog("  Downloading test video (truck_60.ts)...")
         r = subprocess.run(f'wget -q -O {test_video_dir}/truck_60.ts "{test_video_url}"',
             shell=True, capture_output=True, text=True, timeout=60)
@@ -46024,14 +47533,16 @@ WantedBy=multi-user.target
                     for _line in _f:
                         if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                             ak_token_val = _line.strip().split('=', 1)[1].strip()
+            # ops #632: the token goes to the 600 env file, not into the 0644 unit.
+            _write_mediamtx_editor_secret_env(ak_token_val)
             ldap_env_lines = (
                 f'Environment=LDAP_ENABLED=1\n'
                 f'Environment=AUTHENTIK_API_URL=http://127.0.0.1:9090\n'
-                f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
                 # Local box: the editor is loopback-bound, so loopback is the whole
                 # trusted set — written explicitly so the unit states the policy.
                 f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
                 f'{_mediamtx_editor_trusted_proxies(settings)}\n'
+                f'{_MEDIAMTX_EDITOR_ENVFILE_LINE}\n'
             )
 
         # Write self-healing overlay script — runs before every service start
@@ -46067,7 +47578,12 @@ UMask=0027
 [Install]
 WantedBy=multi-user.target
 """
+            # ops #643: its own account, its broker socket and its own package dir.
+            webeditor_svc = _mediamtx_unit_text_as(webeditor_svc, _run_user, editor=True)
             _write_priv('/etc/systemd/system/mediamtx-webeditor.service', webeditor_svc)
+            if _run_user == _MEDIAMTX_RUN_USER:
+                subprocess.run(_sudo_wrap(['rm', '-f', _MEDIAMTX_EDITOR_HOME_DROPIN]),
+                               capture_output=True, timeout=30)
             plog("✓ mediamtx-webeditor.service created")
         else:
             plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
@@ -46076,7 +47592,8 @@ WantedBy=multi-user.target
         # GH #330: checked as the editor runs (takwerx, its HOME), not as the console.
         _editor_deps_err = None
         if os.path.exists(editor_file):
-            _mediamtx_editor_install_py_deps()
+            if not _mediamtx_editor_uses_pylib():
+                _mediamtx_editor_install_py_deps()
             _ok_deps, _deps_detail = _mediamtx_editor_ensure_py_deps()
             if not _ok_deps:
                 _editor_deps_err = _deps_detail
@@ -46107,14 +47624,12 @@ WantedBy=multi-user.target
         if os.path.exists(editor_file):
             try:
                 subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
                 # Editor writes theme_config.json, email_config.json, users_file,
                 # share_links, group_metadata, srt_passphrase_backup, pending_reg,
-                # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
-                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
-                # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
-                # the editor's Save-Config UI. takwerx ownership lets both work.
-                subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
+                # reset_tokens, etc. into /opt/mediamtx-webeditor/, and mediamtx.yml is
+                # read by MediaMTX and written by the editor's Save-Config UI. All of it
+                # goes to the account both run as (ops #643: mediamtx; takwerx fallback).
+                _mediamtx_hand_over_files(_run_user)
                 # v10.1.33: owning the FILE is not enough for the editor. Its save paths
                 # shell out to `sed -i` (12+ call sites in the upstream editor), and
                 # `sed -i` writes its temp file in the target's DIRECTORY, then renames.
@@ -46138,6 +47653,9 @@ WantedBy=multi-user.target
         if os.path.exists(editor_file):
             subprocess.run(_sudo_wrap(['systemctl', 'start', 'mediamtx-webeditor']), capture_output=True)
         plog("✓ Services enabled and started")
+        # ops #649: never leave the editor on admin/admin. Before Caddy publishes it below.
+        if os.path.exists(editor_file):
+            _mediamtx_editor_secure_login(settings, log_fn=plog)
 
         # Step 6: Firewall
         # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890,
@@ -46204,9 +47722,9 @@ WantedBy=multi-user.target
                         _txt = _read_priv(yml)
                     _txt = _mediamtx_yml_wire_tls(_txt, cert_file, key_file)
                     _write_priv(yml, _txt)
-                    # chown back: the web editor runs as takwerx and rewrites this file.
-                    subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
-                                   capture_output=True, timeout=15)
+                    # chown back: the web editor rewrites this file (as its own account
+                    # once ops #643 moved it, else takwerx).
+                    _mediamtx_chown_yml(yml)
                     _check = _read_priv(yml)
                     if _mediamtx_tls_wired(_check, cert_file):
                         plog("✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
@@ -49410,7 +50928,7 @@ def _cloudtak_env_set(env_path, updates=None, remove=()):
     for k, v in updates.items():
         if k not in seen:
             out.append(f'{k}={v}')
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(out) + '\n')
 
 
@@ -52554,7 +54072,7 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 2/6: Ensuring Docker on remote ━━━")
             docker_cmd = (
                 "if ! command -v docker >/dev/null 2>&1; then "
-                "curl -fsSL https://get.docker.com | sh; "
+                + _docker_install_cmd(sudo_fallback=True) + "; "
                 "fi; "
                 "(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); "
                 "(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true); "
@@ -52628,7 +54146,7 @@ def run_cloudtak_deploy(cfg=None):
             try:
                 env_tmp = os.path.join(tmp_dir, '.env')
                 ov_tmp = os.path.join(tmp_dir, 'docker-compose.override.yml')
-                with open(env_tmp, 'w') as f:
+                with _open_secret_w(env_tmp) as f:   # 0600: scp carries the mode to the remote (ops #632)
                     f.write(env_content)
                 with open(ov_tmp, 'w') as f:
                     f.write(override_yml)
@@ -52639,7 +54157,7 @@ def run_cloudtak_deploy(cfg=None):
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
                 mv_cmd = (
-                    "mv /tmp/.env ~/CloudTAK/.env && "
+                    "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                     "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
                     "( " + _cloudtak_remote_custom_compose_sh() + " )"   # GH #261
                 )
@@ -52669,6 +54187,18 @@ def run_cloudtak_deploy(cfg=None):
             if not _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_TILES_LIVE_PERL, timeout=30)[0]:
                 plog("  ⚠ Could not set the remote tiles build to skip live-network tests (non-fatal)")
 
+            # ops #631: limit the published API, tiles, video, PostGIS and store ports to the
+            # console BEFORE the containers start (Docker-published ports are filtered in
+            # DOCKER-USER, see _docker_port_guard_files). No lock = no start.
+            plog("")
+            plog("━━━ Locking CloudTAK ports to the console (remote) ━━━")
+            _ct_guard_ok, _ = _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)
+            if not _ct_guard_ok:
+                plog("✗ CloudTAK was not started: its ports could not be limited to the console.")
+                plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
             run_cmd = (
@@ -52693,16 +54223,8 @@ def run_cloudtak_deploy(cfg=None):
                 save_settings(settings)
             except Exception as _e:
                 plog(f"  ⚠ Could not persist deployment flag: {_e}")
-            fw_cmd = (
-                "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
-                "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
-                "command -v firewall-cmd >/dev/null 2>&1 && "
-                "(sudo firewall-cmd --permanent --add-port=5000/tcp >/dev/null 2>&1 || true); "
-                "command -v firewall-cmd >/dev/null 2>&1 && "
-                "(sudo firewall-cmd --permanent --add-port=5002/tcp >/dev/null 2>&1 || true); "
-                "command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --reload >/dev/null 2>&1 || true)"
-            )
-            _ssh_probe(remote_cfg, fw_cmd, timeout=40)
+            # ops #631: no ufw/firewalld rule for 5000/5002 here. Who may reach the published
+            # ports is set by the DOCKER-USER port guard above.
             # Probe /api/server (returns 200 even on unconfigured installs — see Step 6 comment).
             # /api/connections is auth-gated and not a reliable readiness signal on a fresh install.
             ready_cmd = (
@@ -52968,7 +54490,7 @@ def run_cloudtak_deploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
         # never delete a key CloudTAK grew that we know nothing about (GARAGE_RPC_SECRET above all)
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_content)
         try:
             _pwfile = os.path.join(cloudtak_dir, '.postgres-password')
@@ -53579,7 +55101,7 @@ def run_cloudtak_redeploy(cfg=None):
             try:
                 env_tmp = os.path.join(tmp_dir, '.env')
                 ov_tmp = os.path.join(tmp_dir, 'docker-compose.override.yml')
-                with open(env_tmp, 'w') as f:
+                with _open_secret_w(env_tmp) as f:   # 0600: scp carries the mode to the remote (ops #632)
                     f.write(env_content)
                 with open(ov_tmp, 'w') as f:
                     f.write(override_yml)
@@ -53598,7 +55120,7 @@ def run_cloudtak_redeploy(cfg=None):
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 _g_sh = '( ' + _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)) + ' ) && '
             cmd = (
-                "mv /tmp/.env ~/CloudTAK/.env && "
+                "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
                 "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
                 + _g_sh +
@@ -53664,7 +55186,7 @@ def run_cloudtak_redeploy(cfg=None):
             store_endpoint=_cloudtak_store_endpoint(cloudtak_dir, existing_env_text))
         # never delete a key CloudTAK grew that we know nothing about (e.g. a store cluster secret)
         env_content = _cloudtak_env_preserve_unknown(env_content, existing_env_text)
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_content)
 
         # v10.2.7: a Garage-based CloudTAK (>= 13.102.0) cannot start without GARAGE_RPC_SECRET,
@@ -53827,12 +55349,16 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         # over the trusted local socket is idempotent and works regardless of the old
         # password; the verify below targets the container's own network IP, which
         # pg_hba matches with `host all all all scram-sha-256` — a REAL password test.
-        a = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'psql', '-U', 'docker', '-d', 'gis',
-                                       '-c', f"ALTER USER docker WITH PASSWORD '{pw}'"]),
+        # ops #632: the password goes over stdin, never argv — every local user sees the
+        # broker's `docker exec` command line in ps.
+        a = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', cid, 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-v', 'ON_ERROR_STOP=1']),
+                           input=f"ALTER USER docker WITH PASSWORD '{pw}';\n",
                            capture_output=True, text=True, timeout=20)
-        v = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid, 'sh', '-c',
+        v = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', cid, 'sh', '-c',
+                                       'IFS= read -r PGPASSWORD; export PGPASSWORD; '
                                        'psql -h "$(hostname -i)" -U docker -d gis -tAc "SELECT 1"']),
-                           capture_output=True, text=True, timeout=20)
+                           input=pw + '\n', capture_output=True, text=True, timeout=20)
         if v.returncode == 0:
             _log("  ✓ postgis role password converged to .env and verified over the network path")
             return True
@@ -55027,6 +56553,87 @@ def emailrelay_retry_queue():
     return jsonify({'success': True})
 
 
+# ── Safe archive extraction (shared) ─────────────────────────────────────────
+# Every place that unpacks an archive a person uploaded goes through these two
+# helpers. An entry name is data from outside: it must never decide where a file
+# lands. Nothing is written when any entry is refused.
+
+def _safe_archive_name(name):
+    """The entry name as a list of path parts, or raise ValueError if it is absolute,
+    holds a NUL byte, or climbs out with '..' (a backslash counts as a separator too)."""
+    if '\x00' in name:
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    flat = name.replace('\\', '/')
+    if flat.startswith('/') or re.match(r'^[A-Za-z]:', flat):
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    parts = [p for p in flat.split('/') if p not in ('', '.')]
+    if '..' in parts:
+        raise ValueError(f'unsafe path in archive: {name!r}')
+    return parts
+
+
+def _safe_extract_zip(zf, dest_dir, strip_prefix='', apply_modes=False):
+    """Extract an open ZipFile under dest_dir and never anywhere else.
+
+    Refuses (ValueError, before anything is written): absolute names, '..', symlink
+    and other non-file entries, and any target whose real path is outside dest_dir.
+    strip_prefix drops one wrapping top folder (entries outside it are refused).
+    apply_modes re-applies the rwx bits the zip records (never setuid/setgid/sticky).
+    Returns the list of file paths written."""
+    real_dest = os.path.realpath(dest_dir)
+    plan = []
+    for info in zf.infolist():
+        parts = _safe_archive_name(info.filename)
+        kind = (info.external_attr >> 16) & 0o170000
+        if kind not in (0, 0o100000, 0o040000):
+            raise ValueError(f'unsafe entry type in archive (link or special file): {info.filename!r}')
+        if strip_prefix:
+            if parts[:1] != [strip_prefix]:
+                raise ValueError(f'unexpected path in archive: {info.filename!r}')
+            parts = parts[1:]
+        if not parts:
+            continue
+        target = os.path.realpath(os.path.join(real_dest, *parts))
+        if target != real_dest and not target.startswith(real_dest + os.sep):
+            raise ValueError(f'unsafe path in archive: {info.filename!r}')
+        plan.append((info, target))
+    written = []
+    for info, target in plan:
+        if info.is_dir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(info) as src, open(target, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+        written.append(target)
+        mode = (info.external_attr >> 16) & 0o777
+        if apply_modes and mode:
+            try:
+                os.chmod(target, mode)
+            except OSError:
+                pass
+    return written
+
+
+def _safe_tar_check(tf, dest_dir):
+    """Raise ValueError unless extracting this open TarFile under dest_dir stays inside
+    it: no absolute names, no '..', no device/fifo entries, and every symlink or hard
+    link must point inside dest_dir. Call it before `tar -x` or tf.extract*."""
+    real_dest = os.path.realpath(dest_dir)
+    for m in tf.getmembers():
+        parts = _safe_archive_name(m.name)
+        if m.isdev() or m.isfifo():
+            raise ValueError(f'unsafe entry type in archive (special file): {m.name!r}')
+        if m.issym() or m.islnk():
+            link = m.linkname or ''
+            if link.startswith('/') or '\x00' in link:
+                raise ValueError(f'unsafe link in archive: {m.name!r}')
+            base = parts[:-1] if m.issym() else []     # a hard link is relative to the archive root
+            tgt = os.path.normpath(os.path.join(real_dest, *base, link))
+            if tgt != real_dest and not tgt.startswith(real_dest + os.sep):
+                raise ValueError(f'unsafe link in archive: {m.name!r}')
+
+
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
 def _cesium_dir():
@@ -55219,27 +56826,14 @@ def cesium_tiles_upload():
             if not has_tileset:
                 return jsonify({'success': False, 'error': 'Zip does not contain a tileset.json — make sure you zipped the dataset folder itself, not just its contents'})
             # Detect if there is a single top-level directory wrapping everything
-            top_dirs = {n.split('/')[0] for n in names if n}
+            # (normalised names; a refused name raises ValueError and nothing is written)
+            top_dirs = {_safe_archive_name(n)[0] for n in names if _safe_archive_name(n)}
             single_wrap = (len(top_dirs) == 1 and not any(
                 n == 'tileset.json' for n in names
             ))
             os.makedirs(dest_dir, exist_ok=True)
-            if single_wrap:
-                # Strip the wrapping directory when extracting
-                wrap = list(top_dirs)[0]
-                for member in zf.infolist():
-                    rel = member.filename[len(wrap):].lstrip('/')
-                    if not rel:
-                        continue
-                    target = os.path.join(dest_dir, rel)
-                    if member.filename.endswith('/'):
-                        os.makedirs(target, exist_ok=True)
-                    else:
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        with zf.open(member) as src, open(target, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
-            else:
-                zf.extractall(dest_dir)
+            # Strip the wrapping directory (if any) while extracting; never write outside dest_dir
+            _safe_extract_zip(zf, dest_dir, strip_prefix=list(top_dirs)[0] if single_wrap else '')
     except zipfile.BadZipFile:
         return jsonify({'success': False, 'error': 'File is not a valid zip archive'})
     except Exception as e:
@@ -55371,6 +56965,13 @@ def _webodm_odm_limits(detected_cores, cfg):
 #                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
 #                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
 WEBODM_VERSION = '4.0.0'
+# TAK overlay plugin (a personal GitHub account's repo, loaded INTO the WebODM container). ops #637:
+# pinned to a release tag and its commit. The clone is refused unless HEAD is exactly
+# WEBODM_OVERLAY_SHA. Reviewed whole-tree at this ref (module-scan). Bump both together after a
+# deploy + Update on a test box.
+WEBODM_OVERLAY_REPO = 'https://github.com/Humble-Helper-96/webodm-tak-overlay.git'
+WEBODM_OVERLAY_REF = 'v0.8.9'
+WEBODM_OVERLAY_SHA = '3f0efb383a9f1bd022eac15ac4b3da83e643fccc'  # commit of tag v0.8.9 (was the default branch's tip)
 WEBODM_IMAGES = {
     'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
     'wo_broker':  'redis:8.10.2-alpine',
@@ -55608,6 +57209,161 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
         return False
 
 
+# ops #629: WebODM ships with no admin; its /welcome page sets one up while none exists
+# (app/views/app.py `welcome`). The remote deploy now makes the admin itself. The password is generated INSIDE
+# the container, so it never crosses SSH or a process list; it is printed once, to the deploy log.
+_WEBODM_ADMIN_PY = '''import secrets
+from django.contrib.auth.models import User
+FIX = {fix}
+su = list(User.objects.filter(is_superuser=True))
+if not su:
+    if FIX:
+        name = 'admin' if not User.objects.filter(username='admin').exists() else 'infratak-admin'
+        p = secrets.token_urlsafe(18)
+        User.objects.create_superuser(name, name + '@localhost', p)
+        print('WOADMIN NEW ' + name + ' ' + p)
+    else:
+        print('WOADMIN NONE')
+for u in su:
+    if u.check_password('admin') or u.check_password(u.username):
+        if FIX:
+            p = secrets.token_urlsafe(18)
+            u.set_password(p)
+            u.save()
+            print('WOADMIN RESET ' + u.username + ' ' + p)
+        else:
+            print('WOADMIN WEAK ' + u.username)
+print('WOADMIN DONE')
+'''
+
+
+def _webodm_admin_cmd(fix):
+    """Shell command that checks (fix=False) or makes safe (fix=True) the WebODM admin."""
+    return _webodm_shell_cmd(_WEBODM_ADMIN_PY.format(fix='True' if fix else 'False'))
+
+
+def _webodm_shell_cmd(code):
+    """`manage.py shell -c <code>` in the webapp container, the code passed as base64."""
+    return ('docker exec webapp python manage.py shell -c '
+            f'"$(echo {_b64.b64encode(code.encode()).decode()} | base64 -d)" 2>&1')
+
+
+# ops #650: a box that never got an admin (local deploys before ops #650) still shows WebODM's
+# first-visit setup page. The console start makes the admin with NO usable password, so there
+# is nothing to print to the journal; the operator sets one with Account Recovery.
+_WEBODM_ADMIN_LOCK_PY = '''from django.contrib.auth.models import User
+su = list(User.objects.filter(is_superuser=True))
+if not su:
+    name = 'admin' if not User.objects.filter(username='admin').exists() else 'infratak-admin'
+    User.objects.create_superuser(name, name + '@localhost', None)
+    print('WOADMIN LOCKED ' + name)
+for u in su:
+    if u.check_password('admin') or u.check_password(u.username):
+        print('WOADMIN WEAK ' + u.username)
+print('WOADMIN DONE')
+'''
+
+
+def _webodm_admin_parse(out):
+    """WOADMIN lines → {'done': bool, 'new': [(user, pw)], 'reset': [(user, pw)], 'none': bool,
+    'weak': [user], 'locked': [user]}."""
+    r = {'done': False, 'new': [], 'reset': [], 'none': False, 'weak': [], 'locked': []}
+    for ln in (out or '').splitlines():
+        f = ln.strip().split(' ')
+        if not f or f[0] != 'WOADMIN' or len(f) < 2:
+            continue
+        if f[1] == 'DONE':
+            r['done'] = True
+        elif f[1] == 'NONE':
+            r['none'] = True
+        elif f[1] in ('WEAK', 'LOCKED') and len(f) == 3:
+            r[f[1].lower()].append(f[2])
+        elif f[1] in ('NEW', 'RESET') and len(f) == 4:
+            r['new' if f[1] == 'NEW' else 'reset'].append((f[2], f[3]))
+    return r
+
+
+def _webodm_ensure_admin(deploy_cfg, plog):
+    """Deploy step: create the WebODM admin with a generated password, or replace a default
+    password (or password = username) on an existing one. Returns True when no open or weak admin is left."""
+    ok, out = _module_run(deploy_cfg, _webodm_admin_cmd(True), timeout=60)
+    r = _webodm_admin_parse(out)
+    if not (ok and r['done']):
+        plog('  ⚠ Could not check the WebODM admin account. Press Reapply Plugin & Config to retry.')
+        return False
+    for user, pw in r['new']:
+        plog(f'  🔑 WebODM admin created: {user} / {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    for user, pw in r['reset']:
+        plog(f'  🔑 WebODM admin "{user}" had a default password. New password: {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    if not r['new'] and not r['reset']:
+        plog('  ✓ WebODM admin account exists with a non-default password')
+    return True
+
+
+def _webodm_migrations_pending(deploy_cfg):
+    """How many WebODM Django migrations are not applied yet; 99 when that is unknown.
+    ops #650: counted here. The old `grep -c "[ ]" || echo 99` printed "0" then "99" when none
+    were pending (grep -c exits 1 on no match), so it never read 0 and the steps after it never ran."""
+    ok, out = _module_run(deploy_cfg, 'docker exec webapp python manage.py showmigrations 2>&1',
+                          timeout=30)
+    if not ok or '[X]' not in (out or ''):
+        return 99
+    return sum(1 for ln in out.splitlines() if ln.strip().startswith('[ ]'))
+
+
+def _webodm_wait_migrations(deploy_cfg, plog, tries=24):
+    """Wait (15 s steps, 6 min by default) until WebODM's migrations are done. True when done."""
+    import time as _time
+    pending = 99
+    for i in range(tries):
+        pending = _webodm_migrations_pending(deploy_cfg)
+        if pending == 0:
+            plog(f"  ✓ Migrations complete ({i * 15}s)")
+            return True
+        if i % 2 == 1:
+            plog(f"  ⏳ Waiting for migrations... ({(i + 1) * 15}s, {pending} pending)")
+        _time.sleep(15)
+    return False
+
+
+def _startup_webodm_local_admin():
+    """ops #650: a local WebODM with no admin shows its first-visit setup page to whoever opens
+    it first. On every console boot (Update Now restarts it), make the admin with no usable
+    password if there is none, and report a default one. Never prints a password.
+    Daemon thread: retries while Docker and WebODM come up."""
+    import time as _time
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return
+        wo_dir = _webodm_dir()
+        if wo_dir != '/root/webodm' and not os.path.exists(os.path.join(wo_dir, 'docker-compose.yml')):
+            return
+        for _ in range(10):
+            ok, out = _module_run(cfg, _webodm_shell_cmd(_WEBODM_ADMIN_LOCK_PY), timeout=60)
+            r = _webodm_admin_parse(out)
+            if ok and r['done']:
+                break
+            _time.sleep(30)
+        else:
+            print("Startup migration: ⚠ could not check the WebODM admin account (WebODM not running?). "
+                  "If WebODM asks a visitor to create an admin, press Reapply Plugin & Config on the WebODM page.")
+            return
+        for name in r['locked']:
+            print(f"Startup migration: ⚠ WebODM had no admin account, so the first visitor could make one "
+                  f"(ops #650). Made '{name}' with no password: set it with Account Recovery on the WebODM "
+                  "page. If you find a project, user or plugin in WebODM you did not add, treat the box "
+                  "as taken over.")
+        if r['weak']:
+            print(f"Startup migration: ⚠ WebODM admin with a default password ({', '.join(r['weak'])}). "
+                  "Press Reapply Plugin & Config on the WebODM page: it sets a generated password and shows it once.")
+    except Exception as _e:
+        print(f"Startup migration: WebODM admin check error (non-fatal): {_e}")
+
+
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
     import secrets as _sec
@@ -55631,7 +57387,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog('  Docker not found — installing...')
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog(f'✗ Docker install failed: {(out or "")[-300:]}')
             _webodm_deploy_status.update({'running': False, 'error': True})
@@ -55658,8 +57414,9 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog('━━━ Installing TAK overlay plugin (remote) ━━━')
     ok, out = _module_run(deploy_cfg,
         f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
-        f'git clone --depth=1 https://github.com/Humble-Helper-96/webodm-tak-overlay.git '
+        f'git clone --depth=1 --branch {WEBODM_OVERLAY_REF} {WEBODM_OVERLAY_REPO} '
         f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
+        f'[ "$(git -C {wo_dir_remote}/plugins/webodm-tak-overlay rev-parse HEAD)" = {WEBODM_OVERLAY_SHA} ] && '
         # Upstream ships an empty __init__.py; WebODM needs Plugin re-exported
         # at package level or the plugin never loads (GH #50).
         f'{{ grep -q Plugin {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py 2>/dev/null || '
@@ -55685,7 +57442,9 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
         wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
-    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
+    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it. The DOCKER-USER
+    # port guard below scopes it to the console (ops #629); ufw alone does not, Docker's
+    # published ports skip ufw.
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
         f'      - "0.0.0.0:{wo_port}:8000"',
@@ -55706,6 +57465,17 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ docker-compose.yml written')
 
+    # ops #629: lock the WebODM port to the console BEFORE the container publishes it. The ufw
+    # lines further down never applied (Docker's published ports skip ufw), so the port was
+    # reachable from anywhere. No lock = no start.
+    plog(f'━━━ Locking port {wo_port} to the console (remote) ━━━')
+    _wo_guard_ok, _ = _remote_docker_port_guard(deploy_cfg, settings, 'webodm', [wo_port], log_fn=plog)
+    if not _wo_guard_ok:
+        plog('✗ WebODM was not started: without this lock the WebODM port is not limited to the console.')
+        plog('  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+
     # Pull images on remote
     plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
     ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
@@ -55721,7 +57491,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ WebODM containers started')
 
-    # Harden WebODM port: allow only from console IP, deny public access
+    # Belt and braces only: ufw does not see Docker-published ports. The port guard above
+    # is what limits the WebODM port to the console (ops #629).
     _wo_console_ip = _fedhub_caddy_source_ip(settings)
     if _wo_console_ip:
         _module_run(deploy_cfg,
@@ -55756,32 +57527,24 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog('━━━ Registering NodeODM node (remote) ━━━')
     # Wait for Django migrations to complete before registering NodeODM (fresh host pulls ~1.5GB)
     plog("  Waiting for WebODM Django migrations to complete...")
-    _node_registered = False
-    _pending = 99
-    for _nr_attempt in range(24):  # 24 × 15s = 6 minutes
-        _ok_mig, _mig_out = _module_run(deploy_cfg,
-            'docker exec webapp python manage.py showmigrations 2>/dev/null | grep -c "\\[ \\]" || echo 99',
-            timeout=20)
-        try:
-            _pending = int((_mig_out or '99').strip())
-        except Exception:
-            pass
-        if _ok_mig and _pending == 0:
-            plog(f"  ✓ Migrations complete ({_nr_attempt * 15}s)")
-            ok_node, out_node = _module_run(deploy_cfg,
-                'docker exec webapp python manage.py addnode wo_nodeodm 3000 --label NodeODX 2>&1',
-                timeout=30)
-            if ok_node:
-                plog("  ✓ NodeODM processing node registered")
-                _node_registered = True
-            else:
-                plog(f"  ⚠ Node registration skipped (add manually: wo_nodeodm:3000): {(out_node or '')[:120]}")
-            break
-        if _nr_attempt % 2 == 1:
-            plog(f"  ⏳ Waiting for migrations... ({(_nr_attempt + 1) * 15}s, {_pending} pending)")
-        _time.sleep(15)
-    if not _node_registered and _pending != 0:
+    _migrated = _webodm_wait_migrations(deploy_cfg, plog)  # 24 × 15s = 6 minutes
+    if _migrated:
+        ok_node, out_node = _module_run(deploy_cfg,
+            'docker exec webapp python manage.py addnode wo_nodeodm 3000 --label NodeODX 2>&1',
+            timeout=30)
+        if ok_node:
+            plog("  ✓ NodeODM processing node registered")
+        else:
+            plog(f"  ⚠ Node registration skipped (add manually: wo_nodeodm:3000): {(out_node or '')[:120]}")
+    else:
         plog("  ⚠ Migrations did not complete in 6 min — NodeODM not registered. Add manually: wo_nodeodm:3000")
+
+    # ops #629: never leave WebODM without an admin or on a default password.
+    plog('━━━ WebODM admin account (remote) ━━━')
+    if _migrated:
+        _webodm_ensure_admin(deploy_cfg, plog)
+    else:
+        plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
 
     # Save settings, reload Caddy (local), configure Authentik (local)
     s = load_settings()
@@ -55838,11 +57601,14 @@ def _run_webodm_deploy(settings):
             # under the non-root console (reapply path; fresh deploys never hit it).
             subprocess.run(_sudo_wrap(['rm', '-rf', plugin_dir]),
                            capture_output=True, timeout=60, check=True)
-        r = _sp.run(['git', 'clone', '--depth=1',
-                     'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
-                     plugin_dir], capture_output=True, text=True, timeout=60)
+        r = _sp.run(['git', 'clone', '--depth=1', '--branch', WEBODM_OVERLAY_REF,
+                     WEBODM_OVERLAY_REPO, plugin_dir], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
+        _head = _sp.run(['git', '-C', plugin_dir, 'rev-parse', 'HEAD'],
+                        capture_output=True, text=True, timeout=15).stdout.strip()
+        if _head != WEBODM_OVERLAY_SHA:
+            raise RuntimeError(f'Plugin clone refused: {WEBODM_OVERLAY_REF} is at {_head[:12] or "?"}, expected {WEBODM_OVERLAY_SHA[:12]}')
         plog(f'Plugin cloned: {plugin_dir}')
         # The plugin repo ships an EMPTY __init__.py, but WebODM's loader does
         # getattr(<package>, "Plugin") — without a package-level re-export the
@@ -55924,6 +57690,11 @@ def _run_webodm_deploy(settings):
         else:
             plog('WebODM did not respond in time — check logs with: docker logs webapp')
 
+        plog('Waiting for WebODM Django migrations to complete…')
+        _migrated = _webodm_wait_migrations(deploy_cfg, plog)
+        if not _migrated:
+            plog('  ⚠ Migrations did not complete in 6 min.')
+
         plog('Registering NodeODM processing node…')
         import time as _t2
         _t2.sleep(5)
@@ -55940,6 +57711,13 @@ def _run_webodm_deploy(settings):
                 plog(f'Node registration skipped (add manually: wo_nodeodm:3000): {_r_node.stderr[:200]}')
         except Exception as e:
             plog(f'Auto node registration skipped: {e}')
+
+        # ops #650: the deploy makes the admin, so WebODM's first-visit setup page never opens.
+        plog('WebODM admin account…')
+        if _migrated:
+            _webodm_ensure_admin(deploy_cfg, plog)
+        else:
+            plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
 
         s = load_settings()
         s['webodm_enabled'] = True
@@ -56652,7 +58430,7 @@ def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     if lines and lines[-1].strip() != '':
         lines.append('')
     lines.extend(email_block)
-    with open(env_path, 'w') as f:
+    with _open_secret_w(env_path) as f:
         f.write('\n'.join(lines) + '\n')
     _log("  Wrote SMTP settings to Authentik .env")
 
@@ -60815,12 +62593,13 @@ def _docker_port_guard_files(name, ports, allow_ips):
     return script, unit
 
 
-def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
+def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, extra_allow=()):
     """Install + start the port guard on a remote module host. Returns (ok, first_time).
 
     Allowed sources: the console as the remote box sees it over SSH ($SSH_CLIENT, right for a
-    console that reaches it on a private address) and Settings → Server IP. Neither found:
-    the ports are dropped for everyone (fail closed). No-op for a local target."""
+    console that reaches it on a private address), Settings → Server IP and `extra_allow`
+    (IPv4s). None found: the ports are dropped for everyone (fail closed). No-op for a local
+    target."""
     if deploy_cfg.get('target_mode') != 'remote':
         return True, False
     _log = log_fn or (lambda _m: None)
@@ -60830,6 +62609,7 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
         if _ln.startswith('SSHSRC '):
             allow.append(_ln[7:].strip())
     allow.append(_fedhub_caddy_source_ip(settings) or '')
+    allow.extend(extra_allow or ())
     _ips = []
     for _a in allow:
         try:
@@ -60861,6 +62641,77 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
     else:
         _log(f"  ✗ Could not lock port {ports_txt} to the console: {(out or '').strip()[-300:]}")
     return good, good and 'had=no' in (out or '')
+
+
+# ops #631: the ports a remote Authentik or CloudTAK publishes that only the console may reach,
+# enforced by the DOCKER-USER port guard (_docker_port_guard_files).
+# Authentik: 9090 is Caddy's forward_auth/auth upstream and the console's API
+# (_get_authentik_upstream), 389/636 the LDAP outpost TAK Server binds to. 9443 is bound to
+# 127.0.0.1 since v0.9.12; guarded too for a box deployed before that.
+REMOTE_AUTHENTIK_GUARD_PORTS = (9090, 389, 636, 9443)
+# CloudTAK: 5000/5002 (map/tiles) and 9997/18888 (video) are Caddy's upstreams
+# (_get_cloudtak_upstreams). The rest are upstream compose defaults that stay published on a
+# remote host (_patch_cloudtak_compose_ports edits only a local checkout): events 5003,
+# PostGIS 5433, MinIO 9000/9002, Garage 3900-3903, HLS 8888. The RTSP/RTMP/SRT stream ports
+# stay public on purpose (ATAK and other clients play them directly).
+REMOTE_CLOUDTAK_GUARD_PORTS = (5000, 5002, 5003, 5433, 9000, 9002, 3900, 3901, 3902, 3903,
+                               9997, 18888, 8888)
+_REMOTE_MODULE_DEPLOYMENT_KEYS = ('authentik_deployment', 'cloudtak_deployment', 'takportal_deployment',
+                                  'mediamtx_deployment', 'nodered_deployment', 'webodm_deployment',
+                                  'fedhub_deployment')
+
+
+def _remote_module_peer_ips(settings, own_key):
+    """IPv4s of the operator's OTHER remote module hosts, for a port guard's allow list.
+
+    ops #631: a remote TAK Portal calls a remote Authentik straight at host:9090
+    (_takportal_build_settings_dict), not through the console, so when the two sit on
+    different boxes the portal's box has to pass the Authentik guard too. A host name is
+    resolved here, on the console; best effort, an unresolvable one is left out."""
+    own = (_get_module_deployment_config(settings, own_key).get('remote', {}).get('host') or '').strip()
+    out = set()
+    for key in _REMOTE_MODULE_DEPLOYMENT_KEYS:
+        if key == own_key:
+            continue
+        cfg = _get_module_deployment_config(settings, key)
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not host or host == own:
+            continue
+        try:
+            out.add(str(ipaddress.IPv4Address(host)))
+        except ValueError:
+            try:
+                out.add(str(ipaddress.IPv4Address(socket.gethostbyname(host))))
+            except (OSError, ValueError):
+                pass
+    return sorted(out)
+
+
+def _remote_authentik_port_guard(deploy_cfg, settings, log_fn=None):
+    """ops #631: lock a remote Authentik's published ports to the console (+ peer module hosts)."""
+    return _remote_docker_port_guard(deploy_cfg, settings, 'authentik', REMOTE_AUTHENTIK_GUARD_PORTS,
+                                     log_fn=log_fn,
+                                     extra_allow=_remote_module_peer_ips(settings, 'authentik_deployment'))
+
+
+def _remote_cloudtak_guard_ports(settings):
+    """Ports the remote CloudTAK guard locks. With no domain, CloudTAK's own env sends the
+    browser straight to http://<remote>:5000 and :5002 (_cloudtak_build_env_content), so those
+    two stay open to everyone; with a domain, Caddy on the console is the only way in."""
+    ports = list(REMOTE_CLOUDTAK_GUARD_PORTS)
+    behind_caddy = bool((settings.get('fqdn') or '').strip()) or all(
+        (_get_service_domain(settings, k) or '').strip()
+        for k in ('cloudtak_map', 'cloudtak_tiles', 'cloudtak_video'))
+    if not behind_caddy:
+        ports = [p for p in ports if p not in (5000, 5002)]
+    return ports
+
+
+def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
+    """ops #631: lock a remote CloudTAK's published ports to the console (+ peer module hosts)."""
+    return _remote_docker_port_guard(deploy_cfg, settings, 'cloudtak', _remote_cloudtak_guard_ports(settings),
+                                     log_fn=log_fn,
+                                     extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
 
 
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
@@ -60957,7 +62808,10 @@ volumes:
         f.write(settings_js)
     with open('/tmp/nodered_docker-compose.yml', 'w') as f:
         f.write(compose_yml)
-    with open('/tmp/nodered_env', 'w') as f:
+    # ops #632: the env template is a secrets file — a private mkstemp (0600, no fixed
+    # /tmp name another local user could pre-create), and scp carries the 0600 across.
+    _nr_fd, _nr_env_tmp = tempfile.mkstemp(prefix='nodered-env-')
+    with os.fdopen(_nr_fd, 'w') as f:
         f.write(env_template)
     ok1, _ = _module_copy(deploy_cfg, '/tmp/nodered_settings.js', '~/node-red/settings.js', log_fn=plog)
     ok2, _ = _module_copy(deploy_cfg, '/tmp/nodered_docker-compose.yml', '~/node-red/docker-compose.yml', log_fn=plog)
@@ -60965,14 +62819,14 @@ volumes:
     try:
         _ok_check, _out_check = _module_run(deploy_cfg, 'test -f ~/node-red/.env && echo present || echo missing', timeout=5)
         if 'missing' in (_out_check or ''):
-            _module_copy(deploy_cfg, '/tmp/nodered_env', '~/node-red/.env', log_fn=plog)
+            _module_copy(deploy_cfg, _nr_env_tmp, '~/node-red/.env', log_fn=plog)
             _module_run(deploy_cfg, 'chmod 600 ~/node-red/.env', timeout=5)
     except Exception:
         pass
     try:
         os.remove('/tmp/nodered_settings.js')
         os.remove('/tmp/nodered_docker-compose.yml')
-        os.remove('/tmp/nodered_env')
+        os.remove(_nr_env_tmp)
     except Exception:
         pass
     if not ok1 or not ok2:
@@ -60985,7 +62839,7 @@ volumes:
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker on remote")
             nodered_deploy_status.update({'running': False, 'error': True})
@@ -61172,7 +63026,7 @@ def run_nodered_deploy():
         # Bootstrap an empty .env file (gitignored on operator hosts) so docker compose env_file: doesn't fail.
         # Operators opt into adminAuth by adding NR_ADMIN_USER/NR_ADMIN_PASSWORD_HASH/NR_CREDENTIAL_SECRET here.
         if not os.path.exists(env_file):
-            with open(env_file, 'w') as f:
+            with _open_secret_w(env_file) as f:
                 f.write("""# infra-TAK Node-RED env file
 # Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
 # Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
@@ -64640,7 +66494,7 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker")
             authentik_deploy_status.update({'running': False, 'error': True})
@@ -64703,12 +66557,15 @@ AUTHENTIK_TOKEN={bootstrap_token}
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS={_trusted_cidrs}{cookie_line}
 """
 
-    with open('/tmp/authentik_remote.env', 'w') as f:
+    # ops #632: 0600 here (scp carries the mode to the remote's /tmp copy) and on the
+    # final .env — it holds the Authentik secret key and Postgres password.
+    _ak_fd, _ak_env_tmp = tempfile.mkstemp(prefix='authentik-remote-env-')
+    with os.fdopen(_ak_fd, 'w') as f:
         f.write(env_content)
-    ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote.env', '/tmp/authentik.env', log_fn=plog)
-    _module_run(deploy_cfg, 'mv /tmp/authentik.env ~/authentik/.env', timeout=10)
+    ok, _ = _module_copy(deploy_cfg, _ak_env_tmp, '/tmp/authentik.env', log_fn=plog)
+    _module_run(deploy_cfg, 'mv /tmp/authentik.env ~/authentik/.env && chmod 600 ~/authentik/.env', timeout=10)
     try:
-        os.remove('/tmp/authentik_remote.env')
+        os.remove(_ak_env_tmp)
     except Exception:
         pass
     plog("✓ .env created")
@@ -64943,7 +66800,7 @@ entries:
       POSTGRES_USER: ${PG_USER:-authentik}
       POSTGRES_DB: ${PG_DB:-authentik}
   redis:
-    image: docker.io/library/redis:alpine
+    image: AK_REDIS_IMAGE_PLACEHOLDER
     command: --save 60 1 --loglevel warning
     restart: unless-stopped
     healthcheck:
@@ -65026,8 +66883,8 @@ entries:
     image: ghcr.io/goauthentik/ldap:${AUTHENTIK_TAG:-2026.2.0}
     # v0.9.12: LDAP outpost stays on 0.0.0.0 for REMOTE Authentik installs —
     # TAK Server on the console host has to reach this at remote_host:389.
-    # Tier 5 (source-scoped): the deploy step source-scopes UFW to the console
-    # IP only, so 389/636 are NOT reachable from the general internet.
+    # Tier 5 (source-scoped): the DOCKER-USER port guard admits only the console
+    # (ops #631).
     ports:
       - 389:3389
       - 636:6636
@@ -65060,6 +66917,7 @@ networks:
     external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
+    compose_content = compose_content.replace('AK_REDIS_IMAGE_PLACEHOLDER', AUTHENTIK_REDIS_IMAGE)
     # Adaptive PG tuning: probe remote host RAM and select appropriate settings.
     # v0.9.28 enterprise settings (12GB shared_buffers) crash PG on anything < 48GB.
     _ok_ram, _ram_out = _module_run(deploy_cfg, "free -m 2>/dev/null | awk '/^Mem:/{print $2}'", timeout=10)
@@ -65079,7 +66937,8 @@ networks:
         'command: ' + _pg_cmd_remote,
     )
     # Remote: bind port 9090 on 0.0.0.0 so Caddy on the console can reach
-    # forward_auth. UFW in Step 8 restricts this to the console IP only.
+    # forward_auth. The DOCKER-USER port guard below scopes it to the console
+    # (ops #631).
     compose_content = compose_content.replace(
         '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
         '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
@@ -65093,6 +66952,18 @@ networks:
     except Exception:
         pass
     plog("✓ docker-compose.yml created")
+
+    # ops #631: limit 9090 and LDAP 389/636 to the console BEFORE the containers start
+    # (Docker-published ports are filtered in DOCKER-USER, see _docker_port_guard_files).
+    # No lock = no start.
+    plog("")
+    plog("━━━ Locking Authentik ports to the console (remote) ━━━")
+    _ak_guard_ok, _ = _remote_authentik_port_guard(deploy_cfg, settings, log_fn=plog)
+    if not _ak_guard_ok:
+        plog("✗ Authentik was not started: its ports could not be limited to the console.")
+        plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
+        authentik_deploy_status.update({'running': False, 'error': True})
+        return
 
     # Step 6: Docker Compose up
     plog("")
@@ -65365,6 +67236,8 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, n
         return
     plog("\u2501\u2501\u2501 Reconfigure: Remote Authentik (no local ~/authentik) \u2501\u2501\u2501")
     plog(f"  Target: {host}")
+    # ops #631: (re)lock 9090 and LDAP 389/636 to the console before compose up.
+    _remote_authentik_port_guard(deploy_cfg, settings, log_fn=plog)
     _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=120, log_fn=plog)
     plog("  Ensured containers are up on remote")
     fqdn = settings.get('fqdn', '')
@@ -65659,7 +67532,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         if not _has_redis_svc:
             _redis_svc = (
                 '  redis:\n'
-                '    image: docker.io/library/redis:alpine\n'
+                f'    image: {AUTHENTIK_REDIS_IMAGE}\n'
                 '    command: --save 60 1 --loglevel warning\n'
                 '    restart: unless-stopped\n'
                 '    healthcheck:\n'
@@ -65719,6 +67592,31 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         if plog:
             plog(f"  ⚠ Compose patching error (legacy): {e}")
         return False
+
+
+def _authentik_loopback_port(entry):
+    """One compose `ports:` entry of the local Authentik, published on 127.0.0.1 only.
+
+    Short syntax `[HOST_IP:][HOST_PORT:]CONTAINER_PORT[/PROTO]`; `${VAR:-x}` defaults hold
+    colons of their own, so count colons with them blanked out. A wildcard host IP
+    (0.0.0.0, ::) becomes 127.0.0.1; any other host IP is the operator's and stays. Long
+    syntax gets host_ip. https://docs.docker.com/reference/compose-file/services/#ports"""
+    if isinstance(entry, dict):
+        if str(entry.get('host_ip') or '').strip() in ('', '0.0.0.0', '::', '[::]'):
+            return {**entry, 'host_ip': '127.0.0.1'}
+        return entry
+    if not isinstance(entry, str):
+        return entry   # an unquoted YAML int: nothing to bind
+    s = entry.strip()
+    for _wild in ('0.0.0.0:', '[::]:'):
+        if s.startswith(_wild):
+            return '127.0.0.1:' + s[len(_wild):]
+    colons = re.sub(r'\$\{[^}]*\}', 'X', s).split('/')[0].count(':')
+    if colons == 1:
+        return '127.0.0.1:' + s
+    if colons == 0:
+        return '127.0.0.1::' + s
+    return entry
 
 
 def _ensure_authentik_compose_patches(compose_path, plog=None):
@@ -65832,7 +67730,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     # v0.9.17: old installs are missing the redis: service (Authentik worker burned CPU retrying localhost:6379)
     if 'redis' not in services:
         services['redis'] = {
-            'image': 'docker.io/library/redis:alpine',
+            'image': AUTHENTIK_REDIS_IMAGE,
             'command': '--save 60 1 --loglevel warning',
             'restart': 'unless-stopped',
             'healthcheck': {
@@ -65873,6 +67771,21 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             changed = True
             if plog:
                 plog("  ✓ Added redis: to top-level volumes section")
+
+    # ── Published ports → 127.0.0.1 (ops #631) ────────────────────────────────
+    # This file is always the LOCAL Authentik (~/authentik); Caddy reaches it at
+    # 127.0.0.1:9090 and containers over the infratak network. Upstream's compose publishes
+    # ${COMPOSE_PORT_HTTP}/${COMPOSE_PORT_HTTPS} with no host IP; bind them to loopback here,
+    # at deploy time, the same as the post-update _auto_authentik_ports does.
+    for _svc_name, _svc in services.items():
+        if not isinstance(_svc, dict) or not isinstance(_svc.get('ports'), list):
+            continue
+        _new_ports = [_authentik_loopback_port(_p) for _p in _svc['ports']]
+        if _new_ports != _svc['ports']:
+            _svc['ports'] = _new_ports
+            changed = True
+            if plog:
+                plog(f"  ✓ Bound {_svc_name} published ports to 127.0.0.1")
 
     if not changed:
         return False
@@ -66647,7 +68560,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
         sep = '' if env_text.endswith('\n') or not env_text else '\n'
         new_text = env_text + sep + new_line
-        with open(env_path, 'w') as _f:
+        with _open_secret_w(env_path) as _f:
             _f.write(new_text)
         plog(f"  gunicorn timeout: appended GUNICORN_CMD_ARGS=--timeout={int(value)} to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
 
@@ -66659,7 +68572,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         if _r.returncode == _AK_COMPOSE_LOCK_BUSY_RC:
             # Undo the .env line, or the next run would see it and skip as "already set"
             # while the running server never got it.
-            with open(env_path, 'w') as _f:
+            with _open_secret_w(env_path) as _f:
                 _f.write(env_text)
             plog(f"  gunicorn timeout: server recreate {_r.stdout} — .env restored, next run retries")
             return
@@ -66777,7 +68690,7 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
         sep = '' if env_text.endswith('\n') or not env_text else '\n'
         header = '\n# v0.9.20: Django persistent DB connections — cuts handshake churn ~95% under heavy load.\n# Both keys use DOUBLE underscore between segments per Authentik docs (single is silently ignored).\n'
         new_text = env_text + sep + header + '\n'.join(appended) + '\n'
-        with open(env_path, 'w') as _f:
+        with _open_secret_w(env_path) as _f:
             _f.write(new_text)
         plog(f"  pg persistent connections: appended {len(appended)} var(s) to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
         for line in appended:
@@ -66892,7 +68805,7 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
             'CONN_MAX_AGE=60',
             'CONN_MAX_AGE=10'
         )
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(new_text)
         plog(f"  ✓ conn_max_age: lowered CONN_MAX_AGE 60→10 in ~/authentik/.env (backup: {os.path.basename(backup_path)})")
         plog("    Reason: enterprise license cache miss creates 1 idle PG conn/2s; at 60s retention → exhausts max_connections=500 in ~20 min")
@@ -67010,7 +68923,7 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
             )
             _changes.append("MAX_REQUESTS_JITTER=0→50")
 
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(new_text)
 
         plog(f"  ✓ max_requests: re-enabled gunicorn worker recycling ({', '.join(_changes)})")
@@ -67174,7 +69087,7 @@ def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
                 pass
             return False
 
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(_new_text)
 
         _saved_recreates = max(0, _estimate_cascade_recreates(_cur_max, _baseline))
@@ -68061,10 +69974,14 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
             return False
         plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
         subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
-        if os.path.exists('/usr/local/etc/mediamtx.yml'):
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
+        _owner = _mediamtx_owner()          # ops #643: never back to takwerx once moved
+        if _owner != 'takwerx':
+            _mediamtx_hand_over_files(_owner)
+        else:
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
+            if os.path.exists('/usr/local/etc/mediamtx.yml'):
+                subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                        capture_output=True, timeout=15)
         # Give it a moment and re-check
@@ -68676,7 +70593,7 @@ def _authentik_apply_official_tunings(plog):
         return False
 
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog("  authentik tunings: .env updated:")
         for action in actions:
@@ -69850,7 +71767,7 @@ def _ensure_authentik_pgbouncer(plog):
     try:
         with open(compose_bak, 'w') as f:
             f.write(raw_compose)
-        with open(env_bak, 'w') as f:
+        with _open_secret_w(env_bak) as f:
             f.write(env_content)
         plog(f"  pgbouncer install: backups written ({compose_bak}, {env_bak})")
     except Exception as e:
@@ -70008,7 +71925,7 @@ def _ensure_authentik_pgbouncer(plog):
     new_env_content = '\n'.join(new_env_lines).rstrip('\n') + '\n'
 
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_env_content)
         plog("  pgbouncer install: .env updated (5 keys: HOST→pgbouncer, PORT, "
              "DISABLE_SERVER_SIDE_CURSORS=true, CONN_HEALTH_CHECKS=true, CONN_MAX_AGE=0)")
@@ -70017,7 +71934,7 @@ def _ensure_authentik_pgbouncer(plog):
         try:
             with open(compose_path, 'w') as f:
                 f.write(raw_compose)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(env_content)
         except Exception:
             pass
@@ -70044,7 +71961,7 @@ def _ensure_authentik_pgbouncer(plog):
         try:
             with open(compose_path, 'w') as f:
                 f.write(raw_compose)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(env_content)
             if started:
                 _ak_compose_subprocess(
@@ -70175,7 +72092,7 @@ def _ensure_authentik_pgbouncer(plog):
                     _new.append('AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50')
                 else:
                     _new.append(ln)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write('\n'.join(_new).rstrip('\n') + '\n')
             plog("  pgbouncer install: reset MAX_REQUESTS to baseline=1000, JITTER=50 "
                  "(autotune floor=100 is no longer load-bearing with PgBouncer in place)")
@@ -70569,7 +72486,7 @@ def _ensure_authentik_server_direct_listen(plog):
             'server-direct-listen', plog, cwd=ak_dir, capture_output=True, text=True, timeout=180)
 
     def _restore_env():
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(env_text)
 
     plog("  server direct-listen: setting AUTHENTIK_POSTGRESQL__DIRECT__HOST/CONN_OPTIONS and recreating "
@@ -70579,10 +72496,10 @@ def _ensure_authentik_server_direct_listen(plog):
             plog("  server direct-listen: compose lock busy — skipped, next console boot retries")
             return None
         try:
-            with open(env_bak, 'w') as f:
+            with _open_secret_w(env_bak) as f:
                 f.write(env_text)
             os.chmod(env_bak, 0o600)
-            with open(env_path, 'w') as f:
+            with _open_secret_w(env_path) as f:
                 f.write(new_text)
         except Exception as e:
             plog(f"  ✗ server direct-listen: .env write failed ({e}) — restoring")
@@ -73873,7 +75790,7 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
             f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={new_jitter}',
             _new_txt, flags=re.MULTILINE
         )
-        with open(ak_env, 'w') as _f:
+        with _open_secret_w(ak_env) as _f:
             _f.write(_new_txt)
 
         plog(
@@ -75644,7 +77561,7 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
 
     new_content = content.rstrip('\n') + f'\n{key}={value}\n'
     try:
-        with open(env_path, 'w') as f:
+        with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog(f"  trusted proxy CIDRs: appended {key}={value}")
         plog(f"    Authentik will now record real client IPs (not Docker bridge 172.18.0.1)")
@@ -76751,7 +78668,7 @@ def run_authentik_deploy(reconfigure=False):
                     env_lines = f.readlines()
                 has_cookie_domain = any(line.strip().startswith('AUTHENTIK_COOKIE_DOMAIN=') for line in env_lines)
                 if not has_cookie_domain:
-                    with open(env_path, 'w') as f:
+                    with _open_secret_w(env_path) as f:
                         for line in env_lines:
                             f.write(line)
                         f.write(f"# Cookie domain — session shared across subdomains (avoids stream. redirect loop)\nAUTHENTIK_COOKIE_DOMAIN={cookie_domain_val}\n")
@@ -76832,7 +78749,7 @@ def run_authentik_deploy(reconfigure=False):
                                 if not seen:
                                     new_env.append(f'AUTHENTIK_HOST={ak_base}\n')
                                 if new_env != env_lines:
-                                    with open(env_path, 'w') as f:
+                                    with _open_secret_w(env_path) as f:
                                         f.writelines(new_env)
                                     restart_why.append('AUTHENTIK_HOST in .env')
                                 elif _ak_container_env_value('authentik-server-1', 'AUTHENTIK_HOST') not in (None, '', ak_base):
@@ -77003,7 +78920,7 @@ AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
 # AUTHENTIK_EMAIL__USE_TLS=true
 # AUTHENTIK_EMAIL__FROM=authentik@example.com
 """
-                with open(env_path, 'w') as f:
+                with _open_secret_w(env_path) as f:
                     f.write(env_content)
                 plog("  Generated PostgreSQL password")
                 plog("  Generated secret key")
@@ -77734,31 +79651,11 @@ entries:
                         if not auth_flow_pk or not inv_flow_pk:
                             plog(f"  ✗ Missing flows — auth={auth_flow_pk} inv={inv_flow_pk}")
                         else:
-                            # Create LDAP provider
-                            ldap_provider_pk = None
+                            # Create LDAP provider (ops #663: retries a 5xx from a busy API)
                             ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
                             ldap_bind_flow = ldap_flow_pk or auth_flow_pk
-                            try:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
-                                    data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
-                                        'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
-                                        'base_dn': 'DC=takldap', 'bind_mode': 'cached',
-                                        'search_mode': 'cached', 'mfa_support': False}).encode(),
-                                    headers=ak_headers, method='POST')
-                                resp = urllib.request.urlopen(req, timeout=10)
-                                ldap_provider_pk = json.loads(resp.read().decode())['pk']
-                                plog(f"  ✓ Created LDAP provider (pk={ldap_provider_pk})")
-                            except urllib.error.HTTPError as e:
-                                err = e.read().decode()[:200]
-                                if e.code == 400:
-                                    req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/?search=LDAP',
-                                        headers=ak_headers)
-                                    resp = urllib.request.urlopen(req, timeout=10)
-                                    results = json.loads(resp.read().decode())['results']
-                                    ldap_provider_pk = results[0]['pk'] if results else None
-                                    plog(f"  ✓ LDAP provider already exists (pk={ldap_provider_pk})")
-                                else:
-                                    plog(f"  ✗ LDAP provider creation failed: {e.code} {err}")
+                            ldap_provider_pk = _ak_ldap_provider_ensure(
+                                ak_url, ak_headers, ldap_bind_flow, inv_flow_pk, plog=plog)
     
                             # Create LDAP application
                             if ldap_provider_pk:
@@ -79162,12 +81059,37 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
     # .env (memory: authentik-ldapservice-password-mismatch-fresh-deploy). Retesting fixes
     # neither, so the loop heals both, and only green-lights on a real live bind.
     healed_routing = False
+    healed_token = False
     healed = False
     for i in range(1, attempts + 1):
         plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  ✓ LDAP service-account bind verified via live ldapsearch (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
+        # Heal 0 — TOKEN (ops #663): an outpost the Authentik API refuses with
+        # `403 Token invalid/expired` never loads its provider, so no bind can pass and
+        # neither routing nor the password is the cause. This gate used to name it at the
+        # very end ("Fix LDAP token ... repairs this") and leave the repair to someone
+        # else; on a fresh Rocky 9 install nobody did, for 70 minutes. Repair it here.
+        if not healed_token and i >= 2:
+            try:
+                _rejected = _ldap_outpost_token_rejected()
+            except Exception:
+                _rejected = False
+            if _rejected:
+                healed_token = True
+                plog("  ⏳ LDAP outpost is refused by the Authentik API (token) — repairing its token…")
+                try:
+                    _tok_ok, _tok_msg = _repair_ldap_outpost_token(plog_fn=plog)
+                except Exception as _tke:
+                    _tok_ok, _tok_msg = False, str(_tke)[:120]
+                plog(f"     LDAP outpost token: {str(_tok_msg)[:140]}")
+                if _tok_ok:
+                    for _w in range(6):
+                        time.sleep(delay_sec)
+                        if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                            plog("  ✓ LDAP SA bind verified via live ldapsearch after token repair. Safe to proceed.")
+                            return True
         # Heal 1 — ROUTING (the usual fresh-deploy disease, field-confirmed 2026-07-08 NUC):
         # a fresh deploy ships the outpost on internal routing (http://authentik-server-1:9000),
         # which exposes the Authentik 2026.x flow recursion — the FIRST bind dies with
@@ -79592,6 +81514,88 @@ def _ldap_outpost_token_rejected(since='180s'):
             and ('token invalid' in low or '403 forbidden' in low))
 
 
+def _ak_ldap_provider_ensure(ak_url, headers, bind_flow_pk, inv_flow_pk, plog=None,
+                             attempts=6, delay=10):
+    """ops #663: find or create the Authentik LDAP provider, and ride out a busy API.
+
+    Fresh deploy, Rocky 9, 2026-11-11: the POST to /providers/ldap/ came back 500 while
+    Authentik was still settling. The old code only knew 400 ("already exists"), logged
+    "LDAP provider creation failed" and skipped everything after it: no application, no
+    outpost, no token. The compose file kept AUTHENTIK_TOKEN: placeholder, the outpost
+    sat on `403 Forbidden (Token invalid/expired)` for 70 minutes, and TAK Server got no
+    LDAP groups. A 5xx or a dropped connection is not a final answer: look first (the
+    provider may exist despite the 500), then retry. Returns the provider pk, or None.
+    """
+    import urllib.request as _req
+    import urllib.error as _uerr
+    _log = plog or (lambda m: None)
+
+    def _find():
+        r = json.loads(_req.urlopen(_req.Request(
+            f'{ak_url}/api/v3/providers/ldap/?search=LDAP', headers=headers),
+            timeout=10).read().decode()).get('results', [])
+        hit = next((x for x in r if x.get('name') == 'LDAP'), r[0] if r else None)
+        return hit['pk'] if hit else None
+
+    last = ''
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            pk = _find()
+            if pk:
+                _log(f"  \u2713 LDAP provider already exists (pk={pk})")
+                return pk
+            body = json.dumps({'name': 'LDAP', 'authentication_flow': bind_flow_pk,
+                               'authorization_flow': bind_flow_pk, 'invalidation_flow': inv_flow_pk,
+                               'base_dn': 'DC=takldap', 'bind_mode': 'cached',
+                               'search_mode': 'cached', 'mfa_support': False}).encode()
+            resp = _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/ldap/', data=body,
+                                             headers=headers, method='POST'), timeout=10)
+            pk = json.loads(resp.read().decode())['pk']
+            _log(f"  \u2713 Created LDAP provider (pk={pk})")
+            return pk
+        except _uerr.HTTPError as e:
+            try:
+                err = e.read().decode()[:120]
+            except Exception:
+                err = ''
+            if e.code == 400:
+                try:
+                    pk = _find()
+                except Exception:
+                    pk = None
+                if pk:
+                    _log(f"  \u2713 LDAP provider already exists (pk={pk})")
+                    return pk
+            if e.code < 500 and e.code != 400:
+                _log(f"  \u2717 LDAP provider creation failed: {e.code} {err}")
+                return None
+            last = f'{e.code} {err}'
+        except Exception as e:  # dropped connection, timeout, bad JSON from a restarting API
+            last = str(e)[:120]
+        if attempt < attempts:
+            _log(f"  \u23f3 LDAP provider not created yet ({last[:80]}) — retrying ({attempt}/{attempts - 1})...")
+            time.sleep(delay)
+    _log(f"  \u2717 LDAP provider creation failed after {attempts} tries: {last}")
+    return None
+
+
+def _ak_ldap_flow_pks(ak_url, headers):
+    """ops #663: (bind_flow_pk, invalidation_flow_pk) for a new LDAP provider; None where missing."""
+    import urllib.request as _req
+
+    def _get(path):
+        return json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/{path}', headers=headers),
+                                       timeout=10).read().decode()).get('results', [])
+    auth = _get('flows/instances/?designation=authentication')
+    ldap_flow = next((f['pk'] for f in auth if f.get('slug') == 'ldap-authentication-flow'), None)
+    default = next((f['pk'] for f in auth if f.get('slug') == 'default-authentication-flow'),
+                   auth[0]['pk'] if auth else None)
+    inv = _get('flows/instances/?designation=invalidation')
+    inv_pk = next((f['pk'] for f in inv if 'invalidation' in f.get('slug', '')
+                   and 'provider' not in f.get('slug', '')), inv[0]['pk'] if inv else None)
+    return (ldap_flow or default), inv_pk
+
+
 def _repair_ldap_outpost_token(plog_fn=None):
     """v10.1.76: re-read the LDAP outpost's real token from Authentik, write it
     into docker-compose.yml, and recreate the outpost container.
@@ -79628,7 +81632,28 @@ def _repair_ldap_outpost_token(plog_fn=None):
         outpost = next((o for o in results
                         if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
         if not outpost:
-            return False, 'LDAP outpost not found in Authentik'
+            # ops #663: a deploy whose provider step failed leaves NO outpost, and the
+            # container keeps the placeholder token. Build what is missing, then go on.
+            _bind_flow, _inv_flow = _ak_ldap_flow_pks(url, headers)
+            if not (_bind_flow and _inv_flow):
+                return False, 'LDAP outpost not found in Authentik, and its flows are not ready'
+            _prov = _ak_ldap_provider_ensure(url, headers, _bind_flow, _inv_flow, plog=_log)
+            if not _prov:
+                return False, 'LDAP outpost not found in Authentik, and the LDAP provider could not be created'
+            try:
+                _req.urlopen(_req.Request(f'{url}/api/v3/core/applications/', data=json.dumps(
+                    {'name': 'LDAP', 'slug': 'ldap', 'provider': _prov,
+                     'open_in_new_tab': True}).encode(), headers=headers, method='POST'), timeout=10)
+            except _uerr.HTTPError as _ae:
+                if _ae.code != 400:  # 400 = the application exists already
+                    _log(f'LDAP application not created ({_ae.code}); continuing')
+            _resp = _req.urlopen(_req.Request(f'{url}/api/v3/outposts/instances/', data=json.dumps(
+                {'name': 'LDAP', 'type': 'ldap', 'providers': [_prov],
+                 'config': {'authentik_host': 'http://authentik-server-1:9000/',
+                            'authentik_host_insecure': True}}).encode(),
+                headers=headers, method='POST'), timeout=30)
+            outpost = json.loads(_resp.read().decode())
+            _log('LDAP provider and outpost were missing in Authentik; created them')
         tok_id = outpost.get('token_identifier') or outpost.get('token')
         if not tok_id:
             tok_id = (_get(f"outposts/instances/{outpost['pk']}/").get('token_identifier')
@@ -84246,35 +86271,39 @@ def takserver_groups():
     admin_p12 = os.path.join(cert_dir, 'admin.p12')
     if not os.path.exists(admin_p12):
         return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
+    # ops #632: the unencrypted admin key used to go to the FIXED path
+    # /tmp/tak-admin-curl.key through a shell `>` (umask 022 → 0644), so any local user
+    # could copy TAK's admin identity while the route ran. Everything now lives in a
+    # per-request 0700 mkdtemp dir that the finally removes, and the cert password goes
+    # through openssl's environment, not argv.
+    import tempfile as _tf
+    _work = _tf.mkdtemp(prefix='tak-admin-curl-')
     try:
         # TAK Server generates legacy PKCS12 (RC2-40-CBC) that modern curl/OpenSSL 3.x
         # rejects (exit 58). Extract PEM cert+key with -legacy flag for curl.
-        admin_pem = '/tmp/tak-admin-curl.pem'
-        admin_key = '/tmp/tak-admin-curl.key'
+        admin_pem = os.path.join(_work, 'admin.pem')
+        admin_key = os.path.join(_work, 'admin.key')
         # v10.0.5 non-root: admin.p12 is 0600 tak:tak — cat it via the broker into a temp so
         # openssl can read it (raw openssl as takwerx -> empty PEM -> "Failed to extract").
-        import tempfile as _tf
-        _src_p12, _tmp_src = admin_p12, None
+        _src_p12 = admin_p12
         try:
             _cat = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=10)
             if _cat.returncode == 0 and _cat.stdout:
-                _fd, _tmp_src = _tf.mkstemp(suffix='.p12')
+                _src_p12 = os.path.join(_work, 'admin.p12')
+                _fd = os.open(_src_p12, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(_fd, 'wb') as _f:
                     _f.write(_cat.stdout)
-                _src_p12 = _tmp_src
         except Exception:
             pass
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _src_p12, '-passin', _pw_arg,
+             '-clcerts', '-nokeys', '-legacy', '-out', admin_pem],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         subprocess.run(
-            f'openssl pkcs12 -in {_src_p12} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
-            shell=True, capture_output=True, text=True, timeout=10)
-        if _tmp_src:
-            try:
-                os.remove(_tmp_src)
-            except Exception:
-                pass
+            ['openssl', 'pkcs12', '-in', _src_p12, '-passin', _pw_arg,
+             '-nocerts', '-nodes', '-legacy', '-out', admin_key],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
         import json as _json
@@ -84388,11 +86417,7 @@ def takserver_groups():
     except Exception as e:
         return jsonify({'error': str(e)[:200], 'groups': []})
     finally:
-        for f in ['/tmp/tak-admin-curl.pem', '/tmp/tak-admin-curl.key']:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+        shutil.rmtree(_work, ignore_errors=True)
 
 
 @app.route('/api/takserver/ca-info')
@@ -89022,12 +91047,25 @@ def _tak58_container_run_detached(container, pw, shell_cmd, tag, say, progress=N
     Returns the command's exit code, or None on timeout.
     """
     rc_path = f'/tmp/{tag}.rc'
+    pw_path = f'/tmp/{tag}.pw'
     subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', rc_path]),
                    capture_output=True, timeout=60)
+    # ops #632: a detached exec has no stdin, and `-e PGPASSWORD=<pw>` put the martiuser
+    # password in the broker's argv (ps, every local user). Hand it over on stdin into a
+    # 600 file INSIDE the container; the detached command reads and deletes it first.
+    w = subprocess.run(_sudo_wrap(['docker', 'exec', '-i', container, 'sh', '-c',
+                                   f'umask 077; cat > {pw_path}']),
+                       input=pw or '', capture_output=True, text=True, timeout=60)
+    if w.returncode != 0:
+        say(f'  Could not start {tag} in {container}: {(w.stderr or "").strip()[:200]}')
+        return None
     r = subprocess.run(_sudo_wrap([
-        'docker', 'exec', '-d', '-e', f'PGPASSWORD={pw}', container, 'sh', '-c',
+        'docker', 'exec', '-d', container, 'sh', '-c',
+        f'PGPASSWORD="$(cat {pw_path})"; rm -f {pw_path}; export PGPASSWORD; '
         f'{shell_cmd}; echo $? > {rc_path}']), capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
+        subprocess.run(_sudo_wrap(['docker', 'exec', container, 'rm', '-f', pw_path]),
+                       capture_output=True, timeout=60)
         say(f'  Could not start {tag} in {container}: {(r.stderr or "").strip()[:200]}')
         return None
     t0 = time.time()
@@ -89073,10 +91111,13 @@ def _tak58_container_psql(container, pgbin, pw, sql, timeout=300):
     """One console-authored SQL statement as martiuser over TCP inside `container`.
     Returns stdout, or None when psql failed. Never pass request-derived SQL here."""
     try:
+        # Password on stdin, not argv (ops #632); psql then gets its args via "$@".
         r = subprocess.run(_sudo_wrap([
-            'docker', 'exec', '-e', f'PGPASSWORD={pw}', container,
+            'docker', 'exec', '-i', container, 'sh', '-c',
+            'IFS= read -r PGPASSWORD; export PGPASSWORD; exec "$0" "$@"',
             f'{pgbin}/psql', '-h', 'localhost', '-U', 'martiuser', '-d', 'cot',
-            '-tAX', '-c', sql]), capture_output=True, text=True, timeout=timeout)
+            '-tAX', '-c', sql]), input=(pw or '') + '\n',
+            capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
     return r.stdout if r.returncode == 0 else None
@@ -92668,6 +94709,14 @@ def takserver_snapshot_upload_api():
         if not has_core and not has_pgdump:
             return jsonify({'ok': False, 'error': 'Archive does not appear to be a TAK Server snapshot (missing CoreConfig.xml and cot.pgdump)'}), 400
 
+        # Refuse an archive that would write outside SNAPSHOT_DIR (../, absolute names,
+        # links pointing out, device files) before anything is extracted
+        try:
+            with _tarfile.open(tmp_path, 'r:gz') as tf:
+                _safe_tar_check(tf, SNAPSHOT_DIR)
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': f'Unsafe archive: {e}'}), 400
+
         # Extract — honour the top-level directory inside the archive (tar -C SNAPSHOT_DIR)
         result = subprocess.run(
             ['tar', '-xzf', tmp_path, '-C', SNAPSHOT_DIR],
@@ -93123,12 +95172,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
-                for info in zf.infolist():
-                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if mode and not info.is_dir():
-                        try: os.chmod(out_path, mode)
-                        except OSError: pass
+                _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as e:
             return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
         _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
@@ -95216,14 +97260,7 @@ def _deploy_takserver_container(config):
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
-                for info in zf.infolist():
-                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if mode and not info.is_dir():
-                        try:
-                            os.chmod(out_path, mode)
-                        except OSError:
-                            pass
+                _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as _ze:
             log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
             deploy_status.update({'error': True, 'running': False}); return
@@ -96985,12 +99022,17 @@ def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
         os.close(_fdp)
         _fdk, _key = tempfile.mkstemp(suffix='.key', prefix='tak-marti-key-')
         os.close(_fdk)
+        # -out onto the 0600 mkstemp files (openssl truncates, the mode stays); the
+        # password goes through the environment, not argv (ops #632).
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {shlex.quote(_pem)}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _tmp_src, '-passin', _pw_arg,
+             '-clcerts', '-nokeys', '-legacy', '-out', _pem],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {shlex.quote(_key)}',
-            shell=True, capture_output=True, text=True, timeout=10)
+            ['openssl', 'pkcs12', '-in', _tmp_src, '-passin', _pw_arg,
+             '-nocerts', '-nodes', '-legacy', '-out', _key],
+            capture_output=True, text=True, timeout=10, env=_pw_env)
         if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
             return None, 'PEM extraction failed'
         _body_file = None
@@ -97496,13 +99538,17 @@ def _takportal_sync_certs(plog=None, restart=False):
         # p12 — the real reason the portal could never read its client cert.
         # -legacy is required to READ TAK's RC2-40-CBC admin.p12; the export stage
         # defaults to modern AES, which the portal's Node 22 / OpenSSL 3 can read.
+        # Password through the environment, not argv (ops #632).
+        _pw_arg, _pw_env = _openssl_pass_env(cert_pass)
         subprocess.run(
-            f'openssl pkcs12 -in {shlex.quote(_local_admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=30)
+            ['openssl', 'pkcs12', '-in', _local_admin_p12, '-passin', _pw_arg,
+             '-nodes', '-legacy', '-out', tmp_pem],
+            capture_output=True, text=True, timeout=30, env=_pw_env)
         if os.path.exists(tmp_pem) and os.path.getsize(tmp_pem) > 0:
             subprocess.run(
-                f'openssl pkcs12 -export -in {shlex.quote(tmp_pem)} -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)} 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=30)
+                ['openssl', 'pkcs12', '-export', '-in', tmp_pem, '-passout', _pw_arg,
+                 '-out', modern_p12],
+                capture_output=True, text=True, timeout=30, env=_pw_env)
         try:
             os.remove(tmp_pem)
         except OSError:
@@ -102250,13 +104296,17 @@ def console_password_reset():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], current):
         return jsonify({'success': False, 'error': 'Current password is wrong'}), 403
-    if not new_pw or len(new_pw) < 8:
-        return jsonify({'success': False, 'error': 'New password must be at least 8 characters'}), 400
+    if not new_pw or len(new_pw) < CONSOLE_PASSWORD_MIN_LEN:   # ops #638 (was 8)
+        return jsonify({'success': False, 'error': 'New password must be at least %d characters'
+                        % CONSOLE_PASSWORD_MIN_LEN}), 400
     if new_pw != confirm:
         return jsonify({'success': False, 'error': 'New password and confirmation do not match'}), 400
     auth['password_hash'] = generate_password_hash(new_pw)
     auth['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    auth['password_min_len_ok'] = True
     save_auth(auth)
+    # ops #634: the new hash ends every other session; keep this one.
+    _stamp_session_login()
     _detached_console_restart()
     return jsonify({'success': True, 'message': 'Password updated. Console will restart in a few seconds.'})
 
@@ -102872,6 +104922,33 @@ def _sync_java_cacerts(log_fn=None):
     return r
 
 
+def _upgrade_mediamtx_pylib_certifi(_log):
+    """ops #643: an editor on its own account loads certifi from its package dir (first on
+    its PYTHONPATH), which the CONSOLE owns — so check and upgrade that copy right here, as
+    the console, with the broker's own distrusted-root matcher. No root needed."""
+    bundle = os.path.join(_MEDIAMTX_EDITOR_PYLIB, 'certifi', 'cacert.pem')
+    try:
+        match = _broker_module()._bundle_distrusted
+    except Exception as e:
+        _log(f"MediaMTX certifi check skipped ({str(e)[:160]})")
+        return None
+    bad = match(bundle)
+    if not bad:
+        return {'ok': True, 'upgraded': []}
+    r = subprocess.run(['/usr/bin/python3', '-m', 'pip', 'install', '--target', _MEDIAMTX_EDITOR_PYLIB,
+                        '--upgrade', 'certifi'], capture_output=True, text=True, timeout=600,
+                       env=dict(os.environ, PYTHONNOUSERSITE='1', PIP_DISABLE_PIP_VERSION_CHECK='1'))
+    left = match(bundle)
+    if r.returncode != 0 or left:
+        _log(f"⚠ MediaMTX certifi upgrade: {((r.stderr or r.stdout or '').strip()[-200:]) or 'still distrusted'}"
+             " — retries next restart")
+        return {'ok': False, 'upgraded': []}
+    _log(f"✓ MediaMTX web editor: upgraded its certifi ({bundle}), which still trusted {', '.join(bad)}")
+    subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'mediamtx-webeditor']),
+                   capture_output=True, text=True, timeout=60)
+    return {'ok': True, 'upgraded': [{'user': _MEDIAMTX_RUN_USER, 'path': bundle, 'removed': bad}]}
+
+
 def _upgrade_mediamtx_certifi(log_fn=None):
     """Upgrade the MediaMTX web editor's certifi when it still trusts a root the OS vendors
     have distrusted (ops #202): root's pip copy in /usr/local, and the editor user's own if
@@ -102885,6 +104962,8 @@ def _upgrade_mediamtx_certifi(log_fn=None):
     _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
     if not os.path.isdir('/opt/mediamtx-webeditor'):
         return None
+    if _mediamtx_editor_uses_pylib():
+        return _upgrade_mediamtx_pylib_certifi(_log)
     if _broker_should_route() and _broker_available():
         try:
             r = _broker_request({'op': 'certifi_upgrade'}, timeout=900)
@@ -103191,6 +105270,7 @@ def _start_guarddog_background_at_boot():
 
 
 _start_guarddog_background_at_boot()
+_fw_remove_blanket_internal_ports()   # before the 8080 source-scope below
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
 
@@ -104660,9 +106740,11 @@ def _startup_converge_mediamtx_editor_write():
             # time, matching the three boxes that already run it as takwerx (proven — a
             # real save round-tripped on test12 with the config intact). Patch in place
             # rather than rewriting: the unit carries per-box Environment/LDAP lines.
-            new_txt = re.sub(r'(?m)^User=\S+[ \t]*$', 'User=takwerx', unit_txt, count=1)
+            # ops #643: only User=root is rewritten — an editor already on its own account
+            # (mediamtx) must not be put back on the console's.
+            new_txt = re.sub(r'(?m)^User=root[ \t]*$', 'User=takwerx', unit_txt, count=1)
             moved_off_root = 'User=root' in unit_txt
-            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
+            new_txt = re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
             if 'UMask=0027' not in new_txt:
                 # Never skip quietly — say why, so this cannot rot unnoticed.
                 print('Startup migration: ⚠ MediaMTX editor unit has no User= line to anchor '
@@ -104735,14 +106817,15 @@ def _caddy_group_exists():
 
 
 def _mediamtx_unit_with_caddy_group(txt):
-    """Return `txt` with `SupplementaryGroups=caddy` right after `User=takwerx`.
+    """Return `txt` with `SupplementaryGroups=caddy` right after its `User=` line.
 
     Idempotent. systemd refuses to start a unit whose SupplementaryGroups= names a group
     that does not exist (status=216/GROUP), and the `caddy` group only exists once Caddy
     is installed, so the line may only be written when the group is there (ops #313)."""
     if re.search(r'(?m)^SupplementaryGroups=.*\bcaddy\b', txt):
         return txt
-    return re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
+    # ops #643: any User= (takwerx, or mediamtx once moved), never just takwerx.
+    return re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
 
 
 def _mediamtx_unit_text():
@@ -104805,6 +106888,26 @@ def _mediamtx_editor_trusted_proxies(settings=None, deploy_cfg=None):
     return ','.join(peers)
 
 
+# ops #632: the MediaMTX editor's Authentik token lives here, mode 600 root, never as
+# Environment= in the unit. The unit is 0644, and systemd hands Environment= values to
+# any local user (`systemctl show -p Environment`); an EnvironmentFile's contents it
+# does not. The `-` keeps the editor starting on a box with no Authentik (no file).
+_MEDIAMTX_EDITOR_SECRET_ENV = '/usr/local/etc/mediamtx-webeditor.env'
+_MEDIAMTX_EDITOR_ENVFILE_LINE = f'EnvironmentFile=-{_MEDIAMTX_EDITOR_SECRET_ENV}'
+
+
+def _mediamtx_editor_secret_env_text(token):
+    return ('# Written by infra-TAK. Mode 600: the Authentik token is kept out of the\n'
+            '# mediamtx-webeditor unit file, which every local user can read.\n'
+            f'AUTHENTIK_TOKEN={token}\n')
+
+
+def _write_mediamtx_editor_secret_env(token):
+    """Write the editor's token file on THIS box: empty at 600 first, then the token."""
+    _write_priv(_MEDIAMTX_EDITOR_SECRET_ENV, '', perm=0o600)
+    _write_priv(_MEDIAMTX_EDITOR_SECRET_ENV, _mediamtx_editor_secret_env_text(token), perm=0o600)
+
+
 def _unit_text_with_env(txt, key, value):
     """Return `txt` with exactly one `Environment=key=value` line in [Service].
 
@@ -104834,6 +106937,126 @@ def _unit_text_with_env(txt, key, value):
             return txt  # not a unit file we recognise — leave it alone
     out.insert(last_env + 1, want)
     return '\n'.join(out)
+
+
+_MEDIAMTX_REMOTE_FW_ALERT_EVERY_S = 86400   # one mail a day per box, the console restarts daily
+
+
+def _startup_converge_mediamtx_remote_firewall():
+    """ops #630: re-check the firewall of an existing remote MediaMTX box on console start.
+
+    Boxes deployed before the fix were "closed" by rules in a firewall that may never
+    have been on, and the deploy is not re-run on update. So on every console start:
+    turn the remote firewall on if it is off (SSH kept open), re-apply the rules in the
+    right order (console allowed before the deny), and if the firewall cannot be turned
+    on, stop the web editor there (streaming keeps running) and send a Guard Dog mail.
+    A box we cannot reach is only logged: we know nothing about it."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = (cfg.get('remote') or {}).get('host') or ''
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
+            return
+        lines = []
+        state, failed = _mediamtx_remote_firewall(settings, cfg, lines.append)
+        for ln in lines:
+            print(f"Startup migration: [MediaMTX remote firewall] {ln}", flush=True)
+        if state == 'unknown':
+            return
+        marker = os.path.join(CONFIG_DIR, 'mediamtx_remote_editor_stopped')
+        if state == 'off':
+            _module_run(cfg, _REMOTE_SUDO_SH + '$S systemctl disable --now mediamtx-webeditor 2>/dev/null; true',
+                        timeout=30)
+            with open(marker, 'w') as f:
+                f.write(host)
+            print(f"Startup migration: [MediaMTX remote firewall] ✗ stopped the web editor on {host}: "
+                  "no firewall would keep it off the internet", flush=True)
+        elif os.path.exists(marker):
+            # The firewall is on again: start the editor this check stopped, and only that one.
+            _module_run(cfg, _REMOTE_SUDO_SH + '$S systemctl enable --now mediamtx-webeditor', timeout=60)
+            os.remove(marker)
+            print(f"Startup migration: [MediaMTX remote firewall] firewall on, web editor on {host} "
+                  "started again", flush=True)
+        if state == 'on' and not failed:
+            return
+        _mediamtx_remote_fw_alert(settings, host, state, failed)
+    except Exception as e:
+        print(f"Startup migration: MediaMTX remote firewall check error (non-fatal): {e}", flush=True)
+
+
+def _mediamtx_remote_fw_alert(settings, host, state, failed):
+    """Guard Dog mail for _startup_converge_mediamtx_remote_firewall, at most once a day per box."""
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("[guarddog] MediaMTX remote firewall alert SUPPRESSED (no recipient configured)", flush=True)
+        return False
+    path = os.path.join(CONFIG_DIR, 'mediamtx_remote_fw_alert.json')
+    try:
+        with open(path) as f:
+            sent = json.load(f)
+    except Exception:
+        sent = {}
+    now = time.time()
+    if now - float(sent.get(host) or 0) < _MEDIAMTX_REMOTE_FW_ALERT_EVERY_S:
+        return False
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    if state == 'off':
+        subj = f"⚠ MediaMTX box {host}: firewall is off, web editor stopped"
+        body = (f"The remote MediaMTX box {host} has no active firewall, and infra-TAK could not "
+                f"turn one on over SSH.\n\nWithout it the MediaMTX web editor (port 5080) is reachable "
+                f"from any address, so infra-TAK stopped the web editor on that box. Video "
+                f"streaming keeps running.\n\nTo fix: on {host}, turn on ufw or firewalld (allow "
+                f"your SSH port first), or give the SSH user passwordless sudo so infra-TAK can. "
+                f"Then restart the infra-TAK console: the web editor starts again once the "
+                f"firewall is on.\n\nConsole: {ident}\n\n— Guard Dog")
+    else:
+        subj = f"⚠ MediaMTX box {host}: firewall rules did not apply"
+        body = (f"The firewall on the remote MediaMTX box {host} is on, but these rules did not "
+                f"apply:\n\n" + '\n'.join(f"  {f}" for f in failed) +
+                f"\n\nCheck the box's firewall rules for ports 5080 and 8888: they should allow "
+                f"only the infra-TAK console.\n\nConsole: {ident}\n\n— Guard Dog")
+    try:
+        ok = _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        print(f"[guarddog] MediaMTX remote firewall alert failed: {e}", flush=True)
+        return False
+    if ok:
+        sent[host] = now
+        try:
+            with open(path, 'w') as f:
+                json.dump(sent, f)
+        except Exception:
+            pass
+    return ok
+
+
+def _unit_text_token_to_envfile(txt):
+    """Return (txt, token): the MediaMTX editor unit with its Authentik token moved out.
+
+    Drops every `Environment=AUTHENTIK_TOKEN=` line and makes sure the unit reads
+    _MEDIAMTX_EDITOR_SECRET_ENV instead. `token` is the value that was in the unit
+    (None when there was none). Unchanged text when there is nothing to move."""
+    lines = txt.split('\n')
+    token = None
+    out = []
+    for ln in lines:
+        if ln.startswith('Environment=AUTHENTIK_TOKEN='):
+            if token is None:
+                token = ln.split('=', 2)[2].strip()
+            continue
+        out.append(ln)
+    if token is None:
+        return txt, None
+    if _MEDIAMTX_EDITOR_ENVFILE_LINE not in out:
+        last_env = max((i for i, ln in enumerate(out) if ln.startswith('Environment=')),
+                       default=None)
+        if last_env is None:
+            try:
+                last_env = out.index('[Service]')
+            except ValueError:
+                return txt, None  # not a unit file we recognise — leave it alone
+        out.insert(last_env + 1, _MEDIAMTX_EDITOR_ENVFILE_LINE)
+    return '\n'.join(out), token
 
 
 def _startup_converge_mediamtx_overlay():
@@ -104874,7 +107097,8 @@ def _startup_converge_mediamtx_overlay():
             have = ''
         if have != want:
             _write_priv(dst, want)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', dst]), capture_output=True, timeout=15)
+            _owner = _mediamtx_owner()      # ops #643: the editor's account; -h never follows
+            subprocess.run(_sudo_wrap(['chown', '-h', f'{_owner}:{_owner}', dst]), capture_output=True, timeout=15)
             changed = True
             print("Startup migration: MediaMTX editor overlay updated (LDAP/Authentik auth + viewer roles)", flush=True)
 
@@ -104896,6 +107120,25 @@ def _startup_converge_mediamtx_overlay():
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
                 changed = True
                 print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
+            # ops #632: the Authentik token sat in the 0644 unit as Environment=, readable
+            # by every local user (the file, and `systemctl show -p Environment`). Move it
+            # to the 0600 EnvironmentFile. File first, then the unit, so the editor never
+            # restarts without its token.
+            if txt and 'Environment=AUTHENTIK_TOKEN=' in txt:
+                _moved, _tok = _unit_text_token_to_envfile(txt)
+                if _tok is not None:
+                    try:
+                        _write_mediamtx_editor_secret_env(_tok)
+                        _write_priv(unit, _moved)
+                        txt = _moved
+                        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                       capture_output=True, timeout=30)
+                        changed = True
+                        print("Startup migration: moved the MediaMTX editor's Authentik token "
+                              "out of its unit file into a 600 env file", flush=True)
+                    except Exception as _te:
+                        print(f"Startup migration: could not move the MediaMTX editor token "
+                              f"({str(_te)[:120]})", flush=True)
             # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
             # unpinned peer. Converge the unit in the SAME pass that ships the file, so
             # an existing box never runs new overlay + old unit. This is a local editor
@@ -104994,7 +107237,7 @@ def _startup_converge_mediamtx_unit_nonroot():
             cf, kf = f'{cd}/{mtx_domain}.crt', f'{cd}/{mtx_domain}.key'
             if _caddy_cert_pair_ready(cf, kf):
                 _grant_caddy_cert_read(cb, cd, cf, kf)
-        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        _mediamtx_chown_yml(yml)
 
         _write_priv(unit_path, _mediamtx_unit_text())
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
@@ -105027,6 +107270,127 @@ def _startup_converge_mediamtx_unit_nonroot():
         pass
     except Exception as _e:
         print('Startup migration: mediamtx unit converge warning (non-fatal): %s' % _e)
+
+
+def _mediamtx_move_to_own_account(log=None):
+    """ops #643: move an installed local MediaMTX + web editor off the console's account.
+
+    Returns 'moved', 'already', 'skipped: <why>' or 'rolled back: <why>'. Changes the
+    identity of RUNNING, internet-facing services, so it refuses rather than guesses and
+    puts everything back when either service that was running does not come back:
+      * only the local box (a split MediaMTX box has no console or broker to protect)
+      * not while a unit still says User=root (the v10.1.33 converge moves those first)
+      * not when recording or playback is on: those write wherever the operator pointed
+        them, which may be the console's files
+      * the account must exist and, where a broker runs, the broker must serve it
+      * the editor's packages must import from its own dir BEFORE the switch
+    """
+    log = log or (lambda m: print(m, flush=True))
+    if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(_MEDIAMTX_SERVICE_UNIT):
+        return 'skipped: MediaMTX not installed here'
+    settings = load_settings()
+    if _get_module_deployment_config(settings, 'mediamtx_deployment').get('target_mode') == 'remote':
+        return 'skipped: MediaMTX runs on a remote box'
+    units = [u for u in (_MEDIAMTX_SERVICE_UNIT, _MEDIAMTX_EDITOR_UNIT) if os.path.exists(u)]
+    old = {}
+    for u in units:
+        try:
+            old[u] = _read_priv(u) or ''
+        except Exception as e:
+            return f'skipped: cannot read {u}: {e}'
+    want = {u: _mediamtx_unit_text_as(old[u], _MEDIAMTX_RUN_USER, editor=(u == _MEDIAMTX_EDITOR_UNIT))
+            for u in units}
+    for u in units:
+        if not re.search(r'(?m)^User=\S+[ \t]*$', old[u]):
+            return f'skipped: {os.path.basename(u)} has no User= line'
+        if re.search(r'(?m)^User=root[ \t]*$', old[u]):
+            return f'skipped: {os.path.basename(u)} still runs as root'
+        if u == _MEDIAMTX_EDITOR_UNIT and 'UMask=' not in want[u]:
+            want[u] = re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nUMask=0027', want[u], count=1)
+    if all(want[u] == old[u] for u in units):
+        return 'already'
+    try:
+        yml = _read_own_or_priv('/usr/local/etc/mediamtx.yml')
+    except Exception:
+        yml = ''
+    if re.search(r'(?m)^[ \t]*(record|playback):[ \t]*(yes|true)[ \t]*$', yml or ''):
+        return 'skipped: recording or playback is on (they write where the operator chose)'
+    if not _ensure_mediamtx_account(plog=log):
+        return 'skipped: the mediamtx account could not be created'
+    if _mediamtx_run_user() != _MEDIAMTX_RUN_USER:
+        return 'skipped: the broker does not serve the mediamtx account yet (restart it)'
+    if _MEDIAMTX_EDITOR_UNIT in units and not _mediamtx_editor_pylib_ok():
+        ok, out = _mediamtx_editor_install_pylib()
+        if not _mediamtx_editor_pylib_ok():
+            tail = ((out or '').strip().splitlines()[-1:] or ['no output'])[0][:160]
+            return f'skipped: the web editor packages could not be installed ({tail})'
+
+    svcs = {_MEDIAMTX_SERVICE_UNIT: 'mediamtx', _MEDIAMTX_EDITOR_UNIT: 'mediamtx-webeditor'}
+
+    def _active(svc):
+        return (subprocess.run(_sudo_wrap(['systemctl', 'is-active', svc]), capture_output=True,
+                               text=True, timeout=15).stdout or '').strip() == 'active'
+    was_active = {svcs[u]: _active(svcs[u]) for u in units}
+    home_dropin = ''
+    if os.path.exists(_MEDIAMTX_EDITOR_HOME_DROPIN):
+        try:
+            home_dropin = _read_priv(_MEDIAMTX_EDITOR_HOME_DROPIN) or ''
+        except Exception:
+            home_dropin = ''
+
+    def _apply(texts, owner, dropin):
+        for svc in ('mediamtx-webeditor', 'mediamtx'):
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', svc]), capture_output=True, timeout=60)
+        _mediamtx_hand_over_files(owner)
+        for u, t in texts.items():
+            _write_priv(u, t)
+        if dropin:
+            _write_priv(_MEDIAMTX_EDITOR_HOME_DROPIN, dropin)
+        else:
+            # GH #330's HOME pin pointed the editor at takwerx's pip --user site; the editor
+            # now has its own package dir and no business in the console's HOME.
+            subprocess.run(_sudo_wrap(['rm', '-f', _MEDIAMTX_EDITOR_HOME_DROPIN]),
+                           capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        for svc, on in was_active.items():
+            if on:
+                subprocess.run(_sudo_wrap(['systemctl', 'start', svc]), capture_output=True, timeout=60)
+
+    _apply(want, _MEDIAMTX_RUN_USER, '')
+    down = []
+    for svc, on in was_active.items():
+        if not on:
+            continue
+        up = False
+        for _ in range(15):
+            time.sleep(1)
+            if _active(svc):
+                up = True
+                break
+        if not up:
+            down.append(svc)
+    if down:
+        _apply(old, 'takwerx', home_dropin)
+        return f"rolled back: {', '.join(down)} did not start as {_MEDIAMTX_RUN_USER}"
+    return 'moved'
+
+
+def _startup_converge_mediamtx_own_account():
+    """ops #643 on console start: MediaMTX + its editor off the console's account. In a
+    thread — the editor's packages may need pip, and an offline box must not slow boot."""
+    def _run():
+        try:
+            res = _mediamtx_move_to_own_account()
+        except Exception as e:
+            res = f'error: {e}'
+        if res == 'moved':
+            print('Startup migration: ✓ MediaMTX and its web editor now run as their own '
+                  "account (mediamtx), not the console's (ops #643)", flush=True)
+        elif res != 'already' and not res.startswith('skipped: MediaMTX not installed') \
+                and not res.startswith('skipped: MediaMTX runs on a remote'):
+            print(f'Startup migration: ⚠ MediaMTX still runs as the console account — {res} '
+                  '(ops #643)', flush=True)
+    threading.Thread(target=_run, daemon=True, name='mediamtx-own-account').start()
 
 
 def _startup_converge_mediamtx_ssl():
@@ -105116,10 +107480,10 @@ def _startup_converge_mediamtx_ssl():
 
         # 2. write + verify
         _write_priv(yml, _mediamtx_yml_wire_tls(cur, cert_file, key_file))
-        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        _mediamtx_chown_yml(yml)
         if not _mediamtx_tls_wired(_read_priv(yml), cert_file):
             _write_priv(yml, cur)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            _mediamtx_chown_yml(yml)
             print('Startup migration: ⚠ MediaMTX SSL converge could not write mediamtx.yml '
                   '— reverted, box unchanged (v10.1.33)')
             return
@@ -105137,7 +107501,7 @@ def _startup_converge_mediamtx_ssl():
         if not ok:
             # 5. roll back — a box with working HLS must not be left with a dead MediaMTX
             _write_priv(yml, cur)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            _mediamtx_chown_yml(yml)
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
             print('Startup migration: ⚠ MediaMTX did not start with SSL wired — config '
                   'ROLLED BACK and service restarted. RTSPS stays off; HLS unaffected. '
@@ -106112,6 +108476,71 @@ def _startup_guard_remote_nodered_port():
         print(f"Startup migration: remote Node-RED port guard error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_guard_remote_nodered_port, daemon=True).start()
+
+
+def _startup_guard_remote_webodm_port():
+    """ops #629: a remote WebODM publishes 0.0.0.0:<webodm_port> and its ufw deny never applied
+    (Docker's published ports skip ufw), so the port was reachable from anywhere.
+    On every console boot (Update Now restarts it), (re)install
+    the DOCKER-USER port guard and check the admin. It does not change the password here: a new
+    one would land in the journal. Reapply (the deploy) sets it and shows it once.
+    Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        port = settings.get('webodm_port', 8765)
+        ok, first = _remote_docker_port_guard(cfg, settings, 'webodm', [port], log_fn=print)
+        if ok and first:
+            print(f"Startup migration: remote WebODM port {port} is now limited to the console. "
+                  "Open WebODM and check its users, projects and plugins: if you find one you "
+                  "did not add, rebuild the remote box and change its keys.")
+        elif not ok:
+            print(f"Startup migration: ⚠ remote WebODM port {port} could NOT be locked to the console "
+                  "and may not be limited to the console. Press Reapply Plugin & Config on the WebODM page to see why.")
+        _ok, out = _module_run(cfg, _webodm_admin_cmd(False), timeout=60)
+        r = _webodm_admin_parse(out)
+        if r['none'] or r['weak']:
+            print("Startup migration: ⚠ remote WebODM has no admin account or one with a default password "
+                  f"({', '.join(r['weak']) or 'no admin'}). Press Reapply Plugin & Config on the WebODM page: "
+                  "it sets a generated admin password and shows it once.")
+    except Exception as _e:
+        print(f"Startup migration: remote WebODM port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_webodm_port, daemon=True).start()
+threading.Thread(target=_startup_webodm_local_admin, daemon=True).start()
+
+
+def _startup_guard_remote_authentik_cloudtak_ports():
+    """ops #631: on every console boot (Update Now restarts it), (re)install the DOCKER-USER
+    port guard on a remote Authentik (9090, LDAP 389/636) and a remote CloudTAK (API, tiles,
+    video, PostGIS, store) host, so their published ports answer only the console. Idempotent.
+    Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+    except Exception as _e:
+        print(f"Startup migration: remote Authentik/CloudTAK port guard error (non-fatal): {_e}")
+        return
+    for _label, _key, _guard, _page in (
+            ('Authentik', 'authentik_deployment', _remote_authentik_port_guard, 'Authentik page > Update config'),
+            ('CloudTAK', 'cloudtak_deployment', _remote_cloudtak_port_guard, 'CloudTAK page > Deploy')):
+        try:
+            cfg = _get_module_deployment_config(settings, _key)
+            if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                    and (cfg.get('remote', {}).get('host') or '').strip()):
+                continue
+            ok, first = _guard(cfg, settings, log_fn=print)
+            if ok and first:
+                print(f"Startup migration: remote {_label} ports are now limited to the console.")
+            elif not ok:
+                print(f"Startup migration: ⚠ remote {_label} ports could NOT be locked to the console "
+                      f"and may not be limited to the console. Run {_page} to see why.")
+        except Exception as _e:
+            print(f"Startup migration: remote {_label} port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_authentik_cloudtak_ports, daemon=True).start()
 
 
 def _startup_ensure_metrics_collector():
@@ -107896,7 +110325,8 @@ def _startup_heal_le_renewal_script():
     delivery ([[feedback-console-path-delivery]]): existing boxes must not have to re-run
     cert setup to stop carrying a latent outage. Idempotent and non-fatal.
     """
-    path = '/opt/tak/renew-letsencrypt.sh'
+    # ops #633: the script now lives at LE_RENEW_SCRIPT; the old path only until it is moved.
+    path = LE_RENEW_SCRIPT if os.path.exists(LE_RENEW_SCRIPT) else LE_RENEW_SCRIPT_OLD
     try:
         if not os.path.exists(path):
             return
@@ -107929,8 +110359,11 @@ def _startup_heal_le_renewal_script():
 
         if out == src:
             return
-        _write_priv(path, out)
-        subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
+        if path == LE_RENEW_SCRIPT:
+            _le_renew_write(out)
+        else:
+            _write_priv(path, out)
+            subprocess.run(_sudo_wrap(['chmod', '+x', path]), capture_output=True)
         print('Startup migration: LE renewal script healed — imports to a temp keystore and '
               'no longer deletes the live one before a fallible import', flush=True)
     except Exception as _e:
@@ -107956,7 +110389,7 @@ def _startup_heal_missing_le_keystore():
     box. Threaded, because it restarts TAK and must not hold up console startup.
     """
     try:
-        script = '/opt/tak/renew-letsencrypt.sh'
+        script = LE_RENEW_SCRIPT if os.path.exists(LE_RENEW_SCRIPT) else LE_RENEW_SCRIPT_OLD
         jks = '/opt/tak/certs/files/takserver-le.jks'
         core = '/opt/tak/CoreConfig.xml'
         if not (os.path.exists(script) and os.path.exists(core)):
@@ -108044,7 +110477,13 @@ def _mediamtx_editor_grant_journal_access():
 # after the Python version, so an Ubuntu 22.04 -> 24.04 upgrade (3.10 -> 3.12) leaves the
 # editor unable to import Flask and it never starts. One package list and one installer for
 # deploy, Patch, the remote deploy and the heal below.
-_MEDIAMTX_EDITOR_PY_PKGS = ('Flask', 'ruamel.yaml', 'requests', 'psutil')
+# ops #637: exact versions, so every box gets the same packages. requests is held at 2.32.5, the
+# newest release that still runs on Rocky/RHEL 9's Python 3.9 (2.34 needs 3.10). Bump together,
+# after a deploy on Ubuntu and Rocky.
+_MEDIAMTX_EDITOR_PY_PKGS = ('Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2')
+# ops #202: certifi is moved forward on every install so the host python drops roots the OS removed;
+# since ops #637 that means a named version, raised on purpose when a root is distrusted.
+_MEDIAMTX_EDITOR_CERTIFI = 'certifi==2026.10.23'
 _MEDIAMTX_EDITOR_PY_IMPORTS = 'import flask, ruamel.yaml, requests, psutil'
 _MEDIAMTX_EDITOR_UNIT = '/etc/systemd/system/mediamtx-webeditor.service'
 _MEDIAMTX_EDITOR_SRC = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
@@ -108052,6 +110491,246 @@ _MEDIAMTX_EDITOR_USER = 'takwerx'
 _MEDIAMTX_EDITOR_HOME_DROPIN = '/etc/systemd/system/mediamtx-webeditor.service.d/20-infratak-home.conf'
 # pip's refusal to replace an apt-installed package (no RECORD file), pip 23.x and 24.x wording.
 _MEDIAMTX_PIP_DISTRO_OWNED = 'Cannot uninstall'
+
+# ops #643 — MediaMTX and its web editor (internet-facing) run as their OWN account on the
+# console's box, apart from the console's own account (least privilege: each service gets
+# only the access it needs). `mediamtx` is in no group of the console's, owns only
+# MediaMTX's files, and reaches the broker on its own socket with a short fixed list
+# (broker/takwerx_broker.py "MediaMTX profile"). The console keeps read access to
+# mediamtx.yml through group takwerx; it never runs anything the editor can write.
+# Its Python packages live in a dir the CONSOLE owns (read-only to the editor), not in
+# takwerx's HOME. A split (remote) MediaMTX box has no console or broker and is unchanged.
+_MEDIAMTX_RUN_USER = 'mediamtx'
+_MEDIAMTX_BROKER_SOCKET = '/run/takwerx-broker-mediamtx.sock'
+_MEDIAMTX_EDITOR_DIR = '/opt/mediamtx-webeditor'
+_MEDIAMTX_EDITOR_PYLIB = '/opt/mediamtx-webeditor-pylib'
+_MEDIAMTX_SERVICE_UNIT = '/etc/systemd/system/mediamtx.service'
+_MEDIAMTX_CONF_BACKUPS = '/usr/local/etc/mediamtx_backups'
+_MEDIAMTX_EDITOR_ENV = (('TAKWERX_BROKER_SOCKET', _MEDIAMTX_BROKER_SOCKET),
+                        ('PYTHONPATH', _MEDIAMTX_EDITOR_PYLIB))
+
+
+def _mediamtx_account_ready():
+    """True when the `mediamtx` account exists and is fit to run MediaMTX: not root, and
+    in no group of the console's (that would hand the editor the console's files back)."""
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(_MEDIAMTX_RUN_USER)
+    except (KeyError, ImportError):
+        return False
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return False
+    try:
+        g = grp.getgrnam('takwerx')
+        if _MEDIAMTX_RUN_USER in g.gr_mem or pw.pw_gid == g.gr_gid:
+            return False
+    except KeyError:
+        pass
+    return True
+
+
+def _ensure_mediamtx_account(plog=None):
+    """Create the `mediamtx` account when it is missing. True when it is there and fit.
+
+    Through the broker when it runs (non-root console, and a root one too: the broker has
+    to start the account's socket), else directly as root. Never raises."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        if _mediamtx_account_ready() and (not _broker_socket_present()
+                                          or os.path.exists(_MEDIAMTX_BROKER_SOCKET)):
+            return True
+        if _broker_socket_present():
+            resp = _broker_request({'op': 'mediamtx_account'}, timeout=60)
+            if not resp.get('ok'):
+                _log(f"  ⚠ mediamtx account: {resp.get('error') or 'broker refused'}")
+        elif os.geteuid() == 0:
+            subprocess.run(['groupadd', '--system', _MEDIAMTX_RUN_USER], capture_output=True, timeout=30)
+            subprocess.run(['useradd', '--system', '-g', _MEDIAMTX_RUN_USER, '-M', '-d', '/nonexistent',
+                            '-s', '/usr/sbin/nologin', _MEDIAMTX_RUN_USER], capture_output=True, timeout=30)
+        ok = _mediamtx_account_ready()
+        if ok:
+            _log("  ✓ mediamtx system account ready (MediaMTX does not run as the console's account)")
+        return ok
+    except Exception as e:
+        _log(f"  ⚠ mediamtx account error (non-fatal): {e}")
+        return False
+
+
+def _mediamtx_run_user():
+    """The account MediaMTX units on this box should name: `mediamtx` once it is fit and,
+    where a broker runs, the broker serves it (else the editor's upgrade/restart/codec
+    buttons would stop working); otherwise takwerx, exactly as before."""
+    if not _mediamtx_account_ready():
+        return 'takwerx'
+    if _broker_socket_present() and not os.path.exists(_MEDIAMTX_BROKER_SOCKET):
+        return 'takwerx'
+    return _MEDIAMTX_RUN_USER
+
+
+def _mediamtx_unit_user(unit_path):
+    """User= of an installed unit, '' when there is none or it cannot be read."""
+    try:
+        m = re.search(r'(?m)^User=(\S+)[ \t]*$', _read_priv(unit_path) or '')
+        return m.group(1) if m else ''
+    except Exception:
+        return ''
+
+
+def _mediamtx_owner():
+    """Who owns MediaMTX's files on this box: the editor unit's User=, else the server's,
+    else takwerx. Used by every path that re-owns them, so none of them hands the files
+    back to the console's account behind the migration's back."""
+    for unit in (_MEDIAMTX_EDITOR_UNIT, _MEDIAMTX_SERVICE_UNIT):
+        u = _mediamtx_unit_user(unit) if os.path.exists(unit) else ''
+        if u and u != 'root':
+            return u
+    return 'takwerx'
+
+
+def _mediamtx_chown_yml(yml):
+    """Give mediamtx.yml back to whoever runs MediaMTX after a root-side write. Group stays
+    takwerx so the console can read it; -h so a planted link is re-owned, never followed."""
+    subprocess.run(_sudo_wrap(['chown', '-h', f'{_mediamtx_owner()}:takwerx', yml]),
+                   capture_output=True, timeout=15)
+
+
+def _mediamtx_unit_text_as(txt, user, editor=False):
+    """Unit text with `User=<user>`; for the editor as `mediamtx` also its broker socket
+    and package dir. Idempotent, other lines untouched."""
+    new = re.sub(r'(?m)^User=\S+[ \t]*$', f'User={user}', txt, count=1)
+    if editor and user == _MEDIAMTX_RUN_USER:
+        for key, val in _MEDIAMTX_EDITOR_ENV:
+            new = _unit_text_with_env(new, key, val)
+    return new
+
+
+def _mediamtx_hand_over_files(user, plog=None):
+    """Give MediaMTX's files to `user` (`mediamtx`, or takwerx when rolling back).
+
+    The config dir goes to `user`:takwerx 2775 — the editor saves with `sed -i`, which needs
+    dir write; setgid keeps new files in group takwerx, and the editor's UMask=0027 makes them
+    0640, so the console still READS mediamtx.yml directly. `chown -R` never follows links
+    (GNU -R defaults to -P with no-dereference) and every single-file chown uses -h."""
+    def _run(argv):
+        return subprocess.run(_sudo_wrap(argv), capture_output=True, timeout=120)
+    group = 'takwerx'
+    if os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+        _run(['chown', '-R', f'{user}:{user}', _MEDIAMTX_EDITOR_DIR])
+    if os.path.isdir(_MEDIAMTX_CONF_BACKUPS):
+        _run(['chown', '-R', f'{user}:{group}', _MEDIAMTX_CONF_BACKUPS])
+    if user == 'takwerx':
+        _run(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', '775', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', 'g-s', _MEDIAMTX_CONF_DIR])   # GNU chmod 775 keeps a dir's setgid bit
+    else:
+        _run(['chown', f'{user}:{group}', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', '2775', _MEDIAMTX_CONF_DIR])
+    try:
+        names = os.listdir(_MEDIAMTX_CONF_DIR)
+    except OSError:
+        names = ['mediamtx.yml']
+    for name in names:
+        if name == 'mediamtx.yml' or (name.startswith('mediamtx.yml.')
+                                      and re.fullmatch(r'[A-Za-z0-9._-]+', name)):
+            _run(['chown', '-h', f'{user}:{group}', os.path.join(_MEDIAMTX_CONF_DIR, name)])
+
+
+def _mediamtx_editor_reclaim(plog=None):
+    """Before the console writes into the editor's dir itself (deploy, Patch web editor):
+    stop both services, take the dir back, and drop every link or special file in it.
+    Returns the services that were running (the caller starts them again).
+
+    After ops #643 that dir belongs to `mediamtx`, which faces the internet. A link it
+    planted at e.g. mediamtx_config_editor.py would turn the console's own `open(..., 'w')`
+    into a write to wherever it points — the console's code included. With both services
+    stopped nothing can plant a new one; the deploy hands the dir back when it is done."""
+    if not os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+        return []
+    if _mediamtx_owner() == 'takwerx' and not _mediamtx_account_ready():
+        return []                   # never moved: nothing else ever owned it
+    stopped = []
+    for svc in ('mediamtx-webeditor', 'mediamtx'):
+        if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', svc]), capture_output=True,
+                           text=True, timeout=15).stdout or '').strip() == 'active':
+            stopped.append(svc)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', svc]), capture_output=True, timeout=60)
+    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _MEDIAMTX_EDITOR_DIR]),
+                   capture_output=True, timeout=120)
+    dropped = 0
+    for root, dirs, files in os.walk(_MEDIAMTX_EDITOR_DIR, followlinks=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if _stat.S_ISLNK(st.st_mode) or not (_stat.S_ISREG(st.st_mode) or _stat.S_ISDIR(st.st_mode)):
+                try:
+                    os.unlink(p)
+                    dropped += 1
+                except OSError:
+                    pass
+    try:
+        p = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        if os.path.islink(p):
+            subprocess.run(_sudo_wrap(['rm', '-f', p]), capture_output=True, timeout=30)
+            dropped += 1
+    except OSError:
+        pass
+    if dropped and plog:
+        plog(f"  ⚠ Removed {dropped} link(s)/special file(s) from the MediaMTX dirs before writing")
+    return stopped
+
+
+def _mediamtx_editor_pylib_ok():
+    """True when the editor's packages import from _MEDIAMTX_EDITOR_PYLIB with nothing else:
+    no user site, no HOME, the console's own environment left out. The dir is the console's
+    and world-readable, so the console's answer is the editor's answer."""
+    if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+        return False
+    try:
+        r = subprocess.run(['/usr/bin/python3', '-s', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
+                           capture_output=True, text=True, timeout=30,
+                           env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/nonexistent',
+                                'PYTHONPATH': _MEDIAMTX_EDITOR_PYLIB})
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _mediamtx_editor_install_pylib(timeout=240):
+    """(ok, output) — install the editor's packages into _MEDIAMTX_EDITOR_PYLIB with
+    `pip --target` (PEP 668 does not apply to a target dir; it never touches the system
+    site or anyone's HOME). The dir is created root-side once and then OWNED BY THE CONSOLE,
+    never by the editor: the console writes it and the editor only reads it."""
+    try:
+        if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+            _makedirs_priv(_MEDIAMTX_EDITOR_PYLIB)
+        if os.geteuid() != 0:
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _MEDIAMTX_EDITOR_PYLIB]),
+                           capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['chmod', '755', _MEDIAMTX_EDITOR_PYLIB]),
+                       capture_output=True, timeout=30)
+        env = dict(os.environ, PYTHONNOUSERSITE='1', PIP_DISABLE_PIP_VERSION_CHECK='1')
+        r = subprocess.run(['/usr/bin/python3', '-m', 'pip', 'install', '--target', _MEDIAMTX_EDITOR_PYLIB,
+                            '--upgrade'] + list(_MEDIAMTX_EDITOR_PY_PKGS) + ['certifi'],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=timeout, env=env)
+        subprocess.run(['chmod', '-R', 'u+rwX,go+rX,go-w', _MEDIAMTX_EDITOR_PYLIB],
+                       capture_output=True, timeout=60)
+        return r.returncode == 0, (r.stdout or '')
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def _mediamtx_editor_uses_pylib():
+    """True when the installed editor unit imports from _MEDIAMTX_EDITOR_PYLIB."""
+    try:
+        return f'Environment=PYTHONPATH={_MEDIAMTX_EDITOR_PYLIB}' in (_read_priv(_MEDIAMTX_EDITOR_UNIT) or '')
+    except Exception:
+        return False
 
 
 def _mediamtx_editor_install_py_deps(timeout=120):
@@ -108090,7 +110769,7 @@ def _mediamtx_editor_install_py_deps(timeout=120):
     if r.returncode == 0:
         # ops #202: certifi -U every time — pip pulls it in once with requests and nothing
         # upgrades it after, so the host python kept roots the OS had since removed.
-        _pip(['pip3', 'install', '-U', 'certifi'] + _flag)
+        _pip(['pip3', 'install', '-U', _MEDIAMTX_EDITOR_CERTIFI] + _flag)
     return r.returncode == 0, (r.stdout or '')
 
 
@@ -108116,7 +110795,11 @@ def _mediamtx_editor_python_ok():
     from the editor's (packages only in /root/.local; or a non-root console with
     HOME=/home/takwerx while takwerx's passwd home is still /nonexistent) the check passed,
     the heal never ran, and the editor crash-looped on `No module named 'flask'`.
-    Unknown -> True: never "heal" on a guess."""
+    Unknown -> True: never "heal" on a guess.
+
+    ops #643: an editor on its own account imports from _MEDIAMTX_EDITOR_PYLIB only."""
+    if _mediamtx_editor_uses_pylib():
+        return _mediamtx_editor_pylib_ok()
     try:
         home = _mediamtx_editor_home()
         if not home:
@@ -108173,6 +110856,14 @@ def _mediamtx_editor_pin_home():
 def _mediamtx_editor_ensure_py_deps():
     """(ok, detail) — leave the editor able to import its packages as it runs. Shared by the
     deploy, Patch web editor and the startup heal. Does not restart the editor."""
+    if _mediamtx_editor_uses_pylib():           # ops #643: its own account, its own dir
+        if _mediamtx_editor_pylib_ok():
+            return True, 'already importable'
+        ok, out = _mediamtx_editor_install_pylib()
+        if _mediamtx_editor_pylib_ok():
+            return True, 'packages reinstalled'
+        tail = (out or '').strip().splitlines()[-1:] or ['no output']
+        return False, (tail[0][:200] if not ok else 'installed, but the editor still cannot import them')
     if _mediamtx_editor_python_ok():
         return True, 'already importable'
     if _mediamtx_editor_pin_home() and _mediamtx_editor_python_ok():
@@ -108199,7 +110890,7 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
         return (f'export PYTHONNOUSERSITE=1; _pi() {{ o=$(pip3 install "$@" {flag} 2>&1); rc=$?; '
                 f'echo "$o"; if [ $rc -ne 0 ] && echo "$o" | grep -q {shlex.quote(_MEDIAMTX_PIP_DISTRO_OWNED)}; '
                 f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
-                f'_pi {_pkgs} && _pi -U certifi')
+                f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')
 
     ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
     if not ok and 'no such option' in (out or ''):
@@ -108606,6 +111297,15 @@ def _startup_migrations():
             _startup_converge_recidive_tak_exempt()
         except Exception as _f2b_e3f:
             print(f"Startup migration: recidive takserver-exempt converge error (non-fatal): {_f2b_e3f}", flush=True)
+        # ops #638 — every box that runs fail2ban gets the console login jail on its next
+        # start, so failed console password logins are banned, not just logged.
+        try:
+            if _f2b_is_available():
+                _ok_cj, _msg_cj = _f2b_arm_console_jail()
+                if not _ok_cj or 'already' not in _msg_cj:
+                    print(f"Startup migration: {'✓ ' if _ok_cj else ''}{_msg_cj}", flush=True)
+        except Exception as _f2b_e3h:
+            print(f"Startup migration: console login jail error (non-fatal): {_f2b_e3h}", flush=True)
 
         # ops #200 — Ubuntu's Java CA keystore never drops a root the OS distrusts. Here and
         # not at import time: on a non-root box it is a broker op.
@@ -108658,6 +111358,11 @@ def _startup_migrations():
             _startup_converge_mediamtx_overlay()
         except Exception as _mtx_ov_e:
             print(f"Startup migration: mediamtx overlay converge error (non-fatal): {_mtx_ov_e}", flush=True)
+
+        # ops #630 — a remote MediaMTX box's firewall may be off. SSH to another box can take
+        # minutes, so in the background: it must never hold up the console's start.
+        threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
+                         name='startup-mediamtx-remote-fw').start()
 
         try:
             _startup_converge_mediamtx_ssl()
@@ -109906,6 +112611,10 @@ def _startup_migrations():
         except Exception as tp_shim_err:
             print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
 
+        # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
+        # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
+        _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
+
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
         # per start and orphans every encrypted user row on the next restart (SSO 401
@@ -110261,9 +112970,31 @@ def _startup_migrations():
             print(f"Startup migration: Node-RED login converge error (non-fatal): {_nl_err}",
                   flush=True)
         try:
+            _startup_caddy_takportal_login_converge()
+        except Exception as _tpl_err:
+            print(f"Startup migration: TAK Portal login converge error (non-fatal): {_tpl_err}",
+                  flush=True)
+        try:
+            _startup_mediamtx_editor_login_converge()
+        except Exception as _ml_err:
+            print(f"Startup migration: MediaMTX editor login converge error (non-fatal): {_ml_err}",
+                  flush=True)
+        try:
+            _startup_caddy_webodm_welcome_converge()
+        except Exception as _ww_err:
+            print(f"Startup migration: WebODM setup-page converge error (non-fatal): {_ww_err}",
+                  flush=True)
+        try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
+
+        # ops #633: move the renewal script from /opt/tak to LE_RENEW_SCRIPT first,
+        # so the heal below patches the copy that will actually run.
+        try:
+            _startup_move_le_renewal_script()
+        except Exception as _lm_err:
+            print(f"Startup migration: LE renewal script move error (non-fatal): {_lm_err}", flush=True)
 
         # v10.1.67: heal an LE renewal script that deletes TAK's keystore before a
         # fallible import (latent total outage until the next restart).
@@ -110300,6 +113031,14 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_prestart()
         except Exception as _mxs_err:
             print(f"Startup migration: MediaMTX editor pre-start heal error (non-fatal): {_mxs_err}", flush=True)
+
+        # ops #643: MediaMTX + its internet-facing editor off the console's account. Last of
+        # the MediaMTX steps: every converge above still writes as before, then this moves the
+        # result over (and rolls back if a service does not come back).
+        try:
+            _startup_converge_mediamtx_own_account()
+        except Exception as _mxa_err:
+            print(f"Startup migration: MediaMTX own-account error (non-fatal): {_mxa_err}", flush=True)
 
         # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
         # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
@@ -111138,7 +113877,7 @@ def _post_update_auto_deploy():
                             env_path = os.path.join(nr_dir, '.env')
                             if not os.path.exists(env_path):
                                 try:
-                                    with open(env_path, 'w') as ef:
+                                    with _open_secret_w(env_path) as ef:
                                         ef.write("""# infra-TAK Node-RED env file
 # Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
 # Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw

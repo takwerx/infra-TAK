@@ -54,7 +54,7 @@ _alert() {
   local subj="$1" body="$2"
   echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
-    local tmpf="/tmp/gd-sms-$$.txt"
+    local tmpf="$(mktemp /tmp/gd-sms.XXXXXX)"
     printf '%s' "$body" > "$tmpf"
     /opt/tak-guarddog/sms_send.sh "$subj" "$tmpf" 2>/dev/null || true
     rm -f "$tmpf"

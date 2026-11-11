@@ -75,9 +75,12 @@ class Box:
             '_read_priv': lambda p: box.files.get(p), '_write_priv': write, '_sudo_wrap': lambda c: c,
             'print': lambda *a, **k: None,
             '_MEDIAMTX_EDITOR_USER': 'takwerx', '_MEDIAMTX_EDITOR_HOME_DROPIN': DROPIN,
-            '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
+            '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2'),
+            '_MEDIAMTX_EDITOR_CERTIFI': 'certifi==2026.10.23',
             '_MEDIAMTX_EDITOR_PY_IMPORTS': 'import flask, ruamel.yaml, requests, psutil',
             '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
+            # an editor still on takwerx (ops #643 not applied yet): the GH #330 path
+            '_mediamtx_editor_uses_pylib': lambda: False,
         }
         for name in ('_mediamtx_editor_home', '_mediamtx_editor_python_ok', '_mediamtx_editor_pin_home',
                      '_mediamtx_editor_install_py_deps', '_mediamtx_editor_ensure_py_deps'):
@@ -159,7 +162,7 @@ def test_root_install_ignores_roots_user_site(monkeypatch):
     assert b.install_py_deps()[0] is True
     for argv, env in b.pips():
         assert env['PYTHONNOUSERSITE'] == '1', argv
-    assert [a for a, _ in b.pips()][-1][:4] == ['pip3', 'install', '-U', 'certifi']
+    assert [a for a, _ in b.pips()][-1][:4] == ['pip3', 'install', '-U', 'certifi==2026.10.23']
 
 
 BLINKER = ('ERROR: Cannot uninstall blinker 1.7.0, RECORD file not found. '
@@ -184,9 +187,9 @@ def test_root_install_gets_past_the_apt_owned_blinker(monkeypatch):
     _apt_blinker_pip(b)
     assert b.install_py_deps()[0] is True
     argvs = [a for a, _ in b.pips()]
-    assert argvs[0] == ['pip3', 'install', 'Flask', 'ruamel.yaml', 'requests', 'psutil', '--break-system-packages']
+    assert argvs[0] == ['pip3', 'install', 'Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2', '--break-system-packages']
     assert argvs[1] == argvs[0] + ['--ignore-installed']
-    assert argvs[-1] == ['pip3', 'install', '-U', 'certifi', '--break-system-packages', '--ignore-installed']
+    assert argvs[-1] == ['pip3', 'install', '-U', 'certifi==2026.10.23', '--break-system-packages', '--ignore-installed']
 
 
 def test_other_pip_errors_are_not_retried_with_ignore_installed(monkeypatch):
@@ -215,17 +218,19 @@ def test_remote_install_gets_past_the_apt_owned_blinker(tmp_path):
                            env={'PATH': f'{tmp_path}:/usr/bin:/bin'})
         return r.returncode == 0, r.stdout
     ns = {'_module_run': module_run, 'shlex': shlex,
-          '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask', 'ruamel.yaml', 'requests', 'psutil'),
+          '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2'),
+          '_MEDIAMTX_EDITOR_CERTIFI': 'certifi==2026.10.23',
           '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
           '_MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK': 'runuser -u takwerx -- /usr/bin/python3 -c x'}
     exec(compile(_fn('_mediamtx_editor_remote_py_deps'), 'app.py', 'exec'), ns)
     ok, _ = ns['_mediamtx_editor_remote_py_deps']({})
     assert ok is True
     calls = log.read_text().splitlines()
-    assert calls == ['install Flask ruamel.yaml requests psutil --break-system-packages',
-                     'install Flask ruamel.yaml requests psutil --break-system-packages --ignore-installed',
-                     'install -U certifi --break-system-packages',
-                     'install -U certifi --break-system-packages --ignore-installed']
+    _pk = 'Flask==3.1.3 ruamel.yaml==0.19.1 requests==2.32.5 psutil==7.2.2'
+    assert calls == [f'install {_pk} --break-system-packages',
+                     f'install {_pk} --break-system-packages --ignore-installed',
+                     'install -U certifi==2026.10.23 --break-system-packages',
+                     'install -U certifi==2026.10.23 --break-system-packages --ignore-installed']
     assert os.path.exists(log)
 
 

@@ -118,6 +118,9 @@ class _Box:
             '_tak_is_container': lambda: self.container,
             '_sudo_wrap': lambda argv: argv,
             'install_le_cert_on_8446': lambda host, log, wait_for_cert=True: self.installs.append(host),
+            'LE_RENEW_SCRIPT': '/usr/local/sbin/takserver-renew-letsencrypt.sh',   # ops #633
+            'LE_RENEW_SCRIPT_OLD': '/opt/tak/renew-letsencrypt.sh',
+            'LE_RENEW_UNIT': '/etc/systemd/system/takserver-cert-renewal.service',
         }
         exec(compile(_src('TAK_CONTAINER') + '\n\n' + _src('_selfheal_takserver_le_cert'), 'app.py', 'exec'), ns)
         ns['_selfheal_takserver_le_cert'](plog=self.logs.append)
