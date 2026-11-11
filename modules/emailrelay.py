@@ -201,7 +201,10 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
         plog("📧 Step 3/5 — Writing credentials...")
         sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
-        ctx['_write_priv']('/etc/postfix/sasl_passwd', sasl_line + '\n')
+        # ops #632: empty and 0600 FIRST, then the password. The chmod below only ran
+        # after postmap succeeded, so a failed postmap left the SMTP password 0644.
+        ctx['_write_priv']('/etc/postfix/sasl_passwd', '', perm=0o600)
+        ctx['_write_priv']('/etc/postfix/sasl_passwd', sasl_line + '\n', perm=0o600)
         if not _postmap(ctx, '/etc/postfix/sasl_passwd', plog):
             # Without the hashed map postfix cannot authenticate to the smarthost
             # and every message queues forever. Fail the deploy rather than report

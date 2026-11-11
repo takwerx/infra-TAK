@@ -40,6 +40,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
+# ops #632: module .env writes go through app.py's _open_secret_w (0600 at creation).
+_OPEN_SECRET_W = {'os': os}
+exec(re.search(r'^def _open_secret_w\(.*?(?=^\S)', APP, re.S | re.M).group(0), _OPEN_SECRET_W)
 
 OVERRIDES = {
     'docker-compose.override.yml':
@@ -95,6 +98,7 @@ def home(tmp_path, monkeypatch):
 def _deploy(home, rec, pulls, exists=False):
     status, log = {'running': True}, []
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'os': os, 're': re, 'time': time, 'datetime': datetime.datetime,
         'subprocess': _sub_ns(rec), '_sudo_wrap': lambda c: list(c),
         'nodered_deploy_status': status, 'nodered_deploy_log': log,
@@ -150,6 +154,7 @@ def test_control_runs_in_node_red_dir_and_start_loads_override(home, action):
     (home / 'node-red' / 'docker-compose.yml').write_text('services: {}\n')
     rec = _Recorder()
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'os': os, 'time': type('t', (), {'sleep': staticmethod(lambda s: None)}),
         'subprocess': _sub_ns(rec), '_sudo_wrap': lambda c: list(c),
         'request': type('r', (), {'json': {'action': action}}),

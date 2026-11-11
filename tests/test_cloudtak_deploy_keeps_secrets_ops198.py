@@ -40,6 +40,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
+# ops #632: module .env writes go through app.py's _open_secret_w (0600 at creation).
+_OPEN_SECRET_W = {'os': os}
+exec(re.search(r'^def _open_secret_w\(.*?(?=^\S)', APP, re.S | re.M).group(0), _OPEN_SECRET_W)
 TREE = ast.parse(APP)
 
 GARAGE_COMPOSE = """services:
@@ -84,6 +87,7 @@ def _ns(settings, **stubs):
         run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='true\n', stderr=''),
         TimeoutExpired=TimeoutError)
     ns = {
+        '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
         'os': os, 're': re, 'json': json, 'shlex': shlex, 'shutil': shutil, 'tempfile': tempfile,
         'time': __import__('time'), 'datetime': datetime.datetime, 'subprocess': fake_sub,
         'load_settings': lambda: settings, 'save_settings': lambda s: None,
