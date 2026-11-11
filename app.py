@@ -54772,6 +54772,78 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
         return False
 
 
+# ops #629: WebODM ships with no admin; its /welcome page sets one up while none exists
+# (app/views/app.py `welcome`). The remote deploy now makes the admin itself. The password is generated INSIDE
+# the container, so it never crosses SSH or a process list; it is printed once, to the deploy log.
+_WEBODM_ADMIN_PY = '''import secrets
+from django.contrib.auth.models import User
+FIX = {fix}
+su = list(User.objects.filter(is_superuser=True))
+if not su:
+    if FIX:
+        name = 'admin' if not User.objects.filter(username='admin').exists() else 'infratak-admin'
+        p = secrets.token_urlsafe(18)
+        User.objects.create_superuser(name, name + '@localhost', p)
+        print('WOADMIN NEW ' + name + ' ' + p)
+    else:
+        print('WOADMIN NONE')
+for u in su:
+    if u.check_password('admin') or u.check_password(u.username):
+        if FIX:
+            p = secrets.token_urlsafe(18)
+            u.set_password(p)
+            u.save()
+            print('WOADMIN RESET ' + u.username + ' ' + p)
+        else:
+            print('WOADMIN WEAK ' + u.username)
+print('WOADMIN DONE')
+'''
+
+
+def _webodm_admin_cmd(fix):
+    """Shell command that checks (fix=False) or makes safe (fix=True) the WebODM admin."""
+    code = _WEBODM_ADMIN_PY.format(fix='True' if fix else 'False')
+    return ('docker exec webapp python manage.py shell -c '
+            f'"$(echo {_b64.b64encode(code.encode()).decode()} | base64 -d)" 2>&1')
+
+
+def _webodm_admin_parse(out):
+    """WOADMIN lines → {'done': bool, 'new': [(user, pw)], 'reset': [(user, pw)], 'none': bool, 'weak': [user]}."""
+    r = {'done': False, 'new': [], 'reset': [], 'none': False, 'weak': []}
+    for ln in (out or '').splitlines():
+        f = ln.strip().split(' ')
+        if not f or f[0] != 'WOADMIN' or len(f) < 2:
+            continue
+        if f[1] == 'DONE':
+            r['done'] = True
+        elif f[1] == 'NONE':
+            r['none'] = True
+        elif f[1] == 'WEAK' and len(f) == 3:
+            r['weak'].append(f[2])
+        elif f[1] in ('NEW', 'RESET') and len(f) == 4:
+            r['new' if f[1] == 'NEW' else 'reset'].append((f[2], f[3]))
+    return r
+
+
+def _webodm_ensure_admin(deploy_cfg, plog):
+    """Deploy step: create the WebODM admin with a generated password, or replace a default
+    password (or password = username) on an existing one. Returns True when no open or weak admin is left."""
+    ok, out = _module_run(deploy_cfg, _webodm_admin_cmd(True), timeout=60)
+    r = _webodm_admin_parse(out)
+    if not (ok and r['done']):
+        plog('  ⚠ Could not check the WebODM admin account. Press Reapply Plugin & Config to retry.')
+        return False
+    for user, pw in r['new']:
+        plog(f'  🔑 WebODM admin created: {user} / {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    for user, pw in r['reset']:
+        plog(f'  🔑 WebODM admin "{user}" had a default password. New password: {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    if not r['new'] and not r['reset']:
+        plog('  ✓ WebODM admin account exists with a non-default password')
+    return True
+
+
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
     import secrets as _sec
@@ -54849,7 +54921,9 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
         wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
-    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
+    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it. The DOCKER-USER
+    # port guard below scopes it to the console (ops #629); ufw alone does not, Docker's
+    # published ports skip ufw.
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
         f'      - "0.0.0.0:{wo_port}:8000"',
@@ -54870,6 +54944,17 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ docker-compose.yml written')
 
+    # ops #629: lock the WebODM port to the console BEFORE the container publishes it. The ufw
+    # lines further down never applied (Docker's published ports skip ufw), so the port was
+    # reachable from anywhere. No lock = no start.
+    plog(f'━━━ Locking port {wo_port} to the console (remote) ━━━')
+    _wo_guard_ok, _ = _remote_docker_port_guard(deploy_cfg, settings, 'webodm', [wo_port], log_fn=plog)
+    if not _wo_guard_ok:
+        plog('✗ WebODM was not started: without this lock the WebODM port is not limited to the console.')
+        plog('  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+
     # Pull images on remote
     plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
     ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
@@ -54885,7 +54970,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ WebODM containers started')
 
-    # Harden WebODM port: allow only from console IP, deny public access
+    # Belt and braces only: ufw does not see Docker-published ports. The port guard above
+    # is what limits the WebODM port to the console (ops #629).
     _wo_console_ip = _fedhub_caddy_source_ip(settings)
     if _wo_console_ip:
         _module_run(deploy_cfg,
@@ -54946,6 +55032,13 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         _time.sleep(15)
     if not _node_registered and _pending != 0:
         plog("  ⚠ Migrations did not complete in 6 min — NodeODM not registered. Add manually: wo_nodeodm:3000")
+
+    # ops #629: never leave WebODM without an admin or on a default password.
+    plog('━━━ WebODM admin account (remote) ━━━')
+    if _pending == 0:
+        _webodm_ensure_admin(deploy_cfg, plog)
+    else:
+        plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
 
     # Save settings, reload Caddy (local), configure Authentik (local)
     s = load_settings()
@@ -105269,6 +105362,40 @@ def _startup_guard_remote_nodered_port():
         print(f"Startup migration: remote Node-RED port guard error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_guard_remote_nodered_port, daemon=True).start()
+
+
+def _startup_guard_remote_webodm_port():
+    """ops #629: a remote WebODM publishes 0.0.0.0:<webodm_port> and its ufw deny never applied
+    (Docker's published ports skip ufw), so the port was reachable from anywhere.
+    On every console boot (Update Now restarts it), (re)install
+    the DOCKER-USER port guard and check the admin. It does not change the password here: a new
+    one would land in the journal. Reapply (the deploy) sets it and shows it once.
+    Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        port = settings.get('webodm_port', 8765)
+        ok, first = _remote_docker_port_guard(cfg, settings, 'webodm', [port], log_fn=print)
+        if ok and first:
+            print(f"Startup migration: remote WebODM port {port} is now limited to the console. "
+                  "Open WebODM and check its users, projects and plugins: if you find one you "
+                  "did not add, rebuild the remote box and change its keys.")
+        elif not ok:
+            print(f"Startup migration: ⚠ remote WebODM port {port} could NOT be locked to the console "
+                  "and may not be limited to the console. Press Reapply Plugin & Config on the WebODM page to see why.")
+        _ok, out = _module_run(cfg, _webodm_admin_cmd(False), timeout=60)
+        r = _webodm_admin_parse(out)
+        if r['none'] or r['weak']:
+            print("Startup migration: ⚠ remote WebODM has no admin account or one with a default password "
+                  f"({', '.join(r['weak']) or 'no admin'}). Press Reapply Plugin & Config on the WebODM page: "
+                  "it sets a generated admin password and shows it once.")
+    except Exception as _e:
+        print(f"Startup migration: remote WebODM port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_webodm_port, daemon=True).start()
 
 
 def _startup_ensure_metrics_collector():
