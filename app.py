@@ -821,6 +821,10 @@ def _priv_write_denied_by_design(path):
     return any(p.startswith(prefix) for prefix in _BROKER_NEVER_ASK_PREFIXES)
 
 
+# Dirs the MediaMTX account can write (ops #643): never written through a link.
+_MEDIAMTX_NOFOLLOW_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -850,6 +854,16 @@ def _write_priv(path, content, mode='w', perm=None):
     is_bytes = isinstance(content, (bytes, bytearray))
     if os.getuid() == 0:
         fmode = mode + 'b' if is_bytes else mode
+        if str(path).startswith(_MEDIAMTX_NOFOLLOW_PREFIXES):
+            # ops #643: MediaMTX's own account can plant links in these dirs; a root
+            # console must not write through one (the broker does the same, O_NOFOLLOW).
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                         | (os.O_APPEND if 'a' in mode else os.O_TRUNC), 0o644)
+            with os.fdopen(fd, fmode) as f:
+                f.write(content)
+                if perm is not None:
+                    os.fchmod(f.fileno(), int(perm))
+            return
         with open(path, fmode) as f:
             f.write(content)
         if perm is not None:
@@ -36066,7 +36080,12 @@ def _mediamtx_editor_run_login_script(settings):
                               timeout=45)
     else:
         argv = ['python3', '-I', '-', path]
-        if not os.access(os.path.dirname(path), os.W_OK):
+        if _mediamtx_owner() == _MEDIAMTX_RUN_USER:
+            # ops #643: the editor's dir belongs to the `mediamtx` account. Run the script AS
+            # that account (the broker allows exactly this argv): as root it would write in a
+            # dir that account can plant links in, and takwerx cannot write there at all.
+            argv = _sudo_wrap(['runuser', '-u', _MEDIAMTX_RUN_USER, '--'] + argv)
+        elif not os.access(os.path.dirname(path), os.W_OK):
             argv = ['sudo', '-n'] + argv
         try:
             r = subprocess.run(argv, input=_MEDIAMTX_EDITOR_LOGIN_SCRIPT, capture_output=True,
@@ -42470,13 +42489,14 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
         editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
         if os.path.isfile(editor_path):
             try:
-                with open(editor_path) as f:
-                    for line in f:
-                        if 'CURRENT_VERSION' in line:
-                            m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
-                            if m:
-                                out['version'] = m.group(1).lstrip('vV')
-                            break
+                # ops #643: the editor's own account owns this file; read it via the broker
+                # when the console cannot.
+                for line in (_read_own_or_priv(editor_path) or '').splitlines():
+                    if 'CURRENT_VERSION' in line:
+                        m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
+                        if m:
+                            out['version'] = m.group(1).lstrip('vV')
+                        break
             except Exception:
                 pass
     # Latest from takwerx/mediamtx-installer, via TWO independent sources.
@@ -42540,7 +42560,24 @@ def _get_mediamtx_version_info():
             if m:
                 out['version'] = m.group(1)
     else:
-        # Local: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
+        # ops #643: on its own account MediaMTX (through the web editor's upgrade button) can
+        # replace /usr/local/bin/mediamtx, so the console must not RUN it — that would run
+        # the editor's choice of code as the console. Ask the running server instead:
+        # GET /v3/info on the loopback API (MediaMTX api/openapi.yaml, v1.21.3: `version`).
+        if _mediamtx_owner() != 'takwerx':
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen('http://127.0.0.1:9898/v3/info', timeout=5) as _r:
+                    _v = json.loads(_r.read(4096).decode(errors='replace')).get('version') or ''
+                m = _re.search(r'v?(\d+\.\d+\.\d+)', str(_v))
+                if m:
+                    out['version'] = m.group(1)
+            except Exception:
+                pass
+    if not out['version'] and not (deploy_cfg.get('target_mode') == 'remote'
+                                   and (deploy_cfg.get('remote', {}).get('host') or '').strip()) \
+            and _mediamtx_owner() == 'takwerx':
+        # Local, still on the console's account: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
         def _run_ver(cmd):
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
             combined = (r.stdout or '') + (r.stderr or '')
@@ -45887,7 +45924,14 @@ def mediamtx_recovery():
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     tmp_f = None
     editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    _is_remote = (deploy_cfg.get('target_mode') == 'remote'
+                  and (deploy_cfg.get('remote', {}).get('host') or '').strip())
+    _restart_after = []
     try:
+        # ops #643: the editor dir belongs to the editor's own account here. Take it back
+        # (services stopped, planted links dropped) before writing into it.
+        if not _is_remote:
+            _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             _module_run(
@@ -45946,7 +45990,10 @@ def mediamtx_recovery():
         # This prevents stale overlay scripts on existing installs from injecting old UI logic.
         try:
             overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
-            if os.path.exists(overlay_src):
+            if os.path.exists(overlay_src) and not _is_remote:
+                with open(overlay_src) as _of:
+                    _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
+            elif os.path.exists(overlay_src):
                 _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
                 _module_copy(
                     deploy_cfg,
@@ -45956,12 +46003,18 @@ def mediamtx_recovery():
                 )
         except Exception:
             pass
-        tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
-        tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
-        tmp_f.close()
-        copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
-        if not copy_ok:
-            return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        if _is_remote:
+            tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+            tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+            tmp_f.close()
+            copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+            if not copy_ok:
+                return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        else:
+            # ops #643: straight into place through the broker (no link followed), no
+            # fixed /tmp name another local account could take first.
+            _write_priv('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT,
+                        perm=0o755)
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
         # v10.1.48: this path ships a new overlay but used to leave the unit alone.
         # The overlay now refuses X-Authentik-* from an unpinned peer, so on a SPLIT
@@ -45991,8 +46044,15 @@ def mediamtx_recovery():
                 deps_ok, deps_detail = _mediamtx_editor_ensure_py_deps()
         except Exception as _de:
             deps_ok, deps_detail = False, str(_de)[:200]
+        if not _is_remote:
+            # The editor's files go back to the account it runs as before it restarts.
+            _mediamtx_hand_over_files(_mediamtx_owner())
+            for _svc in _restart_after:
+                if _svc != 'mediamtx-webeditor':
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
         cmd = (
-            'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            ('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+             if _is_remote else '') +
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
             f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
             f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
@@ -46021,6 +46081,12 @@ def mediamtx_recovery():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     finally:
+        # ops #643: never leave MediaMTX stopped because a step above failed.
+        for _svc in _restart_after:
+            try:
+                subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
+            except Exception:
+                pass
         if tmp_f and os.path.exists(tmp_f.name):
             try:
                 os.unlink(tmp_f.name)
@@ -46215,15 +46281,22 @@ def _mediamtx_grant_config_dir_write(plog=None):
         if plog:
             plog(m)
     try:
+        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        owner = _mediamtx_owner()
+        if owner != 'takwerx':
+            # ops #643: MediaMTX on its own account owns the dir (2775, group takwerx so the
+            # console still reads the yml). Never hand it back to the console's account.
+            _mediamtx_hand_over_files(owner)
+            subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
+            return True
         # `chown root:takwerx`, not `chgrp` — chgrp is not in the broker allowlist and
         # would be denied on a routed box; chown is, and does the same job.
         subprocess.run(_sudo_wrap(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR]),
                        capture_output=True, timeout=15)
         subprocess.run(_sudo_wrap(['chmod', '775', _MEDIAMTX_CONF_DIR]),
                        capture_output=True, timeout=15)
-        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
         if _caddy_cert_pair_ready(yml, yml):        # cheap privileged existence test
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+            subprocess.run(_sudo_wrap(['chown', '-h', 'takwerx:takwerx', yml]),
                            capture_output=True, timeout=15)
             subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
         return True
@@ -46941,6 +47014,15 @@ def run_mediamtx_deploy():
         created = _ensure_takwerx_system_user(plog=plog)
         if not created:
             plog("  ✓ takwerx system user already present")
+        # ops #643: MediaMTX + its web editor run as their own account, not the console's.
+        # Falls back to takwerx (as before) only when the account or its broker socket
+        # cannot be had. A redeploy takes the editor dir back first (services stopped,
+        # planted links dropped) because the console writes into it directly below.
+        _ensure_mediamtx_account(plog=plog)
+        _mediamtx_editor_reclaim(plog=plog)
+        _run_user = _mediamtx_run_user()
+        if _run_user != _MEDIAMTX_RUN_USER:
+            plog("  ⚠ MediaMTX will run as takwerx: the mediamtx account or its broker socket is not ready")
 
         # Step 2: Detect architecture, select the vetted version
         plog("")
@@ -47161,6 +47243,7 @@ WantedBy=multi-user.target
         # names a missing group dies with 216/GROUP (ops #313). Caddy installed later
         # gets the line from _mediamtx_unit_ensure_caddy_group() when the cert is wired.
         mediamtx_svc = _mediamtx_unit_with_caddy_group(mediamtx_svc) if _caddy_group_exists() else mediamtx_svc
+        mediamtx_svc = _mediamtx_unit_text_as(mediamtx_svc, _run_user)   # ops #643
         _write_priv('/etc/systemd/system/mediamtx.service', mediamtx_svc)
         plog("✓ mediamtx.service created")
 
@@ -47459,7 +47542,12 @@ UMask=0027
 [Install]
 WantedBy=multi-user.target
 """
+            # ops #643: its own account, its broker socket and its own package dir.
+            webeditor_svc = _mediamtx_unit_text_as(webeditor_svc, _run_user, editor=True)
             _write_priv('/etc/systemd/system/mediamtx-webeditor.service', webeditor_svc)
+            if _run_user == _MEDIAMTX_RUN_USER:
+                subprocess.run(_sudo_wrap(['rm', '-f', _MEDIAMTX_EDITOR_HOME_DROPIN]),
+                               capture_output=True, timeout=30)
             plog("✓ mediamtx-webeditor.service created")
         else:
             plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
@@ -47468,7 +47556,8 @@ WantedBy=multi-user.target
         # GH #330: checked as the editor runs (takwerx, its HOME), not as the console.
         _editor_deps_err = None
         if os.path.exists(editor_file):
-            _mediamtx_editor_install_py_deps()
+            if not _mediamtx_editor_uses_pylib():
+                _mediamtx_editor_install_py_deps()
             _ok_deps, _deps_detail = _mediamtx_editor_ensure_py_deps()
             if not _ok_deps:
                 _editor_deps_err = _deps_detail
@@ -47499,14 +47588,12 @@ WantedBy=multi-user.target
         if os.path.exists(editor_file):
             try:
                 subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
                 # Editor writes theme_config.json, email_config.json, users_file,
                 # share_links, group_metadata, srt_passphrase_backup, pending_reg,
-                # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
-                subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
-                # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
-                # the editor's Save-Config UI. takwerx ownership lets both work.
-                subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
+                # reset_tokens, etc. into /opt/mediamtx-webeditor/, and mediamtx.yml is
+                # read by MediaMTX and written by the editor's Save-Config UI. All of it
+                # goes to the account both run as (ops #643: mediamtx; takwerx fallback).
+                _mediamtx_hand_over_files(_run_user)
                 # v10.1.33: owning the FILE is not enough for the editor. Its save paths
                 # shell out to `sed -i` (12+ call sites in the upstream editor), and
                 # `sed -i` writes its temp file in the target's DIRECTORY, then renames.
@@ -47599,9 +47686,9 @@ WantedBy=multi-user.target
                         _txt = _read_priv(yml)
                     _txt = _mediamtx_yml_wire_tls(_txt, cert_file, key_file)
                     _write_priv(yml, _txt)
-                    # chown back: the web editor runs as takwerx and rewrites this file.
-                    subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
-                                   capture_output=True, timeout=15)
+                    # chown back: the web editor rewrites this file (as its own account
+                    # once ops #643 moved it, else takwerx).
+                    _mediamtx_chown_yml(yml)
                     _check = _read_priv(yml)
                     if _mediamtx_tls_wired(_check, cert_file):
                         plog("✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
@@ -69051,10 +69138,14 @@ def _heal_mediamtx_webeditor_writable_paths(plog=None):
             return False
         plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
         subprocess.run(_sudo_wrap(['mkdir', '-p', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
-        subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
-        if os.path.exists('/usr/local/etc/mediamtx.yml'):
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
+        _owner = _mediamtx_owner()          # ops #643: never back to takwerx once moved
+        if _owner != 'takwerx':
+            _mediamtx_hand_over_files(_owner)
+        else:
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/usr/local/etc/mediamtx_backups']), capture_output=True, timeout=5)
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/opt/mediamtx-webeditor']), capture_output=True, timeout=10)
+            if os.path.exists('/usr/local/etc/mediamtx.yml'):
+                subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                        capture_output=True, timeout=15)
         # Give it a moment and re-check
@@ -103887,6 +103978,33 @@ def _sync_java_cacerts(log_fn=None):
     return r
 
 
+def _upgrade_mediamtx_pylib_certifi(_log):
+    """ops #643: an editor on its own account loads certifi from its package dir (first on
+    its PYTHONPATH), which the CONSOLE owns — so check and upgrade that copy right here, as
+    the console, with the broker's own distrusted-root matcher. No root needed."""
+    bundle = os.path.join(_MEDIAMTX_EDITOR_PYLIB, 'certifi', 'cacert.pem')
+    try:
+        match = _broker_module()._bundle_distrusted
+    except Exception as e:
+        _log(f"MediaMTX certifi check skipped ({str(e)[:160]})")
+        return None
+    bad = match(bundle)
+    if not bad:
+        return {'ok': True, 'upgraded': []}
+    r = subprocess.run(['/usr/bin/python3', '-m', 'pip', 'install', '--target', _MEDIAMTX_EDITOR_PYLIB,
+                        '--upgrade', 'certifi'], capture_output=True, text=True, timeout=600,
+                       env=dict(os.environ, PYTHONNOUSERSITE='1', PIP_DISABLE_PIP_VERSION_CHECK='1'))
+    left = match(bundle)
+    if r.returncode != 0 or left:
+        _log(f"⚠ MediaMTX certifi upgrade: {((r.stderr or r.stdout or '').strip()[-200:]) or 'still distrusted'}"
+             " — retries next restart")
+        return {'ok': False, 'upgraded': []}
+    _log(f"✓ MediaMTX web editor: upgraded its certifi ({bundle}), which still trusted {', '.join(bad)}")
+    subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'mediamtx-webeditor']),
+                   capture_output=True, text=True, timeout=60)
+    return {'ok': True, 'upgraded': [{'user': _MEDIAMTX_RUN_USER, 'path': bundle, 'removed': bad}]}
+
+
 def _upgrade_mediamtx_certifi(log_fn=None):
     """Upgrade the MediaMTX web editor's certifi when it still trusts a root the OS vendors
     have distrusted (ops #202): root's pip copy in /usr/local, and the editor user's own if
@@ -103900,6 +104018,8 @@ def _upgrade_mediamtx_certifi(log_fn=None):
     _log = log_fn or (lambda m: print(f"Startup migration: {m}", flush=True))
     if not os.path.isdir('/opt/mediamtx-webeditor'):
         return None
+    if _mediamtx_editor_uses_pylib():
+        return _upgrade_mediamtx_pylib_certifi(_log)
     if _broker_should_route() and _broker_available():
         try:
             r = _broker_request({'op': 'certifi_upgrade'}, timeout=900)
@@ -105676,9 +105796,11 @@ def _startup_converge_mediamtx_editor_write():
             # time, matching the three boxes that already run it as takwerx (proven — a
             # real save round-tripped on test12 with the config intact). Patch in place
             # rather than rewriting: the unit carries per-box Environment/LDAP lines.
-            new_txt = re.sub(r'(?m)^User=\S+[ \t]*$', 'User=takwerx', unit_txt, count=1)
+            # ops #643: only User=root is rewritten — an editor already on its own account
+            # (mediamtx) must not be put back on the console's.
+            new_txt = re.sub(r'(?m)^User=root[ \t]*$', 'User=takwerx', unit_txt, count=1)
             moved_off_root = 'User=root' in unit_txt
-            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
+            new_txt = re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
             if 'UMask=0027' not in new_txt:
                 # Never skip quietly — say why, so this cannot rot unnoticed.
                 print('Startup migration: ⚠ MediaMTX editor unit has no User= line to anchor '
@@ -105751,14 +105873,15 @@ def _caddy_group_exists():
 
 
 def _mediamtx_unit_with_caddy_group(txt):
-    """Return `txt` with `SupplementaryGroups=caddy` right after `User=takwerx`.
+    """Return `txt` with `SupplementaryGroups=caddy` right after its `User=` line.
 
     Idempotent. systemd refuses to start a unit whose SupplementaryGroups= names a group
     that does not exist (status=216/GROUP), and the `caddy` group only exists once Caddy
     is installed, so the line may only be written when the group is there (ops #313)."""
     if re.search(r'(?m)^SupplementaryGroups=.*\bcaddy\b', txt):
         return txt
-    return re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
+    # ops #643: any User= (takwerx, or mediamtx once moved), never just takwerx.
+    return re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nSupplementaryGroups=caddy', txt, count=1)
 
 
 def _mediamtx_unit_text():
@@ -106030,7 +106153,8 @@ def _startup_converge_mediamtx_overlay():
             have = ''
         if have != want:
             _write_priv(dst, want)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', dst]), capture_output=True, timeout=15)
+            _owner = _mediamtx_owner()      # ops #643: the editor's account; -h never follows
+            subprocess.run(_sudo_wrap(['chown', '-h', f'{_owner}:{_owner}', dst]), capture_output=True, timeout=15)
             changed = True
             print("Startup migration: MediaMTX editor overlay updated (LDAP/Authentik auth + viewer roles)", flush=True)
 
@@ -106169,7 +106293,7 @@ def _startup_converge_mediamtx_unit_nonroot():
             cf, kf = f'{cd}/{mtx_domain}.crt', f'{cd}/{mtx_domain}.key'
             if _caddy_cert_pair_ready(cf, kf):
                 _grant_caddy_cert_read(cb, cd, cf, kf)
-        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        _mediamtx_chown_yml(yml)
 
         _write_priv(unit_path, _mediamtx_unit_text())
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
@@ -106202,6 +106326,127 @@ def _startup_converge_mediamtx_unit_nonroot():
         pass
     except Exception as _e:
         print('Startup migration: mediamtx unit converge warning (non-fatal): %s' % _e)
+
+
+def _mediamtx_move_to_own_account(log=None):
+    """ops #643: move an installed local MediaMTX + web editor off the console's account.
+
+    Returns 'moved', 'already', 'skipped: <why>' or 'rolled back: <why>'. Changes the
+    identity of RUNNING, internet-facing services, so it refuses rather than guesses and
+    puts everything back when either service that was running does not come back:
+      * only the local box (a split MediaMTX box has no console or broker to protect)
+      * not while a unit still says User=root (the v10.1.33 converge moves those first)
+      * not when recording or playback is on: those write wherever the operator pointed
+        them, which may be the console's files
+      * the account must exist and, where a broker runs, the broker must serve it
+      * the editor's packages must import from its own dir BEFORE the switch
+    """
+    log = log or (lambda m: print(m, flush=True))
+    if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(_MEDIAMTX_SERVICE_UNIT):
+        return 'skipped: MediaMTX not installed here'
+    settings = load_settings()
+    if _get_module_deployment_config(settings, 'mediamtx_deployment').get('target_mode') == 'remote':
+        return 'skipped: MediaMTX runs on a remote box'
+    units = [u for u in (_MEDIAMTX_SERVICE_UNIT, _MEDIAMTX_EDITOR_UNIT) if os.path.exists(u)]
+    old = {}
+    for u in units:
+        try:
+            old[u] = _read_priv(u) or ''
+        except Exception as e:
+            return f'skipped: cannot read {u}: {e}'
+    want = {u: _mediamtx_unit_text_as(old[u], _MEDIAMTX_RUN_USER, editor=(u == _MEDIAMTX_EDITOR_UNIT))
+            for u in units}
+    for u in units:
+        if not re.search(r'(?m)^User=\S+[ \t]*$', old[u]):
+            return f'skipped: {os.path.basename(u)} has no User= line'
+        if re.search(r'(?m)^User=root[ \t]*$', old[u]):
+            return f'skipped: {os.path.basename(u)} still runs as root'
+        if u == _MEDIAMTX_EDITOR_UNIT and 'UMask=' not in want[u]:
+            want[u] = re.sub(r'(?m)^(User=\S+[ \t]*)$', r'\1\nUMask=0027', want[u], count=1)
+    if all(want[u] == old[u] for u in units):
+        return 'already'
+    try:
+        yml = _read_own_or_priv('/usr/local/etc/mediamtx.yml')
+    except Exception:
+        yml = ''
+    if re.search(r'(?m)^[ \t]*(record|playback):[ \t]*(yes|true)[ \t]*$', yml or ''):
+        return 'skipped: recording or playback is on (they write where the operator chose)'
+    if not _ensure_mediamtx_account(plog=log):
+        return 'skipped: the mediamtx account could not be created'
+    if _mediamtx_run_user() != _MEDIAMTX_RUN_USER:
+        return 'skipped: the broker does not serve the mediamtx account yet (restart it)'
+    if _MEDIAMTX_EDITOR_UNIT in units and not _mediamtx_editor_pylib_ok():
+        ok, out = _mediamtx_editor_install_pylib()
+        if not _mediamtx_editor_pylib_ok():
+            tail = ((out or '').strip().splitlines()[-1:] or ['no output'])[0][:160]
+            return f'skipped: the web editor packages could not be installed ({tail})'
+
+    svcs = {_MEDIAMTX_SERVICE_UNIT: 'mediamtx', _MEDIAMTX_EDITOR_UNIT: 'mediamtx-webeditor'}
+
+    def _active(svc):
+        return (subprocess.run(_sudo_wrap(['systemctl', 'is-active', svc]), capture_output=True,
+                               text=True, timeout=15).stdout or '').strip() == 'active'
+    was_active = {svcs[u]: _active(svcs[u]) for u in units}
+    home_dropin = ''
+    if os.path.exists(_MEDIAMTX_EDITOR_HOME_DROPIN):
+        try:
+            home_dropin = _read_priv(_MEDIAMTX_EDITOR_HOME_DROPIN) or ''
+        except Exception:
+            home_dropin = ''
+
+    def _apply(texts, owner, dropin):
+        for svc in ('mediamtx-webeditor', 'mediamtx'):
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', svc]), capture_output=True, timeout=60)
+        _mediamtx_hand_over_files(owner)
+        for u, t in texts.items():
+            _write_priv(u, t)
+        if dropin:
+            _write_priv(_MEDIAMTX_EDITOR_HOME_DROPIN, dropin)
+        else:
+            # GH #330's HOME pin pointed the editor at takwerx's pip --user site; the editor
+            # now has its own package dir and no business in the console's HOME.
+            subprocess.run(_sudo_wrap(['rm', '-f', _MEDIAMTX_EDITOR_HOME_DROPIN]),
+                           capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=60)
+        for svc, on in was_active.items():
+            if on:
+                subprocess.run(_sudo_wrap(['systemctl', 'start', svc]), capture_output=True, timeout=60)
+
+    _apply(want, _MEDIAMTX_RUN_USER, '')
+    down = []
+    for svc, on in was_active.items():
+        if not on:
+            continue
+        up = False
+        for _ in range(15):
+            time.sleep(1)
+            if _active(svc):
+                up = True
+                break
+        if not up:
+            down.append(svc)
+    if down:
+        _apply(old, 'takwerx', home_dropin)
+        return f"rolled back: {', '.join(down)} did not start as {_MEDIAMTX_RUN_USER}"
+    return 'moved'
+
+
+def _startup_converge_mediamtx_own_account():
+    """ops #643 on console start: MediaMTX + its editor off the console's account. In a
+    thread — the editor's packages may need pip, and an offline box must not slow boot."""
+    def _run():
+        try:
+            res = _mediamtx_move_to_own_account()
+        except Exception as e:
+            res = f'error: {e}'
+        if res == 'moved':
+            print('Startup migration: ✓ MediaMTX and its web editor now run as their own '
+                  "account (mediamtx), not the console's (ops #643)", flush=True)
+        elif res != 'already' and not res.startswith('skipped: MediaMTX not installed') \
+                and not res.startswith('skipped: MediaMTX runs on a remote'):
+            print(f'Startup migration: ⚠ MediaMTX still runs as the console account — {res} '
+                  '(ops #643)', flush=True)
+    threading.Thread(target=_run, daemon=True, name='mediamtx-own-account').start()
 
 
 def _startup_converge_mediamtx_ssl():
@@ -106291,10 +106536,10 @@ def _startup_converge_mediamtx_ssl():
 
         # 2. write + verify
         _write_priv(yml, _mediamtx_yml_wire_tls(cur, cert_file, key_file))
-        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        _mediamtx_chown_yml(yml)
         if not _mediamtx_tls_wired(_read_priv(yml), cert_file):
             _write_priv(yml, cur)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            _mediamtx_chown_yml(yml)
             print('Startup migration: ⚠ MediaMTX SSL converge could not write mediamtx.yml '
                   '— reverted, box unchanged (v10.1.33)')
             return
@@ -106312,7 +106557,7 @@ def _startup_converge_mediamtx_ssl():
         if not ok:
             # 5. roll back — a box with working HLS must not be left with a dead MediaMTX
             _write_priv(yml, cur)
-            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            _mediamtx_chown_yml(yml)
             subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
             print('Startup migration: ⚠ MediaMTX did not start with SSL wired — config '
                   'ROLLED BACK and service restarted. RTSPS stays off; HLS unaffected. '
@@ -109296,6 +109541,246 @@ _MEDIAMTX_EDITOR_HOME_DROPIN = '/etc/systemd/system/mediamtx-webeditor.service.d
 # pip's refusal to replace an apt-installed package (no RECORD file), pip 23.x and 24.x wording.
 _MEDIAMTX_PIP_DISTRO_OWNED = 'Cannot uninstall'
 
+# ops #643 — MediaMTX and its web editor (internet-facing) run as their OWN account on the
+# console's box, apart from the console's own account (least privilege: each service gets
+# only the access it needs). `mediamtx` is in no group of the console's, owns only
+# MediaMTX's files, and reaches the broker on its own socket with a short fixed list
+# (broker/takwerx_broker.py "MediaMTX profile"). The console keeps read access to
+# mediamtx.yml through group takwerx; it never runs anything the editor can write.
+# Its Python packages live in a dir the CONSOLE owns (read-only to the editor), not in
+# takwerx's HOME. A split (remote) MediaMTX box has no console or broker and is unchanged.
+_MEDIAMTX_RUN_USER = 'mediamtx'
+_MEDIAMTX_BROKER_SOCKET = '/run/takwerx-broker-mediamtx.sock'
+_MEDIAMTX_EDITOR_DIR = '/opt/mediamtx-webeditor'
+_MEDIAMTX_EDITOR_PYLIB = '/opt/mediamtx-webeditor-pylib'
+_MEDIAMTX_SERVICE_UNIT = '/etc/systemd/system/mediamtx.service'
+_MEDIAMTX_CONF_BACKUPS = '/usr/local/etc/mediamtx_backups'
+_MEDIAMTX_EDITOR_ENV = (('TAKWERX_BROKER_SOCKET', _MEDIAMTX_BROKER_SOCKET),
+                        ('PYTHONPATH', _MEDIAMTX_EDITOR_PYLIB))
+
+
+def _mediamtx_account_ready():
+    """True when the `mediamtx` account exists and is fit to run MediaMTX: not root, and
+    in no group of the console's (that would hand the editor the console's files back)."""
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(_MEDIAMTX_RUN_USER)
+    except (KeyError, ImportError):
+        return False
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return False
+    try:
+        g = grp.getgrnam('takwerx')
+        if _MEDIAMTX_RUN_USER in g.gr_mem or pw.pw_gid == g.gr_gid:
+            return False
+    except KeyError:
+        pass
+    return True
+
+
+def _ensure_mediamtx_account(plog=None):
+    """Create the `mediamtx` account when it is missing. True when it is there and fit.
+
+    Through the broker when it runs (non-root console, and a root one too: the broker has
+    to start the account's socket), else directly as root. Never raises."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        if _mediamtx_account_ready() and (not _broker_socket_present()
+                                          or os.path.exists(_MEDIAMTX_BROKER_SOCKET)):
+            return True
+        if _broker_socket_present():
+            resp = _broker_request({'op': 'mediamtx_account'}, timeout=60)
+            if not resp.get('ok'):
+                _log(f"  ⚠ mediamtx account: {resp.get('error') or 'broker refused'}")
+        elif os.geteuid() == 0:
+            subprocess.run(['groupadd', '--system', _MEDIAMTX_RUN_USER], capture_output=True, timeout=30)
+            subprocess.run(['useradd', '--system', '-g', _MEDIAMTX_RUN_USER, '-M', '-d', '/nonexistent',
+                            '-s', '/usr/sbin/nologin', _MEDIAMTX_RUN_USER], capture_output=True, timeout=30)
+        ok = _mediamtx_account_ready()
+        if ok:
+            _log("  ✓ mediamtx system account ready (MediaMTX does not run as the console's account)")
+        return ok
+    except Exception as e:
+        _log(f"  ⚠ mediamtx account error (non-fatal): {e}")
+        return False
+
+
+def _mediamtx_run_user():
+    """The account MediaMTX units on this box should name: `mediamtx` once it is fit and,
+    where a broker runs, the broker serves it (else the editor's upgrade/restart/codec
+    buttons would stop working); otherwise takwerx, exactly as before."""
+    if not _mediamtx_account_ready():
+        return 'takwerx'
+    if _broker_socket_present() and not os.path.exists(_MEDIAMTX_BROKER_SOCKET):
+        return 'takwerx'
+    return _MEDIAMTX_RUN_USER
+
+
+def _mediamtx_unit_user(unit_path):
+    """User= of an installed unit, '' when there is none or it cannot be read."""
+    try:
+        m = re.search(r'(?m)^User=(\S+)[ \t]*$', _read_priv(unit_path) or '')
+        return m.group(1) if m else ''
+    except Exception:
+        return ''
+
+
+def _mediamtx_owner():
+    """Who owns MediaMTX's files on this box: the editor unit's User=, else the server's,
+    else takwerx. Used by every path that re-owns them, so none of them hands the files
+    back to the console's account behind the migration's back."""
+    for unit in (_MEDIAMTX_EDITOR_UNIT, _MEDIAMTX_SERVICE_UNIT):
+        u = _mediamtx_unit_user(unit) if os.path.exists(unit) else ''
+        if u and u != 'root':
+            return u
+    return 'takwerx'
+
+
+def _mediamtx_chown_yml(yml):
+    """Give mediamtx.yml back to whoever runs MediaMTX after a root-side write. Group stays
+    takwerx so the console can read it; -h so a planted link is re-owned, never followed."""
+    subprocess.run(_sudo_wrap(['chown', '-h', f'{_mediamtx_owner()}:takwerx', yml]),
+                   capture_output=True, timeout=15)
+
+
+def _mediamtx_unit_text_as(txt, user, editor=False):
+    """Unit text with `User=<user>`; for the editor as `mediamtx` also its broker socket
+    and package dir. Idempotent, other lines untouched."""
+    new = re.sub(r'(?m)^User=\S+[ \t]*$', f'User={user}', txt, count=1)
+    if editor and user == _MEDIAMTX_RUN_USER:
+        for key, val in _MEDIAMTX_EDITOR_ENV:
+            new = _unit_text_with_env(new, key, val)
+    return new
+
+
+def _mediamtx_hand_over_files(user, plog=None):
+    """Give MediaMTX's files to `user` (`mediamtx`, or takwerx when rolling back).
+
+    The config dir goes to `user`:takwerx 2775 — the editor saves with `sed -i`, which needs
+    dir write; setgid keeps new files in group takwerx, and the editor's UMask=0027 makes them
+    0640, so the console still READS mediamtx.yml directly. `chown -R` never follows links
+    (GNU -R defaults to -P with no-dereference) and every single-file chown uses -h."""
+    def _run(argv):
+        return subprocess.run(_sudo_wrap(argv), capture_output=True, timeout=120)
+    group = 'takwerx'
+    if os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+        _run(['chown', '-R', f'{user}:{user}', _MEDIAMTX_EDITOR_DIR])
+    if os.path.isdir(_MEDIAMTX_CONF_BACKUPS):
+        _run(['chown', '-R', f'{user}:{group}', _MEDIAMTX_CONF_BACKUPS])
+    if user == 'takwerx':
+        _run(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', '775', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', 'g-s', _MEDIAMTX_CONF_DIR])   # GNU chmod 775 keeps a dir's setgid bit
+    else:
+        _run(['chown', f'{user}:{group}', _MEDIAMTX_CONF_DIR])
+        _run(['chmod', '2775', _MEDIAMTX_CONF_DIR])
+    try:
+        names = os.listdir(_MEDIAMTX_CONF_DIR)
+    except OSError:
+        names = ['mediamtx.yml']
+    for name in names:
+        if name == 'mediamtx.yml' or (name.startswith('mediamtx.yml.')
+                                      and re.fullmatch(r'[A-Za-z0-9._-]+', name)):
+            _run(['chown', '-h', f'{user}:{group}', os.path.join(_MEDIAMTX_CONF_DIR, name)])
+
+
+def _mediamtx_editor_reclaim(plog=None):
+    """Before the console writes into the editor's dir itself (deploy, Patch web editor):
+    stop both services, take the dir back, and drop every link or special file in it.
+    Returns the services that were running (the caller starts them again).
+
+    After ops #643 that dir belongs to `mediamtx`, which faces the internet. A link it
+    planted at e.g. mediamtx_config_editor.py would turn the console's own `open(..., 'w')`
+    into a write to wherever it points — the console's code included. With both services
+    stopped nothing can plant a new one; the deploy hands the dir back when it is done."""
+    if not os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+        return []
+    if _mediamtx_owner() == 'takwerx' and not _mediamtx_account_ready():
+        return []                   # never moved: nothing else ever owned it
+    stopped = []
+    for svc in ('mediamtx-webeditor', 'mediamtx'):
+        if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', svc]), capture_output=True,
+                           text=True, timeout=15).stdout or '').strip() == 'active':
+            stopped.append(svc)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', svc]), capture_output=True, timeout=60)
+    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _MEDIAMTX_EDITOR_DIR]),
+                   capture_output=True, timeout=120)
+    dropped = 0
+    for root, dirs, files in os.walk(_MEDIAMTX_EDITOR_DIR, followlinks=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if _stat.S_ISLNK(st.st_mode) or not (_stat.S_ISREG(st.st_mode) or _stat.S_ISDIR(st.st_mode)):
+                try:
+                    os.unlink(p)
+                    dropped += 1
+                except OSError:
+                    pass
+    try:
+        p = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        if os.path.islink(p):
+            subprocess.run(_sudo_wrap(['rm', '-f', p]), capture_output=True, timeout=30)
+            dropped += 1
+    except OSError:
+        pass
+    if dropped and plog:
+        plog(f"  ⚠ Removed {dropped} link(s)/special file(s) from the MediaMTX dirs before writing")
+    return stopped
+
+
+def _mediamtx_editor_pylib_ok():
+    """True when the editor's packages import from _MEDIAMTX_EDITOR_PYLIB with nothing else:
+    no user site, no HOME, the console's own environment left out. The dir is the console's
+    and world-readable, so the console's answer is the editor's answer."""
+    if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+        return False
+    try:
+        r = subprocess.run(['/usr/bin/python3', '-s', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
+                           capture_output=True, text=True, timeout=30,
+                           env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/nonexistent',
+                                'PYTHONPATH': _MEDIAMTX_EDITOR_PYLIB})
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _mediamtx_editor_install_pylib(timeout=240):
+    """(ok, output) — install the editor's packages into _MEDIAMTX_EDITOR_PYLIB with
+    `pip --target` (PEP 668 does not apply to a target dir; it never touches the system
+    site or anyone's HOME). The dir is created root-side once and then OWNED BY THE CONSOLE,
+    never by the editor: the console writes it and the editor only reads it."""
+    try:
+        if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+            _makedirs_priv(_MEDIAMTX_EDITOR_PYLIB)
+        if os.geteuid() != 0:
+            subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _MEDIAMTX_EDITOR_PYLIB]),
+                           capture_output=True, timeout=60)
+        subprocess.run(_sudo_wrap(['chmod', '755', _MEDIAMTX_EDITOR_PYLIB]),
+                       capture_output=True, timeout=30)
+        env = dict(os.environ, PYTHONNOUSERSITE='1', PIP_DISABLE_PIP_VERSION_CHECK='1')
+        r = subprocess.run(['/usr/bin/python3', '-m', 'pip', 'install', '--target', _MEDIAMTX_EDITOR_PYLIB,
+                            '--upgrade'] + list(_MEDIAMTX_EDITOR_PY_PKGS) + ['certifi'],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=timeout, env=env)
+        subprocess.run(['chmod', '-R', 'u+rwX,go+rX,go-w', _MEDIAMTX_EDITOR_PYLIB],
+                       capture_output=True, timeout=60)
+        return r.returncode == 0, (r.stdout or '')
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def _mediamtx_editor_uses_pylib():
+    """True when the installed editor unit imports from _MEDIAMTX_EDITOR_PYLIB."""
+    try:
+        return f'Environment=PYTHONPATH={_MEDIAMTX_EDITOR_PYLIB}' in (_read_priv(_MEDIAMTX_EDITOR_UNIT) or '')
+    except Exception:
+        return False
+
 
 def _mediamtx_editor_install_py_deps(timeout=120):
     """(ok, output) — `pip3 install … --break-system-packages` (PEP 668 on 24.04 / Debian 12),
@@ -109359,7 +109844,11 @@ def _mediamtx_editor_python_ok():
     from the editor's (packages only in /root/.local; or a non-root console with
     HOME=/home/takwerx while takwerx's passwd home is still /nonexistent) the check passed,
     the heal never ran, and the editor crash-looped on `No module named 'flask'`.
-    Unknown -> True: never "heal" on a guess."""
+    Unknown -> True: never "heal" on a guess.
+
+    ops #643: an editor on its own account imports from _MEDIAMTX_EDITOR_PYLIB only."""
+    if _mediamtx_editor_uses_pylib():
+        return _mediamtx_editor_pylib_ok()
     try:
         home = _mediamtx_editor_home()
         if not home:
@@ -109416,6 +109905,14 @@ def _mediamtx_editor_pin_home():
 def _mediamtx_editor_ensure_py_deps():
     """(ok, detail) — leave the editor able to import its packages as it runs. Shared by the
     deploy, Patch web editor and the startup heal. Does not restart the editor."""
+    if _mediamtx_editor_uses_pylib():           # ops #643: its own account, its own dir
+        if _mediamtx_editor_pylib_ok():
+            return True, 'already importable'
+        ok, out = _mediamtx_editor_install_pylib()
+        if _mediamtx_editor_pylib_ok():
+            return True, 'packages reinstalled'
+        tail = (out or '').strip().splitlines()[-1:] or ['no output']
+        return False, (tail[0][:200] if not ok else 'installed, but the editor still cannot import them')
     if _mediamtx_editor_python_ok():
         return True, 'already importable'
     if _mediamtx_editor_pin_home() and _mediamtx_editor_python_ok():
@@ -111583,6 +112080,14 @@ def _startup_migrations():
             _startup_heal_mediamtx_editor_prestart()
         except Exception as _mxs_err:
             print(f"Startup migration: MediaMTX editor pre-start heal error (non-fatal): {_mxs_err}", flush=True)
+
+        # ops #643: MediaMTX + its internet-facing editor off the console's account. Last of
+        # the MediaMTX steps: every converge above still writes as before, then this moves the
+        # result over (and rolls back if a service does not come back).
+        try:
+            _startup_converge_mediamtx_own_account()
+        except Exception as _mxa_err:
+            print(f"Startup migration: MediaMTX own-account error (non-fatal): {_mxa_err}", flush=True)
 
         # Docker TAK: stale PostgreSQL lock files left by an unclean stop keep takserver-db from
         # starting (_TAK_DB_STALE_LOCK_PROBE). Watched in the background for the life of the console; the
