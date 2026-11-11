@@ -35952,6 +35952,18 @@ def _mediamtx_vhost_is_safe(generated):
     return 'request_header -X-Authentik-Groups' in blk or ' 503' in blk
 
 
+def _mediamtx_vhost_needs_regen(generated, login_ok):
+    """ops #649: without Authentik the vhost is open exactly when the login is known good.
+    True when it is unsafe, or open/closed (503) the wrong way round: closed by an earlier
+    regen this boot, or open while the login could not be checked."""
+    blk = _mediamtx_vhost_block(generated)
+    if not _mediamtx_vhost_is_safe(generated):
+        return True
+    if not blk or 'forward_auth' in blk:
+        return False
+    return (' 503' not in blk) != bool(login_ok)
+
+
 def _startup_mediamtx_editor_login_converge():
     """ops #649 — on the console update: replace admin/admin in the MediaMTX editor (local or
     remote) and make sure Caddy never publishes it without a login or with client
@@ -35985,10 +35997,7 @@ def _mediamtx_editor_login_converge_run(s):
         print('Startup migration: MediaMTX vhost converge skipped — cannot read %s (%s)'
               % (CADDYFILE_PATH, str(e)[:120]), flush=True)
         return
-    # Regenerate when the vhost is unsafe, or when it is closed (503, e.g. written by an
-    # earlier regen this boot) but the login is now known good.
-    _blk = _mediamtx_vhost_block(before)
-    if _mediamtx_vhost_is_safe(before) and not (' 503' in _blk and _mediamtx_editor_login_ok(s)):
+    if not _mediamtx_vhost_needs_regen(before, _mediamtx_editor_login_ok(s)):
         return
     generate_caddyfile(s)
     if not _CADDY_REGISTRY_READY.is_set():

@@ -40,7 +40,7 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 _NAMES = ('_emit_mediamtx_site', '_mediamtx_vhost_block', '_mediamtx_edge_uses_sso',
-          '_mediamtx_vhost_is_safe')
+          '_mediamtx_vhost_is_safe', '_mediamtx_vhost_needs_regen')
 _CONSTS = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT')
 AK_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
               'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
@@ -121,6 +121,19 @@ def test_dev_bare_vhost_is_not_safe_and_authentik_vhost_is():
     assert NS['_mediamtx_vhost_is_safe'](site(ak_up='127.0.0.1:9090', hls=None))
     assert NS['_mediamtx_vhost_is_safe'](site())          # 503
     assert NS['_mediamtx_vhost_is_safe']('# no mediamtx here\n')
+
+
+def test_startup_converge_opens_exactly_when_the_login_is_good():
+    need = NS['_mediamtx_vhost_needs_regen']
+    bare = '# MediaMTX Web Console\nstream.example.com {\n    reverse_proxy 127.0.0.1:5080\n}\n'
+    assert need(bare, True) and need(bare, False)
+    assert need(site(), True)                     # closed, login now good -> open it
+    assert not need(site(), False)
+    assert need(site(login_ok=True), False)       # open, login not known good -> close it
+    assert not need(site(login_ok=True), True)
+    ak = site(ak_up='127.0.0.1:9090', hls=None)
+    assert not need(ak, False) and not need(ak, True)
+    assert not need('# nothing\n', False)
 
 
 # ── a failed Authentik check is unknown, not "no Authentik" ────────────────────
