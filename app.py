@@ -142,33 +142,72 @@ class _SurrogateSafeResponse(app.response_class):
 
 app.response_class = _SurrogateSafeResponse
 # Persist the secret key so session cookies survive console restarts.
-_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
+# ops #634: the key lives in `session_key`, not the old `secret_key` file. A box that
+# updates mints a fresh key on its first start, so every cookie signed before the
+# update stops working; the old file is removed. Created 0600 from the first byte.
+_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'session_key')
+_OLD_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
 try:
     os.makedirs(os.path.dirname(_SECRET_KEY_FILE), exist_ok=True)
+    _key = ''
     if os.path.exists(_SECRET_KEY_FILE):
-        app.secret_key = open(_SECRET_KEY_FILE).read().strip()
-    else:
-        _new_key = secrets.token_hex(32)
-        with open(_SECRET_KEY_FILE, 'w') as _f:
-            _f.write(_new_key)
-        os.chmod(_SECRET_KEY_FILE, 0o600)
-        app.secret_key = _new_key
+        with open(_SECRET_KEY_FILE) as _f:
+            _key = _f.read().strip()
+    if not _key:
+        _key = secrets.token_hex(32)
+        _tmp = _SECRET_KEY_FILE + '.tmp'
+        _fd = os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, 'w') as _f:
+            _f.write(_key)
+        os.replace(_tmp, _SECRET_KEY_FILE)
+    app.secret_key = _key
+    try:
+        os.remove(_OLD_SECRET_KEY_FILE)
+    except OSError:
+        pass   # gone already, or not ours to remove: the key above is still the one in use
 except Exception:
     app.secret_key = secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024
-# When using domain (infratak.*) set cookie domain for session; when using IP (backdoor) use no domain so cookie is sent
-def _set_session_cookie_domain():
-    try:
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'settings.json')
-        if os.path.exists(p) and (not app.config.get('SESSION_COOKIE_DOMAIN')):
-            _s = json.load(open(p))
-            if _s.get('fqdn'):
-                app.config['SESSION_COOKIE_DOMAIN'] = '.' + _s['fqdn'].split(':')[0]
-    except Exception:
-        pass
-_set_session_cookie_domain()
+
+# ops #634: the console session cookie belongs to the console's own host only.
+# It used to be scoped to `.<fqdn>`, so the browser sent the admin session to every
+# module site (Node-RED, TAK Portal, CloudTAK, ...) and, with no Secure flag, over
+# plain HTTP too. Nothing outside the console needs it: module sites log in through
+# Authentik's own cookie. Now: no Domain (host-only), Secure on HTTPS, and on HTTPS
+# the `__Host-` name, which the browser refuses to accept with a Domain or from a
+# sibling host. The new name also keeps the old `.<fqdn>` cookie called `session`
+# (still in browsers after the update) from shadowing the new one.
+LEGACY_SESSION_COOKIE = 'session'
+
+
+def _request_is_https():
+    from flask import has_request_context
+    if not has_request_context():
+        return False
+    if request.is_secure:
+        return True
+    # Only Caddy on this box may say the client used HTTPS.
+    return (request.remote_addr in ('127.0.0.1', '::1')
+            and (request.headers.get('X-Forwarded-Proto') or '').lower() == 'https')
+
+
+from flask.sessions import SecureCookieSessionInterface as _SecureCookieSessionInterface
+
+
+class _ConsoleSessionInterface(_SecureCookieSessionInterface):
+    def get_cookie_name(self, app):
+        return '__Host-infratak_session' if _request_is_https() else 'infratak_session'
+
+    def get_cookie_domain(self, app):
+        return None
+
+    def get_cookie_secure(self, app):
+        return _request_is_https()
+
+
+app.session_interface = _ConsoleSessionInterface()
 
 # In-memory rate limiter (per-process). Good baseline protection without extra deps.
 _RATE_LOCK = threading.Lock()
@@ -1293,24 +1332,12 @@ def _request_host_is_ip():
         return True
 
 @app.before_request
-def ensure_session_cookie_domain():
-    """Pin the session cookie to the FQDN ONLY when the request actually arrives on the FQDN
-    (SSO at infratak.<fqdn>, which needs the cross-subdomain cookie). For ANY other host — a bare
-    IP, `localhost`, or the SSH-tunnel break-glass path — use a host-only cookie. Otherwise the
-    browser silently drops a `.<fqdn>`-scoped cookie that was set over localhost/IP, the session
-    never persists, and the break-glass login bounces back to /login ('flash'). The earlier code
-    only special-cased a literal IP, so `https://localhost:5001` break-glass was broken on every
-    box that has an FQDN configured. (Found 2026-06-13 validating W-IDLE break-glass on test6.)"""
-    host = (request.host or '').split(':')[0].lower()
-    fqdn = ''
-    try:
-        fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
-    except Exception:
-        fqdn = ''
-    if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
-        app.config['SESSION_COOKIE_DOMAIN'] = '.' + fqdn
-    else:
-        app.config['SESSION_COOKIE_DOMAIN'] = False
+def ensure_session_valid():
+    """End a session whose login token no longer matches (password changed, logged out
+    elsewhere, or signed before ops #634). The cookie itself is host-only on every host now
+    (see _ConsoleSessionInterface), so the IP / localhost break-glass path needs no special
+    case."""
+    _drop_stale_session()
 
     # Baseline rate limiting
     ip = _client_ip()
@@ -1359,6 +1386,25 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
+
+
+@app.after_request
+def clear_legacy_session_cookie(response):
+    """ops #634: a browser that logged in before the update still holds the old `session`
+    cookie scoped to `.<fqdn>` and keeps sending it to every module site. It is dead (no
+    login token, old key), but expire it so the browser stops sending it at all."""
+    if LEGACY_SESSION_COOKIE in request.cookies:
+        host = (request.host or '').split(':')[0].lower()
+        try:
+            fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
+        except Exception:
+            fqdn = ''
+        response.delete_cookie(LEGACY_SESSION_COOKIE, path='/')
+        if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
+            response.delete_cookie(LEGACY_SESSION_COOKIE, path='/', domain='.' + fqdn)
+    return response
+
+
 VERSION = "10.3.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
@@ -2650,6 +2696,54 @@ def save_auth(auth_dict):
     with open(p, 'w') as f:
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
+    _session_token_cache['key'] = None
+
+
+# ops #634: every authenticated session carries a login token. It is an HMAC (keyed with
+# the session secret, so the cookie reveals nothing) over the stored password hash and
+# auth.json's `session_gen`. A password change (console page, reset-console-password.sh,
+# or a hash upgrade) or a logout changes it, and every other session ends on its next
+# request. A session from before this change has no token and ends too.
+SESSION_TOKEN_KEY = 'login_token'
+_session_token_cache = {'key': None, 'token': ''}
+
+
+def _session_auth_token():
+    p = os.path.join(CONFIG_DIR, 'auth.json')
+    try:
+        st = os.stat(p)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = ('missing',)
+    if _session_token_cache['key'] != key:
+        auth = load_auth()
+        raw = '%s|%s' % (auth.get('password_hash') or '', auth.get('session_gen') or '')
+        _session_token_cache['token'] = hmac.new(
+            (app.secret_key or '').encode(), raw.encode(), hashlib.sha256).hexdigest()
+        _session_token_cache['key'] = key
+    return _session_token_cache['token']
+
+
+def _stamp_session_login():
+    session[SESSION_TOKEN_KEY] = _session_auth_token()
+
+
+def _drop_stale_session():
+    if not session.get('authenticated'):
+        return
+    if not hmac.compare_digest(str(session.get(SESSION_TOKEN_KEY) or ''), _session_auth_token()):
+        session.clear()
+
+
+def _end_all_sessions():
+    """Bump session_gen so every existing console session ends. Never raises."""
+    try:
+        auth = load_auth()
+        if auth.get('password_hash'):   # save_auth needs it; no password = no password sessions
+            auth['session_gen'] = secrets.token_hex(16)
+            save_auth(auth)
+    except Exception as e:
+        print(f"[auth] could not end other sessions: {str(e)[:120]}", flush=True)
 
 
 # GH #137: werkzeug's default hash is scrypt, and an OpenSSL without scrypt (FIPS mode
@@ -4182,6 +4276,7 @@ def _apply_authentik_session():
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
+    _stamp_session_login()   # ops #634
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
@@ -6845,6 +6940,7 @@ def login():
             _note_password_length(request.form.get('password', ''))   # ops #638
             session.clear()
             session['authenticated'] = True
+            _stamp_session_login()   # ops #634
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
@@ -6856,6 +6952,11 @@ def login():
 @app.route('/logout', methods=['POST'])
 def logout():
     audit('auth:logout', '')
+    # ops #634: logout ends every console session, not just this browser's, so a
+    # copied cookie dies with it. Only a logged-in caller may do that: /logout has no
+    # login check, and anyone could otherwise log every admin out, over and over.
+    if session.get('authenticated'):
+        _end_all_sessions()
     session.clear()
     return redirect(url_for('index'))
 
@@ -6877,6 +6978,7 @@ def index():
             _note_password_length(request.form.get('password', ''))   # ops #638
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
+            _stamp_session_login()   # ops #634
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         _console_log_failed_login('/')   # ops #638
@@ -102777,6 +102879,8 @@ def console_password_reset():
     auth['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     auth['password_min_len_ok'] = True
     save_auth(auth)
+    # ops #634: the new hash ends every other session; keep this one.
+    _stamp_session_login()
     _detached_console_restart()
     return jsonify({'success': True, 'message': 'Password updated. Console will restart in a few seconds.'})
 
