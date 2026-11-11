@@ -54390,6 +54390,12 @@ def run_cloudtak_redeploy(cfg=None):
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             _cloudtak_remote_media_bufs(remote_cfg, plog)
+            # ops #631 follow-up: the domain may have been added or removed since the last
+            # Deploy, which changes whether 5000/5002 are locked (_remote_cloudtak_guard_ports).
+            # Re-apply the port lock so it matches the .env written here; it also removes the
+            # lock on ports that are no longer on the list.
+            if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
+                plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -54713,14 +54719,45 @@ def _cloudtak_postgis_extensions_upgrade(plog=None, remote_cfg=None):
         return False
 
 
-# Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
-# consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
+# Remote target after a checkout: media:9997 stays PUBLISHED on the remote host. Caddy runs on
+# the console, not on the remote, and proxies video.<fqdn> (443 and :9997) to <remote>:9997
+# (_get_cloudtak_upstreams), so a 127.0.0.1:9997 publish there breaks every remote video.
+# The loopback move exists for a LOCAL CloudTAK, where Caddy's own :9997 listener shares the
+# box (_patch_cloudtak_compose_ports). On a remote host the DOCKER-USER port guard
+# (_remote_cloudtak_port_guard) limits 9997 to the console instead. This undoes the loopback
+# prefix an older Update wrote; idempotent, perl for a consistent regex across distros.
 _CLOUDTAK_REMOTE_MEDIA_PERL = (
-    "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
+    "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml compose.yaml; do "
     "[ -f \"$f\" ] && perl -i -pe "
-    "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
+    "'s/(- \")127\\.0\\.0\\.1:(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}$2/' "
     "\"$f\"; done; true"
 )
+
+
+def _cloudtak_remote_media_publish_heal(remote_cfg, log_fn=None):
+    """ops #631 follow-up: a remote CloudTAK that an older Update left with media on
+    127.0.0.1:9997 has no video through Caddy on the console. Put the publish back and
+    recreate only the media container. No-op (no restart) when the compose is already right.
+    Call it only after the port guard is in place: it publishes 9997 for the console.
+    Returns 'same', 'healed' or 'failed'."""
+    _log = log_fn or (lambda _m: None)
+    cmd = (
+        "cd ~/CloudTAK 2>/dev/null || { echo NOCT; exit 0; }; "
+        "grep -qsE '127\\.0\\.0\\.1:\\$\\{MEDIA_PORT_API:-[0-9]+\\}:9997' "
+        "docker-compose.yml docker-compose.yaml compose.yaml || { echo SAME; exit 0; }; "
+        + _CLOUDTAK_REMOTE_MEDIA_PERL + "; "
+        "cd ~/CloudTAK && docker compose up -d --no-deps media >/dev/null 2>&1 && echo HEALED || echo FAILED"
+    )
+    ok, out = _ssh_probe(remote_cfg, cmd, timeout=180)
+    out = out or ''
+    if ok and 'HEALED' in out:
+        _log("  ✓ Remote CloudTAK video port 9997 published again for Caddy on the console (media container recreated)")
+        _cloudtak_media_hls_heal(plog=_log, remote_cfg=remote_cfg, wait=True)
+        return 'healed'
+    if ok and ('SAME' in out or 'NOCT' in out):
+        return 'same'
+    _log(f"  ⚠ Could not publish the remote CloudTAK video port 9997 again: {out.strip()[-200:]}")
+    return 'failed'
 
 
 # v10.2.15 (#150): operator pre-build hooks. Update's `checkout -f` wipes any local edit to
@@ -55374,13 +55411,16 @@ def run_cloudtak_update():
         # the startup migration.) Re-apply the loopback hardening here — the same
         # patch the startup migration / deploy path run — BEFORE the build/up.
         if is_remote:
-            # _patch_cloudtak_compose_ports() edits local files; over SSH apply the
-            # critical media:9997 → loopback rewrite via perl (consistent regex across
-            # distros; sed's brace/backref handling diverges). The `unless /127.0.0.1/`
-            # guard makes it idempotent. Fuller hardening runs on the box's next restart.
+            # The loopback move above is for a local CloudTAK only: on a remote host Caddy
+            # (on the console) proxies video to <remote>:9997, so media:9997 stays published
+            # there and the DOCKER-USER port guard limits it, and the other published ports,
+            # to the console (ops #631 follow-up). The guard is re-applied here so it matches
+            # the current domain settings before the containers are recreated.
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
-            plog("  Re-applied media:9997 loopback hardening after checkout"
-                 if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            plog("  Video port 9997 published for Caddy on the console"
+                 if ok_sed else "  ⚠ Could not check the video port 9997 publish (non-fatal)")
+            if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
+                plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -61851,6 +61891,17 @@ def _docker_port_guard_files(name, ports, allow_ips):
     for p in _ports:
         m = f'-p tcp -m conntrack --ctorigdstport {p} --ctdir ORIGINAL -j "$C"'
         lines.append(f'iptables -w -C DOCKER-USER {m} 2>/dev/null || iptables -w -I DOCKER-USER {m} || exit 1')
+    # ops #631 follow-up: this guard's port list can shrink (a remote CloudTAK whose domain is
+    # removed opens 5000/5002 to browsers again; a WebODM port can change). Remove the jumps
+    # to this chain for ports no longer on the list, so a port left out answers again instead
+    # of staying locked until someone clears the rule by hand. Only this guard's own chain.
+    keep = ' ' + ' '.join(str(p) for p in _ports) + ' '
+    lines += [
+        f'KEEP="{keep}"',
+        'for p in $(iptables -w -S DOCKER-USER | sed -n "/ -j $C\\$/s/.*--ctorigdstport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '  case "$KEEP" in *" $p "*) ;; *) iptables -w -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j "$C" || exit 1;; esac',
+        'done',
+    ]
     script = '\n'.join(lines) + '\n'
     unit = (
         '[Unit]\n'
@@ -107947,6 +107998,11 @@ def _startup_guard_remote_authentik_cloudtak_ports():
             elif not ok:
                 print(f"Startup migration: ⚠ remote {_label} ports could NOT be locked to the console "
                       f"and may not be limited to the console. Run {_page} to see why.")
+            # ops #631 follow-up: an older CloudTAK Update moved the remote video port 9997 to
+            # 127.0.0.1, out of reach of Caddy on the console. Publish it again, only once the
+            # guard limits it to the console.
+            if ok and _key == 'cloudtak_deployment':
+                _cloudtak_remote_media_publish_heal(cfg.get('remote', {}), log_fn=print)
         except Exception as _e:
             print(f"Startup migration: remote {_label} port guard error (non-fatal): {_e}")
 

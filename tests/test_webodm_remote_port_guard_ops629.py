@@ -92,7 +92,8 @@ def test_webodm_guard_drops_everyone_but_the_console():
     script = base64.b64decode(re.search(r'echo (\S+) \| base64 -d \| \$S tee /usr/local/sbin/', install).group(1)).decode()
     assert 'C=INFRATAK-WEBODM' in script
     assert '-s 10.0.0.9 -j RETURN' in script and '-s 198.51.100.7 -j RETURN' in script
-    assert script.rstrip().splitlines()[-1].count('--ctorigdstport 8765') == 2
+    insert = [ln for ln in script.splitlines() if ln.startswith('iptables -w -C DOCKER-USER ')]
+    assert len(insert) == 1 and insert[0].count('--ctorigdstport 8765') == 2
     assert 'iptables -w -A "$C" -j DROP' in script
     assert 'systemctl enable infratak-port-guard-webodm.service' in install
 
