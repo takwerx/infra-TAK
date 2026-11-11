@@ -228,4 +228,9 @@ def test_ops191_watch_script_rides_both_redeploy_paths():
                                             if isinstance(n, ast.FunctionDef)
                                             and n.name == '_auto_update_guarddog'))
     assert "os.listdir(scripts_dir) if f.endswith(('.sh', '.py'))" in auto
-    assert '_read_priv(dest) == content' in auto and '_write_priv(dest, content, perm=0o755)' in auto
+    # ops #645 W2 part 2a: through _gd_install_script, which leaves an identical script alone
+    assert '_gd_install_script(name, template, vals)' in auto
+    helper = ast.get_source_segment(APP, next(n for n in TOP
+                                              if isinstance(n, ast.FunctionDef)
+                                              and n.name == '_gd_install_script'))
+    assert '_read_priv(dest) == content' in helper and '_write_priv(dest, content, perm=perm)' in helper
