@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.11-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.11-alpha)**
+**Current release: [v10.3.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.12-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -443,6 +443,39 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.12-alpha — 2026-11-11 — Security update: every web site has a login, ports closed, the console locked down
+
+**Headline: Security update. TAK Portal and the MediaMTX web editor now always sit behind a login, WebODM gets its own admin password, and module ports on a second server answer only the console. The console sign-in is stricter, and Guard Dog, MediaMTX and the installer run with less power. Rocky 9 installs no longer end with TAK Server missing its LDAP groups. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.12-alpha))
+
+**Security: logins in front of every site.**
+- TAK Portal is only ever published behind Authentik. Without Authentik, its site says "TAK Portal needs Authentik" instead of opening.
+- MediaMTX web editor: without Authentik, the console sets a random password before the editor goes online and shows it once on the MediaMTX page. With Authentik, Authentik's login stays.
+- WebODM: the install (local and second server) makes the admin account with a generated password, shown once. WebODM's first-run setup page is closed.
+- Sites behind Authentik drop any identity headers a browser sends, so only Authentik can set them.
+
+**Security: ports.**
+- On a second server, Authentik, CloudTAK and WebODM ports answer only the console (and your other module servers that need them), also after a reboot or a Docker restart.
+- Second-server deploys turn the firewall on before they start anything.
+- On RHEL, re-running `start.sh` no longer opens internal ports to everyone.
+
+**Security: the console.**
+- New console passwords need 12 or more characters. Your current password keeps working.
+- Failed console sign-ins are logged, and 10 failures in 10 minutes ban the address for 1 hour (console and web ports only).
+- The console sign-in cookie stays on the console's own address, and a password change or logout signs out the other sessions.
+- Secret files are created private, and passwords are no longer passed on command lines.
+- Uploaded archives (Cesium tiles, TAK Server bundles, snapshots) are unpacked with one checked extractor.
+
+**Security: less power.**
+- MediaMTX and its web editor run as their own `mediamtx` account, not the console's.
+- TAK Portal's SSH key works only from TAK Portal's own network.
+- Guard Dog checks the numbers and folders it reads before it uses them, and uses private temp files. The daily Let's Encrypt renewal script moves to `/usr/local/sbin`.
+- External downloads are pinned to tested versions (MediaMTX editor, WebODM plugin, Docker from its signed repo, Authentik's redis).
+
+**Authentik on Rocky 9.**
+- A brief Authentik error during install no longer leaves TAK Server without its LDAP groups. The install retries, and repairs a missing outpost token.
+
+**Upgrading:** use **Update Now** on the Console page. Without Authentik, open the MediaMTX page after the update to see the editor's new password. If you roll back to 10.3.11 on a server with Let's Encrypt, TAK Server restarts once (about 10 seconds).
 
 ### v10.3.11-alpha — 2026-11-10 — Security update: the Node-RED editor always has a login
 
