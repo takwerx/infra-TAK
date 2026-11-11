@@ -121,6 +121,7 @@
   </div>
   {% endif %}
   {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">Node-RED is behind Authentik. The application and proxy provider are created automatically when you deploy Authentik or Node-RED.</p></div>{% endif %}
+  {% if nr.installed and settings.fqdn and not authentik_installed %}<div class="card" id="nodered-edge-card" style="border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.06)"><div class="card-title" id="nodered-edge-title">&#128274; Checking Node-RED login&hellip;</div><p id="nodered-edge-text" style="font-size:13px;color:var(--text-secondary);line-height:1.5"></p><div id="nodered-edge-secret" style="display:none;margin:10px 0;font-family:monospace;font-size:14px;color:var(--text-primary);word-break:break-all"></div><button class="btn" id="nodered-edge-reveal" style="display:none" onclick="noderedEdgeReveal()">Show password (once)</button> <button class="btn" id="nodered-edge-reset" style="display:none" onclick="noderedEdgeReset()">Make a new password</button></div>{% endif %}
   <div class="card"><div class="card-title">Access</div><div class="info-grid">
     {% if settings.fqdn %}<div class="info-item"><div class="info-label">Flow editor</div><div class="info-value"><a href="https://nodered.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://nodered.{{ settings.fqdn }}</a> &#8599;</div></div>
     {% else %}<div class="info-item"><div class="info-label">Flow editor</div><div class="info-value"><a href="http://{{ settings.server_ip }}:1880" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">http://{{ settings.server_ip }}:1880</a> &#8599;</div></div>{% endif %}
@@ -142,6 +143,24 @@
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
+<script>
+(function(){
+var card=document.getElementById('nodered-edge-card');if(!card)return;
+function $(i){return document.getElementById(i);}
+function show(secret){var b=$('nodered-edge-secret');b.textContent='Username: '+secret.user+'   Password: '+secret.password;b.style.display='block';$('nodered-edge-text').textContent='Copy this now. It is shown one time. Lost it? Make a new password.';$('nodered-edge-reveal').style.display='none';}
+window.noderedEdgeReveal=function(){fetch('/api/nodered/edge-login/reveal',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');return d;});}).then(show).catch(function(e){$('nodered-edge-text').textContent=e.message;});};
+window.noderedEdgeReset=function(){if(!confirm('Make a new Node-RED password? The old one stops working.'))return;fetch('/api/nodered/edge-login/reset',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');return d;});}).then(show).catch(function(e){$('nodered-edge-text').textContent=e.message;});};
+fetch('/api/nodered/edge-login',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+ var t=$('nodered-edge-title'),x=$('nodered-edge-text');
+ if(d.mode==='basic'){t.textContent='\uD83D\uDD12 Node-RED asks for a login';card.style.borderColor='rgba(59,130,246,.3)';card.style.background='rgba(59,130,246,.05)';
+  x.textContent='There is no Authentik here, so Caddy asks for a username and password before the flow editor opens. User: '+d.user+'.';
+  $('nodered-edge-reset').style.display='inline-block';
+  if(d.password_pending){x.textContent+=' Your password has not been shown yet.';$('nodered-edge-reveal').style.display='inline-block';}}
+ else if(d.mode==='blocked'){t.textContent='\u26A0 Node-RED is switched off at the web address';x.textContent='No login could be made, so the flow editor is not published. Make a new password to turn it on.';$('nodered-edge-reset').style.display='inline-block';}
+ else{card.style.display='none';}
+}).catch(function(){card.style.display='none';});
+})();
+</script>
 <script>window.MOD_INSTALLED={{ 'true' if nr.installed else 'false' }};</script>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>

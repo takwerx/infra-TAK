@@ -1345,7 +1345,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.11-alpha"
+VERSION = "10.3.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -4331,6 +4331,7 @@ def _detect_modules_uncached():
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     ak_installed = False
     ak_running = False
+    ak_probe_ok = True        # ops #613: False = the docker probe failed, so "not installed" is unknown
     if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
         ak_installed = True
         ok, out = _ssh_probe(ak_cfg.get('remote', {}), 'docker ps --filter name=authentik-server --format "{{.Status}}"', timeout=12)
@@ -4346,10 +4347,12 @@ def _detect_modules_uncached():
         _ak_home = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
         _akc = _run(['docker', 'ps', '-a', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
         ak_installed = _ak_home or bool((_akc.stdout or '').strip())
+        ak_probe_ok = ak_installed or _akc.returncode == 0
         if ak_installed:
             r = _run(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Status}}'], capture_output=True, text=True)
             ak_running = 'Up' in (r.stdout or '')
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
+        'probe_ok': ak_probe_ok,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
     # TAK Portal - Docker-based user management (local only; stays with TAK Server)
     # v10.0.5 non-root: a root-era TAK-Portal lives in /root/TAK-Portal, invisible to the
@@ -27843,6 +27846,13 @@ KNOWN_SECURITY_RELEASES = (
     {'component': 'cloudtak', 'fixed_in': '13.113.0',
      'reason': 'body-parser security fix GHSA-27r3-jxmh-p828 (an unauthenticated request '
                'could crash the API)'},
+    # ops #606: WebODM 4.0.0 replaces the end-of-life Django 2.2 that 3.x runs.
+    {'component': 'webodm', 'fixed_in': '4.0.0',
+     'reason': 'an end-of-life Django with known flaws'},
+    # ops #608 (from the pin notes, ops #202/#207): 2026.8.5 ships a certificate bundle that
+    # drops a distrusted root the container still trusted in 2026.8.4.
+    {'component': 'authentik', 'fixed_in': '2026.8.5',
+     'reason': 'a certificate bundle that still trusted a distrusted root (eMudhra)'},
 )
 
 
@@ -28508,6 +28518,128 @@ def _collect_patch_now_items(feed, unknown, now=None):
     return items, feed
 
 
+# ops #608: components with a console Update button that the sweep did not read. Per row:
+# module key (as in detect_modules), label, GitHub repo whose security advisories apply (or
+# None), `gated` and the step the operator takes. Gated components are pinned (Authentik,
+# NetBird, TAK Server, Federation Hub): they are mailed only for the version infra-TAK pins,
+# so nobody is told to move to a version we have not tested. Node-RED is not listed on
+# purpose: the console update moves it onto NODERED_IMAGE by itself (Post-update step), and
+# a new Node.js is already mailed through NODE_SECURITY_RELEASES.
+_MODULE_UPDATE_ROWS = (
+    ('takportal', 'TAK Portal', 'ValleyTacticalSolutions/TAK-Portal', False,
+     'TAK Portal page → Update.'),
+    ('atlas', 'ATLAS', None, False, 'ATLAS page → Update (or Update all deployments).'),
+    ('authentik', 'Authentik', 'goauthentik/authentik', True, 'Authentik page → Update.'),
+    ('mediamtx', 'MediaMTX', 'bluenviron/mediamtx', False,
+     'MediaMTX page → open the web editor and update there (the console does not update '
+     'MediaMTX itself).'),
+    ('takserver', 'TAK Server', None, True, 'TAK Server page → Update TAK Server.'),
+    ('fedhub', 'Federation Hub', None, True, 'Federation Hub page → Update Federation Hub.'),
+    ('netbird', 'NetBird', 'netbirdio/netbird', True, 'NetBird page → Update.'),
+    ('remote_assist', 'Remote Assist', None, False, 'Remote Assist page → Update.'),
+    ('tak_video_restreamer', 'TAK Video Restreamer', None, False,
+     'TAK Video Restreamer page → Update Now.'),
+    ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
+)
+
+
+def _module_update_info(key):
+    """The console's own version helper for one module, as the card reads it."""
+    if key == 'takportal':
+        return _get_takportal_version_info()
+    if key == 'atlas':
+        return mod_registry.atlas.get_version_info(mod_registry.get_ctx())
+    if key == 'authentik':
+        return _get_authentik_version_info()
+    if key == 'mediamtx':
+        return _get_mediamtx_version_info()
+    if key == 'takserver':
+        return _get_takserver_version_info()
+    if key == 'fedhub':
+        return _get_fedhub_version_info()
+    if key == 'netbird':
+        return _get_netbird_version_info()
+    if key == 'remote_assist':
+        return _get_remote_assist_version_info()
+    if key == 'tak_video_restreamer':
+        return mod_registry.tvr.get_version_info(mod_registry.get_ctx())
+    if key == 'simulator':
+        return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
+    return {}
+
+
+def _module_update_candidates(key, label, info, how):
+    """[{key, label, installed, target, identity, how, raw_installed, raw_target}] for one
+    module's pending update. Empty when the module has no update, or `info` does not say what
+    it would move to. MediaMTX can hold two: the binary and its web editor."""
+    def one(k, lbl, cur, tgt, hw, plain=False):
+        fmt = (lambda s: s) if plain else (lambda s: 'v' + s if re.match(r'^\d', s or '') else s)
+        num = re.search(r'\d+(?:\.\d+)+', str(cur) + ' ')
+        tnum = re.search(r'\d+(?:\.\d+)+', str(tgt) + ' ')
+        return {'key': k, 'label': lbl, 'installed': fmt(str(cur)), 'target': fmt(str(tgt)),
+                'identity': str(tgt), 'how': hw,
+                'raw_installed': num.group(0) if num else '', 'raw_target': tnum.group(0) if tnum else ''}
+    if key == 'mediamtx':
+        out = []
+        if info.get('binary_update_available') and info.get('version') and info.get('latest'):
+            out.append(one('mediamtx', 'MediaMTX', info['version'], info['latest'], how))
+        if info.get('editor_update_available') and info.get('editor_version') and info.get('editor_latest'):
+            out.append(one('mediamtx-editor', 'MediaMTX web editor', info['editor_version'],
+                           info['editor_latest'], how))
+        return out
+    if not (info.get('update_available') and info.get('version') and info.get('latest')):
+        return []
+    return [one(key, label, info['version'], info['latest'], how,
+                plain=key in ('tak_video_restreamer', 'takserver', 'fedhub'))]
+
+
+def _module_update_items(unknown):
+    """ops #608: pending updates for the components in _MODULE_UPDATE_ROWS, as
+    _collect_pending_updates items. Each module is read on its own, so one that fails never
+    hides the rest. A module that is installed but cannot be read is put in `unknown` (it is
+    not "up to date": its dedup state is carried, never re-mailed on a guess)."""
+    items = []
+    try:
+        modules = detect_modules()
+    except Exception as e:
+        for r in _MODULE_UPDATE_ROWS:
+            unknown.update({r[0], r[0] + '-editor'})
+        print(f"[update-notify] module detection failed: {e}", flush=True)
+        return items
+    for key, label, repo, gated, how in _MODULE_UPDATE_ROWS:
+        if not modules.get(key, {}).get('installed'):
+            continue
+        try:
+            info = _module_update_info(key) or {}
+            if not info.get('version'):
+                unknown.add(key)
+                unknown.add(key + '-editor')
+                continue
+            if gated and (info.get('channel') or 'main') != 'main':
+                continue
+            for c in _module_update_candidates(key, label, info, how):
+                raw_i, raw_t = c.pop('raw_installed'), c.pop('raw_target')
+                known = ['Fixes ' + k for k in _known_security_fixed_by(key, raw_i, raw_t)]
+                sec = list(known)
+                if repo and c['key'] == key:
+                    try:
+                        sec = ['Fixes ' + a for a in _gh_advisories_fixed_by(repo, raw_i, raw_t)] + known
+                    except Exception as e:
+                        c['security_unknown'] = True
+                        print(f"[update-notify] {label} advisories unreadable: {e}", flush=True)
+                if key == 'tak_video_restreamer' and info.get('security_update'):
+                    sec.append('Fixes the restreamer’s publish login and its pinned MediaMTX and '
+                               'Python components')
+                if sec:
+                    c['security'] = sec
+                items.append(_apply_security_identity(c))
+        except Exception as e:
+            unknown.add(key)
+            unknown.add(key + '-editor')
+            print(f"[update-notify] {label} check failed: {e}", flush=True)
+    return items
+
+
 def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
@@ -28545,6 +28677,29 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
                 pending.append(_apply_security_identity(ct))
     except Exception as e:
         print(f"[update-notify] CloudTAK check failed: {e}", flush=True)
+    try:
+        # ops #606: WebODM's Update is the operator's to press after the console update, so
+        # it needs its own mail line. Its Update backs up the database first.
+        if detect_modules().get('webodm', {}).get('installed'):
+            info = _get_webodm_version_info()
+            if info.get('version') and info.get('update_available') and info.get('latest'):
+                wo = {'key': 'webodm', 'label': 'WebODM',
+                      'installed': f"v{info['version']}", 'target': f"v{info['latest']}",
+                      'identity': str(info['latest']),
+                      'how': 'WebODM page → Update (makes a backup first; the database upgrade '
+                             'cannot be undone without the backup).'}
+                known = ['Fixes ' + k for k in _known_security_fixed_by(
+                    'webodm', info['version'], info['latest'])]
+                if known:
+                    wo['security'] = known
+                pending.append(_apply_security_identity(wo))
+    except Exception as e:
+        print(f"[update-notify] WebODM check failed: {e}", flush=True)
+    try:
+        # ops #608: the other modules with a console Update button.
+        pending.extend(_module_update_items(unknown))
+    except Exception as e:
+        print(f"[update-notify] module update check failed: {e}", flush=True)
     try:
         pending.extend(_os_security_items(seen, unknown))
     except Exception as e:
@@ -36994,8 +37149,12 @@ _CADDY_MIN_TRUST_POOL = (2, 8)
 # verified 2026-11-04 Cloudsmith apt carries 2.11.8 while the @caddy/caddy COPR is still on
 # 2.11.7-1. One floor for both would leave every dnf box permanently short, falling back to
 # the static build on each console start. Raise _CADDY_MIN_SECURE_DNF once the COPR has it.
+# ops #609: the COPR still only had 2.11.7-1 on 2026-11-10 (upstream 2.11.9 since 2026-11-05),
+# so Rocky/RHEL stayed below the security update. The dnf floor is now 2.11.8 too: _caddy_lift_to_secure_floor asks the COPR first and, when it is still
+# short, takes the official static build. A COPR that catches up later changes nothing here:
+# dnf serves the same or a newer version, and the floor is met either way.
 _CADDY_MIN_SECURE = (2, 11, 8)
-_CADDY_MIN_SECURE_DNF = (2, 11, 7)
+_CADDY_MIN_SECURE_DNF = (2, 11, 8)
 # `servers { timeouts { read_body_idle } }` landed in 2.11.6 — see _caddy_read_body_idle_lines.
 _CADDY_MIN_READ_BODY_IDLE = (2, 11, 6)
 
@@ -37111,27 +37270,72 @@ def _caddy_rescue_html_oneline(root_url):
     )
 
 
+def _caddy_fetch_release_binary(dest, log_fn=None):
+    """Fetch the newest Caddy release for this CPU from GitHub, SHA-512 checked, into dest.
+
+    Returns the version string (e.g. '2.11.9') on success, None otherwise (the reason is
+    logged). The tarball and the release's own caddy_<ver>_checksums.txt come from the same
+    GitHub release page that _caddy_install_github_deb() uses; the binary is only written
+    when the tarball's SHA-512 matches that file. Only the member named `caddy` is read out
+    of the archive, in memory (never extractall). Nothing is written to dest on a failure."""
+    import io as _io
+    import tarfile as _tarfile
+    _log = log_fn or (lambda m: None)
+    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+    try:
+        with urllib.request.urlopen('https://github.com/caddyserver/caddy/releases/latest', timeout=30) as r:
+            m = re.search(r'/tag/v(\d+\.\d+\.\d+)$', r.geturl())
+        if not m:
+            _log('  \u2717 could not determine the latest Caddy release from GitHub')
+            return None
+        ver = m.group(1)
+        base = f'https://github.com/caddyserver/caddy/releases/download/v{ver}'
+        tar_name = f'caddy_{ver}_linux_{_arch}.tar.gz'
+        with urllib.request.urlopen(f'{base}/caddy_{ver}_checksums.txt', timeout=30) as r:
+            sums = r.read().decode('utf-8', 'replace')
+        want = next((ln.split()[0] for ln in sums.splitlines()
+                     if len(ln.split()) == 2 and ln.split()[1] == tar_name), None)
+        if not want:
+            _log(f'  \u2717 {tar_name} is not listed in the Caddy v{ver} checksums file')
+            return None
+        with urllib.request.urlopen(f'{base}/{tar_name}', timeout=300) as r:
+            data = r.read()
+        if hashlib.sha512(data).hexdigest() != want.lower():
+            _log(f'  \u2717 {tar_name} failed its SHA-512 check \u2014 not installing it')
+            return None
+        with _tarfile.open(fileobj=_io.BytesIO(data), mode='r:gz') as tf:
+            member = next((t for t in tf.getmembers() if t.name == 'caddy' and t.isfile()), None)
+            if member is None:
+                _log(f'  \u2717 {tar_name} has no caddy binary in it')
+                return None
+            binary = tf.extractfile(member).read()
+        with open(dest, 'wb') as f:
+            f.write(binary)
+        return ver
+    except (OSError, ValueError, _tarfile.TarError) as e:
+        _log(f'  \u2717 Caddy release download failed: {type(e).__name__}: {str(e)[:200]}')
+        return None
+
+
 def _caddy_install_official_static(plog=None):
     """Install the official static Caddy build over the current one. Returns True on success.
 
     Used by the deploy version gate on the dnf side: the RHEL COPR package is the family's
     usual source but can lag, and there is no `--only-upgrade` equivalent there that
-    reliably lands >= 2.7. Verifies the download RUNS before installing it \u2014 a partial
+    reliably lands >= 2.7. The build comes from Caddy's GitHub release, SHA-512 checked
+    against the release's checksums file (_caddy_fetch_release_binary), the same check the
+    .deb path has. Then it verifies the download RUNS before installing it \u2014 a partial
     fetch would otherwise pass a mere presence check and then fail caddy.service with
     203/EXEC. Mirrors the existing EL9 COPR payload-quirk path."""
     _log = plog or (lambda m: print(m, flush=True))
-    _arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-    _dl = '/tmp/caddy.upgrade.download'
-    _url = f'https://caddyserver.com/api/download?os=linux&arch={_arch}'
+    tmpd = None
     try:
-        # argv throughout — no shell string carries an interpolated value (Dependency Rule).
-        try:
-            os.remove(_dl)
-        except OSError:
-            pass
-        subprocess.run(['curl', '-fsSL', '--retry', '3', '--retry-delay', '2', _url, '-o', _dl],
-                       capture_output=True, text=True, timeout=300)
-        subprocess.run(_sudo_wrap(['chmod', '+x', _dl]), capture_output=True, text=True)
+        tmpd = tempfile.mkdtemp(prefix='caddy-static-')   # 0700, ours: no predictable /tmp path
+        _dl = os.path.join(tmpd, 'caddy')
+        if not _caddy_fetch_release_binary(_dl, _log):
+            return False
+        os.chmod(_dl, 0o755)
+        # argv throughout \u2014 no shell string carries an interpolated value (Dependency Rule).
         ver = subprocess.run([_dl, 'version'], capture_output=True, text=True, timeout=20)
         if ver.returncode != 0:
             _log(f"  \u2717 official static caddy download did not validate: {((ver.stderr or ver.stdout) or 'no output').strip()[:160]}")
@@ -37141,16 +37345,14 @@ def _caddy_install_official_static(plog=None):
         # RHEL: keep the httpd_exec_t label the rpm scriptlet set, else systemd refuses it.
         _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'],
                          ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
-        _log(f"  \u2713 official static caddy {(ver.stdout or '').split()[0] if ver.stdout else ''} installed")
+        _log(f"  \u2713 official static caddy {(ver.stdout or '').split()[0] if ver.stdout else ''} installed (SHA-512 verified)")
         return True
     except (subprocess.TimeoutExpired, OSError) as e:
         _log(f"  \u2717 official static caddy install failed: {str(e)[:160]}")
         return False
     finally:
-        try:
-            os.remove(_dl)
-        except OSError:
-            pass
+        if tmpd:
+            shutil.rmtree(tmpd, ignore_errors=True)
         _caddy_version_cache['ver'] = None
 
 
@@ -37579,6 +37781,81 @@ def _startup_caddy_request_encoding_converge():
     _ok, _detail = _caddy_reload_if_changed(timeout=60)
     print('Startup migration: ✓ TAK Portal / Remote Assist / Node-RED / CloudTAK vhosts now drop '
           'request Content-Encoding and Caddy %s (ops #190)'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
+def _nodered_vhost_has_login(generated):
+    """True when the Node-RED vhost in a generated Caddyfile has nothing in front of the
+    editor to remove (no vhost at all counts as fine). ops #613."""
+    i = generated.find('# Node-RED flow editor')
+    if i < 0:
+        return True
+    j = generated.find('\n}\n', i)
+    block = generated[i:j if j > 0 else len(generated)]
+    return any(k in block for k in ('forward_auth', 'basic_auth', ' 503'))
+
+
+def _nodered_vhost_has_forward_auth(generated):
+    """True when the Node-RED vhost in a Caddyfile text sits behind Authentik forward_auth."""
+    i = generated.find('# Node-RED flow editor')
+    if i < 0:
+        return False
+    j = generated.find('\n}\n', i)
+    return 'forward_auth' in generated[i:j if j > 0 else len(generated)]
+
+
+def _nodered_edge_uses_sso(ak, existing_caddyfile):
+    """ops #613: should the Node-RED vhost be built with Authentik forward_auth?
+
+    Yes when Authentik is installed. When the Authentik probe FAILED (or gave no answer at
+    all) the state is unknown, not "no Authentik": keep the Authentik block if the Caddyfile
+    already on disk has one, otherwise fall through to the Caddy login. A failed probe must
+    never turn into a bare reverse_proxy."""
+    ak = ak or {}
+    if ak.get('installed'):
+        return True
+    if ak and ak.get('probe_ok', True):
+        return False
+    return _nodered_vhost_has_forward_auth(existing_caddyfile or '')
+
+
+def _startup_caddy_nodered_login_converge():
+    """ops #613 — an existing box whose Node-RED vhost is a bare reverse_proxy (no Authentik)
+    gets a login from Caddy on the console update. The password is shown once on the
+    Node-RED page. Same shape as _startup_caddy_request_encoding_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: Node-RED login converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if _nodered_vhost_has_login(generated):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    print('Startup migration: ⚠ the Node-RED editor is published with NO login in front of it '
+          '(ops #613) — putting one in front now', flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: Node-RED login queued — written with the post-registry '
+              'Caddyfile regen (ops #613). Check your flows: if you find one you did not '
+              'write, delete it and rebuild this box.', flush=True)
+        return
+    try:
+        if not _nodered_vhost_has_login(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ Node-RED login converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. The editor is STILL open on this '
+                  'box (ops #613).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ Node-RED editor now needs a login (Console, Node-RED page shows '
+          'the password once) and Caddy %s (ops #613). Check your flows: if you find one you '
+          'did not write, delete it and rebuild this box.'
           % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
@@ -38064,6 +38341,94 @@ def _cloudtak_print_caddy_converge(log=None):
     return True
 
 
+# ops #613: a Node-RED flow editor that anyone can reach can build a flow that runs commands. The editor must never be published
+# without a login in front of it. With Authentik that login is forward_auth. Without it,
+# Caddy asks for a generated username and password (basic_auth). If neither can be put in
+# place the vhost answers 503: a bare reverse_proxy is never emitted.
+#
+# Why Caddy and not Node-RED's own adminAuth: adminAuth also locks the admin API, and the
+# deploy, backup and post-update code reads /context/global from inside the container
+# without a token. adminAuth would break the Configurator backup path. adminAuth stays
+# opt-in through ~/node-red/.env.
+_NODERED_EDGE_LOGIN_FILE = os.path.join(CONFIG_DIR, 'nodered_edge_login.json')
+_NODERED_EDGE_USER = 'nodered-admin'
+_NODERED_PUBLIC_PATHS = '/ipaws/alerts.kml /icons/ipaws/*'
+_NODERED_EDGE_HASH_RE = re.compile(r'^[A-Za-z0-9+/=$.\-_]{20,200}$')
+
+
+def _nodered_edge_login_load():
+    try:
+        with open(_NODERED_EDGE_LOGIN_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _nodered_edge_login_save(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _NODERED_EDGE_LOGIN_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, _NODERED_EDGE_LOGIN_FILE)
+
+
+def _caddy_hash_password(plaintext):
+    """bcrypt hash for a Caddy basic_auth entry, from Caddy itself. The password goes in on
+    stdin, never on the command line. Returns '' on any failure."""
+    try:
+        r = subprocess.run(['caddy', 'hash-password'], input=plaintext + '\n',
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return ''
+    out = (r.stdout or '').strip()
+    return out if r.returncode == 0 and _NODERED_EDGE_HASH_RE.match(out) else ''
+
+
+def _nodered_edge_login(create=False, rotate=False):
+    """The Caddy login for the Node-RED editor on a box with no Authentik.
+
+    State lives in .config/nodered_edge_login.json (0600): {'user', 'hash', 'reveal'}.
+    'reveal' holds the plaintext until the console has shown it once, then it is removed.
+    create=True makes a login when there is none; rotate=True always makes a new one.
+    Returns the state ({} when there is no usable login)."""
+    state = _nodered_edge_login_load()
+    if not rotate and _NODERED_EDGE_HASH_RE.match(state.get('hash') or ''):
+        return state
+    if not (create or rotate):
+        return {}
+    password = secrets.token_urlsafe(18)
+    hashed = _caddy_hash_password(password)
+    if not hashed:
+        return {}
+    state = {'user': _NODERED_EDGE_USER, 'hash': hashed, 'reveal': password,
+             'created': int(time.time())}
+    _nodered_edge_login_save(state)
+    return state
+
+
+def _nodered_no_sso_lines(nodered_up, login):
+    """Caddy lines for the Node-RED vhost when Authentik is not installed. Fails closed."""
+    user = (login or {}).get('user') or ''
+    hashed = (login or {}).get('hash') or ''
+    if not (user == _NODERED_EDGE_USER and _NODERED_EDGE_HASH_RE.match(hashed)):
+        return ['    # ops #613: no login could be created, so the editor is NOT published',
+                '    respond "Node-RED is not available: no login is set up. Open the infra-TAK console, Node-RED page." 503']
+    return ['    route {',
+            '        @nodered_public {',
+            f'            path {_NODERED_PUBLIC_PATHS}',
+            '        }',
+            '        handle @nodered_public {',
+            f'            reverse_proxy {nodered_up}',
+            '        }',
+            '        basic_auth {',
+            f'            {user} {hashed}',
+            '        }',
+            f'        reverse_proxy {nodered_up}',
+            '    }']
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -38291,7 +38656,12 @@ def generate_caddyfile(settings=None):
         lines.append(f"# Node-RED flow editor")
         lines.append(f"{nodered_host} {{")
         lines += _caddy_drop_request_encoding_lines()
-        if ak.get('installed'):
+        # ops #613: an unknown Authentik probe keeps the block already on disk, else fails closed.
+        try:
+            _nr_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _nr_existing = ''
+        if _nodered_edge_uses_sso(ak, _nr_existing):
             lines.append(f"    route {{")
             _emit_outpost_callback_rescue(f"{_pub_url(nodered_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
@@ -38308,7 +38678,8 @@ def generate_caddyfile(settings=None):
             lines.append(f"        reverse_proxy {nodered_up}")
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy {nodered_up}")
+            # ops #613: never a bare reverse_proxy. Login from Caddy, or 503.
+            lines += _nodered_no_sso_lines(nodered_up, _nodered_edge_login(create=True))
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'nodered'), nodered_host)
@@ -39953,25 +40324,10 @@ def run_caddy_deploy(domain):
             # atomically install + apply the fcontext the scriptlet set. Arch-aware.
             # Validated on Rocky 9.6 under SELinux Enforcing.
             plog("  Binary missing after dnf install (known EL9 COPR payload quirk) — installing official static binary...")
-            _caddy_arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-            _caddy_dl = '/tmp/caddy.download'
-            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
-            subprocess.run(
-                f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o {_caddy_dl}',
-                shell=True, capture_output=True, text=True, timeout=300)
-            subprocess.run(_sudo_wrap(['chmod', '+x', _caddy_dl]), capture_output=True, text=True)
-            # verify the downloaded binary actually executes before trusting it
-            _caddy_ver = subprocess.run(f'{_caddy_dl} version', shell=True, capture_output=True, text=True, timeout=20)
-            if _caddy_ver.returncode == 0:
-                subprocess.run(_sudo_wrap(['install', '-m', '0755', _caddy_dl, '/usr/bin/caddy']), capture_output=True, text=True, timeout=30)
-                # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
-                # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
-                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
+            # The same helper the version gate uses: GitHub release tarball, SHA-512 checked,
+            # verified to run, installed with the fcontext. Then make sure /etc/caddy exists.
+            if _caddy_install_official_static(plog):
                 subprocess.run(_sudo_wrap(['mkdir', '-p', '/etc/caddy']), capture_output=True, text=True)
-                plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
-            else:
-                plog(f"  ✗ static caddy download did not validate: {((_caddy_ver.stderr or _caddy_ver.stdout) or 'no output').strip()[:160]}")
-            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
             # functional final check (not mere presence) so we never false-report success
             r = subprocess.run('caddy version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
@@ -40052,22 +40408,7 @@ def run_caddy_deploy(domain):
         # static binary, so a missing/broken binary can never reach systemd. Idempotent.
         if pkg_mgr == 'dnf' and subprocess.run('caddy version', shell=True, capture_output=True).returncode != 0:
             plog("  Caddy binary missing/non-functional before start — installing official static binary…")
-            _ca = 'arm64' if _host_arch() == 'arm64' else 'amd64'
-            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
-            subprocess.run(f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_ca}" -o /tmp/caddy.download',
-                           shell=True, capture_output=True, timeout=300)
-            try:
-                os.chmod('/tmp/caddy.download', 0o755)  # console-owned /tmp scratch; direct
-            except OSError:
-                pass
-            _cv = subprocess.run('/tmp/caddy.download version', shell=True, capture_output=True, text=True, timeout=20)
-            if _cv.returncode == 0:
-                subprocess.run(_sudo_wrap(['install', '-m', '0755', '/tmp/caddy.download', '/usr/bin/caddy']), capture_output=True, timeout=30)
-                _run_priv_chain([['restorecon', '-v', '/usr/bin/caddy'], ['chcon', '-t', 'httpd_exec_t', '/usr/bin/caddy']], 'or')
-                plog(f"  ✓ official static caddy {(_cv.stdout or '').split()[0] if _cv.stdout else ''} installed")
-            else:
-                plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
-            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
+            _caddy_install_official_static(plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'caddy']), capture_output=True)
         r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
         if r.returncode != 0:
@@ -57032,6 +57373,50 @@ def _ensure_docker_log_limits(log_fn=None):
 nodered_deploy_log = []
 nodered_deploy_status = {'running': False, 'complete': False, 'error': False, 'cancelled': False}
 
+@app.route('/api/nodered/edge-login')
+@login_required
+def nodered_edge_login_status():
+    """ops #613: what stands in front of the Node-RED editor. Never returns the password."""
+    modules = detect_modules()
+    if not modules.get('nodered', {}).get('installed'):
+        return jsonify({'mode': 'none'})
+    if modules.get('authentik', {}).get('installed'):
+        return jsonify({'mode': 'authentik'})
+    st = _nodered_edge_login()
+    if not st:
+        return jsonify({'mode': 'blocked'})
+    return jsonify({'mode': 'basic', 'user': st.get('user'),
+                    'password_pending': bool(st.get('reveal'))})
+
+
+@app.route('/api/nodered/edge-login/reveal', methods=['POST'])
+@login_required
+def nodered_edge_login_reveal():
+    """Hand out the generated password once, then forget the plaintext."""
+    st = _nodered_edge_login()
+    pw = st.get('reveal') if st else None
+    if not pw:
+        return jsonify({'error': 'Password was already shown. Use Reset to make a new one.'}), 404
+    st.pop('reveal', None)
+    _nodered_edge_login_save(st)
+    return jsonify({'user': st.get('user'), 'password': pw})
+
+
+@app.route('/api/nodered/edge-login/reset', methods=['POST'])
+@login_required
+def nodered_edge_login_reset():
+    """New generated password, written into Caddy now. Shown once."""
+    st = _nodered_edge_login(rotate=True)
+    if not st:
+        return jsonify({'error': 'Could not make a password (Caddy hash-password failed).'}), 500
+    settings = load_settings()
+    generate_caddyfile(settings)
+    ok, detail = _caddy_reload_if_changed(timeout=60)
+    pw = st.pop('reveal', None)
+    _nodered_edge_login_save(st)
+    return jsonify({'user': st.get('user'), 'password': pw, 'caddy_reloaded': bool(ok)})
+
+
 @app.route('/api/nodered/deploy', methods=['POST'])
 @login_required
 def nodered_deploy_api():
@@ -60371,6 +60756,113 @@ def _docker_compose_pull(compose_yml, cwd, plog, timeout=1800, label='image', se
     return False
 
 
+_PORT_GUARD_NAME_RE = re.compile(r'^[a-z0-9]{1,16}$')
+
+
+def _docker_port_guard_files(name, ports, allow_ips):
+    """(script, unit) that let only `allow_ips` reach the Docker-published `ports` of a remote box.
+
+    ops #615: Docker publishes a port with its own nat + FORWARD rules, so `ufw deny <port>`
+    (and firewalld) never sees that traffic. A remote Node-RED behind `ufw deny 1880/tcp`
+    answered from any address (proved on Azure Ubuntu 22.04, 2026-11-10).
+    DOCKER-USER is the chain Docker keeps for this and evaluates before its own rules; match
+    the host port with --ctorigdstport (the port before DNAT):
+    https://docs.docker.com/engine/network/packet-filtering-firewalls/
+    Containers on the box's own Docker bridges keep access. The unit is WantedBy + PartOf
+    docker.service, so the rules come back on every boot and every Docker restart.
+    """
+    if not _PORT_GUARD_NAME_RE.match(name or ''):
+        raise ValueError(f'bad port guard name: {name!r}')
+    _ports = [int(p) for p in ports]
+    if not _ports or not all(0 < p < 65536 for p in _ports):
+        raise ValueError(f'bad port list: {ports!r}')
+    _ips = sorted({str(ipaddress.IPv4Address(ip)) for ip in allow_ips})
+    chain = f'INFRATAK-{name.upper()}'
+    lines = [
+        '#!/bin/sh',
+        f'# infra-TAK port guard ({name}): only the console may reach Docker-published port(s) '
+        + ' '.join(str(p) for p in _ports) + '.',
+        '# Docker port publishing skips ufw/firewalld; DOCKER-USER does not. Managed by infra-TAK, re-written on update.',
+        'command -v iptables >/dev/null 2>&1 || { echo "infratak-port-guard: iptables not found" >&2; exit 1; }',
+        f'C={chain}',
+        'iptables -w -N "$C" 2>/dev/null || iptables -w -F "$C" || exit 1',
+    ]
+    lines += [f'iptables -w -A "$C" -s {ip} -j RETURN || exit 1' for ip in _ips]
+    lines += [
+        'iptables -w -A "$C" -i docker0 -j RETURN || exit 1',
+        'iptables -w -A "$C" -i br-+ -j RETURN || exit 1',
+        'iptables -w -A "$C" -j DROP || exit 1',
+        'iptables -w -N DOCKER-USER 2>/dev/null || true',
+    ]
+    for p in _ports:
+        m = f'-p tcp -m conntrack --ctorigdstport {p} --ctdir ORIGINAL -j "$C"'
+        lines.append(f'iptables -w -C DOCKER-USER {m} 2>/dev/null || iptables -w -I DOCKER-USER {m} || exit 1')
+    script = '\n'.join(lines) + '\n'
+    unit = (
+        '[Unit]\n'
+        f'Description=infra-TAK port guard ({name}): only the console reaches Docker-published ports\n'
+        'After=docker.service\n'
+        'PartOf=docker.service\n'
+        '\n'
+        '[Service]\n'
+        'Type=oneshot\n'
+        'RemainAfterExit=yes\n'
+        f'ExecStart=/usr/local/sbin/infratak-port-guard-{name}\n'
+        '\n'
+        '[Install]\n'
+        'WantedBy=docker.service\n'
+    )
+    return script, unit
+
+
+def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None):
+    """Install + start the port guard on a remote module host. Returns (ok, first_time).
+
+    Allowed sources: the console as the remote box sees it over SSH ($SSH_CLIENT, right for a
+    console that reaches it on a private address) and Settings → Server IP. Neither found:
+    the ports are dropped for everyone (fail closed). No-op for a local target."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return True, False
+    _log = log_fn or (lambda _m: None)
+    allow = []
+    _ok, _out = _module_run(deploy_cfg, 'echo "SSHSRC ${SSH_CLIENT%% *}"', timeout=20)
+    for _ln in (_out or '').splitlines():
+        if _ln.startswith('SSHSRC '):
+            allow.append(_ln[7:].strip())
+    allow.append(_fedhub_caddy_source_ip(settings) or '')
+    _ips = []
+    for _a in allow:
+        try:
+            _ips.append(str(ipaddress.IPv4Address(_a)))
+        except ValueError:
+            pass
+    script, unit = _docker_port_guard_files(name, ports, _ips)
+    _unit = f'infratak-port-guard-{name}.service'
+    _chain = f'INFRATAK-{name.upper()}'
+    _p0 = int(list(ports)[0])
+    cmd = (
+        'S=""; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+        f'had=no; [ -f /etc/systemd/system/{_unit} ] && had=yes; '
+        f'echo {_b64.b64encode(script.encode()).decode()} | base64 -d | $S tee /usr/local/sbin/infratak-port-guard-{name} >/dev/null && '
+        f'$S chmod 755 /usr/local/sbin/infratak-port-guard-{name} && '
+        f'echo {_b64.b64encode(unit.encode()).decode()} | base64 -d | $S tee /etc/systemd/system/{_unit} >/dev/null && '
+        f'$S systemctl daemon-reload && $S systemctl enable {_unit} 2>&1 && $S systemctl restart {_unit} 2>&1 && '
+        f'$S iptables -w -C DOCKER-USER -p tcp -m conntrack --ctorigdstport {_p0} --ctdir ORIGINAL -j {_chain} && '
+        'echo "GUARD_OK had=$had"'
+    )
+    ok, out = _module_run(deploy_cfg, cmd, timeout=60)
+    good = ok and 'GUARD_OK' in (out or '')
+    ports_txt = '/'.join(str(p) for p in ports)
+    if good:
+        if _ips:
+            _log(f"  ✓ Port {ports_txt} locked to the console ({', '.join(_ips)}) in DOCKER-USER (kept across reboot)")
+        else:
+            _log(f"  ⚠ Port {ports_txt} dropped for every source: no console IP found. Set Settings → Server IP.")
+    else:
+        _log(f"  ✗ Could not lock port {ports_txt} to the console: {(out or '').strip()[-300:]}")
+    return good, good and 'had=no' in (out or '')
+
+
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
     remote = deploy_cfg.get('remote', {})
@@ -60435,7 +60927,8 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     # probe the remote host's /opt/tak/certs/files contents from here. Operator can narrow
     # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
     # Port binding is 0.0.0.0:1880 for remote so Caddy on the console can reach it via
-    # reverse_proxy. UFW source-scopes this to the console IP only (see below).
+    # reverse_proxy. The DOCKER-USER port guard scopes it to the console (ops #615);
+    # the ufw lines below alone do not, Docker's published ports skip ufw.
     compose_yml = f"""services:
   node-red:
     image: {NODERED_IMAGE}
@@ -60507,6 +61000,18 @@ volumes:
     plog("")
     plog("━━━ Docker log limits (remote) ━━━")
     _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
+
+    # ops #615: lock 1880 to the console BEFORE the container publishes it. The ufw lines
+    # further down never applied (Docker's published ports skip ufw), so the port was reachable
+    # from anywhere. No lock = no start.
+    plog("")
+    plog("━━━ Locking port 1880 to the console (remote) ━━━")
+    _nr_guard_ok, _ = _remote_docker_port_guard(deploy_cfg, settings, 'nodered', [1880], log_fn=plog)
+    if not _nr_guard_ok:
+        plog("✗ Node-RED was not started: without this lock the editor port is not limited to the console.")
+        plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
 
     # Pull first, on its own generous budget. Same reason as the local path: the
     # image is a ~200 MB download and folding it into `up -d`'s 120 s killed the
@@ -60867,6 +61372,9 @@ volumes:
             generate_caddyfile(settings)
             if _caddy_apply_and_verify(plog, 'Node-RED', [_get_service_domain(settings, 'nodered')], settings) == 'ok':
                 plog(f"  Open via https://{_pub_hostport(_get_service_domain(settings, 'nodered'), settings)}")
+                if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+                    plog("  ops #613: no Authentik here, so Caddy asks for a login before the editor opens.")
+                    plog("  Open the Node-RED page in this console to see the password (shown once).")
             else:
                 plog("  Node-RED itself is running on port 1880.")
         else:
@@ -105581,6 +106089,31 @@ def _startup_harden_fedhub_ports():
 threading.Thread(target=_startup_harden_fedhub_ports, daemon=True).start()
 
 
+def _startup_guard_remote_nodered_port():
+    """ops #615: a remote Node-RED publishes 0.0.0.0:1880 and its ufw deny never applied
+    (Docker's published ports skip ufw), so the port was reachable from anywhere.
+    On every console boot (Update Now restarts it), (re)install the DOCKER-USER port guard on
+    the remote host. Idempotent. Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        ok, first = _remote_docker_port_guard(cfg, settings, 'nodered', [1880], log_fn=print)
+        if ok and first:
+            print("Startup migration: remote Node-RED port 1880 is now limited to the console. "
+                  "Check every flow in the Node-RED editor: if you find a flow "
+                  "you did not write, delete it and rebuild the remote box.")
+        elif not ok:
+            print("Startup migration: ⚠ remote Node-RED port 1880 could NOT be locked to the console "
+                  "and may not be limited to the console. Run Deploy on the Node-RED page to see why.")
+    except Exception as _e:
+        print(f"Startup migration: remote Node-RED port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_nodered_port, daemon=True).start()
+
+
 def _startup_ensure_metrics_collector():
     """v0.9.47: ensure the Guard Dog network/fanout metrics collector is installed + running
     whenever Guard Dog is already deployed — on EVERY console boot, so a plain pull+restart
@@ -109721,6 +110254,11 @@ def _startup_migrations():
             _startup_caddy_request_encoding_converge()
         except Exception as _rce_err:
             print(f"Startup migration: request Content-Encoding converge error (non-fatal): {_rce_err}",
+                  flush=True)
+        try:
+            _startup_caddy_nodered_login_converge()
+        except Exception as _nl_err:
+            print(f"Startup migration: Node-RED login converge error (non-fatal): {_nl_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
