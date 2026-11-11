@@ -83963,7 +83963,7 @@ def _run_vacuum_background(use_full, tak_cfg):
                 return
             _vacuum_status.update({'running': False, 'result': (out or '').strip()})
         else:
-            r = _pg_exec(['psql', '-d', 'cot', '-c', vacuum_sql], timeout=timeout_sec)
+            r = _cotdb_pg(tak_cfg)(['psql', '-d', 'cot', '-c', vacuum_sql], timeout=timeout_sec)
             out = (r.stdout or '') + (r.stderr or '')
             if r.returncode != 0:
                 _vacuum_status.update({'running': False, 'error': out.strip() or f'Exit code {r.returncode}'})
@@ -83998,6 +83998,9 @@ def takserver_vacuum():
     # operator cannot act on, and the one that dead-ended mg1921 on 2026-08-10.
     # Refuse legibly instead of letting PostgreSQL hit ENOSPC. VACUUM ANALYZE
     # (full=false) is safe and cheap and stays completely ungated.
+    if use_full and _cotdb_managed(tak_cfg):
+        # ops #668: never against a stray local cluster, and not blind on a managed one.
+        return _cotdb_managed_refusal('vacuum_full')
     if use_full:
         facts = _cotdb_facts(tak_cfg)
         refusal = _cotdb_space_refusal(facts)
@@ -84040,7 +84043,7 @@ def takserver_vacuum_status():
                     ok, out = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', timeout=10)
                     raw = (out or '').strip()
             else:
-                r = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', check_sql], timeout=10)
+                r = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-d', 'cot', '-c', check_sql], timeout=10)
                 raw = (r.stdout or '').strip()
             if raw and 'VACUUM' in raw.upper():
                 running = True
@@ -84087,7 +84090,7 @@ def takserver_reindex():
         return jsonify({'success': True, 'output': (out or '').strip(), 'remote': True})
 
     try:
-        r = _pg_exec(['psql', '-d', 'cot', '-c', reindex_sql], timeout=timeout_sec)
+        r = _cotdb_pg(tak_cfg)(['psql', '-d', 'cot', '-c', reindex_sql], timeout=timeout_sec)
         out = (r.stdout or '') + (r.stderr or '')
         if r.returncode != 0:
             return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
@@ -84115,7 +84118,11 @@ def takserver_cot_db_size():
             ok, out = _ssh_probe(s1, size_cmd, timeout=15)
             raw = (out or '0').strip()
         else:
-            r = _pg_exec(['psql', '-t', '-A', '-c', "SELECT COALESCE(pg_database_size('cot'), 0);"], timeout=10)
+            r = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-c', "SELECT COALESCE(pg_database_size('cot'), 0);"], timeout=10)
+            if _cotdb_managed(tak_cfg) and r.returncode != 0:
+                # A managed database that could not be read is unknown, never "0 B".
+                return jsonify({'size_bytes': 0, 'size_human': 'N/A',
+                                'error': _cotdb_clean((r.stderr or r.stdout or 'could not read the managed database'))[:200]})
             raw = (r.stdout or '0').strip()
         size = int(raw or 0)
         if size >= 1024 ** 3:
@@ -84135,7 +84142,7 @@ def takserver_cot_db_size():
                 ok2, out2 = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', timeout=15)
                 parts = (out2 or '0|0').strip().split('|')
             else:
-                r2 = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', stats_sql], timeout=10)
+                r2 = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-d', 'cot', '-c', stats_sql], timeout=10)
                 parts = (r2.stdout or '0|0').strip().split('|')
             msg_count = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 0
             dead_tuples = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
@@ -84231,12 +84238,72 @@ def _cotdb_fmt_age(seconds):
     return f'{d // 365} years'
 
 
+def _cotdb_managed(tak_cfg=None):
+    """True when TAK's CoT database is a managed / remote endpoint that is NOT the
+    two-server Server One this console drives over SSH (Azure Flexible Server, AWS
+    RDS, or any other host named in CoreConfig.xml). ops #668 (infra-TAK #475):
+    every Guard Dog CoT-card read used to fall through to the LOCAL cluster here, so
+    a box with a leftover local PostgreSQL showed that stale cluster's size, age and a
+    false "Retention: STALLED", and a box with none showed unknowns. The answer comes
+    from the same ground truth TAK Server connects with: _tak_db_topology()."""
+    try:
+        if (tak_cfg or {}).get('mode') == 'two_server':
+            return False
+        return _tak_db_topology()[0] == 'remote'
+    except Exception:
+        return False
+
+
+_COTDB_MANAGED_STORAGE = 'provider-managed'
+
+
+def _cotdb_managed_refusal(action):
+    """(response, status) for a CoT-card action this console will not run against a
+    managed database. Never falls back to the local cluster: a refusal is the only
+    safe answer when the local cluster is not the one TAK uses."""
+    why = {
+        'vacuum_full': ('VACUUM FULL rewrites every table and needs free space the console '
+                        'cannot see on a managed database. Run VACUUM ANALYZE (Optimize Tables) '
+                        'here, or compact from your provider if you really need to.'),
+        'repack': ('Online Compact (pg_repack) is not available on a managed database from this '
+                   'console: it needs the pg_repack extension and free space the console cannot '
+                   'see. Run VACUUM ANALYZE (Optimize Tables) instead.'),
+        'purge': ('Purge Old CoT is disabled on a managed database. Set CoT retention in TAK '
+                  "Server's own Web Admin (:8443 > Data Retention Policies) and TAK Server's "
+                  'retention will delete old rows there.'),
+        'retention_run': ("TAK Server's own retention handles a managed database; Guard Dog's "
+                          'retention guard stands down there. Set the retention period in TAK '
+                          "Server's Web Admin (:8443 > Data Retention Policies)."),
+    }.get(action, 'This action is not available on a managed database.')
+    return jsonify({'success': False, 'managed_db': True, 'verdict': 'managed_db',
+                    'error': 'This server uses a managed database. ' + why}), 400
+
+
+def _cotdb_pg(tak_cfg):
+    """The psql runner for TAK's CoT database: the remote seam on a managed
+    database, else the local _pg_exec (unchanged)."""
+    return _cot_pg_exec if _cotdb_managed(tak_cfg) else _pg_exec
+
+
 def _cotdb_psql(tak_cfg, sql, db='cot', timeout=25):
     """Run ONE console-authored statement against the CoT cluster.
 
     Returns (ok, text). Covers local native, containerized TAK and the non-root
-    broker (all via _pg_exec, which already picks runuser vs docker exec) plus
-    the two-server SSH path used by the existing DB routes."""
+    broker (all via _pg_exec, which already picks runuser vs docker exec), the
+    two-server SSH path used by the existing DB routes, and a managed / remote
+    database (via _cot_pg_exec, over TCP with TAK's own credentials). A managed
+    database is queried through the connection TAK itself uses, so `db` is ignored
+    there: the application database is the only one a managed role may reach."""
+    if _cotdb_managed(tak_cfg):
+        try:
+            r = _cot_pg_exec(['psql', '-t', '-A', '-c', sql], timeout=timeout)
+            if r.returncode == 0:
+                return True, _cotdb_clean(r.stdout or '')
+            return False, _cotdb_clean((r.stdout or '') + (r.stderr or ''))
+        except subprocess.TimeoutExpired:
+            return False, 'query timed out'
+        except Exception as e:
+            return False, str(e)[:200]
     if tak_cfg.get('mode') == 'two_server':
         s1 = tak_cfg.get('server_one', {})
         if not (s1.get('host') or '').strip():
@@ -84394,23 +84461,35 @@ def _cotdb_facts(tak_cfg=None):
         'guard_timer_enabled': None, 'guard_timer_last': None,
         'repack_timer_enabled': None,
         'fk_dependents': [], 'two_server': tak_cfg.get('mode') == 'two_server',
+        'managed_db': _cotdb_managed(tak_cfg),
         'reltuples': None, 'stats_stale': None, 'stats_never_analyzed': None,
         'stats_tables': None,
         'errors': [],
     }
 
-    # Both are cluster-level and fail together if the cluster is unreachable, so
-    # merging them costs no robustness and saves an SSH round trip on split boxes.
-    ok, out = _cotdb_psql(tak_cfg,
-                          "SELECT COALESCE(pg_database_size('cot'), 0), current_setting('data_directory');",
-                          db='postgres', timeout=15)
-    if ok and '|' in out:
-        size_s, _, dd = out.strip().partition('|')
-        if size_s.strip().isdigit():
-            f['db_bytes'] = int(size_s.strip())
-        f['data_directory'] = dd.strip() or None
-    elif not ok:
-        f['errors'].append(f'db size: {out[:200]}')
+    if f['managed_db']:
+        # ops #668 (infra-TAK #475): a managed database has no data directory this
+        # console can see (current_setting('data_directory') needs superuser or
+        # pg_read_all_settings on RDS / Azure and says nothing useful anyway), so ask
+        # only for the size.
+        ok, out = _cotdb_psql(tak_cfg, "SELECT COALESCE(pg_database_size('cot'), 0);", timeout=15)
+        if ok and out.strip().isdigit():
+            f['db_bytes'] = int(out.strip())
+        elif not ok:
+            f['errors'].append(f'db size: {out[:200]}')
+    else:
+        # Both are cluster-level and fail together if the cluster is unreachable, so
+        # merging them costs no robustness and saves an SSH round trip on split boxes.
+        ok, out = _cotdb_psql(tak_cfg,
+                              "SELECT COALESCE(pg_database_size('cot'), 0), current_setting('data_directory');",
+                              db='postgres', timeout=15)
+        if ok and '|' in out:
+            size_s, _, dd = out.strip().partition('|')
+            if size_s.strip().isdigit():
+                f['db_bytes'] = int(size_s.strip())
+            f['data_directory'] = dd.strip() or None
+        elif not ok:
+            f['errors'].append(f'db size: {out[:200]}')
 
     # n_live_tup/n_dead_tup are counters maintained since the last stats reset and
     # are only reconciled with reality by (auto)ANALYZE. On a box where analyze has
@@ -84451,11 +84530,14 @@ def _cotdb_facts(tak_cfg=None):
     elif out:
         f['errors'].append(f'largest table: {out[:200]}')
 
-    free_b, total_b = _cotdb_df(tak_cfg, f['data_directory'] or '/')
-    f['fs_free_bytes'] = free_b
-    f['fs_total_bytes'] = total_b
-    if total_b:
-        f['fs_pct'] = round(free_b * 100.0 / total_b, 1)
+    if not f['managed_db']:
+        free_b, total_b = _cotdb_df(tak_cfg, f['data_directory'] or '/')
+        f['fs_free_bytes'] = free_b
+        f['fs_total_bytes'] = total_b
+        if total_b:
+            f['fs_pct'] = round(free_b * 100.0 / total_b, 1)
+    # Managed: storage belongs to the provider and this console cannot see it. Leave
+    # the numbers None (never the VM's own disk, never 0) so no disk verdict can fire.
 
     # A seq-scan min() on a 48M-row table would hang the card on exactly the box
     # that needs it, so bound the statement rather than the HTTP request.
@@ -84553,7 +84635,8 @@ def _cotdb_facts(tak_cfg=None):
 
     # Formatted once, here, so the tiles and the verdict text cannot drift apart.
     f['db_human'] = _cotdb_fmt_bytes(f['db_bytes']) if f['db_bytes'] is not None else '-'
-    f['fs_free_human'] = _cotdb_fmt_bytes(f['fs_free_bytes'])
+    f['fs_free_human'] = (_COTDB_MANAGED_STORAGE if f['managed_db']
+                          else _cotdb_fmt_bytes(f['fs_free_bytes']))
     f['largest_table_human'] = (_cotdb_fmt_bytes(f['largest_table_bytes'])
                                 if f['largest_table_bytes'] is not None else '-')
     f['oldest_age_human'] = _cotdb_fmt_age(f['oldest_age_secs'])
@@ -84588,6 +84671,11 @@ def _cotdb_facts(tak_cfg=None):
     f['retention_stalled'] = bool(stall_secs and f['oldest_expirable_age_secs']
                                   and f['oldest_expirable_age_secs'] > stall_secs)
     f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
+    if f['managed_db']:
+        # Guard Dog's retention guard stands down on a remote database (tak-retention-guard.sh
+        # gd_db_is_remote); TAK Server's own retention is the one deleting there. Its timer
+        # state says nothing about this database, so it must not turn the card red.
+        f['guard_timer_ok'] = True
     return f
 
 
@@ -84669,7 +84757,7 @@ def _cotdb_verdict_tree(facts):
         causes = []
         if facts.get('retention_proc_alive') is False:
             causes.append("TAK Server's retention process is not running")
-        if not facts.get('guard_timer_ok'):
+        if not facts.get('guard_timer_ok') and not facts.get('managed_db'):
             causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
         if not causes:
             causes.append('retention is configured but has not been deleting')
@@ -84737,8 +84825,10 @@ def _cotdb_verdict_tree(facts):
     dead_phrase = ('dead tuples unknown (statistics have never been collected on this database)'
                    if facts.get('stats_stale')
                    else f"{(dead if dead is not None else 0):,} dead tuples")
+    _free_phrase = ('storage is provider-managed' if facts.get('managed_db')
+                    else f"{facts.get('fs_free_human', '-')} free on the database filesystem")
     detail = (f"{dead_phrase}, "
-              f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
+              f"{_free_phrase}, oldest CoT row "
               f"{facts.get('oldest_age_human', '-')} old"
               + (" (mission content or GeoChat, which retention keeps on purpose)"
                  if facts.get('old_rows_kept') else '')
@@ -84827,6 +84917,8 @@ def guarddog_cotdb_retention_run():
     takretentionguard.service is Type=oneshot with TimeoutStartSec=1800 - a
     blocking start would hold a gunicorn thread (1 worker / 4 threads) for up to
     half an hour. The client polls /api/guarddog/cotdb/job-status."""
+    if _cotdb_managed(_get_tak_deployment_config(load_settings())):
+        return _cotdb_managed_refusal('retention_run')
     if not os.path.exists('/etc/systemd/system/takretentionguard.service'):
         return jsonify({'success': False,
                         'error': 'Guard Dog retention guard is not installed on this box. '
@@ -84863,11 +84955,13 @@ def guarddog_cotdb_repack():
     broker's _PG_AS_POSTGRES allowlist, so running it through _pg_exec() would be
     DENIED - driving the unit is what makes this work on the non-root fleet with
     no new broker privilege and no new CJIS review surface."""
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    if _cotdb_managed(tak_cfg):
+        return _cotdb_managed_refusal('repack')
     if not os.path.exists('/etc/systemd/system/takdbrepack.service'):
         return jsonify({'success': False,
                         'error': 'Guard Dog online repack is not installed on this box. '
                                  'Deploy or update Guard Dog first.'}), 400
-    tak_cfg = _get_tak_deployment_config(load_settings())
     # pg_repack builds a full copy of each table before swapping it in, exactly
     # like VACUUM FULL - so it gets the same free-space refusal (W3).
     facts = _cotdb_facts(tak_cfg)
@@ -85015,6 +85109,10 @@ def guarddog_cotdb_purge():
     automatic or scheduled path into this route."""
     if not os.path.exists('/opt/tak'):
         return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if _cotdb_managed(_get_tak_deployment_config(load_settings())):
+        # ops #668: destructive and unscoped (no mission-row guard), so it never runs on a
+        # database whose storage and backups this console cannot see.
+        return _cotdb_managed_refusal('purge')
     data = request.get_json(silent=True) or {}
     mode = (data.get('mode') or '').strip()
     if mode not in ('age', 'all'):
@@ -89601,6 +89699,27 @@ def _tak58_external_schema_version(edb):
     return int(out) if out.isdigit() else None
 
 
+_TAK58_MANAGED_STORAGE = 'provider-managed'
+
+
+def _tak58_fmt_measured(n):
+    """Bytes as text, or 'unknown' when the value was never measured (None). 0 is a real
+    measurement and stays '0 B'."""
+    return 'unknown' if n is None else _cotdb_fmt_bytes(n)
+
+
+def _tak58_preflight_summary_line(f):
+    """The run-log line for the pre-check: versions, database size, free space. On a
+    managed database free space is the provider's, so it says so instead of a number."""
+    if f.get('external_db'):
+        tail = 'storage: %s' % _TAK58_MANAGED_STORAGE
+    else:
+        tail = '%s free' % _tak58_fmt_measured(f.get('avail_bytes'))
+    return ('  PostgreSQL %s → %s, database %s, %s.'
+            % (f.get('pg_running_major'), f.get('pg_target_major'),
+               _tak58_fmt_measured(f.get('data_bytes')), tail))
+
+
 def _tak_58_preflight():
     """Read-only readiness for the 5.8 + PG18 migration.
 
@@ -89764,6 +89883,21 @@ def _tak_58_preflight():
     # 4. Disk: the new cluster needs 1.5x the old data dir, on ITS partition.
     datadir = None if facts.get('external_db') else _sql('SHOW data_directory;', db='postgres')
     facts['data_directory'] = datadir
+    if facts.get('external_db'):
+        # ops #668 (infra-TAK #472): a managed database has no local data directory, so
+        # this block used to be skipped whole and the card and run log printed
+        # "database 0 B, 0 B free". The size is measurable over the network (the same
+        # reader the backup step uses for "cot database 2.0 GB"). Free space is not: the
+        # provider owns the storage, so say that instead of printing a number that was
+        # never measured.
+        try:
+            _mcfg = _get_tak_deployment_config(load_settings()) or {}
+        except Exception:
+            _mcfg = {}
+        facts['storage'] = _TAK58_MANAGED_STORAGE
+        _msz = _cot_db_size_for_dump(_mcfg, _mcfg.get('external_db') or {})
+        if _msz is not None:
+            facts['data_bytes'] = _msz
     if datadir:
         target_parent = '/var/lib/pgsql' if datadir.startswith('/var/lib/pgsql') else '/var/lib/postgresql'
 
@@ -89857,9 +89991,11 @@ def _tak_58_preflight():
 
     facts['pg_target_major'] = TAK_PG_MAJOR
     # Pre-formatted for the template — Jinja should not be doing byte math.
-    facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
-    facts['avail_human'] = _cotdb_fmt_bytes(facts.get('avail_bytes') or 0)
-    facts['need_human'] = _cotdb_fmt_bytes(facts.get('need_bytes') or 0)
+    # A number that was not measured is "unknown", never "0 B" (ops #668 / infra-TAK #472).
+    facts['data_human'] = _tak58_fmt_measured(facts.get('data_bytes'))
+    facts['avail_human'] = (_TAK58_MANAGED_STORAGE if facts.get('external_db')
+                            else _tak58_fmt_measured(facts.get('avail_bytes')))
+    facts['need_human'] = _tak58_fmt_measured(facts.get('need_bytes'))
     # The cot_router facts are only gathered for a LOCAL cluster (step 5 above is
     # gated on `mode == 'local'`), so a container / remote / managed box reached this
     # return with the keys ABSENT, not None. Jinja renders a missing key as Undefined,
@@ -90844,10 +90980,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
                 _say('  BLOCKED: %s' % b)
             return fail('Pre-flight failed — nothing was changed on this server.')
         f = pf.get('facts', {})
-        _say('  PostgreSQL %s → %s, database %s, %s free.'
-                   % (f.get('pg_running_major'), f.get('pg_target_major'),
-                      _cotdb_fmt_bytes(f.get('data_bytes') or 0),
-                      _cotdb_fmt_bytes(f.get('avail_bytes') or 0)))
+        _say(_tak58_preflight_summary_line(f))
         if f.get('pk_rewrite_expected'):
             _say('  This database still has cot_router.id as integer, so the 5.8 schema '
                        'update will rewrite that table in full. Expect a long window.')
