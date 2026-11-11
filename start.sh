@@ -1252,33 +1252,50 @@ finalize_nonroot_ownership
 # Create and start systemd service
 create_service
 
-# Stop existing instance if running
-systemctl stop takwerx-console 2>/dev/null || true
-sleep 1
-
-# Start the console
-systemctl start takwerx-console
-
 # Host firewall: keep the console + SSH reachable, and on RHEL bring up ALWAYS-ON
 # firewalld (operator decision 2026-06-21 — many deploys aren't in a cloud with a
 # security group, and the Cyber-Controls W4 checks need a host firewall to assert
 # against). On Debian, ufw is enabled later by the TAK Server deploy; just open 5001.
+# Runs BEFORE the console starts so the console's startup convergence (hardening
+# posture closing 5001, Guard Dog 8080 source-scope, internal-port cleanup) has the
+# last word — it used to run after, and undid them until the next console restart.
 if [ "$PKG_MGR" = "dnf" ]; then
     # Install firewalld if the image didn't ship it (cloud RHEL AMIs often strip it).
     command -v firewall-cmd >/dev/null 2>&1 || dnf install -y firewalld >/dev/null 2>&1
     if command -v firewall-cmd >/dev/null 2>&1; then
+        _fwd_was_active=0
+        systemctl is-active --quiet firewalld 2>/dev/null && _fwd_was_active=1
         # Start firewalld FIRST — `firewall-cmd` (even --permanent) needs the daemon
         # running, and the default `public` zone already allows ssh, so SSH survives.
         systemctl enable --now firewalld >/dev/null 2>&1 || true
-        # Now add console + SSH explicitly, then seed from current PUBLIC listeners so a
-        # re-run on a box that already has modules doesn't strand their ports (a fresh box
-        # only has SSH + console here). Module deploys open their ports later via the shim.
         firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
-        for _p in $(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.0\.0\.1:|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
-            [ "$_p" = "111" ] && continue   # rpcbind — never expose
+        # SSH moved off 22 (Security → SSH port): keep every port sshd listens on, so
+        # turning firewalld on never locks the operator out.
+        for _p in $(ss -ltnpH 2>/dev/null | awk '/"sshd"/ {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
+            [ "$_p" = "22" ] && continue
             firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
         done
+        # Console: a blanket allow beats a rich rule, so leave 5001 alone when the
+        # operator has source-scoped it.
+        if ! firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -q 'port="5001"'; then
+            firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
+        fi
+        # Seed module ports ONLY when firewalld is being turned on for the first time
+        # (an older box with modules must not have them stranded), and ONLY ports that
+        # are public by design. Never seed from `ss` alone: internal listeners (Guard Dog
+        # 8080, Postfix 25, PostgreSQL 5432, Fed Hub UI 9100, TAK 8444/9000/9001) are
+        # source-scoped by their modules. Once firewalld runs, module deploys open their
+        # own ports, and the permanent rules already hold them.
+        # Public-by-design TCP: Caddy 80/443, TAK 8089/8443/8446, MediaMTX RTSP/RTSPS
+        # 8554/8322, Video Restreamer 1935/8555, CoTURN 3478/3479, Remote Assist 8448,
+        # ATLAS 8449, CloudTAK video/stream 9997/18554/11935, Fed Hub federation 9101-9103.
+        if [ "$_fwd_was_active" = "0" ]; then
+            _public_listen=$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un)
+            for _p in 80 443 8089 8443 8446 8554 8322 1935 8555 3478 3479 8448 8449 9997 18554 11935 9101 9102 9103; do
+                printf '%s\n' "$_public_listen" | grep -qx "$_p" || continue
+                firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
+            done
+        fi
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 else
@@ -1291,6 +1308,13 @@ else
         ufw allow 5001/tcp >/dev/null 2>&1 || true
     fi
 fi
+
+# Stop existing instance if running
+systemctl stop takwerx-console 2>/dev/null || true
+sleep 1
+
+# Start the console
+systemctl start takwerx-console
 
 # Get access URL — on cloud VMs the public IP genuinely reaches the box (1:1 NAT), so
 # it's a real access URL. On home/hotspot/CGNAT networks the "public" IP is NOT reachable

@@ -1344,7 +1344,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.3.11-alpha"
+VERSION = "10.3.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -3671,6 +3671,65 @@ def _fw_deny(port, proto='tcp'):
     except Exception as e:
         return False, str(e)[:160]
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+
+# Older start.sh runs on RHEL seeded firewalld from every TCP listener with a blanket
+# `--add-port`. These internal ports are console-only and never take a blanket allow:
+# each module scopes its own by source (Guard Dog 8080 → console IP, Email Relay 25 →
+# Docker networks / remote Authentik host as rich rules, Fed Hub UI → Caddy on
+# localhost) or keeps it on the box (TAK's PostgreSQL). Removing the blanket allow
+# leaves those rich rules in place. TAK's 8444/9000/9001 are not here: mTLS
+# connectors an operator may have opened on purpose for federation.
+_FW_CONSOLE_ONLY_TCP = (
+    (25, 'Email Relay (Postfix)'),
+    (5432, 'TAK Server database (PostgreSQL)'),
+    (8080, 'Guard Dog health agent / Federation Hub UI'),
+    (9100, 'Federation Hub UI'),
+)
+
+
+def _fw_remove_blanket_internal_ports(log=None):
+    """Remove a blanket firewalld allow for any port in _FW_CONSOLE_ONLY_TCP, in
+    the public zone and the default zone (start.sh added its seeds without --zone).
+    Runs on every console start, so a box heals on update and after any older start.sh
+    re-run. firewalld only: ufw boxes never ran the seed. Logs each port it closes and
+    returns them as ['zone:port/tcp', ...]. Never raises."""
+    _log = log or (lambda m: print(m, flush=True))
+    closed = []
+    try:
+        if _fw_backend() != 'firewalld':
+            return closed
+        zones = ['public']
+        r = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
+                           capture_output=True, text=True, timeout=20)
+        dz = (r.stdout or '').strip()
+        if r.returncode == 0 and re.fullmatch(r'[A-Za-z0-9_-]+', dz or '') and dz not in zones:
+            zones.append(dz)
+        for zone in zones:
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}', '--list-ports']),
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                continue
+            listed = set((r.stdout or '').split())
+            for port, label in _FW_CONSOLE_ONLY_TCP:
+                if f'{port}/tcp' not in listed:
+                    continue
+                rr = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}',
+                                                f'--remove-port={port}/tcp']),
+                                    capture_output=True, text=True, timeout=20)
+                if rr.returncode == 0:
+                    closed.append(f'{zone}:{port}/tcp')
+                    _log(f'Startup migration: firewalld: removed blanket allow for {port}/tcp in zone {zone} '
+                         f'({label}; an older start.sh added it). Source-scoped rules are kept.')
+                else:
+                    _log(f'Startup migration: firewalld: could not close {port}/tcp in zone {zone}: '
+                         f'{((rr.stderr or "") + (rr.stdout or "")).strip()[:120]}')
+        if closed:
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _log(f'Startup migration: firewalld internal-port cleanup error (non-fatal): {str(e)[:160]}')
+    return closed
 
 
 def _selinux_allow_caddy_port(port, log=None):
@@ -12787,15 +12846,38 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
     log.append(f'PostgreSQL configured: listen_addresses=*, pg_hba host {core_ip}, service active.')
 
     # Step 5: firewalld — open db_port FROM the core IP only (+ ssh); drop any broad port-open.
+    # ops #630: Postgres now listens on every address, so this firewall is the only thing
+    # between it and the internet. It used to `enable --now firewalld || true` on a box that
+    # might not have firewalld at all (minimal and cloud Rocky images) and print FW_DONE
+    # regardless. Install it like _fw_ensure_installed(), keep SSH open (the configured port
+    # and the one this session came in on) before it goes default-deny, and stop the deploy
+    # unless `firewall-cmd --state` says running.
+    try:
+        _s1_ssh_port = int(s1.get('ssh_port') or 22)
+    except (TypeError, ValueError):
+        _s1_ssh_port = 22
     fw_cmd = (
+        'command -v firewall-cmd >/dev/null 2>&1 || sudo dnf -y install firewalld >/dev/null 2>&1; '
+        'if ! sudo firewall-cmd --state >/dev/null 2>&1; then '
+        '  sudo firewall-offline-cmd --add-service=ssh >/dev/null 2>&1; '
+        f'  for P in {_s1_ssh_port} ${{SSH_CONNECTION##* }}; do case "$P" in ""|*[!0-9]*) continue;; esac; '
+        '    sudo firewall-offline-cmd --add-port=$P/tcp >/dev/null 2>&1; done; '
+        'fi; '
         'sudo systemctl enable --now firewalld 2>/dev/null || true; '
         'sudo firewall-cmd --permanent --add-service=ssh 2>/dev/null || true; '
         f'sudo firewall-cmd --permanent --add-rich-rule="rule family=\'ipv4\' source address=\'{core_ip}\' port protocol=\'tcp\' port=\'{db_port}\' accept" 2>&1 || true; '
         f'sudo firewall-cmd --permanent --remove-port={db_port}/tcp 2>/dev/null || true; '
-        'sudo firewall-cmd --reload 2>&1; echo FW_DONE'
+        'sudo firewall-cmd --reload 2>&1; '
+        'sudo firewall-cmd --state >/dev/null 2>&1 && echo FW_STATE=running || echo FW_STATE=off'
     )
-    _, fout = _ssh_probe(s1, fw_cmd, timeout=40)
-    log.append('firewalld: ' + ('db port scoped to core, ssh allowed.' if 'FW_DONE' in (fout or '') else (fout or '')[:200]))
+    _, fout = _ssh_probe(s1, fw_cmd, timeout=300)
+    if 'FW_STATE=running' not in (fout or ''):
+        log.append('✗ firewalld is NOT running on Server One, and PostgreSQL now listens on every '
+                   f'address: port {db_port} would be reachable from any address. Stopping here. Install '
+                   'and start firewalld on Server One (sudo dnf -y install firewalld && sudo '
+                   'systemctl enable --now firewalld), then deploy again. ' + (fout or '')[-200:])
+        return False, log, ''
+    log.append('firewalld: running; db port scoped to core, ssh allowed.')
 
     # Step 5b: make sure the cot DB and martiuser actually EXIST.
     #
@@ -34291,6 +34373,11 @@ def _normalize_module_deployment_config(cfg):
     r['username'] = r['ssh_user']
     r['port'] = r['ssh_port']
     c['remote'] = r
+    # ops #630: per-deploy firewall caches (_module_fw_backend / _module_fw_ensure_active)
+    # must not be saved. A stored "active" would skip the next deploy's check on a box
+    # whose firewall was turned off since; a stored "none" would hide a later install.
+    c.pop(_MODULE_FW_BACKEND_KEY, None)
+    c.pop(_MODULE_FW_ACTIVE_KEY, None)
     return c
 
 
@@ -34458,24 +34545,121 @@ def _module_fw(deploy_cfg, verb, port, proto='tcp', log_fn=None):
             return _fw_deny(port, proto)
         return _fw_remove(port, proto)
 
-    be = _module_fw_backend(deploy_cfg, log_fn=log_fn)
+    if verb in ('allow', 'deny'):
+        # ops #630: a rule in an INACTIVE firewall does nothing. Stock Ubuntu cloud images
+        # ship ufw installed but off, so `ufw deny 5080` succeeded and the deploy printed
+        # "closed" over a port the firewall did not filter.
+        act_ok, be, act_msg = _module_fw_ensure_active(deploy_cfg, log_fn=log_fn)
+        if not act_ok:
+            return False, f'firewall not active on target, rule would do nothing ({act_msg})'
+    else:
+        be = _module_fw_backend(deploy_cfg, log_fn=log_fn)
     if be is None:
-        # Say it. A target with no firewall is a real posture fact, not a no-op to
-        # swallow — especially for the deny verbs.
+        # Only 'remove' gets here: nothing to remove from a firewall that is not there.
         return True, 'no firewall present on target'
     if be == 'firewalld':
         flag = '--add-port' if verb == 'allow' else '--remove-port'
-        cmd = (f"firewall-cmd --zone=public --permanent {flag}={port}/{proto} "
-               f"&& firewall-cmd --reload")
+        cmd = (f"$S firewall-cmd --zone=public --permanent {flag}={port}/{proto} "
+               f"&& $S firewall-cmd --reload")
     else:
         if verb == 'allow':
-            cmd = f"ufw allow {port}/{proto}"
+            cmd = f"$S ufw allow {port}/{proto}"
         elif verb == 'deny':
-            cmd = f"ufw deny {port}/{proto}"
+            cmd = f"$S ufw deny {port}/{proto}"
         else:
-            cmd = f"ufw --force delete allow {port}/{proto}"
-    ok, out = _module_run(deploy_cfg, cmd, timeout=30)
+            cmd = f"$S ufw --force delete allow {port}/{proto}"
+    ok, out = _module_run(deploy_cfg, _REMOTE_SUDO_SH + cmd, timeout=30)
     return ok, (out or '').strip()[:300]
+
+
+# Remote snippets run as the SSH user. Root needs no sudo; a cloud image's sudo user
+# (azureuser/ubuntu/rocky) does, and must never sit at a password prompt.
+_REMOTE_SUDO_SH = 'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+
+_MODULE_FW_ACTIVE_KEY = '_infratak_fw_active'
+
+
+def _remote_fw_ensure_sh(ssh_port=22):
+    """Shell for a remote target: make its host firewall ACTIVE, keeping SSH open. ops #630.
+
+    Prints one line, `FW_STATE=<active|inactive> BE=<ufw|firewalld|none> NOW=<0|1>`
+    (NOW=1 means this run turned the firewall on). Backend choice mirrors
+    _module_fw_backend(): the family-native tool first, installed when neither exists.
+
+    An already-active firewall is left exactly as it is. Only when we turn it on do we
+    first allow SSH: the configured port AND the port this very session arrived on
+    (the last field of $SSH_CONNECTION), so a NAT port-forward (2222 outside, 22 inside)
+    cannot lock the console out. Same lockout guard as _fw_ensure_installed()."""
+    sp = int(ssh_port or 22)
+    return (
+        _REMOTE_SUDO_SH +
+        f'P1={sp}; P2=${{SSH_CONNECTION##* }}; '
+        'case "$P2" in ""|*[!0-9]*) P2=$P1;; esac; '
+        'PORTS=$P1; [ "$P2" = "$P1" ] || PORTS="$P1 $P2"; '
+        'U=; command -v ufw >/dev/null 2>&1 && U=1; '
+        'F=; command -v firewall-cmd >/dev/null 2>&1 && F=1; '
+        'BE=; '
+        'if [ -f /etc/redhat-release ]; then '
+        '  if [ -z "$F$U" ]; then $S dnf -y install firewalld >/dev/null 2>&1; '
+        '    command -v firewall-cmd >/dev/null 2>&1 && F=1; fi; '
+        '  if [ -n "$F" ]; then BE=firewalld; elif [ -n "$U" ]; then BE=ufw; fi; '
+        'else '
+        '  if [ -z "$F$U" ]; then $S env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove ufw >/dev/null 2>&1; '
+        '    command -v ufw >/dev/null 2>&1 && U=1; fi; '
+        '  if [ -n "$U" ]; then BE=ufw; elif [ -n "$F" ]; then BE=firewalld; fi; '
+        'fi; '
+        'NOW=0; ST=inactive; '
+        'if [ "$BE" = firewalld ]; then '
+        '  if ! $S firewall-cmd --state >/dev/null 2>&1; then NOW=1; '
+        '    $S firewall-offline-cmd --add-service=ssh >/dev/null 2>&1; '
+        '    for P in $PORTS; do $S firewall-offline-cmd --add-port=$P/tcp >/dev/null 2>&1; done; '
+        '    $S systemctl enable --now firewalld >/dev/null 2>&1; '
+        '  fi; '
+        '  $S firewall-cmd --state >/dev/null 2>&1 && ST=active; '
+        'elif [ "$BE" = ufw ]; then '
+        '  if ! $S ufw status 2>/dev/null | grep -q "^Status: active"; then NOW=1; '
+        '    for P in $PORTS; do $S ufw allow $P/tcp >/dev/null 2>&1; done; '
+        '    $S ufw --force enable >/dev/null 2>&1; '
+        '  fi; '
+        '  $S ufw status 2>/dev/null | grep -q "^Status: active" && ST=active; '
+        'else BE=none; fi; '
+        'echo "FW_STATE=$ST BE=$BE NOW=$NOW"'
+    )
+
+
+def _module_fw_ensure_active(deploy_cfg, log_fn=None):
+    """Make sure the TARGET's host firewall is on before trusting a rule in it. ops #630.
+
+    Returns (ok, backend, msg). Local targets answer for the console's own box, whose
+    firewall the console manages itself. Remote: turn it on if it is off (SSH allowed
+    first, see _remote_fw_ensure_sh), or say plainly that it could not. Cached for the
+    deploy on `deploy_cfg`; _normalize_module_deployment_config() drops the cache, so
+    a saved config never carries "active" into the next deploy."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return True, _fw_backend(), 'local target'
+    cached = deploy_cfg.get(_MODULE_FW_ACTIVE_KEY)
+    if cached:
+        return True, cached, 'active'
+    try:
+        sp = int((deploy_cfg.get('remote') or {}).get('ssh_port') or 22)
+    except (TypeError, ValueError):
+        sp = 22
+    ok, out = _module_run(deploy_cfg, _remote_fw_ensure_sh(sp), timeout=300)
+    m = re.search(r'FW_STATE=(\w+) BE=(\w+) NOW=(\d)', out or '')
+    if not ok or not m:
+        return False, None, f'could not check the firewall on the target: {(out or "")[-200:]}'
+    state, be, now = m.groups()
+    if state != 'active':
+        if be == 'none':
+            return False, None, 'no firewall on the target and ufw/firewalld could not be installed'
+        return False, be, (f'{be} is installed but off and could not be turned on '
+                           f'(the SSH user needs root or passwordless sudo)')
+    deploy_cfg[_MODULE_FW_BACKEND_KEY] = be
+    deploy_cfg[_MODULE_FW_ACTIVE_KEY] = be
+    if log_fn:
+        log_fn(f"  firewall on target: {be}, active" +
+               (" (it was OFF: turned it on, SSH kept open)" if now == '1' else ''))
+    return True, be, ('turned on' if now == '1' else 'active')
 
 
 def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
@@ -44952,6 +45136,83 @@ _MEDIAMTX_REMOTE_CERT_PERMS = (
 )
 
 
+# Remote MediaMTX firewall. Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890
+# (UDP; this opened 8890/tcp until v10.1.10). The API (9898) is loopback-only and denied
+# outright. The web editor (5080) and HLS (8888) bind 0.0.0.0 so Caddy on the CONSOLE can
+# reach them, so they are open to the console only: _mediamtx_remote_console_scope_sh().
+_MEDIAMTX_REMOTE_FW_RULES = (('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'),
+                             ('allow', 8890, 'udp'), ('deny', 9898, 'tcp'))
+_MEDIAMTX_REMOTE_CONSOLE_PORTS = (5080, 8888)
+
+
+def _mediamtx_remote_console_scope_sh(console_ip=None):
+    """Shell: only the console may reach the remote editor (5080) and HLS (8888). ops #630.
+
+    Sources: the console's address as the remote sees it ($SSH_CLIENT, right on a
+    private-LAN split) plus Settings → Server IP (validated IPv4 by the caller), the same
+    union _remote_healthagent_fw_step uses. Prints SCOPE_SRCS=... and SCOPE_RC=0|1.
+
+    ORDER on ufw (first match wins, new rules append): delete the old deny and any broad
+    allow FIRST, add the scoped allows, re-add the deny LAST. The pre-#630 deploy put the
+    deny in before the allow, so with ufw on, the console's own Caddy was blocked."""
+    extra = console_ip or ''
+    ports = ' '.join(str(p) for p in _MEDIAMTX_REMOTE_CONSOLE_PORTS)
+    return (
+        _REMOTE_SUDO_SH +
+        'SRCS=; for A in "${SSH_CLIENT%% *}" "' + extra + '"; do '
+        'case "$A" in ""|*[!0-9a-fA-F:.]*) continue;; esac; '
+        'case " $SRCS " in *" $A "*) ;; *) SRCS="$SRCS $A";; esac; done; '
+        'echo "SCOPE_SRCS=$SRCS"; RC=0; '
+        'if command -v firewall-cmd >/dev/null 2>&1 && $S firewall-cmd --state >/dev/null 2>&1; then '
+        f'  for P in {ports}; do for A in $SRCS; do FAM=ipv4; case "$A" in *:*) FAM=ipv6;; esac; '
+        '    $S firewall-cmd --permanent --add-rich-rule="rule family=\'$FAM\' source address=\'$A\' '
+        'port port=\'$P\' protocol=\'tcp\' accept" >/dev/null 2>&1 || RC=1; done; '
+        '    $S firewall-cmd --permanent --remove-port=$P/tcp >/dev/null 2>&1; done; '
+        '  $S firewall-cmd --reload >/dev/null 2>&1 || RC=1; '
+        'elif command -v ufw >/dev/null 2>&1; then '
+        f'  for P in {ports}; do '
+        '    $S ufw --force delete deny $P/tcp >/dev/null 2>&1; '
+        '    $S ufw --force delete allow $P/tcp >/dev/null 2>&1; '
+        '    for A in $SRCS; do $S ufw allow from $A to any port $P proto tcp >/dev/null 2>&1 || RC=1; done; '
+        '    $S ufw deny $P/tcp >/dev/null 2>&1 || RC=1; done; '
+        'else RC=1; fi; '
+        'echo "SCOPE_RC=$RC"'
+    )
+
+
+def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
+    """Firewall a remote MediaMTX box. Returns (state, failed). ops #630.
+
+    state: 'on' (active, rules applied), 'off' (reachable, but no active firewall and
+    it could not be turned on), 'unknown' (could not ask). failed: rules that did not
+    apply. Never reports a port closed unless the firewall holding the rule is on."""
+    host = ((deploy_cfg.get('remote') or {}).get('host') or '').strip()
+    act_ok, _be, act_msg = _module_fw_ensure_active(deploy_cfg, log_fn=plog)
+    if not act_ok:
+        plog(f"✗ Firewall on {host} is NOT on: {act_msg}")
+        plog("  With it off, the web editor (5080) and HLS (8888) are reachable from any address.")
+        return ('unknown' if act_msg.startswith('could not check') else 'off'), []
+    failed = []
+    for verb, port, proto in _MEDIAMTX_REMOTE_FW_RULES:
+        ok, msg = _module_fw(deploy_cfg, verb, port, proto, log_fn=plog)
+        if not ok:
+            failed.append(f'{verb} {port}/{proto}: {msg[:120]}')
+    console_ip = _fedhub_caddy_source_ip(settings)
+    ok, out = _module_run(deploy_cfg, _mediamtx_remote_console_scope_sh(console_ip), timeout=60)
+    srcs = (re.search(r'SCOPE_SRCS=([^\n]*)', out or '') or [None, ''])[1].split()
+    if not ok or 'SCOPE_RC=0' not in (out or ''):
+        failed.append(f'console-only 5080/8888: {(out or "")[-160:]}')
+    if failed:
+        plog("✗ Firewall is on, but these rules did NOT apply on the target:")
+        for f in failed:
+            plog(f"    {f}")
+        plog("  Fix the target's firewall before using this box.")
+    else:
+        plog("✓ Firewall on. RTSP/RTSPS/SRT public; web editor and HLS open to the console only "
+             f"({', '.join(srcs) or 'no console address found: closed to all'}); API closed")
+    return 'on', failed
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -45286,6 +45547,21 @@ paths:
     except Exception:
         pass
     plog("✓ Services created")
+
+    # Step 6: Firewall, BEFORE the services start (ops #630). The editor binds 0.0.0.0:5080
+    # and is meant for the console only. This step used to come after the
+    # start and trusted a firewall it never checked was on (stock Ubuntu cloud: ufw off).
+    # No active firewall = the editor does not start.
+    plog("")
+    plog("━━━ Step 6/8: Firewall (remote) ━━━")
+    _fw_state, _fw_failed = _mediamtx_remote_firewall(settings, deploy_cfg, plog)
+    if _fw_state != 'on':
+        _module_run(deploy_cfg, _REMOTE_SUDO_SH + '$S systemctl disable --now mediamtx-webeditor 2>/dev/null; true', timeout=30)
+        plog("✗ Deploy stopped: the web editor was NOT started, because nothing would keep it")
+        plog("  off the internet. Turn on ufw (or firewalld) on the remote box, or give the SSH")
+        plog("  user passwordless sudo, then deploy again.")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
     plog("✓ Services started")
 
@@ -45298,39 +45574,7 @@ paths:
     else:
         plog("⚠ Test video download failed — you can upload it manually via the web console")
 
-    # Step 6: Firewall
-    plog("")
-    plog("━━━ Step 6/8: Firewall (remote) ━━━")
-    # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890.
-    # Webedit 5080 / API 9898 / HLS 8888 are Tier 3 (Caddy-loopback) — explicitly
-    # DENIED here so a regressed bind can't leak the admin surface. Browsers
-    # reach the webedit + HLS through Caddy on 443.
-    # v10.1.49 W1: these six rules used to be one bare-`ufw` shell string ending in
-    # `; true`, with every command silenced by 2>/dev/null. On a RHEL/Rocky target
-    # ufw does not exist, so all six failed, the block still exited 0, and the line
-    # below printed a tick over a firewall that had never been touched. The three
-    # DENY rules are the MediaMTX admin surface, and v10.1.48's overlay header-pin
-    # names this firewall rule as its residual control on split boxes — so on a RHEL
-    # remote that control was silently absent. Route through the family-aware helper
-    # and report what actually happened.
-    # 8890 is SRT — UDP. This opened 8890/tcp until v10.1.10, which held a hole
-    # open on a port nothing listens on while leaving SRT's real port closed.
-    _fw_public = [('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'), ('allow', 8890, 'udp')]
-    _fw_closed = [('deny', 8888, 'tcp'), ('deny', 5080, 'tcp'), ('deny', 9898, 'tcp')]
-    _fw_failed = []
-    for _verb, _port, _proto in _fw_public + _fw_closed:
-        _ok, _msg = _module_fw(deploy_cfg, _verb, _port, _proto, log_fn=plog)
-        if not _ok:
-            _fw_failed.append(f'{_verb} {_port}/{_proto}: {_msg[:120]}')
-    if _fw_failed:
-        # Do NOT claim the ports are set. The deny rules are the admin surface.
-        plog("✗ Firewall rules did NOT all apply on the target:")
-        for _f in _fw_failed:
-            plog(f"    {_f}")
-        plog("  RTSP/RTSPS/SRT may be closed, and — more importantly — the webedit/API/HLS")
-        plog("  admin ports may be REACHABLE. Fix the target's firewall before using this box.")
-    else:
-        plog("✓ Ports set (RTSP/RTSPS/SRT public; webedit/API/HLS closed to the network)")
+    # Step 6 (firewall) runs before the services start, above.
 
     # Step 7: Caddy on infra-TAK (point stream.* to remote)
     plog("")
@@ -45470,23 +45714,6 @@ paths:
             _ak_headers = {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'}
             _ensure_authentik_console_app(domain, _ak_token, plog)
             _repair_embedded_outpost_all_apps(_ak_url, _ak_headers, settings, plog)
-
-    # Harden MediaMTX ports: webedit (5080) and HLS (8888) only from console IP
-    _mtx_console_ip = _fedhub_caddy_source_ip(settings)
-    if _mtx_console_ip:
-        _module_run(deploy_cfg,
-            f'command -v ufw >/dev/null 2>&1 && ('
-            f'sudo ufw allow from {_mtx_console_ip} to any port 5080 proto tcp 2>/dev/null; '
-            f'sudo ufw allow from {_mtx_console_ip} to any port 8888 proto tcp 2>/dev/null; '
-            f'sudo ufw deny 5080/tcp 2>/dev/null; sudo ufw deny 8888/tcp 2>/dev/null; '
-            f'sudo ufw reload 2>/dev/null); true',
-            timeout=15)
-        plog(f"  UFW: ports 5080/8888 source-scoped to console IP {_mtx_console_ip}")
-    else:
-        _module_run(deploy_cfg,
-            'command -v ufw >/dev/null 2>&1 && (sudo ufw deny 5080/tcp 2>/dev/null; sudo ufw deny 8888/tcp 2>/dev/null; sudo ufw reload 2>/dev/null); true',
-            timeout=15)
-        plog("  ⚠ No console IP set — ports 5080/8888 denied publicly. Set Settings → Server IP.")
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -54837,6 +55064,78 @@ def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=N
         return False
 
 
+# ops #629: WebODM ships with no admin; its /welcome page sets one up while none exists
+# (app/views/app.py `welcome`). The remote deploy now makes the admin itself. The password is generated INSIDE
+# the container, so it never crosses SSH or a process list; it is printed once, to the deploy log.
+_WEBODM_ADMIN_PY = '''import secrets
+from django.contrib.auth.models import User
+FIX = {fix}
+su = list(User.objects.filter(is_superuser=True))
+if not su:
+    if FIX:
+        name = 'admin' if not User.objects.filter(username='admin').exists() else 'infratak-admin'
+        p = secrets.token_urlsafe(18)
+        User.objects.create_superuser(name, name + '@localhost', p)
+        print('WOADMIN NEW ' + name + ' ' + p)
+    else:
+        print('WOADMIN NONE')
+for u in su:
+    if u.check_password('admin') or u.check_password(u.username):
+        if FIX:
+            p = secrets.token_urlsafe(18)
+            u.set_password(p)
+            u.save()
+            print('WOADMIN RESET ' + u.username + ' ' + p)
+        else:
+            print('WOADMIN WEAK ' + u.username)
+print('WOADMIN DONE')
+'''
+
+
+def _webodm_admin_cmd(fix):
+    """Shell command that checks (fix=False) or makes safe (fix=True) the WebODM admin."""
+    code = _WEBODM_ADMIN_PY.format(fix='True' if fix else 'False')
+    return ('docker exec webapp python manage.py shell -c '
+            f'"$(echo {_b64.b64encode(code.encode()).decode()} | base64 -d)" 2>&1')
+
+
+def _webodm_admin_parse(out):
+    """WOADMIN lines → {'done': bool, 'new': [(user, pw)], 'reset': [(user, pw)], 'none': bool, 'weak': [user]}."""
+    r = {'done': False, 'new': [], 'reset': [], 'none': False, 'weak': []}
+    for ln in (out or '').splitlines():
+        f = ln.strip().split(' ')
+        if not f or f[0] != 'WOADMIN' or len(f) < 2:
+            continue
+        if f[1] == 'DONE':
+            r['done'] = True
+        elif f[1] == 'NONE':
+            r['none'] = True
+        elif f[1] == 'WEAK' and len(f) == 3:
+            r['weak'].append(f[2])
+        elif f[1] in ('NEW', 'RESET') and len(f) == 4:
+            r['new' if f[1] == 'NEW' else 'reset'].append((f[2], f[3]))
+    return r
+
+
+def _webodm_ensure_admin(deploy_cfg, plog):
+    """Deploy step: create the WebODM admin with a generated password, or replace a default
+    password (or password = username) on an existing one. Returns True when no open or weak admin is left."""
+    ok, out = _module_run(deploy_cfg, _webodm_admin_cmd(True), timeout=60)
+    r = _webodm_admin_parse(out)
+    if not (ok and r['done']):
+        plog('  ⚠ Could not check the WebODM admin account. Press Reapply Plugin & Config to retry.')
+        return False
+    for user, pw in r['new']:
+        plog(f'  🔑 WebODM admin created: {user} / {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    for user, pw in r['reset']:
+        plog(f'  🔑 WebODM admin "{user}" had a default password. New password: {pw}')
+        plog('     Save this password now. It is shown only here and is not stored by infra-TAK.')
+    if not r['new'] and not r['reset']:
+        plog('  ✓ WebODM admin account exists with a non-default password')
+    return True
+
+
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
     import secrets as _sec
@@ -54914,7 +55213,9 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     wo_compose = WEBODM_DOCKER_COMPOSE.format(
         wo_dir=wo_dir_remote, wo_port=wo_port, wo_secret=wo_secret,
         wo_odm_cpus=_odm_cpus, wo_odm_mem=_odm_mem, images=WEBODM_IMAGES)
-    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it
+    # Remote: bind WebODM port on 0.0.0.0 so Caddy on the console can reach it. The DOCKER-USER
+    # port guard below scopes it to the console (ops #629); ufw alone does not, Docker's
+    # published ports skip ufw.
     wo_compose = wo_compose.replace(
         f'      - "127.0.0.1:{wo_port}:8000"',
         f'      - "0.0.0.0:{wo_port}:8000"',
@@ -54935,6 +55236,17 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ docker-compose.yml written')
 
+    # ops #629: lock the WebODM port to the console BEFORE the container publishes it. The ufw
+    # lines further down never applied (Docker's published ports skip ufw), so the port was
+    # reachable from anywhere. No lock = no start.
+    plog(f'━━━ Locking port {wo_port} to the console (remote) ━━━')
+    _wo_guard_ok, _ = _remote_docker_port_guard(deploy_cfg, settings, 'webodm', [wo_port], log_fn=plog)
+    if not _wo_guard_ok:
+        plog('✗ WebODM was not started: without this lock the WebODM port is not limited to the console.')
+        plog('  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
+
     # Pull images on remote
     plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
     ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
@@ -54950,7 +55262,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         return
     plog('✓ WebODM containers started')
 
-    # Harden WebODM port: allow only from console IP, deny public access
+    # Belt and braces only: ufw does not see Docker-published ports. The port guard above
+    # is what limits the WebODM port to the console (ops #629).
     _wo_console_ip = _fedhub_caddy_source_ip(settings)
     if _wo_console_ip:
         _module_run(deploy_cfg,
@@ -55011,6 +55324,13 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         _time.sleep(15)
     if not _node_registered and _pending != 0:
         plog("  ⚠ Migrations did not complete in 6 min — NodeODM not registered. Add manually: wo_nodeodm:3000")
+
+    # ops #629: never leave WebODM without an admin or on a default password.
+    plog('━━━ WebODM admin account (remote) ━━━')
+    if _pending == 0:
+        _webodm_ensure_admin(deploy_cfg, plog)
+    else:
+        plog('  ⚠ WebODM admin not set: migrations not finished. Press Reapply Plugin & Config when WebODM is up.')
 
     # Save settings, reload Caddy (local), configure Authentik (local)
     s = load_settings()
@@ -102420,6 +102740,7 @@ def _start_guarddog_background_at_boot():
 
 
 _start_guarddog_background_at_boot()
+_fw_remove_blanket_internal_ports()   # before the 8080 source-scope below
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
 
@@ -104065,6 +104386,97 @@ def _unit_text_with_env(txt, key, value):
     return '\n'.join(out)
 
 
+_MEDIAMTX_REMOTE_FW_ALERT_EVERY_S = 86400   # one mail a day per box, the console restarts daily
+
+
+def _startup_converge_mediamtx_remote_firewall():
+    """ops #630: re-check the firewall of an existing remote MediaMTX box on console start.
+
+    Boxes deployed before the fix were "closed" by rules in a firewall that may never
+    have been on, and the deploy is not re-run on update. So on every console start:
+    turn the remote firewall on if it is off (SSH kept open), re-apply the rules in the
+    right order (console allowed before the deny), and if the firewall cannot be turned
+    on, stop the web editor there (streaming keeps running) and send a Guard Dog mail.
+    A box we cannot reach is only logged: we know nothing about it."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = (cfg.get('remote') or {}).get('host') or ''
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
+            return
+        lines = []
+        state, failed = _mediamtx_remote_firewall(settings, cfg, lines.append)
+        for ln in lines:
+            print(f"Startup migration: [MediaMTX remote firewall] {ln}", flush=True)
+        if state == 'unknown':
+            return
+        marker = os.path.join(CONFIG_DIR, 'mediamtx_remote_editor_stopped')
+        if state == 'off':
+            _module_run(cfg, _REMOTE_SUDO_SH + '$S systemctl disable --now mediamtx-webeditor 2>/dev/null; true',
+                        timeout=30)
+            with open(marker, 'w') as f:
+                f.write(host)
+            print(f"Startup migration: [MediaMTX remote firewall] ✗ stopped the web editor on {host}: "
+                  "no firewall would keep it off the internet", flush=True)
+        elif os.path.exists(marker):
+            # The firewall is on again: start the editor this check stopped, and only that one.
+            _module_run(cfg, _REMOTE_SUDO_SH + '$S systemctl enable --now mediamtx-webeditor', timeout=60)
+            os.remove(marker)
+            print(f"Startup migration: [MediaMTX remote firewall] firewall on, web editor on {host} "
+                  "started again", flush=True)
+        if state == 'on' and not failed:
+            return
+        _mediamtx_remote_fw_alert(settings, host, state, failed)
+    except Exception as e:
+        print(f"Startup migration: MediaMTX remote firewall check error (non-fatal): {e}", flush=True)
+
+
+def _mediamtx_remote_fw_alert(settings, host, state, failed):
+    """Guard Dog mail for _startup_converge_mediamtx_remote_firewall, at most once a day per box."""
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("[guarddog] MediaMTX remote firewall alert SUPPRESSED (no recipient configured)", flush=True)
+        return False
+    path = os.path.join(CONFIG_DIR, 'mediamtx_remote_fw_alert.json')
+    try:
+        with open(path) as f:
+            sent = json.load(f)
+    except Exception:
+        sent = {}
+    now = time.time()
+    if now - float(sent.get(host) or 0) < _MEDIAMTX_REMOTE_FW_ALERT_EVERY_S:
+        return False
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    if state == 'off':
+        subj = f"⚠ MediaMTX box {host}: firewall is off, web editor stopped"
+        body = (f"The remote MediaMTX box {host} has no active firewall, and infra-TAK could not "
+                f"turn one on over SSH.\n\nWithout it the MediaMTX web editor (port 5080) is reachable "
+                f"from any address, so infra-TAK stopped the web editor on that box. Video "
+                f"streaming keeps running.\n\nTo fix: on {host}, turn on ufw or firewalld (allow "
+                f"your SSH port first), or give the SSH user passwordless sudo so infra-TAK can. "
+                f"Then restart the infra-TAK console: the web editor starts again once the "
+                f"firewall is on.\n\nConsole: {ident}\n\n— Guard Dog")
+    else:
+        subj = f"⚠ MediaMTX box {host}: firewall rules did not apply"
+        body = (f"The firewall on the remote MediaMTX box {host} is on, but these rules did not "
+                f"apply:\n\n" + '\n'.join(f"  {f}" for f in failed) +
+                f"\n\nCheck the box's firewall rules for ports 5080 and 8888: they should allow "
+                f"only the infra-TAK console.\n\nConsole: {ident}\n\n— Guard Dog")
+    try:
+        ok = _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        print(f"[guarddog] MediaMTX remote firewall alert failed: {e}", flush=True)
+        return False
+    if ok:
+        sent[host] = now
+        try:
+            with open(path, 'w') as f:
+                json.dump(sent, f)
+        except Exception:
+            pass
+    return ok
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -105334,6 +105746,40 @@ def _startup_guard_remote_nodered_port():
         print(f"Startup migration: remote Node-RED port guard error (non-fatal): {_e}")
 
 threading.Thread(target=_startup_guard_remote_nodered_port, daemon=True).start()
+
+
+def _startup_guard_remote_webodm_port():
+    """ops #629: a remote WebODM publishes 0.0.0.0:<webodm_port> and its ufw deny never applied
+    (Docker's published ports skip ufw), so the port was reachable from anywhere.
+    On every console boot (Update Now restarts it), (re)install
+    the DOCKER-USER port guard and check the admin. It does not change the password here: a new
+    one would land in the journal. Reapply (the deploy) sets it and shows it once.
+    Daemon thread: an unreachable host never blocks boot."""
+    try:
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+        if not (cfg.get('deployed') and cfg.get('target_mode') == 'remote'
+                and (cfg.get('remote', {}).get('host') or '').strip()):
+            return
+        port = settings.get('webodm_port', 8765)
+        ok, first = _remote_docker_port_guard(cfg, settings, 'webodm', [port], log_fn=print)
+        if ok and first:
+            print(f"Startup migration: remote WebODM port {port} is now limited to the console. "
+                  "Open WebODM and check its users, projects and plugins: if you find one you "
+                  "did not add, rebuild the remote box and change its keys.")
+        elif not ok:
+            print(f"Startup migration: ⚠ remote WebODM port {port} could NOT be locked to the console "
+                  "and may not be limited to the console. Press Reapply Plugin & Config on the WebODM page to see why.")
+        _ok, out = _module_run(cfg, _webodm_admin_cmd(False), timeout=60)
+        r = _webodm_admin_parse(out)
+        if r['none'] or r['weak']:
+            print("Startup migration: ⚠ remote WebODM has no admin account or one with a default password "
+                  f"({', '.join(r['weak']) or 'no admin'}). Press Reapply Plugin & Config on the WebODM page: "
+                  "it sets a generated admin password and shows it once.")
+    except Exception as _e:
+        print(f"Startup migration: remote WebODM port guard error (non-fatal): {_e}")
+
+threading.Thread(target=_startup_guard_remote_webodm_port, daemon=True).start()
 
 
 def _startup_ensure_metrics_collector():
@@ -107884,6 +108330,11 @@ def _startup_migrations():
             _startup_converge_mediamtx_overlay()
         except Exception as _mtx_ov_e:
             print(f"Startup migration: mediamtx overlay converge error (non-fatal): {_mtx_ov_e}", flush=True)
+
+        # ops #630 — a remote MediaMTX box's firewall may be off. SSH to another box can take
+        # minutes, so in the background: it must never hold up the console's start.
+        threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
+                         name='startup-mediamtx-remote-fw').start()
 
         try:
             _startup_converge_mediamtx_ssl()
