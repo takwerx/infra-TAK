@@ -79,6 +79,7 @@ from werkzeug.security import (check_password_hash as _werkzeug_check_password_h
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib, socket
+import errno
 import hmac
 import urllib.request
 import urllib.parse
@@ -825,20 +826,105 @@ def _priv_write_denied_by_design(path):
 _MEDIAMTX_NOFOLLOW_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
 
 
+# ops #666 / infra-TAK #473: files that a RUNNING process may be reading. bash reads a
+# script as it goes, so an in-place rewrite (open + O_TRUNC) of tak-post-start.sh by the
+# console's startup Guard Dog sync made the unit fail with exit 2 after it had already
+# started every service. These are written by temp file + rename instead, so the running
+# process keeps the old file. It is a short list on purpose: a rename also breaks a
+# single-file bind mount into a container and a log that a running process holds open,
+# which in-place writes keep working, so everything else stays in place.
+_ATOMIC_WRITE_PREFIXES = ('/opt/tak-guarddog/', '/etc/systemd/system/')
+
+
+def _priv_write_wants_atomic(path, mode):
+    """True when a full-file privileged write to `path` must go by temp file + rename."""
+    return 'a' not in mode and str(path).startswith(_ATOMIC_WRITE_PREFIXES)
+
+
+def _atomic_replace_local(path, data, perm=None):
+    """Root-console twin of the broker's _atomic_replace() (broker/takwerx_broker.py): write
+    `data` (bytes) to a temp file beside `path`, fsync, rename over it. A process that has the
+    old file open keeps the old inode. Keeps the old file's mode and owner unless `perm` is
+    given. Returns False, changing nothing, for a target that must stay written in place
+    (symlink, non-regular file, extra hard links, a mount point); any other failure raises
+    with the target untouched."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not _stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+        return False
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, '.%s.tmp-%d-%s' % (base, os.getpid(), secrets.token_hex(4)))
+    # 0o600 until the final mode is set; a new file with no perm keeps the old 0o644 via umask.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o644 if (st is None and perm is None) else 0o600)
+    try:
+        try:
+            if perm is not None:
+                os.fchmod(fd, int(perm))
+            elif st is not None:
+                os.fchmod(fd, _stat.S_IMODE(st.st_mode))
+            if st is not None:
+                try:
+                    os.fchown(fd, st.st_uid, st.st_gid)
+                except OSError:
+                    pass
+                try:   # keep the SELinux label an in-place write would have kept (Rocky)
+                    os.setxattr(tmp, 'security.selinux', os.getxattr(path, 'security.selinux'))
+                except (OSError, AttributeError):
+                    pass
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, path)
+        except OSError as e:
+            if e.errno in (errno.EBUSY, errno.EXDEV):
+                os.unlink(tmp)
+                return False
+            raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:   # make the rename itself durable; best effort
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+    return True
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
     given (octal int), the file is chmod'd to it after the write.
 
+    Full-file writes under _ATOMIC_WRITE_PREFIXES (Guard Dog scripts, systemd units) go
+    by temp file + rename so a running script is never rewritten under itself (ops #666).
+    The legacy sudo-tee path still writes in place.
+
     Full-file writes of CoreConfig.xml first stash the previous version as
     `.infratak-prev` — see _backup_coreconfig_before_write()."""
     _backup_coreconfig_before_write(path, content, mode)
+    atomic = _priv_write_wants_atomic(path, mode)
     if _broker_should_route() and _broker_available():
         data = content if isinstance(content, (bytes, bytearray)) else str(content).encode()
         req = {'op': 'write', 'path': path, 'mode': mode,
                'content_b64': _b64.b64encode(data).decode()}
         if perm is not None:
             req['perm'] = int(perm)
+        if atomic:
+            req['atomic'] = True
         resp = _broker_request(req)
         if not resp.get('ok'):
             raise BrokerError(f"broker write denied ({path}): {resp.get('error')}")
@@ -854,6 +940,9 @@ def _write_priv(path, content, mode='w', perm=None):
     is_bytes = isinstance(content, (bytes, bytearray))
     if os.getuid() == 0:
         fmode = mode + 'b' if is_bytes else mode
+        if atomic and _atomic_replace_local(
+                path, bytes(content) if is_bytes else str(content).encode(), perm):
+            return
         if str(path).startswith(_MEDIAMTX_NOFOLLOW_PREFIXES):
             # ops #643: MediaMTX's own account can plant links in these dirs; a root
             # console must not write through one (the broker does the same, O_NOFOLLOW).
