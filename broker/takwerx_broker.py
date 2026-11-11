@@ -5375,11 +5375,11 @@ def _mtx_own_path(p):
     it planted can only reach what it could already read or write."""
     return (p.startswith(_MTX_EDITOR_DIR) or p.startswith(_MTX_CONF_BACKUPS)
             or p == _MTX_CONF or (p.startswith(_MTX_CONF + '.')
-                                  and _MTX_BACKUP_NAME_RE.match(os.path.basename(p))))
+                                  and _MTX_BACKUP_NAME_RE.fullmatch(os.path.basename(p))))
 
 
 def _mtx_port_ok(spec):
-    m = _MTX_PORT_RE.match(spec or '')
+    m = _MTX_PORT_RE.fullmatch(spec or '')
     if not m:
         raise Denied(f'mediamtx: bad port spec {spec!r}')
     port = int(m.group(1))

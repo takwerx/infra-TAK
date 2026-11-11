@@ -534,6 +534,9 @@ KNOWN_GAPS = {
     'nmcli device disconnect <var>',
     'runuser -u postgres -- <var>',
     'runuser -u tak -- <var>',
+    # The MediaMTX editor login step (app.py, `runuser -u _MEDIAMTX_RUN_USER --`): the
+    # scan cannot fill the user name. Same verdict on dev e5e7ef1 before this change.
+    'runuser -u <var> -- <var>',
     'sh <var>',
     'sysctl -w <var>',
     'systemctl <var>',

@@ -270,3 +270,16 @@ def test_semanage_fcontext_takes_only_httpd_sys_content_t(typ):
 ])
 def test_console_shapes_still_allowed(argv):
     B.check_exec(argv)
+
+
+@pytest.mark.parametrize('spec', ['5000/tcp\n', '5000/udp\n'])
+def test_mediamtx_port_spec_with_trailing_newline_is_refused(spec):
+    """The MediaMTX profile's port check is $-anchored too (fullmatch, not match)."""
+    B._mtx_port_ok(spec.rstrip('\n'))
+    with pytest.raises(B.Denied):
+        B._mtx_port_ok(spec)
+
+
+def test_mediamtx_backup_name_with_trailing_newline_is_not_its_own_path():
+    assert B._mtx_own_path('/usr/local/etc/mediamtx.yml.bak1')
+    assert not B._mtx_own_path('/usr/local/etc/mediamtx.yml.bak1\n')
