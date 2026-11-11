@@ -38246,6 +38246,126 @@ def _startup_caddy_nodered_login_converge():
           % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
+# ops #648: TAK Portal has no login of its own; Authentik in front of it is the login. TAK
+# Portal reads who the user is from the X-Authentik-* headers that forward_auth sets, so those
+# headers may only ever come from Authentik. The TAK Portal vhost is therefore Authentik
+# forward_auth, or a 503 — never a bare reverse_proxy — and every client-sent X-Authentik-*
+# header is removed first, on every path of the vhost (the public paths too).
+_TAKPORTAL_VHOST_MARKER = '# TAK Portal'
+_TAKPORTAL_PUBLIC_PATHS = '/request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*'
+_CADDY_STRIP_AUTHENTIK_HEADERS = 'request_header -X-Authentik-*'
+_TAKPORTAL_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements '
+                              'X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt '
+                              'X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider '
+                              'X-Authentik-Meta-App X-Authentik-Meta-Version')
+
+
+def _caddy_vhost_block(caddyfile, marker):
+    """Text of the generated vhost whose comment line is exactly `marker` ('' when there is
+    none). Only the infra-TAK part of the file is read: operator blocks never count."""
+    gen = (caddyfile or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    m = re.search(r'(?m)^' + re.escape(marker) + r'$', gen)
+    if not m:
+        return ''
+    j = gen.find('\n}\n', m.start())
+    return gen[m.start():j + 2 if j > 0 else len(gen)]
+
+
+def _vhost_uses_sso(ak, existing_caddyfile, marker):
+    """ops #648, the rule of _nodered_edge_uses_sso (ops #613) for any vhost: build it with
+    Authentik forward_auth? Yes when Authentik is installed. A failed Authentik probe (or no
+    answer at all) is unknown, not "no Authentik": keep forward_auth when the vhost already
+    on disk has it. The caller must fail closed when this returns False."""
+    ak = ak or {}
+    if ak.get('installed'):
+        return True
+    if ak and ak.get('probe_ok', True):
+        return False
+    return 'forward_auth' in _caddy_vhost_block(existing_caddyfile, marker)
+
+
+def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=()):
+    """Caddy lines for the TAK Portal vhost after its log / encoding lines. Fails closed:
+    without Authentik the vhost answers 503 and nothing reaches TAK Portal."""
+    if not use_sso:
+        return ['    # ops #648: TAK Portal has no login of its own, so it is published only behind Authentik',
+                '    respond "TAK Portal needs Authentik. Open the infra-TAK console and deploy Authentik." 503']
+    return (['    route {',
+             f'        {_CADDY_STRIP_AUTHENTIK_HEADERS}']
+            + list(rescue_lines)
+            + [f'        reverse_proxy /outpost.goauthentik.io/* {ak_up}',
+               '',
+               '        @public {',
+               f'            path {_TAKPORTAL_PUBLIC_PATHS}',
+               '        }',
+               '',
+               '        handle @public {',
+               f'            reverse_proxy {portal_up}',
+               '        }',
+               '',
+               f'        forward_auth {ak_up} {{',
+               '            uri /outpost.goauthentik.io/auth/caddy',
+               f'            copy_headers {_TAKPORTAL_AK_COPY_HEADERS}',
+               '            trusted_proxies private_ranges',
+               '        }',
+               '',
+               f'        reverse_proxy {portal_up}',
+               '    }'])
+
+
+def _takportal_vhost_is_closed(block):
+    """True when a TAK Portal vhost text is safe: no vhost, a 503 with nothing proxied, or
+    forward_auth with the client X-Authentik-* headers removed first."""
+    if not block:
+        return True
+    if 'reverse_proxy' not in block:
+        return ' 503' in block
+    return 'forward_auth' in block and _CADDY_STRIP_AUTHENTIK_HEADERS in block
+
+
+def _startup_caddy_takportal_login_converge():
+    """ops #648 — an existing box whose TAK Portal vhost is a bare reverse_proxy, or an
+    Authentik one that passes client X-Authentik-* headers through, is rebuilt on the console
+    update. Same shape as _startup_caddy_nodered_login_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        block = _caddy_vhost_block(_read_priv(CADDYFILE_PATH), _TAKPORTAL_VHOST_MARKER)
+    except Exception as e:
+        print('Startup migration: TAK Portal login converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if _takportal_vhost_is_closed(block):
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    bare = 'forward_auth' not in block
+    check = (' Check TAK Portal: if you find a user, agency or certificate you did not create, '
+             'treat this box as taken over.' if bare else '')
+    print('Startup migration: ⚠ TAK Portal %s (ops #648) — rebuilding its Caddy site now'
+          % ('is published with NO login in front of it' if bare
+             else 'login headers are not cleaned at the edge'), flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: TAK Portal site queued — written with the post-registry '
+              'Caddyfile regen (ops #648).' + check, flush=True)
+        return
+    try:
+        if not _takportal_vhost_is_closed(_caddy_vhost_block(_read_priv(CADDYFILE_PATH),
+                                                             _TAKPORTAL_VHOST_MARKER)):
+            print('Startup migration: ⚠ TAK Portal login converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. TAK Portal is STILL open on this '
+                  'box (ops #648).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ TAK Portal is now only reachable through Authentik (or closed '
+          'with a 503 when there is no Authentik) and Caddy %s (ops #648).'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]) + check, flush=True)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -39168,29 +39288,20 @@ def generate_caddyfile(settings=None):
             lines.append(f"        }}")
             lines.append(f"    }}")
         lines += _caddy_drop_request_encoding_lines()
-        if ak.get('installed'):
-            lines.append(f"    route {{")
+        # ops #648: Authentik, or (Authentik probe failed) the Authentik block already on
+        # disk, or a 503. Never a bare reverse_proxy.
+        try:
+            _tp_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _tp_existing = ''
+        _tp_sso = _vhost_uses_sso(ak, _tp_existing, _TAKPORTAL_VHOST_MARKER)
+        _tp_rescue = []
+        if _tp_sso:
+            _n = len(lines)
             _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
-            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.append(f"")
-            lines.append(f"        @public {{")
-            lines.append(f"            path /request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        handle @public {{")
-            lines.append(f"            reverse_proxy {portal_up}")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider X-Authentik-Meta-App X-Authentik-Meta-Version")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
-            lines.append(f"")
-            lines.append(f"        reverse_proxy {portal_up}")
-            lines.append(f"    }}")
-        else:
-            lines.append(f"    reverse_proxy {portal_up}")
+            _tp_rescue = lines[_n:]
+            del lines[_n:]
+        lines += _takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue)
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'takportal'), portal_host)
@@ -44082,6 +44193,10 @@ def takportal_update_status():
 def takportal_deploy():
     if takportal_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    # ops #648: TAK Portal has no login of its own; Authentik is its login. No Authentik, no deploy.
+    if not detect_modules(fresh=True).get('authentik', {}).get('installed'):
+        return jsonify({'error': 'TAK Portal needs Authentik for its login. Deploy Authentik '
+                                 'first, then deploy TAK Portal.'}), 409
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_takportal_deploy, daemon=True).start()
@@ -110245,6 +110360,11 @@ def _startup_migrations():
             _startup_caddy_nodered_login_converge()
         except Exception as _nl_err:
             print(f"Startup migration: Node-RED login converge error (non-fatal): {_nl_err}",
+                  flush=True)
+        try:
+            _startup_caddy_takportal_login_converge()
+        except Exception as _tpl_err:
+            print(f"Startup migration: TAK Portal login converge error (non-fatal): {_tpl_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()
