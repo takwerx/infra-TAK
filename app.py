@@ -15185,6 +15185,51 @@ def mediamtx_page():
         mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
 
+@app.route('/api/mediamtx/editor-login')
+@login_required
+def mediamtx_editor_login_status():
+    """ops #649: is the web editor's default admin/admin gone? Never returns the password."""
+    modules = detect_modules()
+    if not modules.get('mediamtx', {}).get('installed'):
+        return jsonify({'mode': 'none'})
+    settings = load_settings()
+    st = _mediamtx_editor_login_load()
+    ok = _mediamtx_editor_login_ok(settings)
+    return jsonify({'mode': 'ok' if ok else 'blocked',
+                    'authentik': bool(modules.get('authentik', {}).get('installed')),
+                    'user': st.get('user') or 'admin',
+                    'password_pending': bool(ok and st.get('reveal'))})
+
+
+@app.route('/api/mediamtx/editor-login/reveal', methods=['POST'])
+@login_required
+def mediamtx_editor_login_reveal():
+    """Hand out the generated editor password once, then forget the plaintext."""
+    settings = load_settings()
+    st = _mediamtx_editor_login_load()
+    pw = st.get('reveal') if _mediamtx_editor_login_ok(settings) else None
+    if not pw:
+        return jsonify({'error': 'The password was already shown. Change it in the web console '
+                                 '(Change Password) if you lost it.'}), 404
+    st.pop('reveal', None)
+    _mediamtx_editor_login_save(st)
+    return jsonify({'user': st.get('user') or 'admin', 'password': pw})
+
+
+@app.route('/api/mediamtx/editor-login/check', methods=['POST'])
+@login_required
+def mediamtx_editor_login_check():
+    """Check the editor login again (replaces admin/admin if it is back) and rewrite Caddy."""
+    settings = load_settings()
+    res = _mediamtx_editor_secure_login(settings)
+    caddy_ok = None
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        caddy_ok, _ = _caddy_reload_if_changed(timeout=60)
+    return jsonify({'result': res, 'ok': _mediamtx_editor_login_ok(settings),
+                    'caddy_reloaded': caddy_ok})
+
+
 # ── NetBird VPN ─────────────────────────────────────────────────────────────
 @app.route('/netbird')
 @login_required
@@ -35662,9 +35707,10 @@ def _get_mediamtx_hls_upstream(settings):
 # (the editor checks it) and a /watch/ page is only HTML; its video is /hls-proxy/, which
 # needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
 MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
+_MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
 
 
-def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue):
+def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
     """Append the MediaMTX stream-domain vhost to `lines` (called by generate_caddyfile).
 
     v10.2.6: with Authentik, /hls-proxy/* goes through the login to the web editor, whose
@@ -35690,8 +35736,12 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
            on a split box, whose remote overlay a console update cannot reach. None
            sends it through the login to the local editor.
     emit_strip(indent) / emit_rescue(root_url): generate_caddyfile's own emitters.
+    login_ok: no Authentik only. True when the console has made sure the editor no longer
+           answers admin/admin (ops #649); False answers 503 instead of the editor.
+    Every route starts with _CADDY_STRIP_AUTHENTIK_HEADERS (ops #648/#649): no client
+    X-Authentik-* header of any name reaches the editor.
     """
-    lines.append("# MediaMTX Web Console")
+    lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
     if hls:
         mtx_hls, hls_enc = hls
@@ -35711,10 +35761,12 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     if ak_up:
         for path in MEDIAMTX_OPEN_PATHS:
             lines.append(f"    route {path} {{")
+            lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append("    }")
         lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
@@ -35727,10 +35779,228 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         lines.append("        }")
         lines.append(f"        reverse_proxy {mtx_up}")
         lines.append("    }")
+    elif login_ok:
+        # ops #649: no Authentik. The editor's own login stands in front (its default login
+        # was replaced, see _mediamtx_editor_secure_login), and client X-Authentik-* is
+        # stripped on every route, same as with Authentik.
+        lines.append("    route {")
+        lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
+        emit_strip("        ")
+        lines.append(f"        reverse_proxy {mtx_up}")
+        lines.append("    }")
     else:
-        lines.append(f"    reverse_proxy {mtx_up}")
+        # ops #649: the editor may still answer admin/admin, so it is not published.
+        lines.append('    respond "The MediaMTX web console is not available: its login is not set up. '
+                     'Open the infra-TAK console, MediaMTX page." 503')
     lines.append("}")
     lines.append("")
+
+
+# ops #649: the MediaMTX web editor (mediamtx-installer) seeds users.json with admin/admin and
+# prints that on its login page. Without Authentik nothing else stands in front of it, so the
+# console replaces admin/admin with a random password (shown once on the MediaMTX page) and
+# Caddy publishes the editor only after that is done. The editor reads users.json on every
+# login, so no restart is needed. The password is made ON the editor's box and comes back on
+# stdout: it is never on a command line. Run as `python3 -I - <users.json path>`.
+_MEDIAMTX_EDITOR_USERS_FILE = '/opt/mediamtx-webeditor/users.json'
+_MEDIAMTX_EDITOR_LOGIN_FILE = os.path.join(CONFIG_DIR, 'mediamtx_editor_login.json')
+_MEDIAMTX_EDITOR_LOGIN_SCRIPT = r'''
+import json, os, secrets, sys
+F = sys.argv[1]
+try:
+    try:
+        with open(F) as f:
+            users = json.load(f)
+        st = os.stat(F)
+    except FileNotFoundError:
+        users = [{'username': 'admin', 'password': 'admin', 'role': 'admin'}]
+        st = os.stat(os.path.dirname(F))
+    if not isinstance(users, list):
+        raise ValueError('users.json is not a list')
+    hit = [u for u in users if isinstance(u, dict)
+           and u.get('username') == 'admin' and u.get('password') == 'admin']
+    if not hit:
+        print('MTXLOGIN keep')
+        sys.exit(0)
+    pw = secrets.token_urlsafe(15)
+    for u in hit:
+        u['password'] = pw
+    tmp = F + '.infratak-tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(users, f, indent=2)
+    if os.geteuid() == 0:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, F)
+    print('MTXLOGIN set ' + pw)
+except SystemExit:
+    raise
+except Exception as e:
+    print('MTXLOGIN fail ' + type(e).__name__)
+'''
+
+
+def _mediamtx_editor_login_target(settings):
+    """Where the editor runs: 'local', or the remote host. The login state is per target."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if cfg.get('target_mode') == 'remote':
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if host:
+            return host
+    return 'local'
+
+
+def _mediamtx_editor_login_load():
+    try:
+        with open(_MEDIAMTX_EDITOR_LOGIN_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mediamtx_editor_login_save(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _MEDIAMTX_EDITOR_LOGIN_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, _MEDIAMTX_EDITOR_LOGIN_FILE)
+
+
+def _mediamtx_editor_login_ok(settings):
+    """True when the console has checked that this box's editor no longer has admin/admin."""
+    st = _mediamtx_editor_login_load()
+    return bool(st.get('ok')) and st.get('target') == _mediamtx_editor_login_target(settings)
+
+
+def _mediamtx_editor_run_login_script(settings):
+    """Run _MEDIAMTX_EDITOR_LOGIN_SCRIPT where the editor runs. Returns its MTXLOGIN line or ''."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    path = _MEDIAMTX_EDITOR_USERS_FILE
+    if _mediamtx_editor_login_target(settings) != 'local':
+        b64 = _b64.b64encode(_MEDIAMTX_EDITOR_LOGIN_SCRIPT.encode()).decode()
+        ok, out = _module_run(cfg, _REMOTE_SUDO_SH + f'echo {b64} | base64 -d | $S python3 -I - {path}',
+                              timeout=45)
+    else:
+        argv = ['python3', '-I', '-', path]
+        if not os.access(os.path.dirname(path), os.W_OK):
+            argv = ['sudo', '-n'] + argv
+        try:
+            r = subprocess.run(argv, input=_MEDIAMTX_EDITOR_LOGIN_SCRIPT, capture_output=True,
+                               text=True, timeout=45)
+            out = r.stdout or ''
+        except Exception:
+            out = ''
+    for ln in (out or '').splitlines():
+        if ln.startswith('MTXLOGIN '):
+            return ln.strip()
+    return ''
+
+
+def _mediamtx_editor_secure_login(settings, log_fn=None):
+    """ops #649: make sure the MediaMTX editor does not answer admin/admin.
+
+    Replaces admin/admin with a random password (kept in .config/mediamtx_editor_login.json,
+    0600, until the MediaMTX page has shown it once). Returns 'set' (replaced now), 'keep'
+    (no admin/admin there) or 'fail' (could not check). A failed check never clears an
+    earlier good one for the same target: an SSH blip must not take the site down."""
+    _log = log_fn or (lambda _m: None)
+    target = _mediamtx_editor_login_target(settings)
+    res = _mediamtx_editor_run_login_script(settings)
+    st = _mediamtx_editor_login_load()
+    if st.get('target') != target:
+        st = {'target': target}
+    if res.startswith('MTXLOGIN set ') and len(res) > 20:
+        st.update({'ok': True, 'user': 'admin', 'reveal': res[len('MTXLOGIN set '):],
+                   'set': int(time.time())})
+        _mediamtx_editor_login_save(st)
+        _log("  ✓ Web editor: the default admin/admin login was replaced with a random password.")
+        _log("    Open the MediaMTX page in this console to see it (shown once).")
+        return 'set'
+    if res == 'MTXLOGIN keep':
+        st.update({'ok': True, 'checked': int(time.time())})
+        _mediamtx_editor_login_save(st)
+        return 'keep'
+    _log(f"  ✗ Web editor login could not be checked ({res or 'no answer'}). The web console")
+    _log("    stays closed (503) until it is. Deploy MediaMTX again to retry.")
+    return 'fail'
+
+
+def _mediamtx_vhost_is_safe(generated):
+    """True when the MediaMTX vhost in a Caddyfile cannot hand a forged X-Authentik-* header or
+    an admin/admin editor to the internet (no vhost at all counts as safe). ops #649."""
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
+    if not blk:
+        return True
+    return 'request_header -X-Authentik-Groups' in blk or ' 503' in blk
+
+
+def _mediamtx_vhost_needs_regen(generated, login_ok):
+    """ops #649: without Authentik the vhost is open exactly when the login is known good.
+    True when it is unsafe, or open/closed (503) the wrong way round: closed by an earlier
+    regen this boot, or open while the login could not be checked."""
+    blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
+    if not _mediamtx_vhost_is_safe(generated):
+        return True
+    if not blk or 'forward_auth' in blk:
+        return False
+    return (' 503' not in blk) != bool(login_ok)
+
+
+def _startup_mediamtx_editor_login_converge():
+    """ops #649 — on the console update: replace admin/admin in the MediaMTX editor (local or
+    remote) and make sure Caddy never publishes it without a login or with client
+    X-Authentik-* headers passed through. Same shape as _startup_caddy_nodered_login_converge.
+    A remote editor is reached over SSH, so that case runs in a daemon thread: an unreachable
+    host never holds up boot."""
+    s = load_settings()
+    if not detect_modules().get('mediamtx', {}).get('installed'):
+        return
+    if _mediamtx_editor_login_target(s) != 'local':
+        threading.Thread(target=_mediamtx_editor_login_converge_run, args=(s,), daemon=True).start()
+        return
+    _mediamtx_editor_login_converge_run(s)
+
+
+def _mediamtx_editor_login_converge_run(s):
+    res = _mediamtx_editor_secure_login(s)
+    if res == 'set':
+        print('Startup migration: ⚠ the MediaMTX web editor still had the default admin/admin '
+              'login (ops #649). It now has a random password: the MediaMTX page shows it once. '
+              'If you find a path, user or share link you did not add, treat the box as taken '
+              'over and rebuild it.', flush=True)
+    elif res == 'fail':
+        print('Startup migration: ⚠ could not check the MediaMTX web editor login (ops #649). '
+              'Without Authentik the web console stays closed (503) until it is.', flush=True)
+    if not os.path.exists(CADDYFILE_PATH) or not (s.get('fqdn') or '').strip():
+        return
+    try:
+        before = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: MediaMTX vhost converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if not _mediamtx_vhost_needs_regen(before, _mediamtx_editor_login_ok(s)):
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: MediaMTX vhost queued — written with the post-registry '
+              'Caddyfile regen (ops #649).', flush=True)
+        return
+    try:
+        if not _mediamtx_vhost_is_safe(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ MediaMTX vhost converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. The web console is STILL open '
+                  'without a login check on this box (ops #649).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ MediaMTX web console vhost secured and Caddy %s (ops #649). '
+          'If you find a path, user or share link you did not add, treat the box as taken '
+          'over and rebuild it.' % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
+          flush=True)
 
 
 def _get_nodered_upstream(settings):
@@ -39425,14 +39695,22 @@ def generate_caddyfile(settings=None):
     if mtx.get('installed'):
         mtx_host = sd['mediamtx']
         mtx_up = _get_mediamtx_upstream(settings)
-        _mtx_ak = ak.get('installed')
+        # ops #649: an unknown Authentik probe keeps the Authentik block already on disk
+        # (_vhost_uses_sso, ops #648); without Authentik the editor is published only once
+        # its admin/admin is gone.
+        try:
+            _mtx_existing = _read_priv(CADDYFILE_PATH) if os.path.exists(CADDYFILE_PATH) else ''
+        except Exception:
+            _mtx_existing = ''
+        _mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)
         # /hls-proxy/ through the login to the local editor only — see _emit_mediamtx_site.
         _mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'
         _emit_mediamtx_site(
             lines, mtx_host, mtx_up,
             ak_up if _mtx_ak else None,
             _get_mediamtx_hls_upstream(settings) if _mtx_direct else None,
-            _emit_ak_header_strip, _emit_outpost_callback_rescue)
+            _emit_ak_header_strip, _emit_outpost_callback_rescue,
+            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings))
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
 
     fedhub = modules.get('fedhub', {})
@@ -46168,6 +46446,8 @@ paths:
     cfg['deployed'] = True
     settings['mediamtx_deployment'] = cfg
     save_settings(settings)
+    # ops #649: never leave the remote editor on admin/admin. Before Caddy publishes it.
+    _mediamtx_editor_secure_login(settings, log_fn=plog)
     generate_caddyfile(settings)
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
@@ -46981,6 +47261,9 @@ WantedBy=multi-user.target
         if os.path.exists(editor_file):
             subprocess.run(_sudo_wrap(['systemctl', 'start', 'mediamtx-webeditor']), capture_output=True)
         plog("✓ Services enabled and started")
+        # ops #649: never leave the editor on admin/admin. Before Caddy publishes it below.
+        if os.path.exists(editor_file):
+            _mediamtx_editor_secure_login(settings, log_fn=plog)
 
         # Step 6: Firewall
         # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890,
@@ -110710,6 +110993,11 @@ def _startup_migrations():
             _startup_caddy_takportal_login_converge()
         except Exception as _tpl_err:
             print(f"Startup migration: TAK Portal login converge error (non-fatal): {_tpl_err}",
+                  flush=True)
+        try:
+            _startup_mediamtx_editor_login_converge()
+        except Exception as _ml_err:
+            print(f"Startup migration: MediaMTX editor login converge error (non-fatal): {_ml_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()

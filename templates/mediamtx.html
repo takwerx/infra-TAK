@@ -91,6 +91,8 @@
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
+  <div class="card" id="mtx-login-card" style="display:none;border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.06)"><div class="card-title" id="mtx-login-title">&#128274; Web console login</div><p id="mtx-login-text" style="font-size:13px;color:var(--text-secondary);line-height:1.5"></p><div id="mtx-login-secret" style="display:none;margin:10px 0;font-family:monospace;font-size:14px;color:var(--text-primary);word-break:break-all"></div><button class="btn" id="mtx-login-reveal" style="display:none" onclick="mtxLoginReveal()">Show password (once)</button> <button class="btn" id="mtx-login-check" style="display:none" onclick="mtxLoginCheck()">Check again</button></div>
+
   <!-- Access info -->
   <div class="card">
     <div class="card-title">Access</div>
@@ -213,6 +215,25 @@
   </div>
 </div>
 
+<script>
+(function(){
+var card=document.getElementById('mtx-login-card');if(!card)return;
+function $(i){return document.getElementById(i);}
+function post(u){return fetch(u,{method:'POST',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');return d;});});}
+function show(d){var b=$('mtx-login-secret');b.textContent='Username: '+d.user+'   Password: '+d.password;b.style.display='block';$('mtx-login-text').textContent='Copy this now. It is shown one time. You can change it in the web console (Change Password).';$('mtx-login-reveal').style.display='none';}
+window.mtxLoginReveal=function(){post('/api/mediamtx/editor-login/reveal').then(show).catch(function(e){$('mtx-login-text').textContent=e.message;});};
+window.mtxLoginCheck=function(){$('mtx-login-text').textContent='Checking…';post('/api/mediamtx/editor-login/check').then(function(){load();}).catch(function(e){$('mtx-login-text').textContent=e.message;});};
+function load(){fetch('/api/mediamtx/editor-login',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+ var t=$('mtx-login-title'),x=$('mtx-login-text');
+ if(d.mode==='ok'&&d.password_pending){card.style.display='block';t.textContent='🔒 New web console password';card.style.borderColor='rgba(59,130,246,.3)';card.style.background='rgba(59,130,246,.05)';
+  x.textContent='The web console no longer uses the default admin/admin login. User: '+d.user+'. Your new password has not been shown yet.';$('mtx-login-reveal').style.display='inline-block';$('mtx-login-check').style.display='none';}
+ else if(d.mode==='blocked'&&!d.authentik){card.style.display='block';t.textContent='⚠ The web console is switched off at the web address';
+  x.textContent='The console could not check that the web console no longer uses the default admin/admin login, so it is not published. Click Check again.';$('mtx-login-check').style.display='inline-block';}
+ else{card.style.display='none';}
+}).catch(function(){card.style.display='none';});}
+load();
+})();
+</script>
 <script>window.MOD_INSTALLED={{ 'true' if mtx.installed else 'false' }};</script>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('service-logs');</script>
