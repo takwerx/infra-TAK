@@ -88,6 +88,29 @@
       ]
     },
     {
+      "id": "plugins",
+      "label": "Plugins: install one plugin from the TAK Portal CloudTAK Marketplace on a box and see it load in CloudTAK, before merge (ops #687, #691)",
+      "why": "touches something TAK Portal Marketplace installs depend on (portal SSH key, sudo or broker grants, Docker networks, Caddy for TAK Portal or CloudTAK)",
+      "boxes": ["test6 (non-root, TAK Portal + CloudTAK)"],
+      "paths": [
+        "scripts/takportal-*"
+      ],
+      "content": [
+        "authorized_keys",
+        "\\b_?takportal_\\w+",
+        "\\bsudoers?\\b|NOPASSWD",
+        "\\bdocker network (create|connect|disconnect|rm)\\b|INFRATAK_DOCKER_NETWORK|host\\.docker\\.internal|extra_hosts",
+        "caddy.*(takportal|tak-portal|cloudtak)|(takportal|tak-portal|cloudtak).*caddy",
+        "\\bCLOUDTAK_PLUGINS\\b|cloudtak[-_]?marketplace"
+      ],
+      "context": [
+        "\\bdef _?\\w*takportal\\w*\\(",
+        "\\bdef \\w*authorized_keys\\w*\\(",
+        "\\bdef \\w*(cloudtak_plugin|marketplace)\\w*\\(",
+        "\\bCLOUDTAK_PLUGINS\\b"
+      ]
+    },
+    {
       "id": "soak",
       "label": "Soak of at least 60 min (T&E invariant 4)",
       "why": "touches Authentik / Postgres / retention / cert renewal",
