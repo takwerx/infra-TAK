@@ -931,20 +931,41 @@ def _gd_template(name):
 
 def _gd_remove_script(name):
     """Remove an optional Guard Dog script. Root does it (gd_remove) on a broker that
-    has the op; an older broker or a root console keeps the old direct remove."""
+    has the op; an older broker gets the old `rm -f`, a root console removes it here."""
     if name not in _GD_OPTIONAL_SCRIPTS:
         raise ValueError(f'not an optional Guard Dog script: {name}')
+    path = os.path.join('/opt/tak-guarddog', name)
     if _broker_should_route() and _broker_available():
         resp = _broker_request({'op': 'gd_remove', 'name': name})
         if resp.get('ok'):
             return bool(resp.get('changed'))
         if not str(resp.get('error') or '').startswith('unknown op'):
             raise BrokerError(f'Guard Dog script {name} not removed: {resp.get("error")}')
-    path = os.path.join('/opt/tak-guarddog', name)
+        # An older broker: the folder can be root's (W1 root-owned layout), so the
+        # console cannot unlink in it itself. Ask that broker with the old rm -f.
+        if not os.path.lexists(path):
+            return False
+        r = subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            raise BrokerError(f'Guard Dog script {name} not removed: '
+                              f'{(r.stderr or r.stdout or "").strip()[:200]}')
+        return True
     if os.path.lexists(path):
         os.remove(path)
         return True
     return False
+
+
+def _gd_render_older_broker(name, err):
+    """True when a root-owned broker on an older commit refused gd_render only because
+    it does not know this script yet: the optional ones were inline before W2 part 2b
+    ("not a Guard Dog script name"), and a template added later is not in its copy
+    ("no Guard Dog template"). That happens when Update could not reach GitHub, so root
+    kept its older commit. The console then writes the old way, which that broker
+    still allows for those names (and refuses for every other Guard Dog script)."""
+    if 'no Guard Dog template' in err:
+        return True
+    return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
 
 
 def _gd_install_script(name, template, values, perm=0o755):
@@ -958,7 +979,8 @@ def _gd_install_script(name, template, values, perm=0o755):
         if resp.get('ok'):
             return bool(resp.get('changed'))
         err = str(resp.get('error') or '')
-        if not (err.startswith('unknown op') or 'root-owned copy' in err):
+        if not (err.startswith('unknown op') or 'root-owned copy' in err
+                or _gd_render_older_broker(name, err)):
             raise BrokerError(f'Guard Dog script {name} not installed: {err}')
     content = _gd_fill(template, values)
     dest = os.path.join('/opt/tak-guarddog', name)

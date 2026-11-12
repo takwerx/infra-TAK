@@ -362,3 +362,108 @@ def test_cert_sync_deploy_sends_only_the_values_the_template_takes():
     i = APP_SRC.index("_gd_install_script('mediamtx-cert-sync.sh'")
     block = APP_SRC[i:i + 600]
     assert set(re.findall(r"'([A-Z_]+_PLACEHOLDER)'", block)) == set(MTX)
+
+
+# --- console against an older root-owned broker ------------------------------------------
+# A box whose root broker could not move to this commit (Update could not reach GitHub,
+# or a trial of an unmerged commit) keeps the older root copy (W1/2a). That broker does
+# not render the four scripts ("not a Guard Dog script name": they were inline) and has
+# no gd_remove ("unknown op"). The console must then use the old routes, which that
+# broker still allows for these names, not fail SMS save, SMS off or the purge.
+
+_OLD_RENDER_REFUSAL = 'gd_render: not a Guard Dog script name: %s'   # broker at dev 85d4f8e
+
+
+def _console(broker_reply, exec_rc=0):
+    """_gd_install_script / _gd_remove_script from app.py, with a fake broker."""
+    names = ('_gd_fill', '_gd_render_older_broker', '_gd_remove_script', '_gd_install_script')
+    tree = ast.parse(APP_SRC)
+    src = [ast.get_source_segment(APP_SRC, n) for n in tree.body
+           if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(src) == len(names)
+    calls = {'broker': [], 'exec': [], 'write': []}
+
+    class BrokerError(RuntimeError):
+        pass
+
+    def _broker_request(req):
+        calls['broker'].append(req)
+        return broker_reply(req)
+
+    def _run(argv, **kw):
+        calls['exec'].append(argv)
+        return types.SimpleNamespace(returncode=exec_rc, stdout='', stderr='denied' if exec_rc else '')
+
+    ns = {
+        'os': types.SimpleNamespace(path=types.SimpleNamespace(join=os.path.join, lexists=lambda p: True),
+                                    remove=lambda p: calls['exec'].append(['os.remove', p])),
+        'subprocess': types.SimpleNamespace(run=_run),
+        're': re, 'BrokerError': BrokerError,
+        '_GD_OPTIONAL_SCRIPTS': frozenset(_app_constant('_GD_OPTIONAL_SCRIPTS')),
+        '_GD_PLACEHOLDER_RE': B._GD_PLACEHOLDER_RE,
+        '_broker_should_route': lambda: True, '_broker_available': lambda: True,
+        '_broker_request': _broker_request,
+        '_sudo_wrap': lambda argv: ['brokerctl', 'exec', '--'] + list(argv),
+        '_read_priv': lambda p: (_ for _ in ()).throw(OSError('absent')),
+        '_chmod_priv': lambda p, m: None,
+        '_write_priv': lambda p, c, perm=None: calls['write'].append((p, c, perm)),
+    }
+    exec('\n\n'.join(src), ns)
+    return ns, calls
+
+
+@pytest.mark.parametrize('name', OPTIONAL)
+def test_install_falls_back_on_a_broker_that_predates_2b(name):
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED',
+                                      'error': _OLD_RENDER_REFUSAL % req['name']})
+    assert ns['_gd_install_script'](name, 'echo hi\n', {}) is True
+    assert calls['write'] == [('/opt/tak-guarddog/' + name, 'echo hi\n', 0o755)]
+
+
+def test_install_still_raises_for_a_normal_script_the_broker_refuses():
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED',
+                                      'error': _OLD_RENDER_REFUSAL % req['name']})
+    with pytest.raises(RuntimeError, match='not installed'):
+        ns['_gd_install_script']('tak-disk-watch.sh', 'echo hi\n', {})
+    assert calls['write'] == []
+
+
+def test_install_still_raises_when_this_broker_refuses_a_value():
+    """A refusal from the current broker (a bad value) is never sidestepped."""
+    with_bad = {'op': 'gd_render', 'name': 'mediamtx-cert-sync.sh',
+                'values': {'MTX_HOST_PLACEHOLDER': '-oProxyCommand=x'}}
+    verdict, reason = B._evaluate(with_bad)
+    assert verdict == 'DENY'
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED', 'error': reason})
+    with pytest.raises(RuntimeError, match='not installed'):
+        ns['_gd_install_script']('mediamtx-cert-sync.sh', 'x', with_bad['values'])
+    assert calls['write'] == []
+
+
+def test_install_falls_back_when_the_older_copy_lacks_a_template():
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'ENOENT',
+                                      'error': 'no Guard Dog template new.sh in commit 85d4f8e62b8c'})
+    assert ns['_gd_install_script']('new.sh', 'echo hi\n', {}) is True
+    assert len(calls['write']) == 1
+
+
+def test_remove_on_a_broker_without_gd_remove_asks_it_with_rm():
+    """Before: os.remove as takwerx in root's folder, which fails on the root layout."""
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED', 'error': 'unknown op: gd_remove'})
+    assert ns['_gd_remove_script']('sms_send.sh') is True
+    assert calls['exec'] == [['brokerctl', 'exec', '--', 'rm', '-f', '/opt/tak-guarddog/sms_send.sh']]
+    B.check_exec(['rm', '-f', '/opt/tak-guarddog/sms_send.sh'])   # this broker allows it too
+
+
+def test_remove_on_an_older_broker_reports_a_refused_rm():
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED', 'error': 'unknown op: gd_remove'},
+                         exec_rc=1)
+    with pytest.raises(RuntimeError, match='not removed'):
+        ns['_gd_remove_script']('sms_send.sh')
+
+
+def test_remove_raises_when_this_broker_refuses():
+    ns, calls = _console(lambda req: {'ok': False, 'code': 'DENIED', 'error': 'gd_remove: not an optional'})
+    with pytest.raises(RuntimeError, match='not removed'):
+        ns['_gd_remove_script']('sms_send.sh')
+    assert calls['exec'] == []
