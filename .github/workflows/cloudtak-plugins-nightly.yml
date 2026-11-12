@@ -56,6 +56,11 @@ jobs:
         include:
           - { name: 'all plugins, latest CloudTAK release', ct: release, scenario: catalog }
           - { name: 'all plugins, CloudTAK main',           ct: main,    scenario: catalog }
+          # ops #691: the legs above use the code the schedule runs from (main = what users have).
+          # These two use infra-TAK dev (what ships next), so a plugin break shows up before a
+          # release, not after. On a PR run both use the PR's own code.
+          - { name: 'all plugins (infra-TAK dev), latest CloudTAK release', ct: release, scenario: catalog, infra: dev }
+          - { name: 'all plugins (infra-TAK dev), CloudTAK main',           ct: main,    scenario: catalog, infra: dev }
           # The Dispatcher's own install.sh, as people without infra-TAK run it. dref is the branch of
           # takwerx/cloudtak-dispatcher-plugin: main is what users get today, dev is what ships next.
           - { name: 'Dispatcher install.sh (main), latest release', ct: release, scenario: dispatcher, dref: main }
@@ -71,9 +76,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          # '' = the ref that triggered the run (main on the schedule, the PR on a PR run).
+          ref: ${{ github.event_name != 'pull_request' && matrix.infra || '' }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+
+      - name: Which infra-TAK code this leg tests
+        env:
+          INFRA_REF: ${{ matrix.infra || github.ref_name }}
+        run: echo "infra-TAK code $(git rev-parse --short=9 HEAD) ($INFRA_REF)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pick the CloudTAK version
         id: ct
