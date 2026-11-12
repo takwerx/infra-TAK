@@ -3390,6 +3390,84 @@ def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
     return bool(patched)
 
 
+# ops #686 — put the PGDG yum repos on PGDG's EL-major path inside TAK's hardened DB image.
+_PGDG_MAJOR_MARK = '# infra-TAK: PGDG repos on the EL major path'
+_PGDG_MAJOR_STEP = (
+    _PGDG_MAJOR_MARK + '\n'
+    "RUN for f in /etc/yum.repos.d/pgdg*.repo; do [ -f \"$f\" ] && "
+    "sed -i 's|/rhel-\\$releasever[_a-z.$]*-\\$basearch|/rhel-'\"$(rpm -E %rhel)\"'-$basearch|g' \"$f\"; "
+    "done; true\n"
+)
+
+
+def _patch_tak_db_pgdg_releasever(build_ctx, db_dockerfile, log_fn=None):
+    """Point the PGDG yum repos in TAK's hardened DB image at rhel-<major>, not rhel-<minor>. Idempotent.
+
+    Field 2026-11-12 (ops #686; the 10.3.13 candidate's ARM fresh install, a day after the
+    same code passed). Dockerfile.hardened-takserver-db (5.8-RELEASE-75) starts FROM
+    ubi10/ubi:10.2, but its first step runs `dnf update -y`, which takes the image to the
+    newest RHEL minor (el10_3 packages since Red Hat shipped 10.3). dnf's release is then 10.3,
+    and PGDG's repo file (pgdg-redhat-repo 42.0-69) reads
+    baseurl=.../redhat/rhel-$releasever_major.$releasever_minor-$basearch (older ones:
+    rhel-$releasever-$basearch; the sed takes both). PGDG only
+    publishes a minor's folder some time after Red Hat ships it (checked 2026-11-12: rhel-10,
+    rhel-10.1, rhel-10.2), so every PGDG repo 404s and `docker build` of the DB image stops at
+    `RUN dnf install … pgdg-redhat-repo-latest.noarch.rpm`. This returns at every RHEL minor.
+
+    PGDG's rhel-<major> folder carries the same packages as its newest minor (rhel-10 and
+    rhel-10.2 had identical postgresql18 builds and repodata dates on 2026-11-12), and the image
+    is always on the newest minor after its own `dnf update`, so rhel-<major> is the right one
+    in every case, not only while PGDG lags. One RUN goes right after every RUN instruction that
+    installs the pgdg-redhat-repo rpm (the repo files exist from there on), with the major from
+    `rpm -E %rhel`. Only the pgdg*.repo files change; $releasever stays as is for UBI, EPEL and
+    Rocky. Same contract as the patchers above: a Dockerfile without that rpm is left as
+    shipped, and one we cannot read or write is built as shipped.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not db_dockerfile:
+        return False
+    df = os.path.join(build_ctx, db_dockerfile)
+    if not os.path.isfile(df):
+        return False
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(db_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    if _PGDG_MAJOR_MARK in src:
+        return False
+    lines = src.splitlines(keepends=True)
+    out, i, added = [], 0, 0
+    while i < len(lines):
+        if not re.match(r'(?i)\s*RUN\s', lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while lines[j].rstrip('\r\n').rstrip().endswith('\\') and j + 1 < len(lines):
+            j += 1
+        block = lines[i:j + 1]
+        out.extend(block)
+        if re.search(r'pgdg-redhat-repo[^\s\'"]*\.rpm', ''.join(block)):
+            if not out[-1].endswith('\n'):
+                out[-1] += '\n'
+            out.append(_PGDG_MAJOR_STEP)
+            added += 1
+        i = j + 1
+    if not added:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(''.join(out))
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(db_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(db_dockerfile)}: PostgreSQL repos use the RHEL major version "
+         "(PGDG has no folder yet for the newest RHEL minor; without this the database image build fails).")
+    return True
+
+
 # ops #200 — CA roots the OS vendors have withdrawn trust from that Temurin's own bundled
 # cacerts still ships. Container TAK trusts that bundled store, not the host's, so an OS
 # update never reaches it. Measured 2026-10-23: Temurin 17.0.19+10 (TAK 5.8's hardened base)
@@ -94662,6 +94740,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
@@ -96743,6 +96822,7 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_db_pgdg_releasever(build_ctx, _db_df, log_step)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
