@@ -914,6 +914,60 @@ def _gd_fill(template, values):
     return _GD_PLACEHOLDER_RE.sub(lambda m: values.get(m.group(0), m.group(0)), template)
 
 
+# ops #645 W2 part 2b: Guard Dog scripts only some boxes get. They are repo templates
+# like the rest (app.py used to build them inline and write them, so the console chose
+# root's code), but the Guard Dog sync skips them: each is installed by its own feature
+# and removed again with gd_remove. Same set as the broker's _GD_OPTIONAL (a test).
+_GD_OPTIONAL_SCRIPTS = frozenset({
+    'sms_send.py', 'sms_send.sh', 'tak-authentik-tasklog-purge.sh', 'mediamtx-cert-sync.sh',
+})
+
+
+def _gd_template(name):
+    """The repo template for a Guard Dog script (scripts/guarddog/<name>)."""
+    with open(os.path.join(BASE_DIR, 'scripts', 'guarddog', name), encoding='utf-8') as f:
+        return f.read()
+
+
+def _gd_remove_script(name):
+    """Remove an optional Guard Dog script. Root does it (gd_remove) on a broker that
+    has the op; an older broker gets the old `rm -f`, a root console removes it here."""
+    if name not in _GD_OPTIONAL_SCRIPTS:
+        raise ValueError(f'not an optional Guard Dog script: {name}')
+    path = os.path.join('/opt/tak-guarddog', name)
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'gd_remove', 'name': name})
+        if resp.get('ok'):
+            return bool(resp.get('changed'))
+        if not str(resp.get('error') or '').startswith('unknown op'):
+            raise BrokerError(f'Guard Dog script {name} not removed: {resp.get("error")}')
+        # An older broker: the folder can be root's (W1 root-owned layout), so the
+        # console cannot unlink in it itself. Ask that broker with the old rm -f.
+        if not os.path.lexists(path):
+            return False
+        r = subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            raise BrokerError(f'Guard Dog script {name} not removed: '
+                              f'{(r.stderr or r.stdout or "").strip()[:200]}')
+        return True
+    if os.path.lexists(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def _gd_render_older_broker(name, err):
+    """True when a root-owned broker on an older commit refused gd_render only because
+    it does not know this script yet: the optional ones were inline before W2 part 2b
+    ("not a Guard Dog script name"), and a template added later is not in its copy
+    ("no Guard Dog template"). That happens when Update could not reach GitHub, so root
+    kept its older commit. The console then writes the old way, which that broker
+    still allows for those names (and refuses for every other Guard Dog script)."""
+    if 'no Guard Dog template' in err:
+        return True
+    return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
+
+
 def _gd_install_script(name, template, values, perm=0o755):
     """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
     file changed. A broker on the root-owned layout renders it from ITS copy of the
@@ -925,7 +979,8 @@ def _gd_install_script(name, template, values, perm=0o755):
         if resp.get('ok'):
             return bool(resp.get('changed'))
         err = str(resp.get('error') or '')
-        if not (err.startswith('unknown op') or 'root-owned copy' in err):
+        if not (err.startswith('unknown op') or 'root-owned copy' in err
+                or _gd_render_older_broker(name, err)):
             raise BrokerError(f'Guard Dog script {name} not installed: {err}')
     content = _gd_fill(template, values)
     dest = os.path.join('/opt/tak-guarddog', name)
@@ -27896,7 +27951,7 @@ def guarddog_update():
             # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
-            _write_priv(_ak_tl_script, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})   # ops #645 W2 part 2b
             _write_priv(_ak_tl_svc_path, '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
             _write_priv(_ak_tl_tmr_path, '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
@@ -30036,12 +30091,11 @@ def guarddog_sms_save():
     if provider == '':
         settings['guarddog_sms'] = {}
         save_settings(settings)
-        for path in ['/opt/tak-guarddog/sms_send.sh', '/opt/tak-guarddog/sms_send.py']:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        for name in ('sms_send.sh', 'sms_send.py'):
+            try:
+                _gd_remove_script(name)   # ops #645 W2 part 2b: root removes it (folder is root's)
+            except Exception as e:
+                print(f"[guarddog] SMS off: {name} not removed: {e}", flush=True)
         return jsonify({'success': True, 'message': 'SMS disabled'})
     if provider == 'twilio':
         account_sid = (data.get('account_sid') or '').strip()
@@ -30068,31 +30122,11 @@ def _guarddog_write_sms_send_script(settings):
     if not sms or not sms.get('provider'):
         return
     _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
-    py_script = '''#!/usr/bin/env python3
-import urllib.request, json, sys
-if len(sys.argv) < 3:
-    sys.exit(0)
-subj, path = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f: body = f.read()
-except Exception:
-    body = subj
-data = json.dumps({"subject": subj, "body": body}).encode()
-req = urllib.request.Request("http://127.0.0.1:5001/api/guarddog/send-sms", data=data, headers={"Content-Type": "application/json"}, method="POST")
-try:
-    urllib.request.urlopen(req, timeout=10)
-except Exception:
-    pass
-'''
-    sh_script = '''#!/bin/bash
-SUBJ="$1"
-BODY_FILE="$2"
-[ -z "$BODY_FILE" ] || [ ! -f "$BODY_FILE" ] && exit 0
-/usr/bin/python3 /opt/tak-guarddog/sms_send.py "$SUBJ" "$BODY_FILE"
-'''
-    for name, content in [('sms_send.py', py_script), ('sms_send.sh', sh_script)]:
-        p = os.path.join('/opt/tak-guarddog', name)
-        _write_priv(p, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
+    # ops #645 W2 part 2b: fixed text in scripts/guarddog/ (was built here inline);
+    # root installs it from its own copy (gd_render). No values: the console API
+    # reads the provider settings at send time.
+    for name in ('sms_send.py', 'sms_send.sh'):
+        _gd_install_script(name, _gd_template(name), {})
 
 def _guarddog_send_sms_now(sms, text, force=False):
     """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging.
@@ -30540,15 +30574,10 @@ def run_guarddog_deploy(alert_email):
             # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
+            # ops #645 W2 part 2b: the text is scripts/guarddog/tak-authentik-tasklog-purge.sh;
+            # root installs it from its own copy (gd_render). Same bytes: left alone, +x kept.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            try:
-                _ak_purge_same = _read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT
-                if _ak_purge_same:
-                    _chmod_priv(_ak_purge_path, 0o755)   # keep +x; leave mtime alone
-            except Exception:
-                _ak_purge_same = False
-            if not _ak_purge_same:
-                _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -46975,33 +47004,33 @@ paths:
                 ssh_port = int(rcfg.get('ssh_port', 22))
                 ssh_key  = (rcfg.get('ssh_key_path') or '').strip()
                 ssh_key_expanded = os.path.expanduser(ssh_key) if ssh_key else ''
-                key_flag = f'-i {ssh_key_expanded}' if ssh_key_expanded and os.path.exists(ssh_key_expanded) else ''
-                _sq = shlex.quote
-                sync_script = (
-                    f"#!/bin/bash\n"
-                    f"# Auto-generated: sync Caddy certs to remote MediaMTX\n"
-                    f"CERT={_sq(cert_file)}\n"
-                    f"KEY={_sq(key_file)}\n"
-                    f"REMOTE={_sq(f'{ssh_user}@{host}')}\n"
-                    f"PORT={_sq(str(ssh_port))}\n"
-                    f"KEY_FLAG={_sq(key_flag)}\n"
-                    f"[ -f \"$CERT\" ] || exit 0\n"
-                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
-                    f"\"$CERT\" \"$REMOTE:/etc/mediamtx/certs/stream.crt\" 2>/dev/null\n"
-                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
-                    f"\"$KEY\" \"$REMOTE:/etc/mediamtx/certs/stream.key\" 2>/dev/null\n"
-                    f"ssh -p $PORT $KEY_FLAG -o BatchMode=yes \"$REMOTE\" "
-                    f"{_sq(_MEDIAMTX_REMOTE_CERT_PERMS + ' && systemctl restart mediamtx')} 2>/dev/null\n"
-                )
-                sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
+                if not (ssh_key_expanded and os.path.exists(ssh_key_expanded)):
+                    ssh_key_expanded = ''
+                # ops #645 W2 part 2b: scripts/guarddog/mediamtx-cert-sync.sh. The console
+                # names the domain and where to send; root's script finds the cert and key
+                # in Caddy's store itself (it used to get both paths from here, so a console
+                # foothold could make root send any file to any host).
                 _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
-                _write_priv(sync_path, sync_script, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
-                svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
-                timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
-                _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
-                _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
-                _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'mediamtx-cert-sync.timer']], 'and')
-                plog("✓ Cert renewal sync timer installed (daily)")
+                _cs_ok = True
+                try:
+                    _gd_install_script('mediamtx-cert-sync.sh', _gd_template('mediamtx-cert-sync.sh'), {
+                        'MTX_DOMAIN_PLACEHOLDER': mtx_domain,
+                        'MTX_HOST_PLACEHOLDER': str(host),
+                        'MTX_USER_PLACEHOLDER': str(ssh_user),
+                        'MTX_PORT_PLACEHOLDER': str(ssh_port),
+                        'MTX_KEYFILE_PLACEHOLDER': ssh_key_expanded,
+                    })
+                except BrokerError as _cs_e:
+                    _cs_ok = False
+                    plog(f"⚠ Cert renewal sync not installed: {_cs_e}")
+                    plog("  The cert was copied now; Deploy again after a renewal to copy it again")
+                if _cs_ok:
+                    svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
+                    timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+                    _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
+                    _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
+                    _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'mediamtx-cert-sync.timer']], 'and')
+                    plog("✓ Cert renewal sync timer installed (daily)")
             else:
                 plog("⚠ Failed to copy certs to remote — RTSPS not configured")
         else:
@@ -81677,96 +81706,12 @@ def _read_compose_heal_stamp():
 # tak-10 grew to 2,025,958 tasklog rows / 516 MB + 640,596 task rows / 442 MB
 # in under 24h. Three-tier escalation (7d → 24h → 1h) handles both the slow
 # steady-state growth case and the runaway-churn case.
-_AUTHENTIK_TASKLOG_PURGE_SCRIPT = (
-    '#!/bin/bash\n'
-    '# Guard Dog: Authentik task log purge (v0.9.26 — fixed VACUUM-in-transaction).\n'
-    '# Removes authentik_tasks_task + authentik_tasks_tasklog rows in tiers:\n'
-    '#   Tier 1: rows older than 7 days (gentle, keeps weekly audit trail)\n'
-    '#   Tier 2: rows older than 24h (if size still ≥ 100 MB after Tier 1)\n'
-    '#   Tier 3: rows older than 1h  (if size still ≥ 100 MB after Tier 2)\n'
-    '# Each tier runs in its own `psql -c` invocation; the final VACUUM ANALYZE\n'
-    '# also runs in a SEPARATE psql -c so it is NOT wrapped in a transaction.\n'
-    '# Old v0.9.5 single-call script failed every Sunday with\n'
-    '#   ERROR: VACUUM cannot run inside a transaction block\n'
-    '# v0.9.26 fix lives both here AND inline in app.py\n'
-    '# (_auto_authentik_tasklog_purge); the inline helper runs on every console\n'
-    '# boot regardless of the timer, so even if THIS script is broken the\n'
-    '# console boot path keeps the tables healthy.\n'
-    'set -u\n'
-    'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-    'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-    'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-    'mkdir -p /var/log/takguard\n'
-    'echo "[$TS] Starting Authentik task log purge (v0.9.26 multi-tier)" >> "$LOG"\n'
-    '\n'
-    'if [ -z "$(docker ps -q --filter name=authentik-postgresql-1 2>/dev/null)" ]; then\n'
-    '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    '  exit 0\n'
-    'fi\n'
-    '\n'
-    'size_mb() {\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
-    '    "SELECT (pg_total_relation_size(\'authentik_tasks_tasklog\') + pg_total_relation_size(\'authentik_tasks_task\')) / 1024 / 1024" 2>/dev/null \\\n'
-    '    | tr -dc "0-9" || echo 0\n'
-    '}\n'
-    '\n'
-    'row_counts() {\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
-    '    "SELECT (SELECT count(*) FROM authentik_tasks_task) || \'/\' || (SELECT count(*) FROM authentik_tasks_tasklog)" 2>/dev/null || echo "?/?"\n'
-    '}\n'
-    '\n'
-    'delete_older_than() {\n'
-    '  local interval="$1"\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-    'DELETE FROM authentik_tasks_tasklog WHERE task_id IN (\n'
-    '  SELECT message_id FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\'\n'
-    ');\n'
-    'DELETE FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\';\n'
-    '" >> "$LOG" 2>&1\n'
-    '}\n'
-    '\n'
-    'INITIAL=$(size_mb)\n'
-    'INITIAL=${INITIAL:-0}\n'
-    'INITIAL_ROWS=$(row_counts)\n'
-    'THRESHOLD=100\n'
-    'echo "[$TS] Initial size: ${INITIAL} MB (task/tasklog rows: ${INITIAL_ROWS}), threshold ${THRESHOLD} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$INITIAL" -lt "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] No cleanup needed — already healthy" >> "$LOG"\n'
-    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    '  exit 0\n'
-    'fi\n'
-    '\n'
-    'echo "[$TS] Tier 1 — DELETE rows older than 7 days" >> "$LOG"\n'
-    'delete_older_than "7 days" || echo "[$TS] Tier 1 returned non-zero (continuing)" >> "$LOG"\n'
-    'AFTER_7D=$(size_mb); AFTER_7D=${AFTER_7D:-$INITIAL}\n'
-    'echo "[$TS] After 7-day pass: ${AFTER_7D} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$AFTER_7D" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] Tier 2 — DELETE rows older than 24 hours" >> "$LOG"\n'
-    '  delete_older_than "24 hours" || echo "[$TS] Tier 2 returned non-zero (continuing)" >> "$LOG"\n'
-    'fi\n'
-    'AFTER_24H=$(size_mb); AFTER_24H=${AFTER_24H:-$AFTER_7D}\n'
-    'echo "[$TS] After 24h pass: ${AFTER_24H} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$AFTER_24H" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] Tier 3 (nuclear) — DELETE rows older than 1 hour" >> "$LOG"\n'
-    '  delete_older_than "1 hour" || echo "[$TS] Tier 3 returned non-zero (continuing)" >> "$LOG"\n'
-    'fi\n'
-    '\n'
-    'echo "[$TS] VACUUM ANALYZE (separate invocation — NOT in transaction)" >> "$LOG"\n'
-    'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c \\\n'
-    '  "VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;" >> "$LOG" 2>&1 || \\\n'
-    '  echo "[$TS] VACUUM returned non-zero (table sizes still updated)" >> "$LOG"\n'
-    '\n'
-    'FINAL=$(size_mb); FINAL=${FINAL:-0}\n'
-    'FINAL_ROWS=$(row_counts)\n'
-    'echo "[$TS] Final size: ${FINAL} MB (task/tasklog rows: ${FINAL_ROWS}), freed $(( INITIAL - FINAL )) MB" >> "$LOG"\n'
-    'echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-    'exit 0\n'
-)
+# ops #645 W2 part 2b: the script text now lives in scripts/guarddog/ (root installs it
+# from its own copy with gd_render). Kept as a constant for the compare and old-broker paths.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'guarddog',
+                       'tak-authentik-tasklog-purge.sh'), encoding='utf-8') as _f:
+    _AUTHENTIK_TASKLOG_PURGE_SCRIPT = _f.read()
+del _f
 
 
 def _ensure_authentik_tasklog_purge_script(plog=None):
@@ -81797,7 +81742,8 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
                 _current = _f.read()
         if _current == _AUTHENTIK_TASKLOG_PURGE_SCRIPT:
             return  # Already canonical
-        _write_priv(_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
+        # ops #645 W2 part 2b: root installs it from its own copy (gd_render)
+        _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})
         _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
     except Exception as _e:
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
@@ -104553,8 +104499,8 @@ def _auto_update_guarddog():
         updated = 0
         for name in script_files:
             src = os.path.join(scripts_dir, name)
-            if not os.path.isfile(src):
-                continue
+            if not os.path.isfile(src) or name in _GD_OPTIONAL_SCRIPTS:
+                continue      # optional ones are installed by their own feature (ops #645 W2 part 2b)
             # v10.2.11 (GH #99): the remote-DB scripts used to be skipped outright unless
             # settings said two_server. A split box whose settings do not (built by hand,
             # external_db, or changed since) kept the copy it was first deployed with — on

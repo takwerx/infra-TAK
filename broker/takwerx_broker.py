@@ -770,8 +770,8 @@ PATH_CLASS_PENDING = {
     '/etc/default/takserver': 'W2 part 3', '/etc/wireguard/wg0.conf': 'W2 part 3',
     '/opt/tak/': 'W2 part 3',          # confirm what root runs from /opt/tak (setenv.sh)
     '/etc/debsig/': 'W2 part 2', '/usr/share/debsig/': 'W2 part 2',
-    # scripts from the repo are enforced (gd_render, _gd_path_locked); the inline
-    # ones in _GD_INLINE_PENDING and the state files are not yet
+    # every script comes from the repo (gd_render, _gd_path_locked; the last inline
+    # ones moved in W2 part 2b); the state files are W2 part 3
     '/opt/tak-guarddog/': 'W2 part 2b', '/usr/sbin/ufw': 'W2 part 2',
     '/usr/bin/caddy': 'W2 part 2', '/usr/local/bin/mediamtx': 'W2 part 2',
     '/usr/local/sbin/tak-console-restart.sh': 'W2 part 2',
@@ -1228,18 +1228,25 @@ def _check_validated_write(req):
 GD_DIR = '/opt/tak-guarddog'
 _GD_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,80}\.(sh|py)$')
 _GD_PLACEHOLDER_RE = re.compile(r'\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b')
-# Scripts app.py still builds inline. They move into the repo in W2 part 2b; until
-# then the console writes them, so GD_DIR is not a closed boundary yet.
-_GD_INLINE_PENDING = frozenset({
+# Scripts only some boxes get (SMS, Authentik purge, remote MediaMTX cert sync). They
+# are templates in the repo like the rest (W2 part 2b; until then app.py built them
+# inline and the console wrote them), but the console's Guard Dog sync skips them and
+# may ask root to remove them again (gd_remove). app.py keeps the same set (a test).
+_GD_OPTIONAL = frozenset({
     'sms_send.py', 'sms_send.sh', 'tak-authentik-tasklog-purge.sh', 'mediamtx-cert-sync.sh',
 })
 # Every placeholder sits inside double quotes in the templates (a test checks it),
 # so no value may hold what is special there: $ ` " \ or a control character.
 _GD_UNSAFE_RE = re.compile(r'[$`"\\\x00-\x1f\x7f]')
 _GD_HOST = r'[A-Za-z0-9\[][A-Za-z0-9.:_\[\]-]{0,252}'   # never a leading '-' (an ssh option)
+# A comma list of addresses or numbers. Each item starts with a letter, a digit or '+'
+# (a phone number), never '-', so none reads as an option (`mail -s "$SUBJ" "<value>"`;
+# Security, W2 third look, note 1). Empty items stay allowed (a trailing comma), so a
+# box's saved value keeps passing unless an item started with - . _ % or @.
+_GD_ADDR_LIST = r'^(?![-._%@])(?!.*,[-._%@])[A-Za-z0-9._%+@,-]{0,1024}$'
 _GD_VALUE_RES = {
-    'ALERT_EMAIL_PLACEHOLDER': re.compile(r'^[A-Za-z0-9._%+@,-]{0,1024}$'),
-    'ALERT_SMS_PLACEHOLDER': re.compile(r'^[A-Za-z0-9._%+@,-]{0,1024}$'),
+    'ALERT_EMAIL_PLACEHOLDER': re.compile(_GD_ADDR_LIST),
+    'ALERT_SMS_PLACEHOLDER': re.compile(_GD_ADDR_LIST),
     'CERT_PASS_PLACEHOLDER': re.compile(r'^\S{0,256}$'),
     'CONSOLE_VERSION_PLACEHOLDER': re.compile(r'^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$'),
     'UPDATE_CHANNEL_PLACEHOLDER': re.compile(r'^[a-z0-9][a-z0-9._-]{0,31}$'),
@@ -1250,6 +1257,16 @@ _GD_VALUE_RES = {
     'DB_PORT_PLACEHOLDER': re.compile(r'^[0-9]{0,5}$'),
     'SSH_USER_PLACEHOLDER': re.compile(r'^([A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$'),
     'SSH_KEY_PLACEHOLDER': re.compile(r'^(?!.*/\.\.(/|$))(/[A-Za-z0-9._@+-]+)*$'),
+    # mediamtx-cert-sync.sh (W2 part 2b). Root finds the cert and key in Caddy's store
+    # from the domain itself; the console names only where they go, never a local file
+    # to send. The -i key may not be one of root's own files.
+    'MTX_DOMAIN_PLACEHOLDER': re.compile(
+        r'^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?){0,126}$'),
+    'MTX_HOST_PLACEHOLDER': re.compile(rf'^{_GD_HOST}$'),
+    'MTX_USER_PLACEHOLDER': re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$'),
+    'MTX_PORT_PLACEHOLDER': re.compile(r'^[1-9][0-9]{0,4}$'),
+    'MTX_KEYFILE_PLACEHOLDER': re.compile(
+        r'^(?!/(etc|root|proc|sys|dev|run|boot|var/lib/caddy)(/|$))(?!.*/\.\.?(/|$))(/[A-Za-z0-9._@+-]+)*$'),
 }
 
 
@@ -1270,7 +1287,8 @@ _GD_STATE_FILES = frozenset({
 def _gd_path_locked(path):
     """True for a path under GD_DIR the console may no longer create or change, once
     this broker runs from the root-owned tree (gd_render needs that tree): the whole
-    tree, less the inline scripts pending 2b and the named state files at depth 1.
+    tree, less the named state files at depth 1. (Until W2 part 2b the scripts app.py
+    built inline were open too; they are templates now, see _GD_OPTIONAL.)
     (Security re-review #2: a subfolder was open, `mkdir /opt/tak-guarddog/sub` then
     `write .../sub/x.sh`, and the unit check took any path under the prefix.)"""
     path = _gd_norm(path)
@@ -1279,7 +1297,7 @@ def _gd_path_locked(path):
     rel = path[len(GD_DIR) + 1:]
     if '/' in rel:
         return True
-    return rel not in _GD_INLINE_PENDING and rel not in _GD_STATE_FILES
+    return rel not in _GD_STATE_FILES
 
 
 def _unit_asset_ok(path):
@@ -1304,7 +1322,7 @@ def _check_gd_render(req):
     if set(req) - {'op', 'name', 'values'}:
         raise Denied('gd_render takes only name and values')
     name, values = req.get('name'), req.get('values', {})
-    if not isinstance(name, str) or not _GD_NAME_RE.fullmatch(name) or name in _GD_INLINE_PENDING:
+    if not isinstance(name, str) or not _GD_NAME_RE.fullmatch(name):
         raise Denied(f'gd_render: not a Guard Dog script name: {str(name)[:80]}')
     if not isinstance(values, dict):
         raise Denied('gd_render: values must be an object')
@@ -1379,6 +1397,39 @@ def _do_gd_render(req):
             raise
         os.close(fd)
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return {'ok': True, 'changed': True}
+    finally:
+        os.close(dfd)
+
+
+def _check_gd_remove(req):
+    """W2 part 2b: the console turns an optional Guard Dog script off again (SMS off,
+    remote MediaMTX gone). Only the _GD_OPTIONAL names; the folder is root's."""
+    if set(req) - {'op', 'name'}:
+        raise Denied('gd_remove takes only name')
+    name = req.get('name')
+    if not isinstance(name, str) or name not in _GD_OPTIONAL:
+        raise Denied(f'gd_remove: not an optional Guard Dog script: {str(name)[:80]}')
+
+
+def _do_gd_remove(req):
+    """Unlink GD_DIR/<name> through one fd of the directory (a link swapped in for
+    GD_DIR changes nothing). Returns changed (False when it was not there)."""
+    name = req['name']
+    try:
+        dfd = os.open(GD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {'ok': True, 'changed': False}
+    except OSError:
+        return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR} is not a plain directory'}
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {'ok': True, 'changed': False}
+        if stat.S_ISDIR(st.st_mode):
+            return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR}/{name} is a directory'}
+        os.unlink(name, dir_fd=dfd)       # a link is removed itself, never its target
         return {'ok': True, 'changed': True}
     finally:
         os.close(dfd)
@@ -6030,6 +6081,8 @@ def _evaluate(req):
             _check_mediamtx_account(req)
         elif op == 'gd_render':
             _check_gd_render(req)           # ops #645 W2 part 2a
+        elif op == 'gd_remove':
+            _check_gd_remove(req)           # ops #645 W2 part 2b
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -6142,7 +6195,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account', 'gd_render'):
+              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -6168,6 +6221,8 @@ def _dispatch(req, peer):
             summary = _TAK58_SETUP_DB
         elif op == 'gd_render':
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]} keys={','.join(sorted(map(str, req.get('values') or {})))[:200]}"
+        elif op == 'gd_remove':
+            summary = f"{GD_DIR}/{str(req.get('name'))[:80]}"
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -6203,6 +6258,8 @@ def _dispatch(req, peer):
             return _do_mediamtx_account(req)
         if op == 'gd_render':
             return _do_gd_render(req)
+        if op == 'gd_remove':
+            return _do_gd_remove(req)
         return _do_pgminer_scan(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)

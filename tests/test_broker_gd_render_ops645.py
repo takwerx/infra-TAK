@@ -128,18 +128,19 @@ def test_exec_routes_into_a_guarddog_script_are_refused(monkeypatch, argv):
 
 def test_old_layout_and_state_files_keep_working(monkeypatch):
     """Before the broker runs from the root tree there is no gd_render, so the old
-    write stays (that broker runs console-owned code anyway). State files and the
-    inline scripts W2 part 2b moves are not scripts from the repo."""
+    write stays (that broker runs console-owned code anyway). State files are not
+    scripts from the repo. Since W2 part 2b the once-inline scripts are."""
     monkeypatch.setattr(B, '_installed_commit', lambda: '')
     assert verdict(write_req(GDS))[0] == 'ALLOW'
+    assert verdict(write_req('/opt/tak-guarddog/sms_send.sh'))[0] == 'ALLOW'
     B.check_exec(['mkdir', '-p', '/opt/tak-guarddog'])       # the deploy makes the folder
     monkeypatch.setattr(B, '_installed_commit', lambda: COMMIT)
     B.check_exec(['mkdir', '-p', '/opt/tak-guarddog'])
-    monkeypatch.setattr(B, '_installed_commit', lambda: COMMIT)
     for p in ('/opt/tak-guarddog/server_identifier', '/opt/tak-guarddog/known_hosts',
-              '/opt/tak-guarddog/guarddog.conf', '/opt/tak-guarddog/sms_send.sh',
-              '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'):
+              '/opt/tak-guarddog/guarddog.conf'):
         assert verdict(write_req(p))[0] == 'ALLOW', p
+    for p in ('/opt/tak-guarddog/sms_send.sh', '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'):
+        assert verdict(write_req(p))[0] == 'DENY', p
 
 
 # --- gd_render: what root accepts -------------------------------------------------------
@@ -248,7 +249,6 @@ def test_bad_values_are_refused(root, key, value):
     {'op': 'gd_render', 'name': '../../etc/cron.d/x.sh', 'values': {}},
     {'op': 'gd_render', 'name': 'x.txt', 'values': {}},
     {'op': 'gd_render', 'name': '.hidden.sh', 'values': {}},
-    {'op': 'gd_render', 'name': 'sms_send.sh', 'values': {}},           # inline, 2b
     {'op': 'gd_render', 'name': 'tak-disk-watch.sh', 'values': []},
     {'op': 'gd_render', 'name': 'tak-disk-watch.sh', 'values': {}, 'path': '/etc/x'},
     {'op': 'gd_render', 'name': 'tak-disk-watch.sh', 'values': {'DB_PORT_PLACEHOLDER': 5432}},
@@ -305,9 +305,11 @@ def test_every_placeholder_sits_inside_double_quotes():
     assert not bad, bad
 
 
-def test_inline_pending_names_are_not_repo_templates():
+def test_optional_scripts_are_repo_templates():
+    """W2 part 2b: nothing root runs from /opt/tak-guarddog is built by the console."""
     names = {p.name for p in _templates()}
-    assert not (B._GD_INLINE_PENDING & names)
+    assert B._GD_OPTIONAL <= names, sorted(B._GD_OPTIONAL - names)
+    assert not hasattr(B, '_GD_INLINE_PENDING')
     assert all(B._GD_NAME_RE.match(n) for n in names if n.endswith(('.sh', '.py')))
 
 
@@ -464,7 +466,7 @@ def test_console_state_file_shapes_still_pass(monkeypatch):
                  ['rm', '-f', '/opt/tak-guarddog/diskio_email_off'],
                  ['touch', '/opt/tak-guarddog/diskio_email_off']):
         B.check_exec(argv)
-    for n in sorted(B._GD_STATE_FILES | B._GD_INLINE_PENDING):
+    for n in sorted(B._GD_STATE_FILES):
         assert verdict(write_req('/opt/tak-guarddog/' + n))[0] == 'ALLOW', n
 
 
