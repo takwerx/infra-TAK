@@ -44503,11 +44503,15 @@ def _takportal_ssh_from_sources():
 
 
 def _takportal_ssh_key_options(sources):
-    """The options for the portal key line. No sources = `restrict` alone (the next heal adds
-    from= once Docker answers), never a from= that would lock the portal out."""
+    """The options for the portal key line. No sources = `restrict,pty` alone (the next heal adds
+    from= once Docker answers), never a from= that would lock the portal out.
+
+    `pty` is needed: `restrict` turns terminal allocation off, and TAK Portal's plugin worker
+    asks for a terminal, so Marketplace installs failed on 10.3.12 (ops #687). `restrict` still
+    blocks port, agent and X11 forwarding; from= still limits who can use the key."""
     if not sources:
-        return 'restrict'
-    return 'restrict,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
+        return 'restrict,pty'
+    return 'restrict,pty,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
 
 
 def _takportal_authorized_keys_text(existing, pub_content, sources):
@@ -44535,6 +44539,9 @@ def _takportal_authorized_keys_text(existing, pub_content, sources):
             opts = want_opts
             if not sources and 'from=' in p[0] and p[0].startswith('restrict'):
                 opts = p[0]
+                # A line written by 10.3.12 has no `pty` (ops #687): add it, keep its from=.
+                if not opts.startswith('restrict,pty'):
+                    opts = 'restrict,pty' + opts[len('restrict'):]
             out.append(f'{opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
             continue
         if p and p[3].strip() == TAKPORTAL_SSH_KEY_COMMENT:
@@ -51985,19 +51992,24 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                 text = f.read()
         excluded = {rel, rel + '/', rel + '/*', rel + '/**'}
         names = []
-        if any(ln.strip() in excluded for ln in text.splitlines()):
+        leaves_out = any(ln.strip() in excluded for ln in text.splitlines())
+        if leaves_out:
             plugins = os.path.join(ct_dir, rel)
             try:
                 names = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
                                and os.path.isdir(os.path.join(plugins, n)))
             except OSError:
                 names = []
-        if not names:
+        if not leaves_out:
             if mine:
                 os.remove(out)
                 plog('  Removed Dockerfile.dockerignore (CloudTAK no longer leaves plugins out of the build)')
             return
-        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '']
+        # ops #687: the wildcard pair goes in even with no plugin folder yet. TAK Portal's Marketplace
+        # installs a plugin and rebuilds CloudTAK through its own helper, which never runs this shield:
+        # a file that lists only the folders that exist at console start drops the first plugin a
+        # customer installs (and every later one until the next console restart) from the image.
+        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '', f'!{rel}/*', f'{rel}/*/**/node_modules/']
         for n in names:
             lines += [f'!{rel}/{n}', f'{rel}/{n}/**/node_modules/']
         want = '\n'.join(lines) + '\n'
@@ -52012,7 +52024,7 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                 plog("  The Dispatcher plugin's installer had written a Dockerfile.dockerignore that kept only "
                      "its own folder in the image build; replaced it so every installed plugin stays in (ops #503)")
             plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
-                 f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
+                 f"Dockerfile.dockerignore so installed plugins stay in it ({', '.join(names) or 'none installed yet'})")
     except Exception as e:
         plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
 

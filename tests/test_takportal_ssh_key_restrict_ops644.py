@@ -17,7 +17,7 @@
 """ops #644: TAK Portal's SSH key is limited to its own network, and the legacy grant is gone.
 
 The portal key's line in the console user's authorized_keys is now
-`restrict,from="127.0.0.1,::1,<TAK Portal's Docker networks>"`, older `tak-portal-auto`
+`restrict,pty,from="127.0.0.1,::1,<TAK Portal's Docker networks>"`, older `tak-portal-auto`
 lines are dropped, a console-start heal fixes boxes that already trust the key, and every
 box gets the hardened grant.
 """
@@ -112,7 +112,7 @@ def test_setup_ssh_writes_a_restricted_line_not_a_bare_key(monkeypatch, tmp_path
     ak = (home / '.ssh' / 'authorized_keys')
     text = ak.read_text()
     portal = _lines_for(text, PORTAL_PUB)
-    assert portal == ['restrict,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" ' + PORTAL_PUB], text
+    assert portal == ['restrict,pty,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" ' + PORTAL_PUB], text
     assert OPERATOR in text.splitlines()
     assert oct(ak.stat().st_mode & 0o777) == '0o600'
 
@@ -124,7 +124,7 @@ def test_bare_portal_line_is_restricted_in_place_and_others_kept(kt):
     assert changed and removed == 0
     lines = text.splitlines()
     assert lines[0] == OPERATOR and lines[1] == '' and lines[3] == '# a comment' and lines[4] == OPERATOR_OPTS
-    assert lines[2] == 'restrict,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" ' + PORTAL_PUB
+    assert lines[2] == 'restrict,pty,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" ' + PORTAL_PUB
 
 
 def test_rewrite_is_idempotent(kt):
@@ -136,7 +136,7 @@ def test_rewrite_is_idempotent(kt):
 def test_from_is_refreshed_when_docker_networks_change(kt):
     once, _, _ = kt['_takportal_authorized_keys_text'](f'{PORTAL_PUB}\n', PORTAL_PUB, NETS)
     new, changed, _ = kt['_takportal_authorized_keys_text'](once, PORTAL_PUB, ['172.30.0.0/16'])
-    assert changed and _lines_for(new, PORTAL_PUB) == ['restrict,from="127.0.0.1,::1,172.30.0.0/16" ' + PORTAL_PUB]
+    assert changed and _lines_for(new, PORTAL_PUB) == ['restrict,pty,from="127.0.0.1,::1,172.30.0.0/16" ' + PORTAL_PUB]
 
 
 def test_older_portal_keys_and_duplicates_are_dropped(kt):
@@ -149,15 +149,15 @@ def test_older_portal_keys_and_duplicates_are_dropped(kt):
 
 def test_missing_key_is_added_once(kt):
     text, changed, _ = kt['_takportal_authorized_keys_text'](f'{OPERATOR}\n\n\n', PORTAL_PUB, NETS)
-    assert changed and text == f'{OPERATOR}\nrestrict,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" {PORTAL_PUB}\n'
+    assert changed and text == f'{OPERATOR}\nrestrict,pty,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" {PORTAL_PUB}\n'
     text, _, _ = kt['_takportal_authorized_keys_text']('', PORTAL_PUB, NETS)
-    assert text.startswith('restrict,from=')
+    assert text.startswith('restrict,pty,from=')
 
 
 def test_docker_unreadable_never_locks_the_portal_out(kt):
-    """No sources: `restrict` alone on a bare line, and an existing from= is kept, not narrowed to loopback."""
+    """No sources: `restrict,pty` alone on a bare line, and an existing from= is kept, not narrowed to loopback."""
     text, _, _ = kt['_takportal_authorized_keys_text'](f'{PORTAL_PUB}\n', PORTAL_PUB, [])
-    assert _lines_for(text, PORTAL_PUB) == ['restrict ' + PORTAL_PUB]
+    assert _lines_for(text, PORTAL_PUB) == ['restrict,pty ' + PORTAL_PUB]
     good, _, _ = kt['_takportal_authorized_keys_text'](f'{PORTAL_PUB}\n', PORTAL_PUB, NETS)
     kept, changed, _ = kt['_takportal_authorized_keys_text'](good, PORTAL_PUB, [])
     assert kept == good and changed is False
@@ -250,7 +250,7 @@ def test_heal_restricts_an_existing_bare_line(monkeypatch, tmp_path):
     ns = _trust_ns()
     log = []
     assert ns['_heal_takportal_ssh_key'](log.append) is True
-    assert ak.read_text() == (f'{OPERATOR}\nrestrict,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" '
+    assert ak.read_text() == (f'{OPERATOR}\nrestrict,pty,from="127.0.0.1,::1,172.19.0.0/16,172.22.0.0/16" '
                               f'{PORTAL_PUB}\n')
     assert oct(ak.stat().st_mode & 0o777) == '0o600'
     assert any('Removed 1 older TAK Portal key' in m for m in log)
@@ -283,7 +283,7 @@ def test_probe_source_is_in_from():
     """The console's own probe connects from 127.0.0.1; from= must admit it."""
     assert "f'{user}@127.0.0.1'" in _func('_takportal_ssh_probe')
     ns = _load('_takportal_ssh_key_options')
-    assert ns['_takportal_ssh_key_options'](NETS).startswith('restrict,from="127.0.0.1,::1,')
+    assert ns['_takportal_ssh_key_options'](NETS).startswith('restrict,pty,from="127.0.0.1,::1,')
 
 
 # ------------------------------------------------------------- no more legacy grant
