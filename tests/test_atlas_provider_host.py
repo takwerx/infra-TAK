@@ -22,9 +22,11 @@ after an update. Caddy served `atlas.yfd.<domain>`; the provider still said
 about. Only deploy ever set the host, so no update could repair it.
 """
 
+import io
 import json
 import pathlib
 import sys
+import urllib.error
 
 import pytest
 
@@ -51,7 +53,16 @@ class FakeProviders:
         if self.fail:
             raise OSError('boom')
         if getattr(req, 'method', None) == 'PATCH':
-            self.patched.append((req.full_url, json.loads(req.data.decode())))
+            body = json.loads(req.data.decode())
+            # ⚠️ What Authentik 2026.8.5 really does (ops #708, seen on a box):
+            # a partial update is validated as if `mode` were its default,
+            # `proxy`, so a body without `mode` is refused with a 400.
+            if 'mode' not in body:
+                raise urllib.error.HTTPError(
+                    req.full_url, 400, 'Bad Request', {},
+                    io.BytesIO(b'{"internal_host":["Internal host cannot be '
+                               b'empty when forward auth is disabled."]}'))
+            self.patched.append((req.full_url, body))
             return _Response({})
         assert 'providers/proxy/?search=' in req.full_url, req.full_url
         return _Response({'results': self.providers})
@@ -94,8 +105,9 @@ def console_url(monkeypatch):
     monkeypatch.setattr(atlas, 'deployment_identity', identity)
 
 
-def provider(name, host, pk=13):
-    return {'pk': pk, 'name': name, 'external_host': host}
+def provider(name, host, pk=13, **more):
+    return dict({'pk': pk, 'name': name, 'external_host': host,
+                 'mode': 'forward_single'}, **more)
 
 
 def test_a_plain_host_on_an_agency_provider_is_corrected(authentik):
@@ -108,19 +120,51 @@ def test_a_plain_host_on_an_agency_provider_is_corrected(authentik):
 
     assert atlas._reconcile_provider_host(make_ctx(), YFD, log.append) == 'fixed'
     assert fake.patched == [('http://ak/api/v3/providers/proxy/13/',
-                             {'external_host': 'https://atlas.yfd.example.com'})]
+                             {'external_host': 'https://atlas.yfd.example.com',
+                              'mode': 'forward_single'})]
     assert 'corrected' in log[-1]
 
 
-def test_only_the_host_is_sent(authentik):
+def test_the_cookie_domain_is_not_sent(authentik):
     """⚠️ The cookie domain decides who stays signed in; it is not ours to
-    change on a running box."""
+    change on a running box. Only the host, and the `mode` Authentik needs to
+    accept the update, go out."""
     fake = authentik(FakeProviders([
-        provider('ATLAS MDM Proxy (yfd)', 'https://atlas.example.com')]))
+        provider('ATLAS MDM Proxy (yfd)', 'https://atlas.example.com',
+                 cookie_domain='.example.com')]))
 
     atlas._reconcile_provider_host(make_ctx(), YFD, lambda _m: None)
 
-    assert list(fake.patched[0][1]) == ['external_host']
+    assert sorted(fake.patched[0][1]) == ['external_host', 'mode']
+
+
+def test_the_patch_carries_mode_or_authentik_refuses_it(authentik):
+    """⚠️ The bug the first version of this repair had (ops #708). Authentik
+    2026.8.5 answers HTTP 400 to a PATCH of `external_host` alone, so the repair
+    reported 'failed' and the console kept answering 404. The fake refuses such
+    a body as the real one does; the repair must get past it, whatever `mode`
+    the provider listing happens to omit."""
+    listing = provider('ATLAS MDM Proxy (yfd)', 'https://atlas.example.com')
+    del listing['mode']
+    fake = authentik(FakeProviders([listing]))
+    log = []
+
+    assert atlas._reconcile_provider_host(make_ctx(), YFD, log.append) == 'fixed'
+    assert fake.patched[0][1]['mode'] == 'forward_single'
+    assert 'Could not check' not in ' '.join(log)
+
+
+def test_a_providers_own_mode_and_internal_host_are_kept(authentik):
+    """A provider in `proxy` mode needs its internal host to pass the same
+    validation; both are sent back unchanged."""
+    fake = authentik(FakeProviders([
+        provider('ATLAS MDM Proxy (yfd)', 'https://atlas.example.com',
+                 mode='proxy', internal_host='http://127.0.0.1:8760')]))
+
+    assert atlas._reconcile_provider_host(make_ctx(), YFD, lambda _m: None) == 'fixed'
+    assert fake.patched[0][1] == {'external_host': 'https://atlas.yfd.example.com',
+                                  'mode': 'proxy',
+                                  'internal_host': 'http://127.0.0.1:8760'}
 
 
 def test_a_correct_provider_is_left_alone(authentik):
@@ -141,7 +185,8 @@ def test_the_plain_deployment_is_matched_by_its_exact_name(authentik):
 
     assert atlas._reconcile_provider_host(make_ctx(), PLAIN, lambda _m: None) == 'fixed'
     assert fake.patched == [('http://ak/api/v3/providers/proxy/1/',
-                             {'external_host': 'https://atlas.example.com'})]
+                             {'external_host': 'https://atlas.example.com',
+                              'mode': 'forward_single'})]
 
 
 def test_a_missing_provider_is_said_not_made(authentik):

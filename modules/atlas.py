@@ -4974,9 +4974,18 @@ def _reconcile_provider_host(ctx, inst, plog):
     (a restore, a hand edit) is repaired by the press an operator already
     makes.
 
-    ⚠️ Only `external_host` is touched. The cookie domain decides which
-    sessions a signed-in administrator keeps, and changing it on a running box
-    would sign everyone out of every app that shares it.
+    ⚠️ Only the host is changed. The cookie domain decides which sessions a
+    signed-in administrator keeps, and changing it on a running box would sign
+    everyone out of every app that shares it.
+
+    ⚠️ **The PATCH carries `mode` as well (ops #708, verified on Authentik
+    2026.8.5).** Authentik validates a partial update as if `mode` were its
+    default, `proxy`, and refuses it with HTTP 400 "Internal host cannot be
+    empty when forward auth is disabled". A body of `external_host` alone is
+    therefore refused on the very version this repair exists for, and the repair
+    reports 'failed' without changing anything. Sending the provider's own
+    `mode` (and its `internal_host`, if it has one) passes the check and changes
+    nothing else.
     """
     import urllib.parse as _urlparse
     import urllib.request as _urlreq
@@ -5009,9 +5018,13 @@ def _reconcile_provider_host(ctx, inst, plog):
         if have == want.rstrip('/'):
             plog('  ✓ Authentik provider serves %s' % want)
             return 'ok'
+        patch = {'external_host': want,
+                 'mode': provider.get('mode') or 'forward_single'}
+        if provider.get('internal_host'):
+            patch['internal_host'] = provider['internal_host']
         req = _urlreq.Request(
             '%s/api/v3/providers/proxy/%s/' % (ak_url, provider['pk']),
-            data=json.dumps({'external_host': want}).encode(),
+            data=json.dumps(patch).encode(),
             headers=headers, method='PATCH')
         _urlreq.urlopen(req, timeout=10)
         plog('  ✓ Authentik provider hostname corrected: %s → %s'
