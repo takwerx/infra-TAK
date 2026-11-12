@@ -168,8 +168,12 @@ def test_deploy_leaves_an_identical_tasklog_purge_script_alone():
     # with identical bytes on every Update Now on test8).
     i = DEPLOY_SRC.index("_ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'")
     block = DEPLOY_SRC[i:i + 600]
-    assert '_read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT' in block
-    assert block.index('if not _ak_purge_same:') < block.index('_write_priv(_ak_purge_path')
+    # ops #645 W2 part 2b: it goes through the shared installer, which compares first:
+    # root's gd_render returns changed=False on the same bytes, and the old-broker path
+    # reads the file and only chmods it when it is identical.
+    assert "_gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})" in block
+    assert '_write_priv(_ak_purge_path' not in block
+    assert GD_HELPER_SRC.index('if _read_priv(dest) == content:') < GD_HELPER_SRC.index('_write_priv(dest, content')
 
 
 def test_startup_sync_still_rewrites_a_changed_script(h):
