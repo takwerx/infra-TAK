@@ -269,8 +269,11 @@ def test_this_tree_is_consistent_with_the_newest_tag():
     notes_version = _newest_section(readme)[0]
     current = _CURRENT_RE.search(readme)
     assert current, 'README.md lost its "**Current release: [vX.Y.Z-alpha](...)**" line'
-    assert tree_problems(_app_version(), notes_version, current.group(1), _tags(),
-                         os.environ.get('GITHUB_BASE_REF')) == []
+    # A PR is held to its base branch. A push run (ops #691: PR checks also run on the merged tip of
+    # dev and main) has no GITHUB_BASE_REF, so pr-checks.yml passes the pushed branch instead: the
+    # dev tip gets the same lenient baseline as a PR into dev, main stays strict.
+    base_ref = os.environ.get('GITHUB_BASE_REF') or os.environ.get('INFRATAK_CI_BRANCH')
+    assert tree_problems(_app_version(), notes_version, current.group(1), _tags(), base_ref) == []
 
 
 def test_current_release_link_points_at_its_own_tag():
