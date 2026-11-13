@@ -37,6 +37,7 @@ empty/truncated/not JSON; 126 when the daemon refuses; 2 on bad usage.
 import base64
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -152,6 +153,42 @@ def client_send(req, timeout=DEFAULT_TIMEOUT):
         s.close()
     return json.loads(bytes(buf).decode())
 
+# ops #687: a command run over SSH without a terminal (TAK Portal falls back to that when a
+# host refuses a pty, and keeps doing it until the Portal restarts) has stdin = a pipe that
+# is held open and never written. Reading it to EOF blocked here forever, so `docker info`
+# through the PATH shim hung every Marketplace install and uninstall. Real docker answers at
+# once in that case. Wait this long for a first byte (or EOF); data that is already there, or
+# that arrives in time, is read to EOF as before. A producer that stays silent longer gets
+# empty input. TAKWERX_BROKER_STDIN_WAIT overrides it (seconds; 0 = only what is ready now).
+# tests/test_brokerctl.py asserts the two clients keep the same value.
+STDIN_FIRST_BYTE_WAIT = 2.0
+
+
+def read_stdin():
+    """The caller's stdin as bytes: b'' for no stdin, a terminal, or a pipe that stays silent."""
+    if sys.stdin is None:
+        return b''
+    try:
+        if sys.stdin.isatty():
+            return b''
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError):
+        return b''
+    try:
+        wait = float(os.environ.get('TAKWERX_BROKER_STDIN_WAIT', STDIN_FIRST_BYTE_WAIT))
+    except ValueError:
+        wait = STDIN_FIRST_BYTE_WAIT
+    try:
+        ready = select.select([fd], [], [], max(wait, 0.0))[0]
+    except (OSError, ValueError):
+        ready = [fd]   # cannot poll this descriptor: keep the old blocking read
+    if not ready:
+        return b''
+    try:
+        return sys.stdin.buffer.read()
+    except Exception:
+        return b''
+
 
 def cli_exec(args):
     if args and args[0] == '--':
@@ -159,12 +196,7 @@ def cli_exec(args):
     if not args:
         sys.stderr.write('takwerx_broker exec: no command\n')
         return 2
-    stdin_data = b''
-    if sys.stdin is not None and not sys.stdin.isatty():
-        try:
-            stdin_data = sys.stdin.buffer.read()
-        except Exception:
-            stdin_data = b''
+    stdin_data = read_stdin()
     req = {
         'op': 'exec',
         'argv': args,
