@@ -50803,8 +50803,8 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            chk_b64 = base64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
-            apply_b64 = base64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            chk_b64 = _b64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
+            apply_b64 = _b64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
             # base64 strings are quoting-safe; decode on the remote host and pipe into
             # the container's sh via stdin (`docker exec -i`).
             cmd = (
@@ -50919,7 +50919,7 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            b64 = base64.b64encode(script.encode()).decode()
+            b64 = _b64.b64encode(script.encode()).decode()
             cmd = (
                 "for i in $(seq 1 %d); do "
                 "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
@@ -58423,12 +58423,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
-def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
-    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
-    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False)."""
-    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
-        return True, False
-    script_content = '''import json, os, subprocess, sys
+# Run on the remote host (python3) to write /etc/docker/daemon.json. Needs root.
+_DOCKER_LOG_LIMITS_REMOTE_PY = '''import json, os, subprocess, sys
 p = "/etc/docker/daemon.json"
 data = {}
 if os.path.isfile(p) and os.path.getsize(p) > 0:
@@ -58450,37 +58446,48 @@ with open(p, "w") as f:
 subprocess.run(["systemctl", "restart", "docker"], timeout=90, capture_output=True)
 print("OK_RESTARTED")
 '''
-    tmp_path = '/tmp/infra_tak_docker_log_limits.py'
+
+
+def _docker_log_limits_remote_cmd(script=None):
+    """Shell command for the remote SSH session that runs the log-limits script as root (ops #736).
+    The script goes in as base64 on stdin, so no file is left in /tmp for another user on the host to
+    swap before root runs it. A root SSH user runs it directly; any other user needs passwordless
+    `sudo -n` (same rule as `_docker_install_cmd(sudo_fallback=True)`). python3's exit code is the
+    exit code of the command, so a refused write is a failure and is never reported as success.
+    NON-ROOT-COMMANDS: python3 (runs systemctl, writes /etc/docker)."""
+    b64 = _b64.b64encode((script or _DOCKER_LOG_LIMITS_REMOTE_PY).encode()).decode()
+    return (f'printf %s {shlex.quote(b64)} | base64 -d | '
+            f'(if [ "$(id -u)" = 0 ]; then python3 -; else sudo -n python3 -; fi) 2>&1')
+
+
+def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
+    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
+    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False).
+    A non-root SSH user needs passwordless sudo (ops #736: it used to fail with no message at all)."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return True, False
     try:
-        with open(tmp_path, 'w') as f:
-            f.write(script_content)
-        copy_ok, _cm = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
-        if not copy_ok:
-            if log_fn:
-                log_fn("  ⚠ Could not copy Docker log-limits script to remote")
-            return False, False
-        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>&1; rm -f {tmp_path}', timeout=45)
+        ok, out = _ssh_probe(remote_cfg, _docker_log_limits_remote_cmd(), timeout=120)
     except Exception as e:
         if log_fn:
             log_fn(f"  ⚠ Docker log limits on remote: {str(e)[:100]}")
         return False, False
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
     out = (out or '').strip()
-    if not ok:
-        if log_fn:
-            log_fn(f"  ⚠ Docker log limits on remote could not be applied: {(out or '')[:120]}")
-        return False, False
-    if 'OK_RESTARTED' in out:
+    if ok and 'OK_RESTARTED' in out:
         if log_fn:
             log_fn("✓ Docker log limits set on remote (50 MB × 3). Docker was restarted.")
         return True, True
-    if log_fn and 'OK_ALREADY' in out:
-        log_fn("✓ Docker log limits already set on remote.")
-    return True, False
+    if ok and 'OK_ALREADY' in out:
+        if log_fn:
+            log_fn("✓ Docker log limits already set on remote.")
+        return True, False
+    if log_fn:
+        hint = ''
+        if 'sudo' in out and ('password' in out or 'not found' in out or 'not in the sudoers' in out):
+            hint = ' The SSH user needs passwordless sudo (sudo -n) to set this.'
+        log_fn(f"  ⚠ Docker log limits on remote could not be applied: {out[-200:] or 'no output'}.{hint} "
+               "Containers on that host keep unlimited logs until it is fixed.")
+    return False, False
 
 
 def _update_boot_stagger_service():
