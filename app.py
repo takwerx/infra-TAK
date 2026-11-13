@@ -49419,6 +49419,24 @@ def cloudtak_container_logs():
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
+# Remote CloudTAK removal (ops #740). The Garage store container writes ~/CloudTAK/.docker-garage
+# as ROOT, so on a host whose SSH user is not root (ubuntu, ec2-user) a plain `rm -rf ~/CloudTAK`
+# stops with "Permission denied", the uninstall returns early, and the firewall cleanup and the
+# console's "deployed" flag never run. Try the plain remove first, then the same passwordless
+# `sudo -n` the remote deploy uses. If neither works, say what to do instead of a bare rm error.
+CLOUDTAK_REMOTE_UNINSTALL_SH = (
+    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
+    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
+    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
+    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
+    "fi; cd ~; "
+    "rm -rf ~/CloudTAK 2>/dev/null || sudo -n rm -rf ~/CloudTAK || "
+    "{ echo 'Could not delete ~/CloudTAK: it holds root-owned files and this SSH user has no "
+    "passwordless sudo. Run: sudo rm -rf ~/CloudTAK on that host, then press Remove again.' >&2; exit 1; }"
+)
+
+
 @app.route('/api/cloudtak/uninstall', methods=['POST'])
 @login_required
 def cloudtak_uninstall():
@@ -49454,16 +49472,7 @@ def cloudtak_uninstall():
                 if not rhost:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': 'Remote target selected but host is not configured'})
                     return
-                ok, out = _ssh_probe(
-                    rcfg,
-                    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
-                    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
-                    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
-                    "fi; rm -rf ~/CloudTAK",
-                    timeout=300
-                )
+                ok, out = _ssh_probe(rcfg, CLOUDTAK_REMOTE_UNINSTALL_SH, timeout=300)
                 if not ok:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
                     return
