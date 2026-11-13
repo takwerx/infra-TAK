@@ -4037,35 +4037,6 @@ def _fw_allow_from(source, port, proto='tcp'):
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
 
-def _fw_remove_from(source, port, proto='tcp'):
-    """Undo _fw_allow_from: close a port that was opened ONLY for one source IP/CIDR
-    (ufw `delete allow from X to any port Y` ↔ firewalld --remove-rich-rule). Returns
-    (ok, msg). ufw and firewalld both treat a missing rule as nothing to do; no-op-safe
-    when no firewall is present."""
-    be = _fw_backend()
-    if be is None:
-        return True, 'no firewall present'
-    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
-    port = int(port)
-    fam = 'ipv6' if ':' in str(source) else 'ipv4'
-    try:
-        if be == 'firewalld':
-            rule = (f'rule family="{fam}" source address="{source}" '
-                    f'port port="{port}" protocol="{proto}" accept')
-            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
-                                       f'--remove-rich-rule={rule}']),
-                           capture_output=True, text=True, timeout=20)
-            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
-                               capture_output=True, text=True, timeout=20)
-        else:
-            r = subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', 'allow', 'from', str(source),
-                                           'to', 'any', 'port', str(port), 'proto', proto]),
-                               capture_output=True, text=True, timeout=20)
-    except Exception as e:
-        return False, str(e)[:160]
-    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
-
-
 def _fw_deny(port, proto='tcp'):
     """Ensure a port is NOT publicly reachable. ufw: explicit `deny`. firewalld: the
     default `public` zone already drops anything not opened, so this removes any allow
@@ -50772,7 +50743,7 @@ def _cloudtak_close_firewall(cfg, log=None):
     if cfg.get('target_mode') == 'remote':
         # ops #737: the rule on THIS box that let the remote host reach Caddy's :9997.
         try:
-            _cloudtak_console_video_fw(None, cfg, 'remove', log_fn=_log)
+            _cloudtak_console_video_fw(cfg, 'remove', log_fn=_log)
         except Exception as e:
             _log(f"cloudtak uninstall: ⚠ console video-port rule not closed: {str(e)[:100]}")
     if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
@@ -53629,7 +53600,7 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             # ops #737: and let the remote host reach Caddy's video listener on THIS box.
-            _cloudtak_console_video_fw(settings, cfg, 'allow', log_fn=plog)
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -54553,7 +54524,7 @@ def run_cloudtak_redeploy(cfg=None):
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #737: the console's own firewall, for the remote host's video calls (9997).
-            _cloudtak_console_video_fw(settings, cfg, 'allow', log_fn=plog)
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -55580,7 +55551,7 @@ def run_cloudtak_update():
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #737: the console's own firewall, for the remote host's video calls (9997).
-            _cloudtak_console_video_fw(settings, cfg, 'allow', log_fn=plog)
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -62239,119 +62210,43 @@ def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
                                      extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
 
 
-# ops #737: a remote CloudTAK's api container calls https://video.<name>:9997 (video-service.ts
-# forces that port), and that name is the CONSOLE box: Caddy's video listener sits on its :9997.
-# The console opened 9997 in its own firewall for a local CloudTAK only, so with CloudTAK on a
-# remote host the call timed out ("CloudTAK has no working media server", "Failed to generate
-# proxy stream") until the operator ran `ufw allow 9997/tcp` by hand. Deploy, Update config,
-# Update, console start and Remove now open and close it, for the remote host's address only.
-CLOUDTAK_VIDEO_FW_KEY = 'cloudtak_video_fw_sources'   # settings key: sources we opened 9997 for
-
-
-def _cloudtak_remote_egress_ip(remote_cfg):
-    """The address the internet (and so this console) sees the remote host at, asked on the
-    remote host itself (same lookup as the console's own public address). '' when it cannot
-    be had. Checked on two AWS boxes in one VPC (ops #737): the remote calls this console by
-    its public name, so the connection arrives from the remote's PUBLIC address, not the
-    private one the console reaches it on over SSH."""
-    try:
-        ok, out = _ssh_probe(remote_cfg, 'curl -s --connect-timeout 5 https://ifconfig.me', timeout=20)
-    except Exception:
-        return ''
-    if not ok:
-        return ''
-    for tok in (out or '').split():
-        try:
-            return str(ipaddress.IPv4Address(tok.strip()))
-        except ValueError:
-            continue
-    return ''
-
-
-def _cloudtak_remote_video_sources(cfg, probe=True):
-    """IPv4 addresses a remote CloudTAK reaches this console from: its host as configured (an
-    address, or a name resolved here) and, when `probe`, the address the remote host presents
-    to the internet. Behind a cloud's NAT those two differ, and the second is the one this
-    console's firewall sees. This box's own addresses and loopback are left out (a rule for
-    them would do nothing). Nothing found: []."""
-    host = ((cfg.get('remote') or {}).get('host') or '').strip()
-    if not host:
-        return []
-    try:
-        found = {str(ipaddress.IPv4Address(host))}
-    except ValueError:
-        try:
-            found = {ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET)}
-        except OSError:
-            found = set()
-    if probe:
-        egress = _cloudtak_remote_egress_ip(cfg.get('remote') or {})
-        if egress:
-            found.add(egress)
-    own = set(_list_local_ipv4s())
-    out = []
-    for ip in sorted(found):
-        try:
-            if ipaddress.IPv4Address(ip).is_loopback or ip in own:
-                continue
-        except ValueError:
-            continue
-        out.append(ip)
-    return out
-
-
-def _cloudtak_console_video_fw(settings, cfg, action='allow', log_fn=None):
-    """ops #737: open (allow) or close (remove) TCP 9997 on THIS box's firewall for the remote
-    CloudTAK host, so its api container can reach Caddy's video listener here. Returns
-    (ok, failed): lists of source addresses. Never raises. Only the remote host may connect,
-    not everyone (the local deploy's rule is open to all; a remote CloudTAK needs less).
-
-    `remove` closes every address we recorded plus the current host's. `allow` also closes
-    the address of an earlier remote host that is no longer the target. The addresses we hold
-    open are kept in settings (CLOUDTAK_VIDEO_FW_KEY), so a rule that could not be closed is
-    tried again on the next call."""
+# ops #737: with CloudTAK on a remote host, video needs TCP 9997 open on THIS box (the console).
+# CloudTAK's video-service.ts forces port 9997 on every media address it builds: its api container
+# calls https://video.<name>:9997 for each lease, and the HLS address it hands to the player is on
+# 9997 too (the user's browser fetches the stream there). That name is the console box, where Caddy
+# listens on :9997 with the same routes as video.<name> on 443 (_cloudtak_caddy_bind_ip). The console
+# opened 9997 for a local CloudTAK only (run_cloudtak_deploy), so with a remote CloudTAK and ufw active
+# on the console every lease timed out ("CloudTAK has no working media server", "Failed to generate
+# proxy stream") until the operator ran `ufw allow 9997/tcp` by hand. Open to everyone, as for a local
+# CloudTAK: the browsers that play the stream come from anywhere, and a rule for the remote host alone
+# lets the lease succeed but blocks the player (checked on two AWS boxes: the remote's public address
+# differs from the one the console reaches it on, and the console's own address cannot play either).
+def _cloudtak_console_video_fw(cfg, action='allow', log_fn=None):
+    """ops #737: open (`allow`) or close (`remove`) TCP 9997 on THIS box's firewall for a remote
+    CloudTAK. Nothing to do for a local CloudTAK (its deploy opens the port itself). Returns True
+    when the firewall is as asked (or nothing was asked). Never raises."""
     _log = log_fn or (lambda m: print(m, flush=True))
-    ok_ips, failed = [], []
+    port = CLOUDTAK_FW_WEB[0][0]
     try:
-        s = settings if settings is not None else load_settings()
-        remote = (cfg.get('target_mode') or '').strip().lower() == 'remote'
-        recorded = [x for x in (s.get(CLOUDTAK_VIDEO_FW_KEY) or []) if isinstance(x, str)]
-        sources = _cloudtak_remote_video_sources(cfg, probe=(action == 'allow')) if remote else []
-        want = sources if action == 'allow' and remote else []
-        drop = [ip for ip in recorded if ip not in want]
+        if (cfg.get('target_mode') or '').strip().lower() != 'remote':
+            return True
         if action == 'remove':
-            drop += [ip for ip in sources if ip not in drop]
-        keep = []
-        for ip in want:
-            ok, msg = _fw_allow_from(ip, CLOUDTAK_FW_WEB[0][0], 'tcp')
-            if ok:
-                ok_ips.append(ip)
-                keep.append(ip)
-            else:
-                failed.append(ip)
-                _log(f"  ⚠ Could not open port {CLOUDTAK_FW_WEB[0][0]} for {ip} on this box: {str(msg).strip()[-160:]}")
-        for ip in drop:
-            ok, msg = _fw_remove_from(ip, CLOUDTAK_FW_WEB[0][0], 'tcp')
-            if not ok:
-                keep.append(ip)
-                failed.append(ip)
-                _log(f"  ⚠ Could not close port {CLOUDTAK_FW_WEB[0][0]} for {ip} on this box: {str(msg).strip()[-160:]}")
-        if keep != recorded:
-            s[CLOUDTAK_VIDEO_FW_KEY] = keep
-            save_settings(s)
-        if action == 'allow' and remote:
-            if want and not failed:
-                _log(f"  ✓ Video port {CLOUDTAK_FW_WEB[0][0]} opened on this box for the CloudTAK host ({', '.join(want)}) only")
-            elif not want:
-                _log(f"  ⚠ Could not work out the CloudTAK host's address, so port {CLOUDTAK_FW_WEB[0][0]} stays closed here. "
-                     f"Video needs TCP {CLOUDTAK_FW_WEB[0][0]} open on this box from the CloudTAK host.")
-            _log("  Cloud firewall: if this box sits behind an AWS security group, Azure NSG or similar, allow "
-                 f"TCP 443 and {CLOUDTAK_FW_WEB[0][0]} from the CloudTAK host to this box. Video fails without them.")
-        elif action == 'remove' and drop and not failed:
-            _log(f"  ✓ Video port {CLOUDTAK_FW_WEB[0][0]} closed on this box for the CloudTAK host ({', '.join(drop)})")
+            ok, msg = _fw_remove(port, 'tcp')
+            _log(f"  \u2713 Video port {port} closed on this box" if ok else
+                 f"  \u26a0 Could not close video port {port} on this box: {str(msg).strip()[-160:]}")
+            return bool(ok)
+        ok, msg = _fw_allow(port, 'tcp')
+        if ok:
+            _log(f"  \u2713 Video port {port} opened on this box (Caddy's video listener; CloudTAK on the remote host and players use it)")
+        else:
+            _log(f"  \u26a0 Could not open video port {port} on this box: {str(msg).strip()[-160:]}. "
+                 f"Video fails until TCP {port} is open here.")
+        _log("  Cloud firewall: if this box sits behind an AWS security group, Azure NSG or similar, allow "
+             f"TCP 443 and {port} to this box (from the CloudTAK host, and from the users' networks that play video).")
+        return bool(ok)
     except Exception as e:
-        _log(f"  ⚠ Video port {CLOUDTAK_FW_WEB[0][0]} firewall step skipped (non-fatal): {str(e)[:120]}")
-    return ok_ips, failed
+        _log(f"  \u26a0 Video port {port} firewall step skipped (non-fatal): {str(e)[:120]}")
+        return False
 
 
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
@@ -107808,7 +107703,7 @@ def _startup_cloudtak_remote_video_fw():
         cfg = _get_cloudtak_deployment_config(settings)
         if cfg.get('target_mode') != 'remote' or not cfg.get('deployed'):
             return
-        _cloudtak_console_video_fw(settings, cfg, 'allow',
+        _cloudtak_console_video_fw(cfg, 'allow',
                                    log_fn=lambda m: print(f"Startup migration: CloudTAK {m.strip()}", flush=True))
     except Exception as _e:
         print(f"Startup migration: CloudTAK remote video port error (non-fatal): {_e}")
