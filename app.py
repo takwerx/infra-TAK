@@ -62248,10 +62248,32 @@ def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
 CLOUDTAK_VIDEO_FW_KEY = 'cloudtak_video_fw_sources'   # settings key: sources we opened 9997 for
 
 
-def _cloudtak_remote_video_sources(cfg):
-    """IPv4 addresses a remote CloudTAK reaches this console from. Its host as configured: an
-    address, or a name resolved here. This box's own addresses and loopback are left out (a
-    rule for them would do nothing). Unresolvable: []."""
+def _cloudtak_remote_egress_ip(remote_cfg):
+    """The address the internet (and so this console) sees the remote host at, asked on the
+    remote host itself (same lookup as the console's own public address). '' when it cannot
+    be had. Checked on two AWS boxes in one VPC (ops #737): the remote calls this console by
+    its public name, so the connection arrives from the remote's PUBLIC address, not the
+    private one the console reaches it on over SSH."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, 'curl -s --connect-timeout 5 https://ifconfig.me', timeout=20)
+    except Exception:
+        return ''
+    if not ok:
+        return ''
+    for tok in (out or '').split():
+        try:
+            return str(ipaddress.IPv4Address(tok.strip()))
+        except ValueError:
+            continue
+    return ''
+
+
+def _cloudtak_remote_video_sources(cfg, probe=True):
+    """IPv4 addresses a remote CloudTAK reaches this console from: its host as configured (an
+    address, or a name resolved here) and, when `probe`, the address the remote host presents
+    to the internet. Behind a cloud's NAT those two differ, and the second is the one this
+    console's firewall sees. This box's own addresses and loopback are left out (a rule for
+    them would do nothing). Nothing found: []."""
     host = ((cfg.get('remote') or {}).get('host') or '').strip()
     if not host:
         return []
@@ -62261,7 +62283,11 @@ def _cloudtak_remote_video_sources(cfg):
         try:
             found = {ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET)}
         except OSError:
-            return []
+            found = set()
+    if probe:
+        egress = _cloudtak_remote_egress_ip(cfg.get('remote') or {})
+        if egress:
+            found.add(egress)
     own = set(_list_local_ipv4s())
     out = []
     for ip in sorted(found):
@@ -62290,7 +62316,7 @@ def _cloudtak_console_video_fw(settings, cfg, action='allow', log_fn=None):
         s = settings if settings is not None else load_settings()
         remote = (cfg.get('target_mode') or '').strip().lower() == 'remote'
         recorded = [x for x in (s.get(CLOUDTAK_VIDEO_FW_KEY) or []) if isinstance(x, str)]
-        sources = _cloudtak_remote_video_sources(cfg) if remote else []
+        sources = _cloudtak_remote_video_sources(cfg, probe=(action == 'allow')) if remote else []
         want = sources if action == 'allow' and remote else []
         drop = [ip for ip in recorded if ip not in want]
         if action == 'remove':

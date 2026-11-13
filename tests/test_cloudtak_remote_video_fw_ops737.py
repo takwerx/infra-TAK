@@ -61,10 +61,12 @@ def _ns(**extra):
     """The new helpers plus the firewall helpers they sit on, exec'd from app.py."""
     parts = [_assign('CLOUDTAK_FW_WEB'), _assign('CLOUDTAK_VIDEO_FW_KEY'),
              _src('_fw_allow_from'), _src('_fw_remove_from'),
-             _src('_cloudtak_remote_video_sources'), _src('_cloudtak_console_video_fw')]
+             _src('_cloudtak_remote_egress_ip'), _src('_cloudtak_remote_video_sources'),
+             _src('_cloudtak_console_video_fw')]
     ns = {'subprocess': subprocess, 'ipaddress': ipaddress, 'socket': socket,
           '_sudo_wrap': lambda cmd: list(cmd),
           '_list_local_ipv4s': lambda: ['10.0.0.5'],
+          '_ssh_probe': lambda *a, **k: (False, 'no ssh'),
           '_fw_backend': lambda: 'ufw'}
     ns.update(extra)
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
@@ -261,6 +263,71 @@ def test_a_firewall_error_never_raises():
     assert ns['_cloudtak_console_video_fw'](None, REMOTE, 'allow', log_fn=logs.append) == ([], [])
     assert any('skipped' in l for l in logs)
 
+
+
+# ── the address the console really sees: the remote's PUBLIC one (checked on two AWS boxes) ──
+
+def test_the_remote_hosts_public_address_is_a_source_too():
+    """On AWS the remote reaches this console by its public name, so the connection arrives from
+    the remote's public address, not the private one the console uses for SSH. A rule for the
+    configured private address alone left 9997 closed (red on the boxes, ops #737)."""
+    seen = []
+
+    def probe(cfg, cmd, timeout=15):
+        seen.append(cmd)
+        return True, '3.138.140.157\n'
+    ns = _ns(_ssh_probe=probe)
+    assert ns['_cloudtak_remote_video_sources'](REMOTE) == ['10.0.0.77', '3.138.140.157']
+    assert len(seen) == 1 and 'ifconfig.me' in seen[0]
+
+
+def test_egress_answer_noise_and_failures_fall_back_to_the_configured_address():
+    for out in ((True, 'not an address'), (True, ''), (False, '3.138.140.157'), (True, '999.1.1.1')):
+        ns = _ns(_ssh_probe=lambda *a, _o=out, **k: _o)
+        assert ns['_cloudtak_remote_video_sources'](REMOTE) == ['10.0.0.77'], out
+
+    def boom(*a, **k):
+        raise RuntimeError('ssh exploded')
+    assert _ns(_ssh_probe=boom)['_cloudtak_remote_video_sources'](REMOTE) == ['10.0.0.77']
+
+
+def test_an_egress_equal_to_the_configured_address_is_listed_once():
+    ns = _ns(_ssh_probe=lambda *a, **k: (True, '10.0.0.77'))
+    assert ns['_cloudtak_remote_video_sources'](REMOTE) == ['10.0.0.77']
+
+
+def test_a_host_name_that_does_not_resolve_still_gets_its_egress_address():
+    def boom(*a, **k):
+        raise OSError('nxdomain')
+    ns = _ns(socket=types.SimpleNamespace(getaddrinfo=boom, AF_INET=2),
+             _ssh_probe=lambda *a, **k: (True, '3.138.140.157'))
+    cfg = {'target_mode': 'remote', 'remote': {'host': 'ct.example.invalid'}}
+    assert ns['_cloudtak_remote_video_sources'](cfg) == ['3.138.140.157']
+
+
+def test_allow_opens_9997_for_both_addresses_and_remove_does_not_ask_the_remote(tmp_path, monkeypatch):
+    log = _fake_fw(tmp_path, monkeypatch)
+    store = _Store()
+    asked = []
+
+    def probe(cfg, cmd, timeout=15):
+        asked.append(cmd)
+        return True, '3.138.140.157'
+    ns = _ns(load_settings=store.load, save_settings=store.save, _ssh_probe=probe)
+    ok, failed = ns['_cloudtak_console_video_fw'](None, REMOTE, 'allow', log_fn=lambda m: None)
+    assert sorted(ok) == ['10.0.0.77', '3.138.140.157'] and failed == []
+    assert sorted(c for c in _calls(log) if c.startswith('ufw allow')) == [
+        'ufw allow from 10.0.0.77 to any port 9997 proto tcp',
+        'ufw allow from 3.138.140.157 to any port 9997 proto tcp']
+    assert len(asked) == 1
+    # Remove: the remote may be gone, so it is not asked; the recorded addresses are closed
+    ns['_cloudtak_console_video_fw'](None, REMOTE, 'remove', log_fn=lambda m: None)
+    assert len(asked) == 1
+    closed = sorted(c for c in _calls(log) if 'delete allow from' in c)
+    assert closed == [
+        'ufw --force delete allow from 10.0.0.77 to any port 9997 proto tcp',
+        'ufw --force delete allow from 3.138.140.157 to any port 9997 proto tcp']
+    assert store.data[ns['CLOUDTAK_VIDEO_FW_KEY']] == []
 
 # ── the wiring: every path that sets up, changes or removes a remote CloudTAK ───────────────
 
