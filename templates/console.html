@@ -107,6 +107,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
+<div id="pg-remote-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px">
+<div id="pg-remote-headline" style="font-size:13px;font-weight:600;color:var(--yellow)"></div>
+<div id="pg-remote-where" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6"></div>
+<div style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.6">infra-TAK only reads the version of this database. It changes nothing on it.</div>
+</div>
+<button onclick="dismissPgRemote()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
@@ -1360,6 +1369,31 @@ async function rebootForKernelPatch(){
     },5000);
 }
 checkKernelPatch();
+// ops #760: TAK's database on another machine (split box, Amazon RDS, Azure) is updated THERE,
+// so the operating system update banner above never sees it. Read-only: this only shows the
+// answer of /api/postgres-remote. A dismissal is keyed to what was shown and lasts 24 hours.
+function _pgRemoteKey(d){return 'pgRemoteDismiss:'+(d.state||'')+':'+(d.host||'')+':'+(d.version||'')+':'+((d.missing||[]).join('+'));}
+function dismissPgRemote(){
+    var b=document.getElementById('pg-remote-banner');if(b)b.style.display='none';
+    var k=b&&b.getAttribute('data-key');
+    if(k){try{localStorage.setItem(k,String(Date.now()));}catch(e){}}
+}
+async function checkPgRemote(){
+    var b=document.getElementById('pg-remote-banner');if(!b)return;
+    try{
+        var r=await fetch('/api/postgres-remote',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        if(!d||!d.remote||(d.state!=='update'&&d.state!=='unknown')){b.style.display='none';return;}
+        var k=_pgRemoteKey(d),t=0;
+        try{t=parseInt(localStorage.getItem(k)||'0',10)||0;}catch(e){}
+        if(t&&Date.now()-t<86400000){b.style.display='none';return;}
+        b.setAttribute('data-key',k);
+        document.getElementById('pg-remote-headline').textContent='\u26a0 '+(d.headline||'PostgreSQL security update');
+        document.getElementById('pg-remote-where').textContent=d.where||'';
+        b.style.display='block';
+    }catch(e){b.style.display='none';}
+}
+checkPgRemote();
 // ===== v10.3.0 W4 — Ubuntu 22.04 -> 24.04 upgrade card =====================
 // Same detached-job pattern as the kernel-patch banner above: poll status + log
 // every 3 s. Two network gaps are EXPECTED and ridden through, not treated as

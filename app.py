@@ -28955,6 +28955,189 @@ def _postgres_security_items(unknown):
         return []
 
 
+# ops #760: TAK Server's database on ANOTHER machine. The host check above only sees PostgreSQL
+# packages on this box, so a split install (database on Server One) and a managed database
+# (Amazon RDS, Azure Database for PostgreSQL) were never told. The version is read from the
+# database with one fixed read-only query, using the login TAK Server itself uses (CoreConfig).
+# Nothing is ever written to or changed on that database.
+_PG_RDS_HOST_RE = re.compile(r'\.rds\.amazonaws\.com(?:\.cn)?\.?$', re.I)
+_PG_AZURE_HOST_RE = re.compile(r'\.postgres\.database\.(?:azure\.com|usgovcloudapi\.net|chinacloudapi\.cn)\.?$', re.I)
+
+
+def _pg_remote_kind(host):
+    """'rds' | 'azure' | 'split': who runs the remote database, from its host name."""
+    h = (host or '').strip()
+    if _PG_RDS_HOST_RE.search(h):
+        return 'rds'
+    if _PG_AZURE_HOST_RE.search(h):
+        return 'azure'
+    return 'split'
+
+
+def _pg_remote_where(kind, host):
+    """One plain sentence: where the database runs and what the operator must do there."""
+    if kind == 'rds':
+        return ("Your TAK database runs on Amazon RDS. Apply the PostgreSQL minor update in the AWS "
+                "console, or turn on auto minor version upgrade. Amazon can take a few days to offer a "
+                "new PostgreSQL release.")
+    if kind == 'azure':
+        return ("Your TAK database runs on Azure Database for PostgreSQL. Apply the PostgreSQL minor "
+                "version update in the Azure portal. Microsoft can take a few days to offer a new "
+                "PostgreSQL release.")
+    return f"Your TAK database runs on {host}. Update PostgreSQL on that machine."
+
+
+def _pg_remote_read_error(rc, err):
+    """A short plain reason for a failed version read. Never the raw error text: it can carry the
+    host and user names."""
+    e = (err or '').lower()
+    if rc == 124 or 'timeout' in e or 'timed out' in e:
+        return 'the database did not answer in time'
+    if 'password' in e or 'authentication' in e or 'pg_hba' in e or 'no password' in e:
+        return 'the saved login was refused or is missing'
+    if rc == 127 or 'no postgresql client' in e:
+        return 'this machine has no PostgreSQL client'
+    if 'could not' in e or 'connection' in e or 'refused' in e or 'no route' in e or 'resolve' in e:
+        return 'could not connect to the database'
+    return 'the database gave no readable version'
+
+
+def _pg_remote_server_version(allow_install=False, timeout=15):
+    """(version text, reason): the PostgreSQL version of TAK's remote database, read with
+    `SHOW server_version` and the login TAK Server itself uses. Read-only, fixed SQL, the password
+    only in the environment. ('', reason) when it cannot be read: the caller must never treat that as
+    "fixed". `allow_install` lets it install a psql client (the console sweep, never a page load)."""
+    host, port, db, user, pw = _cot_conn_params()
+    if not host or not pw:
+        return '', 'the saved login was refused or is missing'
+    psql = _psql_client_bin() or (_ensure_psql_client() if allow_install else '')
+    if not psql:
+        return '', 'this machine has no PostgreSQL client'
+    env = dict(os.environ, PGPASSWORD=pw, PGCONNECT_TIMEOUT='8')
+    argv = [psql, '-X', '-w', '-tA', '-h', host, '-p', str(port), '-U', user, '-d', db,
+            '-c', 'SHOW server_version;']
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return '', _pg_remote_read_error(124, '')
+    except OSError:
+        return '', _pg_remote_read_error(127, '')
+    if r.returncode != 0:
+        return '', _pg_remote_read_error(r.returncode, r.stderr)
+    out = (r.stdout or '').strip()
+    if not out:
+        return '', _pg_remote_read_error(0, '')
+    return out.splitlines()[0], ''
+
+
+def _postgres_remote_status(topology=None, reader=None, allow_install=False):
+    """ops #760: where TAK's database runs and whether it has the PostgreSQL security fix.
+    None when the database is on this box (the host and Docker checks cover it). Otherwise
+    {host, port, kind, version, state, missing, where, reason}: state is 'update' (read, and
+    below a POSTGRES_SECURITY_RELEASES fix), 'ok' (read, at or above the fix, or a major the table
+    does not list), or 'unknown' (could not be read: never reported as fixed). Read-only."""
+    mode, host, port = topology if topology is not None else _tak_db_topology()
+    if mode != 'remote':
+        return None
+    kind = _pg_remote_kind(host)
+    version, reason = (reader or (lambda: _pg_remote_server_version(allow_install)))()
+    st = {'host': host, 'port': port, 'kind': kind, 'version': '', 'state': 'unknown', 'missing': [],
+          'where': _pg_remote_where(kind, host), 'reason': reason or ''}
+    ver = _pg_version_tuple(version)
+    if ver is None:
+        st['reason'] = st['reason'] or 'the database gave no readable version'
+        return st
+    st['version'] = '%d.%d' % ver
+    st['reason'] = ''
+    st['missing'] = _pg_releases_missing(st['version'])
+    st['state'] = 'update' if st['missing'] else 'ok'
+    return st
+
+
+def _postgres_remote_items(status):
+    """Update-email items (ops #760) from _postgres_remote_status(). One item, key 'pg-remote'. The
+    email says where the database runs and what to do THERE: infra-TAK changes nothing on it. A
+    version that could not be read says so, and is never counted as fixed. Pure."""
+    if not status or status.get('state') not in ('update', 'unknown'):
+        return []
+    host = status['host']
+    newest = POSTGRES_SECURITY_RELEASES[-1]
+    if status['state'] == 'update':
+        rels = {r['id']: r for r in status['missing']}
+        major = _pg_version_tuple(status['version'])[0]
+        target = _pg_fixed_tuple(newest, major)
+        lines = ['Fixes ' + '; '.join(f"{i}: {r['reason']}" for i, r in sorted(rels.items())) + '.',
+                 status['where'],
+                 'The update restarts the database, so TAK Server is briefly without it. '
+                 'infra-TAK changes nothing on that database.']
+        return [{'key': 'pg-remote', 'label': 'PostgreSQL (TAK database on ' + host + ')',
+                 'installed': f"PostgreSQL {status['version']} on {host}",
+                 'target': 'PostgreSQL %d.%d' % target if target else 'the security fix',
+                 'summary': f'PostgreSQL (the TAK database on {host}): security update pending',
+                 'identity': 'pg-remote-' + '+'.join(sorted(rels)) + '=' + host,
+                 'security': lines}]
+    fixed = ', '.join(newest['fixed'][m] for m in sorted(newest['fixed']))
+    lines = [f"We could not read the PostgreSQL version of your TAK database on {host}: {status['reason']}.",
+             f"{newest['id']} is fixed in {fixed} (use the one for your PostgreSQL major version). "
+             "Check your database version.",
+             status['where']]
+    return [{'key': 'pg-remote', 'label': 'PostgreSQL (TAK database on ' + host + ')',
+             'installed': 'PostgreSQL version unknown', 'target': 'the security fix',
+             'summary': f'PostgreSQL (the TAK database on {host}): version could not be checked',
+             'identity': 'pg-remote-unknown-' + newest['id'] + '=' + host,
+             'security': lines}]
+
+
+def _postgres_remote_security_items(unknown):
+    """_postgres_remote_items for this box (the sweep reads the version; it may install a psql
+    client). A failure of the check itself goes into `unknown`: the caller carries its dedup
+    state, never re-mails or drops on a guess."""
+    try:
+        return _postgres_remote_items(_postgres_remote_status(allow_install=True))
+    except Exception as e:
+        unknown.add('pg-remote')
+        print(f"[update-notify] remote PostgreSQL check failed: {e}", flush=True)
+        return []
+
+
+_PG_REMOTE_CACHE = {'ts': 0.0, 'data': None}
+_PG_REMOTE_TTL = 600
+
+
+def _postgres_remote_panel(force=False):
+    """The console page's view of _postgres_remote_status(): {'remote': False} on a box whose
+    database is local, else the status plus the plain headline. Cached 10 minutes (it opens a
+    database connection); never installs a package."""
+    now = time.time()
+    if not force and _PG_REMOTE_CACHE['data'] is not None and (now - _PG_REMOTE_CACHE['ts']) < _PG_REMOTE_TTL:
+        return _PG_REMOTE_CACHE['data']
+    try:
+        st = _postgres_remote_status()
+    except Exception as e:
+        st = {'host': '', 'port': 0, 'kind': 'split', 'version': '', 'state': 'unknown', 'missing': [],
+              'where': '', 'reason': 'the check failed: ' + str(e)[:80]}
+    if st is None:
+        data = {'remote': False}
+    else:
+        data = dict(st, remote=True, missing=[r['id'] for r in st['missing']])
+        if st['state'] == 'update':
+            data['headline'] = (f"PostgreSQL security update pending on your TAK database "
+                                f"({st['version']} on {st['host']})")
+        elif st['state'] == 'unknown':
+            data['headline'] = (f"Could not check the PostgreSQL version of your TAK database on "
+                                f"{st['host']}: {st['reason']}")
+    _PG_REMOTE_CACHE['ts'], _PG_REMOTE_CACHE['data'] = now, data
+    return data
+
+
+@app.route('/api/postgres-remote')
+@login_required
+def postgres_remote_api():
+    """ops #760: does TAK's database, when it runs on another machine, need the PostgreSQL
+    security update? Read-only."""
+    return jsonify(_postgres_remote_panel(force=(request.args.get('refresh') == '1')))
+
+
 # Docker databases that float on an upstream tag: running containers keep the build they
 # were created from until the image is pulled AND the container recreated, and Docker Hub
 # rebuilds `postgres:16-alpine` at every minor. Authentik's update only pulls when a newer
@@ -29762,6 +29945,8 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
         print(f"[update-notify] OS security check failed: {e}", flush=True)
     # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
     pending.extend(_postgres_security_items(unknown))
+    # ops #760: ... and TAK's database when it runs on another machine (split box, RDS, Azure)
+    pending.extend(_postgres_remote_security_items(unknown))
     try:
         nv = _node_container_versions()
         # a container that did not answer is unknown, not fixed: keep its dedup state
