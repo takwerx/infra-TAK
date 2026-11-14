@@ -52,7 +52,7 @@ HOST_FUNCS = VERSION_FUNCS + ('_postgres_host_security_items', '_postgres_securi
                               '_upstream_version', '_pkg_restart_impact', '_classify_os_updates',
                               '_is_major_jump')
 CONVERGE_FUNCS = VERSION_FUNCS + ('_pg_run', '_pg_stack_container', '_pg_container_version',
-                                  '_pg_container_image_state', '_pg_wait_healthy',
+                                  '_pg_container_image_state', '_pg_image_version', '_pg_wait_healthy',
                                   '_postgres_compose_converge')
 
 OS_INSTALL_HOW = 'Console page → "Operating system updates available" → Install updates.'
@@ -245,6 +245,11 @@ class FakeDocker:
             return out(0, '%s postgres:16-alpine\n' % self.img)
         if argv[:3] == ['docker', 'image', 'inspect']:
             return out(0, self.tag_img + '\n')
+        if argv[:2] == ['docker', 'run']:
+            # the throwaway read of the pulled image: never mounts or starts the data volume
+            assert '--rm' in argv and '-v' not in argv and '--volume' not in argv
+            assert argv[argv.index('--entrypoint') + 1:] == ['postgres', 'postgres:16-alpine', '--version']
+            return out(0, 'postgres (PostgreSQL) %s\n' % self.tag_ver) if self.tag_ver else out(125, '', 'no')
         if argv[:5] == ['docker', 'compose', 'up', '-d', '--no-deps']:
             if self.up_rc == 0:
                 self.cid, self.img, self.ver = 'cid2', self.tag_img, self.tag_ver
@@ -294,6 +299,23 @@ def test_pull_that_finds_nothing_newer_recreates_nothing():
     assert res == {'cloudtak': 'waiting'}
     assert fake.recreates == []
     assert any('no newer database image is published yet' in l for l in logs)
+
+
+def test_rebuilt_image_without_the_fix_does_not_restart_the_database():
+    # field, aws-arm Nov 14: imresamu/postgis:17-3.6-alpine was rebuilt Nov 9 but is still 17.11
+    fake = FakeDocker(running=('sha256:old', '17.11'), tag=('sha256:old', '17.11'),
+                      pull_brings=('sha256:rebuilt', '17.11'))
+    res, logs, _ = _run_converge(fake, dirs=('~/CloudTAK',))
+    assert res == {'cloudtak': 'waiting'}
+    assert fake.recreates == []
+    assert any('not the security fix yet' in l and '17.11' in l for l in logs)
+
+
+def test_pulled_image_whose_version_cannot_be_read_is_not_trusted():
+    fake = FakeDocker(pull_brings=('sha256:new', ''))
+    res, logs, _ = _run_converge(fake)
+    assert res == {'authentik': 'waiting'} and fake.recreates == []
+    assert any('PostgreSQL unknown' in l for l in logs)
 
 
 def test_fixed_database_is_left_completely_alone():

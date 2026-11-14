@@ -28989,14 +28989,23 @@ def _pg_container_version(cid):
 
 
 def _pg_container_image_state(cid):
-    """(running image id, id the container's image tag points at now): equal means a pull found
-    nothing newer. ('', '') when docker could not answer."""
+    """(running image id, id the container's image tag points at now, the image reference): equal
+    ids mean a pull found nothing newer. ('', '', '') when docker could not answer."""
     r = _pg_run(['docker', 'inspect', '--format', '{{.Image}} {{.Config.Image}}', cid], timeout=20)
     bits = (r.stdout or '').split()
     if r.returncode != 0 or len(bits) != 2:
-        return '', ''
+        return '', '', ''
     r2 = _pg_run(['docker', 'image', 'inspect', '--format', '{{.Id}}', bits[1]], timeout=20)
-    return bits[0], (r2.stdout or '').strip() if r2.returncode == 0 else ''
+    return bits[0], ((r2.stdout or '').strip() if r2.returncode == 0 else ''), bits[1]
+
+
+def _pg_image_version(image):
+    """'major.minor' of the PostgreSQL inside a local image, read from a throwaway container that
+    never touches the data volume; '' when it cannot be read."""
+    r = _pg_run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'postgres', image, '--version'],
+                timeout=90)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
 
 
 def _pg_wait_healthy(cid, seconds=90):
@@ -29014,9 +29023,9 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
     """ops #754: bring the local Docker databases of Authentik and CloudTAK onto a build with
     the PostgreSQL security fix. Idempotent and quiet on a fixed box. Only a database whose
     running PostgreSQL is BELOW a POSTGRES_SECURITY_RELEASES fix is touched, only its own
-    service is pulled and recreated (--no-deps), and only when the pull really brought a different
-    image: a tag the image maker has not rebuilt yet changes nothing, and the next update tries
-    again. Never raises. Returns {key: 'fixed' | 'ok' | 'waiting' | 'failed' | 'skipped'}."""
+    service is pulled and recreated (--no-deps), and only when the pulled image itself carries the
+    fix: a tag the image maker has not rebuilt, or rebuilt without the fix, changes nothing, and the
+    next update tries again. Never raises. Returns {key: 'fixed' | 'ok' | 'waiting' | 'failed' | 'skipped'}."""
     out = {}
     for key, label, d, service in stacks:
         stack_dir = os.path.expanduser(d)
@@ -29039,9 +29048,18 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
                                         label=f'{label} database image', services=[service]):
                 out[key] = 'failed'
                 continue
-            have, now = _pg_container_image_state(cid)
+            have, now, image = _pg_container_image_state(cid)
             if not have or not now or have == now:
                 log(f"{label}: no newer database image is published yet — the next update tries again")
+                out[key] = 'waiting'
+                continue
+            # A rebuilt tag is not necessarily a fixed one (CloudTAK's postgis was rebuilt on Nov 9,
+            # still PostgreSQL 17.11): read what is in the pulled image and restart the database
+            # only for a build that carries the fix.
+            new_img = _pg_image_version(image)
+            if not new_img or _pg_releases_missing(new_img):
+                log(f"{label}: the newest published database image has PostgreSQL {new_img or 'unknown'}, "
+                    f"not the security fix yet — leaving the running database alone, the next update tries again")
                 out[key] = 'waiting'
                 continue
             argv = ['docker', 'compose', 'up', '-d', '--no-deps', service]
