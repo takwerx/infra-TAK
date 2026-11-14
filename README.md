@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.12-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.12-alpha)**
+**Current release: [v10.3.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.13-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,37 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.3.13-alpha — 2026-11-14 — TAK Portal Marketplace plugin installs work again
+
+**Headline: Urgent fix. On 10.3.12, CloudTAK plugins installed from the TAK Portal Marketplace failed. They install and load again. This update also fixes false Guard Dog alerts, a Guard Dog start script after a reboot, managed PostgreSQL readings, the ATLAS agency console, and video on a remote CloudTAK. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.13-alpha))
+
+**CloudTAK plugins.**
+- TAK Portal Marketplace installs work again. TAK Portal's SSH key may open a terminal again (still only from TAK Portal's own network), the install no longer hangs, and the plugin folders stay in the CloudTAK image after a rebuild.
+
+**Guard Dog.**
+- No more false "cannot reach the internet" alerts on servers that block ping. The network watcher also tries a TCP connection.
+- The TAK Server start script works after a reboot. The console no longer rewrites it while it runs.
+- SMS alerts, the Authentik task-log clean-up and the MediaMTX certificate sync are installed by the root helper from the repo's own files, like the other Guard Dog scripts.
+
+**Managed PostgreSQL.**
+- The TAK Server 5.8 upgrade pre-check and the Guard Dog CoT Database card read the managed database, not the local one. No more "0 B" sizes or false "Retention STALLED".
+
+**ATLAS.**
+- The agency console no longer answers 404. An ATLAS update corrects the Authentik provider's hostname.
+
+**Remote servers.**
+- A remote CloudTAK keeps its video after an Update, and its port lock follows the domain.
+- The port guards on a second server also cover IPv6.
+
+**Install.**
+- Docker TAK Server 5.8 installs again. Its database image failed to build after Red Hat moved it to 10.3, on every host.
+
+**Security.**
+- The root helper on non-root servers runs from a root-owned copy of the code, with tighter checks on what it accepts. See "If the privilege broker does not start after an update" above.
+- Security problems are reported by email to takwerx@gmail.com, never in a public issue (see `SECURITY.md`).
+
+**Upgrading:** use **Update Now** on the Console page. No other step is needed. Plugins that failed to install on 10.3.12 can be installed again from the TAK Portal Marketplace.
 
 ### v10.3.12-alpha — 2026-11-11 — Security update: every web site has a login, ports closed, the console locked down
 
