@@ -58545,6 +58545,35 @@ def _ensure_authentik_showpw_css(ak_url, ak_headers):
     return changed
 
 
+# ops #763: Authentik expression policy bound to the recovery flow's Redirect stage.
+# The reset email link carries the login page's query (incl. next=/application/o/authorize/
+# ?client_id=...), so after the signed-out ending we can send the user back to the app they
+# started from. The target is NEVER taken from the URL: only client_id is read, and the
+# destination is that application's own launch URL from Authentik's database. Anything
+# unknown or not https -> no override, and the Redirect stage's static target (TAK Portal)
+# is used.
+_AK_RECOVERY_BACK_TO_APP_POLICY_NAME = 'Recovery Redirect to the app you came from'
+_AK_RECOVERY_BACK_TO_APP_EXPR = """# infra-TAK (ops #763): after a password reset, go back to the app the user started from.
+from urllib.parse import urlsplit, parse_qs
+try:
+    from authentik.providers.oauth2.models import OAuth2Provider
+    plan = request.context.get("flow_plan")
+    get = request.http_request.session.get("authentik/flows/get")
+    nxt = (get.get("next", "") if get else "") or ""
+    qs = parse_qs(urlsplit(nxt).query)
+    cid = (qs.get("client_id") or [""])[0]
+    if plan is not None and cid:
+        prov = OAuth2Provider.objects.filter(client_id=cid).first()
+        app = getattr(prov, "application", None) if prov else None
+        url = (app.get_launch_url() or "") if app else ""
+        if url.startswith("https://") and not any(c in url for c in " \\t\\r\\n\\"'<>"):
+            plan.context["redirect_stage_target"] = url
+except Exception:
+    pass
+return True
+"""
+
+
 def _recovery_takportal_landing_url(api_get):
     """Where the password-reset flow sends the user after the signed-out ending (ops #763).
 
@@ -58862,13 +58891,49 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             try:
                 _api_post('flows/bindings/', {
                     'target': recovery_flow_pk, 'stage': stage_pk, 'order': order,
-                    'evaluate_on_plan': True, 're_evaluate_policies': order <= 20,
+                    'evaluate_on_plan': True,
+                    # the redirect binding re-evaluates its policy when the stage is reached
+                    # (the email link restores the plan, the planner does not run again)
+                    're_evaluate_policies': order <= 20 or order == 120,
                     'policy_engine_mode': 'any', 'invalid_response_action': 'retry'})
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     pass
                 else:
                     raise
+
+        # 5b) ops #763: the redirect stage goes back to the app the user came from (policy sets
+        #     redirect_stage_target); the static TAK Portal target is the fallback.
+        if redirect_stage_pk:
+            try:
+                rb = None
+                for b in _api_get(f'flows/bindings/?ordering=order&page_size=500').get('results', []):
+                    if str(b.get('target')) == str(recovery_flow_pk) and str(b.get('stage')) == str(redirect_stage_pk):
+                        rb = b
+                        break
+                if rb:
+                    if not rb.get('re_evaluate_policies'):
+                        _api_patch(f'flows/bindings/{rb["pk"]}/', {'re_evaluate_policies': True})
+                    pol_body = {'name': _AK_RECOVERY_BACK_TO_APP_POLICY_NAME,
+                                'expression': _AK_RECOVERY_BACK_TO_APP_EXPR,
+                                'execution_logging': False}
+                    pol_pk = None
+                    for pol in _api_get('policies/expression/?search=' + _req.quote(_AK_RECOVERY_BACK_TO_APP_POLICY_NAME)).get('results', []):
+                        if pol.get('name') == _AK_RECOVERY_BACK_TO_APP_POLICY_NAME:
+                            pol_pk = pol['pk']
+                            break
+                    if pol_pk:
+                        _api_patch(f'policies/expression/{pol_pk}/', pol_body)
+                    else:
+                        pol_pk = _api_post('policies/expression/', pol_body)['pk']
+                    have = [x for x in _api_get(f'policies/bindings/?target={rb["pk"]}&page_size=100').get('results', [])
+                            if str(x.get('policy')) == str(pol_pk)]
+                    if not have:
+                        _api_post('policies/bindings/', {
+                            'target': rb['pk'], 'policy': pol_pk, 'order': 0, 'enabled': True,
+                            'negate': False, 'timeout': 30, 'failure_result': True})
+            except Exception:
+                pass  # best effort: without it the reset still ends at TAK Portal
 
         # 6) Link recovery flow to the default-authentication-identification stage
         auth_id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')

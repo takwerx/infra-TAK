@@ -42,6 +42,15 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _TREE = ast.parse(APP)
 
 
+def _consts():
+    return '\n'.join(ast.get_source_segment(APP, n) for n in _TREE.body
+                     if isinstance(n, ast.Assign)
+                     and any(getattr(t, 'id', '').startswith('_AK_RECOVERY_BACK_TO_APP') for t in n.targets))
+
+
+_POLICY_CONSTS = _consts()
+
+
 def _func(name):
     return next((ast.get_source_segment(APP, n) for n in _TREE.body
                  if isinstance(n, ast.FunctionDef) and n.name == name), '')
@@ -54,6 +63,7 @@ class FakeAuthentik:
         self.n = 0
         self.objs = {}      # kind -> list of dicts
         self.bindings = []
+        self.policy_bindings = []
         self.flows = []
         self.apps = []
         self.providers = {}
@@ -79,6 +89,25 @@ class FakeAuthentik:
             return {'results': [a for a in self.apps if a['slug'] == q.get('slug', a['slug'])]}
         if parts[0] == 'providers':
             return self.providers[parts[2]]
+        if parts[0] == 'policies':
+            if parts[1] == 'expression':
+                lst = self.objs.setdefault('policy', [])
+                if len(parts) == 2 and method == 'GET':
+                    return {'results': list(lst)}
+                if len(parts) == 2:
+                    o = dict(body, pk=self._pk())
+                    lst.append(o)
+                    return o
+                o = next(x for x in lst if x['pk'] == parts[2])
+                o.update(body)
+                return o
+            if parts[1] == 'bindings':
+                if method == 'GET':
+                    return {'results': [b for b in self.policy_bindings
+                                        if b['target'] == q.get('target', b['target'])]}
+                b = dict(body, pk=self._pk())
+                self.policy_bindings.append(b)
+                return b
         if parts[0] == 'flows' and parts[1] == 'instances':
             if method == 'GET':
                 return {'results': list(self.flows)}
@@ -132,8 +161,8 @@ class FakeAuthentik:
 
 def _run(fake):
     assert _func('_ensure_authentik_recovery_flow'), 'function under test was renamed'
-    src = '\n\n'.join(_func(n) for n in ('_recovery_takportal_landing_url',
-                                         '_ensure_authentik_recovery_flow'))
+    src = _POLICY_CONSTS + '\n\n' + '\n\n'.join(
+        _func(n) for n in ('_recovery_takportal_landing_url', '_ensure_authentik_recovery_flow'))
     g = {'json': json, '_AK_SHOWPW_FIELD_HTML': '<label>x</label>',
          '_ensure_authentik_showpw_css': lambda *a, **k: 0}
     exec(src, g)
@@ -225,3 +254,100 @@ def test_rerun_is_idempotent():
     before = _recovery_binding_stage_names(fake)
     _run(fake)
     assert _recovery_binding_stage_names(fake) == before
+
+
+# ---- "go back to the app you came from" (AJ, ops #763): the Redirect stage's policy ----
+
+def test_redirect_binding_has_the_back_to_app_policy_and_reevaluates():
+    fake = FakeAuthentik(portal_external_host='https://takportal.example.com')
+    _run(fake)
+    rb = next(b for b in fake.bindings if b['order'] == 120)
+    assert rb['re_evaluate_policies'] is True
+    pol = fake.objs['policy'][0]
+    assert pol['name'] == 'Recovery Redirect to the app you came from'
+    assert [x['policy'] for x in fake.policy_bindings if x['target'] == rb['pk']] == [pol['pk']]
+    _run(fake)  # re-run: one policy, one binding
+    assert len(fake.objs['policy']) == 1
+    assert len(fake.policy_bindings) == 1
+
+
+class _Prov:
+    def __init__(self, application):
+        self.application = application
+
+
+class _App:
+    def __init__(self, url):
+        self._u = url
+
+    def get_launch_url(self):
+        return self._u
+
+
+def _run_policy(next_param, providers, flow_plan=True):
+    """Run the shipped policy expression against stand-ins for Authentik's objects.
+    Returns (result, plan.context)."""
+    import sys
+    import types
+    expr = eval(_POLICY_CONSTS.split('_AK_RECOVERY_BACK_TO_APP_EXPR = ', 1)[1])
+    body = 'def _policy(request):\n' + ''.join('    ' + ln + '\n' for ln in expr.splitlines())
+
+    class _Qs:
+        def __init__(self, d):
+            self.d = d
+
+        def filter(self, client_id):
+            class _R:
+                def __init__(s, v):
+                    s.v = v
+
+                def first(s):
+                    return s.v
+            return _R(self.d.get(client_id))
+
+    mod = types.ModuleType('authentik.providers.oauth2.models')
+    mod.OAuth2Provider = types.SimpleNamespace(objects=_Qs(providers))
+    sys.modules.update({'authentik': types.ModuleType('authentik'),
+                        'authentik.providers': types.ModuleType('authentik.providers'),
+                        'authentik.providers.oauth2': types.ModuleType('authentik.providers.oauth2'),
+                        'authentik.providers.oauth2.models': mod})
+    plan = types.SimpleNamespace(context={})
+    request = types.SimpleNamespace(
+        context={'flow_plan': plan if flow_plan else None},
+        http_request=types.SimpleNamespace(session={'authentik/flows/get': {'next': next_param}}))
+    g = {}
+    exec(body, g)
+    return g['_policy'](request), plan.context
+
+
+def test_policy_sends_the_user_back_to_the_app_they_started_from():
+    provs = {'cid-cloudtak': _Prov(_App('https://map.example.com/')),
+             'cid-portal': _Prov(_App('https://takportal.example.com/'))}
+    res, ctx = _run_policy('/application/o/authorize/?client_id=cid-cloudtak&state=abc', provs)
+    assert res is True
+    assert ctx == {'redirect_stage_target': 'https://map.example.com/'}
+
+
+def test_policy_never_uses_an_address_from_the_url_and_falls_back():
+    provs = {'cid-portal': _Prov(_App('https://takportal.example.com/'))}
+    # an address in the URL is ignored; unknown client_id -> no override (static TAK Portal)
+    for nxt in ('https://evil.example.com/', '/application/o/authorize/?client_id=nope&redirect_uri=https://evil.example.com/',
+                '', '/if/user/'):
+        res, ctx = _run_policy(nxt, provs)
+        assert res is True and ctx == {}, nxt
+
+
+def test_policy_ignores_app_launch_urls_that_are_not_plain_https():
+    for bad in ('http://x.example.com/', 'javascript:alert(1)', '', None, 'https://x.example.com/"><b>'):
+        res, ctx = _run_policy('/application/o/authorize/?client_id=c', {'c': _Prov(_App(bad))})
+        assert res is True and ctx == {}, bad
+
+
+def test_policy_never_breaks_the_reset():
+    # a lookup that raises must still let the flow continue (policy returns True)
+    class _Boom:
+        @property
+        def application(self):
+            raise RuntimeError('db down')
+    res, ctx = _run_policy('/application/o/authorize/?client_id=c', {'c': _Boom()})
+    assert res is True and ctx == {}
