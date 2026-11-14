@@ -79,14 +79,11 @@ def _rebase_ns():
 
 def _install_patched(tmp_path, body):
     """The bundle's Dockerfile as the INSTALL left it: run through the real GH #69/#84 patcher."""
-    import ast
     import os
     (tmp_path / 'docker').mkdir()
     (tmp_path / 'docker' / 'Dockerfile.takserver-db').write_text(body)
-    fn = [x for x in ast.parse(APP).body if isinstance(x, ast.FunctionDef)
-          and x.name == '_patch_tak_db_dockerfile'][0]
     ns = {'os': os, 're': re}
-    exec(ast.get_source_segment(APP, fn), ns)
+    exec(compile(_cut('_patch_tak_db_dockerfile'), 'app.py', 'exec'), ns)
     assert ns['_patch_tak_db_dockerfile'](str(tmp_path), lambda m: None) is True
     return (tmp_path / 'docker' / 'Dockerfile.takserver-db').read_text()
 
@@ -490,7 +487,13 @@ class AtlasBox:
 @pytest.fixture
 def atlas(monkeypatch):
     from modules import atlas as m
-    monkeypatch.setattr(time, 'sleep', lambda s: None)
+    # A fake clock: sleep() moves it forward, so the 90 second wait for the database ends at once. Patching only
+    # sleep made that loop spin on the real clock for 90 seconds, the recorded calls grew to about 10 GB, and the
+    # CI runner died (it showed up as a cancelled pytest job, three times).
+    clock = [0.0]
+    fake = types.SimpleNamespace(time=lambda: clock[0],
+                                 sleep=lambda secs: clock.__setitem__(0, clock[0] + secs))
+    monkeypatch.setattr(m, 'time', fake)
     return m
 
 
