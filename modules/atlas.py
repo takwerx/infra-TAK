@@ -5351,8 +5351,9 @@ def refresh_database(ctx, inst, plog):
     pull and the recreate both go through `_compose`, which adds `-p` and uses the broker.
     ⚠️ **Touched only when it has to be:** the running PostgreSQL must be below the newest security fix
     AND the pulled image must itself carry the fix. A tag that was not rebuilt, or was rebuilt without
-    the fix, changes nothing and the next update tries again. `--no-deps`: never recreates `api`. The
-    data lives in the bind-mounted `pgdata` store, which a recreate does not touch.
+    the fix, changes nothing and the next update tries again. `--no-deps`: never recreates `api`; once
+    the database is replaced the api is only restarted (fresh connections), never rebuilt. The data
+    lives in the bind-mounted `pgdata` store, which a recreate does not touch.
     """
     missing = ctx.get('_pg_releases_missing')
     if not callable(missing):
@@ -5409,6 +5410,17 @@ def refresh_database(ctx, inst, plog):
             time.sleep(3)
         if after and not missing(after):
             plog('✓ database now runs PostgreSQL ' + after)
+            # ⚠️ The api keeps its pooled connections to the OLD database process (the engine has no
+            # pool_pre_ping), so after the swap each one fails once with "terminating connection due to
+            # administrator command" (Verified on a test box, Nov 14: the api's 2-minute background check
+            # failed once after every database recreate). A restart of the same container gives it fresh
+            # connections; it takes a few seconds, and the container, its image and the store are untouched.
+            r = _compose(ctx, 'restart api', timeout=300, inst=inst)
+            if r.returncode != 0:
+                plog('⚠ the database is fixed, but restarting the api failed: ' +
+                     (r.stderr or r.stdout or '')[-160:].strip())
+            else:
+                plog('✓ api restarted so it reconnects to the new database')
             return 'fixed'
         plog('✗ after the recreate the database reports PostgreSQL ' + (after or 'nothing') + ': check it')
         return 'failed'

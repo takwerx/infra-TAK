@@ -512,8 +512,10 @@ def test_atlas_old_database_is_pulled_and_recreated_alone(atlas, monkeypatch):
     box = AtlasBox()
     res, logs = _atlas_run(atlas, monkeypatch, box)
     assert res == 'fixed'
-    assert box.compose == [('pull db', None), ('up -d --no-deps db', None)]
+    # the api is only RESTARTED afterwards (fresh connections to the new database process), never recreated
+    assert box.compose == [('pull db', None), ('up -d --no-deps db', None), ('restart api', None)]
     assert any('now runs PostgreSQL 16.16' in l for l in logs)
+    assert any('api restarted' in l for l in logs)
 
 
 def test_atlas_agency_database_goes_through_its_own_project(atlas, monkeypatch):
@@ -523,7 +525,7 @@ def test_atlas_agency_database_goes_through_its_own_project(atlas, monkeypatch):
     assert res == 'fixed'
     # both compose calls carry the agency, so `-p takmdm-corona` is added; and the container is looked
     # up by that project, never the plain deployment's
-    assert box.compose == [('pull db', inst), ('up -d --no-deps db', inst)]
+    assert box.compose == [('pull db', inst), ('up -d --no-deps db', inst), ('restart api', inst)]
     ps = [c for c in box.root if c[:3] == ['docker', 'ps', '-q']]
     assert ps and all('label=com.docker.compose.project=takmdm-corona' in c for c in ps)
     assert all('label=com.docker.compose.service=db' in c for c in ps)
@@ -566,7 +568,30 @@ def test_atlas_never_recreates_api_or_removes_the_store(atlas, monkeypatch):
     box = AtlasBox()
     _atlas_run(atlas, monkeypatch, box)
     for action, _inst in box.compose:
-        assert 'api' not in action.split() and 'down' not in action and ' -v' not in action
+        if 'api' in action.split():
+            assert action == 'restart api'      # a restart keeps the container, its image and its volumes
+        assert 'down' not in action and ' -v' not in action and '--build' not in action
+
+
+def test_atlas_api_is_restarted_only_after_the_database_was_really_replaced(atlas, monkeypatch):
+    # nothing replaced, nothing to reconnect: the api is left completely alone
+    for box in (AtlasBox(running='16.16'), AtlasBox(same_image=True), AtlasBox(pulled='16.15'),
+                AtlasBox(up_rc=1), AtlasBox(ready=False), AtlasBox(pull_rc=1)):
+        _atlas_run(atlas, monkeypatch, box)
+        assert ('restart api', None) not in box.compose
+
+
+def test_atlas_failed_api_restart_does_not_undo_a_fixed_database(atlas, monkeypatch):
+    box = AtlasBox()
+    real = box.comp
+    def comp(ctx, action, timeout=180, inst=None):
+        if action == 'restart api':
+            box.compose.append((action, inst))
+            return types.SimpleNamespace(returncode=1, stdout='', stderr='no such service')
+        return real(ctx, action, timeout=timeout, inst=inst)
+    box.comp = comp
+    res, logs = _atlas_run(atlas, monkeypatch, box)
+    assert res == 'fixed' and any('restarting the api failed' in l for l in logs)
 
 
 def test_atlas_update_and_the_console_update_both_refresh_the_database():
