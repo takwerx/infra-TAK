@@ -12264,7 +12264,7 @@ def takserver_page():
     except Exception:
         _tak58 = None
     return render_template('takserver.html',
-        tak58=_tak58,
+        tak58=_tak58, tak_db_refresh=_tak_dbr_page(tak.get('installed')),
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
@@ -29092,6 +29092,298 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
     return out
 
 
+# ── ops #755: TAK Server's own database container ──────────────────────────────────
+# Container TAK builds its database image ONCE, at install (5.8 hardened: UBI 10 + PGDG, so
+# PostgreSQL 18.x of that day; 5.7: `FROM postgres:15.1`). Nothing ever rebuilt it, so it never
+# got a PostgreSQL security minor. This is the one action that does, from the stored bundle:
+#   build the image with no cache while TAK keeps running; read the PostgreSQL inside it and
+#   stop there when it is not the fix; verified backup; stop TAK and the database cleanly;
+#   recreate ONLY the database container, on the SAME volume; check it answers and that every
+#   table kept its rows; start TAK. Any failure after the stop puts the old image back.
+# https://www.postgresql.org/docs/current/upgrading.html  (a minor release needs no dump/restore)
+tak_dbr_log = []
+tak_dbr_status = {'running': False, 'complete': False, 'error': False}
+TAK_DB_REFRESH_TAG = 'takserver_db:refresh'
+# 5.7 and earlier build FROM postgres:15.1 (Debian bullseye); its PostgreSQL apt archive tops out
+# at 15.19, so no rebuild on that base can reach 15.20. tak-server-installer already builds this
+# bundle on this base (same PostgreSQL 15): https://github.com/takwerx/tak-server-installer
+TAK_DB_LEGACY_BASE = 'postgres:15-bookworm'
+_TAK_DB_LEGACY_FROM_RE = re.compile(
+    r'(?im)^(FROM\s+)((?:docker\.io/)?(?:library/)?postgres:15(?:\.\d+)*(?:-bullseye)?)(\s*)$')
+_TAK_DB_BULLSEYE_RUN_RE = re.compile(r"(?m)^RUN sed -i -e '/debian-security/d'.*install -y (.+)$")
+
+
+def _tak_db_legacy_refresh_dockerfile(src):
+    """The 5.7 bundle's Dockerfile.takserver-db, rebased on TAK_DB_LEGACY_BASE for the refresh. Pure.
+
+    The install wrote the bullseye repairs of GH #69 / #84 into the bundle's copy (Debian and PGDG
+    pointed at their archives). Those are wrong on bookworm, where PGDG's live repository carries
+    the new minor, so that one RUN line goes back to the plain install it was made from, with the
+    same package list. None when the text has no postgres:15 base: nothing is guessed."""
+    if not _TAK_DB_LEGACY_FROM_RE.search(src or ''):
+        return None
+    out = _TAK_DB_LEGACY_FROM_RE.sub(lambda m: m.group(1) + TAK_DB_LEGACY_BASE + m.group(3), src, count=1)
+    return _TAK_DB_BULLSEYE_RUN_RE.sub(lambda m: 'RUN apt-get update && apt-get install -y ' + m.group(1),
+                                       out, count=1)
+
+
+def _tak_db_pg_version(pgbin):
+    """'major.minor' of the PostgreSQL the RUNNING takserver-db container was started from, or ''."""
+    r = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, f'{pgbin}/postgres', '--version'], timeout=20)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _tak_db_refresh_facts():
+    """What the TAK Server page and the refresh job both need. Read-only, never raises.
+    {'applicable', 'version', 'pgbin', 'missing' (security releases it is below), 'bundle',
+     'db_dockerfile', 'era' ('hardened'|'legacy'), 'why' (when not applicable)}."""
+    f = {'applicable': False, 'version': '', 'pgbin': '', 'missing': [], 'bundle': '',
+         'db_dockerfile': '', 'era': '', 'why': ''}
+    try:
+        if not _tak_is_container():
+            f['why'] = 'TAK Server does not run as containers here'
+            return f
+        if not _tak_container_running(TAK_DB_CONTAINER):
+            f['why'] = 'the database container is not running'
+            return f
+        for major in TAK_PG_MAJORS:
+            pgbin = _tak58_container_pgbin(TAK_DB_CONTAINER, major)
+            if pgbin:
+                f['pgbin'], f['version'] = pgbin, _tak_db_pg_version(pgbin)
+                break
+        if not f['version']:
+            f['why'] = 'could not read the database version'
+            return f
+        f['missing'] = _pg_releases_missing(f['version'])
+        ctx = os.path.dirname(os.path.realpath('/opt/tak'))
+        _app_df, db_df = _tak_bundle_dockerfiles(ctx)
+        if not db_df:
+            f['why'] = 'the TAK Server bundle this install was built from is no longer on disk'
+            return f
+        f.update({'bundle': ctx, 'db_dockerfile': db_df,
+                  'era': 'hardened' if 'hardened' in db_df.lower() else 'legacy', 'applicable': True})
+    except Exception as e:
+        f['why'] = 'check failed: ' + str(e)[:120]
+    return f
+
+
+_tak_dbr_cache = {'at': 0.0, 'data': None}
+
+
+def _tak_db_refresh_facts_cached(max_age=300):
+    """Page renders read this; two `docker exec`s per visit are not free. The job never does."""
+    now = time.time()
+    if _tak_dbr_cache['data'] is not None and now - _tak_dbr_cache['at'] < max_age:
+        return _tak_dbr_cache['data']
+    d = _tak_db_refresh_facts()
+    _tak_dbr_cache.update({'at': now, 'data': d})
+    return d
+
+
+def _tak_db_refresh_items():
+    """Update-email item (ops #755) for TAK Server's database container, or []. One probe, only for a
+    container install; a probe that cannot answer claims nothing."""
+    f = _tak_db_refresh_facts_cached()
+    if not (f.get('applicable') and f.get('missing')):
+        return []
+    ids = ', '.join(r['id'] for r in f['missing'])
+    reason = '; '.join(f"{r['id']}: {r['reason']}" for r in f['missing'])
+    return [{'key': 'pg-tak-container', 'label': 'PostgreSQL (TAK Server database container)',
+             'installed': 'PostgreSQL ' + f['version'], 'target': 'the newest PostgreSQL ' + f['version'].split('.')[0],
+             'summary': 'PostgreSQL (the TAK database container): security update pending',
+             'identity': 'pg-tak-container-' + ids + '=' + f['version'],
+             'security': ['Fixes ' + reason + '.',
+                          'The TAK Server database container is built once when TAK Server is installed and '
+                          'is not rebuilt by a console update. Restarts TAK Server and its database for a few minutes.'],
+             'how': 'Open the TAK Server page, then Update TAK Server, then "Refresh database image".'}]
+
+
+def run_tak_db_refresh(log=None, status=None):
+    """Rebuild takserver-db from the stored bundle onto the newest PostgreSQL security minor and
+    swap it in on the same volume. Never raises; ends in `status`. See the block comment above."""
+    _log = tak_dbr_log if log is None else log
+    _status = tak_dbr_status if status is None else status
+
+    def say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry)
+        print(entry, flush=True)
+
+    def done(ok=True, msg=None):
+        if msg:
+            say(msg)
+        _status.update({'running': False, 'complete': bool(ok), 'error': not ok})
+        _tak_dbr_cache['data'] = None
+
+    def run(argv, timeout=120):
+        r = _pg_run(argv, timeout=timeout)
+        return r.returncode, ((r.stdout or '') + (r.stderr or '')).strip()
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    old_tag = f'takserver_db:pre-refresh-{stamp}'
+    stopped = {'tak': False, 'db': False, 'swapped': False}
+    f = {}
+
+    def recreate_db(tag):
+        """The database container, from image `tag`, on the same volume, network and alias as
+        every install and upgrade creates it (run_takserver_upgrade_container)."""
+        run(['docker', 'rm', '-f', TAK_DB_CONTAINER], 120)
+        tak_real = os.path.realpath('/opt/tak')
+        mount = _tak_db_volume_mount(f['bundle']).split()
+        argv = ['docker', 'run'] + mount + ['-v', f'{tak_real}:/opt/tak:z', '--restart=always',
+                '--network', TAK_DOCKER_NET, '--network-alias', 'tak-database', '--name', TAK_DB_CONTAINER, '-d', tag]
+        return run(argv, 120)[0] == 0
+
+    def wait_db(seconds=180):
+        end = time.time() + seconds
+        while time.time() < end:
+            if run(['docker', 'exec', TAK_DB_CONTAINER, f"{f['pgbin']}/pg_isready", '-q'], 10)[0] == 0:
+                return True
+            time.sleep(3)
+        return False
+
+    def roll_back(why):
+        """Put the previous database image back and start TAK again. Only ever called after the stop."""
+        say(f'✗ {why}')
+        say('Putting the previous database image back…')
+        ok = recreate_db(old_tag) and wait_db()
+        run(['docker', 'tag', old_tag, 'takserver_db'], 30)
+        run(['docker', 'start', TAK_CONTAINER], 120)
+        if ok:
+            done(False, 'The previous database image is running again and TAK Server was started. Nothing was lost.')
+        else:
+            done(False, f'⚠ The previous image did not start either. The data is untouched in volume '
+                        f'{TAK_DB_VOLUME}; the previous image is {old_tag}.')
+
+    try:
+        say('Checking this server…')
+        f = _tak_db_refresh_facts()
+        if not f['applicable']:
+            return done(False, f"✗ Nothing was changed: {f['why']}.")
+        say(f"  The database container runs PostgreSQL {f['version']}.")
+        if not f['missing']:
+            return done(True, '✓ Already on a build with the newest security fix. Nothing to do.')
+        pw = _tak58_db_password()
+        if not pw:
+            return done(False, '✗ Nothing was changed: could not read the database password from CoreConfig.xml.')
+
+        # 1. Build while TAK keeps serving. The Dockerfiles are the bundle's own, with the same
+        #    repairs the install applied; the 5.7 one is rebased (see TAK_DB_LEGACY_BASE).
+        ctx, db_df = f['bundle'], f['db_dockerfile']
+        say('Step 1/5: Building the database image from the stored bundle, no cache (minutes; TAK Server stays up)…')
+        if f['era'] == 'legacy':
+            try:
+                with open(os.path.join(ctx, db_df)) as fh:
+                    new_src = _tak_db_legacy_refresh_dockerfile(fh.read())
+                if not new_src:
+                    return done(False, '✗ Nothing was changed: the bundle Dockerfile has no postgres:15 base to rebuild.')
+                db_df = db_df + '.refresh'
+                with open(os.path.join(ctx, db_df), 'w') as fh:
+                    fh.write(new_src)
+            except Exception as e:
+                return done(False, f'✗ Nothing was changed: could not prepare the 5.7 Dockerfile: {str(e)[:160]}')
+            say(f'  5.7 bundle: the database image is rebuilt on {TAK_DB_LEGACY_BASE} (same PostgreSQL 15).')
+        else:
+            _patch_tak_hardened_dockerfile(ctx, (None, db_df), say)
+            _patch_tak_db_pgdg_releasever(ctx, db_df, say)
+        r = _pg_run(['docker', 'build', '--no-cache', '--pull', '-t', TAK_DB_REFRESH_TAG, '-f', db_df, '.'],
+                    timeout=2400, cwd=ctx)
+        if r.returncode != 0:
+            say('  ! ' + ((r.stderr or r.stdout or '').strip()[-300:]))
+            return done(False, '✗ Nothing was changed: the database image did not build.')
+        rc, out = run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint',
+                       f"{f['pgbin']}/postgres", TAK_DB_REFRESH_TAG, '--version'], 90)
+        v = _pg_version_tuple(out) if rc == 0 else None
+        new_ver = '%d.%d' % v if v else ''
+        if not new_ver or _pg_releases_missing(new_ver):
+            run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+            return done(True, f"✓ Nothing was changed. The newest build available today has PostgreSQL "
+                              f"{new_ver or 'unknown'}, not the security fix yet. Try again later.")
+        say(f'✓ Built: the new image has PostgreSQL {new_ver} (running: {f["version"]}).')
+
+        # 2. The backup, proven readable, before anything is touched.
+        say('Step 2/5: Backing up (TAK Server stays up)…')
+        bk = _tak_58_backup(say, label_prefix='pre-dbrefresh')
+        if not bk.get('ok'):
+            run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+            return done(False, f"✗ Nothing was changed: the backup could not be proven readable ({bk.get('error') or 'unknown'}).")
+        say(f"✓ Backup verified: {bk.get('snapshot_path')}")
+
+        # 3. Downtime. Stop TAK, count the rows, stop the database cleanly, keep the old image.
+        say('Step 3/5: Stopping TAK Server and its database (downtime starts now)…')
+        t_down = time.time()
+        rc, out = run(['docker', 'inspect', '-f', '{{.Image}}', TAK_DB_CONTAINER], 20)
+        if rc != 0 or not out:
+            return done(False, '✗ Nothing was changed: could not read the running database image.')
+        run(['docker', 'tag', out.strip(), old_tag], 30)
+        run(['docker', 'stop', '-t', '120', TAK_CONTAINER], 180)
+        stopped['tak'] = True
+        before = _tak58_container_counts(TAK_DB_CONTAINER, f['pgbin'], pw)
+        if not before:
+            run(['docker', 'start', TAK_CONTAINER], 120)
+            return done(False, '✗ Nothing was changed: could not count the rows to check against. TAK Server was started again.')
+        say(f'  {len(before)} tables, {sum(before.values()):,} rows counted.')
+        run(['docker', 'stop', '-t', '120', TAK_DB_CONTAINER], 180)
+        stopped['db'] = True
+
+        # 4. Swap. Same volume; the data directory is not touched (a minor release needs no dump/restore).
+        say('Step 4/5: Starting the new database image on the same data…')
+        run(['docker', 'tag', TAK_DB_REFRESH_TAG, 'takserver_db'], 30)
+        stopped['swapped'] = True
+        if not recreate_db('takserver_db') or not wait_db():
+            return roll_back('The new database did not start.')
+        after_ver = _tak_db_pg_version(f['pgbin'])
+        if not after_ver or _pg_releases_missing(after_ver):
+            return roll_back(f"The database reports PostgreSQL {after_ver or 'nothing'}, not the fix.")
+        if f['era'] == 'legacy':
+            # A different Debian means a different glibc, which can change how text sorts: indexes built
+            # before no longer match. PostgreSQL records the collation version and says so.
+            out = _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw,
+                                        "select count(*) from pg_database where datname='cot' and "
+                                        "datcollversion is distinct from pg_database_collation_actual_version(oid)")
+            if (out or '').strip() not in ('', '0'):
+                say('  The sort order of the new Debian differs: rebuilding the cot indexes (TAK Server stays stopped)…')
+                if _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw, 'REINDEX DATABASE cot', timeout=7200) is None \
+                        or _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw,
+                                                 'ALTER DATABASE cot REFRESH COLLATION VERSION', timeout=60) is None:
+                    return roll_back('Rebuilding the indexes failed.')
+        counts = _tak58_container_counts(TAK_DB_CONTAINER, f['pgbin'], pw)
+        if counts != before:
+            return roll_back('The row counts after the swap differ from before.')
+        say(f'✓ PostgreSQL {after_ver} is serving; all {sum(counts.values()):,} rows are there.')
+
+        # 5. TAK back up.
+        say('Step 5/5: Starting TAK Server…')
+        run(['docker', 'start', TAK_CONTAINER], 120)
+        up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if run(['docker', 'exec', TAK_CONTAINER, 'grep', '-q', 'Started TAK Server messaging Microservice',
+                    '/opt/tak/logs/takserver-messaging.log'], 60)[0] == 0 and waited >= 20:
+                up = True
+                break
+        for t in run(['docker', 'images', 'takserver_db', '--format', '{{.Tag}}'], 20)[1].split():
+            if t.startswith('pre-refresh-') and f'takserver_db:{t}' != old_tag:
+                run(['docker', 'rmi', f'takserver_db:{t}'], 60)
+        run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+        say(f'  Downtime about {int(time.time() - t_down)} s. The previous image stays as {old_tag} until the next refresh.')
+        if not up:
+            return done(True, '⚠ The database is on the fixed build, but TAK Server did not log its start within 10 minutes: '
+                              'check `docker logs takserver`. No data was lost.')
+        done(True, f'✓ Done. The TAK Server database now runs PostgreSQL {after_ver}.')
+    except Exception as e:
+        if stopped['db'] and stopped['swapped']:
+            try:
+                return roll_back(f'Unexpected error: {str(e)[:160]}')
+            except Exception:
+                pass
+        if stopped['tak']:
+            run(['docker', 'start', TAK_DB_CONTAINER], 120)
+            run(['docker', 'start', TAK_CONTAINER], 120)
+        done(False, f'✗ Unexpected error: {str(e)[:200]}')
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -29762,6 +30054,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
         print(f"[update-notify] OS security check failed: {e}", flush=True)
     # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
     pending.extend(_postgres_security_items(unknown))
+    # ops #755: ...and the TAK Server database CONTAINER (built once at install, never refreshed)
+    try:
+        pending.extend(_tak_db_refresh_items())
+    except Exception as e:
+        unknown.add('pg-tak-container')
+        print(f"[update-notify] TAK database container check failed: {e}", flush=True)
     try:
         nv = _node_container_versions()
         # a container that did not answer is unknown, not fixed: keep its dedup state
@@ -90544,8 +90842,11 @@ def _pg_restore_toc(dump_path, timeout=600):
     return len(toc), ''
 
 
-def _tak_58_backup(plog=None):
+def _tak_58_backup(plog=None, label_prefix='pre-58'):
     """Snapshot before the 5.8 migration, then PROVE the cot dump reads.
+
+    `label_prefix` (ops #755): the PostgreSQL image refresh uses the same proof under its own
+    snapshot name; only `pre-58-*` snapshots mean "carries the 5.7 schema" to a restore.
 
     Returns {'ok', 'label', 'snapshot_path', 'dump_path', 'dump_bytes',
              'toc_entries', 'error'}. `ok` is True only when pg_restore parsed the
@@ -90554,7 +90855,7 @@ def _tak_58_backup(plog=None):
     if plog is None:
         plog = lambda m: print(m, flush=True)
 
-    label = 'pre-58-%s' % time.strftime('%Y%m%d-%H%M%S')
+    label = '%s-%s' % (label_prefix, time.strftime('%Y%m%d-%H%M%S'))
     out = {'ok': False, 'label': label,
            'snapshot_path': os.path.join(SNAPSHOT_DIR, label),
            'dump_path': None, 'dump_bytes': 0, 'toc_entries': 0, 'error': None}
@@ -91763,6 +92064,58 @@ def takserver_58_migrate_log():
                     'running': tak58_status['running'],
                     'complete': tak58_status['complete'],
                     'error': tak58_status['error']})
+
+
+def _tak_dbr_page(installed):
+    """The refresh card's facts for a page render: only a container install below the fix, else None."""
+    try:
+        f = _tak_db_refresh_facts_cached() if installed else None
+        return f if f and f['applicable'] and f['missing'] else None
+    except Exception:
+        return None
+
+
+@app.route('/api/takserver/db-refresh')
+@login_required
+def takserver_db_refresh_state():
+    """ops #755: is TAK Server's database container on a build with the newest PostgreSQL security fix."""
+    f = _tak_db_refresh_facts()
+    return jsonify({'applicable': f['applicable'], 'version': f['version'],
+                    'security': [r['id'] for r in f['missing']], 'why': f['why'],
+                    'running': tak_dbr_status['running']})
+
+
+@app.route('/api/takserver/db-refresh', methods=['POST'])
+@login_required
+def takserver_db_refresh_start():
+    """ops #755: rebuild TAK Server's database image from the stored bundle and swap it in on the
+    same data. Restarts TAK Server and its database, so it asks for the admin password like every
+    destructive route."""
+    if tak_dbr_status.get('running'):
+        return jsonify({'error': 'A database refresh is already running'}), 409
+    if upgrade_status.get('running') or tak58_status.get('running'):
+        return jsonify({'error': 'A TAK Server update is running. Wait for it to finish.'}), 409
+    _gate = _require_admin_password()
+    if _gate is not None:
+        return _gate
+    f = _tak_db_refresh_facts()
+    if not f['applicable']:
+        return jsonify({'error': 'Nothing to refresh here: ' + f['why']}), 400
+    if not f['missing']:
+        return jsonify({'error': 'The database is already on a build with the newest security fix.'}), 400
+    tak_dbr_log.clear()
+    tak_dbr_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_tak_db_refresh, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/takserver/db-refresh/log')
+@login_required
+def takserver_db_refresh_log():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': tak_dbr_log[idx:], 'total': len(tak_dbr_log),
+                    'running': tak_dbr_status['running'], 'complete': tak_dbr_status['complete'],
+                    'error': tak_dbr_status['error']})
 
 
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
@@ -114943,6 +115296,14 @@ def _post_update_auto_deploy():
                 _postgres_compose_converge(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _pge:
                 print(f"Post-update: PostgreSQL security converge error (non-fatal): {_pge}", flush=True)
+            # ops #755: ATLAS's database container (compose project takmdm, agencies takmdm-<slug>)
+            # needs its own helper: Update only rebuilds ATLAS's api.
+            try:
+                _atlas_pg = (mod_registry.MODULES.get('atlas') or {}).get('refresh_databases')
+                if _atlas_pg:
+                    _atlas_pg(mod_registry.get_ctx(), lambda m: print(f"Post-update: ATLAS {m}", flush=True))
+            except Exception as _ape:
+                print(f"Post-update: ATLAS database refresh error (non-fatal): {_ape}", flush=True)
 
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
@@ -115723,6 +116084,9 @@ _MODULE_CTX = {
     # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
+    # ops #755: ATLAS refreshes its own database container; which PostgreSQL minors carry the
+    # security fix is the console's one table (POSTGRES_SECURITY_RELEASES), not a copy in the module.
+    '_pg_releases_missing': _pg_releases_missing,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
