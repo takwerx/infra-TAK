@@ -813,6 +813,16 @@ install_broker() {
         chmod 644 /var/lib/takwerx-broker/enforce-optin 2>/dev/null || true
     fi
 
+    # ops #645 W1: once the broker moved itself to root-owned code under
+    # /usr/local/lib/infratak-broker (verified from GitHub), keep that ExecStart.
+    # A fresh box starts from the repo path; the broker moves itself at its first start.
+    local broker_exec="$INSTALL_DIR/.venv/bin/python3 $broker_py serve"
+    local root_broker=/usr/local/lib/infratak-broker/current/broker/takwerx_broker.py
+    if [ -f "$root_broker" ] && grep -q "^ExecStart=/usr/bin/python3 -I $root_broker serve" \
+            /etc/systemd/system/takwerx-broker.service 2>/dev/null; then
+        broker_exec="/usr/bin/python3 -I $root_broker serve"
+    fi
+
     cat > /etc/systemd/system/takwerx-broker.service << EOF
 [Unit]
 Description=infra-TAK privileged broker (least-privilege console mediation)
@@ -822,7 +832,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ${BROKER_SELINUX:+$BROKER_SELINUX
-}ExecStart=$INSTALL_DIR/.venv/bin/python3 $broker_py serve
+}ExecStart=$broker_exec
 Restart=always
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1

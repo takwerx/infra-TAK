@@ -82,7 +82,7 @@ def test_operators_own_file_is_left_alone(tmp_path):
     assert (ct / 'Dockerfile.dockerignore').read_text() == '# mine\nfoo\n'
 
 
-def test_removed_plugin_drops_out_and_last_one_removes_the_file(tmp_path):
+def test_removed_plugin_drops_out_and_the_wildcard_stays_ops687(tmp_path):
     ct, _ = _go(tmp_path, ('taksim', 'udash'))
     ns = _load()
     (ct / 'app' / 'plugins' / 'udash' / 'index.ts').unlink()
@@ -92,6 +92,12 @@ def test_removed_plugin_drops_out_and_last_one_removes_the_file(tmp_path):
     assert '!app/plugins/taksim' in out and 'udash' not in out
     (ct / 'app' / 'plugins' / 'taksim' / 'index.ts').unlink()
     (ct / 'app' / 'plugins' / 'taksim').rmdir()
+    ns['_cloudtak_keep_plugins_in_build'](str(ct), lambda m: None)
+    # ops #687: with the last plugin gone the file stays (wildcard only), so the next Marketplace
+    # install is kept in the build; it goes only when CloudTAK stops excluding plugins
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert '\n!app/plugins/*\n' in out and 'taksim' not in out
+    (ct / '.dockerignore').write_text(OLD)
     ns['_cloudtak_keep_plugins_in_build'](str(ct), lambda m: None)
     assert not (ct / 'Dockerfile.dockerignore').exists()
 
@@ -136,6 +142,7 @@ def test_runs_inside_the_shield_that_every_build_calls():
 # ops #503: the Dispatcher plugin's own installer writes a Dockerfile.dockerignore that re-includes
 # only its folder. infra-TAK used to leave it alone, so every other plugin dropped out of the next
 # image build with no error.
+MARK = '# infra-TAK (ops #299): generated from .dockerignore; re-includes the installed CloudTAK plugins.'
 DISPATCHER_MARK = '# managed by cloudtak-dispatcher-plugin install.sh'
 
 
@@ -253,3 +260,71 @@ def test_startup_heal_runs_the_dockerignore_fix_before_the_other_cloudtak_heals_
     body = start[:start.index('_startup_heal_cloudtak_media_hls()\n')]
     assert '_cloudtak_heal_dockerignore_at_start(_ct_dir)' in body
     assert body.index('_cloudtak_heal_dockerignore_at_start(') < body.index('_cloudtak_upload_limit_heal()')
+
+
+# ops #687: a fresh box has no plugin folder when the console starts, and TAK Portal's Marketplace
+# rebuilds CloudTAK through its own helper (it never runs the shield). The file must already hold a
+# wildcard re-include, or the first plugin a customer installs is left out of the build: the job ends
+# "complete", the folder is in ~/CloudTAK/app/plugins, and the CloudTAK app never shows the plugin.
+def _kept_by(text, names):
+    """Plugin folders (of `names`) that the ignore file `text` still leaves out of the build."""
+    return _load()['_ct_dockerignore_leaves_out'](text, 'app/plugins', names)
+
+
+def test_fresh_box_with_no_plugins_still_gets_the_file_ops687(tmp_path):
+    ct, _ = _go(tmp_path, ())
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert out.splitlines()[0].startswith('# infra-TAK (ops #299)')
+    assert UPSTREAM in out
+    assert '\n!app/plugins/*\n' in out and '\napp/plugins/*/**/node_modules/\n' in out
+    assert out.index('app/plugins/*\n') < out.index('!app/plugins/*\n')
+
+
+def test_a_plugin_installed_later_is_kept_by_the_file_written_before_it_ops687(tmp_path):
+    ct, _ = _go(tmp_path, ())
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    # what TAK Portal does next: copy folders in, then rebuild with NO call into our code
+    assert _kept_by(out, ('print', 'search-containment', 'taksim')) == []
+    # the same folders, against the upstream file alone, are all dropped (what 10.3.12 shipped)
+    assert _kept_by(UPSTREAM, ('print', 'search-containment', 'taksim')) == [
+        'print', 'search-containment', 'taksim']
+
+
+def test_a_second_plugin_installed_later_is_kept_on_a_box_that_already_has_one_ops687(tmp_path):
+    ct, _ = _go(tmp_path, ('taksim',))
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert _kept_by(out, ('taksim', 'print')) == []
+
+
+def test_fresh_box_second_run_is_a_noop_ops687(tmp_path):
+    ct, _ = _go(tmp_path, ())
+    first = (ct / 'Dockerfile.dockerignore').read_text()
+    log = []
+    _load()['_cloudtak_keep_plugins_in_build'](str(ct), log.append)
+    assert log == [] and (ct / 'Dockerfile.dockerignore').read_text() == first
+
+
+def test_file_from_10_3_12_gets_the_wildcard_at_console_start_ops687(tmp_path, capsys):
+    """An existing box on 10.3.12 has our per-folder file; Update Now restarts the console, which heals it."""
+    ct = _tree(tmp_path, ('taksim',))
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    old = (MARK + '\n' + UPSTREAM.rstrip('\n') + '\n\n!app/plugins/taksim\napp/plugins/taksim/**/node_modules/\n')
+    (ct / 'Dockerfile.dockerignore').write_text(old)
+    assert _kept_by(old, ('taksim', 'print')) == ['print']
+    _startup_heal()(str(ct))
+    out = (ct / 'Dockerfile.dockerignore').read_text()
+    assert out != old and '\n!app/plugins/*\n' in out and '!app/plugins/taksim' in out
+    assert _kept_by(out, ('taksim', 'print')) == []
+    assert 'Startup self-heal' in capsys.readouterr().out
+
+
+def test_console_start_on_a_fresh_box_writes_the_file_before_any_plugin_exists_ops687(tmp_path):
+    ct = _tree(tmp_path, ())
+    (ct / '.dockerignore').write_text(UPSTREAM)
+    _startup_heal()(str(ct))
+    assert '\n!app/plugins/*\n' in (ct / 'Dockerfile.dockerignore').read_text()
+
+
+def test_fresh_box_with_an_old_cloudtak_still_gets_no_file_ops687(tmp_path):
+    ct, _ = _go(tmp_path, (), ignore=OLD)
+    assert not (ct / 'Dockerfile.dockerignore').exists()

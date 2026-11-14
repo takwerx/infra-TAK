@@ -44,6 +44,7 @@ a later step (the thin console is far easier to confine than a root monolith).
 """
 
 import base64
+import errno
 import grp
 import hashlib
 import http.client
@@ -94,10 +95,67 @@ try:
 except Exception:
     RUNNING_SRC_SHA = ''
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
-# The console repo this broker ships inside (…/broker/takwerx_broker.py -> repo
-# root). Used by the v10.1.4 repo-ownership self-heal carve-out in _check_chown —
-# derived from SELF_PATH, never from client input.
-CONSOLE_REPO_DIR = os.path.dirname(os.path.dirname(SELF_PATH))
+
+# ops #645 W1: the broker runs from a ROOT-OWNED copy of code that root fetched
+# from GitHub and checked (_root_install), not from the console user's repo. Until
+# W1 the unit ran <repo>/broker/takwerx_broker.py, a file `takwerx` owns, so an edit
+# plus a restart made the console user root. BROKER_SECURITY_LEVEL goes up with
+# every broker security fix; root never installs code with a lower level, so the
+# console cannot ask for an older broker with a known hole.
+# RULE: a commit that changes this file for a security reason MUST raise
+# BROKER_SECURITY_LEVEL by one in the same commit. Otherwise the console can roll
+# the broker back to the copy with the hole. Security reviews check this.
+BROKER_ROOT_LAYOUT = 1
+# 1: W1 root layout. 2: W2 part 1 (unit checks, coreutils flags). 3: W2 part 2a
+# (root renders the Guard Dog scripts). Keep this line as
+# exactly `BROKER_SECURITY_LEVEL = <n>`: root parses it from candidate commits.
+BROKER_SECURITY_LEVEL = 3
+ROOT_CODE_DIR = '/usr/local/lib/infratak-broker'
+ROOT_CODE_CURRENT = ROOT_CODE_DIR + '/current'
+ROOT_SRC_GIT = '/var/lib/takwerx-broker/src.git'
+ROOT_CONF_DIR = '/etc/infratak'
+ROOT_CONF = ROOT_CONF_DIR + '/broker.conf'
+BROKER_SRC_URL = 'https://github.com/takwerx/infra-TAK.git'
+SYSTEM_PYTHON = '/usr/bin/python3'
+ROOT_EXEC_START = (f'ExecStart={SYSTEM_PYTHON} -I {ROOT_CODE_CURRENT}'
+                   f'/broker/takwerx_broker.py serve')
+RUNNING_FROM_ROOT = SELF_PATH.startswith(ROOT_CODE_DIR + '/')
+
+
+def _read_root_conf(path=None):
+    """key=value lines of the root-owned broker.conf. Ignored unless it is a plain
+    file owned by root and not group/other-writable."""
+    path = path or ROOT_CONF
+    out = {}
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            return {}
+        with open(path) as f:
+            for ln in f:
+                k, sep, v = ln.strip().partition('=')
+                if sep and k and not k.startswith('#'):
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def _console_repo_dir():
+    """The console repo (for the v10.1.4 repo-ownership chown carve-out). From the
+    repo path (pre-W1 layout) it is SELF_PATH's repo; from the root layout it is
+    `console_dir` in the root-owned broker.conf. Never from client input."""
+    if not RUNNING_FROM_ROOT:
+        return os.path.dirname(os.path.dirname(SELF_PATH))
+    d = _read_root_conf().get('console_dir', '')
+    if d.startswith('/') and os.path.normpath(d) == d and d != '/':
+        return d
+    return '/nonexistent'
+
+
+# The console repo this broker serves. Used by the v10.1.4 repo-ownership self-heal
+# carve-out in _check_chown.
+CONSOLE_REPO_DIR = _console_repo_dir()
 
 # The console-owned TAK Server docker bundle is unzipped here (app.py
 # TAK_DOCKER_ROOT = ~/tak-docker) and bind-mounted into the TAK containers at
@@ -455,13 +513,16 @@ PATH_ALLOW = (
 # stays denied.
 PATH_ALLOW_READONLY = (
     '/root/.ssh/',
+    # ops #645 W2: read only. Root shell scripts `. /etc/os-release`, and the file
+    # links to /usr/lib/os-release, so a write was a root-exec primitive. The
+    # console only ever reads it (fleet audit logs + code scan).
+    '/etc/os-release',
 )
 
 # Exact privileged paths that are read/written but aren't directories.
 PATH_ALLOW_EXACT = (
     '/etc/fstab',
-    '/etc/os-release',
-    '/etc/sysctl.conf',         # vm.overcommit_memory persistence (Redis BGSAVE fix)
+    '/etc/sysctl.conf',        # vm.overcommit_memory persistence (Redis BGSAVE fix)
     '/etc/docker/daemon.json',
     '/swapfile',
     '/usr/sbin/ufw',            # ufw->firewalld shim (RHEL); see _check_install
@@ -518,7 +579,30 @@ PATH_DENY_PREFIX = (
     # systemd DROP-IN under its .d/ dir would override ExecStart/Environment
     # just the same (incl. the ENFORCE flag) — deny the whole drop-in dir.
     BROKER_UNIT + '.d/',
-)
+    # ops #645 W0: write-then-root-runs paths under allowlisted prefixes that the
+    # console never writes through the broker (static scan + test6/test12 audit
+    # logs): apt hook config (DPkg::Pre-Invoke runs on the next apt), certbot
+    # renewal hooks, and the broker's own audit log (tamper / forged clean window).
+    '/etc/apt/apt.conf.d/',
+    '/etc/letsencrypt/renewal-hooks/',
+    AUDIT_LOG,                           # audit.log and its rotations audit.log.N
+    # W0 part 2: broker state (ENFORCE state, dump key) and the verified-package
+    # staging dir (a file root installs after its signature check).
+    '/var/lib/takwerx-broker/',
+    # W1: the root-owned broker code and its config (console_dir).
+    ROOT_CODE_DIR + '/',
+    ROOT_CONF_DIR + '/',
+) + tuple(d + '.git/' for d in ROOT_MODULE_DIRS)   # root-run git reads this config
+PATH_DENY_EXACT |= {ROOT_CODE_DIR, ROOT_CONF_DIR, '/var/lib/takwerx-broker'}
+
+# ops #645 W0: single files root executes or sources (same reason as above).
+PATH_DENY_EXACT |= {
+    '/opt/tak/apply-selinux.sh',         # run as root by the gated `bash` shape
+    '/etc/apt/apt.conf',
+    '/etc/security/namespace.init',      # pam_namespace runs it as root at login
+    '/etc/ufw/before.init',              # ufw runs these as root on start/stop
+    '/etc/ufw/after.init',
+} | {d + '.git' for d in ROOT_MODULE_DIRS}
 
 
 class Denied(Exception):
@@ -614,6 +698,817 @@ def _path_allowed(path, readonly=False):
     raise Denied(f'path not in allow-list: {p}')
 
 
+# ---------------------------------------------------------------------------
+# ops #645 W2: every writable destination has a class.
+#   data       root never runs it and never reads it as config that runs commands
+#   validated  root reads it as config that CAN run commands: the console may put
+#              bytes there only through the `write` op, and a parser checks them
+#   asset      root runs it (script or binary): content must come from the
+#              verified tree (W1) or a pinned checksum, never from the console
+# Every PATH_ALLOW / PATH_ALLOW_EXACT entry must be in PATH_CLASS (a test fails
+# otherwise). W2 ships in parts: PATH_CLASS_PENDING lists entries whose rule is not
+# enforced yet, with the part that brings it. Nothing may be added to it without a
+# part number.
+# ---------------------------------------------------------------------------
+DEST_DATA, DEST_VALIDATED, DEST_ASSET = 'data', 'validated', 'asset'
+PATH_CLASS = {
+    '/var/lib/infratak-backups/': DEST_DATA,
+    '/etc/systemd/system/': DEST_VALIDATED,      # enforced: _check_unit_write
+    '/etc/fail2ban/': DEST_VALIDATED,
+    '/etc/caddy/': DEST_DATA,                    # Caddy runs as `caddy`
+    '/etc/postfix/': DEST_VALIDATED,
+    '/etc/docker/': DEST_VALIDATED,
+    '/etc/firewalld/': DEST_DATA,
+    '/etc/ufw/': DEST_DATA,                      # before/after.init deny-listed (W0)
+    '/etc/sysctl.d/': DEST_VALIDATED,
+    '/etc/security/': DEST_VALIDATED,
+    '/etc/ssh/': DEST_VALIDATED,
+    '/etc/letsencrypt/': DEST_VALIDATED,
+    '/etc/apt/': DEST_VALIDATED,
+    '/usr/share/keyrings/': DEST_VALIDATED,      # which repos root trusts
+    '/etc/debsig/': DEST_ASSET,
+    '/usr/share/debsig/': DEST_ASSET,
+    '/etc/netplan/': DEST_DATA,
+    '/opt/tak/': DEST_DATA,                      # TAK runs as `tak`; see pending
+    '/var/lib/pgsql/': DEST_DATA,                # postgres user, not root
+    '/var/lib/postgresql/': DEST_DATA,
+    '/opt/tak-guarddog/': DEST_ASSET,
+    TAK_BUNDLE_DIR + '/': DEST_DATA,
+    '/usr/local/etc/': DEST_DATA,                # MediaMTX config, runs as the console user
+    '/var/lib/cesium-tiles/': DEST_DATA,
+    '/var/lib/takguard/': DEST_VALIDATED,        # Guard Dog state root scripts read
+    '/var/lib/infratak-os-upgrade/': DEST_VALIDATED,
+    '/opt/mediamtx-webeditor/': DEST_DATA,       # runs as the console user
+    '/opt/mediamtx-webeditor-pylib/': DEST_DATA, # editor's Python packages: run by the mediamtx account, never by root
+    '/var/log/': DEST_DATA,                      # broker audit log deny-listed (W0)
+    '/var/lib/takwerx-console/': DEST_DATA,
+    '/var/lib/caddy/': DEST_DATA,
+    # exact files
+    '/etc/fstab': DEST_VALIDATED,
+    '/etc/sysctl.conf': DEST_VALIDATED,
+    '/etc/docker/daemon.json': DEST_VALIDATED,
+    '/swapfile': DEST_DATA,
+    '/usr/sbin/ufw': DEST_ASSET,
+    '/usr/bin/caddy': DEST_ASSET,
+    '/usr/local/bin/mediamtx': DEST_ASSET,
+    '/usr/local/sbin/tak-console-restart.sh': DEST_ASSET,
+    '/usr/local/sbin/infratak-f2b-notify': DEST_ASSET,
+    '/usr/local/sbin/takserver-renew-letsencrypt.sh': DEST_ASSET,
+    '/var/lib/infratak-kernel-patch.sh': DEST_ASSET,
+    '/var/lib/infratak-os-upgrade.sh': DEST_ASSET,
+    '/etc/default/takserver': DEST_VALIDATED,
+    '/etc/wireguard/wg0.conf': DEST_VALIDATED,
+}
+PATH_CLASS.update({d: DEST_DATA for d in ROOT_MODULE_DIRS + HOME_MODULE_DIRS})   # until W3
+# Classed, but the class rule is not enforced yet: W2 part 2 = verified assets
+# (Guard Dog and the other root scripts rendered by root from the W1 tree), part 3 =
+# content parsers for the other validated config files.
+PATH_CLASS_PENDING = {
+    '/etc/fail2ban/': 'W2 part 3', '/etc/postfix/': 'W2 part 3', '/etc/docker/': 'W2 part 3',
+    '/etc/sysctl.d/': 'W2 part 3', '/etc/security/': 'W2 part 3', '/etc/ssh/': 'W2 part 3',
+    '/etc/letsencrypt/': 'W2 part 3', '/etc/apt/': 'W2 part 3',
+    '/usr/share/keyrings/': 'W2 part 3', '/var/lib/takguard/': 'W2 part 3',
+    '/var/lib/infratak-os-upgrade/': 'W2 part 3', '/etc/fstab': 'W2 part 3',
+    '/etc/sysctl.conf': 'W2 part 3', '/etc/docker/daemon.json': 'W2 part 3',
+    '/etc/default/takserver': 'W2 part 3', '/etc/wireguard/wg0.conf': 'W2 part 3',
+    '/opt/tak/': 'W2 part 3',          # confirm what root runs from /opt/tak (setenv.sh)
+    '/etc/debsig/': 'W2 part 2', '/usr/share/debsig/': 'W2 part 2',
+    # every script comes from the repo (gd_render, _gd_path_locked; the last inline
+    # ones moved in W2 part 2b); the state files are W2 part 3
+    '/opt/tak-guarddog/': 'W2 part 2b', '/usr/sbin/ufw': 'W2 part 2',
+    '/usr/bin/caddy': 'W2 part 2', '/usr/local/bin/mediamtx': 'W2 part 2',
+    '/usr/local/sbin/tak-console-restart.sh': 'W2 part 2',
+    '/usr/local/sbin/infratak-f2b-notify': 'W2 part 2',
+    '/usr/local/sbin/takserver-renew-letsencrypt.sh': 'W2 part 2',
+    '/var/lib/infratak-kernel-patch.sh': 'W2 part 2',
+    '/var/lib/infratak-os-upgrade.sh': 'W2 part 2',
+}
+
+
+def _dest_class(path):
+    """PATH_CLASS of a normalised path: the exact entry, else the longest prefix
+    (also for the prefix dir itself). None when the path is in no class."""
+    if path in PATH_CLASS:
+        return PATH_CLASS[path]
+    best = None
+    for a, cls in PATH_CLASS.items():
+        if a.endswith('/') and (path.startswith(a) or path == a.rstrip('/')):
+            if best is None or len(a) > len(best[0]):
+                best = (a, cls)
+    return best[1] if best else None
+
+
+def _root_runs(path):
+    """True for a validated or asset destination: root runs it or reads it as
+    config that can run commands."""
+    return _dest_class(path) in (DEST_VALIDATED, DEST_ASSET)
+
+
+UNIT_DIR = '/etc/systemd/system'
+
+
+def _in_unit_dir(path):
+    return path == UNIT_DIR or path.startswith(UNIT_DIR + '/')
+
+
+# Unit files the console writes (the generated check in
+# tests/test_broker_unit_writes_ops645.py keeps this equal to app.py). Anything else
+# under /etc/systemd/system is refused: a new unit name was a root service of the
+# console's own choosing.
+UNIT_FILES = frozenset({
+    'authentik-log-forwarder.service', 'docker-stagger.service',
+    'mediamtx.service', 'mediamtx-webeditor.service',
+    'mediamtx-cert-sync.service', 'mediamtx-cert-sync.timer',
+    'tak-health.service', 'tak-metrics-collector.service', 'tak-post-start.service',
+    'takauthentiktasklogpurge.service', 'takauthentiktasklogpurge.timer',
+    'takautovacuum.service', 'takautovacuum.timer',
+    'takbuildcachereclaim.service', 'takbuildcachereclaim.timer',
+    'takclientgate.service', 'takclientgate.timer', 'takclientgatesweep.service',
+    'takconsolerestart.service', 'takconsolerestart.timer',
+    'takdbrepack.service', 'takdbrepack.timer',
+    'takrestartwatch.service',
+    'takretentionguard.service', 'takretentionguard.timer',
+    'takserver-cert-renewal.service', 'takserver-cert-renewal.timer',
+    'takswapreclaim.service', 'takswapreclaim.timer',
+    'takwerx-console.service',
+    'takwerx-setup-ap.service', 'takwerxsetupapwatch.service', 'takwerxsetupapwatch.timer',
+    # drop-ins
+    'takserver.service.d/soft-start.conf', 'takserver.service.d/jvm-pin.conf',
+    'caddy.service.d/10-takwerx-boot.conf', 'caddy.service.d/10-takwerx-acme-eab.conf',
+    'mediamtx-webeditor.service.d/10-infratak-journal.conf',
+    'mediamtx-webeditor.service.d/20-infratak-home.conf',
+})
+_UNIT_FILE_RE = re.compile(r'^tak[a-z0-9]+guard\.(service|timer)$')   # Guard Dog watchers
+# Users a non-root unit may run as, and the groups it may add. A unit running as
+# another user (tak, postgres) would hand the console that account, and `tak` owns
+# files root runs. ops #643: MediaMTX and its web editor run as their own account.
+UNIT_USERS = frozenset({BROKER_USER, 'mediamtx'})
+UNIT_GROUPS = frozenset({BROKER_USER, 'caddy', 'systemd-journal'})
+# These must keep a non-root User= (the plan's rule). So their drop-ins are checked
+# as non-root too; every other drop-in counts as root (it can't see its base User=).
+UNIT_MUST_BE_NONROOT = frozenset({'takwerx-console.service', 'mediamtx.service',
+                                  'mediamtx-webeditor.service'})
+_UNIT_EXEC_KEYS = frozenset({'ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecCondition',
+                             'ExecReload', 'ExecStop', 'ExecStopPost'})
+# Keys allowed per section: what the fleet's units and app.py use. An allow-list,
+# because many keys make PID 1 act as root for a non-root unit (StandardOutput=file:
+# opens as root, BindPaths=, LoadCredential=, AmbientCapabilities=, PAMName=, Alias=).
+_UNIT_KEYS = {
+    'Unit': frozenset({
+        'Description', 'Documentation', 'After', 'Before', 'Requires', 'Wants', 'BindsTo',
+        'PartOf', 'Conflicts', 'StartLimitIntervalSec', 'StartLimitBurst',
+        'ConditionPathExists', 'ConditionPathIsDirectory', 'ConditionFileIsExecutable',
+        'ConditionFileNotEmpty', 'DefaultDependencies'}),
+    'Service': _UNIT_EXEC_KEYS | frozenset({
+        'Type', 'RemainAfterExit', 'Restart', 'RestartSec', 'TimeoutSec', 'TimeoutStartSec',
+        'TimeoutStopSec', 'RuntimeMaxSec', 'StartLimitInterval', 'StartLimitIntervalSec',
+        'StartLimitBurst', 'SuccessExitStatus', 'RestartPreventExitStatus',
+        'User', 'Group', 'SupplementaryGroups', 'WorkingDirectory', 'Environment',
+        'EnvironmentFile', 'StandardOutput', 'StandardError', 'SyslogIdentifier',
+        'KillMode', 'KillSignal', 'SendSIGKILL', 'LimitNOFILE', 'LimitNPROC', 'Nice',
+        'MemoryMax', 'MemoryHigh', 'CPUQuota', 'TasksMax', 'IOSchedulingClass',
+        'IOSchedulingPriority', 'OOMScoreAdjust', 'NoNewPrivileges', 'PrivateTmp',
+        'ProtectSystem', 'ProtectHome', 'ReadOnlyPaths', 'ReadWritePaths',
+        'InaccessiblePaths', 'UMask', 'SELinuxContext'}),
+    'Timer': frozenset({
+        'OnCalendar', 'OnBootSec', 'OnStartupSec', 'OnActiveSec', 'OnUnitActiveSec',
+        'OnUnitInactiveSec', 'Persistent', 'RandomizedDelaySec', 'AccuracySec', 'Unit'}),
+    'Install': frozenset({'WantedBy', 'RequiredBy', 'Also'}),
+}
+_UNIT_SECTIONS = {'.service': ('Unit', 'Service', 'Install'),
+                  '.timer': ('Unit', 'Timer', 'Install'),
+                  '.conf': ('Unit', 'Service', 'Install')}       # service drop-ins
+_UNIT_OUTPUTS = frozenset({'journal', 'null', 'inherit', 'journal+console', 'kmsg'})
+_UNIT_SELINUX = 'system_u:system_r:unconfined_service_t:s0'
+_UNIT_PATH_DIRS = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
+# env names that change what a root process loads or runs
+_UNIT_ENV_DENY_RE = re.compile(
+    r'^(LD_.*|BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PS4|IFS|CDPATH|GLOBIGNORE|PYTHON(?!UNBUFFERED$).*'
+    r'|PERL.*|RUBY.*|NODE_OPTIONS|NODE_PATH|GCONV_PATH|LOCPATH|NLSPATH|GIT_.*|HOSTALIASES'
+    r'|RES_OPTIONS|LOCALDOMAIN|TMPDIR|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS'
+    r'|OPENSSL_CONF|OPENSSL_MODULES|SSL_CERT_.*|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|HOME)$')
+_UNIT_PY_FLAGS = frozenset({'-I', '-u', '-B', '-s', '-E'})
+_UNIT_SHELLS = frozenset({'sh', 'bash', 'dash'})
+# The two root units that run inline shell. Each has its own parser below; no other
+# unit may use `bash -c`.
+_AK_FORWARDER_SCRIPT = ('docker logs -f authentik-server-1 2>&1 | grep --line-buffered '
+                        '-F invalid_login >> /var/log/authentik/auth.log')
+_CONTAINER_RE = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
+_STAGGER_STEP_RES = (
+    re.compile(rf'docker stop( {_CONTAINER_RE})+ 2>/dev/null; true'),
+    re.compile(r'echo "(Starting [A-Za-z ]{1,40}\.\.\.|All containers started)"'),
+    re.compile(rf'docker start( {_CONTAINER_RE})+'),
+    re.compile(r'sleep [0-9]{1,3}'),
+)
+# TAK Portal: compose up from its module dir (compose itself is W3's job)
+_STAGGER_TP_RE = re.compile(
+    rf'\(\(cd (/[A-Za-z0-9_./-]+) && docker compose up -d\) \|\| docker start( {_CONTAINER_RE})+\)')
+
+
+def _unit_name_ok(rel):
+    return rel in UNIT_FILES or bool(_UNIT_FILE_RE.fullmatch(rel))
+
+
+def _console_writable(path):
+    """True when the console user can change `path` itself or through the broker
+    (any data/validated destination, its home, the console repo, temp dirs)."""
+    p = os.path.normpath(path)
+    for d in ('/tmp/', '/var/tmp/', '/dev/shm/', '/home/', '/run/user/',
+              CONSOLE_REPO_DIR + '/', _NONROOT_HOME + '/'):
+        if p.startswith(d) or p == d.rstrip('/'):
+            return True
+    cls = _dest_class(p)
+    return cls in (DEST_DATA, DEST_VALIDATED)
+
+
+# ops #645 W2 (Security re-review): the checker must read the same lines systemd
+# runs. Where the two readers could differ, the shape is refused, not modelled:
+# - systemd drops a comment line inside a `\` continuation and keeps joining, so
+#   `ExecStart=<asset> \` / `# c` / `RestartSec=5 ; +/tmp/x` is ONE Exec line to it.
+# - a line ending in `\\` (escaped backslash), or `\` then spaces, is NOT a
+#   continuation to systemd (it counts escapes, it does not strip first).
+# - other readers split lines on CR, VT, FF, NEL, U+2028/2029; the console never
+#   writes those, or any other control character but tab.
+# - the console continues lines only in Exec*= (docker-stagger's inline script).
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.syntax.html
+_UNIT_BAD_CHARS_RE = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ufeff]')
+_UNIT_WS = ' \t'                     # systemd WHITESPACE, less the line breaks
+
+
+def _unit_lines(text):
+    """[(section, key, value)] of a unit file. A `\\` continuation joins the next
+    line with one space (as systemd does); every shape where systemd could read
+    the lines differently is refused (see above)."""
+    m = _UNIT_BAD_CHARS_RE.search(text)
+    if m:
+        raise Denied(f'unit: control or line-separator character {m.group(0)!r} not allowed')
+    def _take(raw):
+        s = raw.strip(_UNIT_WS)
+        if s.endswith('\\') and not raw.endswith('\\'):
+            raise Denied('unit: a backslash followed by spaces at the end of a line')
+        if len(s) - len(s.rstrip('\\')) > 1:
+            raise Denied('unit: a line ends in more than one backslash')
+        return s
+
+    raws = text.split('\n')
+    out, section, i = [], None, 0
+    while i < len(raws):
+        s = raws[i].strip(_UNIT_WS)
+        i += 1
+        if not s or s[0] in '#;':
+            if s.endswith('\\'):     # systemd >= 235 skips it; older ones continued it
+                raise Denied('unit: a comment line ends in a backslash')
+            continue
+        parts = [_take(raws[i - 1])]
+        while parts[-1].endswith('\\'):
+            if i >= len(raws):
+                raise Denied('unit: file ends in a line continuation')
+            nxt = raws[i].strip(_UNIT_WS)
+            if not nxt or nxt[0] in '#;':
+                raise Denied('unit: a blank or comment line inside a line continuation')
+            nxt = _take(raws[i])
+            i += 1
+            parts[-1] = parts[-1][:-1].rstrip(_UNIT_WS)
+            parts.append(nxt)
+        line = ' '.join(parts)
+        if line.startswith('[') and line.endswith(']'):
+            if len(parts) > 1:
+                raise Denied('unit: line continuation in a section header')
+            section = line[1:-1]
+            continue
+        if '=' not in line:
+            raise Denied(f'unit: not a key=value line: {line[:60]}')
+        k, v = line.split('=', 1)
+        k, v = k.strip(_UNIT_WS), v.strip(_UNIT_WS)
+        if len(parts) > 1 and k not in _UNIT_EXEC_KEYS:
+            raise Denied(f'unit: line continuation in {k[:40]}= (only Exec lines may continue)')
+        out.append((section, k, v))
+    return out
+
+
+def _unit_split(value, what):
+    import shlex
+    try:
+        return shlex.split(value, posix=True)
+    except ValueError:
+        raise Denied(f'unit: cannot parse {what}')
+
+
+def _unit_stagger_ok(script):
+    for m in _STAGGER_TP_RE.finditer(script):
+        if not any(m.group(1) == d.rstrip('/') for d in ROOT_MODULE_DIRS + HOME_MODULE_DIRS):
+            raise Denied(f'unit: docker-stagger compose dir is not a module dir: {m.group(1)}')
+    rest = _STAGGER_TP_RE.sub('docker start x', script)
+    for step in rest.split('&&'):
+        step = ' '.join(step.split())
+        if not any(r.fullmatch(step) for r in _STAGGER_STEP_RES):
+            raise Denied(f'unit: docker-stagger step not allowed: {step[:80]}')
+
+
+# ops #645 W2 (Security re-review #2): a path root runs or reads from a unit is plain
+# text, already normalised. systemd decodes C escapes (`\x2f`, `\057`), specifiers
+# (`%T`, `%h`) and `$VAR`/`${VAR}` in Exec words; shlex and normpath do not, so
+# `/opt/tak-guarddog/..\x2f..\x2ftmp/evil.sh` looked like an asset and ran /tmp/evil.sh.
+# `\` and `%` are refused in every unit value (_check_unit_write); this charset also
+# keeps `$`, quotes and `..` out of the words root runs.
+_UNIT_PLAIN_PATH_RE = re.compile(r'/[A-Za-z0-9_./-]+')
+
+
+def _unit_plain_path(path, what):
+    if not _UNIT_PLAIN_PATH_RE.fullmatch(path) or os.path.normpath(path) != path:
+        raise Denied(f'unit: {what} must be a plain, normalised absolute path: {path[:80]!r}')
+    return path
+
+
+def _unit_root_command_ok(toks, rel):
+    """A command root runs from a unit: one of infra-TAK's own scripts (asset), the
+    system python with safe flags on one, or the two parsed inline shells. The binary
+    and the script word must be plain, normalised paths (no escapes, no `..`)."""
+    binary = toks[0]
+    if not binary.startswith('/'):
+        raise Denied(f'unit: root command must be an absolute path: {binary[:80]}')
+    p = _unit_plain_path(binary, 'root command')
+    base = os.path.basename(p)
+    if _unit_asset_ok(p):
+        return
+    if base in _UNIT_SHELLS and os.path.dirname(p) in ('/bin', '/usr/bin'):
+        if len(toks) == 3 and toks[1] == '-c':
+            if rel == 'authentik-log-forwarder.service' and toks[2] == _AK_FORWARDER_SCRIPT:
+                return
+            if rel == 'docker-stagger.service':
+                return _unit_stagger_ok(toks[2])
+            raise Denied(f'unit: inline shell is not allowed in {rel}')
+        if len(toks) >= 2 and not toks[1].startswith('-') and _unit_asset_ok(
+                _unit_plain_path(toks[1], 'root script')):
+            return
+        raise Denied(f'unit: root shell must run an infra-TAK script: {" ".join(toks)[:80]}')
+    if re.fullmatch(r'python3(\.[0-9]+)?', base) and os.path.dirname(p) in ('/usr/bin', '/bin'):
+        i = 1
+        while i < len(toks) and toks[i] in _UNIT_PY_FLAGS:
+            i += 1
+        if i < len(toks) and toks[i].startswith('/') and _unit_asset_ok(
+                _unit_plain_path(toks[i], 'root script')):
+            return
+        raise Denied(f'unit: root python must run an infra-TAK script: {" ".join(toks)[:80]}')
+    raise Denied(f'unit: root may run only infra-TAK scripts, not {binary[:80]}')
+
+
+# ops #645 W2 (Security review): systemd runs `ExecStartPre=/a.sh ; /tmp/evil.sh` as
+# TWO commands; a lone `;` word separates them, and each one has its own prefixes
+# (`; +/tmp/x` runs the second as root even in a non-root unit). An escaped `\;` or
+# a quoted `";"` is a literal argument instead; the console never writes either, so
+# both are refused rather than guessed at.
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Command%20lines
+_UNIT_LITERAL_SEMI_RE = re.compile(r'\\;|(["\'])\s*;\s*\1')
+
+
+def _unit_exec_commands(value, key):
+    """[(prefixes, argv)] for every command in an Exec*= value."""
+    if _UNIT_LITERAL_SEMI_RE.search(value):
+        raise Denied(f'unit: {key}= has an escaped or quoted ";"')
+    words = _unit_split(value, key)
+    parts, cur = [], []
+    for w in words:
+        if w == ';':
+            parts.append(cur)
+            cur = []
+        else:
+            cur.append(w)
+    parts.append(cur)
+    out = []
+    for toks in parts:
+        if not toks:
+            raise Denied(f'unit: empty command in {key}=')
+        pre, first = '', toks[0]
+        while first and first[0] in '-@:+!|':
+            pre, first = pre + first[0], first[1:]
+        if '|' in pre:
+            raise Denied(f'unit: {key}=| (shell) not allowed')
+        if not first:
+            raise Denied(f'unit: empty command in {key}=')
+        toks = [first] + toks[1:]
+        if '@' in pre:
+            toks = [toks[0]] + toks[2:]
+        out.append((pre, toks))
+    return out
+
+
+def _unit_env_ok(value, root_ctx):
+    if not root_ctx:
+        return
+    for a in _unit_split(value, 'Environment'):
+        if '=' not in a:
+            raise Denied(f'unit: bad Environment item: {a[:40]}')
+        k, v = a.split('=', 1)
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', k):
+            raise Denied(f'unit: bad Environment name: {k[:40]!r}')
+        if _UNIT_ENV_DENY_RE.fullmatch(k):
+            raise Denied(f'unit: Environment {k} not allowed for a root process')
+        if k == 'PATH':
+            for d in v.split(':'):
+                if not (d in _UNIT_PATH_DIRS or (d.startswith('/usr/lib/jvm/')
+                                                 and '..' not in d.split('/'))):
+                    raise Denied(f'unit: PATH entry not allowed for a root process: {d}')
+            continue
+        for t in re.findall(r'/[^\s:;,]*', v):
+            if _console_writable(t):
+                raise Denied(f'unit: Environment {k} points at a console-writable path')
+
+
+def _check_unit_write(path, content, mode):
+    """ops #645 W2: content check for a write under /etc/systemd/system. systemd runs
+    every unit there as root, so the console may write only the units it owns, in a
+    shape where root runs only infra-TAK's own scripts and a non-root unit cannot be
+    turned into root."""
+    rel = path[len(UNIT_DIR) + 1:] if path.startswith(UNIT_DIR + '/') else ''
+    if not rel or not _unit_name_ok(rel):
+        raise Denied(f'unit: not a unit file infra-TAK writes: {path}')
+    if mode not in ('w', 'wb'):
+        raise Denied('unit: append is not allowed; write the whole file')
+    if len(content) > 65536 or b'\x00' in content:
+        raise Denied('unit: file too big or has NUL bytes')
+    try:
+        text = content.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Denied('unit: not UTF-8')
+    dropin = '/' in rel
+    ext = os.path.splitext(rel)[1]
+    sections = _UNIT_SECTIONS.get(ext)
+    if not sections:
+        raise Denied(f'unit: type not allowed: {rel}')
+    lines = _unit_lines(text)
+    user = ''
+    for sec, k, v in lines:
+        # systemd decodes C escapes and %-specifiers in values; the checker does not.
+        # The console writes neither (line-continuation backslashes are gone by now,
+        # and its two inline shells use none), so refuse them all, in every key.
+        if '\\' in v or '%' in v:
+            raise Denied(f'unit: {k[:40]}= has a backslash escape or a % specifier')
+        if sec not in sections:
+            raise Denied(f'unit: section [{sec}] not allowed in {rel}')
+        if k not in _UNIT_KEYS[sec]:
+            raise Denied(f'unit: key {k}= not allowed in [{sec}]')
+        if k == 'User':
+            user = v
+    base_unit = rel.split('/', 1)[0][:-2] if dropin else rel
+    if dropin:
+        # A drop-in can't see the base unit's User=: root, unless the base is one of
+        # the units the broker keeps non-root.
+        root_ctx = base_unit not in UNIT_MUST_BE_NONROOT
+    else:
+        root_ctx = user in ('', 'root', '0')
+        if root_ctx and rel in UNIT_MUST_BE_NONROOT:
+            raise Denied(f'unit: {rel} must keep a non-root User=')
+        if not root_ctx and user not in UNIT_USERS:
+            raise Denied(f'unit: User={user} not allowed')
+    for sec, k, v in lines:
+        if k == 'User' and dropin:
+            raise Denied('unit: a drop-in may not set User=')
+        elif k in ('Group', 'SupplementaryGroups'):
+            if dropin and k == 'Group':
+                raise Denied('unit: a drop-in may not set Group=')
+            for g in v.split():
+                if g not in UNIT_GROUPS:
+                    raise Denied(f'unit: {k}={g} not allowed')
+        elif k in _UNIT_EXEC_KEYS:
+            if not v:
+                if not dropin:
+                    raise Denied(f'unit: empty {k}=')
+                continue                    # `ExecStart=` reset in a drop-in
+            for pre, toks in _unit_exec_commands(v, k):
+                if root_ctx or '+' in pre or '!' in pre:
+                    _unit_root_command_ok(toks, rel)
+        elif k == 'Environment':
+            _unit_env_ok(v, root_ctx)
+        elif k == 'EnvironmentFile':
+            f = v[1:] if v.startswith('-') else v
+            if root_ctx and (not f.startswith('/') or _console_writable(
+                    _unit_plain_path(f, 'root EnvironmentFile'))):
+                raise Denied('unit: root EnvironmentFile must not be console-writable')
+        elif k in ('StandardOutput', 'StandardError'):
+            if v not in _UNIT_OUTPUTS:
+                raise Denied(f'unit: {k}={v} not allowed (PID 1 opens files as root)')
+        elif k == 'SELinuxContext':
+            if v != _UNIT_SELINUX:
+                raise Denied(f'unit: SELinuxContext={v} not allowed')
+        elif k == 'Unit' and sec == 'Timer':
+            if not _unit_name_ok(v):
+                raise Denied(f'unit: timer Unit={v} is not an infra-TAK unit')
+        elif k == 'Also':
+            for n in v.split():
+                if not _unit_name_ok(n):
+                    raise Denied(f'unit: Also={n} is not an infra-TAK unit')
+        elif k in ('WantedBy', 'RequiredBy'):
+            for n in v.split():
+                if not (n.endswith('.target') or _unit_name_ok(n)):
+                    raise Denied(f'unit: {k}={n} not allowed')
+        elif sec == 'Unit' and k in ('Requires', 'Wants', 'BindsTo', 'After', 'Before',
+                                     'PartOf', 'Conflicts'):
+            if 'debug-shell' in v:
+                raise Denied('unit: debug-shell not allowed')
+
+
+def _check_validated_write(req):
+    """ops #645 W2: the `write` op into a validated destination whose parser is
+    built. Others pass for now (PATH_CLASS_PENDING says which part brings them)."""
+    p = _abs(req.get('path'))
+    if _in_unit_dir(p):
+        _check_unit_write(p, base64.b64decode(req.get('content_b64') or ''),
+                          req.get('mode', 'w'))
+    if _gd_path_locked(p):
+        raise Denied(f'Guard Dog scripts are installed by root from its own copy of '
+                     f'infra-TAK (gd_render), not written by the console: {p}')
+
+
+# ---------------------------------------------------------------------------
+# ops #645 W2 part 2a: Guard Dog scripts. Root runs every script in GD_DIR (units,
+# timers, the boot sequencer), and the console used to write them: fill in the
+# repo template, then `write` the result. Now root reads the template from the
+# verified tree it runs from (W1, /usr/local/lib/infratak-broker/<commit>/
+# scripts/guarddog/), checks each value the console sends, and writes the script.
+# The console can choose the values, never the code.
+# ---------------------------------------------------------------------------
+GD_DIR = '/opt/tak-guarddog'
+_GD_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,80}\.(sh|py)$')
+_GD_PLACEHOLDER_RE = re.compile(r'\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b')
+# Scripts only some boxes get (SMS, Authentik purge, remote MediaMTX cert sync). They
+# are templates in the repo like the rest (W2 part 2b; until then app.py built them
+# inline and the console wrote them), but the console's Guard Dog sync skips them and
+# may ask root to remove them again (gd_remove). app.py keeps the same set (a test).
+_GD_OPTIONAL = frozenset({
+    'sms_send.py', 'sms_send.sh', 'tak-authentik-tasklog-purge.sh', 'mediamtx-cert-sync.sh',
+})
+# Every placeholder sits inside double quotes in the templates (a test checks it),
+# so no value may hold what is special there: $ ` " \ or a control character.
+_GD_UNSAFE_RE = re.compile(r'[$`"\\\x00-\x1f\x7f]')
+_GD_HOST = r'[A-Za-z0-9\[][A-Za-z0-9.:_\[\]-]{0,252}'   # never a leading '-' (an ssh option)
+# A comma list of addresses or numbers. Each item starts with a letter, a digit or '+'
+# (a phone number), never '-', so none reads as an option (`mail -s "$SUBJ" "<value>"`;
+# Security, W2 third look, note 1). Empty items stay allowed (a trailing comma), so a
+# box's saved value keeps passing unless an item started with - . _ % or @.
+_GD_ADDR_LIST = r'^(?![-._%@])(?!.*,[-._%@])[A-Za-z0-9._%+@,-]{0,1024}$'
+_GD_VALUE_RES = {
+    'ALERT_EMAIL_PLACEHOLDER': re.compile(_GD_ADDR_LIST),
+    'ALERT_SMS_PLACEHOLDER': re.compile(_GD_ADDR_LIST),
+    'CERT_PASS_PLACEHOLDER': re.compile(r'^\S{0,256}$'),
+    'CONSOLE_VERSION_PLACEHOLDER': re.compile(r'^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$'),
+    'UPDATE_CHANNEL_PLACEHOLDER': re.compile(r'^[a-z0-9][a-z0-9._-]{0,31}$'),
+    'AK_VETTED_PLACEHOLDER': re.compile(r'^([0-9A-Za-z][0-9A-Za-z.+_-]{0,63})?$'),
+    'EXTERNAL_DB_PLACEHOLDER': re.compile(r'^(true)?$'),
+    'DB_HOST_PLACEHOLDER': re.compile(rf'^({_GD_HOST})?$'),
+    'FEDHUB_HOST_PLACEHOLDER': re.compile(rf'^({_GD_HOST})?$'),
+    'DB_PORT_PLACEHOLDER': re.compile(r'^[0-9]{0,5}$'),
+    'SSH_USER_PLACEHOLDER': re.compile(r'^([A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$'),
+    'SSH_KEY_PLACEHOLDER': re.compile(r'^(?!.*/\.\.(/|$))(/[A-Za-z0-9._@+-]+)*$'),
+    # mediamtx-cert-sync.sh (W2 part 2b). Root finds the cert and key in Caddy's store
+    # from the domain itself; the console names only where they go, never a local file
+    # to send. The -i key may not be one of root's own files.
+    'MTX_DOMAIN_PLACEHOLDER': re.compile(
+        r'^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?){0,126}$'),
+    'MTX_HOST_PLACEHOLDER': re.compile(rf'^{_GD_HOST}$'),
+    'MTX_USER_PLACEHOLDER': re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$'),
+    'MTX_PORT_PLACEHOLDER': re.compile(r'^[1-9][0-9]{0,4}$'),
+    'MTX_KEYFILE_PLACEHOLDER': re.compile(
+        r'^(?!/(etc|root|proc|sys|dev|run|boot|var/lib/caddy)(/|$))(?!.*/\.\.?(/|$))(/[A-Za-z0-9._@+-]+)*$'),
+}
+
+
+def _gd_norm(path):
+    """`/opt/tak-guarddog/./x`, `//opt/...` and `.../sub/../x` all name the same file."""
+    return '/' + os.path.normpath(str(path)).lstrip('/')
+
+
+# State files the console itself writes in GD_DIR (app.py; a generated test keeps
+# this equal to the code). Root scripts read them as data, never run them. Their
+# content check is W2 part 3.
+_GD_STATE_FILES = frozenset({
+    'server_identifier', 'guarddog.conf', 'known_hosts', 'diskio_email_off',
+    'authentik_tasklog_purge_last.txt', '.metrics_collector_applied',
+})
+
+
+def _gd_path_locked(path):
+    """True for a path under GD_DIR the console may no longer create or change, once
+    this broker runs from the root-owned tree (gd_render needs that tree): the whole
+    tree, less the named state files at depth 1. (Until W2 part 2b the scripts app.py
+    built inline were open too; they are templates now, see _GD_OPTIONAL.)
+    (Security re-review #2: a subfolder was open, `mkdir /opt/tak-guarddog/sub` then
+    `write .../sub/x.sh`, and the unit check took any path under the prefix.)"""
+    path = _gd_norm(path)
+    if not path.startswith(GD_DIR + '/') or not _installed_commit():
+        return False
+    rel = path[len(GD_DIR) + 1:]
+    if '/' in rel:
+        return True
+    return rel not in _GD_STATE_FILES
+
+
+def _unit_asset_ok(path):
+    """A root command a unit may run: a Guard Dog script directly in GD_DIR, or one
+    of the exact asset files. Not a prefix asset dir (debsig), not a GD subfolder."""
+    if path.startswith(GD_DIR + '/'):
+        return bool(_GD_NAME_RE.fullmatch(path[len(GD_DIR) + 1:]))
+    return PATH_CLASS.get(path) == DEST_ASSET and not path.endswith('/')
+
+
+def _gd_template_dir():
+    c = _installed_commit()
+    return os.path.join(ROOT_CODE_DIR, c, 'scripts', 'guarddog') if c else ''
+
+
+def _gd_fill(template, values):
+    """One pass: a value is never searched for further placeholders."""
+    return _GD_PLACEHOLDER_RE.sub(lambda m: values.get(m.group(0), m.group(0)), template)
+
+
+def _check_gd_render(req):
+    if set(req) - {'op', 'name', 'values'}:
+        raise Denied('gd_render takes only name and values')
+    name, values = req.get('name'), req.get('values', {})
+    if not isinstance(name, str) or not _GD_NAME_RE.fullmatch(name):
+        raise Denied(f'gd_render: not a Guard Dog script name: {str(name)[:80]}')
+    if not isinstance(values, dict):
+        raise Denied('gd_render: values must be an object')
+    for k, v in values.items():
+        rx = _GD_VALUE_RES.get(k)
+        if rx is None:
+            raise Denied(f'gd_render: unknown placeholder: {str(k)[:60]}')
+        if not isinstance(v, str) or _GD_UNSAFE_RE.search(v) or not rx.fullmatch(v):
+            raise Denied(f'gd_render: value for {k} not allowed')
+    if not _gd_template_dir():
+        raise Denied('gd_render: this broker does not run from its root-owned copy of '
+                     'infra-TAK yet (see ping root_install)')
+
+
+def _do_gd_render(req):
+    """Render the template from the tree this broker runs from and install it
+    root:root 0755. Returns changed (False when the bytes were already there)."""
+    name, values = req['name'], req.get('values') or {}
+    src = os.path.join(_gd_template_dir(), name)
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return {'ok': False, 'code': 'ENOENT', 'error': f'no Guard Dog template {name} in '
+                                                         f'commit {_installed_commit()[:12]}'}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {'ok': False, 'code': 'DENIED', 'error': f'template {name} is not a file'}
+        template = os.read(fd, MAX_MSG).decode('utf-8')
+    finally:
+        os.close(fd)
+    data = _gd_fill(template, values).encode('utf-8')
+    if os.path.islink(GD_DIR) or (os.path.lexists(GD_DIR) and not os.path.isdir(GD_DIR)):
+        return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR} is not a plain directory'}
+    os.makedirs(GD_DIR, mode=0o755, exist_ok=True)
+    # Everything below goes through one fd of the directory, so a swap of GD_DIR for
+    # a link after the check above changes nothing (Security re-review #2).
+    try:
+        dfd = os.open(GD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR} is not a plain directory'}
+    try:
+        st = os.fstat(dfd)
+        if st.st_uid != 0 or st.st_gid != 0 or st.st_mode & 0o022:
+            os.fchown(dfd, 0, 0)
+            os.fchmod(dfd, 0o755)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            try:
+                dst = os.fstat(fd)
+                same = (stat.S_ISREG(dst.st_mode) and dst.st_size == len(data)
+                        and os.read(fd, len(data) + 1) == data)
+                if same:
+                    os.fchown(fd, 0, 0)
+                    os.fchmod(fd, 0o755)
+            finally:
+                os.close(fd)
+        except OSError:
+            same = False
+        if same:
+            return {'ok': True, 'changed': False}
+        tmp = f'.{name}.gd-{os.getpid()}-{threading.get_ident()}'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=dfd)
+        try:
+            os.write(fd, data)
+            os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o755)
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            os.unlink(tmp, dir_fd=dfd)
+            raise
+        os.close(fd)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        return {'ok': True, 'changed': True}
+    finally:
+        os.close(dfd)
+
+
+def _check_gd_remove(req):
+    """W2 part 2b: the console turns an optional Guard Dog script off again (SMS off,
+    remote MediaMTX gone). Only the _GD_OPTIONAL names; the folder is root's."""
+    if set(req) - {'op', 'name'}:
+        raise Denied('gd_remove takes only name')
+    name = req.get('name')
+    if not isinstance(name, str) or name not in _GD_OPTIONAL:
+        raise Denied(f'gd_remove: not an optional Guard Dog script: {str(name)[:80]}')
+
+
+def _do_gd_remove(req):
+    """Unlink GD_DIR/<name> through one fd of the directory (a link swapped in for
+    GD_DIR changes nothing). Returns changed (False when it was not there)."""
+    name = req['name']
+    try:
+        dfd = os.open(GD_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {'ok': True, 'changed': False}
+    except OSError:
+        return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR} is not a plain directory'}
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {'ok': True, 'changed': False}
+        if stat.S_ISDIR(st.st_mode):
+            return {'ok': False, 'code': 'DENIED', 'error': f'{GD_DIR}/{name} is a directory'}
+        os.unlink(name, dir_fd=dfd)       # a link is removed itself, never its target
+        return {'ok': True, 'changed': True}
+    finally:
+        os.close(dfd)
+
+
+def _check_exec_into_root_run(base, paths, link_args=None):
+    """ops #645 W2: the coreutils path into root-run destinations.
+    - cp/mv/install/tee into /etc/systemd/system: refused (only `write`, which
+      checks the unit text);
+    - ln with any operand in a validated or asset destination: refused (a link
+      makes a later write land in a unit or a root script);
+    - chown of a validated/asset path to anyone but root, chmod that lets group or
+      others write it: refused (the console user could then edit it directly)."""
+    for p in paths:
+        if base in ('cp', 'mv', 'install', 'tee') and _in_unit_dir(p):
+            raise Denied(f'{base}: unit files go through the write op only: {p}')
+        if base in ('cp', 'mv', 'install', 'tee', 'mkdir', 'touch') and _gd_path_locked(p):
+            raise Denied(f'{base}: Guard Dog scripts are installed by root (gd_render): {p}')
+        if (base == 'mkdir' and _gd_norm(p).startswith(GD_DIR + '/')
+                and _installed_commit()):
+            raise Denied(f'mkdir: no folders inside the Guard Dog folder: {p}')
+        # `cp X /opt/tak-guarddog/` lands as /opt/tak-guarddog/<basename X>: a script
+        # name the check above never sees. The console names the file it copies.
+        if (base in ('cp', 'mv', 'install', 'tee') and _gd_norm(p) == GD_DIR
+                and _installed_commit()):
+            raise Denied(f'{base}: name the file, not the Guard Dog folder: {p}')
+        if base == 'ln' and _root_runs(p):
+            raise Denied(f'ln: no links into or out of root-run paths: {p}')
+    if base == 'ln':
+        for t in link_args or ():
+            if not t.startswith('/') and '..' in t.split('/'):
+                raise Denied(f'ln: relative link target with .. not allowed: {t}')
+
+
+_COREUTIL_FLAGS = {
+    'chmod': frozenset({'-R', '--recursive', '-v', '-c', '-f', '--verbose', '--changes',
+                        '--silent', '--quiet'}),
+    'chown': frozenset({'-R', '-h', '--recursive', '--no-dereference', '-v', '-c', '-f',
+                        '--verbose', '--changes', '--silent', '--quiet'}),
+    'mv': frozenset({'-f', '-n', '-v', '-T', '--force', '--no-clobber', '--verbose',
+                     '--no-target-directory'}),
+    'ln': frozenset({'-s', '-f', '-n', '-T', '-v', '-sf', '-fs', '-sn', '-ns', '-sfn', '-snf',
+                     '-fsn', '-fns', '-nsf', '-nfs', '-sfT', '--symbolic', '--force',
+                     '--no-dereference', '--no-target-directory'}),
+    'tee': frozenset({'-a', '--append'}),
+    'rm': frozenset({'-f', '-r', '-R', '-rf', '-fr', '-Rf', '-fR', '-v', '--force', '--recursive'}),
+    'mkdir': frozenset({'-p', '-v', '--parents'}),
+    'rmdir': frozenset({'-p', '--parents', '--ignore-fail-on-non-empty'}),
+    'touch': frozenset({'-c', '-a', '-m', '--no-create'}),
+    'cat': frozenset({'-A', '-n', '-v', '-e', '-E', '-t', '-T', '-s', '-b'}),
+}
+# cp short-flag letters allowed (no -t target dir, no -l/-s links, no -S suffix)
+_CP_SHORT = set('aprRfPdnTv')
+_CP_LONG = frozenset({'--archive', '--recursive', '--force', '--no-clobber', '--no-dereference',
+                      '--verbose', '--no-target-directory'})
+
+
+def _owner_is_root(spec):
+    user, _, group = spec.partition(':') if ':' in spec else spec.partition('.')
+    return user in ('root', '0') and group in ('', 'root', '0')
+
+
+def _mode_lets_go_write(mode):
+    m = (mode or '').strip()
+    if re.fullmatch(r'[0-7]{1,5}', m):
+        d = m[-3:].rjust(3, '0')
+        return bool(int(d[1]) & 2 or int(d[2]) & 2)
+    for clause in m.split(','):
+        for op in ('+', '='):
+            if op in clause:
+                who, perms = clause.split(op, 1)
+                if 'w' in perms and (not who or any(c in who for c in 'goa')):
+                    return True
+    return False
+
+
 def _check_docker(argv):
     """docker is inherently root-equivalent (run -v /:/host, --privileged, the
     docker.sock). We can't make it least-privilege in one pass — that's flagged
@@ -629,6 +1524,12 @@ def _check_docker(argv):
     # explicit read-only set.)
     if sub in ('--version', '-v', '--help', '-h'):
         return
+    # ops #645 W0: `docker container run …` / `docker image save …` are the same
+    # commands as `docker run …` / `docker save …`. Check them under their short
+    # name, or the run/create/exec/cp checks below never see them.
+    if sub in ('container', 'image'):
+        argv = _docker_normalize_object(argv)
+        sub = argv[1]
     allowed_sub = {
         'ps', 'inspect', 'logs', 'cp', 'exec', 'restart', 'start', 'stop',
         'rm', 'kill', 'network', 'compose', 'images', 'image', 'pull', 'version',
@@ -643,36 +1544,452 @@ def _check_docker(argv):
     if sub not in allowed_sub:
         raise Denied(f'docker subcommand not allowed: {sub}')
     if sub in ('run', 'create'):
-        joined = ' '.join(argv)
-        if '--privileged' in argv:
-            raise Denied('docker run/create --privileged denied')
-        for i, a in enumerate(argv):
-            if a in ('--pid', '--ipc', '--userns') and i + 1 < len(argv) and argv[i + 1] == 'host':
-                raise Denied(f'docker run/create {a}=host denied')
-            if a in ('--pid=host', '--ipc=host', '--userns=host'):
-                raise Denied(f'docker run/create {a} denied')
-            if a in ('-v', '--volume', '--mount'):
-                spec = argv[i + 1] if i + 1 < len(argv) else ''
-                _check_docker_mount(spec)
-            if a.startswith('-v=') or a.startswith('--volume=') or a.startswith('--mount='):
-                _check_docker_mount(a.split('=', 1)[1])
-        # docker.sock passthrough = host root
-        if '/var/run/docker.sock' in joined or '/run/docker.sock' in joined:
-            raise Denied('docker run/create mounting the docker socket denied')
+        _check_docker_container_flags(argv[2:], f'docker {sub}')
+    elif sub == 'exec':
+        _check_docker_exec_flags(argv[2:], 'docker exec')
+    elif sub == 'cp':
+        _check_docker_cp(argv)
+    elif sub == 'volume':
+        _check_docker_volume(argv)
+    elif sub == 'compose':
+        _check_docker_compose(argv)
+    elif sub in ('save', 'build', 'buildx'):
+        _check_docker_build_save(argv)
 
 
-def _check_docker_mount(spec):
+# ---------------------------------------------------------------------------
+# ops #645 W0 — docker escapes. Each of these was a one-command root shell on a
+# non-root box in ENFORCE mode (rulebook dry run on dev d67aa04):
+#   docker container run --privileged -v /:/host …   (the `container` form)
+#   docker run --cap-add SYS_ADMIN --device /dev/sda …
+#   docker exec --privileged <c> sh
+#   docker volume create --opt type=none --opt device=/etc --opt o=bind v
+#   docker compose run -v /:/host <svc>
+#   docker cp <c>:/x /etc/sudoers.d/x   (and docker cp /etc/shadow <c>:/x)
+# ---------------------------------------------------------------------------
+
+# `docker container <x>` / `docker image <x>` → the short command it is the same as.
+_DOCKER_CONTAINER_SUBS = {
+    'run': 'run', 'create': 'create', 'exec': 'exec', 'cp': 'cp', 'start': 'start',
+    'stop': 'stop', 'restart': 'restart', 'rm': 'rm', 'kill': 'kill', 'logs': 'logs',
+    'inspect': 'inspect', 'port': 'port', 'top': 'top', 'wait': 'wait', 'update': 'update',
+    'stats': 'stats', 'ls': 'ps', 'list': 'ps', 'ps': 'ps', 'prune': 'system',
+}
+_DOCKER_IMAGE_SUBS = {
+    'build': 'build', 'save': 'save', 'load': 'load', 'pull': 'pull', 'tag': 'tag',
+    'inspect': 'images', 'ls': 'images', 'list': 'images', 'rm': 'images',
+    'prune': 'images', 'history': 'images',
+}
+
+
+def _docker_normalize_object(argv):
+    """['docker', 'container'|'image', X, …] → ['docker', <short X>, …]. Anything
+    not in the two maps is refused (fail-closed)."""
+    obj = argv[1]
+    if len(argv) < 3:
+        raise Denied(f'docker {obj}: no subcommand')
+    table = _DOCKER_CONTAINER_SUBS if obj == 'container' else _DOCKER_IMAGE_SUBS
+    x = argv[2]
+    if x not in table:
+        raise Denied(f'docker {obj} subcommand not allowed: {x}')
+    return [argv[0], table[x]] + list(argv[3:])
+
+
+def _flag_split(tok):
+    """'--flag=value' → ('--flag', 'value'); '--flag' → ('--flag', None)."""
+    if tok.startswith('--') and '=' in tok:
+        k, v = tok.split('=', 1)
+        return k, v
+    return tok, None
+
+
+# Value-taking flags of run/create/exec/compose run whose VALUE is checked below.
+_DOCKER_NS_FLAGS = ('--pid', '--ipc', '--uts', '--userns', '--cgroupns', '--network', '--net')
+_DOCKER_SECOPT_OK = {'no-new-privileges', 'no-new-privileges:true', 'no-new-privileges=true'}
+# Flags that give a container host power or make root read/write a host file.
+# Refused outright on run/create/compose run (no console call site uses them):
+_DOCKER_DENY_FLAGS = {
+    '--privileged': 'gives the container full host access',
+    '--cap-add': 'adds kernel capabilities',
+    '--device': 'passes a host device',
+    '--device-cgroup-rule': 'opens host devices',
+    '--volumes-from': 'reuses another container\'s mounts',
+    '--runtime': 'picks a different container runtime',
+    '--env-file': 'makes root read a host file',
+    '--label-file': 'makes root read a host file',
+    '--cidfile': 'makes root write a host file',
+}
+# Every flag `docker run|create` / `docker compose run` may carry. A flag NOT in
+# one of these two sets is refused: a walker that guessed would read the value of an
+# unknown value-flag as the image name and stop checking the flags after it
+# (`docker run --gpus all --privileged …`).
+_DOCKER_RUN_VALUE_FLAGS = frozenset((
+    '-v', '--volume', '--mount', '-e', '--env', '-u', '--user', '-w', '--workdir',
+    '--entrypoint', '--name', '-p', '--publish', '-l', '--label', '--network', '--net',
+    '--pid', '--ipc', '--uts', '--userns', '--cgroupns', '--security-opt', '--cap-add',
+    '--cap-drop', '--device', '--restart', '--log-driver', '--log-opt', '-m', '--memory',
+    '--cpus', '--hostname', '-h', '--add-host', '--dns', '--tmpfs', '--platform',
+    '--pull', '--stop-signal', '--stop-timeout', '--shm-size', '--ulimit', '--group-add',
+    '--health-cmd', '--health-interval', '--health-retries', '--health-timeout',
+    '--health-start-period', '--health-start-interval',
+    '--network-alias', '--ip', '--ip6', '--mac-address', '--memory-swap',
+    '--memory-reservation', '--memory-swappiness', '--kernel-memory',
+    '--volumes-from', '--runtime', '--env-file', '--label-file', '--cidfile',
+    '--detach-keys', '--device-cgroup-rule', '-a', '--attach', '--expose', '--link',
+    '--sysctl', '--storage-opt', '--cpu-shares', '-c', '--cpuset-cpus', '--cpuset-mems',
+    '--cpu-period', '--cpu-quota', '--cpu-rt-period', '--cpu-rt-runtime',
+    '--blkio-weight', '--blkio-weight-device', '--device-read-bps', '--device-write-bps',
+    '--device-read-iops', '--device-write-iops', '--pids-limit', '--oom-score-adj',
+    '--gpus', '--isolation', '--domainname', '--dns-search', '--dns-option',
+    '--link-local-ip', '--annotation', '--cgroup-parent', '--init-path', '--index',
+))
+_DOCKER_RUN_BOOL_FLAGS = frozenset((
+    '--rm', '-d', '--detach', '-i', '--interactive', '-t', '--tty', '--init',
+    '--read-only', '--no-healthcheck', '--oom-kill-disable', '-P', '--publish-all',
+    '-q', '--quiet', '--sig-proxy', '--disable-content-trust', '--privileged',
+    '--use-api-socket',
+    # docker compose run
+    '--no-deps', '--service-ports', '--use-aliases', '--build', '--quiet-pull',
+    '--remove-orphans', '-T', '--no-TTY',
+))
+_DOCKER_EXEC_VALUE_FLAGS = frozenset((
+    '-e', '--env', '--env-file', '-u', '--user', '-w', '--workdir', '--detach-keys',
+    '--index'))
+_DOCKER_EXEC_BOOL_FLAGS = frozenset((
+    '-d', '--detach', '-i', '--interactive', '-t', '--tty', '--privileged', '-T',
+    '--no-TTY'))
+
+
+_DOCKER_SHORT_VALUE = set('veuwplhmca')
+_DOCKER_SHORT_BOOL = set('ditPqT')
+
+
+def _docker_walk_flags(args, value_flags, bool_flags, what):
+    """Yield (flag, value) for every flag before the first positional (image,
+    service or container name). value is None for a boolean flag without `=`.
+    Unknown flags are refused (fail-closed). Handles `--f=v`, `--f v`, `-v x`,
+    `-v/x` (attached) and bundled booleans `-it`; a bundle that holds a value flag
+    (`-dv /:/host`) is refused."""
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == '--' or not tok.startswith('-') or tok == '-':
+            return
+        k, v = _flag_split(tok)
+        if not tok.startswith('--') and len(tok) > 2:
+            if '-' + tok[1] in value_flags and tok[1] in _DOCKER_SHORT_VALUE:
+                k, v = '-' + tok[1], tok[2:].lstrip('=')
+            elif all('-' + c in bool_flags for c in tok[1:]):
+                for c in tok[1:]:
+                    yield '-' + c, None
+                i += 1
+                continue
+            else:
+                raise Denied(f'{what}: short flags not allowed in this form: {tok}')
+        if k in value_flags:
+            if v is None:
+                if i + 1 >= len(args):
+                    raise Denied(f'{what} {k}: missing value')
+                v = args[i + 1]
+                i += 1
+        elif k not in bool_flags:
+            raise Denied(f'{what}: flag not allowed: {k}')
+        yield k, v
+        i += 1
+
+
+def _check_docker_container_flags(args, what, compose=False):
+    """Flag checks for `docker run|create` and `docker compose run`. Only the
+    words BEFORE the image/service name are flags; the rest is the container's
+    own command and is not looked at (a container command is not host power)."""
+    if any('/var/run/docker.sock' in a or '/run/docker.sock' in a for a in args):
+        raise Denied(f'{what} mounting the docker socket denied')
+    for k, v in _docker_walk_flags(args, _DOCKER_RUN_VALUE_FLAGS, _DOCKER_RUN_BOOL_FLAGS, what):
+        if k == '--use-api-socket':
+            raise Denied(f'{what} --use-api-socket denied: mounts the docker socket')
+        if k in _DOCKER_DENY_FLAGS:
+            if not (k == '--privileged' and v is not None and v.lower() == 'false'):
+                raise Denied(f'{what} {k} denied: {_DOCKER_DENY_FLAGS[k]}')
+        if k in _DOCKER_NS_FLAGS and (v or '').strip().lower() == 'host':
+            raise Denied(f'{what} {k}=host denied: shares a host namespace')
+        if k == '--security-opt' and (v or '').strip() not in _DOCKER_SECOPT_OK:
+            raise Denied(f'{what} --security-opt {v!r} denied (only no-new-privileges)')
+        if k in ('-v', '--volume'):
+            _check_docker_mount(v or '', compose=compose)
+        if k == '--mount':
+            _check_docker_mount(v or '', mount_flag=True, compose=compose)
+
+
+def _check_docker_exec_flags(args, what):
+    """`docker exec` / `docker compose exec`: refuse --privileged (full host caps
+    for the exec'd process) and the host-file flags. -u 0 stays allowed: root
+    INSIDE an unprivileged container is not host root."""
+    for k, v in _docker_walk_flags(args, _DOCKER_EXEC_VALUE_FLAGS, _DOCKER_EXEC_BOOL_FLAGS, what):
+        if k == '--privileged' and not (v is not None and v.lower() == 'false'):
+            raise Denied(f'{what} --privileged denied: gives the process full host access')
+        if k == '--env-file':
+            raise Denied(f'{what} {k} denied: makes root read a host file')
+
+
+def _check_docker_volume(argv):
+    """`docker volume create` with driver options can bind any host dir (/etc)
+    into a named volume, which then passes the bind-mount check as a NAME.
+    Allow only a plain `docker volume create <name>`."""
+    if len(argv) < 3 or argv[2] != 'create':
+        return
+    rest = argv[3:]
+    for tok in rest:
+        if tok.startswith('-'):
+            raise Denied(f'docker volume create option denied: {tok} '
+                         '(driver options can bind host paths)')
+    if len(rest) > 1:
+        raise Denied('docker volume create: one name only')
+
+
+def _check_docker_build_save(argv):
+    """`docker save -o PATH` and `docker build -o PATH` write a host file as root;
+    `buildx --allow security.insecure` runs privileged build steps. Path-check the
+    output and refuse the insecure entitlement."""
+    for i, tok in enumerate(argv[2:], start=2):
+        k, v = _flag_split(tok)
+        if k in ('-o', '--output'):
+            if v is None:
+                v = argv[i + 1] if i + 1 < len(argv) else ''
+            dest = v
+            if argv[1] in ('build', 'buildx') and ('dest=' in v or 'type=' in v):
+                dest = ''
+                for part in v.split(','):
+                    if part.startswith('dest='):
+                        dest = part.split('=', 1)[1]
+                if not dest:
+                    continue            # type=image / type=registry: no host file
+            if dest == '-':
+                continue
+            _path_allowed(dest)
+        if k == '--allow' or (k.startswith('--allow') and 'insecure' in tok):
+            raise Denied(f'docker {argv[1]} --allow denied (privileged build steps)')
+        if argv[1] == 'buildx' and k in ('--driver-opt', '--buildkitd-flags'):
+            raise Denied(f'docker buildx {k} denied')
+
+
+def _docker_compose_split(argv):
+    """['docker','compose', <compose flags…>, SUB, <sub args…>] → (SUB, sub args)."""
+    i = 2
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith('-'):
+            k, v = _flag_split(a)
+            if k in _DOCKER_VALUE_FLAGS and v is None:
+                i += 1
+            i += 1
+            continue
+        return a, argv[i + 1:]
+    return None, []
+
+
+def _check_docker_compose(argv):
+    """`docker compose run` takes the same host-power flags as `docker run`
+    (-v /:/host, --cap-add …), and `compose exec` takes --privileged. W0 checks
+    those flags. The compose FILE itself is not validated yet (W3)."""
+    sub, rest = _docker_compose_split(argv)
+    if sub == 'run':
+        _check_docker_container_flags(rest, 'docker compose run', compose=True)
+    elif sub == 'exec':
+        _check_docker_exec_flags(rest, 'docker compose exec')
+    elif sub == 'cp':
+        raise Denied('docker compose cp denied (use docker cp, which is path-checked)')
+
+
+# docker cp: only these flags. -L/--follow-link makes the CLI follow a symlink in
+# the source path, which turns a console-planted link into a read of any file.
+_DOCKER_CP_FLAGS = {'-a', '--archive', '-q', '--quiet'}
+
+
+def _docker_cp_is_container(arg):
+    """docker's own rule: a path that starts with / or . is local; otherwise
+    NAME:PATH (NAME without a slash) is a container path."""
+    if arg == '-' or arg.startswith(('/', '.')):
+        return False
+    head, sep, _ = arg.partition(':')
+    return bool(sep) and bool(head) and '/' not in head
+
+
+def _docker_cp_parts(argv):
+    """-> (src, dst, src_is_container) or raise Denied."""
+    pos = []
+    for tok in argv[2:]:
+        if tok.startswith('-') and tok != '-':
+            if tok not in _DOCKER_CP_FLAGS:
+                raise Denied(f'docker cp option denied: {tok}')
+            continue
+        pos.append(tok)
+    if len(pos) != 2:
+        raise Denied('docker cp needs exactly SRC and DEST')
+    src, dst = pos
+    sc, dc = _docker_cp_is_container(src), _docker_cp_is_container(dst)
+    if sc == dc:
+        raise Denied('docker cp: exactly one side must be a container path')
+    return src, dst, sc
+
+
+def _docker_cp_host_direct(path, readonly):
+    """True when ROOT may touch this host path itself: '-' (stdin/stdout) or a path
+    the read/write allowlist admits. Any other host path is still allowed, but the
+    host side then runs as the console user (see _docker_cp_staged), so it can
+    reach only what that user can reach anyway."""
+    if path == '-':
+        return True
+    try:
+        _path_allowed(path, readonly=readonly)
+        return True
+    except Denied:
+        return False
+
+
+def _check_docker_cp(argv):
+    """`docker cp` runs as root, so its HOST side was a read or write of any file
+    (`docker cp c:/x /etc/sudoers.d/x` = root). The host path must be absolute or
+    '-'. Allowlisted paths run as before; anything else is staged through the
+    console user by _do_exec (no root access to that path at all)."""
+    src, dst, src_is_container = _docker_cp_parts(argv)
+    host = dst if src_is_container else src
+    if host != '-':
+        p = _abs(host)                  # absolute, no NUL, no '..'
+        # The deny-list is never a docker cp target or source, staged or not.
+        if p in PATH_DENY_EXACT or any(p.startswith(d) for d in PATH_DENY_PREFIX):
+            raise Denied(f'docker cp host path is in the deny-list: {p}')
+
+
+def _docker_cp_staged(argv, timeout):
+    """Run a `docker cp` whose host path is NOT on the allowlist, without root ever
+    opening that path. Root copies between the container and a fresh root-owned
+    staging dir; the console user (setuid child, its own permissions) copies between
+    the staging dir and the host path. Returns a subprocess.CompletedProcess.
+
+    host -> container: user `cp -rP SRC STAGE/` ; root re-owns STAGE ;
+                       root `docker cp STAGE/<name> C:PATH`
+    container -> host: root `docker cp C:PATH STAGE/` ; STAGE handed to the user ;
+                       user `cp -rP STAGE/<name> DEST`"""
+    src, dst, src_is_container = _docker_cp_parts(argv)
+    flags = [t for t in argv[2:] if t in _DOCKER_CP_FLAGS]
+    pw = pwd.getpwnam(BROKER_USER)
+    os.makedirs(_CP_STAGE_ROOT, mode=0o711, exist_ok=True)
+    if os.path.islink(_CP_STAGE_ROOT) or not os.path.isdir(_CP_STAGE_ROOT):
+        raise Denied('docker cp staging dir is not a plain directory')
+    os.chown(_CP_STAGE_ROOT, 0, 0)
+    os.chmod(_CP_STAGE_ROOT, 0o711)
+    stage = tempfile.mkdtemp(prefix='cp-', dir=_CP_STAGE_ROOT)   # root 0700
+    user_env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C', 'HOME': '/'}
+
+    def _as_user(cmd):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, cwd='/',
+                              env=user_env, user=pw.pw_uid, group=pw.pw_gid,
+                              extra_groups=[])
+
+    def _own_tree(top, uid, gid):
+        for d, dirs, files in os.walk(top, followlinks=False):
+            for n in dirs + files:
+                os.lchown(os.path.join(d, n), uid, gid)
+        os.lchown(top, uid, gid)
+
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH) or 'docker'
+    try:
+        if src_is_container:
+            cpath = src.split(':', 1)[1]
+            dot = cpath.endswith('/.')
+            name = 'content' if dot else (os.path.basename(cpath.rstrip('/')) or 'content')
+            if dot:
+                os.mkdir(os.path.join(stage, 'content'), 0o700)
+            r = subprocess.run([docker, 'cp'] + flags + [src, stage + '/'],
+                               capture_output=True, timeout=timeout)
+            if r.returncode != 0:
+                return r
+            _own_tree(stage, pw.pw_uid, pw.pw_gid)
+            staged = os.path.join(stage, name) + ('/.' if dot else '')
+            return _as_user(['cp', '-rP', '--', staged, dst])
+        # host -> container
+        os.chown(stage, pw.pw_uid, pw.pw_gid)
+        norm = src.rstrip('/')
+        dot = norm.endswith('/.')
+        base = os.path.basename(norm[:-2] if dot else norm) or 'content'
+        r = _as_user(['cp', '-rP', '--no-preserve=ownership', '--',
+                      norm[:-2] if dot else norm, os.path.join(stage, base)])
+        if r.returncode != 0:
+            return r
+        _own_tree(stage, 0, 0)
+        os.chmod(stage, 0o700)
+        staged = os.path.join(stage, base) + ('/.' if dot else '')
+        if src.endswith('/') and not dot:
+            staged += '/'
+        return subprocess.run([docker, 'cp'] + flags + [staged, dst],
+                              capture_output=True, timeout=timeout)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+# tmpfs, root 0711: the console user can enter its own staging dir but not list others.
+_CP_STAGE_ROOT = '/run/takwerx-broker-cp'
+
+
+def _docker_cp_needs_stage(argv):
+    """True for a docker cp whose host side is not on the allowlist."""
+    if not argv or os.path.basename(argv[0]) != 'docker' or len(argv) < 2:
+        return False
+    a = list(argv)
+    if a[1] == 'container' and len(a) > 2 and a[2] == 'cp':
+        a = [a[0], 'cp'] + a[3:]
+    if a[1] != 'cp':
+        return False
+    try:
+        src, dst, src_is_container = _docker_cp_parts(a)
+    except Denied:
+        return False
+    if src_is_container:
+        return not _docker_cp_host_direct(dst, readonly=False)
+    return not _docker_cp_host_direct(src, readonly=True)
+
+
+# Bind sources `docker compose run` may use beyond the generic check: the console
+# user's own home and /tmp (CloudTAK's build step mounts both — audit logs on test6
+# and test12). A root container with a rw bind of a console-writable dir is still
+# near-root (setuid drop); W3 replaces this with a validated compose model.
+_COMPOSE_RUN_BIND_OK = (_CONV_HOME, '/tmp')
+
+
+def _check_docker_mount(spec, mount_flag=False, compose=False):
     """Reject bind mounts of sensitive host paths in a -v/--mount spec."""
     src = ''
-    if spec.startswith('type='):  # --mount form: type=bind,source=/x,...
+    if mount_flag or spec.startswith('type='):  # --mount form: key=value,…
+        kind = 'volume'
         for part in spec.split(','):
-            if part.startswith(('source=', 'src=')):
-                src = part.split('=', 1)[1]
+            k, _, v = part.partition('=')
+            k = k.strip()
+            if k in ('source', 'src'):
+                src = v
+            elif k == 'type':
+                kind = v
+            elif k.startswith('volume-opt') or k == 'volume-driver':
+                # ops #645 W0: an inline volume with driver options can bind any
+                # host path (o=bind,device=/etc) under a volume NAME.
+                raise Denied(f'docker --mount {k} denied (can bind host paths)')
+        if kind == 'bind' and not src.startswith('/'):
+            raise Denied(f'docker --mount bind source must be absolute: {src!r}')
     else:                          # -v form: SRC:DST[:opts]
+        if ':' not in spec:
+            return                 # `-v /data`: an anonymous volume at a container path
         src = spec.split(':', 1)[0]
+    if src.startswith(('.', '~')) or ('/' in src and not src.startswith('/')):
+        # relative host path: resolved against a cwd the caller chooses
+        raise Denied(f'docker bind mount with a relative host path denied: {src}')
     if not src.startswith('/'):
         return                     # named volume, not a host bind
     real = os.path.normpath(src)
+    if compose:
+        for ok in _COMPOSE_RUN_BIND_OK:
+            if real == ok or real.startswith(ok + '/'):
+                if _within_realpath(src, ok):
+                    return
+                raise Denied(f'docker compose run bind escapes {ok} via symlink: {src}')
     # The console's own TAK bundle dir is the LEGIT /opt/tak source mount — it is
     # under takwerx's HOME (not a root /opt path) only because the non-root
     # console unzips it there. Allow this one subtree before the /home denial, but
@@ -762,6 +2079,14 @@ def check_exec(argv, cwd=None):
         _check_wpa_cli(argv)
     elif base == 'chown':
         _check_chown(argv, cwd)
+    elif base == 'ip':
+        _check_ip(argv)
+    elif base == 'dpkg':
+        _check_dpkg(argv)
+    elif base == 'fail2ban-client':
+        _check_fail2ban_client(argv)
+    elif base == 'postconf':
+        _check_postconf(argv)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
@@ -805,9 +2130,9 @@ def _check_iw(argv):
     rest = argv[1:]
     if rest == ['dev']:
         return
-    if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.match(rest[1]):
+    if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.fullmatch(rest[1]):
         return
-    if len(rest) == 4 and rest[0] == 'dev' and rest[2] == 'scan' and rest[3] == 'dump' and _IFACE_RE.match(rest[1]):
+    if len(rest) == 4 and rest[0] == 'dev' and rest[2] == 'scan' and rest[3] == 'dump' and _IFACE_RE.fullmatch(rest[1]):
         return
     raise Denied('iw: only `iw dev` and `iw dev <iface> scan [dump]` allowed')
 
@@ -821,7 +2146,7 @@ def _check_wpa_cli(argv):
     save_config, p2p, wps, raw `set` — is denied. iface matches the strict regex;
     the network id is numeric; `enable_network` takes `all` or a numeric id."""
     r = argv[1:]
-    if len(r) >= 3 and r[0] == '-i' and _IFACE_RE.match(r[1]):
+    if len(r) >= 3 and r[0] == '-i' and _IFACE_RE.fullmatch(r[1]):
         verb = r[2]
         rest = r[3:]
         if verb == 'list_networks' and not rest:
@@ -900,7 +2225,7 @@ def _check_nmcli(argv):
     if (len(rest) >= 12
             and rest[0:5] == ['connection', 'add', 'type', 'wifi', 'con-name']
             and _free(rest[5]) and rest[6] == 'ifname'
-            and (rest[7] == '*' or _IFACE_RE.match(rest[7]))
+            and (rest[7] == '*' or _IFACE_RE.fullmatch(rest[7]))
             and rest[8] == 'ssid' and _free(rest[9])
             and rest[10:12] == ['connection.autoconnect', 'yes']):
         tail = rest[12:]
@@ -957,6 +2282,630 @@ def _check_pkgmgr(argv):
         raise Denied(f'{argv[0]}: no subcommand')
     if sub not in PKGMGR_SUBCMDS:
         raise Denied(f'{argv[0]} subcommand not allowed: {sub}')
+    # ops #645 W0 part 2: options. `dnf --config=X` / `--installroot` /
+    # `--repofrompath` / `--nogpgcheck`, `apt-get --allow-unauthenticated` and
+    # friends point the package manager at config, plugins or packages of the
+    # caller's choosing (root code). Only the options the console uses pass.
+    base = os.path.basename(argv[0])
+    for a in argv[1:]:
+        if not a.startswith('-') or a.startswith('--setopt='):
+            continue
+        if a in _PKGMGR_FLAGS:
+            continue
+        if a.startswith(_PKGMGR_VALUE_FLAGS):
+            v = a.split('=', 1)[1]
+            if not v or not _PKGMGR_VALUE_RE.fullmatch(v):
+                raise Denied(f'{argv[0]}: option value not allowed: {a}')
+            continue
+        if (base in ('apt', 'apt-get') and len(a) > 2 and a[0] == '-' and a[1] != '-'
+                and set(a[1:]) <= _APT_SHORT_BUNDLE):
+            continue                     # -qq, -qy, -yq
+        raise Denied(f'{argv[0]}: option not allowed: {a}')
+    pos = [a for a in argv[1:] if not a.startswith('-')]
+    if sub == 'config-manager' and '--add-repo' in argv:
+        for a in pos[1:]:
+            if not a.startswith(_PKG_REPO_URL_PREFIXES) or '..' in a:
+                raise Denied(f'{argv[0]} config-manager --add-repo: repo URL not on the allow-list: {a}')
+    if sub == 'copr' and pos[1:] != ['enable', '@caddy/caddy']:
+        raise Denied(f'{argv[0]} copr: only `enable @caddy/caddy` is allowed')
+    # ops #645 W0: `apt-get install ./x.deb` / `dnf install /home/…/x.rpm` /
+    # `dnf install https://anywhere/x.rpm` install a package of the CALLER's
+    # choosing, and its scripts run as root. Package NAMES resolve through the
+    # configured, signed repos; a URL must be one of the fixed repo-RPM sources
+    # the console uses. A LOCAL file must be a .deb (apt) or .rpm (dnf/yum) and
+    # is checked as root at run time, in both modes (_pkg_stage_verified): a TAK
+    # Server package signed with the pinned TAK release key, or the Caddy .deb
+    # matching Caddy's published SHA-512. Anything else is refused there.
+    if sub in _PKG_INSTALL_SUBS:
+        for a in pos[1:]:
+            if '://' in a:
+                if not a.startswith(_PKG_URL_PREFIXES) or '..' in a or '@' in a.split('://', 1)[1].split('/', 1)[0]:
+                    raise Denied(f'{argv[0]} {sub}: package URL not on the allow-list: {a}')
+                continue
+            if _pkg_arg_is_file(a):
+                want = '.deb' if base in ('apt', 'apt-get') else '.rpm'
+                if not a.endswith(want):
+                    raise Denied(f'{argv[0]} {sub}: only a {want} package file can be installed from a path: {a}')
+                if not _PKG_FILE_NAME_RE.fullmatch(os.path.basename(a)):
+                    raise Denied(f'{argv[0]} {sub}: {_pkg_name_hint(os.path.basename(a))}')
+
+
+# The only package URLs the console installs (repo-release RPMs, RHEL family).
+_PKG_URL_PREFIXES = (
+    'https://dl.fedoraproject.org/pub/epel/',
+    'https://download.postgresql.org/pub/repos/yum/reporpms/',
+    'https://download1.rpmfusion.org/free/el/',
+)
+
+# ops #645 W0 part 2 — package-manager options, repos and local package files.
+_PKG_INSTALL_SUBS = ('install', 'reinstall', 'upgrade', 'localinstall')
+# Options the console uses (static scan of app.py/modules + test6/test12 audit logs),
+# plus harmless output/answer switches. Everything else is refused, above all
+# -c/--config, --installroot, --repofrompath, --nogpgcheck, --allow-unauthenticated,
+# --downloaddir/--destdir, --enableplugin, --forcearch.
+_PKGMGR_FLAGS = frozenset({
+    '-y', '--yes', '--assume-yes', '--assumeyes', '-q', '-qq', '--quiet',
+    '--assumeno', '--assume-no', '-C', '--cacheonly', '-v', '--verbose',
+    '-s', '--simulate', '--dry-run', '--just-print', '--refresh',
+    '--allow-downgrades', '--reinstall', '--purge', '--auto-remove', '--autoremove',
+    '--no-install-recommends', '--no-install-suggests', '-f', '--fix-broken',
+    '-m', '--fix-missing', '--only-upgrade', '--no-remove', '--with-new-pkgs',
+    '--upgradable', '--installed', '--all', '--available', '--enabled', '--disabled',
+    '--security', '--nobest', '--best', '--allowerasing', '--skip-broken',
+    '--set-enabled', '--set-disabled', '--add-repo', '--enable', '--disable',
+})
+_PKGMGR_VALUE_FLAGS = ('--exclude=', '--enablerepo=', '--disablerepo=')
+_PKGMGR_VALUE_RE = re.compile(r'^[A-Za-z0-9_.+*?,:@-]+$')     # names and globs, no '/'
+_APT_SHORT_BUNDLE = frozenset('yqfsm')
+# `dnf config-manager --add-repo` (Docker CE on the RHEL family).
+_PKG_REPO_URL_PREFIXES = ('https://download.docker.com/linux/',)
+# A package FILE name: what TAK.gov and Caddy publish (letters, digits, . _ + ~ -).
+# The console's upload route saves names through werkzeug secure_filename (spaces
+# become _, brackets go), so a browser's "takserver_…_all (1).deb" arrives as
+# "takserver_…_all_1.deb" and passes. A file copied in by hand may not.
+_PKG_FILE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+~-]*\.(deb|rpm)$')
+
+
+def _pkg_name_hint(name):
+    """Plain refusal text for a package file whose NAME fails _PKG_FILE_NAME_RE."""
+    return (f'package file "{name[:120]}" was not installed: its name has characters '
+            f'infra-TAK does not accept. A package file name may use only letters, '
+            f'digits and . _ + ~ - and must start with a letter or digit. Rename the '
+            f'file (for example, remove spaces and brackets such as " (1)"), or upload '
+            f'it again from the console page, then try again. Nothing was installed.')
+
+
+def _pkg_arg_is_file(a):
+    """True when apt/dnf would read this package argument as a local file: it has
+    a '/', or ends in a package-file suffix (apt and dnf both take `x.deb` /
+    `x.rpm` in the working directory as a file)."""
+    return '://' not in a and ('/' in a or a.endswith(
+        ('.deb', '.udeb', '.ddeb', '.rpm', '.dsc', '.changes')))
+
+
+# The TAK Server release key. TAK.gov signs every takserver .deb (debsig
+# `_gpgorigin`) and .rpm with it. Taken from the debsig keyring TAK's own install
+# steps create (/usr/share/debsig/keyrings/F06237936851F5B5/debsig.gpg), same on
+# test6 and test12, and it verifies takserver_5.8-RELEASE84 (.deb and .rpm).
+# If TAK.gov ever rotates it, a TAK install from a file stops with
+# _TAK_KEY_CHANGED_HINT until infra-TAK ships the new key here.
+_TAK_PKG_KEY_FPR = '71C03345F393DBD0E03AEB2BF06237936851F5B5'
+_TAK_PKG_KEY_ASC = '''\
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQGNBGAwFLcBDADAeSns0R5l4dJpsHy7N0ZXjA8vm6MBrmRR6Fym+UNY0+wUwNwJ
+Y41fRwstBQ2ZhzNYQDI1bwjUoVbDi4w2Db+BjutglpVmTt7sEHnhP+U/SfSXT1LW
+3zx8qGJa0UCx+ktxokCM78qtiB0K5NBDw8QJfMep1r0GNE/t/wpnWmOBOw2BHdVE
+8NJyyW37HB+Zi8ASswYMK31JebvBTU078a7sf97QQtxMa2afwuEX2iwhQhz3nEeZ
+O11hSa6Yrbq1wQzI6JTAPhQKcbcocjJyzv/nsJzhXMRMoFnruZHsXn5PtGlWy+EC
+6MZbygyY64fH0xB3ruzyCyKj5EidcA5OrxBd1albeRfq3Uu1XLLlZoeTTkePpUlb
+K/GsBYwLRb7uYleCNn5FQfyB84vsQibLcxDpWIwUu5jmbvTFTvmETXZaZw7wUdiI
+gRNRL+dbByPHbtdtEXPKUrDOEaKER7gZmD+GmgXUTwL3pen2H81hvmFtU3FMqWNo
+P8Nmy1Clmk+tKKkAEQEAAbQ3VEFLIFByb2R1Y3QgQ2VudGVyIFRBSyBTZXJ2ZXIg
+UmVsZWFzZSA8c3VwcG9ydEB0YWsuZ292PokBzgQTAQgAOBYhBHHAM0Xzk9vQ4Drr
+K/BiN5NoUfW1BQJgMBS3AhsvBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJEPBi
+N5NoUfW1cO0L/R9cYeDa8vdhFGKU9vgBmi8h8zRkZMXyRK4Avt5tMyfftbZfkE+R
+lWMxf4U6bO1TSZw9BhWxtWKxVMB+B7YeZ7ua2n5y0cdofcIh13MvA0JIkW4yUqFH
+hnoGyQNpyiio8pmlzElmw4bngrX0tq/l4F5x9y/bvJ2lrIjv9SjTWClj03RDcbUY
+qBStbKBuxQIF5FCaSyp4WKd00Qx1rmE3Pea/SArcqXzKGCoovL8/zd1y5xvWHah7
+I/X+AqRWcvnaEnKqBJ1J9sWot79fV1lHQsx5GLjPcg5AkDaVvi2zCvs+Ppa442uF
+A2Q3oGxGypMs4RnGb7isre928okIdqQCsosHT6601AdtuvGTcG6zzMbhf0DajnFV
+zmrLeAWTJXBOdQoR27wjRSeMihGpZpytP/athCkcLRMXc74xuxWFYWZ76QmekxyV
+Z4mle/EyVr3yg1+XU2q7QyG0BpYCrdkBKutO4hJihZreDq8udLtzCrkyKJTCxe0g
+xA09pVPS+bAzGA==
+=Heiq
+-----END PGP PUBLIC KEY BLOCK-----
+'''
+_TAK_KEY_CHANGED_HINT = (
+    'If TAK.gov now signs its packages with a new key, update infra-TAK (Update Now) '
+    'to a version that knows the new key, then run this again. Nothing was installed.')
+# Caddy's own GitHub release .deb (the fallback install when Cloudsmith is down).
+_CADDY_DEB_RE = re.compile(r'^caddy_(\d+\.\d+\.\d+)_linux_(amd64|arm64|armv[5-7]|386|ppc64le|s390x|riscv64)\.deb$')
+_CADDY_SUMS_URL = 'https://github.com/caddyserver/caddy/releases/download/v{ver}/caddy_{ver}_checksums.txt'
+# Root-only staging dir: the package root installs is a copy only root can change.
+_PKG_STAGE_ROOT = '/var/lib/takwerx-broker/pkg-stage'
+
+
+def _fpr_spaced(fpr):
+    return ' '.join(fpr[i:i + 4] for i in range(0, len(fpr), 4))
+
+
+def _pkg_refuse(name, why):
+    raise Denied(f'package file {name} was not installed: {why}')
+
+
+def _tak_key_packets():
+    """The pinned TAK key as binary OpenPGP packets (a keyring gpgv accepts)."""
+    body = [ln.strip() for ln in _TAK_PKG_KEY_ASC.strip().splitlines()[1:-1]]
+    body = [ln for ln in body if ln and ':' not in ln and not ln.startswith('=')]
+    return base64.b64decode(''.join(body))
+
+
+def _ar_members(f):
+    """[(name, offset, size)] of a Debian package (an `ar` archive)."""
+    if f.read(8) != b'!<arch>\n':
+        raise ValueError('not a Debian package (no ar header)')
+    out = []
+    while True:
+        h = f.read(60)
+        if not h:
+            return out
+        if len(h) != 60 or h[58:60] != b'`\n':
+            raise ValueError('damaged Debian package (bad ar member header)')
+        name = h[0:16].decode('ascii', 'replace').strip().rstrip('/')
+        size = int(h[48:58].decode('ascii', 'replace').strip() or '-1')
+        if size < 0:
+            raise ValueError('damaged Debian package (bad ar member size)')
+        off = f.tell()
+        out.append((name, off, size))
+        f.seek(off + size + (size & 1))
+
+
+def _gpgv_tak(sig_path, feed, workdir, name):
+    """Run gpgv on `sig_path` against the pinned TAK key only; `feed(stdin)` writes
+    the signed bytes. Refuses (Denied) unless the signature is good and made by
+    the pinned key."""
+    gpgv = shutil.which('gpgv', path=BROKER_TRUSTED_PATH)
+    if not gpgv:
+        _pkg_refuse(name, 'gpgv is not installed, so its TAK signature cannot be checked')
+    ring = os.path.join(workdir, 'tak-release.gpg')
+    with open(ring, 'wb') as k:
+        k.write(_tak_key_packets())
+    env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C', 'GNUPGHOME': workdir}
+    p = subprocess.Popen([gpgv, '--status-fd', '1', '--keyring', ring, sig_path, '-'],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env, cwd=workdir)
+    try:
+        feed(p.stdin)
+    except BrokenPipeError:
+        pass
+    except BaseException:
+        p.kill()
+        p.wait()
+        raise
+    finally:
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+    status = p.stdout.read().decode('ascii', 'replace')
+    rc = p.wait()
+    _tak_sig_verdict(rc, status, name)
+
+
+def _tak_sig_verdict(rc, status, name):
+    """Judge gpgv --status-fd output. Good = exit 0, GOODSIG, and a VALIDSIG whose
+    primary-key fingerprint is the pinned TAK key."""
+    lines = [ln.split() for ln in status.splitlines() if ln.startswith('[GNUPG:] ')]
+    valid = [ln for ln in lines if len(ln) > 2 and ln[1] == 'VALIDSIG']
+    good = any(len(ln) > 1 and ln[1] == 'GOODSIG' for ln in lines)
+    if rc == 0 and good and valid and all(
+            ln[-1].upper() == _TAK_PKG_KEY_FPR for ln in valid):
+        return
+    other = [ln[2] for ln in lines if len(ln) > 2 and ln[1] in ('ERRSIG', 'NO_PUBKEY')]
+    bad = any(len(ln) > 1 and ln[1] == 'BADSIG' for ln in lines)
+    want = f'the TAK Server release key ({_fpr_spaced(_TAK_PKG_KEY_FPR)})'
+    if bad:
+        _pkg_refuse(name, f'its signature does not match its content (damaged or changed '
+                          f'after TAK.gov signed it). Download it again from TAK.gov.')
+    if other:
+        _pkg_refuse(name, f'it is signed with key {other[0]}, not {want}. {_TAK_KEY_CHANGED_HINT}')
+    _pkg_refuse(name, f'it has no valid signature from {want}. Only TAK Server packages '
+                      f'from TAK.gov (and the Caddy .deb from Caddy\'s GitHub release) can be '
+                      f'installed from a file.')
+
+
+def _verify_tak_deb(path, name, workdir):
+    """debsig origin signature: `_gpgorigin` signs debian-binary + control.tar.* +
+    data.tar.* (in that order). The member list must be exactly that shape, so
+    dpkg installs exactly the bytes that were checked."""
+    with open(path, 'rb') as f:
+        try:
+            mem = _ar_members(f)
+        except ValueError as e:
+            _pkg_refuse(name, str(e))
+        names = [m[0] for m in mem]
+        signed = [m for m in mem if not m[0].startswith('_gpg')]
+        ok_shape = (len(signed) == 3 and signed[0][0] == 'debian-binary'
+                    and re.fullmatch(r'^control\.tar(\.(gz|xz|zst))?$', signed[1][0])
+                    and re.fullmatch(r'^data\.tar(\.(gz|xz|zst|bz2|lzma))?$', signed[2][0])
+                    and names[:3] == [m[0] for m in signed])
+        sig = [m for m in mem if m[0] == '_gpgorigin']
+        if not sig:
+            _pkg_refuse(name, f'it has no TAK.gov signature (no _gpgorigin). Only TAK Server '
+                              f'packages from TAK.gov (and the Caddy .deb from Caddy\'s GitHub '
+                              f'release) can be installed from a file.')
+        if not ok_shape or len(sig) != 1:
+            _pkg_refuse(name, f'unexpected package layout {names}')
+        f.seek(sig[0][1])
+        sig_path = os.path.join(workdir, '_gpgorigin')
+        with open(sig_path, 'wb') as s:
+            s.write(f.read(min(sig[0][2], 1 << 16)))
+
+        def feed(stdin):
+            for _n, off, size in signed:
+                f.seek(off)
+                left = size
+                while left:
+                    b = f.read(min(1 << 20, left))
+                    if not b:
+                        raise ValueError('truncated package')
+                    left -= len(b)
+                    stdin.write(b)
+        try:
+            _gpgv_tak(sig_path, feed, workdir, name)
+        except ValueError as e:
+            _pkg_refuse(name, str(e))
+
+
+def _verify_tak_rpm(path, name, workdir):
+    """rpm: check the signature with a throwaway rpm database that holds ONLY the
+    pinned TAK key, so a good signature can only be TAK's."""
+    rpmkeys = shutil.which('rpmkeys', path=BROKER_TRUSTED_PATH)
+    if not rpmkeys:
+        _pkg_refuse(name, 'rpmkeys is not installed, so its TAK signature cannot be checked')
+    db = os.path.join(workdir, 'rpmdb')
+    os.mkdir(db, 0o700)
+    asc = os.path.join(workdir, 'tak-release.asc')
+    with open(asc, 'w') as k:
+        k.write(_TAK_PKG_KEY_ASC)
+    env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'}
+    r = subprocess.run([rpmkeys, '--dbpath', db, '--import', asc], capture_output=True,
+                       text=True, timeout=120, env=env, cwd=workdir)
+    if r.returncode != 0:
+        _pkg_refuse(name, f'could not load the TAK key for the check: {(r.stderr or r.stdout).strip()[:200]}')
+    r = subprocess.run([rpmkeys, '--dbpath', db, '--checksig', '-v', path], capture_output=True,
+                       text=True, timeout=900, env=env, cwd=workdir)
+    _tak_rpm_verdict(r.returncode, (r.stdout or '') + (r.stderr or ''), name)
+
+
+def _tak_rpm_verdict(rc, out, name):
+    kid = _TAK_PKG_KEY_FPR[-8:].lower()
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    sig_ok = [ln for ln in lines if re.search(r'Signature, key ID ([0-9a-f]+): OK$', ln)]
+    bad = any(re.search(r': (NOT OK|BAD|NOKEY|NOTTRUSTED|NOTFOUND)\b', ln) for ln in lines)
+    if rc == 0 and sig_ok and all(f'key ID {kid}: OK' in ln for ln in sig_ok) and not bad:
+        return
+    want = f'the TAK Server release key ({_fpr_spaced(_TAK_PKG_KEY_FPR)})'
+    nokey = re.search(r'key ID ([0-9a-f]+): NOKEY', out)
+    if nokey and nokey.group(1) != kid:
+        _pkg_refuse(name, f'it is signed with key {nokey.group(1)}, not {want}. {_TAK_KEY_CHANGED_HINT}')
+    if bad and not nokey:
+        _pkg_refuse(name, 'its signature or digest does not match its content (damaged or '
+                          'changed after TAK.gov signed it). Download it again from TAK.gov.')
+    _pkg_refuse(name, f'it has no valid signature from {want}. Only TAK Server packages '
+                      f'from TAK.gov can be installed from a file.')
+
+
+def _verify_caddy_deb(path, name, m):
+    """Caddy's GitHub release .deb: SHA-512 must match the release checksums file,
+    fetched here by root over HTTPS (the console's copy of it is not trusted)."""
+    import urllib.request
+    ver = m.group(1)
+    url = _CADDY_SUMS_URL.format(ver=ver)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            sums = r.read(1 << 20).decode('utf-8', 'replace')
+    except Exception as e:  # noqa: BLE001 — any fetch failure refuses the install
+        _pkg_refuse(name, f'could not fetch Caddy\'s checksum file ({url}): {type(e).__name__}')
+    want = next((ln.split()[0].lower() for ln in sums.splitlines()
+                 if len(ln.split()) == 2 and ln.split()[1] == name), None)
+    if not want:
+        _pkg_refuse(name, f'it is not listed in Caddy\'s v{ver} checksum file')
+    h = hashlib.sha512()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    if h.hexdigest() != want:
+        _pkg_refuse(name, f'its SHA-512 does not match Caddy\'s v{ver} checksum file')
+
+
+def _pkg_local_files(argv, cwd):
+    """[(argv index, absolute path)] of the local package-file args of an
+    apt/dnf/yum install. Relative paths resolve against the request cwd."""
+    if not argv or os.path.basename(argv[0]) not in ('apt', 'apt-get', 'dnf', 'yum'):
+        return []
+    base_cwd = cwd if (isinstance(cwd, str) and cwd.startswith('/')) else '/'
+    sub, out = None, []
+    for i, a in enumerate(argv[1:], 1):
+        if a.startswith('-'):
+            continue
+        if sub is None:
+            sub = a
+            if sub not in _PKG_INSTALL_SUBS:
+                return []
+            continue
+        if _pkg_arg_is_file(a):
+            out.append((i, os.path.normpath(a if a.startswith('/') else os.path.join(base_cwd, a))))
+    return out
+
+
+def _pkg_stage_verified(argv, cwd, timeout):
+    """ops #645 W0 part 2 (both modes): for an install that names local package
+    files, copy each one AS THE CONSOLE USER into a fresh root-only dir, check the
+    copy as root, and return (argv pointing at the checked copies, stage dir).
+    Root never opens the caller's path, and the console cannot change the copy
+    between the check and the install. Returns (argv, None) when there is no
+    local file. Raises Denied with a plain reason when a file fails its check."""
+    files = _pkg_local_files(argv, cwd)
+    if not files:
+        return argv, None
+    pw = pwd.getpwnam(BROKER_USER)
+    os.makedirs(_PKG_STAGE_ROOT, mode=0o711, exist_ok=True)
+    if os.path.islink(_PKG_STAGE_ROOT) or not os.path.isdir(_PKG_STAGE_ROOT):
+        raise Denied('package staging dir is not a plain directory')
+    os.chown(_PKG_STAGE_ROOT, 0, 0)
+    os.chmod(_PKG_STAGE_ROOT, 0o711)
+    _pkg_stage_sweep()
+    stage = tempfile.mkdtemp(prefix='pkg-', dir=_PKG_STAGE_ROOT)    # root 0700
+    try:
+        new = list(argv)
+        user_env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C', 'HOME': '/'}
+        groups = os.getgrouplist(pw.pw_name, pw.pw_gid)
+        for idx, src in files:
+            name = os.path.basename(src)
+            if not _PKG_FILE_NAME_RE.fullmatch(name):
+                raise Denied(_pkg_name_hint(name))
+            _pkg_stage_space_check(src, name, pw, groups, user_env)
+            work = tempfile.mkdtemp(prefix='chk-', dir=stage)
+            dst = os.path.join(stage, name)
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as out:
+                r = subprocess.run(['cat', '--', src], stdout=out, stderr=subprocess.PIPE,
+                                   timeout=timeout, cwd='/', env=user_env, user=pw.pw_uid,
+                                   group=pw.pw_gid, extra_groups=groups)
+            if r.returncode != 0:
+                err = (r.stderr or b'').decode('utf-8', 'replace').strip()[:200]
+                if 'No space left' in err:
+                    _pkg_refuse(name, _pkg_space_msg(None, None))
+                _pkg_refuse(name, f'{BROKER_USER} cannot read {src}: {err}')
+            m = _CADDY_DEB_RE.fullmatch(name)
+            if m and os.path.basename(argv[0]) in ('apt', 'apt-get'):
+                _verify_caddy_deb(dst, name, m)
+            elif name.endswith('.deb'):
+                _verify_tak_deb(dst, name, work)
+            else:
+                _verify_tak_rpm(dst, name, work)
+            shutil.rmtree(work, ignore_errors=True)
+            os.chmod(dst, 0o644)         # apt reads local debs as _apt
+            new[idx] = dst
+        os.chmod(stage, 0o711)
+        return new, stage
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+# Head room left free on the staging filesystem after the copy (apt/dnf, logs).
+_PKG_STAGE_HEADROOM = 256 * 1024 * 1024
+
+
+def _pkg_space_msg(need, free):
+    mb = lambda n: f'{(n + (1 << 20) - 1) >> 20} MB'  # noqa: E731
+    have = f' It needs about {mb(need)} there, and {mb(free)} is free.' if need else ''
+    return (f'there is not enough free disk space under {_PKG_STAGE_ROOT} to check it '
+            f'before install.{have} Free up disk space on this server, then try again. '
+            f'Nothing was installed.')
+
+
+def _pkg_stage_space_check(src, name, pw, groups, env):
+    """Refuse with a plain message, before the copy, when the staging filesystem
+    cannot hold a copy of `src` plus head room (a TAK package is ~650 MB). The
+    size is read AS THE CONSOLE USER (`stat`), so root never looks at the
+    caller's path. If the size cannot be read, the copy itself reports it."""
+    r = subprocess.run(['stat', '-L', '-c', '%s', '--', src], capture_output=True,
+                       timeout=30, cwd='/', env=env, user=pw.pw_uid, group=pw.pw_gid,
+                       extra_groups=groups)
+    try:
+        size = int(r.stdout.decode('ascii', 'replace').strip()) if r.returncode == 0 else None
+    except ValueError:
+        size = None
+    if size is None:
+        return
+    st = os.statvfs(_PKG_STAGE_ROOT)
+    free = st.f_bavail * st.f_frsize
+    need = size + _PKG_STAGE_HEADROOM
+    if free < need:
+        _pkg_refuse(name, _pkg_space_msg(need, free))
+
+
+def _pkg_stage_sweep(max_age=6 * 3600):
+    """Remove staging dirs a killed broker left behind (a TAK package is ~650 MB)."""
+    try:
+        now = time.time()
+        for n in os.listdir(_PKG_STAGE_ROOT):
+            p = os.path.join(_PKG_STAGE_ROOT, n)
+            if n.startswith('pkg-') and now - os.lstat(p).st_mtime > max_age:
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# ops #645 W0 — ip, dpkg, fail2ban-client, postconf. Each had NO gate, and each
+# was a one-command root shell: `ip netns exec x /bin/sh`, `dpkg -i evil.deb`,
+# `fail2ban-client set <jail> action … actionban '<cmd>'`,
+# `postconf -e daemon_directory=<console dir>`. Allow only the shapes the console
+# uses (static scan of app.py/modules + 10 days of test6/test12 audit logs).
+# ---------------------------------------------------------------------------
+
+_IP_OPTS = {'-4', '-6', '-o', '-oneline', '-j', '-json', '-p', '-pretty', '-br', '-brief',
+            '-d', '-details', '-s', '-stats', '-statistics', '-c', '-color', '-h',
+            '-human', '-N', '-numeric', '-r', '-resolve'}
+_IP_OBJECTS = {'addr', 'address', 'a', 'route', 'r', 'ro', 'link', 'l', 'neigh',
+               'neighbor', 'neighbour', 'n', 'rule', 'ru', 'maddr', 'maddress'}
+_IP_READ_CMDS = {'show', 'list', 'lst', 'ls', 'sh', 'get'}
+_IP_BAD_WORDS = {'add', 'del', 'delete', 'change', 'replace', 'set', 'flush', 'exec',
+                 'netns', 'append', 'prepend', 'save', 'restore', 'test'}
+
+
+def _check_ip(argv):
+    """`ip`: read-only listing only (`ip [-4|-6|-o|-j…] addr|route|link|neigh|rule
+    [show|list|get …]`). No netns, no batch, no change verbs."""
+    i = 1
+    while i < len(argv) and argv[i].startswith('-'):
+        if argv[i] not in _IP_OPTS:
+            raise Denied(f'ip option not allowed: {argv[i]}')
+        i += 1
+    if i >= len(argv) or argv[i] not in _IP_OBJECTS:
+        raise Denied(f'ip: only read-only addr/route/link/neigh/rule listing is allowed')
+    rest = argv[i + 1:]
+    if rest and rest[0] not in _IP_READ_CMDS:
+        raise Denied(f'ip {argv[i]}: only show/list/get is allowed, not {rest[0]!r}')
+    for w in rest:
+        if w in _IP_BAD_WORDS or w.startswith('-b'):
+            raise Denied(f'ip: {w!r} not allowed')
+
+
+_DPKG_NAME_RE = re.compile(r'^[A-Za-z0-9*?][A-Za-z0-9+.:~_*?-]*$')
+_DPKG_NOARG = {'--print-architecture', '--print-foreign-architectures', '--version',
+               '--set-selections', '--audit', '-C'}
+_DPKG_QUERY = {'-l', '--list', '-s', '--status', '-L', '--listfiles', '-V', '--verify',
+               '--get-selections'}
+_DPKG_REMOVE = {'--purge', '-P', '--remove', '-r'}
+
+
+def _check_dpkg(argv):
+    """`dpkg`: query, configure, remove and selection shapes only. `-i`/`--install`
+    /`--unpack`/`-x`/`--root`/`--admindir`/`--force-*` (other than --force-all on a
+    removal) are refused: they install or unpack a file of the caller's choosing."""
+    a = argv[1:]
+    if not a:
+        raise Denied('dpkg: no action')
+    act, rest = a[0], a[1:]
+    if act in _DPKG_NOARG:
+        if rest:
+            raise Denied(f'dpkg {act} takes no arguments')
+        return
+    if act in _DPKG_QUERY:
+        for x in rest:
+            if not _DPKG_NAME_RE.fullmatch(x):
+                raise Denied(f'dpkg {act}: not a package name: {x}')
+        return
+    if act in ('-S', '--search'):
+        if not rest or any(x.startswith('-') for x in rest):
+            raise Denied('dpkg -S: patterns only')
+        return
+    if act == '--compare-versions':
+        if len(rest) != 3 or any(x.startswith('-') for x in (rest[0], rest[2])):
+            raise Denied('dpkg --compare-versions: V1 OP V2')
+        return
+    if act == '--configure':
+        if rest in (['-a'], ['--pending']):
+            return
+        if rest and all(_DPKG_NAME_RE.fullmatch(x) and '*' not in x and '?' not in x for x in rest):
+            return
+        raise Denied('dpkg --configure: -a or package names only')
+    if act in _DPKG_REMOVE or (act == '--force-all' and rest and rest[0] in _DPKG_REMOVE):
+        names = [x for x in a if x not in _DPKG_REMOVE and x != '--force-all']
+        if [x for x in a if x in _DPKG_REMOVE].__len__() != 1:
+            raise Denied('dpkg: one removal action')
+        if not names or not all(_DPKG_NAME_RE.fullmatch(x) and '*' not in x and '?' not in x for x in names):
+            raise Denied('dpkg removal: package names only')
+        return
+    raise Denied(f'dpkg action not allowed: {act}')
+
+
+_F2B_JAIL_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$')
+_F2B_IP_RE = re.compile(r'^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$')
+_F2B_RELOAD_OPTS = {'--restart', '--unban', '--if-exists', '--all'}
+
+
+def _check_fail2ban_client(argv):
+    """`fail2ban-client`: status, reload, ban/unban and `get` (read-only). Every
+    other `set` (action*, addaction, addlogpath, logtarget, dbfile …), `add`,
+    `start`, `-c`/`--conf`/`-s` are refused: fail2ban-server is root and runs
+    whatever action command it is given."""
+    a = argv[1:]
+    if not a:
+        raise Denied('fail2ban-client: no command')
+    cmd, rest = a[0], a[1:]
+    if cmd in ('--version', '-V', '-h', '--help', 'ping', 'version') and not rest:
+        return
+    if cmd == 'status':
+        if len(rest) <= 1 and all(_F2B_JAIL_RE.fullmatch(x) for x in rest):
+            return
+        raise Denied('fail2ban-client status [JAIL] only')
+    if cmd == 'reload':
+        jails = [x for x in rest if x not in _F2B_RELOAD_OPTS]
+        if len(jails) <= 1 and all(_F2B_JAIL_RE.fullmatch(x) for x in jails):
+            return
+        raise Denied('fail2ban-client reload [--restart] [JAIL] only')
+    if cmd == 'set':
+        if (len(rest) >= 3 and _F2B_JAIL_RE.fullmatch(rest[0]) and rest[1] in ('banip', 'unbanip')
+                and all(_F2B_IP_RE.fullmatch(x) or x == '--report-absent' for x in rest[2:])):
+            return
+        raise Denied('fail2ban-client set: only JAIL banip|unbanip IP…')
+    if cmd == 'unban':
+        if rest == ['--all'] or (rest and all(_F2B_IP_RE.fullmatch(x) for x in rest)):
+            return
+        raise Denied('fail2ban-client unban: IPs or --all only')
+    if cmd == 'banned':
+        if all(_F2B_IP_RE.fullmatch(x) for x in rest):
+            return
+        raise Denied('fail2ban-client banned [IP…] only')
+    if cmd == 'get':
+        if rest and all(not x.startswith('-') for x in rest):
+            return
+        raise Denied('fail2ban-client get: no options')
+    raise Denied(f'fail2ban-client command not allowed: {cmd}')
+
+
+# postconf -e keys the console may set (Email Relay). Keys that name a program,
+# a directory or a command (daemon_directory, *_command, *_path, mailbox_*,
+# content_filter …) are NOT here: Postfix's root master runs them.
+_POSTCONF_EDIT_KEYS = {
+    'myhostname', 'mydomain', 'myorigin', 'mydestination', 'relayhost',
+    'inet_interfaces', 'inet_protocols', 'mynetworks', 'smtp_sasl_auth_enable',
+    'smtp_sasl_password_maps', 'smtp_sasl_security_options',
+    'smtp_sasl_tls_security_options', 'smtp_sasl_mechanism_filter',
+    'smtp_tls_security_level', 'smtp_tls_CAfile', 'smtp_tls_wrappermode',
+    'smtp_use_tls', 'smtp_tls_loglevel', 'smtp_generic_maps', 'sender_canonical_maps',
+    'header_size_limit', 'message_size_limit', 'smtputf8_enable', 'compatibility_level',
+}
+_POSTCONF_KEY_RE = re.compile(r'^[a-z0-9_]+$', re.I)
+
+
+def _check_postconf(argv):
+    """`postconf`: read (`postconf [-n|-h|-d|-x] [KEY…]`) and `-e KEY=VALUE` for the
+    Email Relay keys only. -c/-M/-F/-P/-X/-# and exec-capable keys are refused."""
+    edit = False
+    for x in argv[1:]:
+        if x.startswith('-'):
+            if x == '-e':
+                edit = True
+            elif x not in ('-n', '-h', '-d', '-x'):
+                raise Denied(f'postconf option not allowed: {x}')
+            continue
+        if edit:
+            key, sep, val = x.partition('=')
+            key = key.strip()
+            if not sep or key not in _POSTCONF_EDIT_KEYS:
+                raise Denied(f'postconf -e: key not allowed: {key or x}')
+            if any(c in val for c in '\n\r|') or '$' in val:
+                raise Denied(f'postconf -e {key}: value not allowed')
+        elif not _POSTCONF_KEY_RE.fullmatch(x):
+            raise Denied(f'postconf: not a parameter name: {x}')
 
 
 # SELinux file-context types the console may LABEL (semanage fcontext / chcon).
@@ -969,24 +2918,38 @@ SELINUX_SAFE_TYPES = {'httpd_sys_content_t', 'httpd_exec_t', 'bin_t',
 # may NOT remove arbitrary modules (e.g. another service's confinement, or its
 # own future takwerx_console policy).
 SEMODULE_REMOVABLE = {'takserver', 'takserver-policy'}
+# The one file-context rule the console adds (RHEL Cesium tiles, app.py
+# `_cesium_ensure_dir`). semanage fcontext takes nothing else.
+SEMANAGE_FCONTEXT_CESIUM = '/var/lib/cesium-tiles(/.*)?'
 
 
 def _check_semanage(argv):
     """semanage manages SELinux policy bits. Allow `semanage port` (custom Caddy
-    ports -> http_port_t) and `semanage fcontext -t <safe content/exec type>`
-    (cesium tiles served by httpd). Deny login/user/boolean/etc. and any
-    relabel to a security-sensitive type."""
+    ports -> http_port_t) and the one `semanage fcontext` rule for the Cesium
+    tiles dir (served by httpd). Deny login/user/boolean/etc. and every other
+    path or type."""
     if len(argv) < 2 or argv[1] not in ('port', 'fcontext'):
         raise Denied('semanage: only `semanage port` / `semanage fcontext` allowed')
-    if argv[1] == 'fcontext':
-        t = None
-        for i, a in enumerate(argv[2:], start=2):
-            if a == '-t' and i + 1 < len(argv):
-                t = argv[i + 1]
-            elif a.startswith('--type='):
-                t = a.split('=', 1)[1]
-        if t is None or t not in SELINUX_SAFE_TYPES:
-            raise Denied(f'semanage fcontext: type not in safe set: {t}')
+    # ops #645 W0 add-on (Security review): exact shapes only. semanage parses with
+    # argparse, which takes unique prefixes (`--typ=shadow_t`) and attached values
+    # (`-tshadow_t`), and the last -t wins, so reading just `-t`/`--type=` was not a
+    # gate. The console sends exactly these (app.py `_selinux_http_port`, cesium tiles).
+    rest = argv[2:]
+    if argv[1] == 'port':
+        if rest == ['-l']:
+            return
+        if (len(rest) == 6 and rest[0] in ('-a', '-m') and rest[1:3] == ['-t', 'http_port_t']
+                and rest[3] == '-p' and rest[4] in ('tcp', 'udp')
+                and re.fullmatch(r'[0-9]{1,5}', rest[5])):
+            return
+        raise Denied('semanage port: only -l, or -a|-m -t http_port_t -p tcp|udp PORT')
+    # Security re-review: any absolute path was allowed (`-t httpd_sys_content_t
+    # /etc/shadow`, `/.*`). The console labels one thing: the RHEL Cesium tiles dir
+    # (app.py `_cesium_ensure_dir`, always /var/lib/cesium-tiles on RHEL).
+    if rest == ['-a', '-t', 'httpd_sys_content_t', SEMANAGE_FCONTEXT_CESIUM]:
+        return
+    raise Denied('semanage fcontext: only -a -t httpd_sys_content_t '
+                 f'{SEMANAGE_FCONTEXT_CESIUM} (the Cesium tiles dir)')
 
 
 def _check_semodule(argv):
@@ -1056,6 +3019,67 @@ _PSQL_FORBIDDEN = (
 )
 
 
+# psql flags the console passes as postgres (code scan of every _pg_exec /
+# _cot_pg_exec call + test6/test12 audit logs): -t -A -X -q, and -c SQL, -d DB,
+# -F SEP, -p PORT. getopt also takes them bundled (`-tAc SQL`, `-tAF,`) and with the
+# value attached (`-dcot`), so the walk below parses them the way getopt does.
+# No long options at all: getopt_long accepts any unique prefix (`--fil=` is
+# `--file=`), so a long-option deny-list cannot hold.
+_PSQL_BOOL = frozenset('tAXq')
+_PSQL_VALUE = frozenset('cdFp')
+_PSQL_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')   # a plain DB name, no conninfo/URI
+
+
+def _psql_value_ok(flag, v):
+    if flag == 'c':
+        # `-c '\o |cmd'` / `-c '\copy … '`: a -c string that starts with a backslash
+        # is a psql meta-command, run by psql itself as postgres. SQL only.
+        if v.lstrip().startswith('\\'):
+            raise Denied('runuser: psql meta-command denied as postgres')
+    elif flag == 'd':
+        if not _PSQL_NAME_RE.fullmatch(v):
+            raise Denied(f'runuser: psql database name not allowed: {v[:60]!r}')
+    elif flag == 'p':
+        if not re.fullmatch(r'[0-9]{1,5}', v):
+            raise Denied(f'runuser: psql port not allowed: {v[:20]!r}')
+    elif flag == 'F':
+        if len(v) > 4:
+            raise Denied('runuser: psql field separator too long')
+
+
+def _check_psql_flags(args):
+    """Walk psql's argv like getopt does, allowing only the console's flags.
+    Positionals (DB name, user name) must be plain names."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith('--') or a == '-':
+            raise Denied(f'runuser: psql option not allowed as postgres: {a!r}')
+        if a.startswith('-'):
+            j = 1
+            while j < len(a):
+                ch = a[j]
+                if ch in _PSQL_BOOL:
+                    j += 1
+                    continue
+                if ch in _PSQL_VALUE:
+                    if j + 1 < len(a):
+                        v = a[j + 1:]
+                    elif i + 1 < len(args):
+                        i += 1
+                        v = args[i]
+                    else:
+                        raise Denied(f'runuser: psql -{ch} needs a value')
+                    _psql_value_ok(ch, v)
+                    break
+                raise Denied(f'runuser: psql option not allowed as postgres: -{ch} in {a!r}')
+            i += 1
+            continue
+        if not _PSQL_NAME_RE.fullmatch(a):
+            raise Denied(f'runuser: psql argument not allowed as postgres: {a[:60]!r}')
+        i += 1
+
+
 def _check_runuser(argv):
     # form: runuser -u <tak|postgres> -- CMD [args...]
     if len(argv) < 5 or argv[1] != '-u' or argv[3] != '--':
@@ -1088,9 +3112,9 @@ def _check_runuser(argv):
             # run as the postgres OS user (documented postgres→root pivot). The
             # PGOPTIONS-via-env vector is already closed — _do_exec drops all
             # caller-supplied env.
-            for a in argv[5:]:
-                if a in ('-f', '--file', '-') or a.startswith('--file='):
-                    raise Denied(f'runuser: psql script/stdin input denied as postgres: {a!r}')
+            # ops #645 W0 add-on (Security review): an exact flag allow-list, not a
+            # deny-list of `-f` spellings (`-f/tmp/x.sql`, `--fil=…`, `-qAtf x` passed).
+            _check_psql_flags(argv[5:])
             blob = ' '.join(' '.join(str(a) for a in argv[4:]).lower().split())
             for tok in _PSQL_FORBIDDEN:
                 if tok in blob:
@@ -1180,6 +3204,28 @@ def _check_git(argv):
         raise Denied(f'git: -C must be a root-era module dir, got: {saw_c_dir}')
     if sub not in _GIT_SUBCMDS:
         raise Denied(f'git: subcommand not allowed: {sub}')
+    _check_git_dir_root_owned(saw_c_dir)
+
+
+def _check_git_dir_root_owned(repo):
+    """ops #645 W0: root git reads <repo>/.git/config, and config keys run commands
+    (core.fsmonitor, core.hooksPath, remote.*.uploadpack, filter drivers …). The
+    root-era module dirs are on the WRITE allowlist, so .git is now deny-listed for
+    writes; this exec-time check also refuses a .git (or its config / hooks dir) that
+    is a symlink, not root's, or writable by group or others — e.g. one a migration
+    `chown -R` handed to the console user."""
+    for rel, want_dir in (('.git', True), ('.git/config', False), ('.git/hooks', True)):
+        p = os.path.join(repo, rel)
+        try:
+            st = os.lstat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            continue                    # git itself fails on a missing repo
+        except PermissionError:
+            continue                    # only in tests: the broker runs as root
+        if stat.S_ISLNK(st.st_mode) or (stat.S_ISDIR(st.st_mode) != want_dir):
+            raise Denied(f'git: {p} is not a plain {"directory" if want_dir else "file"}')
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise Denied(f'git: {p} must be root-owned and not group/other-writable')
 
 
 # TAK's rpm/deb ships apply-selinux.sh which compiles + installs TAK's own SELinux
@@ -1191,6 +3237,32 @@ _TAK_BASH_SCRIPTS = ('/opt/tak/apply-selinux.sh',)
 def _check_bash(argv):
     if len(argv) != 2 or argv[1] not in _TAK_BASH_SCRIPTS:
         raise Denied('bash: only the TAK apply-selinux.sh script is allowed')
+    _check_tak_script_trusted(argv[1])
+
+
+def _check_tak_script_trusted(path):
+    """ops #645 W0: `bash /opt/tak/apply-selinux.sh` runs as root, and /opt/tak was on
+    the write allowlist (and may be a link into the console's own TAK bundle). Run it
+    only when the file and every directory up to / are real (no symlink), owned by
+    root or the TAK service user, and not writable by group/other — i.e. as the TAK
+    package installed it. Broker writes to the exact path are deny-listed too."""
+    owners = {0}
+    try:
+        owners.add(pwd.getpwnam('tak').pw_uid)
+    except KeyError:
+        pass
+    cur = ''
+    for c in [''] + [c for c in path.split('/') if c]:
+        cur = (cur.rstrip('/') + '/' + c) if c else '/'
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return                      # bash fails on a missing file by itself
+        except PermissionError:
+            return                      # only in tests: the broker runs as root
+        if stat.S_ISLNK(st.st_mode) or st.st_uid not in owners or st.st_mode & 0o022:
+            raise Denied(f'bash: {cur} is not as the TAK package installed it '
+                         '(symlink, foreign owner or group/other-writable)')
 
 
 def _check_gpg(argv):
@@ -1254,9 +3326,22 @@ def _check_cp(argv, cwd=None):
     recursive = False
     positionals = []
     for a in argv[1:]:
-        if a == '--':
-            continue
+        # ops #645 W2: no target-dir flag (the dest would skip the check below), no
+        # -l/-s (a hard link to a unit file turns a data write into a unit write)
+        if a.startswith('--'):
+            if a not in _CP_LONG and not a.startswith(('--preserve=', '--no-preserve=')):
+                raise Denied(f'cp: option not allowed: {a}')
+        elif a.startswith('-') and a != '-' and not set(a[1:]) <= _CP_SHORT:
+            raise Denied(f'cp: option not allowed: {a}')
         if a.startswith('-') and a != '-':
+            # ops #645 W0: `--preserve=mode` without ownership makes ROOT the owner
+            # of a copy that keeps the source's setuid bit (a console-made 4755
+            # file becomes a root setuid binary). -p/-a also keep the owner, so the
+            # bit stays on the console's own uid: those stay allowed.
+            if a.startswith('--preserve='):
+                keep = a.split('=', 1)[1].split(',')
+                if 'mode' in keep and not ({'ownership', 'all'} & set(keep)):
+                    raise Denied('cp --preserve=mode without ownership not allowed')
             if a in ('-r', '-R', '-a', '--recursive', '--archive') or (
                     len(a) > 1 and a[0] == '-' and not a.startswith('--')
                     and any(c in a[1:] for c in 'raR')):
@@ -1269,7 +3354,7 @@ def _check_cp(argv, cwd=None):
     def _resolve(p):
         return p if p.startswith('/') else os.path.join(base_cwd, p)
     dst = _resolve(positionals[-1])
-    _path_allowed(dst)                       # destination must be allowlisted
+    _check_exec_into_root_run('cp', [_path_allowed(dst)])   # dest allowlisted, not a unit
     for src in positionals[:-1]:
         sp = _resolve(src)
         if recursive:
@@ -1329,19 +3414,61 @@ def _check_sysctl(argv):
             raise Denied(f'sysctl param not in safe namespace (vm./fs./net.): {param}')
 
 
+# ops #645 W0 add-on (Security review): install(1) takes ONLY the flags the
+# console uses (code scan + test6/test12 audit logs): `-D`, `-m MODE`, `-o OWNER`,
+# `-g GROUP`, and `-mMODE` attached. A deny-list of flag spellings was bypassed by
+# GNU's unique long-option prefixes (`--mo=4755`, `--own=`, `--strip-p=`, `--tar=`)
+# and combined short flags (`-Dm4755`), so every other flag is refused.
+_INSTALL_OWNERS = frozenset({'root', 'tak'})
+_INSTALL_MODE_RE = re.compile(r'^0?[0-7]{3}$')     # plain rwx modes: no setuid/setgid/sticky
+
+
+def _parse_install(argv):
+    """Walk install(1)'s argv with the exact allow-list. Returns (owners, paths)."""
+    owners, paths = [], []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '-D':
+            i += 1
+            continue
+        if a in ('-m', '-o', '-g'):
+            if i + 1 >= len(argv):
+                raise Denied(f'install: {a} needs a value')
+            v = argv[i + 1]
+            if a == '-m':
+                if not _INSTALL_MODE_RE.fullmatch(v):
+                    raise Denied(f'install: mode not allowed: {v}')
+            elif v not in _INSTALL_OWNERS:
+                raise Denied(f'install: owner/group not allowed: {v}')
+            else:
+                owners.append(v)
+            i += 2
+            continue
+        if a.startswith('-m') and len(a) > 2:
+            if not _INSTALL_MODE_RE.fullmatch(a[2:]):
+                raise Denied(f'install: mode not allowed: {a[2:]}')
+            i += 1
+            continue
+        if a.startswith('-'):
+            raise Denied(f'install: option not allowed: {a}')
+        paths.append(a)
+        i += 1
+    return owners, paths
+
+
 def _check_install(argv):
-    """install(1): `install -m MODE src dst`. The SOURCE is a read of a
-    console-owned file (anywhere); only the DEST must be allowlisted. Block the
-    `--strip-program=cmd` arbitrary-exec vector."""
-    for a in argv[1:]:
-        if a in ('-S', '--strip') or a.startswith('--strip-program'):
-            raise Denied('install: --strip-program/--strip not allowed')
-    paths = [a for a in argv[1:] if not a.startswith('-')
-             and a not in ('0755', '0644', '0700', '0600', '0750')]
-    # the mode value follows -m; drop a bare numeric mode if present
-    paths = [a for a in paths if not (len(a) <= 4 and a.isdigit())]
+    """install(1): `install [-D] [-m MODE] [-o OWNER] [-g GROUP] src dst`. The
+    SOURCE is a read of a console-owned file (anywhere); only the DEST must be
+    allowlisted. Only the console's own flags pass (_parse_install), which also
+    closes `--strip-program=cmd` (root runs it) and `-t`/`--target-directory`
+    (the dest would skip the check below)."""
+    owners, paths = _parse_install(argv)
     if paths:
-        _path_allowed(paths[-1])   # dst = last positional path
+        dst = _path_allowed(paths[-1])   # dst = last positional path
+        _check_exec_into_root_run('install', [dst])          # ops #645 W2
+        if _root_runs(dst) and any(o not in ('root', '0') for o in owners):
+            raise Denied(f'install: root-run paths stay root-owned: {dst}')
         # SOURCE hardening: install(1) reads its source(s) as ROOT and can copy to
         # an allowlisted (console-readable) dest, so an unguarded source is an
         # arbitrary root-READ primitive (e.g. `install -m 0644 /etc/shadow
@@ -1502,6 +3629,45 @@ def _check_systemctl(argv):
     return                         # no verb (e.g. `systemctl --version`) — fine
 
 
+def _mode_setid_bits(mode):
+    """-> (setuid, setgid) a chmod/install MODE grants."""
+    m = (mode or '').strip()
+    if re.fullmatch(r'[0-7]{1,5}', m):
+        d = int(m[-4]) if len(m) >= 4 else 0
+        return bool(d & 4), bool(d & 2)
+    suid = sgid = False
+    for clause in m.split(','):
+        for op in ('+', '='):
+            if op in clause and 's' in clause.split(op, 1)[1]:
+                who = clause.split(op, 1)[0] or 'a'
+                suid = suid or any(c in who for c in 'ua')
+                sgid = sgid or any(c in who for c in 'ga')
+    return suid, sgid
+
+
+def _check_mode_no_setid(mode, what, dirs_ok=False):
+    """ops #645 W0: refuse a setuid/setgid bit. Root setting 4755 on a file the
+    console wrote (or can write) is a root shell; no console call site sets one.
+    Setgid on a DIRECTORY only makes new files inherit the group (the console runs
+    `chmod 2775 /usr/local/etc`): allowed when the caller has checked that every
+    target is a real directory (dirs_ok)."""
+    suid, sgid = _mode_setid_bits(mode)
+    if suid or (sgid and not dirs_ok):
+        raise Denied(f'{what}: setuid/setgid mode not allowed: {mode}')
+
+
+def _all_real_dirs(paths):
+    """True when every path is an existing directory and not a symlink."""
+    for p in paths:
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+    return bool(paths)
+
+
 def _check_path_args(base, argv, cwd=None):
     """For coreutils that mutate/read files, EVERY non-flag path argument must
     resolve (against the request cwd) into PATH_ALLOW and out of PATH_DENY.
@@ -1513,16 +3679,53 @@ def _check_path_args(base, argv, cwd=None):
     # must NOT be treated as a path operand.
     skip_first_positional = base in ('chmod', 'chown')
     seen_positional = False
+    checked, raw, owner_spec = [], [], None
+    # ops #645 W2: only the flags each tool really uses (code scan + fleet audit
+    # logs). Other flags carried paths past the check: `chmod -w,o+w /etc/passwd`
+    # (GNU chmod reads a dash mode, and the file was skipped as "the mode"),
+    # `chown --reference=F /etc/passwd`, `mv|ln --target-directory=/etc/sudoers.d`.
+    allowed = _COREUTIL_FLAGS.get(base)
     for a in argv[1:]:
+        if not a.startswith('-'):
+            continue
+        if allowed is None or not (a in allowed or (base == 'chown' and a.startswith('--from='))
+                                   or (base == 'mkdir' and (a.startswith('--mode=')
+                                                            or re.fullmatch(r'-m[0-7]{3,4}', a)))):
+            raise Denied(f'{base}: option not allowed: {a}')
+    if base == 'chmod':
+        pos = [a for a in argv[1:] if not a.startswith('-')]
+        if pos:
+            targets = [p if p.startswith('/') else os.path.join(base_cwd, p) for p in pos[1:]]
+            recursive = any(a in ('-R', '--recursive') or
+                            (a.startswith('-') and not a.startswith('--') and 'R' in a)
+                            for a in argv[1:])
+            # setgid is fine on directories, but -R would also hit the files inside
+            _check_mode_no_setid(pos[0], 'chmod',
+                                 dirs_ok=not recursive and _all_real_dirs(targets))
+    for a in argv[1:]:
+        if base == 'chmod' and a.startswith('--reference'):
+            raise Denied('chmod --reference not allowed (can copy a setuid bit)')
+        if base == 'mkdir' and (a.startswith('--mode') or (a.startswith('-m') and len(a) > 2)):
+            _check_mode_no_setid(a.split('=', 1)[1] if '=' in a else a[2:], 'mkdir',
+                                 dirs_ok=True)
         if a == '--' or a.startswith('-'):
             continue               # flag — coreutils flags here don't take paths
         if skip_first_positional and not seen_positional:
             seen_positional = True
+            owner_spec = a
             continue               # the MODE (chmod) / OWNER (chown) arg
         seen_positional = True
         # Everything else is a path operand and must be allowlisted.
         target = a if a.startswith('/') else os.path.join(base_cwd, a)
-        _path_allowed(target)      # raises Denied if outside allowlist
+        checked.append(_path_allowed(target))   # raises Denied if outside allowlist
+        raw.append(a)
+    # ops #645 W2: no exec route around the content checks of root-run paths
+    _check_exec_into_root_run(base, checked, link_args=raw if base == 'ln' else None)
+    rr = [t for t in checked if _root_runs(t)]
+    if rr and base == 'chown' and owner_spec is not None and not _owner_is_root(owner_spec):
+        raise Denied(f'chown: root-run paths stay root-owned: {rr[0]}')
+    if rr and base == 'chmod' and owner_spec is not None and _mode_lets_go_write(owner_spec):
+        raise Denied(f'chmod: root-run paths may not be group/other-writable: {rr[0]}')
 
 
 # ---------------------------------------------------------------------------
@@ -1686,8 +3889,24 @@ def _do_exec(req):
         # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
         # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
         env.setdefault('DPKG_FORCE', 'confdef,confold')
-    proc = subprocess.run(argv, input=input_bytes, capture_output=True,
-                          timeout=timeout, cwd=cwd, env=env)
+    if _docker_cp_needs_stage(argv):
+        # ops #645 W0 (hardening, both modes): a docker cp whose host path is not on
+        # the allowlist never lets root open that path; the console user does the
+        # host side with its own permissions.
+        a = list(argv)
+        if a[1] == 'container':
+            a = [a[0], 'cp'] + a[3:]
+        proc = _docker_cp_staged(a, timeout)
+    else:
+        # ops #645 W0 part 2 (both modes): a local .deb/.rpm installs only as a
+        # root-checked copy (TAK release key, or Caddy's published SHA-512).
+        argv, pkg_stage = _pkg_stage_verified(argv, cwd, timeout)
+        try:
+            proc = subprocess.run(argv, input=input_bytes, capture_output=True,
+                                  timeout=timeout, cwd=cwd, env=env)
+        finally:
+            if pkg_stage:
+                shutil.rmtree(pkg_stage, ignore_errors=True)
     return {
         'ok': True,
         'returncode': proc.returncode,
@@ -1703,6 +3922,82 @@ def _is_console_owned(path):
     return any(path == p.rstrip('/') or path.startswith(p) for p in _CONSOLE_OWNED_PREFIXES)
 
 
+def _write_all(fd, data):
+    """os.write() until every byte is out (one call may write less than asked)."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _atomic_replace(path, content, perm):
+    """Write `content` to `path` by temp file + rename, so a process that already has
+    the old file open (a running bash script reads its source as it goes) keeps the OLD
+    inode and finishes cleanly. ops #666 / infra-TAK #473: the in-place O_TRUNC write
+    in _do_write rewrote tak-post-start.sh under a running unit and the unit died with
+    exit 2.
+
+    Returns True when done. Returns False, having changed nothing, when the target is a
+    kind of file that must keep being written in place: a symlink, a non-regular file,
+    a file with other hard links, or a mount point (rename gives EBUSY/EXDEV). Any other
+    failure (disk full...) raises with the target untouched. It never falls back after a
+    failed write: truncating the target then would be the very bug this fixes."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+        return False
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, '.%s.tmp-%d-%s' % (base, os.getpid(), os.urandom(4).hex()))
+    # 0o600 until the final mode is set, so a secret never sits readable in the temp file.
+    # A new file with no perm keeps the old 0o644 (subject to umask) via the open mode.
+    create_mode = 0o644 if (st is None and perm is None) else 0o600
+    # O_EXCL|O_NOFOLLOW: a planted link at the temp name can never be written through.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, create_mode)
+    try:
+        try:
+            if perm is not None:
+                os.fchmod(fd, int(perm))
+            elif st is not None:
+                os.fchmod(fd, stat.S_IMODE(st.st_mode))
+            if st is not None:
+                try:
+                    os.fchown(fd, st.st_uid, st.st_gid)
+                except OSError:
+                    pass
+                try:   # keep the SELinux label an in-place write would have kept (Rocky)
+                    os.setxattr(tmp, 'security.selinux', os.getxattr(path, 'security.selinux'))
+                except (OSError, AttributeError):
+                    pass
+            _write_all(fd, content)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, path)
+        except OSError as e:
+            if e.errno in (errno.EBUSY, errno.EXDEV):
+                os.unlink(tmp)
+                return False
+            raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:   # make the rename itself durable; best effort
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+    return True
+
+
 def _do_write(req):
     # Decision made in _dispatch; here only normalize (reject NUL/traversal) so
     # permissive mode can still execute an off-allowlist write (console is root).
@@ -1716,6 +4011,13 @@ def _do_write(req):
     content = base64.b64decode(req.get('content_b64') or '')
     mode = req.get('mode', 'w')
     append = mode in ('a', 'ab')
+    # ops #666: `atomic` is the console asking for temp file + rename (scripts a running
+    # process may be reading). Full-file writes only; append stays in place. Opt-in per
+    # request because a rename breaks a single-file bind mount into a container and a log
+    # a running process holds open, and in-place writes keep both working.
+    if req.get('atomic') is True and not append:
+        if _atomic_replace(path, content, req.get('perm')):
+            return {'ok': True}
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
     if _is_console_owned(path):
         flags |= os.O_NOFOLLOW
@@ -2880,7 +5182,7 @@ def _takportal_sudoers_text(user=BROKER_USER, variant='hardened', helper=False):
     Returns the file content, or raises Denied when the box cannot support the
     grant (no /opt/tak, containerized TAK, missing `tak` user, unresolvable
     binaries)."""
-    if not re.match(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
+    if not re.fullmatch(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
     if variant != 'hardened':
         raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
@@ -4481,6 +6783,8 @@ def _evaluate(req):
             _check_openssl_cnf_write(req)      # exact-patch gate, not a blanket allow
         elif op in ('write', 'read'):
             _path_allowed(req.get('path'), readonly=(op == 'read'))
+            if op == 'write':
+                _check_validated_write(req)     # ops #645 W2
         elif op == 'pg_dump':
             _check_pg_dump(req)
         elif op == 'stack_pg_dump':
@@ -4516,6 +6820,10 @@ def _evaluate(req):
             _check_etl_egress(req)
         elif op == 'mediamtx_account':
             _check_mediamtx_account(req)
+        elif op == 'gd_render':
+            _check_gd_render(req)           # ops #645 W2 part 2a
+        elif op == 'gd_remove':
+            _check_gd_remove(req)           # ops #645 W2 part 2b
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -4595,7 +6903,27 @@ def _dispatch(req, peer):
         return {'ok': True, 'pong': True, 'enforce': ENFORCE,
                 'enforce_info': ENFORCE_INFO, 'deny_count': _DENY_COUNT,
                 'readiness': _enforce_readiness(fresh=False),
-                'src_sha': RUNNING_SRC_SHA, 'src_path': SELF_PATH}
+                'src_sha': RUNNING_SRC_SHA, 'src_path': SELF_PATH,
+                # ops #645 W1: '' until the broker runs from the root-owned layout
+                'installed_commit': _installed_commit(),
+                'root_install': dict(ROOT_MOVE_STATE),
+                'security_level': BROKER_SECURITY_LEVEL}
+    if op == 'broker_update':
+        # ops #645 W1: fixed shape, fail-closed in both modes. Root fetches the
+        # commit itself and installs it only if it is on GitHub main/dev/v* and
+        # not below this broker's security level (_root_install).
+        commit = req.get('commit')
+        summary = str(commit)[:64]
+        if set(req) - {'op', 'commit'} or not (
+                isinstance(commit, str) and _COMMIT_RE.fullmatch(commit)):
+            audit(peer, op, summary, 'DENY', 'bad broker_update request')
+            return {'ok': False, 'code': 'DENIED',
+                    'error': 'broker_update takes only a full 40-character commit id'}
+        audit(peer, op, summary, 'ALLOW')
+        r = _do_broker_update(req)
+        if not r.get('ok'):
+            audit(peer, op, summary, 'ERROR', r.get('error', '')[:300])
+        return r
     if op == 'enforce_enable':
         # Operator opts the box in to enforcement (ratchet — enable only). Audited.
         audit(peer, 'enforce_enable', '', 'ALLOW')
@@ -4608,7 +6936,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account'):
+              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -4632,6 +6960,10 @@ def _dispatch(req, peer):
             summary = _TAK58_UPGRADE_DB
         elif op == 'tak58_setup_db':
             summary = _TAK58_SETUP_DB
+        elif op == 'gd_render':
+            summary = f"{GD_DIR}/{str(req.get('name'))[:80]} keys={','.join(sorted(map(str, req.get('values') or {})))[:200]}"
+        elif op == 'gd_remove':
+            summary = f"{GD_DIR}/{str(req.get('name'))[:80]}"
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -4665,6 +6997,10 @@ def _dispatch(req, peer):
             return _do_pg_old_cluster(req)
         if op == 'mediamtx_account':
             return _do_mediamtx_account(req)
+        if op == 'gd_render':
+            return _do_gd_render(req)
+        if op == 'gd_remove':
+            return _do_gd_remove(req)
         return _do_pgminer_scan(req)
     if op == 'etl':
         # The console reaches the same verb on the main socket (status, uninstall
@@ -4782,11 +7118,11 @@ def _mtx_own_path(p):
     it planted can only reach what it could already read or write."""
     return (p.startswith(_MTX_EDITOR_DIR) or p.startswith(_MTX_CONF_BACKUPS)
             or p == _MTX_CONF or (p.startswith(_MTX_CONF + '.')
-                                  and _MTX_BACKUP_NAME_RE.match(os.path.basename(p))))
+                                  and _MTX_BACKUP_NAME_RE.fullmatch(os.path.basename(p))))
 
 
 def _mtx_port_ok(spec):
-    m = _MTX_PORT_RE.match(spec or '')
+    m = _MTX_PORT_RE.fullmatch(spec or '')
     if not m:
         raise Denied(f'mediamtx: bad port spec {spec!r}')
     port = int(m.group(1))
@@ -5596,6 +7932,323 @@ def _converge_own_unit(unit_path=BROKER_UNIT, run=None):
     return True
 
 
+# ---------------------------------------------------------------------------
+# ops #645 W1 — root-owned broker code, installed only from verified GitHub commits
+# ---------------------------------------------------------------------------
+# Layout:  ROOT_CODE_DIR/<commit>/{broker,selinux}/  root 0755/0644 (git archive)
+#          ROOT_CODE_CURRENT -> <commit>              (atomic symlink swap)
+#          ROOT_SRC_GIT                               bare, blob-less mirror, root 0700
+#          ROOT_CONF  console_dir=<console repo>      root 0644
+# Unit:    ROOT_EXEC_START (system python, -I: no script dir, user site or PYTHON* env)
+# A commit is installed only when root itself fetched it from BROKER_SRC_URL (never
+# the console's git config), it is on main, dev or a v* tag there, and its broker
+# declares BROKER_ROOT_LAYOUT and a BROKER_SECURITY_LEVEL not below this one.
+_COMMIT_RE = re.compile(r'^[0-9a-f]{40}$')
+_SRC_REFSPECS = ('+refs/heads/main:refs/heads/main', '+refs/heads/dev:refs/heads/dev',
+                 '+refs/tags/v*:refs/tags/v*')
+_SRC_ALLOWED_REFS = ('refs/heads/main', 'refs/heads/dev', 'refs/tags/v*')
+_ARCHIVE_PATHS = ('broker', 'selinux', 'scripts/guarddog')   # W2 part 2a: Guard Dog templates
+_ROOT_KEEP = 3                       # commit dirs kept (current + 2 to roll back to)
+_ROOT_LOCK = threading.Lock()
+ROOT_MOVE_STATE = {'state': 'installed' if RUNNING_FROM_ROOT else 'not-started',
+                   'reason': ''}
+
+
+def _installed_commit():
+    """The commit this broker runs from (root layout), else ''."""
+    if not RUNNING_FROM_ROOT:
+        return ''
+    c = os.path.basename(os.path.dirname(os.path.dirname(SELF_PATH)))
+    return c if _COMMIT_RE.fullmatch(c) else ''
+
+
+def _src_git(args, timeout=600):
+    """git as root on the root-only mirror: no system/global config, no hooks."""
+    git = shutil.which('git', path=BROKER_TRUSTED_PATH)
+    if not git:
+        raise Denied('broker update: git is not installed')
+    env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C', 'HOME': os.path.dirname(ROOT_SRC_GIT),
+           'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
+           'GIT_TERMINAL_PROMPT': '0', 'GIT_DIR': ROOT_SRC_GIT}
+    return subprocess.run([git, '-c', 'core.hooksPath=' + os.devnull,
+                           '-c', 'core.fsmonitor=false'] + list(args),
+                          capture_output=True, text=True, timeout=timeout, env=env, cwd='/')
+
+
+def _src_ok(r, what):
+    if r.returncode != 0:
+        raise Denied(f'broker update: {what} failed: {(r.stderr or r.stdout).strip()[:300]}')
+    return r.stdout
+
+
+def _src_fetch():
+    """Create/refresh the root-only mirror from BROKER_SRC_URL (commits + trees;
+    blobs come on demand at archive time)."""
+    parent = os.path.dirname(ROOT_SRC_GIT)
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    if not os.path.isdir(ROOT_SRC_GIT):
+        _src_ok(_src_git(['init', '-q', '--bare', ROOT_SRC_GIT]), 'git init')
+    if os.path.islink(ROOT_SRC_GIT):
+        raise Denied('broker update: source mirror is a symlink')
+    os.chown(ROOT_SRC_GIT, 0, 0)
+    os.chmod(ROOT_SRC_GIT, 0o700)
+    for k, v in (('remote.origin.url', BROKER_SRC_URL), ('remote.origin.promisor', 'true'),
+                 ('remote.origin.partialclonefilter', 'blob:none'),
+                 ('extensions.partialclone', 'origin')):
+        _src_ok(_src_git(['config', k, v]), 'git config')
+    _src_ok(_src_git(['fetch', '-q', '--prune', '--no-tags', '--filter=blob:none',
+                      'origin'] + list(_SRC_REFSPECS), timeout=900), 'fetch from GitHub')
+
+
+def _src_verify(commit):
+    """Refuse (Denied) unless `commit` is on main, dev or a v* tag of the mirror."""
+    if not isinstance(commit, str) or not _COMMIT_RE.fullmatch(commit):
+        raise Denied('broker update: commit must be a full 40-character commit id')
+    if _src_git(['cat-file', '-e', commit + '^{commit}']).returncode != 0:
+        raise Denied(f'broker update: commit {commit[:12]} is not on GitHub '
+                     f'({BROKER_SRC_URL})')
+    refs = _src_ok(_src_git(['for-each-ref', '--format=%(refname)', '--contains', commit]
+                            + list(_SRC_ALLOWED_REFS)), 'for-each-ref').split()
+    if not refs:
+        raise Denied(f'broker update: commit {commit[:12]} is not on main, dev or a '
+                     f'release tag')
+    return refs
+
+
+def _src_level(text):
+    """(root_layout, security_level) declared by a broker source file."""
+    lay = re.search(r'^BROKER_ROOT_LAYOUT = (\d+)\s*$', text, re.M)
+    lvl = re.search(r'^BROKER_SECURITY_LEVEL = (\d+)\s*$', text, re.M)
+    return (int(lay.group(1)) if lay else 0, int(lvl.group(1)) if lvl else 0)
+
+
+def _fix_tree_perms(top):
+    for root, dirs, files in os.walk(top):
+        for n in dirs + files:
+            p = os.path.join(root, n)
+            if os.path.islink(p):
+                raise Denied(f'broker update: symlink in the archive: {p}')
+            os.chown(p, 0, 0)
+            os.chmod(p, 0o755 if os.path.isdir(p) else 0o644)
+    os.chown(top, 0, 0)
+    os.chmod(top, 0o755)
+
+
+def _root_install(commit, fetch=True):
+    """Fetch, verify and install `commit` under ROOT_CODE_DIR, then point `current`
+    at it. Returns the install dir. Raises Denied with a plain reason."""
+    with _ROOT_LOCK:
+        if fetch:
+            _src_fetch()
+        _src_verify(commit)
+        os.makedirs(ROOT_CODE_DIR, mode=0o755, exist_ok=True)
+        if os.path.islink(ROOT_CODE_DIR) or not os.path.isdir(ROOT_CODE_DIR):
+            raise Denied('broker update: code dir is not a plain directory')
+        os.chown(ROOT_CODE_DIR, 0, 0)
+        os.chmod(ROOT_CODE_DIR, 0o755)
+        dest = os.path.join(ROOT_CODE_DIR, commit)
+        tmp = tempfile.mkdtemp(prefix='.new-', dir=ROOT_CODE_DIR)
+        try:
+            tar = os.path.join(tmp, '.src.tar')
+            # only the listed paths the commit has (a broker-only test commit has no
+            # scripts/; real infra-TAK commits have all three)
+            have = _src_ok(_src_git(['ls-tree', '--name-only', commit, '--']
+                                    + list(_ARCHIVE_PATHS)), 'ls-tree').split()
+            paths = [x for x in _ARCHIVE_PATHS if x in have]
+            if 'broker' not in paths:
+                raise Denied(f'broker update: commit {commit[:12]} has no broker')
+            _src_ok(_src_git(['archive', '--format=tar', '-o', tar, commit, '--'] + paths,
+                             timeout=900), 'git archive')
+            tarbin = shutil.which('tar', path=BROKER_TRUSTED_PATH) or 'tar'
+            r = subprocess.run([tarbin, '-x', '-f', tar, '-C', tmp, '--no-same-owner',
+                                '--no-same-permissions'], capture_output=True, text=True,
+                               timeout=300, cwd='/', env={'PATH': BROKER_TRUSTED_PATH,
+                                                          'LC_ALL': 'C'})
+            _src_ok(r, 'unpack')
+            os.unlink(tar)
+            _fix_tree_perms(tmp)
+            src = os.path.join(tmp, 'broker', 'takwerx_broker.py')
+            try:
+                with open(src) as f:
+                    text = f.read()
+            except OSError:
+                raise Denied(f'broker update: commit {commit[:12]} has no broker')
+            lay, lvl = _src_level(text)
+            if lay < 1:
+                raise Denied(f'broker update: commit {commit[:12]} predates the root-owned '
+                             f'broker layout')
+            if lvl < BROKER_SECURITY_LEVEL:
+                raise Denied(f'broker update: commit {commit[:12]} has broker security '
+                             f'level {lvl}, below this broker\'s {BROKER_SECURITY_LEVEL}')
+            py = SYSTEM_PYTHON if os.path.exists(SYSTEM_PYTHON) else sys.executable
+            r = subprocess.run([py, '-I', '-c', 'import ast,sys; ast.parse(open(sys.argv[1]).read())',
+                                src], capture_output=True, text=True, timeout=120, cwd='/',
+                               env={'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'})
+            _src_ok(r, f'syntax check with {py}')
+            if os.path.lexists(dest):
+                shutil.rmtree(dest, ignore_errors=True)
+            os.rename(tmp, dest)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        link = os.path.join(ROOT_CODE_DIR, '.current.new')
+        if os.path.lexists(link):
+            os.unlink(link)
+        os.symlink(commit, link)
+        os.replace(link, ROOT_CODE_CURRENT)
+        _root_prune(commit)
+        return dest
+
+
+def _root_prune(keep_commit):
+    """Keep the newest _ROOT_KEEP commit dirs (always the current and the running one)."""
+    try:
+        dirs = [n for n in os.listdir(ROOT_CODE_DIR) if _COMMIT_RE.fullmatch(n)]
+        dirs.sort(key=lambda n: os.lstat(os.path.join(ROOT_CODE_DIR, n)).st_mtime, reverse=True)
+        keep = set(dirs[:_ROOT_KEEP]) | {keep_commit, _installed_commit()}
+        for n in dirs:
+            if n not in keep:
+                shutil.rmtree(os.path.join(ROOT_CODE_DIR, n), ignore_errors=True)
+        for n in os.listdir(ROOT_CODE_DIR):
+            if n.startswith('.new-'):
+                shutil.rmtree(os.path.join(ROOT_CODE_DIR, n), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _write_root_conf(console_dir):
+    os.makedirs(ROOT_CONF_DIR, mode=0o755, exist_ok=True)
+    os.chown(ROOT_CONF_DIR, 0, 0)
+    os.chmod(ROOT_CONF_DIR, 0o755)
+    tmp = ROOT_CONF + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('# infra-TAK broker (ops #645 W1). Written by root; the console cannot change it.\n'
+                f'console_dir={console_dir}\n')
+    os.chown(tmp, 0, 0)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, ROOT_CONF)
+
+
+def _unit_point_at_root(unit_path=BROKER_UNIT, run=None):
+    """Point this broker's unit at the root-owned code (ROOT_EXEC_START), keeping every
+    other line (ENFORCE env, SELinux context). Returns True when it changed the unit."""
+    run = run or subprocess.run
+    with open(unit_path) as f:
+        cur = f.read()
+    lines = cur.splitlines(keepends=True)
+    out = [ROOT_EXEC_START + '\n' if ln.strip().startswith('ExecStart=') else ln for ln in lines]
+    if out == lines:
+        return False
+    if not any(ln.strip().startswith('ExecStart=') for ln in lines):
+        raise Denied('broker update: own unit has no ExecStart line')
+    tmp = unit_path + '.takwerx-tmp'
+    with open(tmp, 'w') as f:
+        f.write(''.join(out))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, unit_path)
+    systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
+    run([systemctl, 'daemon-reload'], capture_output=True, timeout=60)
+    return True
+
+
+def _restart_self_later(delay=2.0, run=None):
+    """Restart this broker after the reply went out (the restart kills this process)."""
+    run = run or subprocess.run
+    systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
+
+    def _go():
+        run([systemctl, '--no-block', 'restart', 'takwerx-broker'], capture_output=True,
+            timeout=30)
+    t = threading.Timer(delay, _go)
+    t.daemon = True
+    t.start()
+    return t
+
+
+def _do_broker_update(req, restart=_restart_self_later):
+    """op broker_update {commit}: install a verified commit and restart onto it."""
+    commit = req.get('commit')
+    if RUNNING_FROM_ROOT and commit == _installed_commit():
+        return {'ok': True, 'installed_commit': commit, 'changed': False}
+    try:
+        _root_install(commit)
+        if not RUNNING_FROM_ROOT:
+            _write_root_conf(CONSOLE_REPO_DIR)
+        _unit_point_at_root()
+    except Denied as e:
+        return {'ok': False, 'code': 'DENIED', 'error': str(e)}
+    except Exception as e:  # noqa: BLE001 — report, never crash the daemon
+        return {'ok': False, 'error': f'broker update failed: {type(e).__name__}: {e}'}
+    restart()
+    return {'ok': True, 'installed_commit': commit, 'changed': True, 'restarting': True}
+
+
+def _repo_head_commit(repo):
+    """The commit checked out in the console repo, read from .git files as text (root
+    never runs git in a repo the console user owns). '' when it cannot tell.
+    Only plain files inside a real .git dir are read: .git itself must not be a
+    link, a path whose realpath leaves .git is refused (a linked parent dir), and
+    the open is non-blocking so a FIFO planted as a ref cannot hang the broker."""
+    gd = os.path.join(repo, '.git')
+    try:
+        if not stat.S_ISDIR(os.lstat(gd).st_mode):
+            return ''
+        gd_real = os.path.realpath(gd)
+    except OSError:
+        return ''
+
+    def _read(p, n=4096):
+        try:
+            if os.path.commonpath([os.path.realpath(p), gd_real]) != gd_real:
+                return ''
+            fd = os.open(p, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+                         | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0))
+            with os.fdopen(fd) as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    return ''
+                return f.read(n)
+        except (OSError, UnicodeDecodeError, ValueError):
+            return ''
+    head = _read(os.path.join(gd, 'HEAD')).strip()
+    if _COMMIT_RE.fullmatch(head):
+        return head
+    m = re.fullmatch(r'^ref: (refs/[A-Za-z0-9._/-]+)$', head)
+    if not m or '..' in m.group(1):
+        return ''
+    val = _read(os.path.join(gd, *m.group(1).split('/'))).strip()
+    if _COMMIT_RE.fullmatch(val):
+        return val
+    for ln in _read(os.path.join(gd, 'packed-refs'), 1 << 22).splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and parts[1] == m.group(1) and _COMMIT_RE.fullmatch(parts[0]):
+            return parts[0]
+    return ''
+
+
+def _root_move_first(restart=_restart_self_later, log=None):
+    """At start from the repo path (pre-W1 boxes): install the console's checked-out
+    commit under the root layout and restart onto it. On any failure, stay on the
+    repo path and say why in ping (`root_install`); the next start retries."""
+    log = log or (lambda v, s: AUDIT and AUDIT.info(json.dumps(
+        {'op': 'root-move', 'verdict': v, 'summary': s})))
+    if RUNNING_FROM_ROOT or os.geteuid() != 0:
+        return False
+    commit = _repo_head_commit(CONSOLE_REPO_DIR)
+    if not commit:
+        ROOT_MOVE_STATE.update(state='pending', reason='cannot read the console commit')
+        log('ERROR', 'root move pending: cannot read the console commit')
+        return False
+    ROOT_MOVE_STATE.update(state='running', reason=commit[:12])
+    r = _do_broker_update({'commit': commit}, restart=restart)
+    if not r.get('ok'):
+        ROOT_MOVE_STATE.update(state='pending', reason=r.get('error', '')[:300])
+        log('ERROR', 'root move pending: ' + r.get('error', '')[:300])
+        return False
+    ROOT_MOVE_STATE.update(state='installed', reason=commit[:12])
+    log('INFO', f'root move: installed {commit[:12]} under {ROOT_CODE_DIR}, restarting onto it')
+    return True
+
+
 def _drain(max_secs=RECYCLE_DRAIN_MAX_SECS, clock=time.monotonic, sleep=time.sleep):
     """Wait for in-flight requests to finish (bounded). True when drained."""
     t0 = clock()
@@ -5663,6 +8316,10 @@ def serve():
     except Exception as e:  # noqa: BLE001 — never let a unit tidy-up stop the broker
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
                                'summary': 'own unit converge failed: %s' % e}))
+    # ops #645 W1: a broker still started from the console repo moves itself to
+    # the root-owned layout (after the socket is up; a fetch can take a while).
+    if not RUNNING_FROM_ROOT:
+        threading.Thread(target=_root_move_first, daemon=True, name='root-move').start()
     _after = _recycle_after_secs()
     threading.Thread(target=_recycle_watch, args=(srv, _after, time.monotonic()),
                      kwargs={'unlink': _unlink_socket},
@@ -5989,6 +8646,15 @@ def main(argv):
             return 1
     if cmd == 'selftest':
         return cli_selftest()
+    if cmd == 'update' and len(argv) == 2:
+        # ops #645 W1: ask the broker to install a verified commit (console converge)
+        try:
+            r = client_send({'op': 'broker_update', 'commit': argv[1]}, timeout=1200)
+            print(json.dumps(r))
+            return 0 if r.get('ok') else 1
+        except Exception as e:
+            sys.stderr.write(f'update failed: {e}\n')
+            return 1
     sys.stderr.write(f'unknown command: {cmd}\n')
     return 2
 

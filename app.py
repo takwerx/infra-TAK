@@ -79,6 +79,7 @@ from werkzeug.security import (check_password_hash as _werkzeug_check_password_h
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress, hashlib, socket
+import errno
 import hmac
 import urllib.request
 import urllib.parse
@@ -826,20 +827,196 @@ def _priv_write_denied_by_design(path):
 _MEDIAMTX_NOFOLLOW_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
 
 
+# ops #666 / infra-TAK #473: files that a RUNNING process may be reading. bash reads a
+# script as it goes, so an in-place rewrite (open + O_TRUNC) of tak-post-start.sh by the
+# console's startup Guard Dog sync made the unit fail with exit 2 after it had already
+# started every service. These are written by temp file + rename instead, so the running
+# process keeps the old file. It is a short list on purpose: a rename also breaks a
+# single-file bind mount into a container and a log that a running process holds open,
+# which in-place writes keep working, so everything else stays in place.
+_ATOMIC_WRITE_PREFIXES = ('/opt/tak-guarddog/', '/etc/systemd/system/')
+
+
+def _priv_write_wants_atomic(path, mode):
+    """True when a full-file privileged write to `path` must go by temp file + rename."""
+    return 'a' not in mode and str(path).startswith(_ATOMIC_WRITE_PREFIXES)
+
+
+def _atomic_replace_local(path, data, perm=None):
+    """Root-console twin of the broker's _atomic_replace() (broker/takwerx_broker.py): write
+    `data` (bytes) to a temp file beside `path`, fsync, rename over it. A process that has the
+    old file open keeps the old inode. Keeps the old file's mode and owner unless `perm` is
+    given. Returns False, changing nothing, for a target that must stay written in place
+    (symlink, non-regular file, extra hard links, a mount point); any other failure raises
+    with the target untouched."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not _stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+        return False
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, '.%s.tmp-%d-%s' % (base, os.getpid(), secrets.token_hex(4)))
+    # 0o600 until the final mode is set; a new file with no perm keeps the old 0o644 via umask.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o644 if (st is None and perm is None) else 0o600)
+    try:
+        try:
+            if perm is not None:
+                os.fchmod(fd, int(perm))
+            elif st is not None:
+                os.fchmod(fd, _stat.S_IMODE(st.st_mode))
+            if st is not None:
+                try:
+                    os.fchown(fd, st.st_uid, st.st_gid)
+                except OSError:
+                    pass
+                try:   # keep the SELinux label an in-place write would have kept (Rocky)
+                    os.setxattr(tmp, 'security.selinux', os.getxattr(path, 'security.selinux'))
+                except (OSError, AttributeError):
+                    pass
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, path)
+        except OSError as e:
+            if e.errno in (errno.EBUSY, errno.EXDEV):
+                os.unlink(tmp)
+                return False
+            raise
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:   # make the rename itself durable; best effort
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+# ops #645 W2 part 2a: Guard Dog scripts are root-run, so on a broker that runs from its
+# root-owned copy of infra-TAK, root fills in the template itself (broker op gd_render)
+# and the console sends only the values. One pass, same as the broker's _gd_fill (a test
+# keeps the two patterns equal).
+_GD_PLACEHOLDER_RE = re.compile(r'\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b')
+
+
+def _gd_fill(template, values):
+    return _GD_PLACEHOLDER_RE.sub(lambda m: values.get(m.group(0), m.group(0)), template)
+
+
+# ops #645 W2 part 2b: Guard Dog scripts only some boxes get. They are repo templates
+# like the rest (app.py used to build them inline and write them, so the console chose
+# root's code), but the Guard Dog sync skips them: each is installed by its own feature
+# and removed again with gd_remove. Same set as the broker's _GD_OPTIONAL (a test).
+_GD_OPTIONAL_SCRIPTS = frozenset({
+    'sms_send.py', 'sms_send.sh', 'tak-authentik-tasklog-purge.sh', 'mediamtx-cert-sync.sh',
+})
+
+
+def _gd_template(name):
+    """The repo template for a Guard Dog script (scripts/guarddog/<name>)."""
+    with open(os.path.join(BASE_DIR, 'scripts', 'guarddog', name), encoding='utf-8') as f:
+        return f.read()
+
+
+def _gd_remove_script(name):
+    """Remove an optional Guard Dog script. Root does it (gd_remove) on a broker that
+    has the op; an older broker gets the old `rm -f`, a root console removes it here."""
+    if name not in _GD_OPTIONAL_SCRIPTS:
+        raise ValueError(f'not an optional Guard Dog script: {name}')
+    path = os.path.join('/opt/tak-guarddog', name)
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'gd_remove', 'name': name})
+        if resp.get('ok'):
+            return bool(resp.get('changed'))
+        if not str(resp.get('error') or '').startswith('unknown op'):
+            raise BrokerError(f'Guard Dog script {name} not removed: {resp.get("error")}')
+        # An older broker: the folder can be root's (W1 root-owned layout), so the
+        # console cannot unlink in it itself. Ask that broker with the old rm -f.
+        if not os.path.lexists(path):
+            return False
+        r = subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            raise BrokerError(f'Guard Dog script {name} not removed: '
+                              f'{(r.stderr or r.stdout or "").strip()[:200]}')
+        return True
+    if os.path.lexists(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def _gd_render_older_broker(name, err):
+    """True when a root-owned broker on an older commit refused gd_render only because
+    it does not know this script yet: the optional ones were inline before W2 part 2b
+    ("not a Guard Dog script name"), and a template added later is not in its copy
+    ("no Guard Dog template"). That happens when Update could not reach GitHub, so root
+    kept its older commit. The console then writes the old way, which that broker
+    still allows for those names (and refuses for every other Guard Dog script)."""
+    if 'no Guard Dog template' in err:
+        return True
+    return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
+
+
+def _gd_install_script(name, template, values, perm=0o755):
+    """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
+    file changed. A broker on the root-owned layout renders it from ITS copy of the
+    template (the console cannot choose the code root runs); an older broker, or a
+    root console, gets the old fill-here-and-write. Raises if the broker refuses."""
+    values = {k: '' if v is None else str(v) for k, v in values.items()}
+    if _broker_should_route() and _broker_available():
+        resp = _broker_request({'op': 'gd_render', 'name': name, 'values': values})
+        if resp.get('ok'):
+            return bool(resp.get('changed'))
+        err = str(resp.get('error') or '')
+        if not (err.startswith('unknown op') or 'root-owned copy' in err
+                or _gd_render_older_broker(name, err)):
+            raise BrokerError(f'Guard Dog script {name} not installed: {err}')
+    content = _gd_fill(template, values)
+    dest = os.path.join('/opt/tak-guarddog', name)
+    try:
+        if _read_priv(dest) == content:
+            if perm is not None:
+                _chmod_priv(dest, perm)   # repair a lost +x; chmod leaves mtime alone
+            return False
+    except Exception:
+        pass
+    _write_priv(dest, content, perm=perm)
+    return True
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
     given (octal int), the file is chmod'd to it after the write.
 
+    Full-file writes under _ATOMIC_WRITE_PREFIXES (Guard Dog scripts, systemd units) go
+    by temp file + rename so a running script is never rewritten under itself (ops #666).
+    The legacy sudo-tee path still writes in place.
+
     Full-file writes of CoreConfig.xml first stash the previous version as
     `.infratak-prev` — see _backup_coreconfig_before_write()."""
     _backup_coreconfig_before_write(path, content, mode)
+    atomic = _priv_write_wants_atomic(path, mode)
     if _broker_should_route() and _broker_available():
         data = content if isinstance(content, (bytes, bytearray)) else str(content).encode()
         req = {'op': 'write', 'path': path, 'mode': mode,
                'content_b64': _b64.b64encode(data).decode()}
         if perm is not None:
             req['perm'] = int(perm)
+        if atomic:
+            req['atomic'] = True
         resp = _broker_request(req)
         if not resp.get('ok'):
             raise BrokerError(f"broker write denied ({path}): {resp.get('error')}")
@@ -855,6 +1032,9 @@ def _write_priv(path, content, mode='w', perm=None):
     is_bytes = isinstance(content, (bytes, bytearray))
     if os.getuid() == 0:
         fmode = mode + 'b' if is_bytes else mode
+        if atomic and _atomic_replace_local(
+                path, bytes(content) if is_bytes else str(content).encode(), perm):
+            return
         if str(path).startswith(_MEDIAMTX_NOFOLLOW_PREFIXES):
             # ops #643: MediaMTX's own account can plant links in these dirs; a root
             # console must not write through one (the broker does the same, O_NOFOLLOW).
@@ -1420,7 +1600,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.3.13-alpha"
+VERSION = "10.3.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -3209,6 +3389,84 @@ def _patch_tak_hardened_dockerfile(build_ctx, dockerfiles, log_fn=None):
         _log(f"  Patched {', '.join(patched)}: `microdnf update --nobest` — Red Hat's newer curl needs an "
              "OpenSSL that TAK's Dockerfile pins out; without this the image build fails on every host.")
     return bool(patched)
+
+
+# ops #686 — put the PGDG yum repos on PGDG's EL-major path inside TAK's hardened DB image.
+_PGDG_MAJOR_MARK = '# infra-TAK: PGDG repos on the EL major path'
+_PGDG_MAJOR_STEP = (
+    _PGDG_MAJOR_MARK + '\n'
+    "RUN for f in /etc/yum.repos.d/pgdg*.repo; do [ -f \"$f\" ] && "
+    "sed -i 's|/rhel-\\$releasever[_a-z.$]*-\\$basearch|/rhel-'\"$(rpm -E %rhel)\"'-$basearch|g' \"$f\"; "
+    "done; true\n"
+)
+
+
+def _patch_tak_db_pgdg_releasever(build_ctx, db_dockerfile, log_fn=None):
+    """Point the PGDG yum repos in TAK's hardened DB image at rhel-<major>, not rhel-<minor>. Idempotent.
+
+    Field 2026-11-12 (ops #686; the 10.3.13 candidate's ARM fresh install, a day after the
+    same code passed). Dockerfile.hardened-takserver-db (5.8-RELEASE-75) starts FROM
+    ubi10/ubi:10.2, but its first step runs `dnf update -y`, which takes the image to the
+    newest RHEL minor (el10_3 packages since Red Hat shipped 10.3). dnf's release is then 10.3,
+    and PGDG's repo file (pgdg-redhat-repo 42.0-69) reads
+    baseurl=.../redhat/rhel-$releasever_major.$releasever_minor-$basearch (older ones:
+    rhel-$releasever-$basearch; the sed takes both). PGDG only
+    publishes a minor's folder some time after Red Hat ships it (checked 2026-11-12: rhel-10,
+    rhel-10.1, rhel-10.2), so every PGDG repo 404s and `docker build` of the DB image stops at
+    `RUN dnf install … pgdg-redhat-repo-latest.noarch.rpm`. This returns at every RHEL minor.
+
+    PGDG's rhel-<major> folder carries the same packages as its newest minor (rhel-10 and
+    rhel-10.2 had identical postgresql18 builds and repodata dates on 2026-11-12), and the image
+    is always on the newest minor after its own `dnf update`, so rhel-<major> is the right one
+    in every case, not only while PGDG lags. One RUN goes right after every RUN instruction that
+    installs the pgdg-redhat-repo rpm (the repo files exist from there on), with the major from
+    `rpm -E %rhel`. Only the pgdg*.repo files change; $releasever stays as is for UBI, EPEL and
+    Rocky. Same contract as the patchers above: a Dockerfile without that rpm is left as
+    shipped, and one we cannot read or write is built as shipped.
+    """
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not db_dockerfile:
+        return False
+    df = os.path.join(build_ctx, db_dockerfile)
+    if not os.path.isfile(df):
+        return False
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(db_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    if _PGDG_MAJOR_MARK in src:
+        return False
+    lines = src.splitlines(keepends=True)
+    out, i, added = [], 0, 0
+    while i < len(lines):
+        if not re.match(r'(?i)\s*RUN\s', lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while lines[j].rstrip('\r\n').rstrip().endswith('\\') and j + 1 < len(lines):
+            j += 1
+        block = lines[i:j + 1]
+        out.extend(block)
+        if re.search(r'pgdg-redhat-repo[^\s\'"]*\.rpm', ''.join(block)):
+            if not out[-1].endswith('\n'):
+                out[-1] += '\n'
+            out.append(_PGDG_MAJOR_STEP)
+            added += 1
+        i = j + 1
+    if not added:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(''.join(out))
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(db_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(db_dockerfile)}: PostgreSQL repos use the RHEL major version "
+         "(PGDG has no folder yet for the newest RHEL minor; without this the database image build fails).")
+    return True
 
 
 # ops #200 — CA roots the OS vendors have withdrawn trust from that Temurin's own bundled
@@ -19947,27 +20205,21 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         if not os.path.isfile(src):
             continue
         try:
-            content = open(src, 'r', encoding='utf-8').read()
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
-                .replace('EXTERNAL_DB_PLACEHOLDER', external_db_flag))
-            content = (content
-                .replace('DB_HOST_PLACEHOLDER', db_host)
-                .replace('DB_PORT_PLACEHOLDER', db_port)
-                .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
-                .replace('SSH_USER_PLACEHOLDER', s1_user))
-            # This runs on every console start: leave an identical script alone (re-assert +x
-            # only), same as run_guarddog_deploy(), so mtimes only move when content does.
-            try:
-                if _read_priv(dest) == content:
-                    _chmod_priv(dest, 0o755)
-                    continue
-            except Exception:
-                pass
-            _write_priv(dest, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog is root-owned
+            template = open(src, 'r', encoding='utf-8').read()
+            # This runs on every console start: an identical script is left alone (+x
+            # re-asserted), same as run_guarddog_deploy(), so mtimes only move when content
+            # does. ops #645 W2 part 2a: root renders it from its own copy (gd_render).
+            _gd_install_script(name, template, {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
+                'EXTERNAL_DB_PLACEHOLDER': external_db_flag,
+                'DB_HOST_PLACEHOLDER': db_host,
+                'DB_PORT_PLACEHOLDER': db_port,
+                'SSH_KEY_PLACEHOLDER': ssh_key_path,
+                'SSH_USER_PLACEHOLDER': s1_user,
+            })
         except Exception as e:
             return False, f'{name}: {e}'
     try:
@@ -27778,7 +28030,7 @@ def guarddog_update():
             # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
-            _write_priv(_ak_tl_script, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})   # ops #645 W2 part 2b
             _write_priv(_ak_tl_svc_path, '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
             _write_priv(_ak_tl_tmr_path, '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
@@ -29949,12 +30201,11 @@ def guarddog_sms_save():
     if provider == '':
         settings['guarddog_sms'] = {}
         save_settings(settings)
-        for path in ['/opt/tak-guarddog/sms_send.sh', '/opt/tak-guarddog/sms_send.py']:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        for name in ('sms_send.sh', 'sms_send.py'):
+            try:
+                _gd_remove_script(name)   # ops #645 W2 part 2b: root removes it (folder is root's)
+            except Exception as e:
+                print(f"[guarddog] SMS off: {name} not removed: {e}", flush=True)
         return jsonify({'success': True, 'message': 'SMS disabled'})
     if provider == 'twilio':
         account_sid = (data.get('account_sid') or '').strip()
@@ -29981,31 +30232,11 @@ def _guarddog_write_sms_send_script(settings):
     if not sms or not sms.get('provider'):
         return
     _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
-    py_script = '''#!/usr/bin/env python3
-import urllib.request, json, sys
-if len(sys.argv) < 3:
-    sys.exit(0)
-subj, path = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f: body = f.read()
-except Exception:
-    body = subj
-data = json.dumps({"subject": subj, "body": body}).encode()
-req = urllib.request.Request("http://127.0.0.1:5001/api/guarddog/send-sms", data=data, headers={"Content-Type": "application/json"}, method="POST")
-try:
-    urllib.request.urlopen(req, timeout=10)
-except Exception:
-    pass
-'''
-    sh_script = '''#!/bin/bash
-SUBJ="$1"
-BODY_FILE="$2"
-[ -z "$BODY_FILE" ] || [ ! -f "$BODY_FILE" ] && exit 0
-/usr/bin/python3 /opt/tak-guarddog/sms_send.py "$SUBJ" "$BODY_FILE"
-'''
-    for name, content in [('sms_send.py', py_script), ('sms_send.sh', sh_script)]:
-        p = os.path.join('/opt/tak-guarddog', name)
-        _write_priv(p, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
+    # ops #645 W2 part 2b: fixed text in scripts/guarddog/ (was built here inline);
+    # root installs it from its own copy (gd_render). No values: the console API
+    # reads the provider settings at send time.
+    for name in ('sms_send.py', 'sms_send.sh'):
+        _gd_install_script(name, _gd_template(name), {})
 
 def _guarddog_send_sms_now(sms, text, force=False):
     """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging.
@@ -30313,50 +30544,43 @@ def run_guarddog_deploy(alert_email):
                 plog(f"✗ Missing script: {name}")
                 guarddog_deploy_status.update({'running': False, 'error': True})
                 return
-            content = open(src, 'r').read()
+            template = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+            vals = {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': alert_sms or '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
                 # v10.1.40: the updates watcher must compare Authentik against what THIS
                 # box's console will actually offer, not upstream latest — see
                 # scripts/guarddog/tak-updates-watch.sh.
-                .replace('UPDATE_CHANNEL_PLACEHOLDER',
-                         (settings.get('update_channel') or 'main').strip().lower())
-                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
+                'UPDATE_CHANNEL_PLACEHOLDER': (settings.get('update_channel') or 'main').strip().lower(),
+                'AK_VETTED_PLACEHOLDER': AUTHENTIK_VETTED_RELEASE,
+            }
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
-                content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
-                content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
-                content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
-                # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
-                # Leaving the placeholder in made the two renders differ, so every Update Now
-                # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')
+                vals.update({
+                    'DB_HOST_PLACEHOLDER': s1_host,
+                    'DB_PORT_PLACEHOLDER': db_port,
+                    'SSH_KEY_PLACEHOLDER': ssh_key_path,
+                    'SSH_USER_PLACEHOLDER': s1_user,
+                    # Same value _sync_guarddog_remote_db_from_settings() writes for two-server.
+                    # Leaving the placeholder in made the two renders differ, so every Update Now
+                    # rewrote tak-remotedb-watch.sh and logged it as changed (test8, 2026-10-10).
+                    'EXTERNAL_DB_PLACEHOLDER': '',
+                })
             if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
                 fh_remote = fh_cfg.get('remote', {})
-                fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
-                fh_ssh_user = (fh_remote.get('username') or 'root').strip()
-                content = content.replace('FEDHUB_HOST_PLACEHOLDER', fh_host)
-                content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
-                content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
-            dest = os.path.join('/opt/tak-guarddog', name)
-            _perm = 0o755 if name.endswith('.sh') else None
-            try:
-                _unchanged = _read_priv(dest) == content
-            except Exception:
-                _unchanged = False
-            if _unchanged and _perm is not None:
-                try:
-                    _chmod_priv(dest, _perm)   # still repair a lost +x; chmod leaves mtime alone
-                except Exception:
-                    _unchanged = False         # legacy non-root: let _write_priv's sudo chmod do it
-            if _unchanged:
-                continue
-            _write_priv(dest, content, perm=_perm)
-            changed.append(name)
+                vals.update({
+                    'FEDHUB_HOST_PLACEHOLDER': fh_host,
+                    'SSH_KEY_PLACEHOLDER': (fh_remote.get('ssh_key_path') or '').strip(),
+                    'SSH_USER_PLACEHOLDER': (fh_remote.get('username') or 'root').strip(),
+                })
+            # ops #645 W2 part 2a: root renders it from its own copy (gd_render). An
+            # identical script is left alone (+x re-asserted), so mtimes only move when
+            # the content does.
+            if _gd_install_script(name, template, vals,
+                                  perm=0o755 if name.endswith('.sh') else None):
+                changed.append(name)
         if changed:
             plog(f"✓ Scripts installed: {len(changed)} changed ({', '.join(sorted(changed))}), "
                  f"{len(script_files) - len(changed)} already current")
@@ -30460,15 +30684,10 @@ def run_guarddog_deploy(alert_email):
             # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
             # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
             # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
+            # ops #645 W2 part 2b: the text is scripts/guarddog/tak-authentik-tasklog-purge.sh;
+            # root installs it from its own copy (gd_render). Same bytes: left alone, +x kept.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
-            try:
-                _ak_purge_same = _read_priv(_ak_purge_path) == _AUTHENTIK_TASKLOG_PURGE_SCRIPT
-                if _ak_purge_same:
-                    _chmod_priv(_ak_purge_path, 0o755)   # keep +x; leave mtime alone
-            except Exception:
-                _ak_purge_same = False
-            if not _ak_purge_same:
-                _write_priv(_ak_purge_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)
+            _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
                 ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -44320,11 +44539,15 @@ def _takportal_ssh_from_sources():
 
 
 def _takportal_ssh_key_options(sources):
-    """The options for the portal key line. No sources = `restrict` alone (the next heal adds
-    from= once Docker answers), never a from= that would lock the portal out."""
+    """The options for the portal key line. No sources = `restrict,pty` alone (the next heal adds
+    from= once Docker answers), never a from= that would lock the portal out.
+
+    `pty` is needed: `restrict` turns terminal allocation off, and TAK Portal's plugin worker
+    asks for a terminal, so Marketplace installs failed on 10.3.12 (ops #687). `restrict` still
+    blocks port, agent and X11 forwarding; from= still limits who can use the key."""
     if not sources:
-        return 'restrict'
-    return 'restrict,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
+        return 'restrict,pty'
+    return 'restrict,pty,from="' + ','.join(['127.0.0.1', '::1'] + list(sources)) + '"'
 
 
 def _takportal_authorized_keys_text(existing, pub_content, sources):
@@ -44352,6 +44575,9 @@ def _takportal_authorized_keys_text(existing, pub_content, sources):
             opts = want_opts
             if not sources and 'from=' in p[0] and p[0].startswith('restrict'):
                 opts = p[0]
+                # A line written by 10.3.12 has no `pty` (ops #687): add it, keep its from=.
+                if not opts.startswith('restrict,pty'):
+                    opts = 'restrict,pty' + opts[len('restrict'):]
             out.append(f'{opts} {ktype} {blob}' + (f' {comment}' if comment else ''))
             continue
         if p and p[3].strip() == TAKPORTAL_SSH_KEY_COMMENT:
@@ -46899,33 +47125,33 @@ paths:
                 ssh_port = int(rcfg.get('ssh_port', 22))
                 ssh_key  = (rcfg.get('ssh_key_path') or '').strip()
                 ssh_key_expanded = os.path.expanduser(ssh_key) if ssh_key else ''
-                key_flag = f'-i {ssh_key_expanded}' if ssh_key_expanded and os.path.exists(ssh_key_expanded) else ''
-                _sq = shlex.quote
-                sync_script = (
-                    f"#!/bin/bash\n"
-                    f"# Auto-generated: sync Caddy certs to remote MediaMTX\n"
-                    f"CERT={_sq(cert_file)}\n"
-                    f"KEY={_sq(key_file)}\n"
-                    f"REMOTE={_sq(f'{ssh_user}@{host}')}\n"
-                    f"PORT={_sq(str(ssh_port))}\n"
-                    f"KEY_FLAG={_sq(key_flag)}\n"
-                    f"[ -f \"$CERT\" ] || exit 0\n"
-                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
-                    f"\"$CERT\" \"$REMOTE:/etc/mediamtx/certs/stream.crt\" 2>/dev/null\n"
-                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
-                    f"\"$KEY\" \"$REMOTE:/etc/mediamtx/certs/stream.key\" 2>/dev/null\n"
-                    f"ssh -p $PORT $KEY_FLAG -o BatchMode=yes \"$REMOTE\" "
-                    f"{_sq(_MEDIAMTX_REMOTE_CERT_PERMS + ' && systemctl restart mediamtx')} 2>/dev/null\n"
-                )
-                sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
+                if not (ssh_key_expanded and os.path.exists(ssh_key_expanded)):
+                    ssh_key_expanded = ''
+                # ops #645 W2 part 2b: scripts/guarddog/mediamtx-cert-sync.sh. The console
+                # names the domain and where to send; root's script finds the cert and key
+                # in Caddy's store itself (it used to get both paths from here, so a console
+                # foothold could make root send any file to any host).
                 _makedirs_priv('/opt/tak-guarddog', exist_ok=True)
-                _write_priv(sync_path, sync_script, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
-                svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
-                timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
-                _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
-                _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
-                _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'mediamtx-cert-sync.timer']], 'and')
-                plog("✓ Cert renewal sync timer installed (daily)")
+                _cs_ok = True
+                try:
+                    _gd_install_script('mediamtx-cert-sync.sh', _gd_template('mediamtx-cert-sync.sh'), {
+                        'MTX_DOMAIN_PLACEHOLDER': mtx_domain,
+                        'MTX_HOST_PLACEHOLDER': str(host),
+                        'MTX_USER_PLACEHOLDER': str(ssh_user),
+                        'MTX_PORT_PLACEHOLDER': str(ssh_port),
+                        'MTX_KEYFILE_PLACEHOLDER': ssh_key_expanded,
+                    })
+                except BrokerError as _cs_e:
+                    _cs_ok = False
+                    plog(f"⚠ Cert renewal sync not installed: {_cs_e}")
+                    plog("  The cert was copied now; Deploy again after a renewal to copy it again")
+                if _cs_ok:
+                    svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
+                    timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+                    _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
+                    _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
+                    _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', '--now', 'mediamtx-cert-sync.timer']], 'and')
+                    plog("✓ Cert renewal sync timer installed (daily)")
             else:
                 plog("⚠ Failed to copy certs to remote — RTSPS not configured")
         else:
@@ -52602,19 +52828,24 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                 text = f.read()
         excluded = {rel, rel + '/', rel + '/*', rel + '/**'}
         names = []
-        if any(ln.strip() in excluded for ln in text.splitlines()):
+        leaves_out = any(ln.strip() in excluded for ln in text.splitlines())
+        if leaves_out:
             plugins = os.path.join(ct_dir, rel)
             try:
                 names = sorted(n for n in os.listdir(plugins) if _CT_PLUGIN_DIR_RE.fullmatch(n)
                                and os.path.isdir(os.path.join(plugins, n)))
             except OSError:
                 names = []
-        if not names:
+        if not leaves_out:
             if mine:
                 os.remove(out)
                 plog('  Removed Dockerfile.dockerignore (CloudTAK no longer leaves plugins out of the build)')
             return
-        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '']
+        # ops #687: the wildcard pair goes in even with no plugin folder yet. TAK Portal's Marketplace
+        # installs a plugin and rebuilds CloudTAK through its own helper, which never runs this shield:
+        # a file that lists only the folders that exist at console start drops the first plugin a
+        # customer installs (and every later one until the next console restart) from the image.
+        lines = [_CT_DOCKERIGNORE_MARK, text.rstrip('\n'), '', f'!{rel}/*', f'{rel}/*/**/node_modules/']
         for n in names:
             lines += [f'!{rel}/{n}', f'{rel}/{n}/**/node_modules/']
         want = '\n'.join(lines) + '\n'
@@ -52629,7 +52860,7 @@ def _cloudtak_keep_plugins_in_build(ct_dir, plog):
                 plog("  The Dispatcher plugin's installer had written a Dockerfile.dockerignore that kept only "
                      "its own folder in the image build; replaced it so every installed plugin stays in (ops #503)")
             plog(f"  CloudTAK's .dockerignore leaves {rel}/ out of the image build: wrote "
-                 f"Dockerfile.dockerignore so the installed plugins stay in it ({', '.join(names)})")
+                 f"Dockerfile.dockerignore so installed plugins stay in it ({', '.join(names) or 'none installed yet'})")
     except Exception as e:
         plog(f"  ⚠ Could not keep the installed plugins in the image build (non-fatal): {str(e)[:160]}")
 
@@ -55114,6 +55345,12 @@ def run_cloudtak_redeploy(cfg=None):
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             _cloudtak_remote_media_bufs(remote_cfg, plog)
+            # ops #631 follow-up: the domain may have been added or removed since the last
+            # Deploy, which changes whether 5000/5002 are locked (_remote_cloudtak_guard_ports).
+            # Re-apply the port lock so it matches the .env written here; it also removes the
+            # lock on ports that are no longer on the list.
+            if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
+                plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -55437,14 +55674,45 @@ def _cloudtak_postgis_extensions_upgrade(plog=None, remote_cfg=None):
         return False
 
 
-# Remote-target port hardening after a checkout: media:9997 → loopback. perl for a
-# consistent regex across distros; the `unless /127.0.0.1/` guard makes it idempotent.
+# Remote target after a checkout: media:9997 stays PUBLISHED on the remote host. Caddy runs on
+# the console, not on the remote, and proxies video.<fqdn> (443 and :9997) to <remote>:9997
+# (_get_cloudtak_upstreams), so a 127.0.0.1:9997 publish there breaks every remote video.
+# The loopback move exists for a LOCAL CloudTAK, where Caddy's own :9997 listener shares the
+# box (_patch_cloudtak_compose_ports). On a remote host the DOCKER-USER port guard
+# (_remote_cloudtak_port_guard) limits 9997 to the console instead. This undoes the loopback
+# prefix an older Update wrote; idempotent, perl for a consistent regex across distros.
 _CLOUDTAK_REMOTE_MEDIA_PERL = (
-    "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
+    "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml compose.yaml; do "
     "[ -f \"$f\" ] && perl -i -pe "
-    "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
+    "'s/(- \")127\\.0\\.0\\.1:(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}$2/' "
     "\"$f\"; done; true"
 )
+
+
+def _cloudtak_remote_media_publish_heal(remote_cfg, log_fn=None):
+    """ops #631 follow-up: a remote CloudTAK that an older Update left with media on
+    127.0.0.1:9997 has no video through Caddy on the console. Put the publish back and
+    recreate only the media container. No-op (no restart) when the compose is already right.
+    Call it only after the port guard is in place: it publishes 9997 for the console.
+    Returns 'same', 'healed' or 'failed'."""
+    _log = log_fn or (lambda _m: None)
+    cmd = (
+        "cd ~/CloudTAK 2>/dev/null || { echo NOCT; exit 0; }; "
+        "grep -qsE '127\\.0\\.0\\.1:\\$\\{MEDIA_PORT_API:-[0-9]+\\}:9997' "
+        "docker-compose.yml docker-compose.yaml compose.yaml || { echo SAME; exit 0; }; "
+        + _CLOUDTAK_REMOTE_MEDIA_PERL + "; "
+        "cd ~/CloudTAK && docker compose up -d --no-deps media >/dev/null 2>&1 && echo HEALED || echo FAILED"
+    )
+    ok, out = _ssh_probe(remote_cfg, cmd, timeout=180)
+    out = out or ''
+    if ok and 'HEALED' in out:
+        _log("  ✓ Remote CloudTAK video port 9997 published again for Caddy on the console (media container recreated)")
+        _cloudtak_media_hls_heal(plog=_log, remote_cfg=remote_cfg, wait=True)
+        return 'healed'
+    if ok and ('SAME' in out or 'NOCT' in out):
+        return 'same'
+    _log(f"  ⚠ Could not publish the remote CloudTAK video port 9997 again: {out.strip()[-200:]}")
+    return 'failed'
 
 
 # v10.2.15 (#150): operator pre-build hooks. Update's `checkout -f` wipes any local edit to
@@ -56098,13 +56366,16 @@ def run_cloudtak_update():
         # the startup migration.) Re-apply the loopback hardening here — the same
         # patch the startup migration / deploy path run — BEFORE the build/up.
         if is_remote:
-            # _patch_cloudtak_compose_ports() edits local files; over SSH apply the
-            # critical media:9997 → loopback rewrite via perl (consistent regex across
-            # distros; sed's brace/backref handling diverges). The `unless /127.0.0.1/`
-            # guard makes it idempotent. Fuller hardening runs on the box's next restart.
+            # The loopback move above is for a local CloudTAK only: on a remote host Caddy
+            # (on the console) proxies video to <remote>:9997, so media:9997 stays published
+            # there and the DOCKER-USER port guard limits it, and the other published ports,
+            # to the console (ops #631 follow-up). The guard is re-applied here so it matches
+            # the current domain settings before the containers are recreated.
             ok_sed, _ = _ssh_probe(remote_cfg, _CLOUDTAK_REMOTE_MEDIA_PERL, timeout=30)
-            plog("  Re-applied media:9997 loopback hardening after checkout"
-                 if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+            plog("  Video port 9997 published for Caddy on the console"
+                 if ok_sed else "  ⚠ Could not check the video port 9997 publish (non-fatal)")
+            if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
+                plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -62548,6 +62819,7 @@ def _docker_port_guard_files(name, ports, allow_ips):
     https://docs.docker.com/engine/network/packet-filtering-firewalls/
     Containers on the box's own Docker bridges keep access. The unit is WantedBy + PartOf
     docker.service, so the rules come back on every boot and every Docker restart.
+    ops #672: IPv6 is covered too (INPUT, where Docker's [::] proxy traffic enters).
     """
     if not _PORT_GUARD_NAME_RE.match(name or ''):
         raise ValueError(f'bad port guard name: {name!r}')
@@ -62575,6 +62847,52 @@ def _docker_port_guard_files(name, ports, allow_ips):
     for p in _ports:
         m = f'-p tcp -m conntrack --ctorigdstport {p} --ctdir ORIGINAL -j "$C"'
         lines.append(f'iptables -w -C DOCKER-USER {m} 2>/dev/null || iptables -w -I DOCKER-USER {m} || exit 1')
+    # ops #631 follow-up: this guard's port list can shrink (a remote CloudTAK whose domain is
+    # removed opens 5000/5002 to browsers again; a WebODM port can change). Remove the jumps
+    # to this chain for ports no longer on the list, so a port left out answers again instead
+    # of staying locked until someone clears the rule by hand. Only this guard's own chain.
+    keep = ' ' + ' '.join(str(p) for p in _ports) + ' '
+    lines += [
+        f'KEEP="{keep}"',
+        'for p in $(iptables -w -S DOCKER-USER | sed -n "/ -j $C\\$/s/.*--ctorigdstport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '  case "$KEEP" in *" $p "*) ;; *) iptables -w -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j "$C" || exit 1;; esac',
+        'done',
+    ]
+    # ops #672: Docker also publishes each port on IPv6 ([::]:PORT, through docker-proxy). That
+    # traffic enters through INPUT, not DOCKER-USER, so the IPv4 rules above do not apply to it.
+    # The console reaches these ports over IPv4 (the allow list above is IPv4), so over IPv6 refuse
+    # everyone except this box's own interfaces. REJECT with a TCP reset, not DROP: a client that
+    # tries IPv6 first (a name with an AAAA record) falls back to IPv4 at once instead of waiting
+    # for a timeout. The same jump goes into ip6tables DOCKER-USER for a Docker whose bridges have
+    # IPv6 on (that path is forwarded, not proxied). Skipped only when the kernel has no IPv6.
+    lines += [
+        'if [ -e /proc/net/if_inet6 ]; then',
+        '  command -v ip6tables >/dev/null 2>&1 || { echo "infratak-port-guard: ip6tables not found" >&2; exit 1; }',
+        '  ip6tables -w -N "$C" 2>/dev/null || ip6tables -w -F "$C" || exit 1',
+        '  ip6tables -w -A "$C" -i lo -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -i docker0 -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -i br-+ -j RETURN || exit 1',
+        '  ip6tables -w -A "$C" -p tcp -j REJECT --reject-with tcp-reset || exit 1',
+    ]
+    for p in _ports:
+        m = f'-p tcp --dport {p} -j "$C"'
+        lines.append(f'  ip6tables -w -C INPUT {m} 2>/dev/null || ip6tables -w -I INPUT {m} || exit 1')
+    lines += [
+        '  if ip6tables -w -S DOCKER-USER >/dev/null 2>&1; then',
+    ]
+    for p in _ports:
+        m = f'-p tcp -m conntrack --ctorigdstport {p} --ctdir ORIGINAL -j "$C"'
+        lines.append(f'    ip6tables -w -C DOCKER-USER {m} 2>/dev/null || ip6tables -w -I DOCKER-USER {m} || exit 1')
+    lines += [
+        '    for p in $(ip6tables -w -S DOCKER-USER | sed -n "/ -j $C\\$/s/.*--ctorigdstport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '      case "$KEEP" in *" $p "*) ;; *) ip6tables -w -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "$p" --ctdir ORIGINAL -j "$C" || exit 1;; esac',
+        '    done',
+        '  fi',
+        '  for p in $(ip6tables -w -S INPUT | sed -n "/ -j $C\\$/s/.*--dport \\([0-9][0-9]*\\).*/\\1/p"); do',
+        '    case "$KEEP" in *" $p "*) ;; *) ip6tables -w -D INPUT -p tcp --dport "$p" -j "$C" || exit 1;; esac',
+        '  done',
+        'fi',
+    ]
     script = '\n'.join(lines) + '\n'
     unit = (
         '[Unit]\n'
@@ -62628,6 +62946,8 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, ex
         f'echo {_b64.b64encode(unit.encode()).decode()} | base64 -d | $S tee /etc/systemd/system/{_unit} >/dev/null && '
         f'$S systemctl daemon-reload && $S systemctl enable {_unit} 2>&1 && $S systemctl restart {_unit} 2>&1 && '
         f'$S iptables -w -C DOCKER-USER -p tcp -m conntrack --ctorigdstport {_p0} --ctdir ORIGINAL -j {_chain} && '
+        # ops #672: and the IPv6 jump, on a kernel that has IPv6 (the script skips it otherwise)
+        f'{{ [ ! -e /proc/net/if_inet6 ] || $S ip6tables -w -C INPUT -p tcp --dport {_p0} -j {_chain}; }} && '
         'echo "GUARD_OK had=$had"'
     )
     ok, out = _module_run(deploy_cfg, cmd, timeout=60)
@@ -62635,7 +62955,7 @@ def _remote_docker_port_guard(deploy_cfg, settings, name, ports, log_fn=None, ex
     ports_txt = '/'.join(str(p) for p in ports)
     if good:
         if _ips:
-            _log(f"  ✓ Port {ports_txt} locked to the console ({', '.join(_ips)}) in DOCKER-USER (kept across reboot)")
+            _log(f"  ✓ Port {ports_txt} locked to the console ({', '.join(_ips)}) in DOCKER-USER, IPv6 refused (kept across reboot)")
         else:
             _log(f"  ⚠ Port {ports_txt} dropped for every source: no console IP found. Set Settings → Server IP.")
     else:
@@ -82312,96 +82632,12 @@ def _read_compose_heal_stamp():
 # tak-10 grew to 2,025,958 tasklog rows / 516 MB + 640,596 task rows / 442 MB
 # in under 24h. Three-tier escalation (7d → 24h → 1h) handles both the slow
 # steady-state growth case and the runaway-churn case.
-_AUTHENTIK_TASKLOG_PURGE_SCRIPT = (
-    '#!/bin/bash\n'
-    '# Guard Dog: Authentik task log purge (v0.9.26 — fixed VACUUM-in-transaction).\n'
-    '# Removes authentik_tasks_task + authentik_tasks_tasklog rows in tiers:\n'
-    '#   Tier 1: rows older than 7 days (gentle, keeps weekly audit trail)\n'
-    '#   Tier 2: rows older than 24h (if size still ≥ 100 MB after Tier 1)\n'
-    '#   Tier 3: rows older than 1h  (if size still ≥ 100 MB after Tier 2)\n'
-    '# Each tier runs in its own `psql -c` invocation; the final VACUUM ANALYZE\n'
-    '# also runs in a SEPARATE psql -c so it is NOT wrapped in a transaction.\n'
-    '# Old v0.9.5 single-call script failed every Sunday with\n'
-    '#   ERROR: VACUUM cannot run inside a transaction block\n'
-    '# v0.9.26 fix lives both here AND inline in app.py\n'
-    '# (_auto_authentik_tasklog_purge); the inline helper runs on every console\n'
-    '# boot regardless of the timer, so even if THIS script is broken the\n'
-    '# console boot path keeps the tables healthy.\n'
-    'set -u\n'
-    'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-    'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-    'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-    'mkdir -p /var/log/takguard\n'
-    'echo "[$TS] Starting Authentik task log purge (v0.9.26 multi-tier)" >> "$LOG"\n'
-    '\n'
-    'if [ -z "$(docker ps -q --filter name=authentik-postgresql-1 2>/dev/null)" ]; then\n'
-    '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    '  exit 0\n'
-    'fi\n'
-    '\n'
-    'size_mb() {\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
-    '    "SELECT (pg_total_relation_size(\'authentik_tasks_tasklog\') + pg_total_relation_size(\'authentik_tasks_task\')) / 1024 / 1024" 2>/dev/null \\\n'
-    '    | tr -dc "0-9" || echo 0\n'
-    '}\n'
-    '\n'
-    'row_counts() {\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
-    '    "SELECT (SELECT count(*) FROM authentik_tasks_task) || \'/\' || (SELECT count(*) FROM authentik_tasks_tasklog)" 2>/dev/null || echo "?/?"\n'
-    '}\n'
-    '\n'
-    'delete_older_than() {\n'
-    '  local interval="$1"\n'
-    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-    'DELETE FROM authentik_tasks_tasklog WHERE task_id IN (\n'
-    '  SELECT message_id FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\'\n'
-    ');\n'
-    'DELETE FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\';\n'
-    '" >> "$LOG" 2>&1\n'
-    '}\n'
-    '\n'
-    'INITIAL=$(size_mb)\n'
-    'INITIAL=${INITIAL:-0}\n'
-    'INITIAL_ROWS=$(row_counts)\n'
-    'THRESHOLD=100\n'
-    'echo "[$TS] Initial size: ${INITIAL} MB (task/tasklog rows: ${INITIAL_ROWS}), threshold ${THRESHOLD} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$INITIAL" -lt "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] No cleanup needed — already healthy" >> "$LOG"\n'
-    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    '  exit 0\n'
-    'fi\n'
-    '\n'
-    'echo "[$TS] Tier 1 — DELETE rows older than 7 days" >> "$LOG"\n'
-    'delete_older_than "7 days" || echo "[$TS] Tier 1 returned non-zero (continuing)" >> "$LOG"\n'
-    'AFTER_7D=$(size_mb); AFTER_7D=${AFTER_7D:-$INITIAL}\n'
-    'echo "[$TS] After 7-day pass: ${AFTER_7D} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$AFTER_7D" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] Tier 2 — DELETE rows older than 24 hours" >> "$LOG"\n'
-    '  delete_older_than "24 hours" || echo "[$TS] Tier 2 returned non-zero (continuing)" >> "$LOG"\n'
-    'fi\n'
-    'AFTER_24H=$(size_mb); AFTER_24H=${AFTER_24H:-$AFTER_7D}\n'
-    'echo "[$TS] After 24h pass: ${AFTER_24H} MB" >> "$LOG"\n'
-    '\n'
-    'if [ "$AFTER_24H" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
-    '  echo "[$TS] Tier 3 (nuclear) — DELETE rows older than 1 hour" >> "$LOG"\n'
-    '  delete_older_than "1 hour" || echo "[$TS] Tier 3 returned non-zero (continuing)" >> "$LOG"\n'
-    'fi\n'
-    '\n'
-    'echo "[$TS] VACUUM ANALYZE (separate invocation — NOT in transaction)" >> "$LOG"\n'
-    'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c \\\n'
-    '  "VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;" >> "$LOG" 2>&1 || \\\n'
-    '  echo "[$TS] VACUUM returned non-zero (table sizes still updated)" >> "$LOG"\n'
-    '\n'
-    'FINAL=$(size_mb); FINAL=${FINAL:-0}\n'
-    'FINAL_ROWS=$(row_counts)\n'
-    'echo "[$TS] Final size: ${FINAL} MB (task/tasklog rows: ${FINAL_ROWS}), freed $(( INITIAL - FINAL )) MB" >> "$LOG"\n'
-    'echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
-    'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-    'exit 0\n'
-)
+# ops #645 W2 part 2b: the script text now lives in scripts/guarddog/ (root installs it
+# from its own copy with gd_render). Kept as a constant for the compare and old-broker paths.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'guarddog',
+                       'tak-authentik-tasklog-purge.sh'), encoding='utf-8') as _f:
+    _AUTHENTIK_TASKLOG_PURGE_SCRIPT = _f.read()
+del _f
 
 
 def _ensure_authentik_tasklog_purge_script(plog=None):
@@ -82432,7 +82668,8 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
                 _current = _f.read()
         if _current == _AUTHENTIK_TASKLOG_PURGE_SCRIPT:
             return  # Already canonical
-        _write_priv(_path, _AUTHENTIK_TASKLOG_PURGE_SCRIPT, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
+        # ops #645 W2 part 2b: root installs it from its own copy (gd_render)
+        _gd_install_script('tak-authentik-tasklog-purge.sh', _AUTHENTIK_TASKLOG_PURGE_SCRIPT, {})
         _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
     except Exception as _e:
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
@@ -84799,7 +85036,7 @@ def _run_vacuum_background(use_full, tak_cfg):
                 return
             _vacuum_status.update({'running': False, 'result': (out or '').strip()})
         else:
-            r = _pg_exec(['psql', '-d', 'cot', '-c', vacuum_sql], timeout=timeout_sec)
+            r = _cotdb_pg(tak_cfg)(['psql', '-d', 'cot', '-c', vacuum_sql], timeout=timeout_sec)
             out = (r.stdout or '') + (r.stderr or '')
             if r.returncode != 0:
                 _vacuum_status.update({'running': False, 'error': out.strip() or f'Exit code {r.returncode}'})
@@ -84834,6 +85071,9 @@ def takserver_vacuum():
     # operator cannot act on, and the one that dead-ended mg1921 on 2026-08-10.
     # Refuse legibly instead of letting PostgreSQL hit ENOSPC. VACUUM ANALYZE
     # (full=false) is safe and cheap and stays completely ungated.
+    if use_full and _cotdb_managed(tak_cfg):
+        # ops #668: never against a stray local cluster, and not blind on a managed one.
+        return _cotdb_managed_refusal('vacuum_full')
     if use_full:
         facts = _cotdb_facts(tak_cfg)
         refusal = _cotdb_space_refusal(facts)
@@ -84876,7 +85116,7 @@ def takserver_vacuum_status():
                     ok, out = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', timeout=10)
                     raw = (out or '').strip()
             else:
-                r = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', check_sql], timeout=10)
+                r = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-d', 'cot', '-c', check_sql], timeout=10)
                 raw = (r.stdout or '').strip()
             if raw and 'VACUUM' in raw.upper():
                 running = True
@@ -84923,7 +85163,7 @@ def takserver_reindex():
         return jsonify({'success': True, 'output': (out or '').strip(), 'remote': True})
 
     try:
-        r = _pg_exec(['psql', '-d', 'cot', '-c', reindex_sql], timeout=timeout_sec)
+        r = _cotdb_pg(tak_cfg)(['psql', '-d', 'cot', '-c', reindex_sql], timeout=timeout_sec)
         out = (r.stdout or '') + (r.stderr or '')
         if r.returncode != 0:
             return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
@@ -84951,7 +85191,11 @@ def takserver_cot_db_size():
             ok, out = _ssh_probe(s1, size_cmd, timeout=15)
             raw = (out or '0').strip()
         else:
-            r = _pg_exec(['psql', '-t', '-A', '-c', "SELECT COALESCE(pg_database_size('cot'), 0);"], timeout=10)
+            r = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-c', "SELECT COALESCE(pg_database_size('cot'), 0);"], timeout=10)
+            if _cotdb_managed(tak_cfg) and r.returncode != 0:
+                # A managed database that could not be read is unknown, never "0 B".
+                return jsonify({'size_bytes': 0, 'size_human': 'N/A',
+                                'error': _cotdb_clean((r.stderr or r.stdout or 'could not read the managed database'))[:200]})
             raw = (r.stdout or '0').strip()
         size = int(raw or 0)
         if size >= 1024 ** 3:
@@ -84971,7 +85215,7 @@ def takserver_cot_db_size():
                 ok2, out2 = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', timeout=15)
                 parts = (out2 or '0|0').strip().split('|')
             else:
-                r2 = _pg_exec(['psql', '-t', '-A', '-d', 'cot', '-c', stats_sql], timeout=10)
+                r2 = _cotdb_pg(tak_cfg)(['psql', '-t', '-A', '-d', 'cot', '-c', stats_sql], timeout=10)
                 parts = (r2.stdout or '0|0').strip().split('|')
             msg_count = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 0
             dead_tuples = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
@@ -85067,12 +85311,72 @@ def _cotdb_fmt_age(seconds):
     return f'{d // 365} years'
 
 
+def _cotdb_managed(tak_cfg=None):
+    """True when TAK's CoT database is a managed / remote endpoint that is NOT the
+    two-server Server One this console drives over SSH (Azure Flexible Server, AWS
+    RDS, or any other host named in CoreConfig.xml). ops #668 (infra-TAK #475):
+    every Guard Dog CoT-card read used to fall through to the LOCAL cluster here, so
+    a box with a leftover local PostgreSQL showed that stale cluster's size, age and a
+    false "Retention: STALLED", and a box with none showed unknowns. The answer comes
+    from the same ground truth TAK Server connects with: _tak_db_topology()."""
+    try:
+        if (tak_cfg or {}).get('mode') == 'two_server':
+            return False
+        return _tak_db_topology()[0] == 'remote'
+    except Exception:
+        return False
+
+
+_COTDB_MANAGED_STORAGE = 'provider-managed'
+
+
+def _cotdb_managed_refusal(action):
+    """(response, status) for a CoT-card action this console will not run against a
+    managed database. Never falls back to the local cluster: a refusal is the only
+    safe answer when the local cluster is not the one TAK uses."""
+    why = {
+        'vacuum_full': ('VACUUM FULL rewrites every table and needs free space the console '
+                        'cannot see on a managed database. Run VACUUM ANALYZE (Optimize Tables) '
+                        'here, or compact from your provider if you really need to.'),
+        'repack': ('Online Compact (pg_repack) is not available on a managed database from this '
+                   'console: it needs the pg_repack extension and free space the console cannot '
+                   'see. Run VACUUM ANALYZE (Optimize Tables) instead.'),
+        'purge': ('Purge Old CoT is disabled on a managed database. Set CoT retention in TAK '
+                  "Server's own Web Admin (:8443 > Data Retention Policies) and TAK Server's "
+                  'retention will delete old rows there.'),
+        'retention_run': ("TAK Server's own retention handles a managed database; Guard Dog's "
+                          'retention guard stands down there. Set the retention period in TAK '
+                          "Server's Web Admin (:8443 > Data Retention Policies)."),
+    }.get(action, 'This action is not available on a managed database.')
+    return jsonify({'success': False, 'managed_db': True, 'verdict': 'managed_db',
+                    'error': 'This server uses a managed database. ' + why}), 400
+
+
+def _cotdb_pg(tak_cfg):
+    """The psql runner for TAK's CoT database: the remote seam on a managed
+    database, else the local _pg_exec (unchanged)."""
+    return _cot_pg_exec if _cotdb_managed(tak_cfg) else _pg_exec
+
+
 def _cotdb_psql(tak_cfg, sql, db='cot', timeout=25):
     """Run ONE console-authored statement against the CoT cluster.
 
     Returns (ok, text). Covers local native, containerized TAK and the non-root
-    broker (all via _pg_exec, which already picks runuser vs docker exec) plus
-    the two-server SSH path used by the existing DB routes."""
+    broker (all via _pg_exec, which already picks runuser vs docker exec), the
+    two-server SSH path used by the existing DB routes, and a managed / remote
+    database (via _cot_pg_exec, over TCP with TAK's own credentials). A managed
+    database is queried through the connection TAK itself uses, so `db` is ignored
+    there: the application database is the only one a managed role may reach."""
+    if _cotdb_managed(tak_cfg):
+        try:
+            r = _cot_pg_exec(['psql', '-t', '-A', '-c', sql], timeout=timeout)
+            if r.returncode == 0:
+                return True, _cotdb_clean(r.stdout or '')
+            return False, _cotdb_clean((r.stdout or '') + (r.stderr or ''))
+        except subprocess.TimeoutExpired:
+            return False, 'query timed out'
+        except Exception as e:
+            return False, str(e)[:200]
     if tak_cfg.get('mode') == 'two_server':
         s1 = tak_cfg.get('server_one', {})
         if not (s1.get('host') or '').strip():
@@ -85230,23 +85534,35 @@ def _cotdb_facts(tak_cfg=None):
         'guard_timer_enabled': None, 'guard_timer_last': None,
         'repack_timer_enabled': None,
         'fk_dependents': [], 'two_server': tak_cfg.get('mode') == 'two_server',
+        'managed_db': _cotdb_managed(tak_cfg),
         'reltuples': None, 'stats_stale': None, 'stats_never_analyzed': None,
         'stats_tables': None,
         'errors': [],
     }
 
-    # Both are cluster-level and fail together if the cluster is unreachable, so
-    # merging them costs no robustness and saves an SSH round trip on split boxes.
-    ok, out = _cotdb_psql(tak_cfg,
-                          "SELECT COALESCE(pg_database_size('cot'), 0), current_setting('data_directory');",
-                          db='postgres', timeout=15)
-    if ok and '|' in out:
-        size_s, _, dd = out.strip().partition('|')
-        if size_s.strip().isdigit():
-            f['db_bytes'] = int(size_s.strip())
-        f['data_directory'] = dd.strip() or None
-    elif not ok:
-        f['errors'].append(f'db size: {out[:200]}')
+    if f['managed_db']:
+        # ops #668 (infra-TAK #475): a managed database has no data directory this
+        # console can see (current_setting('data_directory') needs superuser or
+        # pg_read_all_settings on RDS / Azure and says nothing useful anyway), so ask
+        # only for the size.
+        ok, out = _cotdb_psql(tak_cfg, "SELECT COALESCE(pg_database_size('cot'), 0);", timeout=15)
+        if ok and out.strip().isdigit():
+            f['db_bytes'] = int(out.strip())
+        elif not ok:
+            f['errors'].append(f'db size: {out[:200]}')
+    else:
+        # Both are cluster-level and fail together if the cluster is unreachable, so
+        # merging them costs no robustness and saves an SSH round trip on split boxes.
+        ok, out = _cotdb_psql(tak_cfg,
+                              "SELECT COALESCE(pg_database_size('cot'), 0), current_setting('data_directory');",
+                              db='postgres', timeout=15)
+        if ok and '|' in out:
+            size_s, _, dd = out.strip().partition('|')
+            if size_s.strip().isdigit():
+                f['db_bytes'] = int(size_s.strip())
+            f['data_directory'] = dd.strip() or None
+        elif not ok:
+            f['errors'].append(f'db size: {out[:200]}')
 
     # n_live_tup/n_dead_tup are counters maintained since the last stats reset and
     # are only reconciled with reality by (auto)ANALYZE. On a box where analyze has
@@ -85287,11 +85603,14 @@ def _cotdb_facts(tak_cfg=None):
     elif out:
         f['errors'].append(f'largest table: {out[:200]}')
 
-    free_b, total_b = _cotdb_df(tak_cfg, f['data_directory'] or '/')
-    f['fs_free_bytes'] = free_b
-    f['fs_total_bytes'] = total_b
-    if total_b:
-        f['fs_pct'] = round(free_b * 100.0 / total_b, 1)
+    if not f['managed_db']:
+        free_b, total_b = _cotdb_df(tak_cfg, f['data_directory'] or '/')
+        f['fs_free_bytes'] = free_b
+        f['fs_total_bytes'] = total_b
+        if total_b:
+            f['fs_pct'] = round(free_b * 100.0 / total_b, 1)
+    # Managed: storage belongs to the provider and this console cannot see it. Leave
+    # the numbers None (never the VM's own disk, never 0) so no disk verdict can fire.
 
     # A seq-scan min() on a 48M-row table would hang the card on exactly the box
     # that needs it, so bound the statement rather than the HTTP request.
@@ -85389,7 +85708,8 @@ def _cotdb_facts(tak_cfg=None):
 
     # Formatted once, here, so the tiles and the verdict text cannot drift apart.
     f['db_human'] = _cotdb_fmt_bytes(f['db_bytes']) if f['db_bytes'] is not None else '-'
-    f['fs_free_human'] = _cotdb_fmt_bytes(f['fs_free_bytes'])
+    f['fs_free_human'] = (_COTDB_MANAGED_STORAGE if f['managed_db']
+                          else _cotdb_fmt_bytes(f['fs_free_bytes']))
     f['largest_table_human'] = (_cotdb_fmt_bytes(f['largest_table_bytes'])
                                 if f['largest_table_bytes'] is not None else '-')
     f['oldest_age_human'] = _cotdb_fmt_age(f['oldest_age_secs'])
@@ -85424,6 +85744,11 @@ def _cotdb_facts(tak_cfg=None):
     f['retention_stalled'] = bool(stall_secs and f['oldest_expirable_age_secs']
                                   and f['oldest_expirable_age_secs'] > stall_secs)
     f['guard_timer_ok'] = (f['guard_timer_enabled'] or '') in ('enabled', 'enabled-runtime', 'static')
+    if f['managed_db']:
+        # Guard Dog's retention guard stands down on a remote database (tak-retention-guard.sh
+        # gd_db_is_remote); TAK Server's own retention is the one deleting there. Its timer
+        # state says nothing about this database, so it must not turn the card red.
+        f['guard_timer_ok'] = True
     return f
 
 
@@ -85505,7 +85830,7 @@ def _cotdb_verdict_tree(facts):
         causes = []
         if facts.get('retention_proc_alive') is False:
             causes.append("TAK Server's retention process is not running")
-        if not facts.get('guard_timer_ok'):
+        if not facts.get('guard_timer_ok') and not facts.get('managed_db'):
             causes.append(f"the Guard Dog retention timer is {facts.get('guard_timer_enabled') or 'unknown'}")
         if not causes:
             causes.append('retention is configured but has not been deleting')
@@ -85573,8 +85898,10 @@ def _cotdb_verdict_tree(facts):
     dead_phrase = ('dead tuples unknown (statistics have never been collected on this database)'
                    if facts.get('stats_stale')
                    else f"{(dead if dead is not None else 0):,} dead tuples")
+    _free_phrase = ('storage is provider-managed' if facts.get('managed_db')
+                    else f"{facts.get('fs_free_human', '-')} free on the database filesystem")
     detail = (f"{dead_phrase}, "
-              f"{facts.get('fs_free_human', '-')} free on the database filesystem, oldest CoT row "
+              f"{_free_phrase}, oldest CoT row "
               f"{facts.get('oldest_age_human', '-')} old"
               + (" (mission content or GeoChat, which retention keeps on purpose)"
                  if facts.get('old_rows_kept') else '')
@@ -85663,6 +85990,8 @@ def guarddog_cotdb_retention_run():
     takretentionguard.service is Type=oneshot with TimeoutStartSec=1800 - a
     blocking start would hold a gunicorn thread (1 worker / 4 threads) for up to
     half an hour. The client polls /api/guarddog/cotdb/job-status."""
+    if _cotdb_managed(_get_tak_deployment_config(load_settings())):
+        return _cotdb_managed_refusal('retention_run')
     if not os.path.exists('/etc/systemd/system/takretentionguard.service'):
         return jsonify({'success': False,
                         'error': 'Guard Dog retention guard is not installed on this box. '
@@ -85699,11 +86028,13 @@ def guarddog_cotdb_repack():
     broker's _PG_AS_POSTGRES allowlist, so running it through _pg_exec() would be
     DENIED - driving the unit is what makes this work on the non-root fleet with
     no new broker privilege and no new CJIS review surface."""
+    tak_cfg = _get_tak_deployment_config(load_settings())
+    if _cotdb_managed(tak_cfg):
+        return _cotdb_managed_refusal('repack')
     if not os.path.exists('/etc/systemd/system/takdbrepack.service'):
         return jsonify({'success': False,
                         'error': 'Guard Dog online repack is not installed on this box. '
                                  'Deploy or update Guard Dog first.'}), 400
-    tak_cfg = _get_tak_deployment_config(load_settings())
     # pg_repack builds a full copy of each table before swapping it in, exactly
     # like VACUUM FULL - so it gets the same free-space refusal (W3).
     facts = _cotdb_facts(tak_cfg)
@@ -85851,6 +86182,10 @@ def guarddog_cotdb_purge():
     automatic or scheduled path into this route."""
     if not os.path.exists('/opt/tak'):
         return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if _cotdb_managed(_get_tak_deployment_config(load_settings())):
+        # ops #668: destructive and unscoped (no mission-row guard), so it never runs on a
+        # database whose storage and backups this console cannot see.
+        return _cotdb_managed_refusal('purge')
     data = request.get_json(silent=True) or {}
     mode = (data.get('mode') or '').strip()
     if mode not in ('age', 'all'):
@@ -89708,7 +90043,9 @@ def upload_takserver_package():
     results = {'packages': [], 'gpg_key': None, 'policy': None}
     for f in files:
         raw_name = f.filename or ''
-        fn = secure_filename(raw_name)
+        # ops #645: secure_filename keeps a leading '-', which the root broker's
+        # package-file name rule refuses (a name must start with a letter or digit).
+        fn = secure_filename(raw_name).lstrip('-._')
         if not fn:
             return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
         # Normalize the EXTENSION to lower case before anything looks at it.
@@ -90437,6 +90774,27 @@ def _tak58_external_schema_version(edb):
     return int(out) if out.isdigit() else None
 
 
+_TAK58_MANAGED_STORAGE = 'provider-managed'
+
+
+def _tak58_fmt_measured(n):
+    """Bytes as text, or 'unknown' when the value was never measured (None). 0 is a real
+    measurement and stays '0 B'."""
+    return 'unknown' if n is None else _cotdb_fmt_bytes(n)
+
+
+def _tak58_preflight_summary_line(f):
+    """The run-log line for the pre-check: versions, database size, free space. On a
+    managed database free space is the provider's, so it says so instead of a number."""
+    if f.get('external_db'):
+        tail = 'storage: %s' % _TAK58_MANAGED_STORAGE
+    else:
+        tail = '%s free' % _tak58_fmt_measured(f.get('avail_bytes'))
+    return ('  PostgreSQL %s → %s, database %s, %s.'
+            % (f.get('pg_running_major'), f.get('pg_target_major'),
+               _tak58_fmt_measured(f.get('data_bytes')), tail))
+
+
 def _tak_58_preflight():
     """Read-only readiness for the 5.8 + PG18 migration.
 
@@ -90600,6 +90958,21 @@ def _tak_58_preflight():
     # 4. Disk: the new cluster needs 1.5x the old data dir, on ITS partition.
     datadir = None if facts.get('external_db') else _sql('SHOW data_directory;', db='postgres')
     facts['data_directory'] = datadir
+    if facts.get('external_db'):
+        # ops #668 (infra-TAK #472): a managed database has no local data directory, so
+        # this block used to be skipped whole and the card and run log printed
+        # "database 0 B, 0 B free". The size is measurable over the network (the same
+        # reader the backup step uses for "cot database 2.0 GB"). Free space is not: the
+        # provider owns the storage, so say that instead of printing a number that was
+        # never measured.
+        try:
+            _mcfg = _get_tak_deployment_config(load_settings()) or {}
+        except Exception:
+            _mcfg = {}
+        facts['storage'] = _TAK58_MANAGED_STORAGE
+        _msz = _cot_db_size_for_dump(_mcfg, _mcfg.get('external_db') or {})
+        if _msz is not None:
+            facts['data_bytes'] = _msz
     if datadir:
         target_parent = '/var/lib/pgsql' if datadir.startswith('/var/lib/pgsql') else '/var/lib/postgresql'
 
@@ -90693,9 +91066,11 @@ def _tak_58_preflight():
 
     facts['pg_target_major'] = TAK_PG_MAJOR
     # Pre-formatted for the template — Jinja should not be doing byte math.
-    facts['data_human'] = _cotdb_fmt_bytes(facts.get('data_bytes') or 0)
-    facts['avail_human'] = _cotdb_fmt_bytes(facts.get('avail_bytes') or 0)
-    facts['need_human'] = _cotdb_fmt_bytes(facts.get('need_bytes') or 0)
+    # A number that was not measured is "unknown", never "0 B" (ops #668 / infra-TAK #472).
+    facts['data_human'] = _tak58_fmt_measured(facts.get('data_bytes'))
+    facts['avail_human'] = (_TAK58_MANAGED_STORAGE if facts.get('external_db')
+                            else _tak58_fmt_measured(facts.get('avail_bytes')))
+    facts['need_human'] = _tak58_fmt_measured(facts.get('need_bytes'))
     # The cot_router facts are only gathered for a LOCAL cluster (step 5 above is
     # gated on `mode == 'local'`), so a container / remote / managed box reached this
     # return with the keys ABSENT, not None. Jinja renders a missing key as Undefined,
@@ -91680,10 +92055,7 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
                 _say('  BLOCKED: %s' % b)
             return fail('Pre-flight failed — nothing was changed on this server.')
         f = pf.get('facts', {})
-        _say('  PostgreSQL %s → %s, database %s, %s free.'
-                   % (f.get('pg_running_major'), f.get('pg_target_major'),
-                      _cotdb_fmt_bytes(f.get('data_bytes') or 0),
-                      _cotdb_fmt_bytes(f.get('avail_bytes') or 0)))
+        _say(_tak58_preflight_summary_line(f))
         if f.get('pk_rewrite_expected'):
             _say('  This database still has cot_router.id as integer, so the 5.8 schema '
                        'update will rewrite that table in full. Expect a long window.')
@@ -95216,6 +95588,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
@@ -97297,6 +97670,7 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_db_pgdg_releasever(build_ctx, _db_df, log_step)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
@@ -105053,8 +105427,8 @@ def _auto_update_guarddog():
         updated = 0
         for name in script_files:
             src = os.path.join(scripts_dir, name)
-            if not os.path.isfile(src):
-                continue
+            if not os.path.isfile(src) or name in _GD_OPTIONAL_SCRIPTS:
+                continue      # optional ones are installed by their own feature (ops #645 W2 part 2b)
             # v10.2.11 (GH #99): the remote-DB scripts used to be skipped outright unless
             # settings said two_server. A split box whose settings do not (built by hand,
             # external_db, or changed since) kept the copy it was first deployed with — on
@@ -105079,42 +105453,40 @@ def _auto_update_guarddog():
                 if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
                     continue
             with open(src) as f:
-                content = f.read()
-            content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
-                .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                template = f.read()
+            vals = {
+                'ALERT_EMAIL_PLACEHOLDER': _safe_alert_email_list(alert_email),
+                'ALERT_SMS_PLACEHOLDER': '',
+                'CERT_PASS_PLACEHOLDER': cert_pass,
+                'CONSOLE_VERSION_PLACEHOLDER': VERSION,
                 # v10.1.40: the updates watcher must compare Authentik against what THIS
                 # box's console will actually offer, not upstream latest — see
                 # scripts/guarddog/tak-updates-watch.sh.
-                .replace('UPDATE_CHANNEL_PLACEHOLDER',
-                         (settings.get('update_channel') or 'main').strip().lower())
-                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
+                'UPDATE_CHANNEL_PLACEHOLDER': (settings.get('update_channel') or 'main').strip().lower(),
+                'AK_VETTED_PLACEHOLDER': AUTHENTIK_VETTED_RELEASE,
+            }
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
-                content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
-                content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'))
-                content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # as run_guarddog_deploy() and the startup sync
+                vals.update({
+                    'DB_HOST_PLACEHOLDER': s1_host,
+                    'DB_PORT_PLACEHOLDER': db_port,
+                    'SSH_KEY_PLACEHOLDER': ssh_key_path or os.path.expanduser('~/.ssh/infratak_serverone'),
+                    'SSH_USER_PLACEHOLDER': s1_user,
+                    'EXTERNAL_DB_PLACEHOLDER': '',   # as run_guarddog_deploy() and the startup sync
+                })
             if baked:
-                for _k, _v in baked.items():
-                    content = content.replace(f'{_k}_PLACEHOLDER', _v)
-                content = content.replace('EXTERNAL_DB_PLACEHOLDER', '')   # an install that never filled it: two-server
+                vals.update({f'{_k}_PLACEHOLDER': _v for _k, _v in baked.items()})
+                vals.setdefault('EXTERNAL_DB_PLACEHOLDER', '')   # an install that never filled it: two-server
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
                 _fh_remote = _fh_cfg.get('remote', {})
-                content = content.replace('FEDHUB_HOST_PLACEHOLDER', (_fh_remote.get('host') or '').strip())
-                content = content.replace('SSH_KEY_PLACEHOLDER', (_fh_remote.get('ssh_key_path') or '').strip())
-                content = content.replace('SSH_USER_PLACEHOLDER', (_fh_remote.get('username') or 'root').strip())
-            dest = os.path.join('/opt/tak-guarddog', name)
-            try:
-                if _read_priv(dest) == content:   # v10.0.5 non-root: /opt/tak-guarddog root-owned
-                    continue
-            except Exception:
-                pass
-            _write_priv(dest, content, perm=0o755)
-            updated += 1
+                vals.update({
+                    'FEDHUB_HOST_PLACEHOLDER': (_fh_remote.get('host') or '').strip(),
+                    'SSH_KEY_PLACEHOLDER': (_fh_remote.get('ssh_key_path') or '').strip(),
+                    'SSH_USER_PLACEHOLDER': (_fh_remote.get('username') or 'root').strip(),
+                })
+            # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
+            if _gd_install_script(name, template, vals):
+                updated += 1
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
@@ -105541,6 +105913,14 @@ def _startup_ensure_broker():
             if _ln.strip().startswith('Environment=TAKWERX_BROKER_ENFORCE='):
                 enforce_line = _ln.strip() + '\n'
                 break
+        # ops #645 W1: once the broker moved itself to its root-owned code, keep that
+        # ExecStart. Writing the repo path back would run console-owned code as root.
+        exec_line = f'ExecStart={venv_py} {broker_py} serve\n'
+        for _ln in existing.splitlines():
+            if (_ln.strip().startswith('ExecStart=')
+                    and ' /usr/local/lib/infratak-broker/current/' in _ln):
+                exec_line = _ln.strip() + '\n'
+                break
         unit = (
             '[Unit]\n'
             'Description=infra-TAK privileged broker (least-privilege console mediation)\n'
@@ -105549,7 +105929,7 @@ def _startup_ensure_broker():
             '[Service]\n'
             'Type=simple\n'
             f'{selinux_line}'
-            f'ExecStart={venv_py} {broker_py} serve\n'
+            f'{exec_line}'
             'Restart=always\n'
             'RestartSec=2\n'
             # v10.2.8 W3: NO RuntimeMaxSec. systemd's stop SIGTERMs the whole cgroup, so
@@ -108537,6 +108917,11 @@ def _startup_guard_remote_authentik_cloudtak_ports():
             elif not ok:
                 print(f"Startup migration: ⚠ remote {_label} ports could NOT be locked to the console "
                       f"and may not be limited to the console. Run {_page} to see why.")
+            # ops #631 follow-up: an older CloudTAK Update moved the remote video port 9997 to
+            # 127.0.0.1, out of reach of Caddy on the console. Publish it again, only once the
+            # guard limits it to the console.
+            if ok and _key == 'cloudtak_deployment':
+                _cloudtak_remote_media_publish_heal(cfg.get('remote', {}), log_fn=print)
         except Exception as _e:
             print(f"Startup migration: remote {_label} port guard error (non-fatal): {_e}")
 
@@ -108573,7 +108958,7 @@ def _startup_ensure_metrics_collector():
         if want == have and active:
             return  # current version already applied AND running — no churn on every boot
         # (re)install: script
-        _write_priv('/opt/tak-guarddog/tak-metrics-collector.py', new_src)
+        _gd_install_script('tak-metrics-collector.py', new_src, {}, perm=None)   # ops #645 W2 part 2a
         # cert pass in guarddog.conf (older deploys lack it → Marti scrape no-ops). Through the
         # one writer: the open() read here failed on a non-root console (root-owned, 600), fell
         # back to {}, and replaced the whole file with just the cert pass (GH #101).
@@ -115288,6 +115673,52 @@ def _post_update_auto_deploy():
 # its own refresh. Synchronous and bounded (~20s worst case) — it MUST complete
 # before _startup_migrations()/_post_update_auto_deploy() start issuing broker
 # ops, so the restart can never kill an in-flight migration operation.
+def _console_head_commit():
+    try:
+        r = subprocess.run(['git', '-C', BASE_DIR, 'rev-parse', 'HEAD'],
+                           capture_output=True, text=True, timeout=20)
+        c = (r.stdout or '').strip()
+        return c if r.returncode == 0 and re.match(r'^[0-9a-f]{40}$', c) else ''
+    except Exception:
+        return ''
+
+
+def _broker_converge_root_commit(resp, _ping, _log, sleep=None, head=None):
+    """ops #645 W1: the broker runs from /usr/local/lib/infratak-broker/<commit>.
+    When this checkout is on another commit, ask the broker to fetch, verify and
+    install it (op broker_update), then wait for it to come back on that commit.
+    A refusal (commit not on GitHub, or an older broker security level) keeps the
+    running broker and is logged; it is not an error for the console."""
+    import time as _tm
+    sleep = sleep or _tm.sleep
+    have = (resp.get('installed_commit') or '').strip()
+    want = head if head is not None else _console_head_commit()
+    if not want or want == have:
+        return False
+    _log(f"[broker-converge] broker runs {have[:12]}, console is on {want[:12]} "
+         f"— asking the broker to install {want[:12]} from GitHub")
+    try:
+        r = subprocess.run([_sys.executable, _BROKER_SCRIPT, 'update', want],
+                           capture_output=True, text=True, timeout=1300)
+        out = json.loads((r.stdout or '').strip() or '{}')
+    except Exception as e:
+        _log(f"[broker-converge] update request failed (non-fatal): {e}")
+        return False
+    if not out.get('ok'):
+        _log(f"[broker-converge] broker kept {have[:12]}: {out.get('error') or 'refused'}")
+        return False
+    if not out.get('changed'):
+        return False
+    for _ in range(15):
+        sleep(2)
+        r2 = _ping(timeout=20)
+        if r2 and r2.get('pong') and (r2.get('installed_commit') or '') == want:
+            _log(f"[broker-converge] ✓ broker restarted on {want[:12]} (root-owned copy)")
+            return True
+    _log("[broker-converge] ⚠ broker did not come back on the new commit within 30s (non-fatal)")
+    return True
+
+
 def _broker_converge_running_source(plog=None):
     _log = plog or (lambda m: print(m, flush=True))
     sock_path = '/run/takwerx-broker.sock'
@@ -115319,6 +115750,12 @@ def _broker_converge_running_source(plog=None):
     if not resp or not resp.get('pong'):
         _log("[broker-converge] broker did not answer ping — skipping this boot (retries next restart)")
         return False
+    # ops #645 W1: a broker on the root-owned layout runs code root fetched from
+    # GitHub, so a restart can never load this repo's file. Converge by COMMIT:
+    # ask the broker to install this checkout's commit (it refuses one that is not
+    # on GitHub main/dev/a release tag, or is below its security level).
+    if (resp.get('installed_commit') or '').strip():
+        return _broker_converge_root_commit(resp, _ping, _log)
     have = (resp.get('src_sha') or '').strip()
     if have == want:
         return False

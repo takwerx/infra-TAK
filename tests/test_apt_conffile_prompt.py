@@ -83,5 +83,10 @@ def test_remote_mediamtx_cert_and_key_are_readable_by_the_service_user_only():
     assert 'chown root:takwerx' in perms and 'chmod 640' in perms
     body = APP[APP.index('def _run_mediamtx_deploy_remote('):]
     body = body[:body.index('\ndef ')]
-    assert body.count('_MEDIAMTX_REMOTE_CERT_PERMS') == 2          # deploy + renewal sync script
+    assert body.count('_MEDIAMTX_REMOTE_CERT_PERMS') == 1          # deploy
     assert "chmod 600 /etc/mediamtx/certs/stream.key" not in body
+    # ops #645 W2 part 2b: the renewal sync script is a repo template now, same command
+    sync = (REPO / 'scripts' / 'guarddog' / 'mediamtx-cert-sync.sh').read_text(encoding='utf-8')
+    assert ('chown root:takwerx /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key && '
+            'chmod 640 /etc/mediamtx/certs/stream.crt /etc/mediamtx/certs/stream.key') in sync
+    assert 'chmod 600' not in sync
