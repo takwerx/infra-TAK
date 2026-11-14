@@ -108,6 +108,7 @@ def _collect(installed, latest, ghsa):
         '_gh_advisories_fixed_by': advisories,
         '_os_security_items': lambda seen, unknown: [],
         '_postgres_security_items': lambda unknown: [],   # ops #754
+        '_postgres_remote_security_items': lambda unknown: [],   # ops #760
         '_node_container_versions': lambda: {},   # ops #296: no Node containers here
         '_node_security_items': lambda versions: [],
         'NODE_MODULE_CONTAINERS': {},
