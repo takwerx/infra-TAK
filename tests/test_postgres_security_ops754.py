@@ -203,6 +203,18 @@ def test_updates_panel_row_for_the_database_names_the_security_fix():
     assert [p['name'] for p in routine] == ['postgresql-client-18']
 
 
+def test_postgresql_common_build_number_is_not_a_major_version_change():
+    # field, test12 Nov 14: postgresql-common 293.pgdg22.04+1 -> 295.pgdg24.04+1 read "MAJOR VERSION CHANGE"
+    n = _ns_host()
+    managed, _ = n['_classify_os_updates']([
+        {'name': 'postgresql-common', 'old': '293.pgdg22.04+1', 'new': '295.pgdg24.04+1'},
+        {'name': 'docker-ce', 'old': '5:28.5.2-1~ubuntu', 'new': '5:29.9.3-1~ubuntu'}])
+    by = {m['name']: m for m in managed}
+    assert not by['postgresql-common'].get('major')
+    assert 'MAJOR' not in by['postgresql-common']['impact']
+    assert by['docker-ce']['major'] is True        # the Docker major jump is still called out
+
+
 def test_updates_panel_row_without_a_fix_has_no_security_note():
     managed, _ = _ns_host()['_classify_os_updates']([apt('postgresql-18', '18.5', '18.6')])
     assert 'SECURITY' not in managed[0]['impact']

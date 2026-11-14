@@ -6295,7 +6295,9 @@ def _classify_os_updates(pending):
             continue
         service, impact, cls = hit
         item = dict(p, service=service, impact=impact, impact_class=cls)
-        if cls == 'restart' and _is_major_jump(p.get('old'), p.get('new')):
+        # postgresql-common's version is a build number (293 -> 295), not a PostgreSQL major: field
+        # test12, Nov 14 — it read "MAJOR VERSION CHANGE" beside the PostgreSQL security update.
+        if cls == 'restart' and p['name'] != 'postgresql-common' and _is_major_jump(p.get('old'), p.get('new')):
             item['major'] = True
             item['impact'] = 'MAJOR VERSION CHANGE — ' + impact
         # ops #754: say it on the panel row too, in the same words as the Guard Dog email.
