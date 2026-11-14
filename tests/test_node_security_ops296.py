@@ -208,6 +208,7 @@ def _sweep(node_by_container, state, ps_rc=0, settings=None):
         '_guarddog_send_alert_email_via_relay': lambda to, subj, body: sent.append((subj, body)),
         '_console_pending_update': lambda s: None,
         '_os_security_items': lambda seen, unknown, now=None: [],
+        '_postgres_security_items': lambda unknown: [],   # ops #754
         '_detect_cloudtak_plugins': lambda: [],
         '_apply_security_identity': lambda i: i,
         'time': time,

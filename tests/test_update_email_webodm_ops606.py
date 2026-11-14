@@ -56,6 +56,7 @@ def _collect(info, installed=True):
         'detect_modules': lambda: {'webodm': {'installed': installed}},
         '_get_webodm_version_info': lambda: dict(info),
         '_os_security_items': lambda seen, unknown: [],
+        '_postgres_security_items': lambda unknown: [],   # ops #754
         '_node_container_versions': lambda: {},
         '_node_security_items': lambda nv: [],
         '_detect_cloudtak_plugins': lambda: [],

@@ -6295,9 +6295,17 @@ def _classify_os_updates(pending):
             continue
         service, impact, cls = hit
         item = dict(p, service=service, impact=impact, impact_class=cls)
-        if cls == 'restart' and _is_major_jump(p.get('old'), p.get('new')):
+        # postgresql-common's version is a build number (293 -> 295), not a PostgreSQL major: field
+        # test12, Nov 14 — it read "MAJOR VERSION CHANGE" beside the PostgreSQL security update.
+        if cls == 'restart' and p['name'] != 'postgresql-common' and _is_major_jump(p.get('old'), p.get('new')):
             item['major'] = True
             item['impact'] = 'MAJOR VERSION CHANGE — ' + impact
+        # ops #754: say it on the panel row too, in the same words as the Guard Dog email.
+        if _PG_SERVER_PKG_RE.match(p['name']):
+            fixes = _pg_releases_fixed_between(p.get('old'), p.get('new'))
+            if fixes:
+                item['security'] = [r['id'] for r in fixes]
+                item['impact'] = 'SECURITY UPDATE (' + ', '.join(item['security']) + ') — ' + item['impact']
         managed.append(item)
     return managed, routine
 
@@ -28859,6 +28867,231 @@ def _node_card_flag(gap):
             f"Press Update.")
 
 
+# ── ops #754: PostgreSQL security releases ─────────────────────────────────────────
+# PostgreSQL ships a security minor for every supported major at once. This table is the ONE
+# place that says which minor is fixed; the Guard Dog email, the Updates panel note and the
+# Docker database converge below all read it. When PostgreSQL ships its next security
+# release, add an entry (newest last) with the fixed minor of each major still supported:
+# a major that is not listed claims nothing. Majors are never moved (15 stays 15): only the
+# minor. https://www.postgresql.org/support/security/
+POSTGRES_SECURITY_RELEASES = (
+    {'id': 'PostgreSQL 2026-11-12', 'released': '2026-11-12',
+     'fixed': {14: '14.25', 15: '15.20', 16: '16.16', 17: '17.12', 18: '18.7'},
+     'reason': 'about 60 flaws in PostgreSQL. Most let someone who can log in to the database '
+               'run code on the machine as the database owner. One lets anyone who can reach '
+               'the database port restart a PostgreSQL 18 server'},
+)
+
+# The server packages of the host install (PGDG on apt: postgresql-18; on dnf: postgresql18-server).
+_PG_SERVER_PKG_RE = re.compile(r'^(?:postgresql-(\d+)|postgresql(\d+)-server)$')
+
+
+def _pg_version_tuple(v):
+    """'18.6-1.pgdg22.04+1' / '0:18.6-1PGDG.rhel9' / 'postgres (PostgreSQL) 16.15' / '16.15'
+    -> (18, 6) etc. None when there is no major.minor (a version that does not parse claims
+    nothing)."""
+    m = re.search(r'(?<![\d.])(?:\d+:)?(\d{2})\.(\d+)(?!\d)', v or '')
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _pg_fixed_tuple(rel, major):
+    return _pg_version_tuple((rel.get('fixed') or {}).get(major))
+
+
+def _pg_releases_missing(version):
+    """POSTGRES_SECURITY_RELEASES entries a PostgreSQL `version` is below. A version that does
+    not parse, or a major no entry lists, is not claimed."""
+    ver = _pg_version_tuple(version)
+    if ver is None:
+        return []
+    return [r for r in POSTGRES_SECURITY_RELEASES
+            if _pg_fixed_tuple(r, ver[0]) and ver < _pg_fixed_tuple(r, ver[0])]
+
+
+def _pg_releases_fixed_between(old, new):
+    """Entries that moving from `old` to `new` (same major) fixes: old < fixed <= new."""
+    o, n = _pg_version_tuple(old), _pg_version_tuple(new)
+    if o is None or n is None or o[0] != n[0]:
+        return []
+    return [r for r in POSTGRES_SECURITY_RELEASES
+            if _pg_fixed_tuple(r, o[0]) and o < _pg_fixed_tuple(r, o[0]) <= n]
+
+
+def _postgres_host_security_items(pending):
+    """Update-email items (ops #754) for the PostgreSQL server packages of the host install
+    (TAK Server's own database). `pending` is _pending_os_updates() rows. A security claim needs
+    positive evidence from the package manager: the package is installed below the fix AND the
+    package manager offers a version at or above it. PGDG publishes no -security pocket and no
+    advisory feed, so neither the OS security list nor the Docker/Caddy advisory check ever saw
+    it, and unattended-upgrades does not take PGDG: without this item nobody was told. Pure."""
+    hits = []
+    for p in pending:
+        if _PG_SERVER_PKG_RE.match(p.get('name') or ''):
+            rels = _pg_releases_fixed_between(p.get('old'), p.get('new'))
+            if rels:
+                hits.append((p, rels))
+    if not hits:
+        return []
+    rels = {r['id']: r for _, rr in hits for r in rr}
+    inst = ', '.join(sorted(f"{p['name']} {_upstream_version(p['old'])}" for p, _ in hits))
+    tgt = ', '.join(sorted(f"{p['name']} {_upstream_version(p['new'])}" for p, _ in hits))
+    lines = ['Fixes ' + '; '.join(f"{r['id']}: {r['reason']}" for _, r in sorted(rels.items())) + '.',
+             _pkg_restart_impact(hits[0][0]['name'])]
+    return [{'key': 'pg-host', 'label': 'PostgreSQL (TAK database)',
+             'installed': inst, 'target': tgt,
+             'summary': 'PostgreSQL (the TAK database): security update pending',
+             'identity': 'pg-' + '+'.join(sorted(rels)) + '=' + tgt,
+             'security': [x for x in lines if x], 'how': _OS_INSTALL_HOW}]
+
+
+def _postgres_security_items(unknown):
+    """_postgres_host_security_items for this box. A package manager that cannot answer goes into
+    `unknown`: the caller carries its dedup state, never re-mails or drops on a guess."""
+    try:
+        return _postgres_host_security_items(_pending_os_updates())
+    except Exception as e:
+        unknown.add('pg-host')
+        print(f"[update-notify] PostgreSQL security check failed: {e}", flush=True)
+        return []
+
+
+# Docker databases that float on an upstream tag: running containers keep the build they
+# were created from until the image is pulled AND the container recreated, and Docker Hub
+# rebuilds `postgres:16-alpine` at every minor. Authentik's update only pulls when a newer
+# Authentik exists, so a box on the pinned Authentik never saw the new database build.
+# (key, label, compose dir, compose service). Local stacks only. WebODM pins its database
+# image by digest (WEBODM_IMAGES), ATLAS only builds its api on update, and the TAK Server
+# containers are built, not pulled: they need their own move and are not handled here.
+POSTGRES_COMPOSE_STACKS = (
+    ('authentik', 'Authentik', '~/authentik', 'postgresql'),
+    ('cloudtak', 'CloudTAK', '~/CloudTAK', 'postgis'),
+    ('takportal', 'TAK Portal', '~/TAK-Portal', 'postgres'),
+    ('remote_assist', 'Remote Assist', '~/eud-remote-assist', 'postgres'),
+)
+
+
+def _pg_run(argv, timeout=30, cwd=None):
+    return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def _pg_stack_container(stack_dir, service):
+    """Container id of one compose service of a local stack, '' when it is not running."""
+    r = _pg_run(['docker', 'compose', 'ps', '-q', service], cwd=stack_dir)
+    ids = (r.stdout or '').split()
+    return ids[0] if r.returncode == 0 and ids else ''
+
+
+def _pg_container_version(cid):
+    """(major.minor string) of the postgres binary the running container was started from, or ''.
+    `postgres --version` reads the container's own filesystem, so it names the build that is
+    running, not the one on disk."""
+    r = _pg_run(['docker', 'exec', cid, 'postgres', '--version'], timeout=20)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _pg_container_image_state(cid):
+    """(running image id, id the container's image tag points at now, the image reference): equal
+    ids mean a pull found nothing newer. ('', '', '') when docker could not answer."""
+    r = _pg_run(['docker', 'inspect', '--format', '{{.Image}} {{.Config.Image}}', cid], timeout=20)
+    bits = (r.stdout or '').split()
+    if r.returncode != 0 or len(bits) != 2:
+        return '', '', ''
+    r2 = _pg_run(['docker', 'image', 'inspect', '--format', '{{.Id}}', bits[1]], timeout=20)
+    return bits[0], ((r2.stdout or '').strip() if r2.returncode == 0 else ''), bits[1]
+
+
+def _pg_image_version(image):
+    """'major.minor' of the PostgreSQL inside a local image, read from a throwaway container that
+    never touches the data volume; '' when it cannot be read."""
+    r = _pg_run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'postgres', image, '--version'],
+                timeout=90)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _pg_wait_healthy(cid, seconds=90):
+    """True once the container's server accepts connections (pg_isready), within `seconds`."""
+    end = time.time() + seconds
+    while time.time() < end:
+        r = _pg_run(['docker', 'exec', cid, 'pg_isready', '-q'], timeout=10)
+        if r.returncode == 0:
+            return True
+        time.sleep(3)
+    return False
+
+
+def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
+    """ops #754: bring the local Docker databases of Authentik and CloudTAK onto a build with
+    the PostgreSQL security fix. Idempotent and quiet on a fixed box. Only a database whose
+    running PostgreSQL is BELOW a POSTGRES_SECURITY_RELEASES fix is touched, only its own
+    service is pulled and recreated (--no-deps), and only when the pulled image itself carries the
+    fix: a tag the image maker has not rebuilt, or rebuilt without the fix, changes nothing, and the
+    next update tries again. Never raises. Returns {key: 'fixed' | 'ok' | 'waiting' | 'failed' | 'skipped'}."""
+    out = {}
+    for key, label, d, service in stacks:
+        stack_dir = os.path.expanduser(d)
+        if not os.path.isdir(stack_dir):
+            continue
+        try:
+            cid = _pg_stack_container(stack_dir, service)
+            ver = _pg_container_version(cid) if cid else ''
+            if not ver:
+                out[key] = 'skipped'
+                continue
+            missing = _pg_releases_missing(ver)
+            if not missing:
+                out[key] = 'ok'
+                continue
+            ids = ', '.join(r['id'] for r in missing)
+            log(f"{label}: the database container runs PostgreSQL {ver}, below the security fix ({ids}) — "
+                f"pulling the current image")
+            if not _docker_compose_pull(None, stack_dir, log, timeout=900,
+                                        label=f'{label} database image', services=[service]):
+                out[key] = 'failed'
+                continue
+            have, now, image = _pg_container_image_state(cid)
+            if not have or not now or have == now:
+                log(f"{label}: no newer database image is published yet — the next update tries again")
+                out[key] = 'waiting'
+                continue
+            # A rebuilt tag is not necessarily a fixed one (CloudTAK's postgis was rebuilt on Nov 9,
+            # still PostgreSQL 17.11): read what is in the pulled image and restart the database
+            # only for a build that carries the fix.
+            new_img = _pg_image_version(image)
+            if not new_img or _pg_releases_missing(new_img):
+                log(f"{label}: the newest published database image has PostgreSQL {new_img or 'unknown'}, "
+                    f"not the security fix yet — leaving the running database alone, the next update tries again")
+                out[key] = 'waiting'
+                continue
+            argv = ['docker', 'compose', 'up', '-d', '--no-deps', service]
+            if key == 'authentik':
+                with _authentik_compose_lock('postgres-security-update') as _locked:
+                    if not _locked:
+                        log(f"{label}: another Authentik operation is running — the next update tries again")
+                        out[key] = 'waiting'
+                        continue
+                    r = _pg_run(argv, timeout=240, cwd=stack_dir)
+            else:
+                r = _pg_run(argv, timeout=240, cwd=stack_dir)
+            if r.returncode != 0:
+                log(f"✗ {label}: recreating the database failed: {(r.stderr or r.stdout or '')[-200:].strip()}")
+                out[key] = 'failed'
+                continue
+            cid2 = _pg_stack_container(stack_dir, service)
+            new_ver = _pg_container_version(cid2) if cid2 and _pg_wait_healthy(cid2) else ''
+            if new_ver and not _pg_releases_missing(new_ver):
+                log(f"✓ {label}: database now runs PostgreSQL {new_ver}")
+                out[key] = 'fixed'
+            else:
+                log(f"✗ {label}: after the recreate the database reports PostgreSQL {new_ver or 'nothing'} — check it")
+                out[key] = 'failed'
+        except Exception as e:
+            log(f"{label}: PostgreSQL security update check failed (non-fatal): {str(e)[:200]}")
+            out[key] = 'failed'
+    return out
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -29527,6 +29760,8 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
     except Exception as e:
         unknown.update({'os-security', 'kernel-security'})
         print(f"[update-notify] OS security check failed: {e}", flush=True)
+    # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
+    pending.extend(_postgres_security_items(unknown))
     try:
         nv = _node_container_versions()
         # a container that did not answer is unknown, not fixed: keep its dedup state
@@ -114786,6 +115021,14 @@ def _post_update_auto_deploy():
                     print(f"Post-update: MediaMTX hardening error (non-fatal): {_mhe}")
 
             _auto_harden_mediamtx()
+
+            # ops #754: Docker databases that float on an upstream tag (Authentik, CloudTAK, TAK
+            # Portal, Remote Assist) keep the build they were created from. Pull and recreate only
+            # a database whose PostgreSQL is below the newest security fix; a fixed box does nothing.
+            try:
+                _postgres_compose_converge(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _pge:
+                print(f"Post-update: PostgreSQL security converge error (non-fatal): {_pge}", flush=True)
 
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
