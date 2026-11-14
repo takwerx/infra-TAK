@@ -29199,6 +29199,15 @@ def _tak_db_refresh_items():
              'how': 'Open the TAK Server page, then Update TAK Server, then "Refresh database image".'}]
 
 
+def _tak_messaging_starts():
+    """How many times TAK has logged its messaging start. A counter, because the log keeps every earlier
+    start: "the line is there" is true before the restart too (the 5.8 migration does the same)."""
+    r = _pg_run(['docker', 'exec', TAK_CONTAINER, 'grep', '-c', 'Started TAK Server messaging Microservice',
+                 '/opt/tak/logs/takserver-messaging.log'], timeout=60)
+    s = (r.stdout or '').strip()
+    return int(s) if s.isdigit() else 0
+
+
 def _tak_db_refresh_backup(pgbin, pw, say, stamp):
     """(path, '') of a backup of the `cot` database, or ('', why). Container installs have no
     PostgreSQL client on the host (the broker's pg_restore op answers "not found on trusted PATH": field
@@ -29352,6 +29361,8 @@ def run_tak_db_refresh(log=None, status=None):
         # 3. Downtime. Stop TAK, count the rows, stop the database cleanly, keep the old image.
         say('Step 3/5: Stopping TAK Server and its database (downtime starts now)…')
         t_down = time.time()
+        # TAK's messaging log keeps the start line of every earlier run: count them now, wait for one more.
+        starts_before = _tak_messaging_starts()
         rc, out = run(['docker', 'inspect', '-f', '{{.Image}}', TAK_DB_CONTAINER], 20)
         if rc != 0 or not out:
             return done(False, '✗ Nothing was changed: could not read the running database image.')
@@ -29398,8 +29409,7 @@ def run_tak_db_refresh(log=None, status=None):
         up = False
         for waited in range(0, 600, 10):
             time.sleep(10)
-            if run(['docker', 'exec', TAK_CONTAINER, 'grep', '-q', 'Started TAK Server messaging Microservice',
-                    '/opt/tak/logs/takserver-messaging.log'], 60)[0] == 0 and waited >= 20:
+            if _tak_messaging_starts() > starts_before:
                 up = True
                 break
         for t in run(['docker', 'images', 'takserver_db', '--format', '{{.Tag}}'], 20)[1].split():

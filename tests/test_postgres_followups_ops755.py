@@ -143,6 +143,8 @@ class Box:
         self.db_up, self.counts_after, self.era = db_up, counts_after, era
         self.running_version, self.collation_mismatch, self.reindex_ok = running_version, collation_mismatch, reindex_ok
         self.db_runs = 0
+        self.start_polls = 0
+        self.tak_restarts = True
         self.sql = []
         self.count_calls = 0
 
@@ -164,8 +166,10 @@ class Box:
         if a[:2] == ['docker', 'exec'] and a[3:4] and a[3].endswith('/pg_isready'):
             # the first start after the swap is the one that may fail; a rollback start always works
             return self._r(0 if (self.db_up or self.db_runs > 1) else 1)
-        if a[:2] == ['docker', 'exec'] and a[2] == 'takserver':           # messaging log grep
-            return self._r(0)
+        if a[:2] == ['docker', 'exec'] and a[2] == 'takserver':           # messaging log: count of start lines
+            self.start_polls += 1
+            # one old start line before the restart; the new one appears on the 3rd look, never earlier
+            return self._r(0, '1' if (self.start_polls < 3 or not self.tak_restarts) else '2')
         if a[:2] == ['docker', 'images']:
             return self._r(0, 'refresh\npre-refresh-19990101-000000\nlatest')
         return self._r(0)
@@ -248,7 +252,7 @@ def _run_job(box, monkeypatch, facts=None):
         '_patch_tak_db_pgdg_releasever': lambda *a, **k: False,
         '_tak_db_legacy_refresh_dockerfile': lambda s: s,
     })
-    exec(compile(_cut('run_tak_db_refresh'), 'app.py', 'exec'), ns)
+    exec(compile(_cut('_tak_messaging_starts') + '\n' + _cut('run_tak_db_refresh'), 'app.py', 'exec'), ns)
     ns['run_tak_db_refresh']()
     return log, status
 
@@ -635,3 +639,21 @@ def test_a_backup_that_is_not_provably_complete_is_refused(box, reason):
     (path, why), _ = _backup(box)
     assert path == '' and reason in why
     assert ['chmod', '600'] not in [c[:2] for c in box.calls]
+
+
+def test_tak_start_is_judged_by_a_new_start_line_not_by_the_old_one_in_the_log(monkeypatch):
+    # field, Nov 14: the job said "done" 30 s after docker start because last week's start line was
+    # still in the log. A TAK that never logs a new start must end with the warning, not "Done".
+    box = Box()
+    box.tak_restarts = False
+    log, status = _run_job(box, monkeypatch)
+    assert status['complete'] and not status['error']                # the database IS fixed and the data is there
+    assert any('did not log its start within 10 minutes' in l for l in log)
+    assert not any(l.endswith('✓ Done. The TAK Server database now runs PostgreSQL 18.7.') for l in log)
+
+
+def test_tak_start_wait_ends_as_soon_as_the_new_start_line_is_counted(monkeypatch):
+    box = Box()
+    log, status = _run_job(box, monkeypatch)
+    assert status['complete'] and any('✓ Done.' in l for l in log)
+    assert box.start_polls >= 3                                       # it really waited for the second line
