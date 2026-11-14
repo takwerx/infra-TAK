@@ -58926,8 +58926,17 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
                         _api_patch(f'policies/expression/{pol_pk}/', pol_body)
                     else:
                         pol_pk = _api_post('policies/expression/', pol_body)['pk']
-                    have = [x for x in _api_get(f'policies/bindings/?target={rb["pk"]}&page_size=100').get('results', [])
-                            if str(x.get('policy')) == str(pol_pk)]
+                    # No server-side filter: `?target=` answers HTTP 400 and `?target__pk=` is
+                    # ignored (seen on test12), so list them all and match here.
+                    have = []
+                    pb_page = 1
+                    while True:
+                        pb = _api_get(f'policies/bindings/?page_size=500&page={pb_page}')
+                        have += [x for x in pb.get('results', [])
+                                 if str(x.get('target')) == str(rb['pk']) and str(x.get('policy')) == str(pol_pk)]
+                        if not pb.get('pagination', {}).get('next'):
+                            break
+                        pb_page += 1
                     if not have:
                         _api_post('policies/bindings/', {
                             'target': rb['pk'], 'policy': pol_pk, 'order': 0, 'enabled': True,

@@ -103,8 +103,12 @@ class FakeAuthentik:
                 return o
             if parts[1] == 'bindings':
                 if method == 'GET':
-                    return {'results': [b for b in self.policy_bindings
-                                        if b['target'] == q.get('target', b['target'])]}
+                    # Real Authentik (seen on test12): ?target= is a 400 and ?target__pk= is
+                    # ignored, so only an unfiltered list is honest.
+                    if 'target' in q or 'target__pk' in q:
+                        raise urllib.error.HTTPError('x', 400, 'Bad Request', {},
+                                                     io.BytesIO(b'{"target":["Select a valid choice."]}'))
+                    return {'results': list(self.policy_bindings), 'pagination': {}}
                 b = dict(body, pk=self._pk())
                 self.policy_bindings.append(b)
                 return b
