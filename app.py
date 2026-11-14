@@ -58553,7 +58553,9 @@ def _recovery_takportal_landing_url(api_get):
     Returns '' when TAK Portal is not in Authentik, or the URL is not a plain https URL
     (a Redirect stage must never be pointed at something we did not build)."""
     try:
-        apps = api_get('core/applications/?slug=tak-portal').get('results', [])
+        # superuser_full_list=true is required: without it Authentik lists only the apps the
+        # token's own user may open, and the TAK Portal app is missing (seen on test12).
+        apps = api_get('core/applications/?slug=tak-portal&superuser_full_list=true').get('results', [])
         app_ = next((a for a in apps if a.get('slug') == 'tak-portal'), None)
         prov = (app_ or {}).get('provider')
         if not prov:

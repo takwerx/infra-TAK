@@ -72,6 +72,10 @@ class FakeAuthentik:
         parts = [p for p in path.strip('/').split('/') if p]
         q = dict(kv.split('=', 1) for kv in query.split('&') if '=' in kv)
         if parts[0] == 'core' and parts[1] == 'applications':
+            # Real Authentik (seen on test12): without superuser_full_list=true the list holds
+            # only the apps the token's user may open, so tak-portal is missing from it.
+            if q.get('superuser_full_list') != 'true':
+                return {'results': []}
             return {'results': [a for a in self.apps if a['slug'] == q.get('slug', a['slug'])]}
         if parts[0] == 'providers':
             return self.providers[parts[2]]
