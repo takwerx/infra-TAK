@@ -58545,9 +58545,62 @@ def _ensure_authentik_showpw_css(ak_url, ak_headers):
     return changed
 
 
+# ops #763: Authentik expression policy bound to the recovery flow's Redirect stage.
+# The reset email link carries the login page's query (incl. next=/application/o/authorize/
+# ?client_id=...), so after the signed-out ending we can send the user back to the app they
+# started from. The target is NEVER taken from the URL: only client_id is read, and the
+# destination is that application's own launch URL from Authentik's database. Anything
+# unknown or not https -> no override, and the Redirect stage's static target (TAK Portal)
+# is used.
+_AK_RECOVERY_BACK_TO_APP_POLICY_NAME = 'Recovery Redirect to the app you came from'
+_AK_RECOVERY_BACK_TO_APP_EXPR = """# infra-TAK (ops #763): after a password reset, go back to the app the user started from.
+from urllib.parse import urlsplit, parse_qs
+try:
+    from authentik.providers.oauth2.models import OAuth2Provider
+    plan = request.context.get("flow_plan")
+    get = request.http_request.session.get("authentik/flows/get")
+    nxt = (get.get("next", "") if get else "") or ""
+    qs = parse_qs(urlsplit(nxt).query)
+    cid = (qs.get("client_id") or [""])[0]
+    if plan is not None and cid:
+        prov = OAuth2Provider.objects.filter(client_id=cid).first()
+        app = getattr(prov, "application", None) if prov else None
+        url = (app.get_launch_url() or "") if app else ""
+        if url.startswith("https://") and not any(c in url for c in " \\t\\r\\n\\"'<>"):
+            plan.context["redirect_stage_target"] = url
+except Exception:
+    pass
+return True
+"""
+
+
+def _recovery_takportal_landing_url(api_get):
+    """Where the password-reset flow sends the user after the signed-out ending (ops #763).
+
+    The TAK Portal proxy provider's external_host, e.g. https://takportal.example.com.
+    `api_get(path)` fetches an Authentik API v3 path and returns the parsed JSON.
+    Returns '' when TAK Portal is not in Authentik, or the URL is not a plain https URL
+    (a Redirect stage must never be pointed at something we did not build)."""
+    try:
+        # superuser_full_list=true is required: without it Authentik lists only the apps the
+        # token's own user may open, and the TAK Portal app is missing (seen on test12).
+        apps = api_get('core/applications/?slug=tak-portal&superuser_full_list=true').get('results', [])
+        app_ = next((a for a in apps if a.get('slug') == 'tak-portal'), None)
+        prov = (app_ or {}).get('provider')
+        if not prov:
+            return ''
+        ext = (api_get(f'providers/proxy/{prov}/').get('external_host') or '').strip().rstrip('/')
+    except Exception:
+        return ''
+    if not ext.startswith('https://') or any(c in ext for c in ' \t\r\n"\'<>'):
+        return ''
+    return ext + '/'
+
+
 def _ensure_authentik_recovery_flow(ak_url, ak_headers):
     """Create recovery flow + stages + bindings and link to default authentication flow.
-    Identification -> Email -> Prompt (new pw) -> User Write -> Session Logout.
+    Identification -> Email -> Prompt (new pw) -> User Write -> Session Logout
+    -> Redirect to the TAK Portal link (only when TAK Portal is deployed; ops #763 / GH #503).
     Deliberately diverges from the stock Authentik blueprint, which ends in User Login:
     the reset ALWAYS ends signed out so the pre-reset OAuth state is never redeemed
     (see the v10.1.28 note below on the click-tracker / SameSite=Lax callback 400).
@@ -58771,6 +58824,28 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         user_login_pk = None
         logout_stage_pk = _find_or_create_stage('stages/user_logout/', 'Recovery Session Logout')
 
+        # ops #763 (GH #503): after the signed-out ending, send the user to the TAK Portal
+        # link. They sign in once with the new password (the login flow carries next= for
+        # this URL), finish MFA setup, and land in TAK Portal instead of the Authentik
+        # library. The ending stays signed out on purpose (see v10.1.28 above): a Redirect
+        # stage runs AFTER the logout and never resumes the pre-reset OAuth state.
+        # The target is the TAK Portal proxy provider's own external_host, which
+        # _sync_authentik_takportal_provider_url keeps equal to the real domain and port.
+        # No TAK Portal in Authentik -> no redirect stage (and an old one is removed below).
+        redirect_url = _recovery_takportal_landing_url(_api_get)
+        redirect_stage_pk = None
+        _redirect_stage_name = 'Recovery Redirect to TAK Portal'
+        if redirect_url:
+            redirect_stage_pk = _find_or_create_stage(
+                'stages/redirect/', _redirect_stage_name,
+                {'mode': 'static', 'target_static': redirect_url, 'keep_context': False})
+            if redirect_stage_pk:
+                try:
+                    _api_patch(f'stages/redirect/{redirect_stage_pk}/', {
+                        'mode': 'static', 'target_static': redirect_url, 'keep_context': False})
+                except Exception:
+                    pass
+
         # 3) Fetch ALL bindings, filter client-side by target == recovery flow PK.
         #    The server-side flow__pk filter is unreliable and returns bindings from other flows.
         all_bindings = []
@@ -58786,11 +58861,12 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         desired_stage_pks = set()
         for pk in [id_stage_pk, email_stage_pk, prompt_stage_pk, user_write_pk, user_login_pk,
-                   logout_stage_pk]:
+                   logout_stage_pk, redirect_stage_pk]:
             if pk:
                 desired_stage_pks.add(str(pk))
 
-        # 4) Delete any binding on the recovery flow whose stage is NOT one of our 5 desired stages
+        # 4) Delete any binding on the recovery flow whose stage is NOT one of our desired stages
+        #    (this also removes our redirect binding when TAK Portal is no longer deployed)
         for b in recovery_bindings:
             if str(b.get('stage', '')) not in desired_stage_pks:
                 try:
@@ -58807,6 +58883,7 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             (40, user_write_pk),
             (100, user_login_pk),
             (110, logout_stage_pk),
+            (120, redirect_stage_pk),
         ]
         for order, stage_pk in desired_bindings:
             if not stage_pk or str(stage_pk) in already_bound:
@@ -58814,13 +58891,58 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             try:
                 _api_post('flows/bindings/', {
                     'target': recovery_flow_pk, 'stage': stage_pk, 'order': order,
-                    'evaluate_on_plan': True, 're_evaluate_policies': order <= 20,
+                    'evaluate_on_plan': True,
+                    # the redirect binding re-evaluates its policy when the stage is reached
+                    # (the email link restores the plan, the planner does not run again)
+                    're_evaluate_policies': order <= 20 or order == 120,
                     'policy_engine_mode': 'any', 'invalid_response_action': 'retry'})
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     pass
                 else:
                     raise
+
+        # 5b) ops #763: the redirect stage goes back to the app the user came from (policy sets
+        #     redirect_stage_target); the static TAK Portal target is the fallback.
+        if redirect_stage_pk:
+            try:
+                rb = None
+                for b in _api_get(f'flows/bindings/?ordering=order&page_size=500').get('results', []):
+                    if str(b.get('target')) == str(recovery_flow_pk) and str(b.get('stage')) == str(redirect_stage_pk):
+                        rb = b
+                        break
+                if rb:
+                    if not rb.get('re_evaluate_policies'):
+                        _api_patch(f'flows/bindings/{rb["pk"]}/', {'re_evaluate_policies': True})
+                    pol_body = {'name': _AK_RECOVERY_BACK_TO_APP_POLICY_NAME,
+                                'expression': _AK_RECOVERY_BACK_TO_APP_EXPR,
+                                'execution_logging': False}
+                    pol_pk = None
+                    for pol in _api_get('policies/expression/?search=' + _req.quote(_AK_RECOVERY_BACK_TO_APP_POLICY_NAME)).get('results', []):
+                        if pol.get('name') == _AK_RECOVERY_BACK_TO_APP_POLICY_NAME:
+                            pol_pk = pol['pk']
+                            break
+                    if pol_pk:
+                        _api_patch(f'policies/expression/{pol_pk}/', pol_body)
+                    else:
+                        pol_pk = _api_post('policies/expression/', pol_body)['pk']
+                    # No server-side filter: `?target=` answers HTTP 400 and `?target__pk=` is
+                    # ignored (seen on test12), so list them all and match here.
+                    have = []
+                    pb_page = 1
+                    while True:
+                        pb = _api_get(f'policies/bindings/?page_size=500&page={pb_page}')
+                        have += [x for x in pb.get('results', [])
+                                 if str(x.get('target')) == str(rb['pk']) and str(x.get('policy')) == str(pol_pk)]
+                        if not pb.get('pagination', {}).get('next'):
+                            break
+                        pb_page += 1
+                    if not have:
+                        _api_post('policies/bindings/', {
+                            'target': rb['pk'], 'policy': pol_pk, 'order': 0, 'enabled': True,
+                            'negate': False, 'timeout': 30, 'failure_result': True})
+            except Exception:
+                pass  # best effort: without it the reset still ends at TAK Portal
 
         # 6) Link recovery flow to the default-authentication-identification stage
         auth_id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')
