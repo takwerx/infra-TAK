@@ -209,6 +209,7 @@ def _sweep(node_by_container, state, ps_rc=0, settings=None):
         '_console_pending_update': lambda s: None,
         '_os_security_items': lambda seen, unknown, now=None: [],
         '_postgres_security_items': lambda unknown: [],   # ops #754
+        '_postgres_remote_security_items': lambda unknown: [],   # ops #760
         '_detect_cloudtak_plugins': lambda: [],
         '_apply_security_identity': lambda i: i,
         'time': time,
