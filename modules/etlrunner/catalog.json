@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "serial": 202611092115,
+  "serial": 202611142111,
   "entries": [
     {
       "prefix": "etl-active911",
@@ -250,13 +250,13 @@
       "name": "CentralSquare",
       "description": "Ingests CentralSquare Public Safety Suite Professional CAD data from the Pro Suite REST API - active calls for service are written to CloudTAK Events with their dispatched units as Assignments and their command log on the Event Timeline, AVL unit locations are posted to the map.",
       "source": "dfpc-coe/etl-central-square",
-      "ref": "v1.11.0",
-      "sha": "7e69016668a6286c3ef48e7623d28cc486611976",
-      "version": "1.11.0",
+      "ref": "v1.12.0",
+      "sha": "7f272ef98fc20814645d54e135577e933abed190",
+      "version": "1.12.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7e69016668a6286c3ef48e7623d28cc486611976/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7e69016668a6286c3ef48e7623d28cc486611976/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7f272ef98fc20814645d54e135577e933abed190/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7f272ef98fc20814645d54e135577e933abed190/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-central-square",
       "compute": {
         "memory": 512,
@@ -270,20 +270,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-13 /module-scan"
     },
     {
       "prefix": "etl-caic",
       "name": "Colorado Avalanche Information Center",
       "description": "Ingests avalanche forecast zones and observations from the Colorado Avalanche Information Center (CAIC) and posts them to the map.",
       "source": "dfpc-coe/etl-caic",
-      "ref": "v3.18.0",
-      "sha": "93ce17f7306be17201d6efe10c47531a85484cf5",
-      "version": "3.18.0",
+      "ref": "v3.18.1",
+      "sha": "070fc4da97cc7a7918daf972396be7c3e771545c",
+      "version": "3.18.1",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/93ce17f7306be17201d6efe10c47531a85484cf5/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/93ce17f7306be17201d6efe10c47531a85484cf5/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/070fc4da97cc7a7918daf972396be7c3e771545c/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/070fc4da97cc7a7918daf972396be7c3e771545c/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-caic",
       "compute": {
         "memory": 512,
@@ -297,7 +297,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-13 /module-scan"
     },
     {
       "prefix": "etl-cotrip-signs",
@@ -736,13 +736,13 @@
       "name": "NASA ACERO",
       "description": "Receives NASA ACERO aircraft and mission data via webhook and posts it to the map.",
       "source": "dfpc-coe/etl-nasa-acero",
-      "ref": "v1.8.0",
-      "sha": "d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569",
-      "version": "1.8.0",
+      "ref": "v1.10.0",
+      "sha": "1af7110924bbf72baed2cc2bd2b8e48d5a5c9104",
+      "version": "1.10.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/d0e2d42d5c9f7c4d45b7ec7cdf17f55c8d752569/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/1af7110924bbf72baed2cc2bd2b8e48d5a5c9104/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/1af7110924bbf72baed2cc2bd2b8e48d5a5c9104/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-nasa-acero",
       "compute": {
         "memory": 512,
@@ -756,7 +756,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-13 /module-scan"
     },
     {
       "prefix": "etl-optimus",

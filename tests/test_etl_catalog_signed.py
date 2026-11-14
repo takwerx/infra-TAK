@@ -262,3 +262,21 @@ def test_refresh_only_while_runner_is_on():
     assert "c.get('enabled') and _etlcat_refresh_due(c)" in loop
     route = ast.get_source_segment(APP, _FNS['cloudtak_etl_catalog_action'])
     assert "action == 'refresh'" in route and "get('enabled')" in route
+
+
+def test_bundled_catalog_carries_the_signed_ops725_bumps():
+    """The bundled copy must not be older than the signed public catalog (serial 202611142111).
+    A box on this release reads the bundled file when the fetch fails, and a lower bundled serial
+    would also put these three ETLs back on their old, already-superseded versions."""
+    d = etl.bundled_catalog()
+    assert etl.catalog_serial(d) >= 202611142111
+    by = {e['prefix']: e for e in d['entries']}
+    want = {
+        'etl-caic': ('3.18.1', '070fc4da97cc7a7918daf972396be7c3e771545c'),
+        'etl-central-square': ('1.12.0', '7f272ef98fc20814645d54e135577e933abed190'),
+        'etl-nasa-acero': ('1.10.0', '1af7110924bbf72baed2cc2bd2b8e48d5a5c9104'),
+    }
+    for prefix, (ver, sha) in want.items():
+        e = by[prefix]
+        assert (e['version'], e['sha'], e['ref']) == (ver, sha, 'v' + ver), prefix
+        assert e.get('reviewed', '').startswith('2026-11-13'), prefix
