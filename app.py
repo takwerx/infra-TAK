@@ -50740,6 +50740,12 @@ def _cloudtak_close_firewall(cfg, log=None):
         except Exception as e:
             ok, msg = False, str(e)[:120]
         (closed if ok else failed).append(f'{port}/{proto}' + ('' if ok else f' ({msg[:80]})'))
+    if cfg.get('target_mode') == 'remote':
+        # ops #737: the rule on THIS box that let the remote host reach Caddy's :9997.
+        try:
+            _cloudtak_console_video_fw(cfg, 'remove', log_fn=_log)
+        except Exception as e:
+            _log(f"cloudtak uninstall: ⚠ console video-port rule not closed: {str(e)[:100]}")
     if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
         for port in CLOUDTAK_FW_DENY:
             try:
@@ -53593,6 +53599,8 @@ def run_cloudtak_deploy(cfg=None):
                 plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #737: and let the remote host reach Caddy's video listener on THIS box.
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -54515,6 +54523,8 @@ def run_cloudtak_redeploy(cfg=None):
             # lock on ports that are no longer on the list.
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -55540,6 +55550,8 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not check the video port 9997 publish (non-fatal)")
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -62204,6 +62216,45 @@ def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
     return _remote_docker_port_guard(deploy_cfg, settings, 'cloudtak', _remote_cloudtak_guard_ports(settings),
                                      log_fn=log_fn,
                                      extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
+
+
+# ops #737: with CloudTAK on a remote host, video needs TCP 9997 open on THIS box (the console).
+# CloudTAK's video-service.ts forces port 9997 on every media address it builds: its api container
+# calls https://video.<name>:9997 for each lease, and the HLS address it hands to the player is on
+# 9997 too (the user's browser fetches the stream there). That name is the console box, where Caddy
+# listens on :9997 with the same routes as video.<name> on 443 (_cloudtak_caddy_bind_ip). The console
+# opened 9997 for a local CloudTAK only (run_cloudtak_deploy), so with a remote CloudTAK and ufw active
+# on the console every lease timed out ("CloudTAK has no working media server", "Failed to generate
+# proxy stream") until the operator ran `ufw allow 9997/tcp` by hand. Open to everyone, as for a local
+# CloudTAK: the browsers that play the stream come from anywhere, and a rule for the remote host alone
+# lets the lease succeed but blocks the player (checked on two AWS boxes: the remote's public address
+# differs from the one the console reaches it on, and the console's own address cannot play either).
+def _cloudtak_console_video_fw(cfg, action='allow', log_fn=None):
+    """ops #737: open (`allow`) or close (`remove`) TCP 9997 on THIS box's firewall for a remote
+    CloudTAK. Nothing to do for a local CloudTAK (its deploy opens the port itself). Returns True
+    when the firewall is as asked (or nothing was asked). Never raises."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    port = CLOUDTAK_FW_WEB[0][0]
+    try:
+        if (cfg.get('target_mode') or '').strip().lower() != 'remote':
+            return True
+        if action == 'remove':
+            ok, msg = _fw_remove(port, 'tcp')
+            _log(f"  \u2713 Video port {port} closed on this box" if ok else
+                 f"  \u26a0 Could not close video port {port} on this box: {str(msg).strip()[-160:]}")
+            return bool(ok)
+        ok, msg = _fw_allow(port, 'tcp')
+        if ok:
+            _log(f"  \u2713 Video port {port} opened on this box (Caddy's video listener; CloudTAK on the remote host and players use it)")
+        else:
+            _log(f"  \u26a0 Could not open video port {port} on this box: {str(msg).strip()[-160:]}. "
+                 f"Video fails until TCP {port} is open here.")
+        _log("  Cloud firewall: if this box sits behind an AWS security group, Azure NSG or similar, allow "
+             f"TCP 443 and {port} to this box (from the CloudTAK host, and from the users' networks that play video).")
+        return bool(ok)
+    except Exception as e:
+        _log(f"  \u26a0 Video port {port} firewall step skipped (non-fatal): {str(e)[:120]}")
+        return False
 
 
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
@@ -107652,6 +107703,22 @@ def _startup_harden_cloudtak_ports():
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _startup_cloudtak_remote_video_fw():
+    """ops #737: a remote CloudTAK deployed before this fix has no rule for :9997 on this box
+    and its video stays broken until the next Update config. Open it on console start."""
+    try:
+        settings = load_settings()
+        cfg = _get_cloudtak_deployment_config(settings)
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed'):
+            return
+        _cloudtak_console_video_fw(cfg, 'allow',
+                                   log_fn=lambda m: print(f"Startup migration: CloudTAK {m.strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup migration: CloudTAK remote video port error (non-fatal): {_e}")
+
+_startup_cloudtak_remote_video_fw()
 
 
 def _startup_heal_cloudtak_media_hls():
