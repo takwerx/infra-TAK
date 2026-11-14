@@ -91,7 +91,7 @@ def scan_file(path):
                     slots, dyn = _list_slots(inner)
                     cmds.append((path, line, slots, dyn))
         else:  # _write_priv / _read_priv / _makedirs_priv / _chmod_priv
-            writes.append((path, line, _const_str(node.args[0])))
+            writes.append((path, line, _const_str(node.args[0]), fn))
     return cmds, writes
 
 
@@ -113,8 +113,38 @@ def evaluate_cmd(slots, dyn):
         try:
             B.check_exec(list(combo))
         except B.Denied as d:
+            # ops #645: shape-checked binaries (fail2ban-client IPs, docker cp
+            # container:path) refuse the neutral filler itself. If some other
+            # plausible value for the variable slots passes, the call site is
+            # DYNAMIC (spot-check live), not a known gap.
+            if base in _SHAPE_CHECKED and _alt_fillers_allow(slots, combo):
+                return 'DYNAMIC', 'variable arg; allowed for a plausible value'
             return 'DENY', str(d)
     return 'ALLOW', ''
+
+
+_SHAPE_CHECKED = {'fail2ban-client', 'docker', 'ip', 'dpkg', 'postconf', 'semanage'}
+_ALT_FILLERS = ('PKGorUNIT', '192.0.2.1', 'c:/x', '/tmp/x', '-', 'tcp', '8443',
+                B.SEMANAGE_FCONTEXT_CESIUM)
+
+
+def _alt_fillers_allow(slots, combo):
+    """True if replacing the variable slots (max 3) with other typical values
+    gives a command the rulebook allows."""
+    import itertools
+    dyn_idx = [i for i, s in enumerate(slots[:24]) if not s][:3]
+    if not dyn_idx:
+        return False
+    for vals in itertools.product(_ALT_FILLERS, repeat=len(dyn_idx)):
+        trial = list(combo)
+        for i, v in zip(dyn_idx, vals):
+            trial[i] = v
+        try:
+            B.check_exec(trial)
+            return True
+        except B.Denied:
+            continue
+    return False
 
 
 def main(argv):
@@ -144,12 +174,14 @@ def main(argv):
             bypass.append(rec)
 
     path_gaps, path_dyn = [], []
-    for path, line, p in all_writes:
+    for path, line, p, fn in all_writes:
         if p is None:
             path_dyn.append((os.path.basename(path), line))
             continue
         try:
-            B._path_allowed(p)
+            # a read goes through the broker `read` op, which also admits the
+            # read-only prefixes (ops #645 W2: /etc/os-release is read-only)
+            B._path_allowed(p, readonly=(fn == '_read_priv'))
         except B.Denied as d:
             path_gaps.append((os.path.basename(path), line, p, str(d)))
 

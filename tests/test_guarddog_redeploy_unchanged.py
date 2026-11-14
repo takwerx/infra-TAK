@@ -31,6 +31,9 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 SRC = APP[APP.index('def run_guarddog_deploy(alert_email):'):APP.index("@app.route('/nodered')")]
+# ops #645 W2 part 2a: every fill-in goes through _gd_install_script. Here it takes the
+# old fill-and-write path (no broker), so _read_priv/_write_priv below see every write.
+GD_HELPER_SRC = APP[APP.index('_GD_PLACEHOLDER_RE = re.compile('):APP.index('def _write_priv(')]
 GD = '/opt/tak-guarddog'
 
 
@@ -79,7 +82,9 @@ def h(tmp_path):
         '_guarddog_alert_recipient_warning': lambda s: '',
         '_safe_alert_email_list': lambda e: e or '',
         '_get_tak_cert_password': lambda s: 'atakatak',
+        're': __import__('re'), '_broker_should_route': lambda: False,
     }
+    exec(GD_HELPER_SRC, ns)
     exec(SRC, ns)
 
     def run(monkeypatch):

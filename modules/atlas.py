@@ -4948,6 +4948,92 @@ def _reconcile_access(ctx, inst, plog):
     # ⚠️ Idempotent, and the only route by which a deployment made before
     # W221 gets its group and its binding at all.
     _reconcile_agency_group(ctx, inst, plog)
+    # ⚠️ Idempotent, and the only route by which a provider created with the
+    # wrong hostname is ever corrected — see the function.
+    _reconcile_provider_host(ctx, inst, plog)
+
+
+def _reconcile_provider_host(ctx, inst, plog):
+    """Make sure Authentik's proxy provider names the host Caddy serves.
+
+    Returns 'ok', 'fixed', 'missing', 'skipped' or 'failed'. Never raises: an
+    update must not fail over it.
+
+    ⚠️ **Reported from a real box (2026-11-12): the console answered 404.**
+    An agency deployment's Caddy site was `atlas.<slug>.<domain>`, but its
+    provider still carried the plain `atlas.<domain>` — created before
+    `ensure_authentik_app` qualified the host for the agency. Only deploy
+    calls that function, so no update ever corrected it. Caddy's forward_auth
+    asks the outpost about a host it has no provider for, the outpost answers
+    404, and Caddy hands that 404 to the browser before ATLAS sees the request.
+
+    ⚠️ **Latent until Authentik 2026.8.** The same provider had worked for
+    weeks; the 404 appeared on that box after the outpost was upgraded, which
+    is why "the update broke it" was the first report. It is checked on every
+    update, not only after a deploy, so a provider that drifts for any reason
+    (a restore, a hand edit) is repaired by the press an operator already
+    makes.
+
+    ⚠️ Only the host is changed. The cookie domain decides which sessions a
+    signed-in administrator keeps, and changing it on a running box would sign
+    everyone out of every app that shares it.
+
+    ⚠️ **The PATCH carries `mode` as well (ops #708, verified on Authentik
+    2026.8.5).** Authentik validates a partial update as if `mode` were its
+    default, `proxy`, and refuses it with HTTP 400 "Internal host cannot be
+    empty when forward auth is disabled". A body of `external_host` alone is
+    therefore refused on the very version this repair exists for, and the repair
+    reports 'failed' without changing anything. Sending the provider's own
+    `mode` (and its `internal_host`, if it has one) passes the check and changes
+    nothing else.
+    """
+    import urllib.parse as _urlparse
+    import urllib.request as _urlreq
+    try:
+        settings = ctx['load_settings']()
+        want = deployment_identity(ctx, inst, settings)['console_url']
+        if not want:
+            return 'skipped'
+        token = _authentik_token(ctx, settings)
+        if not token:
+            plog('  ⚠ No Authentik API token found — the provider hostname was '
+                 'not checked')
+            return 'skipped'
+        ak_url = ctx['_get_authentik_api_url'](settings)
+        headers = {'Authorization': 'Bearer %s' % token,
+                   'Content-Type': 'application/json'}
+        name = atlas_instances.authentik_names(inst)['provider']
+        # ⚠️ Matched by exact name: `search` is a substring match, and every
+        # agency's provider contains the plain deployment's name.
+        req = _urlreq.Request('%s/api/v3/providers/proxy/?search=%s'
+                              % (ak_url, _urlparse.quote(name)), headers=headers)
+        results = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())
+        found = [r for r in results.get('results', []) if r.get('name') == name]
+        if not found:
+            plog('  ⚠ Authentik has no provider "%s" — redeploy ATLAS to '
+                 'register the console' % name)
+            return 'missing'
+        provider = found[0]
+        have = (provider.get('external_host') or '').rstrip('/')
+        if have == want.rstrip('/'):
+            plog('  ✓ Authentik provider serves %s' % want)
+            return 'ok'
+        patch = {'external_host': want,
+                 'mode': provider.get('mode') or 'forward_single'}
+        if provider.get('internal_host'):
+            patch['internal_host'] = provider['internal_host']
+        req = _urlreq.Request(
+            '%s/api/v3/providers/proxy/%s/' % (ak_url, provider['pk']),
+            data=json.dumps(patch).encode(),
+            headers=headers, method='PATCH')
+        _urlreq.urlopen(req, timeout=10)
+        plog('  ✓ Authentik provider hostname corrected: %s → %s'
+             % (have or '(none)', want))
+        return 'fixed'
+    except Exception as exc:
+        plog('  ⚠ Could not check the Authentik provider hostname: %s'
+             % str(exc)[:80])
+        return 'failed'
 
 
 def _run_update_recorded(ctx, inst=None):

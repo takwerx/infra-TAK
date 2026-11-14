@@ -340,6 +340,7 @@ def test_root_write_priv_does_not_follow_links_in_mediamtx_dirs(tmp_path):
             return 0
     ns.update(os=_OS(), _backup_coreconfig_before_write=lambda *a: None,
               _broker_should_route=lambda: False, _broker_available=lambda: False,
+              _priv_write_wants_atomic=lambda path, mode: False,   # ops #666: not under test here
               _MEDIAMTX_NOFOLLOW_PREFIXES=(str(tmp_path) + '/ed/',))
     exec(_fn('_write_priv'), ns)
     (tmp_path / 'ed').mkdir()
