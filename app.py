@@ -1599,7 +1599,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.3.13-alpha"
+VERSION = "10.3.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -50001,6 +50001,24 @@ def cloudtak_container_logs():
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
+# Remote CloudTAK removal (ops #740). The Garage store container writes ~/CloudTAK/.docker-garage
+# as ROOT, so on a host whose SSH user is not root (ubuntu, ec2-user) a plain `rm -rf ~/CloudTAK`
+# stops with "Permission denied", the uninstall returns early, and the firewall cleanup and the
+# console's "deployed" flag never run. Try the plain remove first, then the same passwordless
+# `sudo -n` the remote deploy uses. If neither works, say what to do instead of a bare rm error.
+CLOUDTAK_REMOTE_UNINSTALL_SH = (
+    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
+    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
+    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
+    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
+    "fi; cd ~; "
+    "rm -rf ~/CloudTAK 2>/dev/null || sudo -n rm -rf ~/CloudTAK || "
+    "{ echo 'Could not delete ~/CloudTAK: it holds root-owned files and this SSH user has no "
+    "passwordless sudo. Run: sudo rm -rf ~/CloudTAK on that host, then press Remove again.' >&2; exit 1; }"
+)
+
+
 @app.route('/api/cloudtak/uninstall', methods=['POST'])
 @login_required
 def cloudtak_uninstall():
@@ -50036,16 +50054,7 @@ def cloudtak_uninstall():
                 if not rhost:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': 'Remote target selected but host is not configured'})
                     return
-                ok, out = _ssh_probe(
-                    rcfg,
-                    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
-                    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
-                    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
-                    "fi; rm -rf ~/CloudTAK",
-                    timeout=300
-                )
+                ok, out = _ssh_probe(rcfg, CLOUDTAK_REMOTE_UNINSTALL_SH, timeout=300)
                 if not ok:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
                     return
@@ -51322,6 +51331,12 @@ def _cloudtak_close_firewall(cfg, log=None):
         except Exception as e:
             ok, msg = False, str(e)[:120]
         (closed if ok else failed).append(f'{port}/{proto}' + ('' if ok else f' ({msg[:80]})'))
+    if cfg.get('target_mode') == 'remote':
+        # ops #737: the rule on THIS box that let the remote host reach Caddy's :9997.
+        try:
+            _cloudtak_console_video_fw(cfg, 'remove', log_fn=_log)
+        except Exception as e:
+            _log(f"cloudtak uninstall: ⚠ console video-port rule not closed: {str(e)[:100]}")
     if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
         for port in CLOUDTAK_FW_DENY:
             try:
@@ -51385,8 +51400,8 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            chk_b64 = base64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
-            apply_b64 = base64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            chk_b64 = _b64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
+            apply_b64 = _b64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
             # base64 strings are quoting-safe; decode on the remote host and pipe into
             # the container's sh via stdin (`docker exec -i`).
             cmd = (
@@ -51501,7 +51516,7 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            b64 = base64.b64encode(script.encode()).decode()
+            b64 = _b64.b64encode(script.encode()).decode()
             cmd = (
                 "for i in $(seq 1 %d); do "
                 "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
@@ -54175,6 +54190,8 @@ def run_cloudtak_deploy(cfg=None):
                 plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #737: and let the remote host reach Caddy's video listener on THIS box.
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -55097,6 +55114,8 @@ def run_cloudtak_redeploy(cfg=None):
             # lock on ports that are no longer on the list.
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -56122,6 +56141,8 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not check the video port 9997 publish (non-fatal)")
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -57404,7 +57425,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog('  Docker not found — installing...')
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog(f'✗ Docker install failed: {(out or "")[-300:]}')
             _webodm_deploy_status.update({'running': False, 'error': True})
@@ -59005,12 +59027,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
-def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
-    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
-    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False)."""
-    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
-        return True, False
-    script_content = '''import json, os, subprocess, sys
+# Run on the remote host (python3) to write /etc/docker/daemon.json. Needs root.
+_DOCKER_LOG_LIMITS_REMOTE_PY = '''import json, os, subprocess, sys
 p = "/etc/docker/daemon.json"
 data = {}
 if os.path.isfile(p) and os.path.getsize(p) > 0:
@@ -59032,37 +59050,48 @@ with open(p, "w") as f:
 subprocess.run(["systemctl", "restart", "docker"], timeout=90, capture_output=True)
 print("OK_RESTARTED")
 '''
-    tmp_path = '/tmp/infra_tak_docker_log_limits.py'
+
+
+def _docker_log_limits_remote_cmd(script=None):
+    """Shell command for the remote SSH session that runs the log-limits script as root (ops #736).
+    The script goes in as base64 on stdin, so no file is left in /tmp for another user on the host to
+    swap before root runs it. A root SSH user runs it directly; any other user needs passwordless
+    `sudo -n` (same rule as `_docker_install_cmd(sudo_fallback=True)`). python3's exit code is the
+    exit code of the command, so a refused write is a failure and is never reported as success.
+    NON-ROOT-COMMANDS: python3 (runs systemctl, writes /etc/docker)."""
+    b64 = _b64.b64encode((script or _DOCKER_LOG_LIMITS_REMOTE_PY).encode()).decode()
+    return (f'printf %s {shlex.quote(b64)} | base64 -d | '
+            f'(if [ "$(id -u)" = 0 ]; then python3 -; else sudo -n python3 -; fi) 2>&1')
+
+
+def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
+    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
+    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False).
+    A non-root SSH user needs passwordless sudo (ops #736: it used to fail with no message at all)."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return True, False
     try:
-        with open(tmp_path, 'w') as f:
-            f.write(script_content)
-        copy_ok, _cm = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
-        if not copy_ok:
-            if log_fn:
-                log_fn("  ⚠ Could not copy Docker log-limits script to remote")
-            return False, False
-        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>&1; rm -f {tmp_path}', timeout=45)
+        ok, out = _ssh_probe(remote_cfg, _docker_log_limits_remote_cmd(), timeout=120)
     except Exception as e:
         if log_fn:
             log_fn(f"  ⚠ Docker log limits on remote: {str(e)[:100]}")
         return False, False
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
     out = (out or '').strip()
-    if not ok:
-        if log_fn:
-            log_fn(f"  ⚠ Docker log limits on remote could not be applied: {(out or '')[:120]}")
-        return False, False
-    if 'OK_RESTARTED' in out:
+    if ok and 'OK_RESTARTED' in out:
         if log_fn:
             log_fn("✓ Docker log limits set on remote (50 MB × 3). Docker was restarted.")
         return True, True
-    if log_fn and 'OK_ALREADY' in out:
-        log_fn("✓ Docker log limits already set on remote.")
-    return True, False
+    if ok and 'OK_ALREADY' in out:
+        if log_fn:
+            log_fn("✓ Docker log limits already set on remote.")
+        return True, False
+    if log_fn:
+        hint = ''
+        if 'sudo' in out and ('password' in out or 'not found' in out or 'not in the sudoers' in out):
+            hint = ' The SSH user needs passwordless sudo (sudo -n) to set this.'
+        log_fn(f"  ⚠ Docker log limits on remote could not be applied: {out[-200:] or 'no output'}.{hint} "
+               "Containers on that host keep unlimited logs until it is fixed.")
+    return False, False
 
 
 def _update_boot_stagger_service():
@@ -62780,6 +62809,45 @@ def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
                                      extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
 
 
+# ops #737: with CloudTAK on a remote host, video needs TCP 9997 open on THIS box (the console).
+# CloudTAK's video-service.ts forces port 9997 on every media address it builds: its api container
+# calls https://video.<name>:9997 for each lease, and the HLS address it hands to the player is on
+# 9997 too (the user's browser fetches the stream there). That name is the console box, where Caddy
+# listens on :9997 with the same routes as video.<name> on 443 (_cloudtak_caddy_bind_ip). The console
+# opened 9997 for a local CloudTAK only (run_cloudtak_deploy), so with a remote CloudTAK and ufw active
+# on the console every lease timed out ("CloudTAK has no working media server", "Failed to generate
+# proxy stream") until the operator ran `ufw allow 9997/tcp` by hand. Open to everyone, as for a local
+# CloudTAK: the browsers that play the stream come from anywhere, and a rule for the remote host alone
+# lets the lease succeed but blocks the player (checked on two AWS boxes: the remote's public address
+# differs from the one the console reaches it on, and the console's own address cannot play either).
+def _cloudtak_console_video_fw(cfg, action='allow', log_fn=None):
+    """ops #737: open (`allow`) or close (`remove`) TCP 9997 on THIS box's firewall for a remote
+    CloudTAK. Nothing to do for a local CloudTAK (its deploy opens the port itself). Returns True
+    when the firewall is as asked (or nothing was asked). Never raises."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    port = CLOUDTAK_FW_WEB[0][0]
+    try:
+        if (cfg.get('target_mode') or '').strip().lower() != 'remote':
+            return True
+        if action == 'remove':
+            ok, msg = _fw_remove(port, 'tcp')
+            _log(f"  \u2713 Video port {port} closed on this box" if ok else
+                 f"  \u26a0 Could not close video port {port} on this box: {str(msg).strip()[-160:]}")
+            return bool(ok)
+        ok, msg = _fw_allow(port, 'tcp')
+        if ok:
+            _log(f"  \u2713 Video port {port} opened on this box (Caddy's video listener; CloudTAK on the remote host and players use it)")
+        else:
+            _log(f"  \u26a0 Could not open video port {port} on this box: {str(msg).strip()[-160:]}. "
+                 f"Video fails until TCP {port} is open here.")
+        _log("  Cloud firewall: if this box sits behind an AWS security group, Azure NSG or similar, allow "
+             f"TCP 443 and {port} to this box (from the CloudTAK host, and from the users' networks that play video).")
+        return bool(ok)
+    except Exception as e:
+        _log(f"  \u26a0 Video port {port} firewall step skipped (non-fatal): {str(e)[:120]}")
+        return False
+
+
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
     remote = deploy_cfg.get('remote', {})
@@ -62905,7 +62973,8 @@ volumes:
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker on remote")
             nodered_deploy_status.update({'running': False, 'error': True})
@@ -66560,7 +66629,8 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker")
             authentik_deploy_status.update({'running': False, 'error': True})
@@ -108276,6 +108346,22 @@ def _startup_harden_cloudtak_ports():
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _startup_cloudtak_remote_video_fw():
+    """ops #737: a remote CloudTAK deployed before this fix has no rule for :9997 on this box
+    and its video stays broken until the next Update config. Open it on console start."""
+    try:
+        settings = load_settings()
+        cfg = _get_cloudtak_deployment_config(settings)
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed'):
+            return
+        _cloudtak_console_video_fw(cfg, 'allow',
+                                   log_fn=lambda m: print(f"Startup migration: CloudTAK {m.strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup migration: CloudTAK remote video port error (non-fatal): {_e}")
+
+_startup_cloudtak_remote_video_fw()
 
 
 def _startup_heal_cloudtak_media_hls():
