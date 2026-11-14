@@ -28974,8 +28974,10 @@ def _pg_remote_kind(host):
     return 'split'
 
 
-def _pg_remote_where(kind, host):
-    """One plain sentence: where the database runs and what the operator must do there."""
+def _pg_remote_where(kind, host, manage=False):
+    """One plain sentence: where the database runs and what the operator must do there. `manage`:
+    this console holds the SSH link to that machine (a split install's database server), so it
+    has a button for it (ops #766)."""
     if kind == 'rds':
         return ("Your TAK database runs on Amazon RDS. Apply the PostgreSQL minor update in the AWS "
                 "console, or turn on auto minor version upgrade. Amazon can take a few days to offer a "
@@ -28984,7 +28986,22 @@ def _pg_remote_where(kind, host):
         return ("Your TAK database runs on Azure Database for PostgreSQL. Apply the PostgreSQL minor "
                 "version update in the Azure portal. Microsoft can take a few days to offer a new "
                 "PostgreSQL release.")
+    if manage:
+        return (f"Your TAK database runs on {host}. Press Update PostgreSQL on the database server card "
+                "on the console page. The console installs the update there over its SSH connection "
+                "and restarts PostgreSQL.")
     return f"Your TAK database runs on {host}. Update PostgreSQL on that machine."
+
+
+def _pg_dbserver_manageable(host):
+    """ops #766: True when `host` (CoreConfig's database host) is the split install's database
+    server this console already holds an SSH link to, so it can update PostgreSQL there itself.
+    A managed database (RDS, Azure) and any other host are False. Config only, no SSH."""
+    try:
+        s1, _why = _dbserver_target()
+        return bool(s1) and _dbserver_same_host(host, s1.get('host'))
+    except Exception:
+        return False
 
 
 def _pg_remote_read_error(rc, err):
@@ -29030,19 +29047,24 @@ def _pg_remote_server_version(allow_install=False, timeout=15):
     return out.splitlines()[0], ''
 
 
-def _postgres_remote_status(topology=None, reader=None, allow_install=False):
+def _postgres_remote_status(topology=None, reader=None, allow_install=False, manage=None):
     """ops #760: where TAK's database runs and whether it has the PostgreSQL security fix.
     None when the database is on this box (the host and Docker checks cover it). Otherwise
-    {host, port, kind, version, state, missing, where, reason}: state is 'update' (read, and
+    {host, port, kind, manage, version, state, missing, where, reason}: `manage` is True when the
+    console can update that database itself (a split install's database server, ops #766).
+    state is 'update' (read, and
     below a POSTGRES_SECURITY_RELEASES fix), 'ok' (read, at or above the fix, or a major the table
     does not list), or 'unknown' (could not be read: never reported as fixed). Read-only."""
     mode, host, port = topology if topology is not None else _tak_db_topology()
     if mode != 'remote':
         return None
     kind = _pg_remote_kind(host)
+    if manage is None:
+        manage = kind == 'split' and _pg_dbserver_manageable(host)
     version, reason = (reader or (lambda: _pg_remote_server_version(allow_install)))()
-    st = {'host': host, 'port': port, 'kind': kind, 'version': '', 'state': 'unknown', 'missing': [],
-          'where': _pg_remote_where(kind, host), 'reason': reason or ''}
+    st = {'host': host, 'port': port, 'kind': kind, 'manage': bool(manage), 'version': '',
+          'state': 'unknown', 'missing': [], 'where': _pg_remote_where(kind, host, bool(manage)),
+          'reason': reason or ''}
     ver = _pg_version_tuple(version)
     if ver is None:
         st['reason'] = st['reason'] or 'the database gave no readable version'
@@ -29069,7 +29091,8 @@ def _postgres_remote_items(status):
         lines = ['Fixes ' + '; '.join(f"{i}: {r['reason']}" for i, r in sorted(rels.items())) + '.',
                  status['where'],
                  'The update restarts the database, so TAK Server is briefly without it. '
-                 'infra-TAK changes nothing on that database.']
+                 + ('It reconnects by itself.' if status.get('manage')
+                    else 'infra-TAK changes nothing on that database.')]
         return [{'key': 'pg-remote', 'label': 'PostgreSQL (TAK database on ' + host + ')',
                  'installed': f"PostgreSQL {status['version']} on {host}",
                  'target': 'PostgreSQL %d.%d' % target if target else 'the security fix',
@@ -29114,12 +29137,13 @@ def _postgres_remote_panel(force=False):
     try:
         st = _postgres_remote_status()
     except Exception as e:
-        st = {'host': '', 'port': 0, 'kind': 'split', 'version': '', 'state': 'unknown', 'missing': [],
-              'where': '', 'reason': 'the check failed: ' + str(e)[:80]}
+        st = {'host': '', 'port': 0, 'kind': 'split', 'manage': False, 'version': '', 'state': 'unknown',
+              'missing': [], 'where': '', 'reason': 'the check failed: ' + str(e)[:80]}
     if st is None:
         data = {'remote': False}
     else:
-        data = dict(st, remote=True, missing=[r['id'] for r in st['missing']])
+        data = dict(st, remote=True, missing=[r['id'] for r in st['missing']],
+                    can_update=bool(st.get('manage')) and st['state'] in ('update', 'unknown'))
         if st['state'] == 'update':
             data['headline'] = (f"PostgreSQL security update pending on your TAK database "
                                 f"({st['version']} on {st['host']})")
@@ -102053,6 +102077,10 @@ _DBSERVER_JOBS = {
     'updates': {'unit': 'infratak-updates', 'script': '/var/lib/infratak-updates.sh',
                 'dir': '/var/lib/infratak-updates', 'log': '/var/log/infratak-updates.log',
                 'title': 'database server Install updates'},
+    # ops #766: the PostgreSQL security update alone (not every pending package), then a restart.
+    'pg-update': {'unit': 'infratak-pg-update', 'script': '/var/lib/infratak-pg-update.sh',
+                  'dir': '/var/lib/infratak-pg-update', 'log': '/var/log/infratak-pg-update.log',
+                  'title': 'database server PostgreSQL security update'},
 }
 _DBSERVER_OS_STEPS = ('pre-snapshot', 'db-dump', 'pin-pg16', 'release-upgrade', 'repos-noble',
                       'reassert', 'reboot')
@@ -102065,7 +102093,16 @@ _DBSERVER_REBOOT_WAIT_S = 1800   # no SSH this long after the reboot -> failed:v
 _DBSERVER_PG_WAIT_S = 300        # PostgreSQL gets this long to answer once SSH is back
 _DBSERVER_RECONNECT_S = 600      # then TAK Server gets this long to reconnect by itself
 _DBSERVER_STANDDOWN = '/var/lib/takguard/dbserver-maintenance'
-_DBSERVER_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800}
+_DBSERVER_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800, 'pg-update': 1800}
+# ops #766: what the pg-update job's status word means, in plain words (the log has the detail).
+_DBSERVER_PG_FAIL = {
+    'no-fix': 'the PostgreSQL repository on that machine does not offer the security fix yet. Nothing was changed. Try again later',
+    'held': 'PostgreSQL is on hold (apt-mark hold) on that machine. The console does not override a hold. Nothing was changed',
+    'apt': 'apt could not install the PostgreSQL update. The log says why',
+    'restart': 'PostgreSQL did not come back on the fixed version after the restart. The log says why',
+    'os': 'that machine does not use apt. Update PostgreSQL there by hand. Nothing was changed',
+    'none': 'no PostgreSQL server package is installed there. Nothing was changed',
+}
 _DBSERVER_IRREVERSIBLE = (
     'The database server goes from Ubuntu 22.04 to Ubuntu 24.04. do-release-upgrade has no rollback; the only way back is the snapshot of the database server you take BEFORE pressing Start.',
     'Every package on the database server is replaced and it reboots at the end. PostgreSQL 18 and the TAK database are kept as they are; the job takes a verified database dump on the database server first.',
@@ -102393,6 +102430,112 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
     ))
 
 
+# ops #766: the database server's PostgreSQL security update, as one detached job. Install updates
+# (the 'updates' job) reads the apt lists as they are, and a database server that is not on all
+# day keeps lists from before the fix, so it says "every available update is installed" while its
+# PostgreSQL is below the fix (verified on a cloud split, 18.6 installed, lists from Oct 29: after
+# apt-get update the PGDG repository offered 18.7). This job refreshes the lists first, upgrades
+# only the PostgreSQL server packages (never TAK's database package, never PostGIS, never the
+# rest of the system), restarts a cluster that still runs the old build, and refuses with a
+# plain reason when the repository does not offer the fix yet.
+_PG_UPDATE_FIXED_RE = re.compile(r'^\d+=\d+\.\d+( \d+=\d+\.\d+)*$')
+_PG_UPDATE_SCRIPT = r'''#!/bin/bash
+set -o pipefail
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+STATUS=@@STATUS@@
+FIXED=@@FIXED@@
+TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+mkdir -p "$(dirname "$STATUS")"
+echo "running:pg-update" > "$STATUS"
+fail() { echo "[$(TS)] FAILED ($1): $2"; echo "failed:$1" > "$STATUS"; exit 1; }
+echo "[$(TS)] === infra-TAK PostgreSQL security update starting (pid $$) ==="
+command -v apt-get >/dev/null 2>&1 || fail os "apt-get is not installed on this machine"
+fixed_for() { local kv; for kv in $FIXED; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return; }; done; }
+upstream() { echo "$1" | sed -E 's/^[0-9]+://; s/^([0-9]+\.[0-9]+).*$/\1/'; }
+WAITED=0
+while [ "$WAITED" -lt 1800 ]; do
+  BUSY=0
+  pgrep -f apt.systemd.daily >/dev/null 2>&1 && BUSY=1
+  pgrep -x apt-get >/dev/null 2>&1 && BUSY=1
+  pgrep -x apt >/dev/null 2>&1 && BUSY=1
+  pgrep -x dpkg >/dev/null 2>&1 && BUSY=1
+  pgrep -af unattended-upgrade 2>/dev/null | grep -qv unattended-upgrade-shutdown && BUSY=1
+  [ "$BUSY" -eq 0 ] && break
+  [ $((WAITED % 60)) -eq 0 ] && echo "[$(TS)] waiting for another apt/dpkg process to finish (${WAITED}s)"
+  sleep 5; WAITED=$((WAITED+5))
+done
+[ "$WAITED" -ge 1800 ] && fail apt "apt/dpkg is still busy after 30 minutes"
+echo "[$(TS)] apt-get update (refresh the package lists first)"
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1
+urc=$?
+[ "$urc" -ne 0 ] && echo "[$(TS)] WARN: apt-get update reported errors (exit $urc); going on with the package lists as they are"
+MAJORS="$(dpkg-query -W -f='${Package}\n' 'postgresql-[0-9]*' 2>/dev/null | sed -nE 's/^postgresql-([0-9]+)$/\1/p' | sort -un)"
+[ -n "$MAJORS" ] || fail none "no postgresql-N server package is installed"
+HELD="$(apt-mark showhold 2>/dev/null)"
+for M in $MAJORS; do
+  F="$(fixed_for "$M")"
+  if [ -z "$F" ]; then echo "[$(TS)] PostgreSQL $M: the security release does not list this major version, leaving it alone"; continue; fi
+  INSTV="$(upstream "$(dpkg-query -W -f='${Version}' "postgresql-$M")")"
+  if dpkg --compare-versions "$INSTV" ge "$F"; then
+    echo "[$(TS)] PostgreSQL $M: installed $INSTV is already at or above the fix $F"
+  else
+    CAND="$(apt-cache policy "postgresql-$M" | awk '/Candidate:/ {print $2; exit}')"
+    CANDV="$(upstream "$CAND")"
+    echo "[$(TS)] PostgreSQL $M: installed $INSTV, the repository offers ${CANDV:-nothing}, the fix is $F"
+    if [ -z "$CAND" ] || [ "$CAND" = "(none)" ] || ! dpkg --compare-versions "$CANDV" ge "$F"; then
+      fail no-fix "the repository on this machine offers PostgreSQL ${CANDV:-nothing} for major version $M, below the fix $F. Nothing was changed"
+    fi
+    PKGS=""
+    for p in "postgresql-$M" "postgresql-$M-jit" "postgresql-client-$M" libpq5 postgresql-common postgresql-client-common; do
+      dpkg -s "$p" >/dev/null 2>&1 && PKGS="$PKGS $p"
+    done
+    for p in $PKGS; do
+      if printf '%s\n' "$HELD" | grep -qx "$p"; then fail held "$p is on hold (apt-mark hold). Nothing was changed"; fi
+    done
+    echo "[$(TS)] upgrading only these packages:$PKGS"
+    apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install --only-upgrade $PKGS 2>&1
+    [ "${PIPESTATUS[0]}" -eq 0 ] || fail apt "apt-get could not install the PostgreSQL update (see above)"
+  fi
+  CL="$(pg_lsclusters -h 2>/dev/null | awk -v m="$M" '$1==m && $4=="online" {print $2" "$3}')"
+  while read -r NAME PORT; do
+    [ -n "$NAME" ] || continue
+    RUN="$(runuser -u postgres -- psql -X -p "$PORT" -tAc 'show server_version' 2>/dev/null | head -1)"
+    RUNV="$(upstream "$RUN")"
+    if [ -n "$RUNV" ] && dpkg --compare-versions "$RUNV" ge "$F"; then
+      echo "[$(TS)] cluster $M/$NAME already runs $RUNV"
+      continue
+    fi
+    echo "[$(TS)] cluster $M/$NAME runs ${RUNV:-an unreadable version}: restarting it"
+    systemctl restart "postgresql@$M-$NAME" 2>&1 || pg_ctlcluster "$M" "$NAME" restart 2>&1
+    for i in $(seq 1 60); do pg_isready -q -p "$PORT" && break; sleep 2; done
+    RUN="$(runuser -u postgres -- psql -X -p "$PORT" -tAc 'show server_version' 2>/dev/null | head -1)"
+    RUNV="$(upstream "$RUN")"
+    if [ -z "$RUNV" ] || ! dpkg --compare-versions "$RUNV" ge "$F"; then
+      fail restart "cluster $M/$NAME runs ${RUNV:-no readable version} after the restart, the fix is $F"
+    fi
+    echo "[$(TS)] cluster $M/$NAME now runs $RUNV"
+  done <<< "$CL"
+done
+echo "[$(TS)] === DONE ==="
+echo "done" > "$STATUS"
+'''
+
+
+def _pg_update_dbserver_script(status_file, fixed=None):
+    """The database server's PostgreSQL security-update job (ops #766), as text. Runs ON the
+    database server as root in the transient unit infratak-pg-update. Pure function of its inputs:
+    `status_file` (checked) and the fixed minor of each major version (default: the newest entry
+    of POSTGRES_SECURITY_RELEASES)."""
+    if not re.fullmatch(r'/var/lib/infratak-[a-z-]+/status', status_file or ''):
+        raise ValueError(f'bad status file {status_file!r}')
+    if fixed is None:
+        fixed = ' '.join(f'{m}={v}' for m, v in sorted(POSTGRES_SECURITY_RELEASES[-1]['fixed'].items()))
+    if not _PG_UPDATE_FIXED_RE.fullmatch(fixed):
+        raise ValueError(f'bad fixed-version list {fixed!r}')
+    return (_PG_UPDATE_SCRIPT.replace('@@STATUS@@', shlex.quote(status_file))
+            .replace('@@FIXED@@', shlex.quote(fixed)))
+
+
 def _dbserver_record_read():
     try:
         with open(_DBSERVER_RECORD) as f:
@@ -102678,6 +102821,8 @@ def _dbserver_finish(rec, phase, step='', detail='', s1=None, notices=None):
     _dbserver_record_write(rec)
     _dbserver_standdown_end()
     job = rec.get('job') or 'job'
+    if job == 'pg-update':
+        _PG_REMOTE_CACHE['data'] = None    # the console page asks again instead of showing the old version
     if s1 is not None and job == 'os-upgrade':
         mark = 'done' if phase == 'done' else ('failed:verify:' + (detail or '?') if step == 'verify' else '')
         if mark:
@@ -102690,6 +102835,23 @@ def _dbserver_finish(rec, phase, step='', detail='', s1=None, notices=None):
     except Exception:
         pass
     return rec
+
+
+def _dbserver_pg_confirm(reader=None):
+    """(problem, note) after a pg-update job: the console reads the database's version itself and
+    must see it at or above the fix. A read that fails is a note, never a pass or a failure."""
+    _PG_REMOTE_CACHE['data'] = None
+    try:
+        st = _postgres_remote_status(reader=reader, allow_install=True)
+    except Exception as e:
+        return '', f'the console could not read the new version itself: {str(e)[:80]}'
+    if st is None:
+        return '', ''
+    if st['state'] == 'update':
+        return f"PostgreSQL still reports {st['version']}, below the fix", ''
+    if st['state'] == 'unknown':
+        return '', f"the console could not read the new version itself ({st['reason']})"
+    return '', f"PostgreSQL now reports {st['version']}"
 
 
 def _dbserver_tick(rec, s1, probe_fn=None, sleep=time.sleep, now=time.time):
@@ -102742,6 +102904,27 @@ def _dbserver_tick(rec, s1, probe_fn=None, sleep=time.sleep, now=time.time):
         if raw.startswith('running') and unit[1] not in ('active', 'activating'):
             return _dbserver_finish(rec, 'failed', 'updates', f"the updates job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", s1)
         rec.update({'phase': 'running', 'step': 'updates'})
+        _dbserver_record_write(rec)
+        return rec
+    if job == 'pg-update':
+        if raw.startswith('done'):
+            rec.update({'phase': 'verifying', 'step': 'verify'})
+            _dbserver_record_write(rec)
+            problems, notices = _dbserver_verify(s1, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+            if problems:
+                return _dbserver_finish(rec, 'failed', 'verify', ' '.join(problems), s1, notices)
+            # The core's own reading of the version, with the login TAK Server uses: the proof the
+            # version rose, not only what the machine said about itself.
+            note = _dbserver_pg_confirm()
+            if note[0]:
+                return _dbserver_finish(rec, 'failed', 'verify', note[0], s1, notices)
+            return _dbserver_finish(rec, 'done', '', note[1], s1, notices)
+        if raw.startswith('failed'):
+            code = (raw.split(':', 1) + [''])[1].strip()
+            return _dbserver_finish(rec, 'failed', 'pg-update', _DBSERVER_PG_FAIL.get(code, 'the PostgreSQL update failed. The log says why'), s1)
+        if raw.startswith('running') and unit[1] not in ('active', 'activating'):
+            return _dbserver_finish(rec, 'failed', 'pg-update', f"the PostgreSQL update job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", s1)
+        rec.update({'phase': 'running', 'step': 'pg-update'})
         _dbserver_record_write(rec)
         return rec
     st = _os_upgrade_job_state(raw=raw, unit=unit)
@@ -102854,6 +103037,18 @@ def _dbserver_start_locked(job, data):
             return 409, {'ok': False, 'error': 'preflight failed: ' + ', '.join(failed), 'preflight': pf}
         script = _os_upgrade_dbserver_script('18')
         return _dbserver_begin(job, s1, pf['baseline'], lambda: _dbserver_launch(s1, job, script))
+    if job == 'pg-update':
+        # ops #766: only for the machine that really holds TAK's database, and only while it is
+        # below the fix. A managed database (RDS, Azure) is never touched from here.
+        try:
+            mode, dbhost, _dbport = _tak_db_topology()
+        except Exception:
+            mode, dbhost = '', ''
+        if mode != 'remote' or not _dbserver_same_host(dbhost, s1['host']):
+            return 409, {'ok': False, 'error': 'TAK Server\'s database is not on the database server this console manages'}
+        cur = _postgres_remote_status(manage=True, allow_install=True)
+        if cur and cur['state'] == 'ok':
+            return 409, {'ok': False, 'error': f"PostgreSQL {cur['version']} on the database server already has the security fix"}
     d, kind, err = _dbserver_probe(s1, 'full')
     if d is None:
         return 409, {'ok': False, 'error': f'cannot reach the database server ({kind}): {err}'}
@@ -102861,6 +103056,9 @@ def _dbserver_start_locked(job, data):
     if busy:
         return 409, {'ok': False, 'error': 'wait for these to finish on the database server: ' + ', '.join(busy)}
     baseline = _dbserver_baseline(d)
+    if job == 'pg-update':
+        script = _pg_update_dbserver_script(_DBSERVER_JOBS['pg-update']['dir'] + '/status')
+        return _dbserver_begin(job, s1, baseline, lambda: _dbserver_launch(s1, job, script))
     if job == 'updates':
         script = _kernel_patch_apt_script('takserver-database', _DBSERVER_JOBS['updates']['dir'] + '/status')
         return _dbserver_begin(job, s1, baseline, lambda: _dbserver_launch(s1, job, script))
@@ -102973,6 +103171,22 @@ def console_dbserver_updates_api():
         return jsonify({'ok': False, 'error': 'not a split install'}), 404
     try:
         code, payload = _dbserver_start('updates')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/dbserver/pg-update', methods=['POST'])
+@login_required
+def console_dbserver_pg_update_api():
+    """ops #766: install the PostgreSQL security update on the split install's database server
+    over the SSH link the console already holds, and restart PostgreSQL there. Same bar as the
+    database server's Install updates (which also installs PostgreSQL packages): signed in, one job
+    at a time, a confirm in the page. 404 unless this is a split install."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    try:
+        code, payload = _dbserver_start('pg-update')
     except Exception as e:
         return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
     return jsonify(payload), code

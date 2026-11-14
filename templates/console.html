@@ -112,9 +112,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="flex:1;min-width:260px">
 <div id="pg-remote-headline" style="font-size:13px;font-weight:600;color:var(--yellow)"></div>
 <div id="pg-remote-where" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6"></div>
-<div style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.6">infra-TAK only reads the version of this database. It changes nothing on it.</div>
+<div id="pg-remote-note" style="font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.6">infra-TAK only reads the version of this database. It changes nothing on it.</div>
 </div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="pg-remote-btn" onclick="dbsUpdatePostgres()" style="display:none;padding:5px 12px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Update PostgreSQL</button>
 <button onclick="dismissPgRemote()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div>
 </div></div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle">
@@ -352,7 +355,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 {% endif %}
 </div>
-{% if host.id == 'tak_db' %}<button type="button" id="dbs-card-updates-btn" data-dbs-updates-btn="1" onclick="event.stopPropagation();dbsCardInstallUpdates()" title="Install this server's updates — does not upgrade Ubuntu, and TAK Server stays up" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">&#9888; Updates needed</button><button type="button" id="dbs-card-reboot-btn" onclick="event.stopPropagation();dbsOpenReboot()" title="Reboot this server any time — TAK Server stays up and reconnects by itself" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot&hellip;</button>{% endif %}
+{% if host.id == 'tak_db' %}<button type="button" id="dbs-card-pg-btn" onclick="event.stopPropagation();dbsUpdatePostgres()" title="Install the PostgreSQL security update on this server and restart PostgreSQL. TAK Server is briefly without its database and reconnects by itself" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">&#9888; Update PostgreSQL</button><button type="button" id="dbs-card-updates-btn" data-dbs-updates-btn="1" onclick="event.stopPropagation();dbsCardInstallUpdates()" title="Install this server's updates — does not upgrade Ubuntu, and TAK Server stays up" style="display:none;margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">&#9888; Updates needed</button><button type="button" id="dbs-card-reboot-btn" onclick="event.stopPropagation();dbsOpenReboot()" title="Reboot this server any time — TAK Server stays up and reconnects by itself" style="margin-top:8px;margin-right:6px;padding:4px 10px;background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot&hellip;</button>{% endif %}
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
 <div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
@@ -1383,7 +1386,12 @@ async function checkPgRemote(){
     try{
         var r=await fetch('/api/postgres-remote',{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
+        // ops #766: a split box's database server has a button for it (the console holds the SSH link)
+        var cb=document.getElementById('dbs-card-pg-btn');
+        if(cb)cb.style.display=(d&&d.can_update)?'inline-block':'none';
         if(!d||!d.remote||(d.state!=='update'&&d.state!=='unknown')){b.style.display='none';return;}
+        var bb=document.getElementById('pg-remote-btn'); if(bb)bb.style.display=d.can_update?'inline-block':'none';
+        var nt=document.getElementById('pg-remote-note'); if(nt)nt.textContent=d.manage?'The console installs only the PostgreSQL update there over SSH, then restarts PostgreSQL. TAK Server is briefly without its database and reconnects by itself.':'infra-TAK only reads the version of this database. It changes nothing on it.';
         var k=_pgRemoteKey(d),t=0;
         try{t=parseInt(localStorage.getItem(k)||'0',10)||0;}catch(e){}
         if(t&&Date.now()-t<86400000){b.style.display='none';return;}
@@ -1666,7 +1674,7 @@ osupInit();
 // SSH read. The core never restarts or reboots during these jobs, so there is no gap to
 // ride through — while the database server reboots its log is simply unreadable.
 var _dbsTargetHost='',_dbsPollTimer=null,_dbsBusy=false;
-var _DBS_TITLE={'os-upgrade':'database server upgrade to Ubuntu 24.04 LTS','updates':'database server updates','reboot':'database server reboot'};
+var _DBS_TITLE={'os-upgrade':'database server upgrade to Ubuntu 24.04 LTS','updates':'database server updates','reboot':'database server reboot','pg-update':'database server PostgreSQL update'};
 function _dbsShow(which){
     var card=document.getElementById('dbserver-card'); if(!card)return;
     ['dbs-idle','dbs-progress','dbs-result'].forEach(function(id){var el=document.getElementById(id);if(el)el.style.display=(id===which)?'block':'none';});
@@ -1680,6 +1688,7 @@ function _dbsRenderProgress(d){
     var h,t;
     if(d.state==='rebooting'){ h='Rebooting the database server'+_dbsHostLabel(); t='Waiting for it to come back over SSH and for PostgreSQL to answer. TAK Server stays up; nothing is saved to the database until then.'; }
     else if(d.state==='verifying'){ h='Database server back up — checking it'; t='Waiting for PostgreSQL with its TLS settings, and for TAK Server to reconnect by itself (up to 15 min).'; }
+    else if(d.job==='pg-update'){ h='Updating PostgreSQL on the database server'+_dbsHostLabel(); t='The PostgreSQL packages are updated on the database server itself and PostgreSQL restarts. Safe to close this tab. TAK Server is briefly without its database and reconnects by itself. Typical time: 2-5 min.'; }
     else if(d.job==='updates'){ h='Installing updates on the database server'+_dbsHostLabel(); t='apt runs on the database server itself — safe to close this tab. TAK\'s database package is held. Typical time: 2-10 min.'; }
     else { h='Upgrading the database server'+_dbsHostLabel()+' to Ubuntu 24.04 LTS — step '+_osupEsc(_OSUP_STEP_LABELS[d.step]||d.step||'start'); t='Runs on the database server itself — safe to close this tab. TAK Server stays up, but nothing is saved to or read from the database while it is down. Typical time: 15-45 min.'; }
     if(head)head.innerHTML='&#9881; '+_osupEsc(h); if(sub)sub.textContent=t;
@@ -1699,6 +1708,7 @@ function _dbsRenderResult(d){
     if(d.state==='done'){
         head.style.color='var(--green)';
         if(d.job==='os-upgrade'){ head.innerHTML='&#10003; Database server'+_dbsHostLabel()+' upgraded to Ubuntu 24.04 LTS'; body.textContent='PostgreSQL 18 is back with its TLS settings and firewall rules, and TAK Server reconnected by itself.'+notes; }
+        else if(d.job==='pg-update'){ head.innerHTML='&#10003; PostgreSQL updated on the database server'; body.textContent='PostgreSQL is back on the fixed version and TAK Server reconnected by itself.'+(d.detail?' '+d.detail+'.':'')+notes; try{checkPgRemote();}catch(e){} }
         else if(d.job==='updates'){ try{sessionStorage.removeItem('dbs-card-updates');}catch(e){} head.innerHTML='&#10003; Updates installed on the database server'; body.textContent=(d.reboot_required||/reboot/i.test(d.detail||'')?'A reboot is required — press Reboot… to open it, then Reboot database server. TAK Server stays up.':'No reboot needed.')+notes; }
         else { head.innerHTML='&#10003; Database server rebooted'; body.textContent='PostgreSQL is back and TAK Server reconnected by itself.'+notes; }
         return;
@@ -1707,6 +1717,7 @@ function _dbsRenderResult(d){
     head.innerHTML='&#10007; '+_osupEsc(_DBS_TITLE[d.job]||'database server job')+' FAILED at step '+_osupEsc(d.step||'?');
     var hint='';
     if(d.step==='start')hint='Nothing was started on the database server.';
+    else if(d.job==='pg-update')hint=d.step==='verify'?'The update was installed but the after-update check found a problem. TAK Server was not restarted. Read the log.':'Read the log for the detail.';
     else if(d.job!=='os-upgrade')hint='Read the log, fix the cause and try again.';
     else if(d.step==='pre-snapshot'||d.step==='db-dump'||d.step==='pin-pg16')hint='Nothing was upgraded — the database server is unchanged. Read the log, fix the cause and press Check & upgrade again.';
     else if(d.step==='release-upgrade')hint='Ubuntu\'s upgrader did not complete. The last lines of the log say which: UNCHANGED means nothing was touched, so fix the cause and run it again; PARTLY UPGRADED means restore the database server\'s snapshot.';
@@ -1853,6 +1864,21 @@ async function dbsInstallUpdates(){
     _dbsBusy=true;
     try{ var d=await _dbsPost('updates'); if(d){ osupCloseModal(); if(rhost)_rhJobStarted('updates',d.message); else _dbsJobStarted('updates',d.message); } }
     catch(e){ var err=document.getElementById('osup-modal-err'); if(err)err.textContent='updates failed: '+e.message; }
+    finally{ _dbsBusy=false; }
+}
+// ops #766: Update PostgreSQL (the database server card, and the yellow notice). One confirm, then the
+// console installs only the PostgreSQL packages on the database server over SSH and restarts PostgreSQL.
+async function dbsUpdatePostgres(){
+    if(_dbsBusy)return;
+    if(!confirm('Update PostgreSQL on the database server'+(_dbsTargetHost?' ('+_dbsTargetHost+')':'')+'?\n\nThe console installs the PostgreSQL security update there over SSH and restarts PostgreSQL. TAK Server is briefly without its database (a minute or two) and reconnects by itself. Nothing else on that machine is updated.'))return;
+    _dbsBusy=true;
+    try{
+        var r=await fetch('/api/console/dbserver/pg-update',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:'{}'});
+        var d={}; try{d=await r.json();}catch(e){}
+        if(!r.ok||!d.ok){ alert(d.error||('could not start the PostgreSQL update ('+r.status+')')); return; }
+        var c=document.getElementById('dbserver-card'); if(c)c.scrollIntoView({behavior:'smooth',block:'center'});
+        _dbsJobStarted('pg-update',d.message);
+    }catch(e){ alert('could not start the PostgreSQL update: '+e.message); }
     finally{ _dbsBusy=false; }
 }
 async function dbsReboot(){

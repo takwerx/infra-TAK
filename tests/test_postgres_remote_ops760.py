@@ -57,7 +57,8 @@ REMOTE_FUNCS = VERSION_FUNCS + ('_pg_remote_kind', '_pg_remote_where', '_pg_remo
 
 def _ns(**over):
     n = {'re': re, 'print': lambda *a, **k: None, 'os': types.SimpleNamespace(environ={'PATH': '/bin'}),
-         'subprocess': _real_subprocess, 'time': __import__('time')}
+         'subprocess': _real_subprocess, 'time': __import__('time'),
+         '_pg_dbserver_manageable': lambda host: False}      # ops #766: no SSH link to a database server
     n.update(over)
     src = '\n'.join([_const('POSTGRES_SECURITY_RELEASES'), _const('_PG_RDS_HOST_RE'),
                      _const('_PG_AZURE_HOST_RE'), _const('_PG_REMOTE_CACHE'), _const('_PG_REMOTE_TTL')]
