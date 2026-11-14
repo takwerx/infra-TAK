@@ -184,11 +184,11 @@ class Box:
             return '' if self.reindex_ok else None
         return ''
 
-    def backup(self, plog=None, label_prefix='pre-58'):
-        self.cmds.append(['BACKUP', label_prefix])
+    def backup(self, pgbin, pw, say, stamp):
+        self.cmds.append(['BACKUP', 'pre-dbrefresh', stamp])
         if self.backup_ok:
-            return {'ok': True, 'snapshot_path': '/opt/tak/snapshots/%s-x' % label_prefix}
-        return {'ok': False, 'error': 'archive unreadable'}
+            return '/home/t/tak-docker/snapshots/pre-dbrefresh-%s/cot.pgdump' % stamp, ''
+        return '', 'archive unreadable'
 
     def verbs(self):
         return [' '.join(c[:3]) if c[0] == 'docker' else c[0] for c in self.cmds]
@@ -243,7 +243,7 @@ def _run_job(box, monkeypatch, facts=None):
         '_tak_db_refresh_facts': lambda: facts if facts is not None else _facts(box),
         '_tak_db_pg_version': lambda pgbin: box.running_version if not box.db_runs else box.new_version,
         '_tak58_container_counts': box.counts, '_tak58_container_psql': box.psql,
-        '_tak_58_backup': box.backup, '_tak_db_volume_mount': lambda ctx: '--mount source=takserver_pgsql,destination=/var/lib/postgresql/data',
+        '_tak_db_refresh_backup': box.backup, '_tak_db_volume_mount': lambda ctx: '--mount source=takserver_pgsql,destination=/var/lib/postgresql/data',
         '_patch_tak_hardened_dockerfile': lambda *a, **k: False,
         '_patch_tak_db_pgdg_releasever': lambda *a, **k: False,
         '_tak_db_legacy_refresh_dockerfile': lambda s: s,
@@ -265,7 +265,7 @@ def test_happy_path_builds_first_then_backs_up_then_swaps_only_the_database(monk
     log, status = _run_job(box, monkeypatch)
     assert status == {'running': False, 'complete': True, 'error': False}
     i_build = _index(box, ['docker', 'build'])
-    i_backup = _index(box, ['BACKUP'])
+    i_backup = box.cmds.index([c for c in box.cmds if c[0] == 'BACKUP'][0])
     i_stop_tak = _index(box, ['docker', 'stop', '-t', '120', 'takserver'])
     i_stop_db = _index(box, ['docker', 'stop', '-t', '120', 'takserver-db'])
     i_swap = _index(box, ['docker', 'tag', 'takserver_db:refresh', 'takserver_db'])
@@ -292,7 +292,7 @@ def test_the_data_volume_and_the_tak_container_are_never_removed(monkeypatch):
 def test_the_backup_has_its_own_snapshot_name_not_the_5_8_one(monkeypatch):
     box = Box()
     _run_job(box, monkeypatch)
-    assert ['BACKUP', 'pre-dbrefresh'] in box.cmds
+    assert [c for c in box.cmds if c[0] == 'BACKUP'][0][:2] == ['BACKUP', 'pre-dbrefresh']
 
 
 def test_old_image_is_kept_as_a_rollback_handle_before_the_swap(monkeypatch):
@@ -308,7 +308,7 @@ def test_a_new_image_without_the_fix_changes_nothing(monkeypatch):
     box = Box(new_version='18.6')
     log, status = _run_job(box, monkeypatch)
     assert status['complete'] and not status['error']
-    assert _index(box, ['BACKUP', 'pre-dbrefresh']) == -1
+    assert all(c[0] != 'BACKUP' for c in box.cmds)
     assert all(c[:2] != ['docker', 'stop'] and c[:2] != ['docker', 'start'] for c in box.cmds)
     assert any('not the security fix yet' in l for l in log)
     assert ['docker', 'rmi', 'takserver_db:refresh'] in box.cmds
@@ -571,3 +571,67 @@ def test_atlas_update_and_the_console_update_both_refresh_the_database():
     assert "get('refresh_databases')" in post
     assert post.index('_postgres_compose_converge(') < post.index("get('refresh_databases')") \
         < post.index('Final orphan postgres kill')
+
+
+# ── 1d. the backup runs inside the container: a container box has no PostgreSQL client on the host ──
+# Field (ARM box, Nov 14): the host-side proof stopped the job with "pg_restore not found on trusted PATH".
+
+class BackupBox:
+    def __init__(self, dump_rc=0, toc='41\n', size=2048, host_size=2048, cp_rc=0):
+        self.calls, self.dump_rc, self.toc, self.size = [], dump_rc, toc, size
+        self.host_size, self.cp_rc = host_size, cp_rc
+        self.dirs = []
+
+    def detached(self, container, pw, shell_cmd, tag, say, progress=None, timeout=0, every=30):
+        self.calls.append(['DETACHED', container, shell_cmd])
+        return self.dump_rc
+
+    def pg_run(self, argv, timeout=30, cwd=None):
+        self.calls.append(list(argv))
+        r = types.SimpleNamespace(returncode=0, stdout='', stderr='')
+        if argv[:2] == ['docker', 'exec'] and argv[3:5] == ['sh', '-c']:
+            r.stdout = '%s%d\n' % (self.toc, self.size)
+        if argv[:2] == ['docker', 'cp']:
+            r.returncode = self.cp_rc
+        return r
+
+
+def _backup(box):
+    fake_os = types.SimpleNamespace(
+        path=types.SimpleNamespace(join=lambda *a: '/'.join(a), exists=lambda p: box.host_size >= 0,
+                                   getsize=lambda p: box.host_size),
+        makedirs=lambda d, mode=0, exist_ok=False: box.dirs.append(d), chmod=lambda *a: None)
+    ns = {'os': fake_os, 'TAK_DB_CONTAINER': 'takserver-db', 'TAK_DOCKER_ROOT': '/home/t/tak-docker',
+          '_tak58_container_run_detached': box.detached, '_pg_run': box.pg_run,
+          '_makedirs_priv': lambda *a, **k: None, '_cotdb_fmt_bytes': lambda n: '%d B' % n}
+    exec(compile(_cut('_tak_db_refresh_backup'), 'app.py', 'exec'), ns)
+    logs = []
+    return ns['_tak_db_refresh_backup']('/usr/pgsql-18/bin', 'pw', logs.append, '20261114-100000'), logs
+
+
+def test_backup_is_dumped_read_back_and_copied_out_without_any_host_postgresql_client():
+    box = BackupBox()
+    (path, why), logs = _backup(box)
+    assert path == '/home/t/tak-docker/snapshots/pre-dbrefresh-20261114-100000/cot.pgdump' and why == ''
+    dump = [c for c in box.calls if c[0] == 'DETACHED'][0]
+    assert '/usr/pgsql-18/bin/pg_dump' in dump[2] and ' -Fc ' in dump[2] and dump[1] == 'takserver-db'
+    read_back = [c for c in box.calls if c[:2] == ['docker', 'exec'] and 'sh' in c][0]
+    assert 'pg_restore --list' in read_back[-1]                       # the proof runs in the container
+    assert all(c[0] in ('DETACHED', 'docker', 'chmod') for c in box.calls)   # never a bare host pg_restore
+    assert ['chmod', '600', path] in box.calls                        # the whole CoT database: not world-readable
+    assert any(c[:4] == ['docker', 'exec', 'takserver-db', 'rm'] for c in box.calls)   # no copy left in the container
+    assert box.dirs == ['/home/t/tak-docker/snapshots/pre-dbrefresh-20261114-100000']   # outside the bundle tree
+
+
+@pytest.mark.parametrize('box,reason', [
+    (BackupBox(dump_rc=1), 'pg_dump exit 1'),
+    (BackupBox(dump_rc=None), 'pg_dump exit None'),
+    (BackupBox(toc='0\n'), 'could not read the dump back'),                 # bytes but no table of contents
+    (BackupBox(size=0), 'could not read the dump back'),
+    (BackupBox(host_size=1024), 'could not copy'),                           # truncated copy
+    (BackupBox(cp_rc=1), 'could not copy'),
+])
+def test_a_backup_that_is_not_provably_complete_is_refused(box, reason):
+    (path, why), _ = _backup(box)
+    assert path == '' and reason in why
+    assert ['chmod', '600'] not in [c[:2] for c in box.calls]

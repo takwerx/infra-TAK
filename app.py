@@ -29199,6 +29199,45 @@ def _tak_db_refresh_items():
              'how': 'Open the TAK Server page, then Update TAK Server, then "Refresh database image".'}]
 
 
+def _tak_db_refresh_backup(pgbin, pw, say, stamp):
+    """(path, '') of a backup of the `cot` database, or ('', why). Container installs have no
+    PostgreSQL client on the host (the broker's pg_restore op answers "not found on trusted PATH": field
+    test, ARM box, Nov 14), so the whole proof runs INSIDE the database container: `pg_dump -Fc`, then
+    `pg_restore --list` must read the archive back (a file with bytes is not a backup), then
+    `docker cp` out to ~/tak-docker/snapshots, OUTSIDE the bundle tree, and the sizes must match.
+    The dump is the whole CoT database: the host copy is 0600 and the in-container copy is removed."""
+    dump, err = '/tmp/cot_dbrefresh.pgdump', '/tmp/cot_dbrefresh.err'
+    say('  Dumping the cot database (TAK Server stays up)…')
+    rc = _tak58_container_run_detached(
+        TAK_DB_CONTAINER, pw, f'{pgbin}/pg_dump -h localhost -U martiuser -d cot -Fc -f {dump} 2>{err}',
+        'cot_dbrefresh', say, every=5)
+    if rc != 0:
+        e = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'head', '-c', '300', err], timeout=60)
+        return '', f'pg_dump exit {rc}: {(e.stdout or "").strip()[:200]}'
+    r = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'sh', '-c',
+                 f'{pgbin}/pg_restore --list {dump} | grep -vc "^;"; wc -c < {dump}'], timeout=900)
+    nums = (r.stdout or '').split()
+    if r.returncode != 0 or len(nums) < 2 or not nums[0].isdigit() or not nums[1].isdigit() \
+            or int(nums[0]) <= 0 or int(nums[1]) <= 0:
+        return '', 'pg_restore could not read the dump back'
+    toc, size = int(nums[0]), int(nums[1])
+    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-dbrefresh-{stamp}')
+    dest = os.path.join(dest_dir, 'cot.pgdump')
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
+    except PermissionError:
+        _makedirs_priv(dest_dir, mode=0o700)
+    c = _pg_run(['docker', 'cp', f'{TAK_DB_CONTAINER}:{dump}', dest], timeout=7300)
+    hsize = os.path.getsize(dest) if os.path.exists(dest) else -1
+    if c.returncode != 0 or hsize != size:
+        return '', 'could not copy the dump out of the container'
+    _pg_run(['chmod', '600', dest], timeout=60)
+    _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'rm', '-f', dump, err], timeout=60)
+    say(f'  Backup read back OK: {toc} objects, {_cotdb_fmt_bytes(size)}')
+    return dest, ''
+
+
 def run_tak_db_refresh(log=None, status=None):
     """Rebuild takserver-db from the stored bundle onto the newest PostgreSQL security minor and
     swap it in on the same volume. Never raises; ends in `status`. See the block comment above."""
@@ -29304,11 +29343,11 @@ def run_tak_db_refresh(log=None, status=None):
 
         # 2. The backup, proven readable, before anything is touched.
         say('Step 2/5: Backing up (TAK Server stays up)…')
-        bk = _tak_58_backup(say, label_prefix='pre-dbrefresh')
-        if not bk.get('ok'):
+        bk_path, bk_why = _tak_db_refresh_backup(f['pgbin'], pw, say, stamp)
+        if not bk_path:
             run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
-            return done(False, f"✗ Nothing was changed: the backup could not be proven readable ({bk.get('error') or 'unknown'}).")
-        say(f"✓ Backup verified: {bk.get('snapshot_path')}")
+            return done(False, f"✗ Nothing was changed: the backup could not be proven readable ({bk_why}).")
+        say(f'✓ Backup verified: {bk_path}')
 
         # 3. Downtime. Stop TAK, count the rows, stop the database cleanly, keep the old image.
         say('Step 3/5: Stopping TAK Server and its database (downtime starts now)…')
@@ -90842,11 +90881,8 @@ def _pg_restore_toc(dump_path, timeout=600):
     return len(toc), ''
 
 
-def _tak_58_backup(plog=None, label_prefix='pre-58'):
+def _tak_58_backup(plog=None):
     """Snapshot before the 5.8 migration, then PROVE the cot dump reads.
-
-    `label_prefix` (ops #755): the PostgreSQL image refresh uses the same proof under its own
-    snapshot name; only `pre-58-*` snapshots mean "carries the 5.7 schema" to a restore.
 
     Returns {'ok', 'label', 'snapshot_path', 'dump_path', 'dump_bytes',
              'toc_entries', 'error'}. `ok` is True only when pg_restore parsed the
@@ -90855,7 +90891,7 @@ def _tak_58_backup(plog=None, label_prefix='pre-58'):
     if plog is None:
         plog = lambda m: print(m, flush=True)
 
-    label = '%s-%s' % (label_prefix, time.strftime('%Y%m%d-%H%M%S'))
+    label = 'pre-58-%s' % time.strftime('%Y%m%d-%H%M%S')
     out = {'ok': False, 'label': label,
            'snapshot_path': os.path.join(SNAPSHOT_DIR, label),
            'dump_path': None, 'dump_bytes': 0, 'toc_entries': 0, 'error': None}
