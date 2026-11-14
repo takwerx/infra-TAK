@@ -1391,7 +1391,7 @@ async function checkPgRemote(){
         if(cb)cb.style.display=(d&&d.can_update)?'inline-block':'none';
         if(!d||!d.remote||(d.state!=='update'&&d.state!=='unknown')){b.style.display='none';return;}
         var bb=document.getElementById('pg-remote-btn'); if(bb)bb.style.display=d.can_update?'inline-block':'none';
-        var nt=document.getElementById('pg-remote-note'); if(nt)nt.textContent=d.manage?'The console installs only the PostgreSQL update there over SSH, then restarts PostgreSQL. TAK Server is briefly without its database and reconnects by itself.':'infra-TAK only reads the version of this database. It changes nothing on it.';
+        var nt=document.getElementById('pg-remote-note'); if(nt)nt.textContent=d.manage?'Only the PostgreSQL packages are updated. TAK Server is briefly without its database and reconnects by itself.':'infra-TAK only reads the version of this database. It changes nothing on it.';
         var k=_pgRemoteKey(d),t=0;
         try{t=parseInt(localStorage.getItem(k)||'0',10)||0;}catch(e){}
         if(t&&Date.now()-t<86400000){b.style.display='none';return;}
