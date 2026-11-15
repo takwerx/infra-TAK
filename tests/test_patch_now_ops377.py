@@ -444,7 +444,7 @@ def _sweep(pn_items, state, now, fast=True, normal=(), unknown_keys=(), send_fai
             raise OSError('relay down')
         sent.append((subj, body))
 
-    def collect(settings, seen=None, unknown=None):
+    def collect(settings, seen=None, unknown=None, etl=None):
         collected.append(1)
         return json.loads(json.dumps(list(normal)))
 

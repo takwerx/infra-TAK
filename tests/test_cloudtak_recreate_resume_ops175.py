@@ -83,6 +83,9 @@ class Box:
             return types.SimpleNamespace(stdout='', stderr='', returncode=0)
         return types.SimpleNamespace(stdout='', stderr='', returncode=0)
 
+    etl_on = False
+    etl_changed = False
+
     def heal(self, **kw):
         self.heals += 1
         self.calls.append(['HEAL'])
@@ -106,6 +109,10 @@ class Box:
             '_cloudtak_upload_limit_heal': lambda *a, **k: True,   # ops #470
             '_cloudtak_open_stream_ports': lambda *a, **k: None,
             '_cloudtak_ensure_custom_compose': lambda *a, **k: False,   # GH #261, tested on its own
+            # v10.4.0 W11: the ETL Runner overlay seam (off unless a test turns it on)
+            '_etlrunner_cfg': lambda *a: {'enabled': self.etl_on},
+            '_etlrunner_setup': lambda d, log: self.calls.append(['ETL-SETUP']) or True,
+            '_etlrunner_sync_overlay': lambda d, log: self.etl_changed,
             '_cloudtak_containers_without_override': lambda d: self.no_override,   # ops #197
             'CONFIG_DIR': str(self.home / '.config'),
         }
@@ -256,3 +263,15 @@ def test_post_update_hardening_journals_the_same_recreate():
     up = body.index("'up', '-d', '--force-recreate'")
     assert 'if _cloudtak_media_hls_heal(wait=True):\n' in body[up:]
     assert body[up:].index('_ct_recreate_clear()') > body[up:].index('_cloudtak_media_hls_heal(wait=True)')
+
+
+def test_etl_overlay_change_recreates_and_off_box_never_touches_etl(home):
+    """v10.4.0 W11: an ETL-enabled box whose overlay changed (e.g. W5's bridge name) gets the
+    recreate; a box with ETL off never calls the ETL setup."""
+    _write_override(home, OVERRIDE)
+    b = Box(home)
+    b.etl_on, b.etl_changed = True, True
+    b.start()
+    assert ['ETL-SETUP'] in b.calls and b.ups()
+    off = Box(home).start()
+    assert ['ETL-SETUP'] not in off.calls and off.ups() == []

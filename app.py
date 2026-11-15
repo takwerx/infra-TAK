@@ -92,6 +92,7 @@ from collections import defaultdict, deque
 # imports nothing from app.py — seams flow the other way, via the ctx dict
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
+from modules import etlrunner as _etl
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
 # whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
@@ -1599,7 +1600,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.3.14-alpha"
+VERSION = "10.4.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -30261,11 +30262,12 @@ def _module_update_items(unknown):
     return items
 
 
-def _collect_pending_updates(settings, seen=None, unknown=None):
+def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
     source shielded so one failure never hides the rest. `seen`/`unknown`: see
-    _os_security_items."""
+    _os_security_items. `etl`: {'known': [...] | None}; the ETL catalog source writes the
+    prefixes it would mark as announced back into etl['known'] (see _etl.notify_items)."""
     seen = {} if seen is None else seen
     unknown = set() if unknown is None else unknown
     pending = []
@@ -30355,6 +30357,23 @@ def _collect_pending_updates(settings, seen=None, unknown=None):
                                 'identity': ident})
     except Exception as e:
         print(f"[update-notify] plugin check failed: {e}", flush=True)
+    try:
+        # W3/W9: ETL catalog — updates for installed ETLs and new catalog ETLs. Only while the
+        # ETL Runner is on: a box that never turned ETL on is not told about ETLs.
+        if etl is not None and _etlrunner_cfg(settings).get('enabled'):
+            r = subprocess.run(_sudo_wrap(['docker', 'images', _etl.ETL_REPO, '--format', '{{.Tag}}']),
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or '').strip()[:200] or 'docker images failed')
+            known = etl.get('known')
+            items, etl['known'] = _etl.notify_items(
+                _etl_catalog(), _etl.installed_versions(r.stdout.splitlines()),
+                known if isinstance(known, list) else None,
+                bool(_etlrunner_cfg(settings).get('allow_unreviewed')))
+            pending.extend(items)
+    except Exception as e:
+        unknown.update({'etl', 'etl-new'})   # etl['known'] is left as it came in
+        print(f"[update-notify] ETL catalog check failed: {e}", flush=True)
     return pending
 
 
@@ -30393,7 +30412,9 @@ def _update_notify_check_once(fast=False):
     seen = state.get('_os_security_seen')
     seen = dict(seen) if isinstance(seen, dict) else {}
     unknown = set()
-    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown)
+    etl_known_in = state.get('_etl_known')
+    etl = {'known': list(etl_known_in) if isinstance(etl_known_in, list) else None}
+    pending = [] if fast else _collect_pending_updates(settings, seen=seen, unknown=unknown, etl=etl)
     feed = state.get('_patch_now_feed')
     try:
         pn_found, feed = _collect_patch_now_items(feed, unknown, now)
@@ -30473,7 +30494,8 @@ def _update_notify_check_once(fast=False):
         else:
             lines += [f"The following updates are pending on {server_id}:", '']
         for p in other:
-            lines.append(f"  • {p['label']}: {p['installed']} → {p['target']}")
+            lines.append(f"  • {p.get('summary') or p['label'] + ': ' + p['installed'] + ' → ' + p['target']}")
+            lines += [f"      {d}" for d in p.get('detail') or []]
             lines += _notes_lines(p)
             if p.get('how'):
                 lines.append(f"      To install: {p['how']}")
@@ -30491,6 +30513,9 @@ def _update_notify_check_once(fast=False):
                     + (' (reminder)' if reminder else ''))
         elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
+        elif all(p.get('etl_new') for p in new_items):
+            subj = (f"🆕 New ETL available on {server_id}" if len(new_items) == 1
+                    else f"🆕 {len(new_items)} new ETLs available on {server_id}")
         else:
             subj = (f"⬆ Update pending on {server_id}" if len(new_items) == 1
                     else f"⬆ {len(new_items)} updates pending on {server_id}")
@@ -30514,6 +30539,13 @@ def _update_notify_check_once(fast=False):
                 new_state[k] = state[k]
         if seen:
             new_state['_os_security_seen'] = seen
+        # W3/W9: announced ETL prefixes. A new ETL that was in this email joins the set only
+        # because the email went out; one that was not mailed stays out and is retried.
+        if etl.get('known') is not None:
+            sent_new = {p['key'].split(':', 1)[1] for p in new_items if p.get('etl_new')} if emailed else set()
+            new_state['_etl_known'] = sorted(set(etl['known']) | sent_new)
+        elif isinstance(etl_known_in, list):
+            new_state['_etl_known'] = etl_known_in
     # ops #377: patch-now reminders. Both modes run the same patch-now sources, so an item
     # missing here was verified fixed and stops; an unreadable source carries its entry.
     mailed_keys = {p['key'] for p in new_items} if emailed else set()
@@ -40931,8 +40963,12 @@ def generate_caddyfile(settings=None):
         lines.append(f"    @ct_pwa_entry path /sw.js /registerSW.js /manifest.webmanifest / /index.html")
         lines.append(f"    header @ct_pwa_entry Cache-Control \"no-cache, no-store, must-revalidate\"")
         lines += _ct_print_caddy[1]   # ops #222: `import cloudtak_print` (defined at the top)
+        if _etlrunner_hooks_wanted(settings):
+            lines += _etl.caddy_hook_lines()   # v10.4.0 W7
         lines.append(f"}}")
         lines.append("")
+        if _etlrunner_hooks_wanted(settings):
+            lines += _etl.caddy_hook_fallback_site()
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
         lines.append(f"# CloudTAK Tile Server")
         lines.append(f"{ct_tiles} {{")
@@ -52015,9 +52051,14 @@ def _cloudtak_compose_file_value(cloudtak_dir, current=''):
     ours = [base]
     if os.path.exists(os.path.join(d, 'docker-compose.override.yml')):
         ours.append('docker-compose.override.yml')
+    # v10.4.0 W11: the ETL Runner's own overlay, only while it exists (enabled), and before
+    # the operator's file so their settings still win.
+    if os.path.exists(os.path.join(d, _etl.OVERLAY)):
+        ours.append(_etl.OVERLAY)
     files = [os.path.join(d, f) for f in ours]
     seen = {os.path.join(d, n) for n in ('docker-compose.yml', 'compose.yaml',
-                                         'docker-compose.override.yml', CLOUDTAK_CUSTOM_COMPOSE)}
+                                         'docker-compose.override.yml', _etl.OVERLAY,
+                                         CLOUDTAK_CUSTOM_COMPOSE)}
     others = [i.strip() for i in (current or '').strip().strip('"\'').split(':')]
     if os.path.exists(os.path.join(d, _CLOUDTAK_TAKPORTAL_CSP_COMPOSE)):
         others.append(_CLOUDTAK_TAKPORTAL_CSP_COMPOSE)
@@ -52042,7 +52083,7 @@ def _cloudtak_ensure_custom_compose(cloudtak_dir, plog=None):
         env_path = os.path.join(cloudtak_dir, '.env')
         if not os.path.isfile(env_path):
             return False                 # not deployed (or remote): nothing runs compose here
-        changed = False
+        changed = _etlrunner_sync_overlay(cloudtak_dir, _log)   # before COMPOSE_FILE is computed
         custom = os.path.join(cloudtak_dir, CLOUDTAK_CUSTOM_COMPOSE)
         if not os.path.lexists(custom):
             with open(custom, 'x') as f:  # 'x': a file that appeared meanwhile is not ours
@@ -52082,6 +52123,808 @@ def _cloudtak_remote_custom_compose_sh():
         "grep -v '^COMPOSE_FILE=' .env > .env.ct261.tmp; echo \"COMPOSE_FILE=$f\" >> .env.ct261.tmp && "
         'cat .env.ct261.tmp > .env; rm -f .env.ct261.tmp; fi'
     )
+
+
+# v10.4.0 W11 — ETL Runner wiring (PLAN-v10.4.0 W11). infra-TAK owns ~/CloudTAK/
+# docker-compose.infratak-etl.yml (modules/etlrunner: the shim service, api/events AWS endpoint
+# env, the CA bundle mount, the cloudtak_etl network). It exists only while the runner is
+# enabled; _cloudtak_compose_file_value() lists it before the operator's custom file. The
+# privileged half (takwerx-etl user, ETL socket, TLS for the SQS host) is broker `etl_setup`.
+# Local CloudTAK only — a remote CloudTAK host is not supported in 10.4.0.
+_ETLRUNNER_KEY = 'etlrunner'
+_ETLRUNNER_SHIM_CONTAINER = 'cloudtak-etl-shim-1'
+
+
+def _etlrunner_cfg(settings=None):
+    s = settings if settings is not None else load_settings()
+    c = s.get('etl_runner')
+    return dict(c) if isinstance(c, dict) else {}
+
+
+# W3 phase 2: the signed catalog from takwerx/infratak-etl-catalog. modules/etlrunner checks the
+# signature; this side fetches (only while the runner is on), refuses rollback, and caches.
+_ETLCAT_CACHE = os.path.join(CONFIG_DIR, 'etl-catalog')
+_ETLCAT_REFRESH_LOCK = threading.Lock()
+
+
+def _etl_catalog():
+    return _etl.load_catalog(cache_dir=_ETLCAT_CACHE)
+
+
+def _etlcat_fetch(url, limit):
+    req = urllib.request.Request(url, headers={'User-Agent': 'infra-TAK-etl-catalog',
+                                               'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f'{url.rsplit("/", 1)[-1]} is larger than {limit} bytes')
+    return data
+
+
+def _etlcat_cache_write(name, data):
+    os.makedirs(_ETLCAT_CACHE, mode=0o700, exist_ok=True)
+    path = os.path.join(_ETLCAT_CACHE, name)
+    try:
+        if open(path, 'rb').read() == data:
+            return
+    except OSError:
+        pass
+    tmp = f'{path}.{os.getpid()}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _etlcat_refresh():
+    """Fetch the signed catalog at the current commit of its main branch. Returns the check
+    record that is also saved in settings (etl_runner.catalog_check)."""
+    if not _ETLCAT_REFRESH_LOCK.acquire(blocking=False):
+        return {'ok': False, 'error': 'a catalog check is already running'}
+    try:
+        rec = {'at': int(time.time()), 'ok': False}
+        try:
+            meta = json.loads(_etlcat_fetch(
+                f'https://api.github.com/repos/{_etl.CATALOG_REPO}/commits/{_etl.CATALOG_BRANCH}', 512 * 1024))
+            sha = str(meta.get('sha') or '') if isinstance(meta, dict) else ''
+            if not _etl.COMMIT_SHA_RE.fullmatch(sha):
+                raise ValueError('GitHub returned no commit for the catalog')
+            # both files at the same commit: a CDN never pairs a new catalog with an old signature
+            base = f'https://raw.githubusercontent.com/{_etl.CATALOG_REPO}/{sha}/{_etl.CATALOG_FILE}'
+            raw = _etlcat_fetch(base, _etl.CATALOG_MAX_BYTES)
+            sig = _etlcat_fetch(base + '.sig', 4096)
+            c = _etlrunner_cfg()
+            floor = max(_etl.catalog_serial(_etl.bundled_catalog()), int(c.get('catalog_serial') or 0))
+            d, why = _etl.accept_fetched(raw, sig, floor)
+            rec['commit'] = sha
+            if d is None:
+                rec['error'] = why
+                print(f"[etlrunner] catalog {sha[:12]} refused: {why}", flush=True)
+            else:
+                _etlcat_cache_write(_etl.CATALOG_FILE + '.sig', sig)
+                _etlcat_cache_write(_etl.CATALOG_FILE, raw)
+                rec.update(ok=True, serial=_etl.catalog_serial(d))
+        except Exception as e:
+            rec['error'] = str(e)[:200]
+        s = load_settings()
+        c = _etlrunner_cfg(s)
+        c['catalog_check'] = rec
+        if rec.get('ok'):
+            c['catalog_serial'] = max(int(c.get('catalog_serial') or 0), rec['serial'])
+        s['etl_runner'] = c
+        save_settings(s)
+        return rec
+    finally:
+        _ETLCAT_REFRESH_LOCK.release()
+
+
+def _etlcat_refresh_due(c, now=None):
+    rec = c.get('catalog_check') if isinstance(c.get('catalog_check'), dict) else {}
+    wait = _etl.CATALOG_CHECK_SEC if rec.get('ok') else 3600
+    return (now or time.time()) - int(rec.get('at') or 0) >= wait
+
+
+def _etlcat_catalog_info():
+    c = _etlrunner_cfg()
+    try:
+        d, src = _etl.active_catalog(_ETLCAT_CACHE)
+    except Exception:
+        d, src = {}, 'bundled'
+    rec = c.get('catalog_check') if isinstance(c.get('catalog_check'), dict) else {}
+    return {'source': src, 'serial': _etl.catalog_serial(d), 'repo': _etl.CATALOG_REPO,
+            'checked_at': rec.get('at'), 'ok': rec.get('ok'), 'error': rec.get('error'),
+            'commit': (rec.get('commit') or '')[:12] or None}
+
+
+def _etlrunner_ct_local(settings):
+    try:
+        return _get_cloudtak_deployment_config(settings).get('target_mode') != 'remote'
+    except Exception:
+        return False
+
+
+def _etlrunner_write(path, text, in_place=False, mode=0o644):
+    """Write `text` only if it differs. `in_place` truncates the existing file instead of
+    replacing it: a single-file bind mount pins the inode, so a rename would leave the
+    running container reading the old file. Returns True when written."""
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except FileNotFoundError:
+        pass
+    if in_place or not os.path.exists(path):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+    else:
+        tmp = path + '.infratak-tmp'
+        try:
+            os.unlink(tmp)          # a leftover tmp would keep its old (wider) mode
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)   # a 0600 file is never readable, even briefly
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    return True
+
+
+def _etlrunner_sync_overlay(cloudtak_dir, log):
+    """Converge the overlay + CA bundle with settings: written while enabled, removed when not.
+    Cheap and idempotent — runs inside _cloudtak_ensure_custom_compose before every CloudTAK
+    compose action. Returns True when anything changed. Never raises."""
+    try:
+        s = load_settings()
+        c = _etlrunner_cfg(s)
+        overlay = os.path.join(cloudtak_dir, _etl.OVERLAY)
+        ca_path = os.path.join(cloudtak_dir, _etl.CA_FILE)
+        on = (bool(c.get('enabled')) and _etlrunner_ct_local(s) and os.path.isfile(ca_path)
+              and all(c.get(k) not in (None, '') for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')))
+        if not on:
+            if os.path.lexists(overlay):
+                os.remove(overlay)
+                log(f"  ETL Runner off — removed {_etl.OVERLAY}")
+                return True
+            return False
+        with open(ca_path) as f:
+            ca = f.read()
+        crt = ''
+        try:
+            with open(os.path.join(CONFIG_DIR, 'ssl', 'console.crt')) as f:
+                crt = f.read()
+        except OSError:
+            pass
+        changed = _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_BUNDLE), _etl.ca_bundle(crt, ca), in_place=True)
+        secret = c.get('hook_secret')
+        if not _etl.HOOK_SECRET_RE.match(str(c.get('aws_secret') or '')):
+            # a box enabled before the shim checked signatures: create the key now. api, events
+            # and the shim all read it from this one overlay, so they change together.
+            s = load_settings()
+            c = _etlrunner_cfg(s)
+            c['aws_secret'] = _etl.new_hook_secret()
+            s['etl_runner'] = c
+            save_settings(s)
+        hooks_url = _etl.webhooks_base(_cloudtak_env_read(os.path.join(cloudtak_dir, '.env')).get('API_URL'), secret)
+        if _etlrunner_write(overlay, _etl.overlay_yml(cloudtak_dir, c['uid'], c['gid'], c['socket_dir'],
+                                                       c['data_dir'], c['tls_dir'], secret, hooks_url,
+                                                       c.get('aws_secret')), mode=0o600):
+            log(f"  ETL Runner: wrote {_etl.OVERLAY}")
+            changed = True
+        try:
+            os.chmod(overlay, 0o600)      # W7: it carries the webhook secret
+        except OSError:
+            pass
+        return changed
+    except Exception as e:
+        log(f"  ⚠ ETL Runner overlay: {e}")
+        return False
+
+
+def _etlrunner_setup(cloudtak_dir, log):
+    """Broker etl_setup (idempotent: user, data dir, socket, TLS — renews a leaf near expiry)
+    and record what it returned. Returns True on success."""
+    try:
+        r = _broker_request({'op': 'etl_setup'}, timeout=120)
+    except Exception as e:
+        log(f"  ✗ ETL Runner setup: broker unreachable: {e}")
+        return False
+    if not (isinstance(r, dict) and r.get('ok')):
+        log(f"  ✗ ETL Runner setup failed: {(r or {}).get('error') or r}")
+        return False
+    _etlrunner_write(os.path.join(cloudtak_dir, _etl.CA_FILE), r['ca_pem'])
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    c.update({k: r[k] for k in ('uid', 'gid', 'socket_dir', 'data_dir', 'tls_dir')})
+    if not _etl.HOOK_SECRET_RE.match(str(c.get('hook_secret') or '')):
+        c['hook_secret'] = _etl.new_hook_secret()     # W7: settings.json is 0600
+    if not _etl.HOOK_SECRET_RE.match(str(c.get('aws_secret') or '')):
+        c['aws_secret'] = _etl.new_hook_secret()      # shim AWS API SigV4 key (api/events/shim)
+    s['etl_runner'] = c
+    save_settings(s)
+    log(f"  ✓ ETL Runner setup: user {r.get('user')} ({r['uid']}:{r['gid']}), TLS {r.get('tls')}, "
+        f"listener {r.get('listener')}")
+    return True
+
+
+def _etlrunner_build_image(log):
+    """Build infratak-etl-shim:local from modules/etlrunner/shim unless the image on the box
+    already carries this source's hash. Never pulled (base pinned by digest in the Dockerfile)."""
+    want = _etl.shim_source_hash()
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHIM_HASH_LABEL, _etl.SHIM_IMAGE]),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode == 0 and r.stdout.strip() == want:
+        log(f"  ✓ {_etl.SHIM_IMAGE} is current")
+        return True
+    log(f"  Building {_etl.SHIM_IMAGE}…")
+    r = subprocess.run(_sudo_wrap(['docker', 'build', '--label', f'{_etl.SHIM_HASH_LABEL}={want}',
+                                   '-t', _etl.SHIM_IMAGE, _etl.SHIM_DIR]),
+                       capture_output=True, text=True, timeout=1800,
+                       env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '1800'})   # ops #160: else killed at 600 s
+    if r.returncode != 0:
+        log("  ✗ shim image build failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+        return False
+    log(f"  ✓ built {_etl.SHIM_IMAGE}")
+    return True
+
+
+def _etlrunner_egress(action, log, allow=None):
+    """W5: broker etl_egress apply/remove/status. apply goes in BEFORE compose up — the rules
+    match the bridge by name, so they hold from the first packet. Returns the broker reply,
+    or {'ok': False, 'error': ...}."""
+    req = {'op': 'etl_egress', 'action': action}
+    if action == 'apply':
+        req['allow'] = list(allow if allow is not None else (_etlrunner_cfg().get('egress_allow') or []))
+    try:
+        r = _broker_request(req, timeout=120)
+    except Exception as e:
+        r = {'ok': False, 'error': f'broker unreachable: {e}'}
+    if not isinstance(r, dict):
+        r = {'ok': False, 'error': str(r)}
+    if action != 'status':
+        if r.get('ok'):
+            log(f"  ✓ ETL egress block {'removed' if action == 'remove' else 'in place'}"
+                + (f" (allowed: {', '.join(r.get('allow') or []) or 'none'}; {r.get('state')})" if action == 'apply' else ''))
+        else:
+            log(f"  ✗ ETL egress block {action}: {r.get('error')}")
+    return r
+
+
+def _etlrunner_net_migrate(log):
+    """A cloudtak_etl network made before W5 has Docker's generated bridge name, so the egress
+    rules would not match it. Remove it (detaching what is on it) and let compose recreate it
+    with the fixed name. Returns 'ok' (nothing to do), 'migrated' (removed: the caller must
+    force-recreate what uses it — compose sees an unchanged config hash and would leave those
+    containers detached; seen on etlspike 2026-11-09) or False (wrong and could not be removed)."""
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                   '{{ index .Options "com.docker.network.bridge.name" }}|'
+                                   '{{ range .Containers }}{{ .Name }} {{ end }}', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return 'ok'                      # absent: compose creates it right
+    name, _, members = r.stdout.strip().partition('|')
+    if name == _etl.ETL_BRIDGE:
+        return 'ok'
+    log(f"  Recreating {_etl.ETL_NETWORK} with bridge {_etl.ETL_BRIDGE} (was {name or 'auto-named'})")
+    for c in members.split():
+        subprocess.run(_sudo_wrap(['docker', 'network', 'disconnect', '-f', _etl.ETL_NETWORK, c]),
+                       capture_output=True, text=True, timeout=60)
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'rm', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        log(f"  ✗ could not remove {_etl.ETL_NETWORK}: {(r.stderr or r.stdout).strip()[-200:]}")
+        return False
+    return 'migrated'
+
+
+def _etlrunner_net_missing():
+    """Compose services (api, the shim) that the overlay puts on the ETL network but are not
+    on it right now."""
+    want = {'api': 'cloudtak-api-1', _etl.SHIM_SERVICE: _ETLRUNNER_SHIM_CONTAINER}
+    r = subprocess.run(_sudo_wrap(['docker', 'network', 'inspect', '-f',
+                                   '{{ range .Containers }}{{ .Name }} {{ end }}', _etl.ETL_NETWORK]),
+                       capture_output=True, text=True, timeout=30)
+    have = set(r.stdout.split()) if r.returncode == 0 else set()
+    return [svc for svc, name in want.items() if name not in have]
+
+
+def _etlrunner_shim_status():
+    """The shim's own /_status (loopback inside its container), or None if it cannot be read."""
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', _ETLRUNNER_SHIM_CONTAINER, 'node', '-e',
+                                   'fetch("http://127.0.0.1:4000/_status").then((r) => r.text())'
+                                   '.then((t) => process.stdout.write(t)).catch(() => process.exit(3))']),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return None
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _etlrunner_hooks_wanted(settings=None):
+    """W7: the public webhook route exists only while the runner is on, the map host is a real
+    https name, and the shim reported at least one layer with webhooks on (hooks_route)."""
+    s = settings if settings is not None else load_settings()
+    c = _etlrunner_cfg(s)
+    return bool(c.get('enabled') and c.get('hooks_route') and _etl.HOOK_SECRET_RE.match(str(c.get('hook_secret') or '')))
+
+
+def _etlrunner_hooks_converge(log=None):
+    """Read the shim, record whether any layer has webhooks on, and regenerate + reload Caddy
+    when that flips. A shim that cannot be read changes nothing (no flapping on a restart).
+    Returns the current route state."""
+    log = log or (lambda m: print(f"[etlrunner] {m}", flush=True))
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    want = False
+    if c.get('enabled'):
+        st = _etlrunner_shim_status()
+        if st is None:
+            return bool(c.get('hooks_route'))
+        want = int(((st.get('hooks') or {}).get('layers')) or 0) > 0
+    if bool(c.get('hooks_route')) == want:
+        # Route already in the wanted state: still converge the live Caddyfile to the lines this
+        # code renders (an older box has the old lines, which put the secret in Caddy's logs).
+        try:
+            live = _read_priv(CADDYFILE_PATH)
+        except Exception:
+            return want
+        has = ('\n'.join(_etl.caddy_hook_lines()) in live
+               and '\n'.join(_etl.caddy_hook_fallback_site()) in live)
+        if has != want or (not want and _etl.HOOK_PATH + '/*' in live):
+            generate_caddyfile(s)
+            ok, detail = _caddy_reload_if_changed(plog=log)
+            log(f"ETL webhooks route lines refreshed on the CloudTAK site"
+                f" ({'reloaded' if ok else 'reload FAILED: ' + str(detail)[:200]})")
+        return want
+    c['hooks_route'] = want
+    s['etl_runner'] = c
+    save_settings(s)
+    generate_caddyfile(s)
+    ok, detail = _caddy_reload_if_changed(plog=log)
+    log(f"ETL webhooks route {'opened' if want else 'closed'} on the CloudTAK site"
+        f" ({'reloaded' if ok else 'reload FAILED: ' + str(detail)[:200]})")
+    return want
+
+
+def _etlrunner_startup_converge():
+    """After an update: when the runner is on and the shim source or the overlay changed, run
+    the (idempotent) enable job once — rebuild the shim, egress first, then api/events/shim up
+    together. Otherwise a box keeps running the old shim until someone clicks Turn ETL on, and
+    a new key in the overlay could reach the shim but not api/events. Returns True if started."""
+    if not _etlrunner_cfg().get('enabled'):
+        return False
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHIM_HASH_LABEL, _etl.SHIM_IMAGE]),
+                       capture_output=True, text=True, timeout=30)
+    stale = r.returncode != 0 or r.stdout.strip() != _etl.shim_source_hash()
+    changed = _etlrunner_sync_overlay(ct_dir, lambda m: print(f"[etlrunner] {m.strip()}", flush=True))
+    if not (stale or changed):
+        return False
+    print(f"[etlrunner] startup: {'shim source changed' if stale else 'overlay changed'} — re-running enable",
+          flush=True)
+    return bool(mod_registry.job_start(_ETLRUNNER_KEY, 'enable', _etlrunner_job, ('enable',)))
+
+
+def _etlrunner_hooks_loop():
+    time.sleep(90)
+    try:
+        _etlrunner_startup_converge()
+    except Exception as e:
+        print(f"[etlrunner] startup converge: {e}", flush=True)
+    while True:
+        try:
+            if _etlrunner_cfg().get('enabled') or _etlrunner_cfg().get('hooks_route'):
+                _etlrunner_hooks_converge()
+        except Exception as e:
+            print(f"[etlrunner] webhooks route check: {e}", flush=True)
+        try:
+            c = _etlrunner_cfg()
+            if c.get('enabled') and _etlcat_refresh_due(c):
+                _etlcat_refresh()
+        except Exception as e:
+            print(f"[etlrunner] catalog check: {e}", flush=True)
+        time.sleep(60)
+
+
+try:
+    threading.Thread(target=_etlrunner_hooks_loop, daemon=True, name='etl-hooks-route').start()
+except Exception:
+    pass
+
+
+def _etlrunner_job(action):
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    log = lambda m: mod_registry.job_log(_ETLRUNNER_KEY, m.strip())
+    ok = False
+    try:
+        ct_dir = os.path.expanduser('~/CloudTAK')
+        s = load_settings()
+        if action == 'enable':
+            if not os.path.isfile(os.path.join(ct_dir, '.env')):
+                log("✗ CloudTAK is not deployed on this box")
+            elif not _etlrunner_ct_local(s):
+                log("✗ ETL Runner needs CloudTAK on this box (a remote CloudTAK is not supported)")
+            elif _etlrunner_setup(ct_dir, log) and _etlrunner_build_image(log):
+                # W5 first: no ETL container may ever start without the egress block.
+                if not _etlrunner_egress('apply', log).get('ok'):
+                    raise RuntimeError('egress block could not be applied — not enabling')
+                if not _etlrunner_net_migrate(log):
+                    raise RuntimeError(f'{_etl.ETL_NETWORK} has the wrong bridge — not enabling')
+                s = load_settings()
+                c = _etlrunner_cfg(s)
+                c['enabled'] = True
+                s['etl_runner'] = c
+                save_settings(s)
+                _cloudtak_ensure_custom_compose(ct_dir, log)
+                r = _broker_compose(ct_dir, f'up -d api events {_etl.SHIM_SERVICE}', timeout=900)
+                if r.returncode == 0:
+                    # compose does not re-attach a running container whose config hash did not
+                    # change, so after a network migration (or any detach) api/shim would stay
+                    # off the ETL network and every ETL would lose api:5000.
+                    missing = _etlrunner_net_missing()
+                    if missing:
+                        log(f"  Re-attaching {', '.join(missing)} to {_etl.ETL_NETWORK}")
+                        r = _broker_compose(ct_dir, 'up -d --force-recreate ' + ' '.join(missing), timeout=900)
+                        if r.returncode == 0 and _etlrunner_net_missing():
+                            log(f"  ✗ still not on {_etl.ETL_NETWORK}: {', '.join(_etlrunner_net_missing())}")
+                if r.returncode != 0:
+                    log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+                else:
+                    log("✓ ETL Runner enabled — etl-shim running, CloudTAK api/events pointed at it")
+                    ok = True
+        elif action == 'rotate-hooks':
+            c = _etlrunner_cfg(s)
+            if not c.get('enabled'):
+                log("✗ ETL is off — nothing to rotate")
+            else:
+                c['hook_secret'] = _etl.new_hook_secret()
+                s['etl_runner'] = c
+                save_settings(s)
+                _cloudtak_ensure_custom_compose(ct_dir, log)
+                # both carry the secret in their env (api: WEBHOOKS_URL, shim: SHIM_HOOK_SECRET)
+                r = _broker_compose(ct_dir, f'up -d api events {_etl.SHIM_SERVICE}', timeout=900)
+                if r.returncode != 0:
+                    log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+                else:
+                    log("✓ New webhook secret in place. Every old webhook URL now fails: copy the new"
+                        " URL from each layer in CloudTAK into the service that sends to it.")
+                    ok = True
+        else:  # disable: keep images, stacks state and TLS; a re-enable picks up where it was
+            if os.path.exists(os.path.join(ct_dir, _etl.OVERLAY)):
+                # while the overlay is still loaded, so compose knows the service
+                _broker_compose(ct_dir, f'rm -sf {_etl.SHIM_SERVICE}', timeout=300)
+            ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'label=etl-shim=1']),
+                                 capture_output=True, text=True, timeout=30).stdout.split()
+            if ids:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + ids), capture_output=True, text=True, timeout=120)
+                log(f"  removed {len(ids)} ETL run container(s)")
+            c = _etlrunner_cfg(s)
+            c['enabled'] = False
+            s['etl_runner'] = c
+            save_settings(s)
+            _cloudtak_ensure_custom_compose(ct_dir, log)
+            r = _broker_compose(ct_dir, 'up -d api events', timeout=900)
+            if r.returncode != 0:
+                log("✗ compose up failed:\n" + '\n'.join((r.stderr or r.stdout or '').splitlines()[-8:]))
+            else:
+                # No ETL container is left, so the block has nothing to guard (rules kept on a
+                # failed compose: an ETL could still be around).
+                _etlrunner_egress('remove', log)
+                _etlrunner_hooks_converge(log)      # enabled is False now: closes the webhook route
+                log("✓ ETL Runner disabled — images and layer state kept")
+                ok = True
+    except Exception as e:
+        log(f"✗ ETL Runner {action}: {e}")
+    job.update({'running': False, 'complete': True, 'error': not ok})
+
+
+@app.route('/api/cloudtak/etl/status')
+@login_required
+def cloudtak_etl_status():
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Status}}', _ETLRUNNER_SHIM_CONTAINER]),
+                        capture_output=True, text=True, timeout=10)
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    eg = _etlrunner_egress('status', lambda m: None) if c.get('enabled') else {}
+    return jsonify({'enabled': bool(c.get('enabled')), 'local_cloudtak': _etlrunner_ct_local(s),
+                    'overlay': os.path.exists(os.path.join(os.path.expanduser('~/CloudTAK'), _etl.OVERLAY)),
+                    'shim': st.stdout.strip() if st.returncode == 0 else 'absent',
+                    'net_missing': _etlrunner_net_missing() if c.get('enabled') else [],
+                    'webhooks': {'route': _etlrunner_hooks_wanted(s)},
+                    'egress': {'enforced': bool(eg.get('enforced')), 'v4': bool(eg.get('v4')),
+                               'v6': eg.get('v6'), 'allow': list(c.get('egress_allow') or [])},
+                    'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
+
+
+@app.route('/api/cloudtak/etl/egress', methods=['POST'])
+@login_required
+def cloudtak_etl_egress():
+    """W5 admin allow-list: private CIDRs ETL containers may reach (a LAN ArcGIS, say). The
+    broker validates (private only; never loopback / link-local / the host itself) and is the
+    authority — settings only remember the list for the UI and the next enable."""
+    data = request.get_json(silent=True) or {}
+    allow = data.get('allow')
+    if isinstance(allow, str):
+        allow = [a.strip() for a in re.split(r'[\s,]+', allow) if a.strip()]
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        return jsonify({'ok': False, 'error': 'allow must be a list of CIDRs'}), 400
+    try:
+        allow = _etl.egress_allow_norm(allow)      # the broker checks again and is the authority
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    if c.get('enabled'):
+        r = _etlrunner_egress('apply', lambda m: None, allow=allow)
+        if not r.get('ok'):
+            return jsonify({'ok': False, 'error': r.get('error') or 'refused'}), 400
+        allow = r.get('allow') or []
+    else:
+        # Validate the same way even while off, so a bad list fails now, not at enable.
+        try:
+            allow = _etl.egress_allow_norm(allow)
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+    s = load_settings()
+    c = _etlrunner_cfg(s)
+    c['egress_allow'] = allow
+    s['etl_runner'] = c
+    save_settings(s)
+    return jsonify({'ok': True, 'allow': allow})
+
+
+@app.route('/api/cloudtak/etl/<action>', methods=['POST'])
+@login_required
+def cloudtak_etl_action(action):
+    if action not in ('enable', 'disable', 'rotate-hooks'):
+        return jsonify({'error': 'unknown action'}), 404
+    if not mod_registry.job_start(_ETLRUNNER_KEY, action, _etlrunner_job, (action,)):
+        return jsonify({'error': 'an ETL Runner job is already running'}), 409
+    return jsonify({'started': action})
+
+
+@app.route('/api/cloudtak/etl/log')
+@login_required
+def cloudtak_etl_log():
+    job = mod_registry.job_state(_ETLRUNNER_KEY)
+    return jsonify({'log': list(job.get('log') or []), 'running': bool(job.get('running')),
+                    'error': bool(job.get('error'))})
+
+
+# ── W3: ETL catalog install / update / remove ────────────────────────────────────────────────
+# infra-TAK turns ETL on and installs ETLs; CloudTAK is where people use them. An install builds
+# etl-local:<prefix>-v<ver> on the box from the catalog's pinned commit (never a branch tip),
+# labels it with the ETL's own capabilities.json (CloudTAK reads static capabilities from it) and
+# registers the CloudTAK Integration, so the ETL appears as a card in CloudTAK's Task Selection.
+_ETLCAT_KEY = 'etlcatalog'
+_ETLCAT_LOGO_MAX = 512 * 1024
+
+
+def _etlcat_src_root():
+    return os.path.join(os.path.expanduser('~'), '.cache', 'infratak-etl-src')
+
+
+def _etlcat_installed():
+    r = subprocess.run(_sudo_wrap(['docker', 'images', _etl.ETL_REPO, '--format', '{{.Tag}}']),
+                       capture_output=True, text=True, timeout=30)
+    return _etl.installed_versions(r.stdout.splitlines()) if r.returncode == 0 else {}
+
+
+def _etlcat_ct(method, path, payload=None):
+    secret = _cloudtak_signing_secret()
+    if not secret:
+        return False, 0, {'message': "CloudTAK's SigningSecret is not readable"}
+    return _cloudtak_request_json(method, 'http://127.0.0.1:5000/api' + path, payload, timeout=30,
+                                  headers={'Authorization': 'Bearer ' + _cloudtak_admin_token(secret)})
+
+
+def _etlcat_integrations():
+    # CloudTAK caps `limit` at 100 (a larger value is a 400), so page through
+    out, page = {}, 0
+    while page < 50:
+        ok, code, d = _etlcat_ct('GET', f'/integration?limit=100&page={page}')
+        if not ok or not isinstance(d, dict):
+            return None
+        items = [i for i in d.get('items') or [] if isinstance(i, dict)]
+        out.update({i.get('prefix'): i for i in items})
+        if len(items) < 100 or len(out) >= int(d.get('total') or 0):
+            return out
+        page += 1
+    return out
+
+
+def _etlcat_git(args, cwd=None, timeout=300):
+    # https only, and no LFS smudge: a repo's .lfsconfig must not make this host fetch a URL
+    # the repo chooses (objects would be OID-pinned, but the request itself is the leak).
+    return subprocess.run(['git', '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
+                           '-c', 'filter.lfs.process=', '-c', 'filter.lfs.smudge=', '-c', 'filter.lfs.required=false']
+                          + args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                          env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_LFS_SKIP_SMUDGE': '1'})
+
+
+def _etlcat_gh_url(u):
+    """A catalog URL CloudTAK may render: github.com / raw.githubusercontent.com over https
+    with a plain path, else ''."""
+    u = str(u or '')
+    return u if re.fullmatch(r'https://(github\.com|raw\.githubusercontent\.com)/[A-Za-z0-9._/-]{1,300}', u) else ''
+
+
+def _etlcat_build(e, log):
+    """Build the pinned commit. Returns (ok, logo_data_url). Skips the build when the image is
+    already there with this exact SHA label."""
+    tag = _etl.image_tag(e['prefix'], e['version'])
+    r = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', '-f',
+                                   '{{ index .Config.Labels "%s" }}' % _etl.SHA_LABEL, tag]),
+                       capture_output=True, text=True, timeout=30)
+    src = os.path.join(_etlcat_src_root(), e['prefix'])
+    built = r.returncode == 0 and r.stdout.strip() == e['sha']
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src, mode=0o700)
+    try:
+        url = f"https://github.com/{e['source']}.git"
+        log(f"  Fetching {e['source']} @ {e['sha'][:12]} ({e['ref']})…")
+        for args in (['init', '-q'], ['fetch', '-q', '--depth', '1', url, e['sha']],
+                     ['checkout', '-q', '--detach', 'FETCH_HEAD']):
+            g = _etlcat_git(args, cwd=src)
+            if g.returncode != 0:
+                log(f"  ✗ git {args[0]} failed: {(g.stderr or g.stdout).strip()[-300:]}")
+                return False, ''
+        head = _etlcat_git(['rev-parse', 'HEAD'], cwd=src).stdout.strip()
+        if head != e['sha']:
+            log(f"  ✗ fetched commit {head[:12]} is not the pinned {e['sha'][:12]} — refusing to build")
+            return False, ''
+        logo = ''
+        lp = os.path.join(src, 'logo.png')
+        if os.path.isfile(lp) and not os.path.islink(lp) and os.path.getsize(lp) <= _ETLCAT_LOGO_MAX:
+            with open(lp, 'rb') as f:
+                logo = 'data:image/png;base64,' + _b64.b64encode(f.read()).decode()
+        if built:
+            log(f"  ✓ {tag} already built from this commit")
+            return True, logo
+        cp = os.path.join(src, 'capabilities.json')
+        caps = ''
+        if os.path.isfile(cp) and not os.path.islink(cp):
+            with open(cp) as f:
+                caps = json.dumps(json.load(f), separators=(',', ':'))
+        log(f"  Building {tag} (first build of an ETL takes a few minutes)…")
+        # On the ETL network: the third-party RUN steps get the W5 egress block (no cloud
+        # metadata, LAN or host); the broker runs it with the classic builder and refuses it
+        # when the block is not enforced. Proven: BuildKit's default bridge reached metadata.
+        args = ['docker', 'build', '--network', _etl.ETL_NETWORK, '--force-rm',
+                '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
+        if caps:
+            args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
+        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600,
+                           env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '3600'})   # ops #160: else killed at 600 s
+        # BuildKit keeps ~1 GB of cache per build; nothing reuses it (PLAN W3)
+        subprocess.run(_sudo_wrap(['docker', 'builder', 'prune', '-f']), capture_output=True, text=True, timeout=600)
+        if b.returncode != 0:
+            log("  ✗ build failed:\n" + '\n'.join((b.stderr or b.stdout or '').splitlines()[-10:]))
+            return False, ''
+        log(f"  ✓ built {tag}")
+        return True, logo
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+
+
+def _etlcat_job(action, prefix):
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    log = lambda m: mod_registry.job_log(_ETLCAT_KEY, m.rstrip())
+    ok = False
+    try:
+        e = next((x for x in _etl_catalog() if x['prefix'] == prefix), None)
+        s = load_settings()
+        if action in ('install', 'update'):
+            can, why = _etl.installable(e or {}, bool(_etlrunner_cfg(s).get('allow_unreviewed')))
+            if not e:
+                log(f"✗ {prefix} is not in the catalog")
+            elif not _etlrunner_cfg(s).get('enabled'):
+                log("✗ Turn on ETL first")
+            elif not can:
+                log(f"✗ {e['name']}: {why}")
+            else:
+                log(f"{'Installing' if action == 'install' else 'Updating'} {e['name']} {e['version']}")
+                built, logo = _etlcat_build(e, log)
+                if built:
+                    have = _etlcat_integrations()
+                    if have is None:
+                        log("✗ CloudTAK API is not answering — the image is built; retry to register it")
+                    elif prefix in have:
+                        log("  ✓ already registered in CloudTAK — the new version shows in each layer's version list")
+                        ok = True
+                    else:
+                        okr, code, d = _etlcat_ct('POST', '/integration', {
+                            'name': e['name'][:120], 'prefix': prefix, 'favorite': False, 'logo': logo,
+                            'repo': _etlcat_gh_url(e.get('repo_url')), 'readme': _etlcat_gh_url(e.get('readme'))})
+                        if okr:
+                            log(f"  ✓ registered in CloudTAK — '{e['name']}' is now a card when you create a layer")
+                            ok = True
+                        else:
+                            log(f"✗ CloudTAK refused the registration (HTTP {code}): {str(d.get('message', d))[:200]}")
+        elif action == 'remove':
+            have = _etlcat_integrations()
+            if have is None:
+                log("✗ CloudTAK API is not answering")
+            else:
+                if prefix in have:
+                    okd, code, d = _etlcat_ct('DELETE', f"/integration/{int(have[prefix]['id'])}")
+                    if not okd:
+                        # CloudTAK refuses while any layer still uses it — say so, remove nothing
+                        log(f"✗ CloudTAK kept it (HTTP {code}): {str(d.get('message', d))[:200]}. "
+                            "Delete the layers that use it first.")
+                        raise StopIteration
+                    log("  ✓ unregistered from CloudTAK")
+                # `docker image rm`, not `docker rmi`: the non-root broker allows only the
+                # long form (its rulebook has no `rmi`), and a refused rmi used to be logged ✓.
+                ok = True
+                for v in _etlcat_installed().get(prefix, []):
+                    rr = subprocess.run(_sudo_wrap(['docker', 'image', 'rm', _etl.image_tag(prefix, v)]),
+                                        capture_output=True, text=True, timeout=120)
+                    if rr.returncode == 0:
+                        log(f"  ✓ removed image {prefix} {v}")
+                    else:
+                        ok = False
+                        log(f"✗ could not remove image {prefix} {v}: "
+                            f"{((rr.stderr or rr.stdout) or '').strip()[:200]}")
+    except StopIteration:
+        pass
+    except Exception as ex:
+        log(f"✗ {action} {prefix}: {ex}")
+    job.update({'running': False, 'complete': True, 'error': not ok})
+
+
+@app.route('/api/cloudtak/etl/catalog')
+@login_required
+def cloudtak_etl_catalog():
+    s = load_settings()
+    allow = bool(_etlrunner_cfg(s).get('allow_unreviewed'))
+    inst = _etlcat_installed()
+    reg = _etlcat_integrations() or {}
+    out = []
+    for e in _etl_catalog():
+        can, why = _etl.installable(e, allow)
+        have = inst.get(e['prefix'], [])
+        out.append({k: e.get(k) for k in ('prefix', 'name', 'description', 'version', 'author',
+                                           'community', 'repo_url', 'note', 'flags', 'reviewed', 'ref')}
+                   | {'installed': have, 'registered': e['prefix'] in reg,
+                      'update': bool(have) and e['version'] not in have,
+                      'installable': can, 'reason': why})
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    return jsonify({'entries': out, 'enabled': bool(_etlrunner_cfg(s).get('enabled')),
+                    'catalog': _etlcat_catalog_info(),
+                    'job': {k: job.get(k) for k in ('running', 'complete', 'error', 'action')}})
+
+
+@app.route('/api/cloudtak/etl/catalog/<action>', methods=['POST'])
+@login_required
+def cloudtak_etl_catalog_action(action):
+    if action == 'refresh':
+        if not _etlrunner_cfg().get('enabled'):
+            return jsonify({'error': 'turn the ETL Runner on first'}), 409
+        rec = _etlcat_refresh()
+        return jsonify({'check': rec, 'catalog': _etlcat_catalog_info()}), (200 if rec.get('ok') else 502)
+    if action not in ('install', 'update', 'remove'):
+        return jsonify({'error': 'unknown action'}), 404
+    prefix = str((request.get_json(silent=True) or {}).get('prefix') or '')
+    if not _etl.PREFIX_RE.fullmatch(prefix) or prefix not in {e['prefix'] for e in _etl_catalog()}:
+        return jsonify({'error': 'not a catalog ETL'}), 400
+    if not mod_registry.job_start(_ETLCAT_KEY, action, _etlcat_job, (action, prefix)):
+        return jsonify({'error': 'an ETL install is already running'}), 409
+    return jsonify({'started': action, 'prefix': prefix})
+
+
+@app.route('/api/cloudtak/etl/catalog/log')
+@login_required
+def cloudtak_etl_catalog_log():
+    job = mod_registry.job_state(_ETLCAT_KEY)
+    return jsonify({'log': list(job.get('log') or []), 'running': bool(job.get('running')),
+                    'error': bool(job.get('error'))})
 
 
 # ops #222: TAK Portal's CloudTAK marketplace runs the Print plugin's service (cloudtak-print)
@@ -108697,6 +109540,13 @@ def _startup_harden_cloudtak_ports():
         _override_changed = _cloudtak_write_override_file(_ct_dir)
         if _override_changed:
             print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+        # v10.4.0 W11: ETL Runner — broker setup is idempotent (renews the SQS-host TLS leaf
+        # near expiry), then a changed overlay or CA bundle needs api/events recreated.
+        _etl_changed = False
+        if _etlrunner_cfg().get('enabled'):
+            _etl_log = lambda m: print(f"Startup migration: {m.strip()}", flush=True)
+            _etlrunner_setup(_ct_dir, _etl_log)
+            _etl_changed = _etlrunner_sync_overlay(_ct_dir, _etl_log)
         # GH #261: before the recreate below, so it keeps the operator's own services.
         if _cloudtak_ensure_custom_compose(_ct_dir, plog=lambda m: print(f"Startup migration: {m.strip()}", flush=True)):
             print("Startup migration: CloudTAK compose now loads docker-compose.custom.yml")
@@ -108704,7 +109554,7 @@ def _startup_harden_cloudtak_ports():
         _changed = _patch_cloudtak_compose_ports(_ct_dir) or _minio_repointed
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
-        _needs_recreate = _changed or _override_changed or _pending is not None
+        _needs_recreate = _changed or _override_changed or _etl_changed or _pending is not None
         if os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt')):
             # Post-update hardening left it STOPPED for Remove + Reinstall — never bring it back.
             if _needs_recreate:
@@ -108716,7 +109566,7 @@ def _startup_harden_cloudtak_ports():
                   "tries — giving up; check `docker compose ps` in ~/CloudTAK")
             _ct_recreate_clear()
             _pending = None
-            _needs_recreate = _changed or _override_changed
+            _needs_recreate = _changed or _override_changed or _etl_changed
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(

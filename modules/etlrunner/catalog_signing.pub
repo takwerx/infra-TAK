@@ -1,0 +1,5 @@
+# infra-TAK ETL catalog signing key (Ed25519). The private half is offline on the operator's
+# machine. A box uses a fetched catalog only when its signature verifies with a key here.
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAxHqtsg+8ZZRRBC+ZnjmCWY1OVZA3VQS4ryVzgpLpQhE=
+-----END PUBLIC KEY-----
