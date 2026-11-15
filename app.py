@@ -4679,6 +4679,22 @@ def _require_admin_password(data=None):
     return None
 
 
+# ops #772: "is fail2ban installed" must look at the REAL package, not at `which` and not
+# at /etc/fail2ban alone. The non-root console has /opt/infratak/.shims first on PATH and a
+# fail2ban-client shim lives there whether or not the package exists, so `which` always
+# succeeds. And a package remove (not a purge) keeps /etc/fail2ban (jail.conf, fail2ban.conf),
+# so the directory outlives the package. After the Remove button the card still said
+# "installed" and Install said "already installed". The package puts the client in one of
+# these places; the shim folder is not among them.
+_F2B_REAL_CLIENT_PATHS = ('/usr/bin/fail2ban-client', '/usr/sbin/fail2ban-client',
+                          '/usr/local/bin/fail2ban-client', '/usr/local/sbin/fail2ban-client')
+
+
+def _f2b_installed():
+    """True only when the fail2ban package is on the box (config dir AND the real client)."""
+    return os.path.isdir('/etc/fail2ban') and any(os.path.isfile(p) for p in _F2B_REAL_CLIENT_PATHS)
+
+
 def _probe_run(*a, **kw):
     """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
     /api/modules, /api/modules/version and the guarddog health endpoint; a slow or
@@ -4907,8 +4923,7 @@ def _detect_modules_uncached():
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
     # Fail2ban
-    f2b_installed = (os.path.exists('/etc/fail2ban') and
-                     _run(['which', 'fail2ban-client'], capture_output=True).returncode == 0)
+    f2b_installed = _f2b_installed()   # ops #772: real package, not the shim
     f2b_running = False
     f2b_version = None
     if f2b_installed:
@@ -5744,7 +5759,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
     parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined" style="font-size:26px">shield_toggle</span>Cyber Controls'))
-    if os.path.exists('/etc/fail2ban'):
+    if _f2b_installed():
         parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
@@ -6296,9 +6311,17 @@ def _classify_os_updates(pending):
             continue
         service, impact, cls = hit
         item = dict(p, service=service, impact=impact, impact_class=cls)
-        if cls == 'restart' and _is_major_jump(p.get('old'), p.get('new')):
+        # postgresql-common's version is a build number (293 -> 295), not a PostgreSQL major: field
+        # test12, Nov 14 — it read "MAJOR VERSION CHANGE" beside the PostgreSQL security update.
+        if cls == 'restart' and p['name'] != 'postgresql-common' and _is_major_jump(p.get('old'), p.get('new')):
             item['major'] = True
             item['impact'] = 'MAJOR VERSION CHANGE — ' + impact
+        # ops #754: say it on the panel row too, in the same words as the Guard Dog email.
+        if _PG_SERVER_PKG_RE.match(p['name']):
+            fixes = _pg_releases_fixed_between(p.get('old'), p.get('new'))
+            if fixes:
+                item['security'] = [r['id'] for r in fixes]
+                item['impact'] = 'SECURITY UPDATE (' + ', '.join(item['security']) + ') — ' + item['impact']
         managed.append(item)
     return managed, routine
 
@@ -8071,7 +8094,7 @@ def _hardening_assertions():
             'pass' if dd else ('na' if dd is None else 'fail'),
             'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
 
-    if os.path.exists('/etc/fail2ban'):
+    if _f2b_installed():
         active = _service_is_active('fail2ban')
         add('fail2ban_active', 'fail2ban intrusion prevention',
             'pass' if active else ('na' if active is None else 'fail'),
@@ -12257,7 +12280,7 @@ def takserver_page():
     except Exception:
         _tak58 = None
     return render_template('takserver.html',
-        tak58=_tak58,
+        tak58=_tak58, tak_db_refresh=_tak_dbr_page(tak.get('installed')),
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
@@ -21438,7 +21461,7 @@ def fail2ban_page():
     from flask import make_response
     r = make_response(render_template('fail2ban.html',
         settings=settings, version=VERSION,
-        installed=os.path.exists('/etc/fail2ban'),
+        installed=_f2b_installed(),
         setup=settings.get('fail2ban_setup', {})))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
@@ -21593,8 +21616,10 @@ def _f2b_is_available():
     POISONED by the broker shim — a fail2ban-client shim sits on the console PATH even when
     fail2ban isn't installed, so `which` returned 0 and the installer falsely refused with
     'fail2ban is already installed'. Check /etc/fail2ban (created by the package, never by
-    the shim) — matches the detect_modules card's `installed` logic."""
-    return os.path.exists('/etc/fail2ban')
+    the shim) — matches the detect_modules card's `installed` logic.
+    ops #772: /etc/fail2ban alone is not enough either: a package remove keeps it. Use
+    _f2b_installed(), which also needs the real client binary."""
+    return _f2b_installed()
 
 def _f2b_parse_status(raw):
     """Parse fail2ban-client status authentik output into a dict."""
@@ -28860,6 +28885,779 @@ def _node_card_flag(gap):
             f"Press Update.")
 
 
+# ── ops #754: PostgreSQL security releases ─────────────────────────────────────────
+# PostgreSQL ships a security minor for every supported major at once. This table is the ONE
+# place that says which minor is fixed; the Guard Dog email, the Updates panel note and the
+# Docker database converge below all read it. When PostgreSQL ships its next security
+# release, add an entry (newest last) with the fixed minor of each major still supported:
+# a major that is not listed claims nothing. Majors are never moved (15 stays 15): only the
+# minor. https://www.postgresql.org/support/security/
+POSTGRES_SECURITY_RELEASES = (
+    {'id': 'PostgreSQL 2026-11-12', 'released': '2026-11-12',
+     'fixed': {14: '14.25', 15: '15.20', 16: '16.16', 17: '17.12', 18: '18.7'},
+     'reason': 'about 60 flaws in PostgreSQL. Most let someone who can log in to the database '
+               'run code on the machine as the database owner. One lets anyone who can reach '
+               'the database port restart a PostgreSQL 18 server'},
+)
+
+# The server packages of the host install (PGDG on apt: postgresql-18; on dnf: postgresql18-server).
+_PG_SERVER_PKG_RE = re.compile(r'^(?:postgresql-(\d+)|postgresql(\d+)-server)$')
+
+
+def _pg_version_tuple(v):
+    """'18.6-1.pgdg22.04+1' / '0:18.6-1PGDG.rhel9' / 'postgres (PostgreSQL) 16.15' / '16.15'
+    -> (18, 6) etc. None when there is no major.minor (a version that does not parse claims
+    nothing)."""
+    m = re.search(r'(?<![\d.])(?:\d+:)?(\d{2})\.(\d+)(?!\d)', v or '')
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _pg_fixed_tuple(rel, major):
+    return _pg_version_tuple((rel.get('fixed') or {}).get(major))
+
+
+def _pg_releases_missing(version):
+    """POSTGRES_SECURITY_RELEASES entries a PostgreSQL `version` is below. A version that does
+    not parse, or a major no entry lists, is not claimed."""
+    ver = _pg_version_tuple(version)
+    if ver is None:
+        return []
+    return [r for r in POSTGRES_SECURITY_RELEASES
+            if _pg_fixed_tuple(r, ver[0]) and ver < _pg_fixed_tuple(r, ver[0])]
+
+
+def _pg_releases_fixed_between(old, new):
+    """Entries that moving from `old` to `new` (same major) fixes: old < fixed <= new."""
+    o, n = _pg_version_tuple(old), _pg_version_tuple(new)
+    if o is None or n is None or o[0] != n[0]:
+        return []
+    return [r for r in POSTGRES_SECURITY_RELEASES
+            if _pg_fixed_tuple(r, o[0]) and o < _pg_fixed_tuple(r, o[0]) <= n]
+
+
+def _postgres_host_security_items(pending):
+    """Update-email items (ops #754) for the PostgreSQL server packages of the host install
+    (TAK Server's own database). `pending` is _pending_os_updates() rows. A security claim needs
+    positive evidence from the package manager: the package is installed below the fix AND the
+    package manager offers a version at or above it. PGDG publishes no -security pocket and no
+    advisory feed, so neither the OS security list nor the Docker/Caddy advisory check ever saw
+    it, and unattended-upgrades does not take PGDG: without this item nobody was told. Pure."""
+    hits = []
+    for p in pending:
+        if _PG_SERVER_PKG_RE.match(p.get('name') or ''):
+            rels = _pg_releases_fixed_between(p.get('old'), p.get('new'))
+            if rels:
+                hits.append((p, rels))
+    if not hits:
+        return []
+    rels = {r['id']: r for _, rr in hits for r in rr}
+    inst = ', '.join(sorted(f"{p['name']} {_upstream_version(p['old'])}" for p, _ in hits))
+    tgt = ', '.join(sorted(f"{p['name']} {_upstream_version(p['new'])}" for p, _ in hits))
+    lines = ['Fixes ' + '; '.join(f"{r['id']}: {r['reason']}" for _, r in sorted(rels.items())) + '.',
+             _pkg_restart_impact(hits[0][0]['name'])]
+    return [{'key': 'pg-host', 'label': 'PostgreSQL (TAK database)',
+             'installed': inst, 'target': tgt,
+             'summary': 'PostgreSQL (the TAK database): security update pending',
+             'identity': 'pg-' + '+'.join(sorted(rels)) + '=' + tgt,
+             'security': [x for x in lines if x], 'how': _OS_INSTALL_HOW}]
+
+
+def _postgres_security_items(unknown):
+    """_postgres_host_security_items for this box. A package manager that cannot answer goes into
+    `unknown`: the caller carries its dedup state, never re-mails or drops on a guess."""
+    try:
+        return _postgres_host_security_items(_pending_os_updates())
+    except Exception as e:
+        unknown.add('pg-host')
+        print(f"[update-notify] PostgreSQL security check failed: {e}", flush=True)
+        return []
+
+
+# ops #760: TAK Server's database on ANOTHER machine. The host check above only sees PostgreSQL
+# packages on this box, so a split install (database on Server One) and a managed database
+# (Amazon RDS, Azure Database for PostgreSQL) were never told. The version is read from the
+# database with one fixed read-only query, using the login TAK Server itself uses (CoreConfig).
+# Nothing is ever written to or changed on that database.
+_PG_RDS_HOST_RE = re.compile(r'\.rds\.amazonaws\.com(?:\.cn)?\.?$', re.I)
+_PG_AZURE_HOST_RE = re.compile(r'\.postgres\.database\.(?:azure\.com|usgovcloudapi\.net|chinacloudapi\.cn)\.?$', re.I)
+
+
+def _pg_remote_kind(host):
+    """'rds' | 'azure' | 'split': who runs the remote database, from its host name."""
+    h = (host or '').strip()
+    if _PG_RDS_HOST_RE.search(h):
+        return 'rds'
+    if _PG_AZURE_HOST_RE.search(h):
+        return 'azure'
+    return 'split'
+
+
+def _pg_remote_where(kind, host, manage=False):
+    """One plain sentence: where the database runs and what the operator must do there. `manage`:
+    this console holds the SSH link to that machine (a split install's database server), so it
+    has a button for it (ops #766)."""
+    if kind == 'rds':
+        return ("Your TAK database runs on Amazon RDS. Apply the PostgreSQL minor update in the AWS "
+                "console, or turn on auto minor version upgrade. Amazon can take a few days to offer a "
+                "new PostgreSQL release.")
+    if kind == 'azure':
+        return ("Your TAK database runs on Azure Database for PostgreSQL. Apply the PostgreSQL minor "
+                "version update in the Azure portal. Microsoft can take a few days to offer a new "
+                "PostgreSQL release.")
+    if manage:
+        return (f"Your TAK database runs on {host}. Press Update PostgreSQL on the database server card "
+                "on the console page. The console installs the update there over its SSH connection "
+                "and restarts PostgreSQL.")
+    return f"Your TAK database runs on {host}. Update PostgreSQL on that machine."
+
+
+def _pg_dbserver_manageable(host):
+    """ops #766: True when `host` (CoreConfig's database host) is the split install's database
+    server this console already holds an SSH link to, so it can update PostgreSQL there itself.
+    A managed database (RDS, Azure) and any other host are False. Config only, no SSH."""
+    try:
+        s1, _why = _dbserver_target()
+        return bool(s1) and _dbserver_same_host(host, s1.get('host'))
+    except Exception:
+        return False
+
+
+def _pg_remote_read_error(rc, err):
+    """A short plain reason for a failed version read. Never the raw error text: it can carry the
+    host and user names."""
+    e = (err or '').lower()
+    if rc == 124 or 'timeout' in e or 'timed out' in e:
+        return 'the database did not answer in time'
+    if 'password' in e or 'authentication' in e or 'pg_hba' in e or 'no password' in e:
+        return 'the saved login was refused or is missing'
+    if rc == 127 or 'no postgresql client' in e:
+        return 'this machine has no PostgreSQL client'
+    if 'could not' in e or 'connection' in e or 'refused' in e or 'no route' in e or 'resolve' in e:
+        return 'could not connect to the database'
+    return 'the database gave no readable version'
+
+
+def _pg_remote_server_version(allow_install=False, timeout=15):
+    """(version text, reason): the PostgreSQL version of TAK's remote database, read with
+    `SHOW server_version` and the login TAK Server itself uses. Read-only, fixed SQL, the password
+    only in the environment. ('', reason) when it cannot be read: the caller must never treat that as
+    "fixed". `allow_install` lets it install a psql client (the console sweep, never a page load)."""
+    host, port, db, user, pw = _cot_conn_params()
+    if not host or not pw:
+        return '', 'the saved login was refused or is missing'
+    psql = _psql_client_bin() or (_ensure_psql_client() if allow_install else '')
+    if not psql:
+        return '', 'this machine has no PostgreSQL client'
+    env = dict(os.environ, PGPASSWORD=pw, PGCONNECT_TIMEOUT='8')
+    argv = [psql, '-X', '-w', '-tA', '-h', host, '-p', str(port), '-U', user, '-d', db,
+            '-c', 'SHOW server_version;']
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return '', _pg_remote_read_error(124, '')
+    except OSError:
+        return '', _pg_remote_read_error(127, '')
+    if r.returncode != 0:
+        return '', _pg_remote_read_error(r.returncode, r.stderr)
+    out = (r.stdout or '').strip()
+    if not out:
+        return '', _pg_remote_read_error(0, '')
+    return out.splitlines()[0], ''
+
+
+def _postgres_remote_status(topology=None, reader=None, allow_install=False, manage=None):
+    """ops #760: where TAK's database runs and whether it has the PostgreSQL security fix.
+    None when the database is on this box (the host and Docker checks cover it). Otherwise
+    {host, port, kind, manage, version, state, missing, where, reason}: `manage` is True when the
+    console can update that database itself (a split install's database server, ops #766).
+    state is 'update' (read, and
+    below a POSTGRES_SECURITY_RELEASES fix), 'ok' (read, at or above the fix, or a major the table
+    does not list), or 'unknown' (could not be read: never reported as fixed). Read-only."""
+    mode, host, port = topology if topology is not None else _tak_db_topology()
+    if mode != 'remote':
+        return None
+    kind = _pg_remote_kind(host)
+    if manage is None:
+        manage = kind == 'split' and _pg_dbserver_manageable(host)
+    version, reason = (reader or (lambda: _pg_remote_server_version(allow_install)))()
+    st = {'host': host, 'port': port, 'kind': kind, 'manage': bool(manage), 'version': '',
+          'state': 'unknown', 'missing': [], 'where': _pg_remote_where(kind, host, bool(manage)),
+          'reason': reason or ''}
+    ver = _pg_version_tuple(version)
+    if ver is None:
+        st['reason'] = st['reason'] or 'the database gave no readable version'
+        return st
+    st['version'] = '%d.%d' % ver
+    st['reason'] = ''
+    st['missing'] = _pg_releases_missing(st['version'])
+    st['state'] = 'update' if st['missing'] else 'ok'
+    return st
+
+
+def _postgres_remote_items(status):
+    """Update-email items (ops #760) from _postgres_remote_status(). One item, key 'pg-remote'. The
+    email says where the database runs and what to do THERE: infra-TAK changes nothing on it. A
+    version that could not be read says so, and is never counted as fixed. Pure."""
+    if not status or status.get('state') not in ('update', 'unknown'):
+        return []
+    host = status['host']
+    newest = POSTGRES_SECURITY_RELEASES[-1]
+    if status['state'] == 'update':
+        rels = {r['id']: r for r in status['missing']}
+        major = _pg_version_tuple(status['version'])[0]
+        target = _pg_fixed_tuple(newest, major)
+        lines = ['Fixes ' + '; '.join(f"{i}: {r['reason']}" for i, r in sorted(rels.items())) + '.',
+                 status['where'],
+                 'The update restarts the database, so TAK Server is briefly without it. '
+                 + ('It reconnects by itself.' if status.get('manage')
+                    else 'infra-TAK changes nothing on that database.')]
+        return [{'key': 'pg-remote', 'label': 'PostgreSQL (TAK database on ' + host + ')',
+                 'installed': f"PostgreSQL {status['version']} on {host}",
+                 'target': 'PostgreSQL %d.%d' % target if target else 'the security fix',
+                 'summary': f'PostgreSQL (the TAK database on {host}): security update pending',
+                 'identity': 'pg-remote-' + '+'.join(sorted(rels)) + '=' + host,
+                 'security': lines}]
+    fixed = ', '.join(newest['fixed'][m] for m in sorted(newest['fixed']))
+    lines = [f"We could not read the PostgreSQL version of your TAK database on {host}: {status['reason']}.",
+             f"{newest['id']} is fixed in {fixed} (use the one for your PostgreSQL major version). "
+             "Check your database version.",
+             status['where']]
+    return [{'key': 'pg-remote', 'label': 'PostgreSQL (TAK database on ' + host + ')',
+             'installed': 'PostgreSQL version unknown', 'target': 'the security fix',
+             'summary': f'PostgreSQL (the TAK database on {host}): version could not be checked',
+             'identity': 'pg-remote-unknown-' + newest['id'] + '=' + host,
+             'security': lines}]
+
+
+def _postgres_remote_security_items(unknown):
+    """_postgres_remote_items for this box (the sweep reads the version; it may install a psql
+    client). A failure of the check itself goes into `unknown`: the caller carries its dedup
+    state, never re-mails or drops on a guess."""
+    try:
+        return _postgres_remote_items(_postgres_remote_status(allow_install=True))
+    except Exception as e:
+        unknown.add('pg-remote')
+        print(f"[update-notify] remote PostgreSQL check failed: {e}", flush=True)
+        return []
+
+
+_PG_REMOTE_CACHE = {'ts': 0.0, 'data': None}
+_PG_REMOTE_TTL = 600
+
+
+def _postgres_remote_panel(force=False):
+    """The console page's view of _postgres_remote_status(): {'remote': False} on a box whose
+    database is local, else the status plus the plain headline. Cached 10 minutes (it opens a
+    database connection); never installs a package."""
+    now = time.time()
+    if not force and _PG_REMOTE_CACHE['data'] is not None and (now - _PG_REMOTE_CACHE['ts']) < _PG_REMOTE_TTL:
+        return _PG_REMOTE_CACHE['data']
+    try:
+        st = _postgres_remote_status()
+    except Exception as e:
+        st = {'host': '', 'port': 0, 'kind': 'split', 'manage': False, 'version': '', 'state': 'unknown',
+              'missing': [], 'where': '', 'reason': 'the check failed: ' + str(e)[:80]}
+    if st is None:
+        data = {'remote': False}
+    else:
+        data = dict(st, remote=True, missing=[r['id'] for r in st['missing']],
+                    can_update=bool(st.get('manage')) and st['state'] in ('update', 'unknown'))
+        if st['state'] == 'update':
+            data['headline'] = (f"PostgreSQL security update pending on your TAK database "
+                                f"({st['version']} on {st['host']})")
+        elif st['state'] == 'unknown':
+            data['headline'] = (f"Could not check the PostgreSQL version of your TAK database on "
+                                f"{st['host']}: {st['reason']}")
+    _PG_REMOTE_CACHE['ts'], _PG_REMOTE_CACHE['data'] = now, data
+    return data
+
+
+@app.route('/api/postgres-remote')
+@login_required
+def postgres_remote_api():
+    """ops #760: does TAK's database, when it runs on another machine, need the PostgreSQL
+    security update? Read-only."""
+    return jsonify(_postgres_remote_panel(force=(request.args.get('refresh') == '1')))
+
+
+# Docker databases that float on an upstream tag: running containers keep the build they
+# were created from until the image is pulled AND the container recreated, and Docker Hub
+# rebuilds `postgres:16-alpine` at every minor. Authentik's update only pulls when a newer
+# Authentik exists, so a box on the pinned Authentik never saw the new database build.
+# (key, label, compose dir, compose service). Local stacks only. WebODM pins its database
+# image by digest (WEBODM_IMAGES), ATLAS only builds its api on update, and the TAK Server
+# containers are built, not pulled: they need their own move and are not handled here.
+POSTGRES_COMPOSE_STACKS = (
+    ('authentik', 'Authentik', '~/authentik', 'postgresql'),
+    ('cloudtak', 'CloudTAK', '~/CloudTAK', 'postgis'),
+    ('takportal', 'TAK Portal', '~/TAK-Portal', 'postgres'),
+    ('remote_assist', 'Remote Assist', '~/eud-remote-assist', 'postgres'),
+)
+
+
+def _pg_run(argv, timeout=30, cwd=None):
+    return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def _pg_stack_container(stack_dir, service):
+    """Container id of one compose service of a local stack, '' when it is not running."""
+    r = _pg_run(['docker', 'compose', 'ps', '-q', service], cwd=stack_dir)
+    ids = (r.stdout or '').split()
+    return ids[0] if r.returncode == 0 and ids else ''
+
+
+def _pg_container_version(cid):
+    """(major.minor string) of the postgres binary the running container was started from, or ''.
+    `postgres --version` reads the container's own filesystem, so it names the build that is
+    running, not the one on disk."""
+    r = _pg_run(['docker', 'exec', cid, 'postgres', '--version'], timeout=20)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _pg_container_image_state(cid):
+    """(running image id, id the container's image tag points at now, the image reference): equal
+    ids mean a pull found nothing newer. ('', '', '') when docker could not answer."""
+    r = _pg_run(['docker', 'inspect', '--format', '{{.Image}} {{.Config.Image}}', cid], timeout=20)
+    bits = (r.stdout or '').split()
+    if r.returncode != 0 or len(bits) != 2:
+        return '', '', ''
+    r2 = _pg_run(['docker', 'image', 'inspect', '--format', '{{.Id}}', bits[1]], timeout=20)
+    return bits[0], ((r2.stdout or '').strip() if r2.returncode == 0 else ''), bits[1]
+
+
+def _pg_image_version(image):
+    """'major.minor' of the PostgreSQL inside a local image, read from a throwaway container that
+    never touches the data volume; '' when it cannot be read."""
+    r = _pg_run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'postgres', image, '--version'],
+                timeout=90)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _pg_wait_healthy(cid, seconds=90):
+    """True once the container's server accepts connections (pg_isready), within `seconds`."""
+    end = time.time() + seconds
+    while time.time() < end:
+        r = _pg_run(['docker', 'exec', cid, 'pg_isready', '-q'], timeout=10)
+        if r.returncode == 0:
+            return True
+        time.sleep(3)
+    return False
+
+
+def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
+    """ops #754: bring the local Docker databases of Authentik and CloudTAK onto a build with
+    the PostgreSQL security fix. Idempotent and quiet on a fixed box. Only a database whose
+    running PostgreSQL is BELOW a POSTGRES_SECURITY_RELEASES fix is touched, only its own
+    service is pulled and recreated (--no-deps), and only when the pulled image itself carries the
+    fix: a tag the image maker has not rebuilt, or rebuilt without the fix, changes nothing, and the
+    next update tries again. Never raises. Returns {key: 'fixed' | 'ok' | 'waiting' | 'failed' | 'skipped'}."""
+    out = {}
+    for key, label, d, service in stacks:
+        stack_dir = os.path.expanduser(d)
+        if not os.path.isdir(stack_dir):
+            continue
+        try:
+            cid = _pg_stack_container(stack_dir, service)
+            ver = _pg_container_version(cid) if cid else ''
+            if not ver:
+                out[key] = 'skipped'
+                continue
+            missing = _pg_releases_missing(ver)
+            if not missing:
+                out[key] = 'ok'
+                continue
+            ids = ', '.join(r['id'] for r in missing)
+            log(f"{label}: the database container runs PostgreSQL {ver}, below the security fix ({ids}) — "
+                f"pulling the current image")
+            if not _docker_compose_pull(None, stack_dir, log, timeout=900,
+                                        label=f'{label} database image', services=[service]):
+                out[key] = 'failed'
+                continue
+            have, now, image = _pg_container_image_state(cid)
+            if not have or not now or have == now:
+                log(f"{label}: no newer database image is published yet — the next update tries again")
+                out[key] = 'waiting'
+                continue
+            # A rebuilt tag is not necessarily a fixed one (CloudTAK's postgis was rebuilt on Nov 9,
+            # still PostgreSQL 17.11): read what is in the pulled image and restart the database
+            # only for a build that carries the fix.
+            new_img = _pg_image_version(image)
+            if not new_img or _pg_releases_missing(new_img):
+                log(f"{label}: the newest published database image has PostgreSQL {new_img or 'unknown'}, "
+                    f"not the security fix yet — leaving the running database alone, the next update tries again")
+                out[key] = 'waiting'
+                continue
+            argv = ['docker', 'compose', 'up', '-d', '--no-deps', service]
+            if key == 'authentik':
+                with _authentik_compose_lock('postgres-security-update') as _locked:
+                    if not _locked:
+                        log(f"{label}: another Authentik operation is running — the next update tries again")
+                        out[key] = 'waiting'
+                        continue
+                    r = _pg_run(argv, timeout=240, cwd=stack_dir)
+            else:
+                r = _pg_run(argv, timeout=240, cwd=stack_dir)
+            if r.returncode != 0:
+                log(f"✗ {label}: recreating the database failed: {(r.stderr or r.stdout or '')[-200:].strip()}")
+                out[key] = 'failed'
+                continue
+            cid2 = _pg_stack_container(stack_dir, service)
+            new_ver = _pg_container_version(cid2) if cid2 and _pg_wait_healthy(cid2) else ''
+            if new_ver and not _pg_releases_missing(new_ver):
+                log(f"✓ {label}: database now runs PostgreSQL {new_ver}")
+                out[key] = 'fixed'
+            else:
+                log(f"✗ {label}: after the recreate the database reports PostgreSQL {new_ver or 'nothing'} — check it")
+                out[key] = 'failed'
+        except Exception as e:
+            log(f"{label}: PostgreSQL security update check failed (non-fatal): {str(e)[:200]}")
+            out[key] = 'failed'
+    return out
+
+
+# ── ops #755: TAK Server's own database container ──────────────────────────────────
+# Container TAK builds its database image ONCE, at install (5.8 hardened: UBI 10 + PGDG, so
+# PostgreSQL 18.x of that day; 5.7: `FROM postgres:15.1`). Nothing ever rebuilt it, so it never
+# got a PostgreSQL security minor. This is the one action that does, from the stored bundle:
+#   build the image with no cache while TAK keeps running; read the PostgreSQL inside it and
+#   stop there when it is not the fix; verified backup; stop TAK and the database cleanly;
+#   recreate ONLY the database container, on the SAME volume; check it answers and that every
+#   table kept its rows; start TAK. Any failure after the stop puts the old image back.
+# https://www.postgresql.org/docs/current/upgrading.html  (a minor release needs no dump/restore)
+tak_dbr_log = []
+tak_dbr_status = {'running': False, 'complete': False, 'error': False}
+TAK_DB_REFRESH_TAG = 'takserver_db:refresh'
+# 5.7 and earlier build FROM postgres:15.1 (Debian bullseye); its PostgreSQL apt archive tops out
+# at 15.19, so no rebuild on that base can reach 15.20. tak-server-installer already builds this
+# bundle on this base (same PostgreSQL 15): https://github.com/takwerx/tak-server-installer
+TAK_DB_LEGACY_BASE = 'postgres:15-bookworm'
+_TAK_DB_LEGACY_FROM_RE = re.compile(
+    r'(?im)^(FROM\s+)((?:docker\.io/)?(?:library/)?postgres:15(?:\.\d+)*(?:-bullseye)?)(\s*)$')
+_TAK_DB_BULLSEYE_RUN_RE = re.compile(r"(?m)^RUN sed -i -e '/debian-security/d'.*install -y (.+)$")
+
+
+def _tak_db_legacy_refresh_dockerfile(src):
+    """The 5.7 bundle's Dockerfile.takserver-db, rebased on TAK_DB_LEGACY_BASE for the refresh. Pure.
+
+    The install wrote the bullseye repairs of GH #69 / #84 into the bundle's copy (Debian and PGDG
+    pointed at their archives). Those are wrong on bookworm, where PGDG's live repository carries
+    the new minor, so that one RUN line goes back to the plain install it was made from, with the
+    same package list. None when the text has no postgres:15 base: nothing is guessed."""
+    if not _TAK_DB_LEGACY_FROM_RE.search(src or ''):
+        return None
+    out = _TAK_DB_LEGACY_FROM_RE.sub(lambda m: m.group(1) + TAK_DB_LEGACY_BASE + m.group(3), src, count=1)
+    return _TAK_DB_BULLSEYE_RUN_RE.sub(lambda m: 'RUN apt-get update && apt-get install -y ' + m.group(1),
+                                       out, count=1)
+
+
+def _tak_db_pg_version(pgbin):
+    """'major.minor' of the PostgreSQL the RUNNING takserver-db container was started from, or ''."""
+    r = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, f'{pgbin}/postgres', '--version'], timeout=20)
+    v = _pg_version_tuple(r.stdout) if r.returncode == 0 else None
+    return '%d.%d' % v if v else ''
+
+
+def _tak_db_refresh_facts():
+    """What the TAK Server page and the refresh job both need. Read-only, never raises.
+    {'applicable', 'version', 'pgbin', 'missing' (security releases it is below), 'bundle',
+     'db_dockerfile', 'era' ('hardened'|'legacy'), 'why' (when not applicable)}."""
+    f = {'applicable': False, 'version': '', 'pgbin': '', 'missing': [], 'bundle': '',
+         'db_dockerfile': '', 'era': '', 'why': ''}
+    try:
+        if not _tak_is_container():
+            f['why'] = 'TAK Server does not run as containers here'
+            return f
+        if not _tak_container_running(TAK_DB_CONTAINER):
+            f['why'] = 'the database container is not running'
+            return f
+        for major in TAK_PG_MAJORS:
+            pgbin = _tak58_container_pgbin(TAK_DB_CONTAINER, major)
+            if pgbin:
+                f['pgbin'], f['version'] = pgbin, _tak_db_pg_version(pgbin)
+                break
+        if not f['version']:
+            f['why'] = 'could not read the database version'
+            return f
+        f['missing'] = _pg_releases_missing(f['version'])
+        ctx = os.path.dirname(os.path.realpath('/opt/tak'))
+        _app_df, db_df = _tak_bundle_dockerfiles(ctx)
+        if not db_df:
+            f['why'] = 'the TAK Server bundle this install was built from is no longer on disk'
+            return f
+        f.update({'bundle': ctx, 'db_dockerfile': db_df,
+                  'era': 'hardened' if 'hardened' in db_df.lower() else 'legacy', 'applicable': True})
+    except Exception as e:
+        f['why'] = 'check failed: ' + str(e)[:120]
+    return f
+
+
+_tak_dbr_cache = {'at': 0.0, 'data': None}
+
+
+def _tak_db_refresh_facts_cached(max_age=300):
+    """Page renders read this; two `docker exec`s per visit are not free. The job never does."""
+    now = time.time()
+    if _tak_dbr_cache['data'] is not None and now - _tak_dbr_cache['at'] < max_age:
+        return _tak_dbr_cache['data']
+    d = _tak_db_refresh_facts()
+    _tak_dbr_cache.update({'at': now, 'data': d})
+    return d
+
+
+def _tak_db_refresh_items():
+    """Update-email item (ops #755) for TAK Server's database container, or []. One probe, only for a
+    container install; a probe that cannot answer claims nothing."""
+    f = _tak_db_refresh_facts_cached()
+    if not (f.get('applicable') and f.get('missing')):
+        return []
+    ids = ', '.join(r['id'] for r in f['missing'])
+    reason = '; '.join(f"{r['id']}: {r['reason']}" for r in f['missing'])
+    return [{'key': 'pg-tak-container', 'label': 'PostgreSQL (TAK Server database container)',
+             'installed': 'PostgreSQL ' + f['version'], 'target': 'the newest PostgreSQL ' + f['version'].split('.')[0],
+             'summary': 'PostgreSQL (the TAK database container): security update pending',
+             'identity': 'pg-tak-container-' + ids + '=' + f['version'],
+             'security': ['Fixes ' + reason + '.',
+                          'The TAK Server database container is built once when TAK Server is installed and '
+                          'is not rebuilt by a console update. Restarts TAK Server and its database for a few minutes.'],
+             'how': 'Open the TAK Server page, then Update TAK Server, then "Refresh database image".'}]
+
+
+def _tak_messaging_starts():
+    """How many times TAK has logged its messaging start. A counter, because the log keeps every earlier
+    start: "the line is there" is true before the restart too (the 5.8 migration does the same)."""
+    r = _pg_run(['docker', 'exec', TAK_CONTAINER, 'grep', '-c', 'Started TAK Server messaging Microservice',
+                 '/opt/tak/logs/takserver-messaging.log'], timeout=60)
+    s = (r.stdout or '').strip()
+    return int(s) if s.isdigit() else 0
+
+
+def _tak_db_refresh_backup(pgbin, pw, say, stamp):
+    """(path, '') of a backup of the `cot` database, or ('', why). Container installs have no
+    PostgreSQL client on the host (the broker's pg_restore op answers "not found on trusted PATH": field
+    test, ARM box, Nov 14), so the whole proof runs INSIDE the database container: `pg_dump -Fc`, then
+    `pg_restore --list` must read the archive back (a file with bytes is not a backup), then
+    `docker cp` out to ~/tak-docker/snapshots, OUTSIDE the bundle tree, and the sizes must match.
+    The dump is the whole CoT database: the host copy is 0600 and the in-container copy is removed."""
+    dump, err = '/tmp/cot_dbrefresh.pgdump', '/tmp/cot_dbrefresh.err'
+    say('  Dumping the cot database (TAK Server stays up)…')
+    rc = _tak58_container_run_detached(
+        TAK_DB_CONTAINER, pw, f'{pgbin}/pg_dump -h localhost -U martiuser -d cot -Fc -f {dump} 2>{err}',
+        'cot_dbrefresh', say, every=5)
+    if rc != 0:
+        e = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'head', '-c', '300', err], timeout=60)
+        return '', f'pg_dump exit {rc}: {(e.stdout or "").strip()[:200]}'
+    r = _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'sh', '-c',
+                 f'{pgbin}/pg_restore --list {dump} | grep -vc "^;"; wc -c < {dump}'], timeout=900)
+    nums = (r.stdout or '').split()
+    if r.returncode != 0 or len(nums) < 2 or not nums[0].isdigit() or not nums[1].isdigit() \
+            or int(nums[0]) <= 0 or int(nums[1]) <= 0:
+        return '', 'pg_restore could not read the dump back'
+    toc, size = int(nums[0]), int(nums[1])
+    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-dbrefresh-{stamp}')
+    dest = os.path.join(dest_dir, 'cot.pgdump')
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
+    except PermissionError:
+        _makedirs_priv(dest_dir, mode=0o700)
+    c = _pg_run(['docker', 'cp', f'{TAK_DB_CONTAINER}:{dump}', dest], timeout=7300)
+    hsize = os.path.getsize(dest) if os.path.exists(dest) else -1
+    if c.returncode != 0 or hsize != size:
+        return '', 'could not copy the dump out of the container'
+    _pg_run(['chmod', '600', dest], timeout=60)
+    _pg_run(['docker', 'exec', TAK_DB_CONTAINER, 'rm', '-f', dump, err], timeout=60)
+    say(f'  Backup read back OK: {toc} objects, {_cotdb_fmt_bytes(size)}')
+    return dest, ''
+
+
+def run_tak_db_refresh(log=None, status=None):
+    """Rebuild takserver-db from the stored bundle onto the newest PostgreSQL security minor and
+    swap it in on the same volume. Never raises; ends in `status`. See the block comment above."""
+    _log = tak_dbr_log if log is None else log
+    _status = tak_dbr_status if status is None else status
+
+    def say(m):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+        _log.append(entry)
+        print(entry, flush=True)
+
+    def done(ok=True, msg=None):
+        if msg:
+            say(msg)
+        _status.update({'running': False, 'complete': bool(ok), 'error': not ok})
+        _tak_dbr_cache['data'] = None
+
+    def run(argv, timeout=120):
+        r = _pg_run(argv, timeout=timeout)
+        return r.returncode, ((r.stdout or '') + (r.stderr or '')).strip()
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    old_tag = f'takserver_db:pre-refresh-{stamp}'
+    stopped = {'tak': False, 'db': False, 'swapped': False}
+    f = {}
+
+    def recreate_db(tag):
+        """The database container, from image `tag`, on the same volume, network and alias as
+        every install and upgrade creates it (run_takserver_upgrade_container)."""
+        run(['docker', 'rm', '-f', TAK_DB_CONTAINER], 120)
+        tak_real = os.path.realpath('/opt/tak')
+        mount = _tak_db_volume_mount(f['bundle']).split()
+        argv = ['docker', 'run'] + mount + ['-v', f'{tak_real}:/opt/tak:z', '--restart=always',
+                '--network', TAK_DOCKER_NET, '--network-alias', 'tak-database', '--name', TAK_DB_CONTAINER, '-d', tag]
+        return run(argv, 120)[0] == 0
+
+    def wait_db(seconds=180):
+        end = time.time() + seconds
+        while time.time() < end:
+            if run(['docker', 'exec', TAK_DB_CONTAINER, f"{f['pgbin']}/pg_isready", '-q'], 10)[0] == 0:
+                return True
+            time.sleep(3)
+        return False
+
+    def roll_back(why):
+        """Put the previous database image back and start TAK again. Only ever called after the stop."""
+        say(f'✗ {why}')
+        say('Putting the previous database image back…')
+        ok = recreate_db(old_tag) and wait_db()
+        run(['docker', 'tag', old_tag, 'takserver_db'], 30)
+        run(['docker', 'start', TAK_CONTAINER], 120)
+        if ok:
+            done(False, 'The previous database image is running again and TAK Server was started. Nothing was lost.')
+        else:
+            done(False, f'⚠ The previous image did not start either. The data is untouched in volume '
+                        f'{TAK_DB_VOLUME}; the previous image is {old_tag}.')
+
+    try:
+        say('Checking this server…')
+        f = _tak_db_refresh_facts()
+        if not f['applicable']:
+            return done(False, f"✗ Nothing was changed: {f['why']}.")
+        say(f"  The database container runs PostgreSQL {f['version']}.")
+        if not f['missing']:
+            return done(True, '✓ Already on a build with the newest security fix. Nothing to do.')
+        pw = _tak58_db_password()
+        if not pw:
+            return done(False, '✗ Nothing was changed: could not read the database password from CoreConfig.xml.')
+
+        # 1. Build while TAK keeps serving. The Dockerfiles are the bundle's own, with the same
+        #    repairs the install applied; the 5.7 one is rebased (see TAK_DB_LEGACY_BASE).
+        ctx, db_df = f['bundle'], f['db_dockerfile']
+        say('Step 1/5: Building the database image from the stored bundle, no cache (minutes; TAK Server stays up)…')
+        if f['era'] == 'legacy':
+            try:
+                with open(os.path.join(ctx, db_df)) as fh:
+                    new_src = _tak_db_legacy_refresh_dockerfile(fh.read())
+                if not new_src:
+                    return done(False, '✗ Nothing was changed: the bundle Dockerfile has no postgres:15 base to rebuild.')
+                db_df = db_df + '.refresh'
+                with open(os.path.join(ctx, db_df), 'w') as fh:
+                    fh.write(new_src)
+            except Exception as e:
+                return done(False, f'✗ Nothing was changed: could not prepare the 5.7 Dockerfile: {str(e)[:160]}')
+            say(f'  5.7 bundle: the database image is rebuilt on {TAK_DB_LEGACY_BASE} (same PostgreSQL 15).')
+        else:
+            _patch_tak_hardened_dockerfile(ctx, (None, db_df), say)
+            _patch_tak_db_pgdg_releasever(ctx, db_df, say)
+        r = _pg_run(['docker', 'build', '--no-cache', '--pull', '-t', TAK_DB_REFRESH_TAG, '-f', db_df, '.'],
+                    timeout=2400, cwd=ctx)
+        if r.returncode != 0:
+            say('  ! ' + ((r.stderr or r.stdout or '').strip()[-300:]))
+            return done(False, '✗ Nothing was changed: the database image did not build.')
+        rc, out = run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint',
+                       f"{f['pgbin']}/postgres", TAK_DB_REFRESH_TAG, '--version'], 90)
+        v = _pg_version_tuple(out) if rc == 0 else None
+        new_ver = '%d.%d' % v if v else ''
+        if not new_ver or _pg_releases_missing(new_ver):
+            run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+            return done(True, f"✓ Nothing was changed. The newest build available today has PostgreSQL "
+                              f"{new_ver or 'unknown'}, not the security fix yet. Try again later.")
+        say(f'✓ Built: the new image has PostgreSQL {new_ver} (running: {f["version"]}).')
+
+        # 2. The backup, proven readable, before anything is touched.
+        say('Step 2/5: Backing up (TAK Server stays up)…')
+        bk_path, bk_why = _tak_db_refresh_backup(f['pgbin'], pw, say, stamp)
+        if not bk_path:
+            run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+            return done(False, f"✗ Nothing was changed: the backup could not be proven readable ({bk_why}).")
+        say(f'✓ Backup verified: {bk_path}')
+
+        # 3. Downtime. Stop TAK, count the rows, stop the database cleanly, keep the old image.
+        say('Step 3/5: Stopping TAK Server and its database (downtime starts now)…')
+        t_down = time.time()
+        # TAK's messaging log keeps the start line of every earlier run: count them now, wait for one more.
+        starts_before = _tak_messaging_starts()
+        rc, out = run(['docker', 'inspect', '-f', '{{.Image}}', TAK_DB_CONTAINER], 20)
+        if rc != 0 or not out:
+            return done(False, '✗ Nothing was changed: could not read the running database image.')
+        run(['docker', 'tag', out.strip(), old_tag], 30)
+        run(['docker', 'stop', '-t', '120', TAK_CONTAINER], 180)
+        stopped['tak'] = True
+        before = _tak58_container_counts(TAK_DB_CONTAINER, f['pgbin'], pw)
+        if not before:
+            run(['docker', 'start', TAK_CONTAINER], 120)
+            return done(False, '✗ Nothing was changed: could not count the rows to check against. TAK Server was started again.')
+        say(f'  {len(before)} tables, {sum(before.values()):,} rows counted.')
+        run(['docker', 'stop', '-t', '120', TAK_DB_CONTAINER], 180)
+        stopped['db'] = True
+
+        # 4. Swap. Same volume; the data directory is not touched (a minor release needs no dump/restore).
+        say('Step 4/5: Starting the new database image on the same data…')
+        run(['docker', 'tag', TAK_DB_REFRESH_TAG, 'takserver_db'], 30)
+        stopped['swapped'] = True
+        if not recreate_db('takserver_db') or not wait_db():
+            return roll_back('The new database did not start.')
+        after_ver = _tak_db_pg_version(f['pgbin'])
+        if not after_ver or _pg_releases_missing(after_ver):
+            return roll_back(f"The database reports PostgreSQL {after_ver or 'nothing'}, not the fix.")
+        if f['era'] == 'legacy':
+            # A different Debian means a different glibc, which can change how text sorts: indexes built
+            # before no longer match. PostgreSQL records the collation version and says so.
+            out = _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw,
+                                        "select count(*) from pg_database where datname='cot' and "
+                                        "datcollversion is distinct from pg_database_collation_actual_version(oid)")
+            if (out or '').strip() not in ('', '0'):
+                say('  The sort order of the new Debian differs: rebuilding the cot indexes (TAK Server stays stopped)…')
+                if _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw, 'REINDEX DATABASE cot', timeout=7200) is None \
+                        or _tak58_container_psql(TAK_DB_CONTAINER, f['pgbin'], pw,
+                                                 'ALTER DATABASE cot REFRESH COLLATION VERSION', timeout=60) is None:
+                    return roll_back('Rebuilding the indexes failed.')
+        counts = _tak58_container_counts(TAK_DB_CONTAINER, f['pgbin'], pw)
+        if counts != before:
+            return roll_back('The row counts after the swap differ from before.')
+        say(f'✓ PostgreSQL {after_ver} is serving; all {sum(counts.values()):,} rows are there.')
+
+        # 5. TAK back up.
+        say('Step 5/5: Starting TAK Server…')
+        run(['docker', 'start', TAK_CONTAINER], 120)
+        up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if _tak_messaging_starts() > starts_before:
+                up = True
+                break
+        for t in run(['docker', 'images', 'takserver_db', '--format', '{{.Tag}}'], 20)[1].split():
+            if t.startswith('pre-refresh-') and f'takserver_db:{t}' != old_tag:
+                run(['docker', 'rmi', f'takserver_db:{t}'], 60)
+        run(['docker', 'rmi', TAK_DB_REFRESH_TAG], 60)
+        say(f'  Downtime about {int(time.time() - t_down)} s. The previous image stays as {old_tag} until the next refresh.')
+        if not up:
+            return done(True, '⚠ The database is on the fixed build, but TAK Server did not log its start within 10 minutes: '
+                              'check `docker logs takserver`. No data was lost.')
+        done(True, f'✓ Done. The TAK Server database now runs PostgreSQL {after_ver}.')
+    except Exception as e:
+        if stopped['db'] and stopped['swapped']:
+            try:
+                return roll_back(f'Unexpected error: {str(e)[:160]}')
+            except Exception:
+                pass
+        if stopped['tak']:
+            run(['docker', 'start', TAK_DB_CONTAINER], 120)
+            run(['docker', 'start', TAK_CONTAINER], 120)
+        done(False, f'✗ Unexpected error: {str(e)[:200]}')
+
+
 # ops #168: with unattended-upgrades / dnf-automatic applying updates, a fresh security
 # patch is normally installed by the next daily run (lists refresh twice a day with up to
 # 12 h of random delay; the upgrade runs ~06:00). Mail only what is still pending after
@@ -29529,6 +30327,16 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     except Exception as e:
         unknown.update({'os-security', 'kernel-security'})
         print(f"[update-notify] OS security check failed: {e}", flush=True)
+    # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
+    pending.extend(_postgres_security_items(unknown))
+    # ops #755: ...and the TAK Server database CONTAINER (built once at install, never refreshed)
+    try:
+        pending.extend(_tak_db_refresh_items())
+    except Exception as e:
+        unknown.add('pg-tak-container')
+        print(f"[update-notify] TAK database container check failed: {e}", flush=True)
+    # ops #760: ... and TAK's database when it runs on another machine (split box, RDS, Azure)
+    pending.extend(_postgres_remote_security_items(unknown))
     try:
         nv = _node_container_versions()
         # a container that did not answer is unknown, not fixed: keep its dedup state
@@ -49455,6 +50263,24 @@ def cloudtak_container_logs():
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
+# Remote CloudTAK removal (ops #740). The Garage store container writes ~/CloudTAK/.docker-garage
+# as ROOT, so on a host whose SSH user is not root (ubuntu, ec2-user) a plain `rm -rf ~/CloudTAK`
+# stops with "Permission denied", the uninstall returns early, and the firewall cleanup and the
+# console's "deployed" flag never run. Try the plain remove first, then the same passwordless
+# `sudo -n` the remote deploy uses. If neither works, say what to do instead of a bare rm error.
+CLOUDTAK_REMOTE_UNINSTALL_SH = (
+    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
+    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
+    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
+    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
+    "fi; cd ~; "
+    "rm -rf ~/CloudTAK 2>/dev/null || sudo -n rm -rf ~/CloudTAK || "
+    "{ echo 'Could not delete ~/CloudTAK: it holds root-owned files and this SSH user has no "
+    "passwordless sudo. Run: sudo rm -rf ~/CloudTAK on that host, then press Remove again.' >&2; exit 1; }"
+)
+
+
 @app.route('/api/cloudtak/uninstall', methods=['POST'])
 @login_required
 def cloudtak_uninstall():
@@ -49490,16 +50316,7 @@ def cloudtak_uninstall():
                 if not rhost:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': 'Remote target selected but host is not configured'})
                     return
-                ok, out = _ssh_probe(
-                    rcfg,
-                    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
-                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
-                    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
-                    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
-                    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
-                    "fi; rm -rf ~/CloudTAK",
-                    timeout=300
-                )
+                ok, out = _ssh_probe(rcfg, CLOUDTAK_REMOTE_UNINSTALL_SH, timeout=300)
                 if not ok:
                     cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
                     return
@@ -50776,6 +51593,12 @@ def _cloudtak_close_firewall(cfg, log=None):
         except Exception as e:
             ok, msg = False, str(e)[:120]
         (closed if ok else failed).append(f'{port}/{proto}' + ('' if ok else f' ({msg[:80]})'))
+    if cfg.get('target_mode') == 'remote':
+        # ops #737: the rule on THIS box that let the remote host reach Caddy's :9997.
+        try:
+            _cloudtak_console_video_fw(cfg, 'remove', log_fn=_log)
+        except Exception as e:
+            _log(f"cloudtak uninstall: ⚠ console video-port rule not closed: {str(e)[:100]}")
     if cfg.get('target_mode') != 'remote' and _fw_backend() == 'ufw':
         for port in CLOUDTAK_FW_DENY:
             try:
@@ -50839,8 +51662,8 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            chk_b64 = base64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
-            apply_b64 = base64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            chk_b64 = _b64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
+            apply_b64 = _b64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
             # base64 strings are quoting-safe; decode on the remote host and pipe into
             # the container's sh via stdin (`docker exec -i`).
             cmd = (
@@ -50955,7 +51778,7 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
     try:
         if remote_cfg:
             import base64
-            b64 = base64.b64encode(script.encode()).decode()
+            b64 = _b64.b64encode(script.encode()).decode()
             cmd = (
                 "for i in $(seq 1 %d); do "
                 "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
@@ -54429,6 +55252,8 @@ def run_cloudtak_deploy(cfg=None):
                 plog("  The SSH user needs root or passwordless sudo, and the box needs iptables and systemd.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #737: and let the remote host reach Caddy's video listener on THIS box.
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
 
             plog("")
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
@@ -55351,6 +56176,8 @@ def run_cloudtak_redeploy(cfg=None):
             # lock on ports that are no longer on the list.
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -56376,6 +57203,8 @@ def run_cloudtak_update():
                  if ok_sed else "  ⚠ Could not check the video port 9997 publish (non-fatal)")
             if not _remote_cloudtak_port_guard(cfg, settings, log_fn=plog)[0]:
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
+            # ops #737: the console's own firewall, for the remote host's video calls (9997).
+            _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -57658,7 +58487,8 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog('  Docker not found — installing...')
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog(f'✗ Docker install failed: {(out or "")[-300:]}')
             _webodm_deploy_status.update({'running': False, 'error': True})
@@ -59259,12 +60089,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
-def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
-    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
-    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False)."""
-    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
-        return True, False
-    script_content = '''import json, os, subprocess, sys
+# Run on the remote host (python3) to write /etc/docker/daemon.json. Needs root.
+_DOCKER_LOG_LIMITS_REMOTE_PY = '''import json, os, subprocess, sys
 p = "/etc/docker/daemon.json"
 data = {}
 if os.path.isfile(p) and os.path.getsize(p) > 0:
@@ -59286,37 +60112,48 @@ with open(p, "w") as f:
 subprocess.run(["systemctl", "restart", "docker"], timeout=90, capture_output=True)
 print("OK_RESTARTED")
 '''
-    tmp_path = '/tmp/infra_tak_docker_log_limits.py'
+
+
+def _docker_log_limits_remote_cmd(script=None):
+    """Shell command for the remote SSH session that runs the log-limits script as root (ops #736).
+    The script goes in as base64 on stdin, so no file is left in /tmp for another user on the host to
+    swap before root runs it. A root SSH user runs it directly; any other user needs passwordless
+    `sudo -n` (same rule as `_docker_install_cmd(sudo_fallback=True)`). python3's exit code is the
+    exit code of the command, so a refused write is a failure and is never reported as success.
+    NON-ROOT-COMMANDS: python3 (runs systemctl, writes /etc/docker)."""
+    b64 = _b64.b64encode((script or _DOCKER_LOG_LIMITS_REMOTE_PY).encode()).decode()
+    return (f'printf %s {shlex.quote(b64)} | base64 -d | '
+            f'(if [ "$(id -u)" = 0 ]; then python3 -; else sudo -n python3 -; fi) 2>&1')
+
+
+def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
+    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
+    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False).
+    A non-root SSH user needs passwordless sudo (ops #736: it used to fail with no message at all)."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return True, False
     try:
-        with open(tmp_path, 'w') as f:
-            f.write(script_content)
-        copy_ok, _cm = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
-        if not copy_ok:
-            if log_fn:
-                log_fn("  ⚠ Could not copy Docker log-limits script to remote")
-            return False, False
-        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>&1; rm -f {tmp_path}', timeout=45)
+        ok, out = _ssh_probe(remote_cfg, _docker_log_limits_remote_cmd(), timeout=120)
     except Exception as e:
         if log_fn:
             log_fn(f"  ⚠ Docker log limits on remote: {str(e)[:100]}")
         return False, False
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
     out = (out or '').strip()
-    if not ok:
-        if log_fn:
-            log_fn(f"  ⚠ Docker log limits on remote could not be applied: {(out or '')[:120]}")
-        return False, False
-    if 'OK_RESTARTED' in out:
+    if ok and 'OK_RESTARTED' in out:
         if log_fn:
             log_fn("✓ Docker log limits set on remote (50 MB × 3). Docker was restarted.")
         return True, True
-    if log_fn and 'OK_ALREADY' in out:
-        log_fn("✓ Docker log limits already set on remote.")
-    return True, False
+    if ok and 'OK_ALREADY' in out:
+        if log_fn:
+            log_fn("✓ Docker log limits already set on remote.")
+        return True, False
+    if log_fn:
+        hint = ''
+        if 'sudo' in out and ('password' in out or 'not found' in out or 'not in the sudoers' in out):
+            hint = ' The SSH user needs passwordless sudo (sudo -n) to set this.'
+        log_fn(f"  ⚠ Docker log limits on remote could not be applied: {out[-200:] or 'no output'}.{hint} "
+               "Containers on that host keep unlimited logs until it is fixed.")
+    return False, False
 
 
 def _update_boot_stagger_service():
@@ -63034,6 +63871,45 @@ def _remote_cloudtak_port_guard(deploy_cfg, settings, log_fn=None):
                                      extra_allow=_remote_module_peer_ips(settings, 'cloudtak_deployment'))
 
 
+# ops #737: with CloudTAK on a remote host, video needs TCP 9997 open on THIS box (the console).
+# CloudTAK's video-service.ts forces port 9997 on every media address it builds: its api container
+# calls https://video.<name>:9997 for each lease, and the HLS address it hands to the player is on
+# 9997 too (the user's browser fetches the stream there). That name is the console box, where Caddy
+# listens on :9997 with the same routes as video.<name> on 443 (_cloudtak_caddy_bind_ip). The console
+# opened 9997 for a local CloudTAK only (run_cloudtak_deploy), so with a remote CloudTAK and ufw active
+# on the console every lease timed out ("CloudTAK has no working media server", "Failed to generate
+# proxy stream") until the operator ran `ufw allow 9997/tcp` by hand. Open to everyone, as for a local
+# CloudTAK: the browsers that play the stream come from anywhere, and a rule for the remote host alone
+# lets the lease succeed but blocks the player (checked on two AWS boxes: the remote's public address
+# differs from the one the console reaches it on, and the console's own address cannot play either).
+def _cloudtak_console_video_fw(cfg, action='allow', log_fn=None):
+    """ops #737: open (`allow`) or close (`remove`) TCP 9997 on THIS box's firewall for a remote
+    CloudTAK. Nothing to do for a local CloudTAK (its deploy opens the port itself). Returns True
+    when the firewall is as asked (or nothing was asked). Never raises."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    port = CLOUDTAK_FW_WEB[0][0]
+    try:
+        if (cfg.get('target_mode') or '').strip().lower() != 'remote':
+            return True
+        if action == 'remove':
+            ok, msg = _fw_remove(port, 'tcp')
+            _log(f"  \u2713 Video port {port} closed on this box" if ok else
+                 f"  \u26a0 Could not close video port {port} on this box: {str(msg).strip()[-160:]}")
+            return bool(ok)
+        ok, msg = _fw_allow(port, 'tcp')
+        if ok:
+            _log(f"  \u2713 Video port {port} opened on this box (Caddy's video listener; CloudTAK on the remote host and players use it)")
+        else:
+            _log(f"  \u26a0 Could not open video port {port} on this box: {str(msg).strip()[-160:]}. "
+                 f"Video fails until TCP {port} is open here.")
+        _log("  Cloud firewall: if this box sits behind an AWS security group, Azure NSG or similar, allow "
+             f"TCP 443 and {port} to this box (from the CloudTAK host, and from the users' networks that play video).")
+        return bool(ok)
+    except Exception as e:
+        _log(f"  \u26a0 Video port {port} firewall step skipped (non-fatal): {str(e)[:120]}")
+        return False
+
+
 def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
     remote = deploy_cfg.get('remote', {})
@@ -63159,7 +64035,8 @@ volumes:
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker on remote")
             nodered_deploy_status.update({'running': False, 'error': True})
@@ -66814,7 +67691,8 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, _docker_install_cmd() + ' 2>&1', timeout=600, log_fn=plog)
+        # ops #735: sudo_fallback so a non-root SSH user (e.g. rocky, ubuntu) can install Docker
+        ok, out = _module_run(deploy_cfg, _docker_install_cmd(sudo_fallback=True) + ' 2>&1', timeout=600, log_fn=plog)
         if not ok:
             plog("✗ Failed to install Docker")
             authentik_deploy_status.update({'running': False, 'error': True})
@@ -92366,6 +93244,58 @@ def takserver_58_migrate_log():
                     'error': tak58_status['error']})
 
 
+def _tak_dbr_page(installed):
+    """The refresh card's facts for a page render: only a container install below the fix, else None."""
+    try:
+        f = _tak_db_refresh_facts_cached() if installed else None
+        return f if f and f['applicable'] and f['missing'] else None
+    except Exception:
+        return None
+
+
+@app.route('/api/takserver/db-refresh')
+@login_required
+def takserver_db_refresh_state():
+    """ops #755: is TAK Server's database container on a build with the newest PostgreSQL security fix."""
+    f = _tak_db_refresh_facts()
+    return jsonify({'applicable': f['applicable'], 'version': f['version'],
+                    'security': [r['id'] for r in f['missing']], 'why': f['why'],
+                    'running': tak_dbr_status['running']})
+
+
+@app.route('/api/takserver/db-refresh', methods=['POST'])
+@login_required
+def takserver_db_refresh_start():
+    """ops #755: rebuild TAK Server's database image from the stored bundle and swap it in on the
+    same data. Restarts TAK Server and its database, so it asks for the admin password like every
+    destructive route."""
+    if tak_dbr_status.get('running'):
+        return jsonify({'error': 'A database refresh is already running'}), 409
+    if upgrade_status.get('running') or tak58_status.get('running'):
+        return jsonify({'error': 'A TAK Server update is running. Wait for it to finish.'}), 409
+    _gate = _require_admin_password()
+    if _gate is not None:
+        return _gate
+    f = _tak_db_refresh_facts()
+    if not f['applicable']:
+        return jsonify({'error': 'Nothing to refresh here: ' + f['why']}), 400
+    if not f['missing']:
+        return jsonify({'error': 'The database is already on a build with the newest security fix.'}), 400
+    tak_dbr_log.clear()
+    tak_dbr_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_tak_db_refresh, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/takserver/db-refresh/log')
+@login_required
+def takserver_db_refresh_log():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': tak_dbr_log[idx:], 'total': len(tak_dbr_log),
+                    'running': tak_dbr_status['running'], 'complete': tak_dbr_status['complete'],
+                    'error': tak_dbr_status['error']})
+
+
 # ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
 # TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
 # package on a PG-15 box through THIS path wedges TAK mid-upgrade: the package
@@ -102399,6 +103329,10 @@ _DBSERVER_JOBS = {
     'updates': {'unit': 'infratak-updates', 'script': '/var/lib/infratak-updates.sh',
                 'dir': '/var/lib/infratak-updates', 'log': '/var/log/infratak-updates.log',
                 'title': 'database server Install updates'},
+    # ops #766: the PostgreSQL security update alone (not every pending package), then a restart.
+    'pg-update': {'unit': 'infratak-pg-update', 'script': '/var/lib/infratak-pg-update.sh',
+                  'dir': '/var/lib/infratak-pg-update', 'log': '/var/log/infratak-pg-update.log',
+                  'title': 'database server PostgreSQL security update'},
 }
 _DBSERVER_OS_STEPS = ('pre-snapshot', 'db-dump', 'pin-pg16', 'release-upgrade', 'repos-noble',
                       'reassert', 'reboot')
@@ -102411,7 +103345,16 @@ _DBSERVER_REBOOT_WAIT_S = 1800   # no SSH this long after the reboot -> failed:v
 _DBSERVER_PG_WAIT_S = 300        # PostgreSQL gets this long to answer once SSH is back
 _DBSERVER_RECONNECT_S = 600      # then TAK Server gets this long to reconnect by itself
 _DBSERVER_STANDDOWN = '/var/lib/takguard/dbserver-maintenance'
-_DBSERVER_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800}
+_DBSERVER_STANDDOWN_S = {'os-upgrade': 3 * 3600, 'updates': 3600, 'reboot': 1800, 'pg-update': 1800}
+# ops #766: what the pg-update job's status word means, in plain words (the log has the detail).
+_DBSERVER_PG_FAIL = {
+    'no-fix': 'the PostgreSQL repository on that machine does not offer the security fix yet. Nothing was changed. Try again later',
+    'held': 'PostgreSQL is on hold (apt-mark hold) on that machine. The console does not override a hold. Nothing was changed',
+    'apt': 'apt could not install the PostgreSQL update. The log says why',
+    'restart': 'PostgreSQL did not come back on the fixed version after the restart. The log says why',
+    'os': 'that machine does not use apt. Update PostgreSQL there by hand. Nothing was changed',
+    'none': 'no PostgreSQL server package is installed there. Nothing was changed',
+}
 _DBSERVER_IRREVERSIBLE = (
     'The database server goes from Ubuntu 22.04 to Ubuntu 24.04. do-release-upgrade has no rollback; the only way back is the snapshot of the database server you take BEFORE pressing Start.',
     'Every package on the database server is replaced and it reboots at the end. PostgreSQL 18 and the TAK database are kept as they are; the job takes a verified database dump on the database server first.',
@@ -102739,6 +103682,112 @@ def _os_upgrade_dbserver_script(pg_expect='18'):
     ))
 
 
+# ops #766: the database server's PostgreSQL security update, as one detached job. Install updates
+# (the 'updates' job) reads the apt lists as they are, and a database server that is not on all
+# day keeps lists from before the fix, so it says "every available update is installed" while its
+# PostgreSQL is below the fix (verified on a cloud split, 18.6 installed, lists from Oct 29: after
+# apt-get update the PGDG repository offered 18.7). This job refreshes the lists first, upgrades
+# only the PostgreSQL server packages (never TAK's database package, never PostGIS, never the
+# rest of the system), restarts a cluster that still runs the old build, and refuses with a
+# plain reason when the repository does not offer the fix yet.
+_PG_UPDATE_FIXED_RE = re.compile(r'^\d+=\d+\.\d+( \d+=\d+\.\d+)*$')
+_PG_UPDATE_SCRIPT = r'''#!/bin/bash
+set -o pipefail
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+STATUS=@@STATUS@@
+FIXED=@@FIXED@@
+TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+mkdir -p "$(dirname "$STATUS")"
+echo "running:pg-update" > "$STATUS"
+fail() { echo "[$(TS)] FAILED ($1): $2"; echo "failed:$1" > "$STATUS"; exit 1; }
+echo "[$(TS)] === infra-TAK PostgreSQL security update starting (pid $$) ==="
+command -v apt-get >/dev/null 2>&1 || fail os "apt-get is not installed on this machine"
+fixed_for() { local kv; for kv in $FIXED; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return; }; done; }
+upstream() { echo "$1" | sed -E 's/^[0-9]+://; s/^([0-9]+\.[0-9]+).*$/\1/'; }
+WAITED=0
+while [ "$WAITED" -lt 1800 ]; do
+  BUSY=0
+  pgrep -f apt.systemd.daily >/dev/null 2>&1 && BUSY=1
+  pgrep -x apt-get >/dev/null 2>&1 && BUSY=1
+  pgrep -x apt >/dev/null 2>&1 && BUSY=1
+  pgrep -x dpkg >/dev/null 2>&1 && BUSY=1
+  pgrep -af unattended-upgrade 2>/dev/null | grep -qv unattended-upgrade-shutdown && BUSY=1
+  [ "$BUSY" -eq 0 ] && break
+  [ $((WAITED % 60)) -eq 0 ] && echo "[$(TS)] waiting for another apt/dpkg process to finish (${WAITED}s)"
+  sleep 5; WAITED=$((WAITED+5))
+done
+[ "$WAITED" -ge 1800 ] && fail apt "apt/dpkg is still busy after 30 minutes"
+echo "[$(TS)] apt-get update (refresh the package lists first)"
+apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1
+urc=$?
+[ "$urc" -ne 0 ] && echo "[$(TS)] WARN: apt-get update reported errors (exit $urc); going on with the package lists as they are"
+MAJORS="$(dpkg-query -W -f='${Package}\n' 'postgresql-[0-9]*' 2>/dev/null | sed -nE 's/^postgresql-([0-9]+)$/\1/p' | sort -un)"
+[ -n "$MAJORS" ] || fail none "no postgresql-N server package is installed"
+HELD="$(apt-mark showhold 2>/dev/null)"
+for M in $MAJORS; do
+  F="$(fixed_for "$M")"
+  if [ -z "$F" ]; then echo "[$(TS)] PostgreSQL $M: the security release does not list this major version, leaving it alone"; continue; fi
+  INSTV="$(upstream "$(dpkg-query -W -f='${Version}' "postgresql-$M")")"
+  if dpkg --compare-versions "$INSTV" ge "$F"; then
+    echo "[$(TS)] PostgreSQL $M: installed $INSTV is already at or above the fix $F"
+  else
+    CAND="$(apt-cache policy "postgresql-$M" | awk '/Candidate:/ {print $2; exit}')"
+    CANDV="$(upstream "$CAND")"
+    echo "[$(TS)] PostgreSQL $M: installed $INSTV, the repository offers ${CANDV:-nothing}, the fix is $F"
+    if [ -z "$CAND" ] || [ "$CAND" = "(none)" ] || ! dpkg --compare-versions "$CANDV" ge "$F"; then
+      fail no-fix "the repository on this machine offers PostgreSQL ${CANDV:-nothing} for major version $M, below the fix $F. Nothing was changed"
+    fi
+    PKGS=""
+    for p in "postgresql-$M" "postgresql-$M-jit" "postgresql-client-$M" libpq5 postgresql-common postgresql-client-common; do
+      dpkg -s "$p" >/dev/null 2>&1 && PKGS="$PKGS $p"
+    done
+    for p in $PKGS; do
+      if printf '%s\n' "$HELD" | grep -qx "$p"; then fail held "$p is on hold (apt-mark hold). Nothing was changed"; fi
+    done
+    echo "[$(TS)] upgrading only these packages:$PKGS"
+    apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install --only-upgrade $PKGS 2>&1
+    [ "${PIPESTATUS[0]}" -eq 0 ] || fail apt "apt-get could not install the PostgreSQL update (see above)"
+  fi
+  CL="$(pg_lsclusters -h 2>/dev/null | awk -v m="$M" '$1==m && $4=="online" {print $2" "$3}')"
+  while read -r NAME PORT; do
+    [ -n "$NAME" ] || continue
+    RUN="$(runuser -u postgres -- psql -X -p "$PORT" -tAc 'show server_version' 2>/dev/null | head -1)"
+    RUNV="$(upstream "$RUN")"
+    if [ -n "$RUNV" ] && dpkg --compare-versions "$RUNV" ge "$F"; then
+      echo "[$(TS)] cluster $M/$NAME already runs $RUNV"
+      continue
+    fi
+    echo "[$(TS)] cluster $M/$NAME runs ${RUNV:-an unreadable version}: restarting it"
+    systemctl restart "postgresql@$M-$NAME" 2>&1 || pg_ctlcluster "$M" "$NAME" restart 2>&1
+    for i in $(seq 1 60); do pg_isready -q -p "$PORT" && break; sleep 2; done
+    RUN="$(runuser -u postgres -- psql -X -p "$PORT" -tAc 'show server_version' 2>/dev/null | head -1)"
+    RUNV="$(upstream "$RUN")"
+    if [ -z "$RUNV" ] || ! dpkg --compare-versions "$RUNV" ge "$F"; then
+      fail restart "cluster $M/$NAME runs ${RUNV:-no readable version} after the restart, the fix is $F"
+    fi
+    echo "[$(TS)] cluster $M/$NAME now runs $RUNV"
+  done <<< "$CL"
+done
+echo "[$(TS)] === DONE ==="
+echo "done" > "$STATUS"
+'''
+
+
+def _pg_update_dbserver_script(status_file, fixed=None):
+    """The database server's PostgreSQL security-update job (ops #766), as text. Runs ON the
+    database server as root in the transient unit infratak-pg-update. Pure function of its inputs:
+    `status_file` (checked) and the fixed minor of each major version (default: the newest entry
+    of POSTGRES_SECURITY_RELEASES)."""
+    if not re.fullmatch(r'/var/lib/infratak-[a-z-]+/status', status_file or ''):
+        raise ValueError(f'bad status file {status_file!r}')
+    if fixed is None:
+        fixed = ' '.join(f'{m}={v}' for m, v in sorted(POSTGRES_SECURITY_RELEASES[-1]['fixed'].items()))
+    if not _PG_UPDATE_FIXED_RE.fullmatch(fixed):
+        raise ValueError(f'bad fixed-version list {fixed!r}')
+    return (_PG_UPDATE_SCRIPT.replace('@@STATUS@@', shlex.quote(status_file))
+            .replace('@@FIXED@@', shlex.quote(fixed)))
+
+
 def _dbserver_record_read():
     try:
         with open(_DBSERVER_RECORD) as f:
@@ -103024,6 +104073,8 @@ def _dbserver_finish(rec, phase, step='', detail='', s1=None, notices=None):
     _dbserver_record_write(rec)
     _dbserver_standdown_end()
     job = rec.get('job') or 'job'
+    if job == 'pg-update':
+        _PG_REMOTE_CACHE['data'] = None    # the console page asks again instead of showing the old version
     if s1 is not None and job == 'os-upgrade':
         mark = 'done' if phase == 'done' else ('failed:verify:' + (detail or '?') if step == 'verify' else '')
         if mark:
@@ -103036,6 +104087,23 @@ def _dbserver_finish(rec, phase, step='', detail='', s1=None, notices=None):
     except Exception:
         pass
     return rec
+
+
+def _dbserver_pg_confirm(reader=None):
+    """(problem, note) after a pg-update job: the console reads the database's version itself and
+    must see it at or above the fix. A read that fails is a note, never a pass or a failure."""
+    _PG_REMOTE_CACHE['data'] = None
+    try:
+        st = _postgres_remote_status(reader=reader, allow_install=True)
+    except Exception as e:
+        return '', f'the console could not read the new version itself: {str(e)[:80]}'
+    if st is None:
+        return '', ''
+    if st['state'] == 'update':
+        return f"PostgreSQL still reports {st['version']}, below the fix", ''
+    if st['state'] == 'unknown':
+        return '', f"the console could not read the new version itself ({st['reason']})"
+    return '', f"PostgreSQL now reports {st['version']}"
 
 
 def _dbserver_tick(rec, s1, probe_fn=None, sleep=time.sleep, now=time.time):
@@ -103088,6 +104156,27 @@ def _dbserver_tick(rec, s1, probe_fn=None, sleep=time.sleep, now=time.time):
         if raw.startswith('running') and unit[1] not in ('active', 'activating'):
             return _dbserver_finish(rec, 'failed', 'updates', f"the updates job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", s1)
         rec.update({'phase': 'running', 'step': 'updates'})
+        _dbserver_record_write(rec)
+        return rec
+    if job == 'pg-update':
+        if raw.startswith('done'):
+            rec.update({'phase': 'verifying', 'step': 'verify'})
+            _dbserver_record_write(rec)
+            problems, notices = _dbserver_verify(s1, rec, probe_fn=probe_fn, sleep=sleep, now=now)
+            if problems:
+                return _dbserver_finish(rec, 'failed', 'verify', ' '.join(problems), s1, notices)
+            # The core's own reading of the version, with the login TAK Server uses: the proof the
+            # version rose, not only what the machine said about itself.
+            note = _dbserver_pg_confirm()
+            if note[0]:
+                return _dbserver_finish(rec, 'failed', 'verify', note[0], s1, notices)
+            return _dbserver_finish(rec, 'done', '', note[1], s1, notices)
+        if raw.startswith('failed'):
+            code = (raw.split(':', 1) + [''])[1].strip()
+            return _dbserver_finish(rec, 'failed', 'pg-update', _DBSERVER_PG_FAIL.get(code, 'the PostgreSQL update failed. The log says why'), s1)
+        if raw.startswith('running') and unit[1] not in ('active', 'activating'):
+            return _dbserver_finish(rec, 'failed', 'pg-update', f"the PostgreSQL update job stopped without reporting (unit {unit[1] or 'gone'}/{unit[2] or '?'})", s1)
+        rec.update({'phase': 'running', 'step': 'pg-update'})
         _dbserver_record_write(rec)
         return rec
     st = _os_upgrade_job_state(raw=raw, unit=unit)
@@ -103200,6 +104289,18 @@ def _dbserver_start_locked(job, data):
             return 409, {'ok': False, 'error': 'preflight failed: ' + ', '.join(failed), 'preflight': pf}
         script = _os_upgrade_dbserver_script('18')
         return _dbserver_begin(job, s1, pf['baseline'], lambda: _dbserver_launch(s1, job, script))
+    if job == 'pg-update':
+        # ops #766: only for the machine that really holds TAK's database, and only while it is
+        # below the fix. A managed database (RDS, Azure) is never touched from here.
+        try:
+            mode, dbhost, _dbport = _tak_db_topology()
+        except Exception:
+            mode, dbhost = '', ''
+        if mode != 'remote' or not _dbserver_same_host(dbhost, s1['host']):
+            return 409, {'ok': False, 'error': 'TAK Server\'s database is not on the database server this console manages'}
+        cur = _postgres_remote_status(manage=True, allow_install=True)
+        if cur and cur['state'] == 'ok':
+            return 409, {'ok': False, 'error': f"PostgreSQL {cur['version']} on the database server already has the security fix"}
     d, kind, err = _dbserver_probe(s1, 'full')
     if d is None:
         return 409, {'ok': False, 'error': f'cannot reach the database server ({kind}): {err}'}
@@ -103207,6 +104308,9 @@ def _dbserver_start_locked(job, data):
     if busy:
         return 409, {'ok': False, 'error': 'wait for these to finish on the database server: ' + ', '.join(busy)}
     baseline = _dbserver_baseline(d)
+    if job == 'pg-update':
+        script = _pg_update_dbserver_script(_DBSERVER_JOBS['pg-update']['dir'] + '/status')
+        return _dbserver_begin(job, s1, baseline, lambda: _dbserver_launch(s1, job, script))
     if job == 'updates':
         script = _kernel_patch_apt_script('takserver-database', _DBSERVER_JOBS['updates']['dir'] + '/status')
         return _dbserver_begin(job, s1, baseline, lambda: _dbserver_launch(s1, job, script))
@@ -103319,6 +104423,22 @@ def console_dbserver_updates_api():
         return jsonify({'ok': False, 'error': 'not a split install'}), 404
     try:
         code, payload = _dbserver_start('updates')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
+    return jsonify(payload), code
+
+
+@app.route('/api/console/dbserver/pg-update', methods=['POST'])
+@login_required
+def console_dbserver_pg_update_api():
+    """ops #766: install the PostgreSQL security update on the split install's database server
+    over the SSH link the console already holds, and restart PostgreSQL there. Same bar as the
+    database server's Install updates (which also installs PostgreSQL packages): signed in, one job
+    at a time, a confirm in the page. 404 unless this is a split install."""
+    if not _dbserver_routes_available():
+        return jsonify({'ok': False, 'error': 'not a split install'}), 404
+    try:
+        code, payload = _dbserver_start('pg-update')
     except Exception as e:
         return jsonify({'ok': False, 'error': f'start error: {str(e)[:200]}'}), 500
     return jsonify(payload), code
@@ -108485,6 +109605,22 @@ def _startup_harden_cloudtak_ports():
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
 _startup_harden_cloudtak_ports()
+
+
+def _startup_cloudtak_remote_video_fw():
+    """ops #737: a remote CloudTAK deployed before this fix has no rule for :9997 on this box
+    and its video stays broken until the next Update config. Open it on console start."""
+    try:
+        settings = load_settings()
+        cfg = _get_cloudtak_deployment_config(settings)
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed'):
+            return
+        _cloudtak_console_video_fw(cfg, 'allow',
+                                   log_fn=lambda m: print(f"Startup migration: CloudTAK {m.strip()}", flush=True))
+    except Exception as _e:
+        print(f"Startup migration: CloudTAK remote video port error (non-fatal): {_e}")
+
+_startup_cloudtak_remote_video_fw()
 
 
 def _startup_heal_cloudtak_media_hls():
@@ -115544,6 +116680,22 @@ def _post_update_auto_deploy():
 
             _auto_harden_mediamtx()
 
+            # ops #754: Docker databases that float on an upstream tag (Authentik, CloudTAK, TAK
+            # Portal, Remote Assist) keep the build they were created from. Pull and recreate only
+            # a database whose PostgreSQL is below the newest security fix; a fixed box does nothing.
+            try:
+                _postgres_compose_converge(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _pge:
+                print(f"Post-update: PostgreSQL security converge error (non-fatal): {_pge}", flush=True)
+            # ops #755: ATLAS's database container (compose project takmdm, agencies takmdm-<slug>)
+            # needs its own helper: Update only rebuilds ATLAS's api.
+            try:
+                _atlas_pg = (mod_registry.MODULES.get('atlas') or {}).get('refresh_databases')
+                if _atlas_pg:
+                    _atlas_pg(mod_registry.get_ctx(), lambda m: print(f"Post-update: ATLAS {m}", flush=True))
+            except Exception as _ape:
+                print(f"Post-update: ATLAS database refresh error (non-fatal): {_ape}", flush=True)
+
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
             # potentially leaving fresh orphans that the first kill couldn't see.
@@ -116323,6 +117475,9 @@ _MODULE_CTX = {
     # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
+    # ops #755: ATLAS refreshes its own database container; which PostgreSQL minors carry the
+    # security fix is the console's one table (POSTGRES_SECURITY_RELEASES), not a copy in the module.
+    '_pg_releases_missing': _pg_releases_missing,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
