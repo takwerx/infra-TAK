@@ -4678,6 +4678,22 @@ def _require_admin_password(data=None):
     return None
 
 
+# ops #772: "is fail2ban installed" must look at the REAL package, not at `which` and not
+# at /etc/fail2ban alone. The non-root console has /opt/infratak/.shims first on PATH and a
+# fail2ban-client shim lives there whether or not the package exists, so `which` always
+# succeeds. And a package remove (not a purge) keeps /etc/fail2ban (jail.conf, fail2ban.conf),
+# so the directory outlives the package. After the Remove button the card still said
+# "installed" and Install said "already installed". The package puts the client in one of
+# these places; the shim folder is not among them.
+_F2B_REAL_CLIENT_PATHS = ('/usr/bin/fail2ban-client', '/usr/sbin/fail2ban-client',
+                          '/usr/local/bin/fail2ban-client', '/usr/local/sbin/fail2ban-client')
+
+
+def _f2b_installed():
+    """True only when the fail2ban package is on the box (config dir AND the real client)."""
+    return os.path.isdir('/etc/fail2ban') and any(os.path.isfile(p) for p in _F2B_REAL_CLIENT_PATHS)
+
+
 def _probe_run(*a, **kw):
     """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
     /api/modules, /api/modules/version and the guarddog health endpoint; a slow or
@@ -4906,8 +4922,7 @@ def _detect_modules_uncached():
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
     # Fail2ban
-    f2b_installed = (os.path.exists('/etc/fail2ban') and
-                     _run(['which', 'fail2ban-client'], capture_output=True).returncode == 0)
+    f2b_installed = _f2b_installed()   # ops #772: real package, not the shim
     f2b_running = False
     f2b_version = None
     if f2b_installed:
@@ -5743,7 +5758,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
     parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined" style="font-size:26px">shield_toggle</span>Cyber Controls'))
-    if os.path.exists('/etc/fail2ban'):
+    if _f2b_installed():
         parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
@@ -8078,7 +8093,7 @@ def _hardening_assertions():
             'pass' if dd else ('na' if dd is None else 'fail'),
             'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
 
-    if os.path.exists('/etc/fail2ban'):
+    if _f2b_installed():
         active = _service_is_active('fail2ban')
         add('fail2ban_active', 'fail2ban intrusion prevention',
             'pass' if active else ('na' if active is None else 'fail'),
@@ -21445,7 +21460,7 @@ def fail2ban_page():
     from flask import make_response
     r = make_response(render_template('fail2ban.html',
         settings=settings, version=VERSION,
-        installed=os.path.exists('/etc/fail2ban'),
+        installed=_f2b_installed(),
         setup=settings.get('fail2ban_setup', {})))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
@@ -21600,8 +21615,10 @@ def _f2b_is_available():
     POISONED by the broker shim — a fail2ban-client shim sits on the console PATH even when
     fail2ban isn't installed, so `which` returned 0 and the installer falsely refused with
     'fail2ban is already installed'. Check /etc/fail2ban (created by the package, never by
-    the shim) — matches the detect_modules card's `installed` logic."""
-    return os.path.exists('/etc/fail2ban')
+    the shim) — matches the detect_modules card's `installed` logic.
+    ops #772: /etc/fail2ban alone is not enough either: a package remove keeps it. Use
+    _f2b_installed(), which also needs the real client binary."""
+    return _f2b_installed()
 
 def _f2b_parse_status(raw):
     """Parse fail2ban-client status authentik output into a dict."""
