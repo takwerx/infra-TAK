@@ -52860,11 +52860,18 @@ def _etlcat_job(action, prefix):
                             "Delete the layers that use it first.")
                         raise StopIteration
                     log("  ✓ unregistered from CloudTAK")
-                for v in _etlcat_installed().get(prefix, []):
-                    subprocess.run(_sudo_wrap(['docker', 'rmi', _etl.image_tag(prefix, v)]),
-                                   capture_output=True, text=True, timeout=120)
-                    log(f"  ✓ removed image {prefix} {v}")
+                # `docker image rm`, not `docker rmi`: the non-root broker allows only the
+                # long form (its rulebook has no `rmi`), and a refused rmi used to be logged ✓.
                 ok = True
+                for v in _etlcat_installed().get(prefix, []):
+                    rr = subprocess.run(_sudo_wrap(['docker', 'image', 'rm', _etl.image_tag(prefix, v)]),
+                                        capture_output=True, text=True, timeout=120)
+                    if rr.returncode == 0:
+                        log(f"  ✓ removed image {prefix} {v}")
+                    else:
+                        ok = False
+                        log(f"✗ could not remove image {prefix} {v}: "
+                            f"{((rr.stderr or rr.stdout) or '').strip()[:200]}")
     except StopIteration:
         pass
     except Exception as ex:
