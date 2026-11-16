@@ -5187,6 +5187,8 @@ def _run_update(ctx, inst=None):
                 if _renewal['ready']:
                     atlas_renewal.start(
                         lambda action: _compose(ctx, action, timeout=1800, inst=inst), plog)
+                # ops #755: a deployment already on the newest ATLAS still gets the database refresh.
+                refresh_database(ctx, inst, plog)
                 slot.update({'running': False, 'complete': True, 'error': False})
                 return
             # ⚠️ The checkout says done and the box says otherwise. Run the
@@ -5247,6 +5249,9 @@ def _run_update(ctx, inst=None):
             # point at the folder Docker made as root.
             _compose(ctx, 'restart api', timeout=300, inst=inst)
         plog('✓ Containers rebuilt — database and device CA untouched')
+        # ops #755: the rebuild above is `api` only. Bring the PostgreSQL container onto the newest
+        # security minor when one is out (its data store is not touched).
+        refresh_database(ctx, inst, plog)
         plog('  The agent and launcher from this release load on start, and the')
         plog('  new agent is offered to the fleet on each device\'s next check-in.')
         if _renewal['ready']:
@@ -5320,6 +5325,122 @@ def tak_ca_changed(ctx, log):
                                        lambda m, n=name: log(n + ':' + m))
         if result['recreated']:
             _compose(ctx, 'restart api', timeout=300, inst=inst)
+
+
+#: The compose service of an ATLAS deployment's PostgreSQL (container `takmdm-db-1`,
+#: `takmdm-<slug>-db-1` for an agency). ops #755.
+PG_DB_SERVICE = 'db'
+
+
+def _pg_ver(text):
+    """'major.minor' from `postgres --version` output, '' when it has none."""
+    m = re.search(r'(?<![\d.])(\d{2})\.(\d+)(?!\d)', text or '')
+    return '%s.%s' % (m.group(1), m.group(2)) if m else ''
+
+
+def refresh_database(ctx, inst, plog):
+    """ops #755: bring one deployment's PostgreSQL container onto the newest security minor.
+
+    ATLAS Update rebuilds only `api` (`up -d --build api`), so `db` (postgres:16-alpine, a tag the
+    image maker rebuilds at every PostgreSQL minor) kept the build it was created from, for ever.
+    Returns 'ok' | 'fixed' | 'waiting' | 'failed' | 'skipped'. Never raises.
+
+    ⚠️ **Only the `db` service, through this deployment's own compose helper.** An agency is its own
+    compose project (`-p takmdm-<slug>`), so the console's generic converge, which runs `docker
+    compose` from a stack directory, would pull the plain deployment's database for an agency. Here the
+    pull and the recreate both go through `_compose`, which adds `-p` and uses the broker.
+    ⚠️ **Touched only when it has to be:** the running PostgreSQL must be below the newest security fix
+    AND the pulled image must itself carry the fix. A tag that was not rebuilt, or was rebuilt without
+    the fix, changes nothing and the next update tries again. `--no-deps`: never recreates `api`; once
+    the database is replaced the api is only restarted (fresh connections), never rebuilt. The data
+    lives in the bind-mounted `pgdata` store, which a recreate does not touch.
+    """
+    missing = ctx.get('_pg_releases_missing')
+    if not callable(missing):
+        return 'skipped'
+    try:
+        project = instance_paths(ctx, inst)['compose_project']
+        rc, out = _run_root(['docker', 'ps', '-q',
+                             '--filter', 'label=com.docker.compose.project=' + project,
+                             '--filter', 'label=com.docker.compose.service=' + PG_DB_SERVICE])
+        cid = (out or '').split()[0] if rc == 0 and (out or '').split() else ''
+        if not cid:
+            return 'skipped'
+        rc, out = _run_root(['docker', 'exec', cid, 'postgres', '--version'], timeout=20)
+        ver = _pg_ver(out) if rc == 0 else ''
+        if not ver:
+            return 'skipped'
+        if not missing(ver):
+            return 'ok'
+        plog('database runs PostgreSQL ' + ver + ', below the security fix: pulling the current image')
+        r = _compose(ctx, 'pull ' + PG_DB_SERVICE, timeout=900, inst=inst)
+        if r.returncode != 0:
+            plog('⚠ could not pull the database image: ' + (r.stderr or r.stdout or '')[-160:].strip())
+            return 'failed'
+        rc, out = _run_root(['docker', 'inspect', '--format', '{{.Image}} {{.Config.Image}}', cid], timeout=20)
+        bits = (out or '').split()
+        if rc != 0 or len(bits) != 2:
+            return 'failed'
+        rc, now = _run_root(['docker', 'image', 'inspect', '--format', '{{.Id}}', bits[1]], timeout=20)
+        if rc != 0 or not now.strip() or now.strip() == bits[0]:
+            plog('no newer database image is published yet: the next update tries again')
+            return 'waiting'
+        rc, out = _run_root(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'postgres',
+                             bits[1], '--version'], timeout=90)
+        new_img = _pg_ver(out) if rc == 0 else ''
+        if not new_img or missing(new_img):
+            plog('the newest published database image has PostgreSQL ' + (new_img or 'unknown') +
+                 ', not the security fix yet: leaving the running database alone')
+            return 'waiting'
+        r = _compose(ctx, 'up -d --no-deps ' + PG_DB_SERVICE, timeout=240, inst=inst)
+        if r.returncode != 0:
+            plog('✗ recreating the database failed: ' + (r.stderr or r.stdout or '')[-160:].strip())
+            return 'failed'
+        # The database must accept connections again, on the fixed build, before this says done.
+        end, after = time.time() + 90, ''
+        while time.time() < end:
+            rc, out = _run_root(['docker', 'ps', '-q',
+                                 '--filter', 'label=com.docker.compose.project=' + project,
+                                 '--filter', 'label=com.docker.compose.service=' + PG_DB_SERVICE])
+            cid2 = (out or '').split()[0] if rc == 0 and (out or '').split() else ''
+            if cid2 and _run_root(['docker', 'exec', cid2, 'pg_isready', '-q'], timeout=10)[0] == 0:
+                rc, out = _run_root(['docker', 'exec', cid2, 'postgres', '--version'], timeout=20)
+                after = _pg_ver(out) if rc == 0 else ''
+                break
+            time.sleep(3)
+        if after and not missing(after):
+            plog('✓ database now runs PostgreSQL ' + after)
+            # ⚠️ The api keeps its pooled connections to the OLD database process (the engine has no
+            # pool_pre_ping), so after the swap each one fails once with "terminating connection due to
+            # administrator command" (Verified on a test box, Nov 14: the api's 2-minute background check
+            # failed once after every database recreate). A restart of the same container gives it fresh
+            # connections; it takes a few seconds, and the container, its image and the store are untouched.
+            r = _compose(ctx, 'restart api', timeout=300, inst=inst)
+            if r.returncode != 0:
+                plog('⚠ the database is fixed, but restarting the api failed: ' +
+                     (r.stderr or r.stdout or '')[-160:].strip())
+            else:
+                plog('✓ api restarted so it reconnects to the new database')
+            return 'fixed'
+        plog('✗ after the recreate the database reports PostgreSQL ' + (after or 'nothing') + ': check it')
+        return 'failed'
+    except Exception as exc:
+        plog('⚠ PostgreSQL security check failed (non-fatal): ' + str(exc)[:160])
+        return 'failed'
+
+
+def refresh_databases(ctx, log):
+    """ops #755: refresh_database for every built deployment, plain and agency. The console calls
+    this after its own update, through the module spec; ATLAS Update calls refresh_database for the
+    one deployment it just rebuilt. {deployment name: outcome}."""
+    out = {}
+    projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        if not instance_is_built(ctx, inst, projects):
+            continue
+        name = atlas_instances.derive(inst)['name']
+        out[name] = refresh_database(ctx, inst, lambda m, n=name: log(n + ': ' + m))
+    return out
 
 
 def revocation_tick(ctx, log):
@@ -6524,6 +6645,8 @@ def register(ctx):
         'deploy_validate': deploy_validate,
         # ATLAS W460: called by the console after a TAK Server CA rotation.
         'tak_ca_changed': tak_ca_changed,
+        # ops #755: called by the console after its own update (PostgreSQL security minors).
+        'refresh_databases': refresh_databases,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),

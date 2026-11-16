@@ -261,6 +261,7 @@ def _redeploy_ns(remote_env, env_read_ok=True):
         '_cloudtak_upload_limit_heal': lambda **k: None,   # ops #470
         '_cloudtak_remote_custom_compose_sh': lambda: ':',   # GH #261, tested on its own
         '_remote_cloudtak_port_guard': lambda *a, **k: (True, False),   # ops #631, tested on its own
+        '_cloudtak_console_video_fw': lambda *a, **k: ([], []),         # ops #737, tested on its own
         'cloudtak_deploy_log': [], 'cloudtak_deploy_status': status,
     }
     exec(compile(src, 'app.py', 'exec'), ns)

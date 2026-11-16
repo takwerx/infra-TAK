@@ -1,0 +1,14 @@
+{
+  "_comment": "Community ETLs offered in the infra-TAK ETL catalog. Each one is pinned to a commit SHA and passes /module-scan before it is added or bumped. The prefix must be unique: CloudTAK keys integrations by prefix, and a fork of a COE ETL must not collide with the COE one.",
+  "entries": [
+    {
+      "prefix": "etl-caltopo-clptak",
+      "name": "CalTopo Two-Way Sync (community)",
+      "source": "clptak/etl-caltopo",
+      "ref": "deploy",
+      "sha": "3df8f15fe53ebefb1accae3f00044c00e1a6ad91",
+      "author": "Paul (clptak)",
+      "note": "Fork of COE CalTopo: adds TAK->CalTopo Mission Sync, PLI forwarding to CalTopo Trackable Devices, and CalTopo App Tracks as live positions. Pinned to a branch SHA because the fork has no release tag yet."
+    }
+  ]
+}

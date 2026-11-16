@@ -1,0 +1,322 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# infra-TAK — TAK Infrastructure Platform
+# Copyright (C) 2026 Andreas Johansson (TAKWERX)
+"""ETL Runner W2 (v10.4.0): the etl-shim's only door to Docker is the broker `etl` verb.
+
+The spike mounted docker.sock into the shim (host root). The product shim has no socket;
+these tests pin what the verb will and will not do for it:
+  * a fixed schema per action — unknown fields, actions and shapes are denied;
+  * only etl-local:etl-<name>-v<x.y.z> images, never a pull, never another image;
+  * the hardened profile is built by the broker and cannot be overridden by the request;
+  * stop/logs/inspect refuse any container the verb did not start;
+  * the ETL socket admits root and the takwerx-etl uid only, and serves only `etl`.
+"""
+import importlib.util
+import json
+import pathlib
+
+import pytest
+
+SRC = pathlib.Path(__file__).resolve().parent.parent / 'broker' / 'takwerx_broker.py'
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location('tb_etl_test', SRC)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+@pytest.fixture
+def m():
+    return _load()
+
+
+def _run(**over):
+    req = {'op': 'etl', 'action': 'run', 'fn': 'test-layer-7', 'image': 'etl-local:etl-geojson-v2.13.0',
+           'memory_mb': 512, 'env': {'ETL_API': 'http://api:5000', 'ETL_LAYER': '7'}}
+    req.update(over)
+    return req
+
+
+def test_valid_requests_pass(m):
+    m._check_etl(_run())
+    for a in ('list', 'list-images', 'net'):
+        m._check_etl({'op': 'etl', 'action': a})
+    m._check_etl({'op': 'etl', 'action': 'logs', 'id': 'a' * 64, 'since': 1730000000})
+    m._check_etl({'op': 'etl', 'action': 'stop', 'id': 'abcdef012345'})
+
+
+@pytest.mark.parametrize('image', [
+    'alpine', 'etl-local:latest', 'etl-local:etl-x', 'docker.io/etl-local:etl-x-v1.0.0',
+    'etl-local:etl-x-v1.0.0@sha256:00', 'etl-local:etl-x_y-v1.0.0', 'etl-local:etl-x-v1.0.0 ',
+    'other:etl-x-v1.0.0', 'etl-local:etl-x-v1.0.0\n', ['etl-local:etl-x-v1.0.0'],
+])
+def test_only_local_etl_images(m, image):
+    with pytest.raises(m.Denied):
+        m._check_etl(_run(image=image))
+
+
+@pytest.mark.parametrize('extra', [
+    {'HostConfig': {'Privileged': True}}, {'binds': ['/:/host']}, {'network': 'host'},
+    {'user': '0:0'}, {'privileged': True}, {'cap_add': ['SYS_ADMIN']},
+])
+def test_run_rejects_any_extra_field(m, extra):
+    with pytest.raises(m.Denied):
+        m._check_etl(_run(**extra))
+
+
+@pytest.mark.parametrize('bad', [
+    {'memory_mb': 64}, {'memory_mb': 99999}, {'memory_mb': '512'}, {'memory_mb': True},
+    {'fn': '../x'}, {'fn': 'a' * 129}, {'fn': ''},
+    {'env': {'BAD KEY': 'x'}}, {'env': {'X': 1}}, {'env': {'X': 'a\x00b'}}, {'env': ['X=1']},
+    {'env': {f'K{i}': 'v' for i in range(65)}}, {'env': {'BIG': 'x' * (64 * 1024 + 1)}},
+])
+def test_run_shape_denials(m, bad):
+    with pytest.raises(m.Denied):
+        m._check_etl(_run(**bad))
+
+
+@pytest.mark.parametrize('req', [
+    {'op': 'etl', 'action': 'exec'}, {'op': 'etl'}, {'op': 'etl', 'action': 'stop', 'id': 'cloudtak-api-1'},
+    {'op': 'etl', 'action': 'stop', 'id': '../../x'}, {'op': 'etl', 'action': 'logs', 'id': 'a' * 12, 'since': -1},
+    {'op': 'etl', 'action': 'list', 'filters': {'label': ['x']}}, {'op': 'etl', 'action': 'net', 'network': 'host'},
+])
+def test_other_denials(m, req):
+    with pytest.raises(m.Denied):
+        m._check_etl(req)
+
+
+def test_hardened_profile_is_fixed(m):
+    hc = m._etl_host_config(512)
+    assert hc['NetworkMode'] == 'cloudtak_etl'
+    assert hc['ReadonlyRootfs'] is True and hc['Privileged'] is False
+    assert hc['CapDrop'] == ['ALL'] and 'no-new-privileges' in hc['SecurityOpt']
+    assert hc['Binds'] == [] and hc['Mounts'] == [] and hc['Devices'] == []
+    assert hc['Memory'] == hc['MemorySwap'] == 512 * 1048576
+    assert hc['PidsLimit'] == 256
+    assert 'size=512m' in hc['Tmpfs']['/tmp']
+
+
+def test_run_sends_only_broker_built_fields(m, monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+
+    def fake_json(method, path, body=None, ok=(200,)):
+        calls.append((method, path, body))
+        if path.startswith('/images/'):
+            return {'Config': {'Volumes': None}}
+        if path.startswith('/containers/json'):
+            return []
+        if path.startswith('/containers/create'):
+            return {'Id': 'f' * 64}
+        if path.endswith('/start'):
+            return {}
+        return {'NetworkSettings': {'Networks': {'cloudtak_etl': {'IPAddress': '172.30.0.9'}}}}
+    monkeypatch.setattr(m, '_docker_json', fake_json)
+    r = m._do_etl(_run())
+    assert r == {'ok': True, 'id': 'f' * 64, 'name': r['name'], 'ip': '172.30.0.9'}
+    assert r['name'].startswith('etl-run-test-layer-7-')
+    create = next(c for c in calls if c[1].startswith('/containers/create'))[2]
+    assert set(create) == {'Image', 'User', 'Env', 'Labels', 'NetworkDisabled', 'HostConfig'}
+    assert create['Image'] == 'etl-local:etl-geojson-v2.13.0'
+    assert create['User'] == '1000:1000'
+    assert create['Labels'] == {'etl-shim': '1', 'etl-shim.fn': 'test-layer-7', 'etl-shim.mb': '512'}
+    assert create['HostConfig']['NanoCpus'] == m.ETL_NANO_CPUS
+    assert create['HostConfig'] == m._etl_host_config(512)
+    assert 'ETL_LAYER=7' in create['Env']
+
+
+def _no_create(path_ok=('/images/',)):
+    def f(method, path, body=None, ok=(200,)):
+        if path.startswith(path_ok):
+            return {'Config': {}}
+        pytest.fail(f'must not call {method} {path}')
+    return f
+
+
+def test_run_refuses_past_the_container_cap(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+    monkeypatch.setattr(m, '_etl_list', lambda: [{}] * m.ETL_MAX_CONTAINERS)
+    monkeypatch.setattr(m, '_docker_json', _no_create())
+    assert m._do_etl(_run())['code'] == 'LIMIT'
+
+
+def test_run_refuses_past_the_memory_cap(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+    monkeypatch.setattr(m, '_etl_mem_cap_mb', lambda: 3500)
+    monkeypatch.setattr(m, '_etl_list', lambda: [{'Labels': {'etl-shim.mb': '3008'}}, {'Labels': {}}])
+    monkeypatch.setattr(m, '_docker_json', _no_create())
+    r = m._do_etl(_run())                       # 3008 + 128 (unlabelled) + 512 > 3500
+    assert r['code'] == 'LIMIT' and 'limit 3500' in r['error']
+
+
+def test_run_refuses_without_the_egress_block(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: 'egress block is not configured')
+    monkeypatch.setattr(m, '_docker_json', _no_create(()))
+    r = m._do_etl(_run())
+    assert r['code'] == 'EGRESS_NOT_ENFORCED'
+
+
+def test_run_refuses_an_image_with_volumes(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+
+    def f(method, path, body=None, ok=(200,)):
+        if path.startswith('/images/'):
+            return {'Config': {'Volumes': {'/data': {}}}}
+        pytest.fail('must not create')
+    monkeypatch.setattr(m, '_docker_json', f)
+    assert m._do_etl(_run())['code'] == 'IMAGE_VOLUMES'
+
+
+@pytest.mark.parametrize('conf,net,v6,why', [
+    (None, {}, 'kept', 'not configured'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-1234abcd'}}, 'kept', 'does not use bridge'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}, 'EnableIPv6': True}, 'error: x', 'IPv6'),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}, 'EnableIPv6': True}, 'kept', None),
+    ([], {'Options': {'com.docker.network.bridge.name': 'br-cloudtak-etl'}}, 'error: no ip6', None),
+])
+def test_egress_gate(m, monkeypatch, conf, net, v6, why):
+    monkeypatch.setattr(m, '_etl_egress_conf_read', lambda: conf)
+    monkeypatch.setattr(m, '_etl_egress_converge', lambda allow: {'v4': 'kept', 'v6': v6})
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): net)
+    r = m._etl_egress_gate()
+    assert (r is None) if why is None else (why in r)
+
+
+def test_egress_gate_fails_closed_when_converge_fails(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_egress_conf_read', lambda: [])
+
+    def boom(allow):
+        raise RuntimeError('IPv4: iptables locked')
+    monkeypatch.setattr(m, '_etl_egress_converge', boom)
+    assert 'could not be verified' in m._etl_egress_gate()
+
+
+def test_stop_deletes_by_full_id_with_volumes(m, monkeypatch):
+    full = 'a' * 64
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,):
+                        {'Id': full, 'Config': {'Labels': {'etl-shim': '1'}}})
+    seen = []
+    monkeypatch.setattr(m, '_docker_api', lambda method, path, *a, **k: (seen.append((method, path)) or (204, b'')))
+    assert m._do_etl({'op': 'etl', 'action': 'stop', 'id': 'a' * 12})['ok']
+    assert seen == [('DELETE', f'/containers/{full}?force=1&v=1')]
+
+
+def test_stop_refuses_a_container_it_did_not_start(m, monkeypatch):
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): {'Config': {'Labels': {}}})
+    monkeypatch.setattr(m, '_docker_api', lambda *a, **k: pytest.fail('must not delete'))
+    with pytest.raises(m.Denied):
+        m._do_etl({'op': 'etl', 'action': 'stop', 'id': 'a' * 64})
+
+
+def test_etl_socket_admits_only_root_and_the_etl_uid(m, monkeypatch):
+    monkeypatch.setattr(m, '_etl_uid', lambda: 995)
+    h = m._EtlHandler.__new__(m._EtlHandler)
+    assert h._peer_ok(0) and h._peer_ok(995)
+    assert not h._peer_ok(1000) and not h._peer_ok(-1)
+    monkeypatch.setattr(m, '_etl_uid', lambda: None)
+    assert not h._peer_ok(995) and h._peer_ok(0)
+    # and the console user is not on the ETL socket (it has the main one)
+    monkeypatch.setattr(m, '_allowed_peer', lambda uid: True)
+    assert not h._peer_ok(1000)
+
+
+def test_etl_socket_serves_only_the_etl_verb(m, monkeypatch):
+    monkeypatch.setattr(m, 'audit', lambda *a, **k: None)
+    for op in ('exec', 'write', 'read', 'pg_dump', 'etl_setup', 'enforce_enable', 'check', None):
+        r = m._etl_dispatch({'op': op, 'argv': ['id']}, (1, 995, 995))
+        assert r['ok'] is False and r['code'] == 'DENIED', op
+    assert m._etl_dispatch({'op': 'ping'}, (1, 995, 995))['pong'] is True
+
+
+def test_denials_are_fail_closed_even_when_permissive(m, monkeypatch):
+    monkeypatch.setattr(m, 'audit', lambda *a, **k: None)
+    monkeypatch.setattr(m, 'ENFORCE', False)
+    monkeypatch.setattr(m, '_do_etl', lambda req: pytest.fail('must not execute'))
+    r = m._dispatch(_run(image='alpine'), (1, 0, 0))
+    assert r['code'] == 'DENIED'
+
+
+def test_demux(m):
+    frame = lambda s: b'\x01\x00\x00\x00' + len(s).to_bytes(4, 'big') + s
+    assert m._etl_demux(frame(b'a\n') + frame(b'bc')) == 'a\nbc'
+    assert m._etl_demux(b'\x01\x00') == ''
+
+
+def test_etl_setup_takes_no_fields(m):
+    assert m._evaluate({'op': 'etl_setup'})[0] == 'ALLOW'
+    assert m._evaluate({'op': 'etl_setup', 'user': 'root'})[0] == 'DENY'
+    with pytest.raises(m.Denied):
+        m._do_etl_setup({'op': 'etl_setup', 'user': 'root'})
+
+
+def _tls_sandbox(m, monkeypatch, tmp_path):
+    import shutil as _sh
+    openssl = _sh.which('openssl')
+    if not openssl:
+        pytest.skip('openssl not installed')
+    d = tmp_path / 'etl-tls'
+    monkeypatch.setattr(m, 'ETL_TLS_DIR', str(d))
+    monkeypatch.setattr(m, 'BROKER_TRUSTED_PATH', str(pathlib.Path(openssl).parent))
+    monkeypatch.setattr(m.os, 'chown', lambda *a, **k: None)     # not root in CI
+    return d, openssl
+
+
+def test_etl_tls_mints_a_leaf_for_the_sqs_host_and_drops_the_ca_key(m, monkeypatch, tmp_path):
+    import subprocess as _sp
+    d, openssl = _tls_sandbox(m, monkeypatch, tmp_path)
+    out = m._etl_tls_ensure(0)
+    assert out['state'] == 'created'
+    assert out['ca_pem'].startswith('-----BEGIN CERTIFICATE-----')
+    assert sorted(p.name for p in d.iterdir()) == ['ca.pem', 'tls.key', 'tls.pem']   # no ca.key, no .new
+    assert (d / 'tls.key').stat().st_mode & 0o777 == 0o640
+    assert d.stat().st_mode & 0o777 == 0o750
+    v = _sp.run([openssl, 'verify', '-CAfile', str(d / 'ca.pem'), '-verify_hostname', m.ETL_SQS_HOST,
+                 str(d / 'tls.pem')], capture_output=True, text=True)
+    assert v.returncode == 0, v.stderr
+    bad = _sp.run([openssl, 'verify', '-CAfile', str(d / 'ca.pem'), '-verify_hostname', 'api',
+                   str(d / 'tls.pem')], capture_output=True, text=True)
+    assert bad.returncode != 0                                   # good for the SQS host only
+
+
+def test_etl_tls_is_idempotent_and_heals_a_broken_pair(m, monkeypatch, tmp_path):
+    d, _ = _tls_sandbox(m, monkeypatch, tmp_path)
+    first = m._etl_tls_ensure(0)
+    again = m._etl_tls_ensure(0)
+    assert again == {'ca_pem': first['ca_pem'], 'state': 'kept'}
+    (d / 'tls.pem').write_text('garbage')
+    healed = m._etl_tls_ensure(0)
+    assert healed['state'] == 'created' and healed['ca_pem'] != first['ca_pem']
+
+
+def test_etl_tls_refuses_a_symlinked_dir(m, monkeypatch, tmp_path):
+    d, _ = _tls_sandbox(m, monkeypatch, tmp_path)
+    (tmp_path / 'elsewhere').mkdir()
+    d.symlink_to(tmp_path / 'elsewhere')
+    with pytest.raises(RuntimeError):
+        m._etl_tls_ensure(0)
+
+
+def test_a_refused_stop_is_audited_as_deny_only(m, monkeypatch):
+    """etlspike 2026-11-05: a stop of a non-ETL container logged ALLOW, then DENY 'None'."""
+    lines = []
+    monkeypatch.setattr(m, 'audit', lambda peer, op, summary, verdict, detail='': lines.append((op, summary, verdict)))
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): {'Config': {'Labels': {}}})
+    r = m._etl_dispatch({'op': 'etl', 'action': 'stop', 'id': 'a' * 64}, (1, 997, 996))
+    assert r['code'] == 'DENIED'
+    assert lines == [('etl', 'stop id=' + 'a' * 64, 'DENY')]
+
+
+def test_a_docker_failure_is_audited_once_with_the_summary(m, monkeypatch):
+    lines = []
+    monkeypatch.setattr(m, 'audit', lambda peer, op, summary, verdict, detail='': lines.append((summary, verdict)))
+
+    def boom(*a, **k):
+        raise RuntimeError('docker down')
+    monkeypatch.setattr(m, '_etl_egress_gate', lambda: None)
+    monkeypatch.setattr(m, '_docker_json', lambda method, path, body=None, ok=(200,): {'Config': {}})
+    monkeypatch.setattr(m, '_etl_list', boom)
+    with pytest.raises(m._EtlAudited):
+        m._etl_dispatch(_run(), (1, 997, 996))
+    assert lines == [('run fn=test-layer-7 image=etl-local:etl-geojson-v2.13.0 mem=512', 'ERROR')]

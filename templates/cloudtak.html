@@ -240,8 +240,10 @@
     </div>
   </div>
   <div class="card">
-    <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+    <div class="card-title ct-collapse-head" data-collapse="ct-logs" data-default="closed">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span><span class="ct-collapse-icon">&#9662;</span></div>
+    <div id="ct-logs-body">
     <div class="log-box" id="container-logs">Loading...</div>
+    </div>
   </div>
   {% endif %}
 
@@ -253,10 +255,12 @@
   </div>
   {% elif cloudtak_plugins is defined %}
   <div class="card" id="ct-plugins-section">
-    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+    <div class="card-title ct-collapse-head" data-collapse="ct-plugins" data-default="closed">
       <span>Plugins</span>
-      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
+      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0;margin-left:auto">upstream docs ↗</a>
+      <span class="ct-collapse-icon">&#9662;</span>
     </div>
+    <div id="ct-plugins-body">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
       Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
       After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
@@ -308,7 +312,234 @@
       <div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span><button class="btn btn-ghost" style="margin-left:auto;font-size:11px;padding:4px 10px;text-transform:none;letter-spacing:0" onclick="ctCopyPluginLog(this)">⧉ Copy</button></div>
       <div class="log-box" id="ct-plugin-log">Waiting...</div>
     </div>
+    </div>
   </div>
+  {% endif %}
+
+  {% if cloudtak_cfg.get('target_mode') != 'remote' %}
+  <!-- ETL (v10.4.0): infra-TAK turns ETL on and installs ETLs; CloudTAK is where people use them -->
+  <div class="card" id="ct-etl-section">
+    <div class="card-title ct-collapse-head" data-collapse="ct-etl" data-default="open">
+      <span>ETL — data feeds</span>
+      <a href="https://docs.cloudtak.io/integrations/" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0;margin-left:auto">what each ETL does ↗</a>
+      <span class="ct-collapse-icon">&#9662;</span>
+    </div>
+    <div id="ct-etl-body">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.6">
+      An ETL pulls data from another service (CalTopo, Waze, ArcGIS, a drone or tracker platform…) and puts it on the TAK map on a schedule.
+      CloudTAK normally needs an AWS account to run them — with ETL on, they run right here on this server instead.
+      <strong style="color:var(--text-secondary)">1.</strong> Turn ETL on. <strong style="color:var(--text-secondary)">2.</strong> Install the ETLs you want.
+      <strong style="color:var(--text-secondary)">3.</strong> In CloudTAK, open a Connection → Layers → <strong style="color:var(--text-secondary)">+</strong> and pick the ETL's card.
+    </p>
+    <div id="ct-etl-onoff" style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      <span id="ct-etl-state" style="font-size:12px;color:var(--text-dim)">Checking…</span>
+      <button class="btn btn-primary" id="ct-etl-toggle" style="font-size:12px;padding:7px 14px;display:none"></button>
+    </div>
+    <div id="ct-etl-net" style="display:none;margin:-6px 0 16px;font-size:12px;line-height:1.6">
+      <span id="ct-etl-net-state"></span>
+      <a id="ct-etl-net-edit" style="color:var(--cyan);cursor:pointer;margin-left:8px">Allow a private network…</a>
+      <div id="ct-etl-net-form" style="display:none;margin-top:8px;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="ct-etl-net-allow" type="text" placeholder="e.g. 192.168.10.0/24, 10.20.0.5" style="flex:1;min-width:220px;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:12px">
+        <button class="btn btn-primary" id="ct-etl-net-save" style="font-size:12px;padding:7px 14px">Save</button>
+        <div style="width:100%;color:var(--text-dim)">Only for an ETL that must reach a server on your own network. Private addresses only. This server itself and the cloud metadata address stay blocked.</div>
+      </div>
+      <div style="margin-top:6px">
+        <span id="ct-etl-hooks-state"></span>
+        <a id="ct-etl-hooks-rotate" style="color:var(--cyan);cursor:pointer;margin-left:8px">Change webhook password…</a>
+      </div>
+      <div style="margin-top:6px">
+        <span id="ct-etl-cat-state"></span>
+        <a id="ct-etl-cat-check" style="color:var(--cyan);cursor:pointer;margin-left:8px">Check now</a>
+      </div>
+    </div>
+    <div id="ct-etl-filter-row" style="display:none;margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
+      <input id="ct-etl-filter" type="search" placeholder="Search ETLs…" style="flex:1;min-width:200px;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px">
+      <div id="ct-etl-tabs" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+    </div>
+    <div id="ct-etl-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px"></div>
+    <div id="ct-etl-log-card" style="display:none;margin-top:20px">
+      <div class="section-title" style="margin-bottom:10px">ETL Log <span id="ct-etl-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="log-box" id="ct-etl-log">Waiting...</div>
+    </div>
+    </div>
+  </div>
+  <script>
+  (function(){
+    var list = document.getElementById('ct-etl-list'), stateEl = document.getElementById('ct-etl-state'),
+        toggle = document.getElementById('ct-etl-toggle'), filter = document.getElementById('ct-etl-filter');
+    var entries = [], enabled = false, busy = false, working = null;   // working: {prefix, action} of the running job
+    function el(tag, style, text){ var e = document.createElement(tag); if (style) e.style.cssText = style; if (text != null) e.textContent = text; return e; }
+    function badge(text, color){ return el('span', 'font-size:10px;font-weight:600;color:'+color+';border:1px solid '+color+';border-radius:4px;padding:1px 6px;opacity:.85', text); }
+    function btn(text, cls, fn){ var b = el('button', 'font-size:12px;padding:6px 12px', text); b.className = 'btn ' + cls; b.disabled = busy; b.onclick = fn; return b; }
+    var WORKING = {install: 'Installing…', remove: 'Uninstalling…', update: 'Updating…'};
+    // The button the operator pressed shows a spinner until its job ends (operator, v10.4.0 T&E:
+    // a dimmed "Install" during a several-minute build looked stuck).
+    function spin(b, e, action){
+      if (!(working && working.prefix === e.prefix && working.action === action)) return b;
+      b.textContent = ''; b.appendChild(el('span')).className = 'ct-btn-spinner'; b.appendChild(document.createTextNode(WORKING[action]));
+      b.style.opacity = '1'; b.setAttribute('aria-busy', 'true'); return b;
+    }
+    var tab = 'all';
+    var TABS = [['all','All'],['available','Available'],['installed','Installed'],['updates','Updates']];
+    function renderTabs(){
+      var box = document.getElementById('ct-etl-tabs'); box.textContent = '';
+      TABS.forEach(function(t){
+        var n = entries.filter(function(e){ return match(e, t[0]); }).length;
+        var b = el('button', 'font-size:12px;padding:7px 12px', t[1] + ' (' + n + ')');
+        b.className = 'btn ' + (tab === t[0] ? 'btn-primary' : 'btn-ghost');
+        b.onclick = function(){ tab = t[0]; renderTabs(); render(); };
+        box.appendChild(b);
+      });
+    }
+    function match(e, t){
+      var inst = (e.installed || []).length > 0;
+      if (t === 'installed') return inst;
+      if (t === 'available') return !inst && e.installable;
+      if (t === 'updates') return !!e.update;
+      return true;
+    }
+    function render(){
+      list.textContent = '';
+      var q = (filter.value || '').toLowerCase(), shown = 0;
+      entries.forEach(function(e){
+        if (!match(e, tab)) return;
+        if (q && (e.name + ' ' + e.description + ' ' + e.author).toLowerCase().indexOf(q) < 0) return;
+        shown++;
+        var inst = (e.installed || []).length > 0;
+        var card = el('div', 'background:var(--bg-surface);border:1px solid '+(inst?'rgba(16,185,129,.35)':'var(--border)')+';border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;min-height:230px');
+        var head = el('div', 'display:flex;align-items:flex-start;justify-content:space-between;gap:8px');
+        head.appendChild(el('div', 'font-size:15px;font-weight:700;color:var(--text-primary);line-height:1.3', e.name));
+        var tags = el('div', 'display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0');
+        if (inst) tags.appendChild(badge('INSTALLED', 'var(--green)'));
+        if (e.update) tags.appendChild(badge('UPDATE', 'var(--cyan)'));
+        if (e.community) tags.appendChild(badge('COMMUNITY', '#a78bfa'));
+        if (e.flags && e.flags.outgoing) tags.appendChild(badge('TWO-WAY', '#eab308'));
+        head.appendChild(tags); card.appendChild(head);
+        if (e.repo_url && /^https:\/\/github\.com\//.test(e.repo_url)) {
+          var a = el('a', 'font-size:12px;font-weight:600;color:var(--text-secondary);text-decoration:none', 'View Original Repository ↗');
+          a.href = e.repo_url; a.target = '_blank'; a.rel = 'noopener'; card.appendChild(a);
+        }
+        card.appendChild(el('div', 'font-size:12px;color:var(--text-dim)', 'By: ' + e.author + ' · v' + e.version + (inst && e.update ? ' (installed ' + e.installed.join(', ') + ')' : '')));
+        // the full author text is readable on the card: clamped to 5 lines with Show more / less
+        var full_text = (e.description || 'No description from the author.') + (e.note ? '\n\n' + e.note : '');
+        var d = el('div', 'font-size:12.5px;color:var(--text-secondary);line-height:1.5;white-space:pre-line', full_text);
+        var CLAMP = 'overflow:hidden;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical';
+        d.style.cssText += ';' + CLAMP;
+        card.appendChild(d);
+        var more = el('a', 'font-size:12px;color:var(--cyan);cursor:pointer;align-self:flex-start;display:none', 'Show more');
+        more.onclick = function(){
+          var clamped = d.style.webkitLineClamp !== 'unset';
+          d.style.webkitLineClamp = clamped ? 'unset' : '5';
+          d.style.display = clamped ? 'block' : '-webkit-box';
+          more.textContent = clamped ? 'Show less' : 'Show more';
+        };
+        card.appendChild(more);
+        // by length, not layout: a collapsed section has no layout to measure
+        if (full_text.length > 200) more.style.display = '';
+        var foot = el('div', 'display:flex;flex-direction:column;gap:6px;margin-top:auto;padding-top:8px');
+        var full = 'width:100%;font-size:13px;font-weight:600;padding:9px 12px';
+        if (inst) {
+          if (e.update) { var u = btn('Update to v' + e.version, 'btn-primary', function(){ act('update', e); }); u.style.cssText = full; foot.appendChild(spin(u, e, 'update')); }
+          var r = btn('Uninstall', '', function(){ if (confirm('Uninstall ' + e.name + '? CloudTAK will refuse while a layer still uses it.')) act('remove', e); });
+          r.style.cssText = full + ';background:rgba(239,68,68,.85);color:#fff;border:none'; foot.appendChild(spin(r, e, 'remove'));
+        } else if (e.installable && enabled) {
+          var i = btn('Install', 'btn-primary', function(){ act('install', e); }); i.style.cssText = full; foot.appendChild(spin(i, e, 'install'));
+        } else {
+          foot.appendChild(el('div', full + ';text-align:center;border-radius:8px;background:rgba(234,179,8,.12);color:#eab308;border:1px solid rgba(234,179,8,.3)', enabled ? e.reason : 'Turn ETL on first'));
+        }
+        card.appendChild(foot); list.appendChild(card);
+      });
+      if (!shown) list.appendChild(el('div', 'font-size:13px;color:var(--text-dim);padding:12px', 'No ETLs match.'));
+    }
+    function load(){
+      fetch('/api/cloudtak/etl/status').then(function(r){ return r.json(); }).then(function(st){
+        enabled = !!st.enabled;
+        stateEl.textContent = enabled ? ('ETL is ON — runner ' + st.shim) : 'ETL is OFF';
+        stateEl.style.color = enabled ? 'var(--green)' : 'var(--text-dim)';
+        toggle.style.display = ''; toggle.textContent = enabled ? 'Turn ETL off' : 'Turn ETL on';
+        toggle.className = 'btn ' + (enabled ? 'btn-ghost' : 'btn-primary');
+        var net = document.getElementById('ct-etl-net'), ns = document.getElementById('ct-etl-net-state');
+        net.style.display = enabled ? '' : 'none';
+        if (enabled) {
+          var eg = st.egress || {}, allow = eg.allow || [];
+          if (!eg.enforced || !eg.v4) {
+            ns.textContent = 'Network block is NOT active — ETLs can reach this server and your network. Turn ETL off and on again.';
+            ns.style.color = 'var(--red)';
+          } else if ((st.net_missing || []).length) {
+            ns.textContent = 'ETLs cannot reach CloudTAK (' + st.net_missing.join(', ') + ' not on the ETL network). Turn ETL off and on again.';
+            ns.style.color = '#eab308';
+          } else {
+            ns.textContent = 'Network: ETLs reach the internet only — not this server, your network or the cloud metadata service'
+              + (allow.length ? ' (allowed: ' + allow.join(', ') + ')' : '') + '.';
+            ns.style.color = 'var(--text-dim)';
+          }
+          document.getElementById('ct-etl-net-allow').value = allow.join(', ');
+          var hs = document.getElementById('ct-etl-hooks-state');
+          hs.style.color = 'var(--text-dim)';
+          hs.textContent = (st.webhooks && st.webhooks.route)
+            ? 'Webhooks: open — at least one layer receives webhooks. Each URL carries this server\u2019s webhook password; copy it from the layer in CloudTAK.'
+            : 'Webhooks: closed — no layer uses them, so there is no webhook address on the internet.';
+        }
+        return fetch('/api/cloudtak/etl/catalog');
+      }).then(function(r){ return r.json(); }).then(function(d){
+        entries = d.entries || [];
+        var cs = document.getElementById('ct-etl-cat-state'), c = d.catalog || {};
+        document.getElementById('ct-etl-cat-check').style.display = enabled ? '' : 'none';
+        cs.style.color = (c.ok === false) ? '#eab308' : 'var(--text-dim)';
+        cs.textContent = 'ETL list: version ' + (c.serial || '—') + (c.source === 'fetched' ? ' (downloaded, signature checked)' : ' (built into this infra-TAK version)')
+          + (c.checked_at ? '. Last check ' + new Date(c.checked_at * 1000).toLocaleString() + (c.ok === false ? ' failed: ' + (c.error || 'unknown error') : '') : '') + '.';
+        entries.sort(function(a, b){ return ((b.installed||[]).length>0) - ((a.installed||[]).length>0) || a.name.localeCompare(b.name); });
+        document.getElementById('ct-etl-filter-row').style.display = 'flex';
+        renderTabs(); render();
+      }).catch(function(){ stateEl.textContent = 'Could not load ETL status'; });
+    }
+    function follow(logUrl, label){
+      busy = true; render();
+      var card = document.getElementById('ct-etl-log-card'), box = document.getElementById('ct-etl-log');
+      card.style.display = ''; document.getElementById('ct-etl-log-action').textContent = label; box.textContent = 'Starting…';
+      (function poll(){
+        fetch(logUrl).then(function(r){ return r.json(); }).then(function(j){
+          box.textContent = (j.log || []).join('\n') || 'Starting…'; box.scrollTop = box.scrollHeight;
+          if (j.running) return setTimeout(poll, 2000);
+          busy = false; working = null; load();
+        }).catch(function(){ setTimeout(poll, 4000); });
+      })();
+    }
+    function act(action, e){
+      fetch('/api/cloudtak/etl/catalog/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prefix: e.prefix})})
+        .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); working = {prefix: e.prefix, action: action}; follow('/api/cloudtak/etl/catalog/log', action + ' ' + e.name); });
+    }
+    toggle.onclick = function(){
+      var action = enabled ? 'disable' : 'enable';
+      if (!confirm(enabled ? 'Turn ETL off? Running ETL layers stop; installed ETLs and layers are kept.' : 'Turn ETL on? CloudTAK restarts for about a minute.')) return;
+      fetch('/api/cloudtak/etl/' + action, {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'turn ETL ' + (enabled ? 'off' : 'on')); });
+    };
+    document.getElementById('ct-etl-net-edit').onclick = function(){
+      var f = document.getElementById('ct-etl-net-form');
+      f.style.display = f.style.display === 'none' ? 'flex' : 'none';
+    };
+    document.getElementById('ct-etl-net-save').onclick = function(){
+      fetch('/api/cloudtak/etl/egress', {method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({allow: document.getElementById('ct-etl-net-allow').value})})
+        .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); document.getElementById('ct-etl-net-form').style.display = 'none'; load(); });
+    };
+    document.getElementById('ct-etl-hooks-rotate').onclick = function(){
+      if (!confirm('Change the webhook password? Every webhook URL you already gave to an outside service stops working. You must copy each new URL from the layer in CloudTAK. CloudTAK restarts for about a minute.')) return;
+      fetch('/api/cloudtak/etl/rotate-hooks', {method: 'POST'}).then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/log', 'change webhook password'); });
+    };
+    document.getElementById('ct-etl-cat-check').onclick = function(){
+      var cs = document.getElementById('ct-etl-cat-state'); cs.textContent = 'Checking for new ETLs…';
+      fetch('/api/cloudtak/etl/catalog/refresh', {method: 'POST'}).then(function(r){ return r.json(); })
+        .then(function(){ load(); }).catch(function(){ load(); });
+    };
+    filter.oninput = render;
+    load();
+  })();
+  </script>
   {% endif %}
 
   {% else %}
@@ -449,6 +680,26 @@
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script src="/cloudtak/page.js"></script>
+<style>
+.ct-collapse-head{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.ct-collapse-icon{margin-left:auto;font-size:16px;color:var(--text-dim);transition:transform .2s ease}
+.ct-collapse-head a + .ct-collapse-icon{margin-left:0}
+.ct-collapse-head.open .ct-collapse-icon{transform:rotate(180deg)}
+.ct-collapse-head:not(.open){margin-bottom:0}
+</style>
+<script>
+(function(){
+  document.querySelectorAll('.ct-collapse-head').forEach(function(h){
+    var key = h.getAttribute('data-collapse'), body = document.getElementById(key + '-body');
+    if (!body) return;
+    var open = h.getAttribute('data-default') !== 'closed';
+    try { var v = localStorage.getItem('ct-collapse:' + key); if (v !== null) open = v === '1'; } catch (e) {}
+    function apply(){ body.style.display = open ? '' : 'none'; h.classList.toggle('open', open); }
+    h.addEventListener('click', function(){ open = !open; try { localStorage.setItem('ct-collapse:' + key, open ? '1' : '0'); } catch (e) {} apply(); });
+    apply();
+  });
+})();
+</script>
 <script>
 (function(){
   var deploying = document.body.getAttribute('data-deploying') === 'true';

@@ -47,6 +47,8 @@ import base64
 import errno
 import grp
 import hashlib
+import http.client
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -64,6 +66,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -3868,6 +3871,14 @@ def _do_exec(req):
     # nothing legitimate. The child inherits the broker's own root env, plus only
     # the explicit apt non-interactive keys below.
     env = None
+    if _is_etl_build(argv):
+        # ETL images are third-party Dockerfiles: their RUN steps must sit behind the same W5
+        # egress block as ETL runs (no cloud metadata, no LAN, no host). BuildKit cannot attach
+        # a build to a custom network; the classic builder can. Fixed value, this argv only.
+        why = _etl_egress_gate()
+        if why:
+            raise Denied(f'docker build on {ETL_NETWORK}: {why}')
+        env = dict(os.environ, DOCKER_BUILDKIT='0')
     if os.path.basename(argv[0]) in ('apt', 'apt-get'):
         env = dict(os.environ)
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
@@ -6038,6 +6049,729 @@ def _do_pg_old_cluster(req):
             'output': out, **({} if gone else {'error': f'{f["path"]} is still present'})}
 
 
+# ---------------------------------------------------------------------------
+# ETL Runner (v10.4.0 W2): the only door the etl-shim container has to Docker.
+#
+# The shim answers CloudTAK's AWS calls and runs each ETL invocation as a container.
+# The spike mounted docker.sock into it, which is host root. Instead the shim gets ONE
+# verb over its own socket (/run/takwerx-etl/broker.sock, directory-mounted so a broker
+# restart's fresh socket is still visible inside the container), and only the dedicated
+# `takwerx-etl` uid may connect there. Every container it can start is forced onto the
+# same hardened profile: the image is etl-local:<task>, the network is cloudtak_etl, no
+# mounts, no caps, read-only root, uid 1000, memory capped. A compromised shim can run
+# an ETL image it was already given, on the ETL network, and nothing else.
+# ---------------------------------------------------------------------------
+ETL_USER = 'takwerx-etl'
+ETL_SOCKET_DIR = '/run/takwerx-etl'
+ETL_SOCKET = ETL_SOCKET_DIR + '/broker.sock'
+ETL_DATA_DIR = '/var/lib/takwerx-etl'
+ETL_NETWORK = 'cloudtak_etl'
+ETL_IMAGE_RE = re.compile(r'^etl-local:etl-[A-Za-z0-9-]{1,64}-v\d{1,4}\.\d{1,4}\.\d{1,4}$')
+ETL_FN_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+ETL_ID_RE = re.compile(r'^[0-9a-f]{12,64}$')
+ETL_ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
+ETL_MEM_MIN_MB, ETL_MEM_MAX_MB = 128, 3008      # Lambda's classic range; above that is not an ETL
+ETL_MAX_CONTAINERS = 64                         # bounds what a runaway/compromised shim can start
+ETL_NANO_CPUS = 1_000_000_000                   # 1 CPU per run: a miner/fork-heavy ETL cannot starve TAK
+ETL_MEM_TOTAL_FRACTION = 0.5                    # all live ETL containers together: at most half the RAM
+_ETL_RUN_LOCK = threading.Lock()                # count + create are one step (parallel connections)
+ETL_MAX_ENV = 64
+ETL_MAX_ENV_BYTES = 64 * 1024
+ETL_MAX_LOG_BYTES = 1024 * 1024
+ETL_LABEL = 'etl-shim'
+ETL_RUN_USER = '1000:1000'
+ETL_ACTIONS = ('run', 'stop', 'logs', 'inspect', 'list', 'list-images', 'net')
+ETL_MUTATING = ('run', 'stop')
+DOCKER_SOCK = '/var/run/docker.sock'
+# W6/W11: CloudTAK builds a real-AWS SQS QueueUrl, and the SDK ignores the endpoint override for
+# it, so the shim answers that hostname over TLS (network alias) with a cert from a per-box CA.
+# Root-owned, NOT under ETL_DATA_DIR: the shim owns that directory, so it could swap a path
+# there for a symlink and redirect root's writes. root:<etl group> 0750, mounted read-only.
+ETL_TLS_DIR = '/var/lib/takwerx-etl-tls'
+ETL_SQS_HOST = 'sqs.us-east-1.amazonaws.com'     # fleet constant; the overlay pins AWS_REGION to match
+ETL_TLS_DAYS = 3650
+ETL_TLS_RENEW_SEC = 30 * 86400
+
+
+class _DockerConn(http.client.HTTPConnection):
+    def __init__(self, timeout=60):
+        super().__init__('localhost', timeout=timeout)
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(DOCKER_SOCK)
+        self.sock = s
+
+
+def _docker_api(method, path, body=None, timeout=60):
+    """(status, bytes) from the Docker Engine API. Paths are built here from validated
+    values only — nothing from the request is ever concatenated in unchecked."""
+    c = _DockerConn(timeout)
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        c.request(method, path, body=data,
+                  headers={'Content-Type': 'application/json'} if data else {})
+        r = c.getresponse()
+        return r.status, r.read(ETL_MAX_LOG_BYTES * 2)
+    finally:
+        c.close()
+
+
+def _docker_json(method, path, body=None, ok=(200,)):
+    st, buf = _docker_api(method, path, body)
+    if st not in ok:
+        raise RuntimeError(f'docker {method} {path.split("?")[0]}: {st} {buf[:300].decode(errors="replace")}')
+    return json.loads(buf.decode()) if buf else {}
+
+
+def _etl_demux(buf):
+    """Docker's multiplexed log stream (8-byte frame headers) -> text. A TTY-less
+    container always uses it; anything malformed just stops the decode."""
+    out, i = [], 0
+    while i + 8 <= len(buf):
+        n = struct.unpack('>I', buf[i + 4:i + 8])[0]
+        out.append(buf[i + 8:i + 8 + n].decode(errors='replace'))
+        i += 8 + n
+    return ''.join(out)
+
+
+def _check_etl(req):
+    """Fixed schema per action. Raises Denied. Shape errors are denials, never
+    best-effort: an unexpected field is how a 'small' extension sneaks in."""
+    a = req.get('action')
+    if a not in ETL_ACTIONS:
+        raise Denied(f'etl: unknown action {a!r}')
+    fields = {'run': {'fn', 'image', 'env', 'memory_mb'},
+              'stop': {'id'}, 'logs': {'id', 'since'}, 'inspect': {'id'},
+              'list': set(), 'list-images': set(), 'net': set()}[a]
+    extra = set(req) - {'op', 'action', 'timeout'} - fields
+    if extra:
+        raise Denied(f'etl {a}: unexpected fields {sorted(extra)}')
+    if a == 'run':
+        if not isinstance(req.get('fn'), str) or not ETL_FN_RE.fullmatch(req['fn']):
+            raise Denied('etl run: fn must match ' + ETL_FN_RE.pattern)
+        if not isinstance(req.get('image'), str) or not ETL_IMAGE_RE.fullmatch(req['image']):
+            raise Denied('etl run: image must match ' + ETL_IMAGE_RE.pattern)
+        mem = req.get('memory_mb')
+        if not isinstance(mem, int) or isinstance(mem, bool) or not ETL_MEM_MIN_MB <= mem <= ETL_MEM_MAX_MB:
+            raise Denied(f'etl run: memory_mb must be an int {ETL_MEM_MIN_MB}..{ETL_MEM_MAX_MB}')
+        env = req.get('env', {})
+        if not isinstance(env, dict) or len(env) > ETL_MAX_ENV:
+            raise Denied(f'etl run: env must be an object of at most {ETL_MAX_ENV} entries')
+        size = 0
+        for k, v in env.items():
+            if not ETL_ENV_KEY_RE.fullmatch(k) or not isinstance(v, str) or '\x00' in v:
+                raise Denied(f'etl run: bad env entry {k[:40]!r}')
+            size += len(k) + len(v)
+        if size > ETL_MAX_ENV_BYTES:
+            raise Denied('etl run: env too large')
+    if a in ('stop', 'logs', 'inspect'):
+        if not isinstance(req.get('id'), str) or not ETL_ID_RE.fullmatch(req['id']):
+            raise Denied('etl: id must be a docker container id (hex)')
+    if a == 'logs':
+        since = req.get('since', 0)
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            raise Denied('etl logs: since must be a non-negative int (epoch seconds)')
+
+
+def _etl_host_config(mem_mb):
+    """The hardened profile (W4). Built here, never taken from the request."""
+    b = mem_mb * 1048576
+    return {'NetworkMode': ETL_NETWORK, 'Memory': b, 'MemorySwap': b, 'NanoCpus': ETL_NANO_CPUS,
+            'ReadonlyRootfs': True, 'Tmpfs': {'/tmp': f'rw,noexec,nosuid,size={mem_mb}m'},
+            'CapDrop': ['ALL'], 'SecurityOpt': ['no-new-privileges'], 'PidsLimit': 256,
+            'Privileged': False, 'Binds': [], 'Mounts': [], 'Devices': [],
+            'AutoRemove': False, 'RestartPolicy': {'Name': 'no'},
+            'LogConfig': {'Type': 'json-file', 'Config': {'max-size': '1m', 'max-file': '1'}}}
+
+
+def _etl_owned(cid):
+    """Inspect a container and refuse anything this verb did not start."""
+    info = _docker_json('GET', f'/containers/{cid}/json')
+    if (info.get('Config') or {}).get('Labels', {}).get(ETL_LABEL) != '1':
+        raise Denied('etl: container is not an ETL run')
+    return info
+
+
+def _etl_list():
+    flt = urllib.parse.quote(json.dumps({'label': [f'{ETL_LABEL}=1']}))
+    return _docker_json('GET', f'/containers/json?all=1&filters={flt}')
+
+
+def _do_etl(req):
+    _check_etl(req)
+    a = req['action']
+    if a == 'net':
+        net = _docker_json('GET', f'/networks/{ETL_NETWORK}')
+        subs = [c.get('Subnet') for c in (net.get('IPAM') or {}).get('Config') or [] if '.' in (c.get('Subnet') or '')]
+        return {'ok': True, 'network': ETL_NETWORK, 'subnets': subs}
+    if a == 'list':
+        return {'ok': True, 'containers': [
+            {'id': c['Id'], 'name': (c.get('Names') or [''])[0].lstrip('/'),
+             'fn': (c.get('Labels') or {}).get(ETL_LABEL + '.fn', ''), 'state': c.get('State')}
+            for c in _etl_list()]}
+    if a == 'list-images':
+        out = []
+        for im in _docker_json('GET', '/images/json'):
+            for t in im.get('RepoTags') or []:
+                if ETL_IMAGE_RE.fullmatch(t):
+                    out.append({'tag': t.split(':', 1)[1], 'digest': im.get('Id'),
+                                'capabilities': (im.get('Labels') or {}).get('com.cloudtak.capabilities')})
+        return {'ok': True, 'images': out}
+    if a == 'run':
+        why = _etl_egress_gate()
+        if why:
+            return {'ok': False, 'code': 'EGRESS_NOT_ENFORCED', 'error': why}
+        img = _docker_json('GET', f'/images/{urllib.parse.quote(req["image"], safe=":")}/json')
+        if (img.get('Config') or {}).get('Volumes'):
+            # A VOLUME would give a writable host-disk volume past ReadonlyRootfs (and outlive the run).
+            return {'ok': False, 'code': 'IMAGE_VOLUMES', 'error': 'etl: image declares VOLUMEs; refused'}
+        with _ETL_RUN_LOCK:
+            live = _etl_list()
+            if len(live) >= ETL_MAX_CONTAINERS:
+                return {'ok': False, 'code': 'LIMIT', 'error': f'{ETL_MAX_CONTAINERS} ETL containers already exist'}
+            used = sum(int((c.get('Labels') or {}).get(ETL_LABEL + '.mb') or ETL_MEM_MIN_MB) for c in live)
+            cap = _etl_mem_cap_mb()
+            if used + req['memory_mb'] > cap:
+                return {'ok': False, 'code': 'LIMIT',
+                        'error': f'ETL containers would use {used + req["memory_mb"]} MB (limit {cap} MB)'}
+            name = f'etl-run-{req["fn"]}-{int(time.time() * 1000)}'
+            body = {'Image': req['image'], 'User': ETL_RUN_USER,
+                    'Env': [f'{k}={v}' for k, v in (req.get('env') or {}).items()],
+                    'Labels': {ETL_LABEL: '1', ETL_LABEL + '.fn': req['fn'],
+                               ETL_LABEL + '.mb': str(req['memory_mb'])},
+                    'NetworkDisabled': False, 'HostConfig': _etl_host_config(req['memory_mb'])}
+            # Engine API create never pulls: an image that is not already local is a 404.
+            created = _docker_json('POST', f'/containers/create?name={urllib.parse.quote(name)}', body, ok=(201,))
+        cid = created['Id']
+        try:
+            _docker_json('POST', f'/containers/{cid}/start', ok=(204, 304))
+            info = _docker_json('GET', f'/containers/{cid}/json')
+        except Exception:
+            _docker_api('DELETE', f'/containers/{cid}?force=1&v=1')
+            raise
+        ip = (((info.get('NetworkSettings') or {}).get('Networks') or {}).get(ETL_NETWORK) or {}).get('IPAddress')
+        return {'ok': True, 'id': cid, 'name': name, 'ip': ip}
+    cid = req['id']
+    info = _etl_owned(cid)
+    if a == 'inspect':
+        st = info.get('State') or {}
+        ip = (((info.get('NetworkSettings') or {}).get('Networks') or {}).get(ETL_NETWORK) or {}).get('IPAddress')
+        return {'ok': True, 'id': info.get('Id'), 'running': bool(st.get('Running')),
+                'exit_code': st.get('ExitCode'), 'oom_killed': bool(st.get('OOMKilled')),
+                'image': (info.get('Config') or {}).get('Image'), 'ip': ip}
+    if a == 'logs':
+        st, buf = _docker_api('GET', f'/containers/{cid}/logs?stdout=1&stderr=1&timestamps=1&since={int(req.get("since", 0))}')
+        if st != 200:
+            raise RuntimeError(f'docker logs: {st}')
+        text = _etl_demux(buf)
+        return {'ok': True, 'logs': text[-ETL_MAX_LOG_BYTES:], 'truncated': len(text) > ETL_MAX_LOG_BYTES}
+    # stop: force-remove (an ETL run is throwaway; nothing to keep)
+    st, buf = _docker_api('DELETE', f'/containers/{info["Id"]}?force=1&v=1')
+    if st not in (204, 404):
+        raise RuntimeError(f'docker rm: {st} {buf[:200].decode(errors="replace")}')
+    return {'ok': True}
+
+
+def _etl_summary(req):
+    a = req.get('action')
+    if a == 'run':
+        return f"run fn={str(req.get('fn'))[:128]} image={str(req.get('image'))[:100]} mem={req.get('memory_mb')}"
+    if a in ('stop', 'logs', 'inspect'):
+        return f"{a} id={str(req.get('id'))[:64]}"
+    return str(a)[:40]
+
+
+def _etl_uid():
+    try:
+        return pwd.getpwnam(ETL_USER).pw_uid
+    except KeyError:
+        return None
+
+
+def _do_etl_setup(req):
+    """Console-only (main socket): create the takwerx-etl system user if missing and
+    start the ETL listener. Idempotent. Returns the uid/gid the shim container runs as."""
+    extra = set(req) - {'op', 'timeout'}
+    if extra:
+        raise Denied(f'etl_setup: takes no fields: {sorted(extra)}')
+    if _etl_uid() is None:
+        useradd = shutil.which('useradd', path=BROKER_TRUSTED_PATH)
+        nologin = next((p for p in ('/usr/sbin/nologin', '/sbin/nologin') if os.path.exists(p)), '/bin/false')
+        if not useradd:
+            return {'ok': False, 'error': 'useradd not found'}
+        r = subprocess.run([useradd, '--system', '--no-create-home', '--home-dir', '/nonexistent',
+                            '--shell', nologin, '--user-group', ETL_USER],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 and _etl_uid() is None:
+            return {'ok': False, 'error': (r.stderr or r.stdout).strip()[-300:]}
+    pw = pwd.getpwnam(ETL_USER)
+    # The shim's state (stacks, run history). Owned by the ETL user, nobody else reads it:
+    # it holds the layer env CloudTAK put in the template, which includes the layer token.
+    if os.path.islink(ETL_DATA_DIR):
+        return {'ok': False, 'error': f'{ETL_DATA_DIR} is a symlink — refusing'}
+    os.makedirs(ETL_DATA_DIR, exist_ok=True)
+    os.chown(ETL_DATA_DIR, pw.pw_uid, pw.pw_gid)
+    os.chmod(ETL_DATA_DIR, 0o700)
+    try:
+        tls = _etl_tls_ensure(pw.pw_gid)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        return {'ok': False, 'error': f'etl tls: {e}'[-300:]}
+    started = _etl_listener_start()
+    return {'ok': True, 'user': ETL_USER, 'uid': pw.pw_uid, 'gid': pw.pw_gid,
+            'socket_dir': ETL_SOCKET_DIR, 'data_dir': ETL_DATA_DIR,
+            'tls_dir': ETL_TLS_DIR, 'sqs_host': ETL_SQS_HOST, 'ca_pem': tls['ca_pem'],
+            'tls': tls['state'], 'listener': 'started' if started else 'running'}
+
+
+def _etl_tls_valid(openssl):
+    """The leaf in ETL_TLS_DIR exists, is for ETL_SQS_HOST, chains to the CA next to it and
+    is not within ETL_TLS_RENEW_SEC of expiry."""
+    ca, leaf, key = (os.path.join(ETL_TLS_DIR, n) for n in ('ca.pem', 'tls.pem', 'tls.key'))
+    if not all(os.path.isfile(p) and not os.path.islink(p) for p in (ca, leaf, key)):
+        return False
+    v = subprocess.run([openssl, 'verify', '-CAfile', ca, '-verify_hostname', ETL_SQS_HOST, leaf],
+                       capture_output=True, text=True, timeout=30)
+    if v.returncode != 0:
+        return False
+    e = subprocess.run([openssl, 'x509', '-noout', '-checkend', str(ETL_TLS_RENEW_SEC), '-in', leaf],
+                       capture_output=True, text=True, timeout=30)
+    return e.returncode == 0
+
+
+def _etl_tls_ensure(etl_gid):
+    """Create (or renew) the per-box CA + leaf the shim serves ETL_SQS_HOST with. Idempotent:
+    a valid pair is left alone. The CA key never lands in ETL_TLS_DIR — it is created in a
+    root-only temp dir and deleted once the leaf is signed, so nothing can mint another cert
+    CloudTAK's `api`/`events` would trust. Returns {'ca_pem', 'state'}."""
+    openssl = shutil.which('openssl', path=BROKER_TRUSTED_PATH)
+    if not openssl:
+        raise RuntimeError('openssl not found')
+    if os.path.islink(ETL_TLS_DIR):
+        raise RuntimeError(f'{ETL_TLS_DIR} is a symlink — refusing')
+    os.makedirs(ETL_TLS_DIR, exist_ok=True)
+    os.chown(ETL_TLS_DIR, 0, etl_gid)
+    os.chmod(ETL_TLS_DIR, 0o750)
+    state = 'kept'
+    if not _etl_tls_valid(openssl):
+        state = 'created'
+        with tempfile.TemporaryDirectory(prefix='etl-tls-') as tmp:   # 0700, root
+            def ossl(*args):
+                r = subprocess.run([openssl, *args], capture_output=True, text=True, timeout=60, cwd=tmp)
+                if r.returncode != 0:
+                    raise RuntimeError(f'openssl {args[0]}: {(r.stderr or r.stdout).strip()[-200:]}')
+            ext = os.path.join(tmp, 'leaf.ext')
+            with open(ext, 'w') as f:
+                f.write('basicConstraints=critical,CA:FALSE\n'
+                        'keyUsage=critical,digitalSignature\n'
+                        'extendedKeyUsage=serverAuth\n'
+                        f'subjectAltName=DNS:{ETL_SQS_HOST}\n')
+            ossl('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+                 '-keyout', 'ca.key', '-out', 'ca.pem', '-days', str(ETL_TLS_DAYS),
+                 '-subj', '/CN=infra-TAK ETL Runner local CA',
+                 '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
+                 '-addext', 'keyUsage=critical,keyCertSign,cRLSign')
+            ossl('req', '-new', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+                 '-keyout', 'tls.key', '-out', 'tls.csr', '-subj', f'/CN={ETL_SQS_HOST}')
+            ossl('x509', '-req', '-in', 'tls.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key',
+                 '-set_serial', '0x' + os.urandom(16).hex(), '-days', str(ETL_TLS_DAYS),
+                 '-sha256', '-extfile', ext, '-out', 'tls.pem')
+            # Into the root-owned dir: write next to the target, then rename (atomic per file).
+            for name, mode in (('tls.key', 0o640), ('tls.pem', 0o644), ('ca.pem', 0o644)):
+                dst = os.path.join(ETL_TLS_DIR, name)
+                part = dst + '.new'
+                shutil.copyfile(os.path.join(tmp, name), part)
+                os.chown(part, 0, etl_gid)
+                os.chmod(part, mode)
+                os.replace(part, dst)
+        # ca.key goes with the temp dir.
+    with open(os.path.join(ETL_TLS_DIR, 'ca.pem')) as f:
+        return {'ca_pem': f.read(), 'state': state}
+
+
+# ---------------------------------------------------------------------------
+# ETL Runner W5 (v10.4.0): egress block for ETL containers.
+#
+# ETLs run third-party code with network access. Docker already keeps them off CloudTAK's
+# other networks, but two paths stay open without this: (1) through the bridge to any
+# private / CGNAT / link-local address — the LAN, other boxes, a cloud's metadata service
+# (169.254.169.254 hands out instance credentials); (2) to the HOST itself (console :5001,
+# TAK :8443/:8089, every published container port), which is INPUT, not FORWARD, so
+# DOCKER-USER never sees it. The ETL network has a fixed bridge name, so both rule sets
+# match the interface and survive container restarts. Allowed: the ETL network itself
+# (ETL -> api:5000), DNS, the public internet, and admin-listed private CIDRs (FORWARD
+# only — the allow-list can never open the host). Rejected, not dropped, so a blocked ETL
+# fails fast with a clear error instead of hanging to its timeout.
+# State: ETL_EGRESS_CONF (root 0600). Present = enforced; the egress-watch thread re-asserts
+# the rules every ETL_EGRESS_HEAL_SEC (reboot, docker restart, firewall reload).
+# ---------------------------------------------------------------------------
+def _etl_mem_cap_mb():
+    try:
+        with open('/proc/meminfo') as f:
+            kb = int(re.search(r'^MemTotal:\s+(\d+)\s+kB', f.read(), re.M).group(1))
+        return max(ETL_MEM_MAX_MB, int(kb / 1024 * ETL_MEM_TOTAL_FRACTION))
+    except (OSError, AttributeError, ValueError):
+        return ETL_MEM_MAX_MB
+
+
+def _etl_egress_gate():
+    """None when an ETL container may start, else the reason. No run without the egress block:
+    the conf must exist, the rules converge now (this also closes the boot window where Docker
+    put its own FORWARD rules above ours), the network must use the bridge the rules match, and
+    an IPv6-enabled network needs the IPv6 rules."""
+    allow = _etl_egress_conf_read()
+    if allow is None:
+        return 'egress block is not configured (turn ETL on from the console)'
+    try:
+        with _ETL_EGRESS_LOCK:
+            st = _etl_egress_converge(allow)
+        net = _docker_json('GET', f'/networks/{ETL_NETWORK}')
+    except Exception as e:  # noqa: BLE001 — any failure means not enforced
+        return f'egress block could not be verified: {e}'[:300]
+    if (net.get('Options') or {}).get('com.docker.network.bridge.name') != ETL_BRIDGE:
+        return f'{ETL_NETWORK} does not use bridge {ETL_BRIDGE}; the egress rules would not match it'
+    if net.get('EnableIPv6') and st.get('v6') not in ('applied', 'kept'):
+        return f'{ETL_NETWORK} has IPv6 but the IPv6 egress rules are not in place ({st.get("v6")})'
+    return None
+
+
+ETL_BRIDGE = 'br-cloudtak-etl'                  # 15 chars: the Linux IFNAMSIZ limit
+ETL_EGRESS_CHAIN = 'TAKWERX-ETL'
+ETL_EGRESS_CHAIN_IN = 'TAKWERX-ETL-IN'
+ETL_EGRESS_CONF = '/var/lib/takwerx-etl-egress.json'
+ETL_EGRESS_HEAL_SEC = 60
+ETL_EGRESS_MAX_ALLOW = 32
+ETL_EGRESS_BLOCK = {
+    4: ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
+        '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4',
+        '240.0.0.0/4',
+        '168.63.129.16/32'),   # Azure WireServer: public address, VM goal state (DNS on 53 stays reachable)
+    6: ('::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8'),
+}
+_ETL_EGRESS_LOCK = threading.Lock()
+_ETL_EGRESS_WATCH = {'started': False}
+
+
+def _etl_egress_allow_norm(allow):
+    """Validate the admin allow-list. Every entry must be a private / CGNAT network (that is
+    the only thing the block stops, so anything else is a mistake) and never loopback or
+    link-local — the metadata service stays blocked whatever an admin types. Returns the
+    sorted, de-duplicated canonical strings. Raises Denied."""
+    if not isinstance(allow, list) or len(allow) > ETL_EGRESS_MAX_ALLOW:
+        raise Denied(f'etl_egress: allow must be a list of at most {ETL_EGRESS_MAX_ALLOW} CIDRs')
+    out = set()
+    cgnat = ipaddress.ip_network('100.64.0.0/10')
+    for a in allow:
+        if not isinstance(a, str) or not re.fullmatch(r'[0-9A-Fa-f:./]{2,49}', a):
+            raise Denied(f'etl_egress: bad CIDR: {str(a)[:60]!r}')
+        try:
+            n = ipaddress.ip_network(a, strict=False)
+        except ValueError:
+            raise Denied(f'etl_egress: bad CIDR: {a!r}')
+        if n.is_loopback or n.is_link_local or n.is_multicast or n.is_unspecified or n.is_reserved \
+                or (n.version == 4 and n.overlaps(ipaddress.ip_network('0.0.0.0/8'))):
+            raise Denied(f'etl_egress: {n} can never be allowed (loopback / link-local / multicast / reserved)')
+        if n.prefixlen < (8 if n.version == 4 else 16):
+            raise Denied(f'etl_egress: {n} is too wide')
+        if not (n.is_private or (n.version == 4 and n.subnet_of(cgnat))):
+            raise Denied(f'etl_egress: {n} is not a private network (public addresses are already allowed)')
+        out.add(str(n))
+    return sorted(out, key=lambda s: (ipaddress.ip_network(s).version, s))
+
+
+def _etl_egress_specs(version, allow):
+    """(forward_rules, input_rules) for one IP family, each rule an argv tail after
+    `-A <chain>`. The first FORWARD rule carries a hash of the whole set, so a check is one
+    `-S` and a grep, independent of how a given iptables version prints the rest."""
+    fwd = [['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'RETURN'],
+           ['-o', ETL_BRIDGE, '-j', 'RETURN'],
+           ['-p', 'udp', '--dport', '53', '-j', 'RETURN'],
+           ['-p', 'tcp', '--dport', '53', '-j', 'RETURN']]
+    fwd += [['-d', a, '-j', 'RETURN'] for a in allow if ipaddress.ip_network(a).version == version]
+    rej = 'icmp-admin-prohibited' if version == 4 else 'adm-prohibited'
+    fwd += [['-d', b, '-j', 'REJECT', '--reject-with', rej] for b in ETL_EGRESS_BLOCK[version]]
+    inp = [['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'RETURN'],
+           ['-j', 'REJECT', '--reject-with', rej]]
+    tag = hashlib.sha256(json.dumps([fwd, inp]).encode()).hexdigest()[:16]
+    for rules in (fwd, inp):
+        rules.insert(0, ['-m', 'comment', '--comment', f'takwerx-etl-{tag}'])
+    return fwd, inp, tag
+
+
+def _etl_egress_tools():
+    """[(version, iptables-binary)] for the families this box has. IPv4 is required."""
+    out = []
+    for v, name in ((4, 'iptables'), (6, 'ip6tables')):
+        b = shutil.which(name, path=BROKER_TRUSTED_PATH)
+        if b:
+            out.append((v, b))
+    return out
+
+
+def _ipt(binary, *args):
+    return subprocess.run([binary, '-w', '10', *args], capture_output=True, text=True, timeout=30)
+
+
+def _etl_egress_converge(allow):
+    """Make the rules exactly what `allow` says, for every family. Idempotent and cheap when
+    already right (a few -S/-C calls). Returns {'v4': state, 'v6': state}; raises
+    RuntimeError if IPv4 could not be enforced."""
+    states = {}
+    tools = _etl_egress_tools()
+    if not any(v == 4 for v, _ in tools):
+        raise RuntimeError('iptables not found')
+    for v, ipt in tools:
+        fwd, inp, tag = _etl_egress_specs(v, allow)
+        try:
+            changed = False
+            for chain, rules in ((ETL_EGRESS_CHAIN, fwd), (ETL_EGRESS_CHAIN_IN, inp)):
+                cur = _ipt(ipt, '-S', chain)
+                if cur.returncode != 0:
+                    r = _ipt(ipt, '-N', chain)
+                    if r.returncode != 0:
+                        raise RuntimeError(f'-N {chain}: {r.stderr.strip()[-200:]}')
+                    cur_lines = []
+                else:
+                    cur_lines = [ln for ln in cur.stdout.splitlines() if ln.startswith('-A ')]
+                ok = (len(cur_lines) == len(rules)
+                      and f'takwerx-etl-{tag}' in (cur_lines[0] if cur_lines else ''))
+                if not ok:
+                    _ipt(ipt, '-F', chain)
+                    for spec in rules:
+                        r = _ipt(ipt, '-A', chain, *spec)
+                        if r.returncode != 0:
+                            raise RuntimeError(f'-A {chain} {" ".join(spec)}: {r.stderr.strip()[-200:]}')
+                    changed = True
+            # Hooks. FORWARD goes through DOCKER-USER when Docker made it (Docker keeps that
+            # jump first in FORWARD); otherwise FORWARD itself.
+            hook = 'DOCKER-USER' if _ipt(ipt, '-S', 'DOCKER-USER').returncode == 0 else 'FORWARD'
+            if hook == 'DOCKER-USER':
+                # A boot where the broker beat Docker hooked FORWARD; DOCKER-USER now covers it.
+                for _ in range(8):
+                    if _ipt(ipt, '-D', 'FORWARD', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode != 0:
+                        break
+            if hook == 'FORWARD':
+                # Docker (started after us) inserts its own FORWARD rules at the top, which would
+                # ACCEPT ETL traffic before our jump. Keep our jump first until DOCKER-USER exists.
+                first = [ln for ln in _ipt(ipt, '-S', 'FORWARD').stdout.splitlines() if ln.startswith('-A ')][:1]
+                if first and f'-j {ETL_EGRESS_CHAIN}' not in first[0]:
+                    for _ in range(8):
+                        if _ipt(ipt, '-D', 'FORWARD', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode != 0:
+                            break
+            for parent, child in ((hook, ETL_EGRESS_CHAIN), ('INPUT', ETL_EGRESS_CHAIN_IN)):
+                jump = ['-i', ETL_BRIDGE, '-j', child]
+                if _ipt(ipt, '-C', parent, *jump).returncode != 0:
+                    r = _ipt(ipt, '-I', parent, '1', *jump)
+                    if r.returncode != 0:
+                        raise RuntimeError(f'-I {parent}: {r.stderr.strip()[-200:]}')
+                    changed = True
+            states[f'v{v}'] = 'applied' if changed else 'kept'
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            if v == 4:
+                raise RuntimeError(f'IPv4: {e}')
+            states[f'v{v}'] = f'error: {e}'[:200]     # IPv6 off / no ip6 filter table
+    return states
+
+
+def _etl_egress_teardown():
+    """Remove every hook and both chains, all families. Idempotent."""
+    for _v, ipt in _etl_egress_tools():
+        for parent, child in (('DOCKER-USER', ETL_EGRESS_CHAIN), ('FORWARD', ETL_EGRESS_CHAIN),
+                              ('INPUT', ETL_EGRESS_CHAIN_IN)):
+            for _ in range(8):           # duplicates from an older bug must not survive
+                if _ipt(ipt, '-D', parent, '-i', ETL_BRIDGE, '-j', child).returncode != 0:
+                    break
+        for chain in (ETL_EGRESS_CHAIN, ETL_EGRESS_CHAIN_IN):
+            _ipt(ipt, '-F', chain)
+            _ipt(ipt, '-X', chain)
+
+
+def _etl_egress_conf_read():
+    try:
+        with open(ETL_EGRESS_CONF) as f:
+            c = json.load(f)
+        return _etl_egress_allow_norm(c.get('allow') or [])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, Denied):
+        return []        # damaged state: enforce with no allow-list (fail closed)
+
+
+def _etl_egress_conf_write(allow):
+    if os.path.islink(ETL_EGRESS_CONF):
+        os.unlink(ETL_EGRESS_CONF)
+    part = ETL_EGRESS_CONF + '.new'
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({'allow': allow}, f)
+    os.replace(part, ETL_EGRESS_CONF)
+
+
+def _etl_egress_watch():
+    while True:
+        time.sleep(ETL_EGRESS_HEAL_SEC)
+        try:
+            with _ETL_EGRESS_LOCK:
+                allow = _etl_egress_conf_read()
+                if allow is None:
+                    continue
+                st = _etl_egress_converge(allow)
+            if 'applied' in st.values() and AUDIT:
+                AUDIT.info(json.dumps({'op': 'etl_egress', 'verdict': 'INFO',
+                                       'summary': f'egress rules re-applied: {st}'}))
+        except Exception as e:  # noqa: BLE001 — the watch must outlive one bad pass
+            if AUDIT:
+                AUDIT.info(json.dumps({'op': 'etl_egress', 'verdict': 'ERROR',
+                                       'summary': f'egress heal failed: {e}'[:300]}))
+
+
+def _etl_egress_watch_start():
+    with _ETL_EGRESS_LOCK:
+        if _ETL_EGRESS_WATCH['started']:
+            return
+        _ETL_EGRESS_WATCH['started'] = True
+    if _etl_egress_conf_read() is not None:
+        try:
+            with _ETL_EGRESS_LOCK:
+                _etl_egress_converge(_etl_egress_conf_read())
+        except Exception:  # noqa: BLE001 — the watch retries in a minute
+            pass
+    threading.Thread(target=_etl_egress_watch, daemon=True, name='etl-egress-watch').start()
+
+
+def _check_etl_egress(req):
+    extra = set(req) - {'op', 'action', 'allow', 'timeout'}
+    if extra:
+        raise Denied(f'etl_egress: unknown fields: {sorted(extra)}')
+    action = req.get('action')
+    if action not in ('apply', 'remove', 'status'):
+        raise Denied(f'etl_egress: unknown action: {action!r}')
+    if action == 'apply':
+        _etl_egress_allow_norm(req.get('allow', []))
+    elif 'allow' in req:
+        raise Denied(f'etl_egress {action}: takes no allow')
+
+
+def _do_etl_egress(req):
+    action = req['action']
+    with _ETL_EGRESS_LOCK:
+        if action == 'apply':
+            allow = _etl_egress_allow_norm(req.get('allow', []))
+            # An allow entry over a Docker network would open other stacks' containers (Postgres,
+            # Authentik, TAK) to every ETL. Refuse it; the ETL net reaches its own peers anyway.
+            for net in _docker_json('GET', '/networks'):
+                for c in (net.get('IPAM') or {}).get('Config') or []:
+                    try:
+                        dn = ipaddress.ip_network(c.get('Subnet') or '', strict=False)
+                    except ValueError:
+                        continue
+                    for a in allow:
+                        n = ipaddress.ip_network(a)
+                        if n.version == dn.version and n.overlaps(dn):
+                            raise Denied(f'etl_egress: {n} overlaps Docker network '
+                                         f'{str(net.get("Name"))[:64]} ({dn}); refused')
+            _etl_egress_conf_write(allow)        # first: the watch enforces even if this pass fails
+            try:
+                st = _etl_egress_converge(allow)
+            except RuntimeError as e:
+                return {'ok': False, 'error': str(e)[-300:]}
+            return {'ok': True, 'allow': allow, 'state': st}
+        if action == 'remove':
+            if os.path.lexists(ETL_EGRESS_CONF):
+                os.unlink(ETL_EGRESS_CONF)
+            _etl_egress_teardown()
+            return {'ok': True}
+        allow = _etl_egress_conf_read()
+        out = {'ok': True, 'enforced': allow is not None, 'allow': allow or [],
+               'bridge': os.path.isdir(f'/sys/class/net/{ETL_BRIDGE}')}
+        for v, ipt in _etl_egress_tools():
+            _fwd, _inp, tag = _etl_egress_specs(v, allow or [])
+            hook = 'DOCKER-USER' if _ipt(ipt, '-S', 'DOCKER-USER').returncode == 0 else 'FORWARD'
+            s = _ipt(ipt, '-S', ETL_EGRESS_CHAIN)
+            si = _ipt(ipt, '-S', ETL_EGRESS_CHAIN_IN)
+            out[f'v{v}'] = bool(
+                s.returncode == 0 and f'takwerx-etl-{tag}' in s.stdout
+                and si.returncode == 0 and f'takwerx-etl-{tag}' in si.stdout
+                and _ipt(ipt, '-C', hook, '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN).returncode == 0
+                and _ipt(ipt, '-C', 'INPUT', '-i', ETL_BRIDGE, '-j', ETL_EGRESS_CHAIN_IN).returncode == 0)
+        return out
+
+
+_ETL_SRV = {'srv': None}
+_ETL_SRV_LOCK = threading.Lock()
+
+
+def _etl_listener_start():
+    """Serve the ETL socket if the ETL user exists. Returns True if it started now.
+    The directory is root:<etl group> 0750 and the socket 0660, so only root and the
+    ETL user can even reach it; the handler checks the peer uid again regardless."""
+    with _ETL_SRV_LOCK:
+        if _ETL_SRV['srv'] is not None:
+            return False
+        try:
+            pw = pwd.getpwnam(ETL_USER)
+        except KeyError:
+            return False
+        try:
+            if os.path.islink(ETL_SOCKET_DIR):
+                os.unlink(ETL_SOCKET_DIR)
+            os.makedirs(ETL_SOCKET_DIR, exist_ok=True)
+            os.chown(ETL_SOCKET_DIR, 0, pw.pw_gid)
+            os.chmod(ETL_SOCKET_DIR, 0o750)
+            if os.path.lexists(ETL_SOCKET):
+                os.unlink(ETL_SOCKET)
+            srv = _Server(ETL_SOCKET, _EtlHandler)
+            os.chown(ETL_SOCKET, 0, pw.pw_gid)
+            os.chmod(ETL_SOCKET, 0o660)
+        except OSError as e:
+            if AUDIT:
+                AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
+                                       'summary': f'etl listener: {e}'}))
+            return False
+        _ETL_SRV['srv'] = srv
+        threading.Thread(target=srv.serve_forever, daemon=True, name='etl-listener').start()
+        if AUDIT:
+            AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                                   'summary': f'listening on {ETL_SOCKET} (uid {pw.pw_uid} only)'}))
+        return True
+
+
+def _etl_dispatch(req, peer):
+    """The ETL socket's whole surface: ping + etl. Fail-closed in both broker modes."""
+    op = req.get('op')
+    if op == 'ping':
+        return {'ok': True, 'pong': True}
+    if op != 'etl':
+        audit(peer, str(op)[:40], '', 'DENY', 'etl socket serves only the etl verb')
+        return {'ok': False, 'code': 'DENIED', 'error': 'etl socket serves only the etl verb'}
+    verdict, reason = _evaluate(req)
+    if verdict == 'DENY':
+        audit(peer, 'etl', _etl_summary(req), 'DENY', reason)
+        return {'ok': False, 'code': 'DENIED', 'error': reason}
+    # Runs happen every minute per layer; audit what changes state, not every read — and
+    # audit the OUTCOME: stop's ownership check runs inside _do_etl, so logging ALLOW up
+    # front recorded refused stops as allowed (seen live on etlspike, 2026-11-05).
+    try:
+        resp = _do_etl(req)
+    except Denied as d:
+        audit(peer, 'etl', _etl_summary(req), 'DENY', str(d))
+        return {'ok': False, 'code': 'DENIED', 'error': str(d)}
+    except Exception as e:  # noqa: BLE001 — recorded here with the real summary, then re-raised
+        audit(peer, 'etl', _etl_summary(req), 'ERROR', f'{type(e).__name__}: {e}'[:300])
+        raise _EtlAudited(e)
+    if req.get('action') in ETL_MUTATING:
+        audit(peer, 'etl', _etl_summary(req), 'ALLOW' if resp.get('ok') else 'ERROR',
+              '' if resp.get('ok') else str(resp.get('error'))[:300])
+    return resp
+
+
+class _EtlAudited(Exception):
+    """An ETL failure already written to the audit log; the handler must not log it twice."""
+    def __init__(self, inner):
+        super().__init__(f'{type(inner).__name__}: {inner}')
+
+
 def _evaluate(req):
     """Return ('ALLOW'|'DENY', reason) for a data-plane request WITHOUT executing
     it. Never raises."""
@@ -6077,6 +6811,13 @@ def _evaluate(req):
             _check_certifi_upgrade(req)
         elif op == 'pg_old_cluster':
             _check_pg_old_cluster(req)
+        elif op == 'etl':
+            _check_etl(req)
+        elif op == 'etl_setup':
+            if set(req) - {'op', 'timeout'}:
+                raise Denied('etl_setup: takes no fields')
+        elif op == 'etl_egress':
+            _check_etl_egress(req)
         elif op == 'mediamtx_account':
             _check_mediamtx_account(req)
         elif op == 'gd_render':
@@ -6261,6 +7002,25 @@ def _dispatch(req, peer):
         if op == 'gd_remove':
             return _do_gd_remove(req)
         return _do_pgminer_scan(req)
+    if op == 'etl':
+        # The console reaches the same verb on the main socket (status, uninstall
+        # clean-up). Same schema, same fail-closed gate as the ETL socket.
+        return _etl_dispatch(req, peer)
+    if op == 'etl_setup':
+        verdict, reason = _evaluate(req)
+        audit(peer, 'etl_setup', ETL_USER, verdict, reason)
+        if verdict == 'DENY':
+            return {'ok': False, 'code': 'DENIED', 'error': reason}
+        return _do_etl_setup(req)
+    if op == 'etl_egress':
+        # Console-only (main socket). Not reachable from the ETL socket: the shim must never
+        # be able to loosen the box's own egress block.
+        verdict, reason = _evaluate(req)
+        audit(peer, 'etl_egress', f"{req.get('action')} allow={req.get('allow') or []}"[:300],
+              verdict, reason)
+        if verdict == 'DENY':
+            return {'ok': False, 'code': 'DENIED', 'error': reason}
+        return _do_etl_egress(req)
     if op in ('exec', 'write', 'read'):
         verdict, reason = _evaluate(req)
         summary = _summary(req)
@@ -6642,10 +7402,16 @@ class _Handler(socketserver.BaseRequestHandler):
         finally:
             _inflight_add(-1)
 
+    def _peer_ok(self, uid):
+        return _allowed_peer(uid)
+
+    def _route(self, req, peer):
+        return _dispatch(req, peer)
+
     def _handle(self):
         conn = self.request
         peer = _peercred(conn)
-        if not _allowed_peer(peer[1]):
+        if not self._peer_ok(peer[1]):
             audit(peer, 'connect', '', 'DENY', 'unauthorized peer uid')
             try:
                 conn.sendall(json.dumps({'ok': False, 'code': 'DENIED',
@@ -6657,7 +7423,9 @@ class _Handler(socketserver.BaseRequestHandler):
         try:
             raw = _recv_all(conn)
             req = json.loads(raw.decode())
-            resp = _dispatch(req, peer)
+            if not isinstance(req, dict):
+                raise Denied('request must be a JSON object')
+            resp = self._route(req, peer)
         except Denied as d:
             # A Denied raised OUTSIDE _evaluate (so _dispatch never audited it) —
             # log it here so EVERY refusal hits the audit chokepoint, not just
@@ -6668,6 +7436,8 @@ class _Handler(socketserver.BaseRequestHandler):
         except subprocess.TimeoutExpired:
             resp = {'ok': False, 'code': 'TIMEOUT', 'error': 'command timed out'}
             audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', 'command timed out')
+        except _EtlAudited as e:
+            resp = {'ok': False, 'code': 'ERROR', 'error': str(e)}
         except Exception as e:  # noqa: BLE001 — broker must never crash a worker thread
             resp = {'ok': False, 'code': 'ERROR', 'error': f'{type(e).__name__}: {e}'}
             audit(peer, _summary_safe(req, 'op'), _summary_safe(req), 'ERROR', f'{type(e).__name__}: {e}')
@@ -6681,6 +7451,16 @@ class _Handler(socketserver.BaseRequestHandler):
             conn.sendall(data)
         except OSError:
             pass
+
+
+class _EtlHandler(_Handler):
+    """/run/takwerx-etl/broker.sock: root or the takwerx-etl uid only, etl verb only.
+    The console user is deliberately NOT admitted here — it has the main socket."""
+    def _peer_ok(self, uid):
+        return uid == 0 or (uid >= 0 and uid == _etl_uid())
+
+    def _route(self, req, peer):
+        return _etl_dispatch(req, peer)
 
 
 class _MediamtxHandler(socketserver.BaseRequestHandler):
@@ -7371,15 +8151,45 @@ def _unit_point_at_root(unit_path=BROKER_UNIT, run=None):
     return True
 
 
+# v10.4.0 T&E (aws-arm, 2026-11-16 00:02:41Z): a restart signals the whole unit cgroup, so a
+# self-restart in the middle of a brokered command kills that command. The first root move
+# restarted 2 s after the broker came up, while the console's startup was running a CloudTAK
+# `docker compose up -d --force-recreate` through it:
+#     takwerx-broker.service: Killing process 824020 (docker) with signal SIGKILL.
+# cloudtak-api-1 was left removed until the next console start. So the self-restart waits for
+# nothing in flight first (the broker keeps serving meanwhile — the console only waits 30 s
+# for a missing socket), then unlinks the socket so new callers wait for the new broker,
+# serves what connected just before for `grace`, drains that, and only then restarts.
+SELF_RESTART_DRAIN_MAX_SECS = 900       # longer than any compose up/recreate the console runs
+SELF_RESTART_LATE_DRAIN_SECS = 20       # inside the console's 30 s missing-socket wait
+
+
+def _self_restart_when_idle(run, systemctl, drain=None, unlink=None, sleep=time.sleep,
+                            grace=RECYCLE_UNLINK_GRACE_SECS, log=None):
+    drain = drain or _drain
+    unlink = unlink or _unlink_socket
+    log = log or (lambda v, s: AUDIT and AUDIT.info(json.dumps(
+        {'op': 'self-restart', 'verdict': v, 'summary': s})))
+    if _inflight() > 0:
+        log('INFO', 'self-restart: waiting for %d request(s) in flight' % _inflight())
+    if not drain(max_secs=SELF_RESTART_DRAIN_MAX_SECS):
+        log('ERROR', 'self-restart: %d request(s) still running after %ds — restarting anyway'
+            % (_inflight(), SELF_RESTART_DRAIN_MAX_SECS))
+    unlink()
+    sleep(grace)
+    if not drain(max_secs=SELF_RESTART_LATE_DRAIN_SECS):
+        log('ERROR', 'self-restart: %d late request(s) still running after %ds — restarting anyway'
+            % (_inflight(), SELF_RESTART_LATE_DRAIN_SECS))
+    run([systemctl, '--no-block', 'restart', 'takwerx-broker'], capture_output=True,
+        timeout=30)
+
+
 def _restart_self_later(delay=2.0, run=None):
-    """Restart this broker after the reply went out (the restart kills this process)."""
+    """Restart this broker after the reply went out (the restart kills this process), once
+    nothing is in flight (see _self_restart_when_idle)."""
     run = run or subprocess.run
     systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
-
-    def _go():
-        run([systemctl, '--no-block', 'restart', 'takwerx-broker'], capture_output=True,
-            timeout=30)
-    t = threading.Timer(delay, _go)
+    t = threading.Timer(delay, _self_restart_when_idle, args=(run, systemctl))
     t.daemon = True
     t.start()
     return t
@@ -7549,6 +8359,8 @@ def serve():
                                'summary': 'recycle threshold overridden to %ds '
                                           '(TAKWERX_BROKER_RECYCLE_SECS test hook)' % _after}))
     _audit_clean_window_cached()   # warm the readiness cache so the first ping is fast
+    _etl_listener_start()          # no-op unless the ETL Runner created its user (v10.4.0)
+    _etl_egress_watch_start()      # re-asserts the ETL egress block while it is configured (W5)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -7591,6 +8403,18 @@ _DOCKER_VALUE_FLAGS = frozenset((
     '-c', '--context', '-H', '--host', '-l', '--log-level', '--config',          # docker
     '-f', '--file', '-p', '--project-name', '--profile', '--env-file',           # compose
     '--project-directory', '--progress', '--ansi', '--parallel'))
+
+
+def _is_etl_build(argv):
+    """True for `docker build ... --network cloudtak_etl ...` (also `--network=`)."""
+    if not argv or os.path.basename(argv[0]) != 'docker' or 'build' not in argv[1:2]:
+        return False
+    for i, a in enumerate(argv):
+        if a == '--network' and i + 1 < len(argv) and argv[i + 1] == ETL_NETWORK:
+            return True
+        if a == f'--network={ETL_NETWORK}':
+            return True
+    return False
 
 
 def default_timeout(argv):
