@@ -137,10 +137,10 @@ sudo systemctl restart takwerx-console</pre>
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Reset console password</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
 <p>Enter your current password and choose a new one of at least 12 characters. The console will restart and you'll use the new password for 5001 and Uninstall all. <em>Only works when you're already logged in.</em> For a full lockout, use the CLI (README has the commands).</p>
-<div class="form-field"><label>Current password</label><input type="password" id="reset-current" placeholder="Current console password"></div>
-<div class="form-field"><label>New password</label><input type="password" id="reset-new" placeholder="At least 12 characters"></div>
-<div class="form-field"><label>Confirm new password</label><input type="password" id="reset-confirm" placeholder="Same as above"></div>
-<button type="button" class="btn btn-primary" onclick="doResetPassword()">Reset password</button>
+<div class="form-field"><label>Current password</label><div style="position:relative"><input type="password" id="reset-current" placeholder="Current console password" autocomplete="current-password" style="padding-right:40px"><span onclick="toggleResetPw('reset-current',this)" class="material-symbols-outlined" role="button" tabindex="0" title="Show password" aria-label="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span></div></div>
+<div class="form-field"><label>New password</label><div style="position:relative"><input type="password" id="reset-new" placeholder="At least 12 characters" autocomplete="new-password" oninput="resetPwCount()" style="padding-right:40px"><span onclick="toggleResetPw('reset-new',this)" class="material-symbols-outlined" role="button" tabindex="0" title="Show password" aria-label="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span></div><div id="reset-new-count" style="font-size:12px;color:var(--text-dim);margin-top:4px">0 of 12 characters</div></div>
+<div class="form-field"><label>Confirm new password</label><div style="position:relative"><input type="password" id="reset-confirm" placeholder="Same as above" autocomplete="new-password" style="padding-right:40px"><span onclick="toggleResetPw('reset-confirm',this)" class="material-symbols-outlined" role="button" tabindex="0" title="Show password" aria-label="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span></div></div>
+<button type="button" class="btn btn-primary" id="reset-btn" onclick="doResetPassword()">Reset password</button>
 <div id="reset-msg"></div>
 </div></div>
 <div class="help-card">
@@ -207,9 +207,42 @@ async function doResetPassword(){
     try{
         var r=await fetch('/api/console/password/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:neu,new_password_confirm:conf})});
         var d=await r.json();
-        if(d.success){msg.style.color='var(--green)';msg.textContent=d.message||'Password updated. Reload in a few seconds.';}
+        if(d.success){
+            ['reset-current','reset-new','reset-confirm'].forEach(function(id){var i=document.getElementById(id);i.value='';i.type='password';});
+            document.querySelectorAll('#reset-console-password .material-symbols-outlined[role=button]').forEach(function(e){e.textContent='visibility';e.title='Show password';e.setAttribute('aria-label','Show password');});
+            resetPwCount();
+            msg.style.color='var(--cyan)';msg.textContent='Password updated. The console is restarting…';
+            resetWaitForRestart(msg);
+        }
         else{msg.style.color='var(--red)';msg.textContent=d.error||'Failed';}
     }catch(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';}
+}
+function toggleResetPw(id,eye){
+    var i=document.getElementById(id);var show=i.type==='password';
+    i.type=show?'text':'password';
+    eye.textContent=show?'visibility_off':'visibility';
+    eye.title=show?'Hide password':'Show password';eye.setAttribute('aria-label',eye.title);
+}
+document.addEventListener('keydown',function(e){var t=e.target;if((e.key==='Enter'||e.key===' ')&&t&&t.getAttribute&&t.getAttribute('role')==='button'&&t.closest&&t.closest('#reset-console-password')){e.preventDefault();t.click();}});
+function resetPwCount(){
+    var n=(document.getElementById('reset-new').value||'').length;var c=document.getElementById('reset-new-count');
+    c.textContent=n+' of 12 characters'+(n>=12?' ✓':'');c.style.color=n>=12?'var(--green)':'var(--text-dim)';
+}
+// The console restarts itself ~2 s after the reply. Wait for it to go down and come back
+// (or, on a fast box, just to answer again after the restart window) and say so.
+function resetWaitForRestart(msg){
+    var t0=Date.now(),wentDown=false;
+    function ping(){
+        fetch('/help',{method:'HEAD',cache:'no-store'}).catch(function(){return null;})
+        .then(function(r){
+            var up=!!(r&&r.ok);var el=(Date.now()-t0)/1000;
+            if(!up)wentDown=true;
+            if(up&&(wentDown||el>=20)){msg.style.color='var(--green)';msg.textContent='✓ Password updated and the console restarted. Use the new password next time you sign in.';return;}
+            if(el>600){msg.style.color='var(--red)';msg.textContent='Password updated, but the console has not answered for 10 minutes. Reload this page.';return;}
+            setTimeout(ping,2000);
+        });
+    }
+    setTimeout(ping,3000);
 }
 async function doApplySshPort(){
     var inp=document.getElementById('ssh-port-input');
