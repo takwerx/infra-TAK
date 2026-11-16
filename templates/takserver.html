@@ -923,7 +923,7 @@ function restoreSnapshot(label){
 // download). A refusal is shown in the dialog, without leaving the page.
 // (No hidden frame: every console response carries X-Frame-Options DENY. The password is
 // checked first with check=1, which streams nothing; then the real form starts the download.)
-var _snapDlLabel='';
+var _snapDlLabel='',_snapDlBusy=false;
 function downloadSnapshot(label){
   _snapDlLabel=label;
   var m=document.getElementById('snap-dl-modal'),p=document.getElementById('snap-dl-password'),e=document.getElementById('snap-dl-msg'),n=document.getElementById('snap-dl-name');
@@ -936,9 +936,11 @@ function downloadSnapshot(label){
 function doDownloadSnapshot(){
   var p=document.getElementById('snap-dl-password'),e=document.getElementById('snap-dl-msg'),pw=p?p.value:'';
   if(!pw){if(e)e.textContent='Enter the console password';if(p)p.focus();return;}
+  if(_snapDlBusy)return;
+  _snapDlBusy=true;
   if(e){e.style.color='var(--text-dim)';e.textContent='Checking…';}
   var url='/api/takserver/snapshot/'+encodeURIComponent(_snapDlLabel)+'/download';
-  function fail(msg){if(e){e.style.color='var(--red)';e.textContent=String(msg||'Download refused').slice(0,200);}}
+  function fail(msg){_snapDlBusy=false;if(e){e.style.color='var(--red)';e.textContent=String(msg||'Download refused').slice(0,200);}}
   fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},
              body:'check=1&admin_password='+encodeURIComponent(pw)})
     .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};},function(){return {ok:false,d:{error:'Download refused ('+r.status+')'}};});})
@@ -949,6 +951,7 @@ function doDownloadSnapshot(){
       document.body.appendChild(f);f.submit();document.body.removeChild(f);
       if(p)p.value='';
       var m=document.getElementById('snap-dl-modal');if(m)m.classList.remove('open');
+      setTimeout(function(){_snapDlBusy=false;},3000);
     }).catch(function(){fail('Network error');});
 }
 

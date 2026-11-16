@@ -34,6 +34,7 @@ import re
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import tarfile
 import threading
@@ -51,13 +52,14 @@ ADMIN_PASSWORD = 'console-password-831'
 
 # Functions this change adds. Where they do not exist, the route tests run the routes as
 # they are, so each test still answers for the behaviour it names.
-NEW_FUNCS = ('_ca_cert_fact', '_ca_key_pub', '_ca_key_stem', '_ca_private_files', '_is_ca_private_file',
-             '_tak_ca_private_lockdown', '_tak_ca_private_lockdown_all')
+NEW_FUNCS = ('_ca_cert_fact', '_ca_pem_key_pubs', '_ca_der_key_pub', '_ca_p12_key_pubs', '_ca_jks_key_certs',
+             '_ca_file_fact', '_ca_key_stem', '_ca_file_stem', '_ca_private_files', '_is_ca_private_file',
+             '_ca_private_verdict_or_refuse_all', '_tak_ca_private_lockdown', '_tak_ca_private_lockdown_all')
 OLD_FUNCS = ('_is_ca_private_material', '_cert_file_bytes', '_private_key_pubkey', '_send_cert_file_priv',
              '_validate_snapshot_label', '_require_admin_password',
              'list_cert_files', 'download_cert_file', 'certs_page', 'takserver_snapshot_download_api')
 NEW_GLOBALS = ('_CA_SCAN_LOCK', '_CA_SCAN_FACTS', '_CA_SCAN_DIRS', '_CA_CERT_EXTS', '_CA_KEYSTORE_EXTS',
-               '_CA_NAME_LEFTOVER_RE')
+               '_CA_NAME_LEFTOVER_RE', '_CA_SCAN_MAX_BYTES', '_CA_PEM_KEY_RE', '_CA_OID_P7_DATA', '_CA_OID_PBE')
 
 
 def _func(name, required=True):
@@ -132,6 +134,24 @@ def _p12(d, out, cert, key):
          '-passout', f'pass:{PASSWORD}', '-out', out, cwd=d)
 
 
+def _der(d, pem_name):
+    return subprocess.run(['openssl', 'x509', '-in', pem_name, '-outform', 'DER'], cwd=d, check=True,
+                          capture_output=True).stdout
+
+
+def _jks(entries):
+    """A real JKS file (Java's own format): entries are ('key' | 'cert', alias, [DER certificates])."""
+    out = b'\xfe\xed\xfe\xed' + struct.pack('>II', 2, len(entries))
+    for kind, alias, chain in entries:
+        a = alias.encode()
+        out += struct.pack('>I', 1 if kind == 'key' else 2) + struct.pack('>H', len(a)) + a + struct.pack('>Q', 0)
+        if kind == 'key':
+            out += struct.pack('>I', 16) + b'sealed-key-bytes' + struct.pack('>I', len(chain))
+        for c in chain:
+            out += struct.pack('>H', 5) + b'X.509' + struct.pack('>I', len(c)) + c
+    return out + b'\0' * 20
+
+
 def _intermediate(d, name):
     """What `makeCert.sh ca NAME` leaves in the folder."""
     _ca(d, name, issuer='root')
@@ -139,30 +159,39 @@ def _intermediate(d, name):
     (d / f'{name}-signing.jks').write_bytes((d / f'{name}-signing.p12').read_bytes())   # stand-in bytes
     (d / f'{name}-trusted.pem').write_bytes((d / f'{name}.pem').read_bytes())
     (d / f'{name}.crl').write_bytes(b'crl')
-    (d / f'truststore-{name}.jks').write_bytes(b'truststore')
+    (d / f'truststore-{name}.jks').write_bytes(_jks([('cert', name.lower(), [_der(d, f'{name}.pem')])]))
     _ssl('pkcs12', '-export', '-nokeys', '-in', f'{name}.pem', '-passout', f'pass:{PASSWORD}',
          '-out', f'truststore-{name}.p12', cwd=d)
 
 
-CA_PRIVATE = ['INTERMEDIATE-CA-01.key', 'INT-CA-02.key',            # <CA name>.key
+# CA private material the file names show (what the file-mode step sets)
+CA_BY_NAME = ['INTERMEDIATE-CA-01.key', 'INT-CA-02.key',            # <CA name>.key
               'INT-CA-00.key',                                      # its certificate is gone, the .crl is not
               'ca-do-not-share.key', 'root-ca-do-not-share.key',    # the name rule
               'INTERMEDIATE-CA-01-signing.p12', 'INTERMEDIATE-CA-01-signing.jks',
-              'INT-CA-02-signing.p12', 'INT-CA-02-signing.jks',
-              'key-backup.key',                                     # a renamed copy of the live CA key
-              'old-ca.p12']                                         # a keystore holding a CA key
-ORPHANS = ['stray.key']                                             # belongs to no certificate here
-SERVED = ['admin.key', 'admin.pem', 'admin.p12', 'takserver.key', 'takserver.pem', 'svc.key', 'svc.pem',
-          'martiuser.key.pk8', 'martiuser.pem', 'ca.pem', 'root-ca.pem', 'INT-CA-02.pem',
+              'INT-CA-02-signing.p12', 'INT-CA-02-signing.jks']
+# CA private material only the content shows: copies under any name or extension
+CA_BY_CONTENT = ['key-backup.key', 'INT-CA-02.key.bak', 'notes.txt', 'link.txt',   # PEM copies (one a symlink)
+                 'cakey.der', 'x.crt',                               # DER copies
+                 'old-ca.p12', 'backup.keystore', 'truststore-copy.p12', 'backup.jks',   # PKCS#12 keystores
+                 'java.jks']                                         # a real JKS with the CA's key entry
+CA_PRIVATE = CA_BY_NAME + CA_BY_CONTENT
+ORPHANS = ['stray.key',                                             # belongs to no certificate here
+           'otherpass.p12']                                         # a keystore the console cannot open
+SERVED = ['admin.key', 'admin.pem', 'admin.p12', 'admin.jks', 'admin.csr', 'admin-trusted.pem',
+          'takserver.key', 'takserver.pem', 'takserver.p12', 'takserver-trusted.pem',
+          'svc.key', 'svc.pem', 'svc.p12', 'martiuser.key.pk8', 'martiuser.pem',
+          'ca.pem', 'ca-trusted.pem', 'ca.crl', 'root-ca.pem', 'INT-CA-02.pem', 'INT-CA-02-trusted.pem',
           'INTERMEDIATE-CA-01.pem', 'truststore-INT-CA-02.p12', 'truststore-INT-CA-02.jks',
-          'INT-CA-02.crl']
+          'truststore-root.p12', 'fed-truststore.jks', 'client-java.jks',
+          'INT-CA-02.crl', 'crl_index.txt', 'config-takserver.cfg']
 
 
 @pytest.fixture
 def certs(cert_template, tmp_path):
     """A fresh copy per test (modes kept); the keys are made once per session."""
     d = tmp_path / 'files'
-    shutil.copytree(cert_template, d)
+    shutil.copytree(cert_template, d, symlinks=True)
     return d
 
 
@@ -175,8 +204,35 @@ def cert_template(tmp_path_factory):
         _intermediate(d, name)
     _leaf(d, 'admin', 'INT-CA-02')
     _p12(d, 'admin.p12', 'admin.pem', 'admin.plain')
+    (d / 'admin.jks').write_bytes((d / 'admin.p12').read_bytes())      # keytool's .jks is PKCS#12 since Java 9
+    (d / 'admin.csr').write_bytes(b'-----BEGIN CERTIFICATE REQUEST-----\nMIIB\n-----END CERTIFICATE REQUEST-----\n')
     _leaf(d, 'takserver', 'INT-CA-02', eku='serverAuth,clientAuth')
+    _p12(d, 'takserver.p12', 'takserver.pem', 'takserver.plain')
     _leaf(d, 'svc', 'INT-CA-02')
+    _ssl('pkcs12', '-export', '-in', 'svc.pem', '-inkey', 'svc.plain', '-passout', 'pass:another-password',
+         '-out', 'svc.p12', cwd=d)
+    # makeCert.sh appends ca-trusted.pem to NAME-trusted.pem for EVERY certificate, so a client's
+    # NAME-trusted.pem holds the CA's certificate and nothing of the client's.
+    for leaf in ('admin', 'takserver', 'svc'):
+        (d / f'{leaf}-trusted.pem').write_bytes((d / 'INT-CA-02-trusted.pem').read_bytes())
+    (d / 'ca-trusted.pem').write_bytes((d / 'INT-CA-02-trusted.pem').read_bytes())
+    (d / 'ca.crl').write_bytes(b'crl')
+    (d / 'crl_index.txt').write_text('V\t271116000000Z\t\t01\tunknown\t/CN=admin\n')
+    (d / 'config-takserver.cfg').write_text('[ req ]\ndefault_bits = 2048\n')
+    _ssl('pkcs12', '-export', '-nokeys', '-in', 'root.pem', '-passout', f'pass:{PASSWORD}',
+         '-out', 'truststore-root.p12', cwd=d)
+    (d / 'fed-truststore.jks').write_bytes(_jks([('cert', 'root', [_der(d, 'root.pem')])]))
+    (d / 'client-java.jks').write_bytes(_jks([('key', 'admin', [_der(d, 'admin.pem'), _der(d, 'INT-CA-02.pem')])]))
+    # copies of CA keys under other names, extensions and formats
+    (d / 'java.jks').write_bytes(_jks([('cert', 'root', [_der(d, 'root.pem')]),
+                                       ('key', 'int-ca-02', [_der(d, 'INT-CA-02.pem'), _der(d, 'root.pem')])]))
+    _p12(d, 'backup.keystore', 'INT-CA-02.pem', 'INT-CA-02.plain')
+    _p12(d, 'truststore-copy.p12', 'INT-CA-02.pem', 'INT-CA-02.plain')
+    _p12(d, 'backup.jks', 'INT-CA-02.pem', 'INT-CA-02.plain')
+    _ssl('pkcs12', '-export', '-in', 'INT-CA-02.pem', '-inkey', 'INT-CA-02.plain',
+         '-passout', 'pass:another-password', '-out', 'otherpass.p12', cwd=d)
+    _ssl('pkcs8', '-topk8', '-nocrypt', '-outform', 'DER', '-in', 'INT-CA-02.plain', '-out', 'cakey.der', cwd=d)
+    (d / 'x.crt').write_bytes((d / 'cakey.der').read_bytes())
     _leaf(d, 'martiuser', 'INT-CA-02')
     _ssl('pkcs8', '-topk8', '-nocrypt', '-outform', 'DER', '-in', 'martiuser.plain',
          '-out', 'martiuser.key.pk8', cwd=d)
@@ -198,10 +254,14 @@ def cert_template(tmp_path_factory):
     (d / 'ca.pem').write_bytes((d / 'INT-CA-02.pem').read_bytes())
     (d / 'ca-do-not-share.key').write_bytes((d / 'INT-CA-02.key').read_bytes())
     (d / 'key-backup.key').write_bytes((d / 'INT-CA-02.key').read_bytes())
+    (d / 'INT-CA-02.key.bak').write_bytes((d / 'INT-CA-02.key').read_bytes())
+    (d / 'notes.txt').write_bytes(b'kept for later\n' + (d / 'INT-CA-02.key').read_bytes())
+    os.symlink('INT-CA-02.key', d / 'link.txt')
     for junk in ('root.pem', 'root.plain', 'x.ext', 'x.csr', 'root.srl', 'INT-CA-02.srl'):
         (d / junk).unlink(missing_ok=True)
     for f in d.iterdir():                                   # what makeCert.sh leaves: 0644, keys 0600
-        os.chmod(f, 0o600 if f.name.endswith('.key') else 0o644)
+        if not f.is_symlink():
+            os.chmod(f, 0o600 if f.name.endswith('.key') else 0o644)
     for f in CA_PRIVATE + ORPHANS + SERVED:
         assert (d / f).is_file(), f
     return d
@@ -277,7 +337,12 @@ class _Harness:
 
 
 @pytest.fixture
-def h(certs, tmp_path):
+def h(certs, tmp_path, monkeypatch):
+    """Native TAK Server: the files belong to `tak` (here: the user that runs the tests)."""
+    import pwd
+    real = pwd.getpwnam
+    monkeypatch.setattr(pwd, 'getpwnam',
+                        lambda n: type('P', (), {'pw_uid': os.getuid()})() if n == 'tak' else real(n))
     return _Harness(certs, tmp_path)
 
 
@@ -301,12 +366,15 @@ def test_the_certificates_page_leaves_out_every_ca_private_key(h):
     assert set(SERVED) <= names
 
 
-@pytest.mark.parametrize('name', CA_PRIVATE + ORPHANS)
-def test_the_download_route_refuses_it(h, name, certs):
-    r = h.client.get(f'/api/certs/download/{name}')
-    assert r.status_code == 403, f'{name}: HTTP {r.status_code}'
-    assert (certs / name).read_bytes() not in r.data
-    assert ('cert_download_refused', f'file={name}') in h.audits
+def test_the_download_route_refuses_ca_private_material(h, certs):
+    served = []
+    for name in CA_PRIVATE + ORPHANS:
+        r = h.client.get(f'/api/certs/download/{name}')
+        if r.status_code != 403 or (certs / name).read_bytes() in r.data:
+            served.append(f'{name}: HTTP {r.status_code}')
+        elif ('cert_download_refused', f'file={name}') not in h.audits:
+            served.append(f'{name}: refused without an audit line')
+    assert not served, served
 
 
 def test_the_rotated_and_the_current_intermediate_key_are_the_same_secret_as_do_not_share(h, certs):
@@ -316,11 +384,13 @@ def test_the_rotated_and_the_current_intermediate_key_are_the_same_secret_as_do_
         assert h.client.get(f'/api/certs/download/{name}').status_code == 403
 
 
-@pytest.mark.parametrize('name', SERVED)
-def test_client_and_server_files_still_download(h, name, certs):
-    r = h.client.get(f'/api/certs/download/{name}')
-    assert r.status_code == 200, f'{name}: HTTP {r.status_code} {r.data[:120]!r}'
-    assert r.data == (certs / name).read_bytes()
+def test_client_and_server_files_still_download(h, certs):
+    refused = []
+    for name in SERVED:
+        r = h.client.get(f'/api/certs/download/{name}')
+        if r.status_code != 200 or r.data != (certs / name).read_bytes():
+            refused.append(f'{name}: HTTP {r.status_code}')
+    assert not refused, refused
 
 
 def test_a_new_client_is_served_and_a_new_ca_is_refused_without_a_restart(h, certs):
@@ -332,6 +402,46 @@ def test_a_new_client_is_served_and_a_new_ca_is_refused_without_a_restart(h, cer
     assert h.client.get('/api/certs/download/INT-CA-03.key').status_code == 403
     names = {f['name'] for f in h.client.get('/api/certs/list').get_json()['files']}
     assert 'INT-CA-03.key' not in names and 'admin.key' in names
+
+
+def test_a_listing_looks_at_the_folder_once(h):
+    if not h.fixed:
+        pytest.skip('no folder scan on this branch')
+    calls = []
+    real = h.ns['_ca_private_files']
+    h.ns['_ca_private_files'] = lambda *a, **k: calls.append(a) or real(*a, **k)
+    h.client.get('/api/certs/list')
+    assert len(calls) == 1
+    calls.clear()
+    h.client.get('/certs')
+    assert len(calls) == 1
+
+
+def test_a_swap_with_the_same_size_and_time_is_seen(h, certs):
+    if not h.fixed:
+        pytest.skip('no folder scan on this branch')
+    st = os.stat(certs / 'admin.key')
+    assert h.client.get('/api/certs/download/admin.key').status_code == 200
+    ca = (certs / 'INT-CA-02.key').read_bytes()
+    (certs / 'admin.key').write_bytes(ca)
+    os.utime(certs / 'admin.key', ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert h.client.get('/api/certs/download/admin.key').status_code == 403
+
+
+def test_a_file_that_cannot_be_read_is_held_back_and_asked_again(h, certs):
+    if not h.fixed:
+        pytest.skip('no folder scan on this branch')
+    real = h.ns['_cert_file_bytes']
+    broken = {'on': True}
+
+    def flaky(p):
+        if broken['on'] and p.endswith('admin.key'):
+            raise OSError('broker not up yet')
+        return real(p)
+    h.ns['_cert_file_bytes'] = flaky
+    assert h.client.get('/api/certs/download/admin.key').status_code == 403
+    broken['on'] = False
+    assert h.client.get('/api/certs/download/admin.key').status_code == 200
 
 
 def test_the_folder_is_not_read_again_when_nothing_changed(h, monkeypatch):
@@ -353,9 +463,9 @@ def test_a_folder_that_cannot_be_judged_refuses_every_key(h):
     def boom(*a, **k):
         raise RuntimeError('scan broke')
     h.ns['_ca_private_files'] = boom
-    assert h.client.get('/api/certs/download/admin.key').status_code == 403
-    assert h.client.get('/api/certs/download/admin.p12').status_code == 403
-    assert h.client.get('/api/certs/download/ca.pem').status_code == 200
+    for name in ('admin.key', 'admin.p12', 'notes.txt', 'ca.pem'):
+        assert h.client.get(f'/api/certs/download/{name}').status_code == 403, name
+    assert h.client.get('/api/certs/list').get_json()['files'] == []
 
 
 def test_the_ca_key_itself_is_never_read_to_judge_it(h):
@@ -447,19 +557,46 @@ def test_the_folder_starts_like_makecert_left_it(certs):
 
 def test_native_lockdown_closes_the_signing_keystores_and_every_ca_key(h, certs):
     os.chmod(certs / 'INT-CA-00.key', 0o640)
-    os.chmod(certs / 'key-backup.key', 0o644)
     before = {f.name: _mode(f) for f in certs.iterdir()}
     fixed, left = h.lockdown()
     assert not left
-    for p in _signing(certs) + [certs / n for n in CA_PRIVATE]:
+    for p in [certs / n for n in CA_BY_NAME]:
         assert _mode(p) == 0o600, f'{p.name} is {oct(_mode(p))}'
-    assert len(fixed) == 7, fixed            # 4 keystores, old-ca.p12, INT-CA-00.key, key-backup.key
-    assert ('ca_private_lockdown', f'dir={certs} files=7') in h.audits
+    assert len(fixed) == 5, fixed            # the 4 signing keystores and INT-CA-00.key
+    assert ('ca_private_lockdown', f'dir={certs} files=5') in h.audits
     # nothing else moved: Node-RED reads admin.pem/admin.key as uid 1000, the folder stays open
     for f in certs.iterdir():
-        if f.name not in CA_PRIVATE:
+        if f.name not in CA_BY_NAME:
             assert _mode(f) == before[f.name], f.name
     assert _mode(certs) & 0o055 == 0o055
+
+
+@pytest.mark.parametrize('name', ['admin.p12', 'admin.jks', 'admin.pem', 'admin-trusted.pem', 'takserver.p12',
+                                  'takserver.pem', 'svc.p12', 'truststore-INT-CA-02.jks', 'ca.pem'])
+def test_lockdown_leaves_client_and_server_files_alone(h, certs, name):
+    """A client's NAME-trusted.pem holds the CA certificate; it must not make NAME a CA name."""
+    h.lockdown()
+    assert _mode(certs / name) == 0o644
+
+
+def test_lockdown_opens_no_file(h, certs):
+    seen = []
+    real = h.ns['_cert_file_bytes']
+    h.ns['_cert_file_bytes'] = lambda p: seen.append(p) or real(p)
+    h.lockdown()
+    assert not seen and not h.priv_reads
+
+
+def test_lockdown_never_follows_a_symlink(h, certs, tmp_path):
+    """Only regular files are changed: a link in the folder is skipped."""
+    outside = tmp_path / 'outside'
+    outside.write_text('x')
+    os.chmod(outside, 0o644)
+    os.symlink(outside, certs / 'evil-do-not-share.key')
+    os.symlink(outside, certs / 'EVIL-CA-signing.jks')
+    fixed, left = h.lockdown()
+    assert _mode(outside) == 0o644
+    assert not any(str(outside) in c or 'evil' in ' '.join(c).lower() for c in h.priv), h.priv
 
 
 def test_node_red_keeps_its_read_on_the_admin_pair(h, certs):
@@ -489,10 +626,13 @@ def test_native_a_keystore_tak_does_not_own_is_given_to_tak_first(h, certs, monk
     import pwd
     real = pwd.getpwnam
     monkeypatch.setattr(pwd, 'getpwnam', lambda n: type('P', (), {'pw_uid': os.getuid() + 1})() if n == 'tak' else real(n))
-    h.lockdown()
+    fixed, left = h.lockdown()
     path = str(certs / 'INT-CA-02-signing.jks')
-    assert ['chown', 'tak:tak', path] in h.priv
-    assert h.priv.index(['chown', 'tak:tak', path]) < h.priv.index(['chmod', '600', path])
+    assert ['chown', '-h', 'tak:tak', path] in h.priv
+    # the owner change did not take (the test's chown does nothing): the mode is left as it is,
+    # so TAK Server keeps its read, and the file is reported
+    assert ['chmod', '600', path] not in h.priv
+    assert _mode(path) == 0o644 and 'INT-CA-02-signing.jks' in left
 
 
 def test_container_lockdown_keeps_the_group_the_container_reads_through(certs, tmp_path):

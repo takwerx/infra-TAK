@@ -255,10 +255,9 @@ def test_the_download_route_still_refuses_signing_material():
     body = _func('download_cert_file')
     assert "_is_ca_private_file(filename, '/opt/tak/certs/files')" in body
     guard = _func('_is_ca_private_file')
-    assert guard.index('_is_ca_private_material(filename)') < guard.index('_ca_private_files(')
+    assert guard.index('if _is_ca_private_material(filename)') < guard.index('verdict = _ca_private_files(')
     ns = {'re': re}
     exec(compile(_func('_is_ca_private_material'), 'app.py', 'exec'), ns)
-    exec(compile(_func('_ca_key_stem'), 'app.py', 'exec'), ns)
     exec(compile(_func('_is_ca_private_file'), 'app.py', 'exec'), ns)
     ns['_ca_private_files'] = lambda d=None: {}
     for name in ('INT-CA-10-signing.p12', 'INT-CA-10-signing.jks', 'ca-do-not-share.key'):

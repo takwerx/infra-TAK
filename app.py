@@ -46921,9 +46921,10 @@ def certs_page():
     cert_dir = '/opt/tak/certs/files'
     files = []
     if os.path.isdir(cert_dir):
+        _held = _ca_private_verdict_or_refuse_all(cert_dir)    # ops #831: one look per page
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp) and not _is_ca_private_file(fn, cert_dir):  # v10.2.26 W6, ops #831
+            if os.path.isfile(fp) and not _is_ca_private_file(fn, cert_dir, _held):  # v10.2.26 W6, ops #831
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -101229,9 +101230,10 @@ def list_cert_files():
     if not os.path.exists(cert_path):
         return jsonify({'files': []})
     files = []
+    _held = _ca_private_verdict_or_refuse_all(cert_path)    # ops #831: one look per listing
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp) and not _is_ca_private_file(f, cert_path):    # ops #831
+        if os.path.isfile(fp) and not _is_ca_private_file(f, cert_path, _held):
             files.append({'name': f, 'size': os.path.getsize(fp),
                 'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
@@ -101246,8 +101248,9 @@ def download_cert_file(filename):
     # private key that matches no certificate is refused as well.
     if _is_ca_private_file(filename, '/opt/tak/certs/files'):
         audit('cert_download_refused', f'file={filename}')
-        return jsonify({'error': 'CA private keys are never downloaded from the console. A private '
-                                 'key with no matching certificate in this folder is treated the same.'}), 403
+        return jsonify({'error': 'CA private keys are never downloaded from the console. A file with '
+                                 'a private key that matches no certificate in this folder is treated '
+                                 'the same.'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
 
 
@@ -101265,76 +101268,200 @@ def _is_ca_private_material(filename):
 # files. The name rule above stays the first test; this adds the content of the folder.
 #
 # _ca_private_files() reads the folder and answers for every file:
-#   'ca'     — proven CA private material: the name rule above; a key or keystore named after a
-#              CA this box has made (a CA:TRUE certificate, its CN, or the NAME.crl /
-#              truststore-NAME / NAME-signing files makeCert.sh leaves behind); or a key whose
-#              public half is the public key of a CA:TRUE certificate in the folder.
-#   'orphan' — a private key that belongs to no certificate in the folder. It cannot be proven
-#              to be a client key, so it is not handed out either (fail closed).
-# Client keys (admin.key, a created client's key) and takserver.key have a leaf certificate with
-# the same public key beside them, so they are neither.
+#   'ca'     — CA private material: the name rule above; a key or keystore named after a CA
+#              this server has made; or any file (whatever its extension) that holds a private
+#              key whose public half is the public key of a CA certificate in the folder.
+#   'orphan' — a file that holds a private key which belongs to no leaf certificate in the
+#              folder, a keystore that cannot be opened, or a file that could not be read. It
+#              cannot be shown to be a client's, so it is not handed out either (fail closed).
+# Client files (admin.key, admin.p12, a created client's files) and takserver.* hold the key of
+# a leaf certificate in the folder, so they are neither. Certificates, truststores, CRLs and
+# CSRs hold no private key.
 _CA_SCAN_LOCK = threading.Lock()
-_CA_SCAN_FACTS = {}      # (kind, path, size, mtime_ns[, password hash]) -> fact
-_CA_SCAN_DIRS = {}       # cert_dir -> (signature, {name: 'ca' | 'orphan'})
+_CA_SCAN_FACTS = {}      # (path, file signature, password hash) -> fact about the content
+_CA_SCAN_DIRS = {}       # (cert_dir, deep) -> (signature, {name: 'ca' | 'orphan'})
 _CA_CERT_EXTS = ('.pem', '.crt', '.cer')
-_CA_KEYSTORE_EXTS = ('.p12', '.pfx', '.jks')
+_CA_KEYSTORE_EXTS = ('.p12', '.pfx', '.jks', '.pkcs12', '.keystore', '.ks', '.bcfks', '.jceks')
 _CA_NAME_LEFTOVER_RE = re.compile(r'^(.+)-(?:signing\.(?:jks|p12|pem|key)|do-not-share\.key)$')
+_CA_SCAN_MAX_BYTES = 4 * 1024 * 1024
+_CA_PEM_KEY_RE = re.compile(rb'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----', re.S)
+_CA_OID_P7_DATA = bytes.fromhex('2a864886f70d010701')     # the first OID inside every PKCS#12
+_CA_OID_PBE = (bytes.fromhex('2a864886f70d0105'), bytes.fromhex('2a864886f70d010c01'))   # an encrypted PKCS#8 key
 
 
-def _ca_cert_fact(path, sig):
-    """(is_ca, public key, CN lower-case, holds a private key) for the first certificate in a
-    certificate file. Cached on the file's size and mtime. (False, b'', '', False) when unreadable."""
-    ck = ('cert', path) + sig
+def _ca_cert_fact(data, der=False):
+    """(is_ca, public key, CN lower-case) of the first certificate in `data`; None when openssl
+    could not be run; (False, b'', '') when `data` holds no certificate."""
+    try:
+        r = subprocess.run(['openssl', 'x509'] + (['-inform', 'DER'] if der else [])
+                           + ['-noout', '-subject', '-nameopt', 'RFC2253', '-pubkey', '-text'],
+                           input=data, capture_output=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return (False, b'', '')
+    out = r.stdout
+    m = re.search(rb'-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----', out, re.S)
+    pub = m.group(0).strip() if m else b''
+    m = re.search(rb'^subject=.*?CN=([^,\n]+)', out, re.M)
+    cn = m.group(1).decode(errors='replace').strip().lower() if m else ''
+    return (b'CA:TRUE' in out, pub, cn)
+
+
+def _ca_pem_key_pubs(data, password):
+    """Public halves of the PEM private keys in `data` (b'' for one the password does not open)."""
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    pubs = []
+    for block in _CA_PEM_KEY_RE.findall(data):
+        try:
+            r = subprocess.run(['openssl', 'pkey', '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                               input=block, capture_output=True, env=env, timeout=10)
+        except Exception:
+            return None
+        pubs.append(r.stdout.strip() if r.returncode == 0 else b'')
+    return pubs
+
+
+def _ca_der_key_pub(data, password):
+    """Public half of a DER private key; b'' when `data` is not one the password opens."""
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        r = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                           input=data, capture_output=True, env=env, timeout=10)
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else b''
+
+
+def _ca_p12_key_pubs(data, password):
+    """Public halves of the private keys in a PKCS#12: [] for a truststore, '' when the
+    password does not open it, None when openssl could not be run. The password travels in
+    the environment, the bytes in a private temp file."""
+    import tempfile as _tf
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-cascan-') as td:
+            os.chmod(td, 0o700)
+            path = os.path.join(td, 'in')
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(data)
+            for extra in ([], ['-legacy']):       # makeCert.sh's RC2-40 .p12 needs -legacy on OpenSSL 3
+                r = subprocess.run(['openssl', 'pkcs12', '-in', path, '-nocerts', '-nodes',
+                                    '-passin', 'env:ITK_P12_PASS'] + extra,
+                                   capture_output=True, env=env, timeout=20)
+                if r.returncode == 0:
+                    break
+            else:
+                return ''
+            return _ca_pem_key_pubs(r.stdout, '')
+    except Exception:
+        return None
+
+
+def _ca_jks_key_certs(data):
+    """The first chain certificate (DER) of every private-key entry in a JKS keystore; [] for a
+    truststore; None when `data` is not a JKS this reads. A JKS key is sealed with Java's own
+    scheme, but its certificate chain is stored in the clear beside it."""
+    import struct as _st
+    try:
+        if data[:4] != b'\xfe\xed\xfe\xed':
+            return None
+        version, count = _st.unpack('>II', data[4:12])
+        pos, out = 12, []
+        for _ in range(count):
+            tag = _st.unpack('>I', data[pos:pos + 4])[0]
+            pos += 4
+            pos += 2 + _st.unpack('>H', data[pos:pos + 2])[0] + 8      # alias, timestamp
+            chain = 1
+            if tag == 1:
+                pos += 4 + _st.unpack('>I', data[pos:pos + 4])[0]       # the sealed key
+                chain = _st.unpack('>I', data[pos:pos + 4])[0]
+                pos += 4
+            elif tag != 2:
+                return None
+            first = b''
+            for i in range(chain):
+                if version == 2:
+                    pos += 2 + _st.unpack('>H', data[pos:pos + 2])[0]   # certificate type
+                clen = _st.unpack('>I', data[pos:pos + 4])[0]
+                pos += 4
+                if i == 0:
+                    first = data[pos:pos + clen]
+                pos += clen
+            if pos > len(data):
+                return None
+            if tag == 1:
+                out.append(first)
+        return out
+    except Exception:
+        return None
+
+
+def _ca_file_fact(path, sig, password, low):
+    """What a file in the certificate folder holds: {'cert': (is_ca, pub, cn) or None,
+    'keys': [public halves of its private keys, b'' for one that could not be opened],
+    'sealed': True for a keystore or key that cannot be looked into, 'ca_chain': True for a
+    JKS key entry whose certificate is a CA}. None when the file could not be read or openssl
+    could not be run (the caller refuses the file and does not keep the answer)."""
+    ck = (path, sig, hashlib.sha256((password or '').encode()).hexdigest()[:16])
     hit = _CA_SCAN_FACTS.get(ck)
     if hit is not None:
         return hit
+    if sig[0] > _CA_SCAN_MAX_BYTES:
+        return None
     try:
         data = _cert_file_bytes(path)
     except Exception:
-        return (False, b'', '', False)          # not cached: the read may work next time
-    has_key = b'PRIVATE KEY-----' in data
-    is_ca, pub, cn = False, b'', ''
-    der = b'-----BEGIN' not in data
-    if data and (der or b'CERTIFICATE-----' in data):
-        try:
-            r = subprocess.run(['openssl', 'x509'] + (['-inform', 'DER'] if der else [])
-                               + ['-noout', '-subject', '-nameopt', 'RFC2253', '-pubkey', '-text'],
-                               input=data, capture_output=True, timeout=10)
-        except Exception:
-            return (False, b'', '', has_key)
-        if r.returncode == 0:
-            out = r.stdout
-            m = re.search(rb'-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----', out, re.S)
-            pub = m.group(0).strip() if m else b''
-            is_ca = b'CA:TRUE' in out
-            m = re.search(rb'^subject=.*?CN=([^,\n]+)', out, re.M)
-            cn = m.group(1).decode(errors='replace').strip().lower() if m else ''
-    fact = (is_ca, pub, cn, has_key)
+        return None
+    fact = {'cert': None, 'keys': [], 'sealed': False, 'ca_chain': False}
+    if b'-----BEGIN' in data:
+        if b'CERTIFICATE-----' in data:
+            fact['cert'] = _ca_cert_fact(data)
+            if fact['cert'] is None:
+                return None
+        fact['keys'] = _ca_pem_key_pubs(data, password)
+        if fact['keys'] is None:
+            return None
+    elif data[:4] == b'\xfe\xed\xfe\xed':
+        certs = _ca_jks_key_certs(data)
+        if certs is None:
+            fact['sealed'] = True
+        for der in certs or []:
+            cf = _ca_cert_fact(der, der=True)
+            if cf is None:
+                return None
+            if cf[0] or not cf[1]:
+                fact['ca_chain'] = fact['ca_chain'] or cf[0]
+                fact['sealed'] = fact['sealed'] or not cf[1]
+            fact['keys'].append(cf[1])      # the public key the sealed key belongs to
+    elif data[:1] == b'\x30' and _CA_OID_P7_DATA in data[:64]:
+        pubs = _ca_p12_key_pubs(data, password)
+        if pubs is None:
+            return None
+        if pubs == '':
+            fact['sealed'] = True
+        else:
+            fact['keys'] = pubs
+    elif data[:1] == b'\x30':
+        pub = _ca_der_key_pub(data, password)
+        if pub is None:
+            return None
+        if pub:
+            fact['keys'] = [pub]
+        elif any(oid in data[:48] for oid in _CA_OID_PBE):
+            fact['keys'] = [b'']            # an encrypted key the password does not open
+        else:
+            fact['cert'] = _ca_cert_fact(data, der=True)
+            if fact['cert'] is None:
+                return None
+            if not fact['cert'][1]:
+                fact['cert'] = None
+                fact['sealed'] = low.endswith(_CA_KEYSTORE_EXTS) or bool(_ca_key_stem(low))
+    else:
+        # not PEM, not DER, not JKS: only a keystore or key by its name is held back
+        fact['sealed'] = (low.endswith(_CA_KEYSTORE_EXTS) or bool(_ca_key_stem(low))) and len(data) > 0
     _CA_SCAN_FACTS[ck] = fact
     return fact
-
-
-def _ca_key_pub(path, sig, password, p12=False):
-    """Public half of the private key in a key file (PEM or DER) or a .p12, b'' when it cannot be
-    opened with the certificate password. Cached on size, mtime and the password."""
-    ck = ('p12' if p12 else 'key', path) + sig + (hashlib.sha256((password or '').encode()).hexdigest()[:16],)
-    hit = _CA_SCAN_FACTS.get(ck)
-    if hit is not None:
-        return hit
-    try:
-        data = _cert_file_bytes(path)
-    except Exception:
-        return b''                              # not cached: the read may work next time
-    pub = _private_key_pubkey(data, password, p12=p12) if data else b''
-    if not pub and data and not p12 and b'-----BEGIN' not in data:
-        try:                                    # an unencrypted DER key (NAME.key.pk8)
-            r = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-pubout'], input=data,
-                               capture_output=True, timeout=10)
-            pub = r.stdout.strip() if r.returncode == 0 else b''
-        except Exception:
-            pub = b''
-    _CA_SCAN_FACTS[ck] = pub
-    return pub
 
 
 def _ca_key_stem(low):
@@ -101345,13 +101472,19 @@ def _ca_key_stem(low):
     return ''
 
 
+def _ca_file_stem(low):
+    """The name a key, keystore or certificate file is filed under: 'admin' for admin.key,
+    admin.p12, admin.jks, admin.pem and admin.key.pk8."""
+    return _ca_key_stem(low) or low.rsplit('.', 1)[0]
+
+
 def _ca_private_files(cert_dir=None, deep=True):
     """{file name: 'ca' | 'orphan'} for the TAK certificate folder (see the block comment above).
     One listdir and one stat per file when nothing changed since the last call.
 
     deep=False judges by file names alone (the name rule and the CA names makeCert.sh leaves
-    behind): no certificate is parsed, no private key is read, no 'orphan' answer. That is
-    enough to find the files whose modes need closing in a snapshot's copy of the folder."""
+    behind): no file is opened and there is no 'orphan' answer. That is what the file-mode
+    step uses, so a console start never reads a private key."""
     d = cert_dir or _CERT_FILES_DIR
     try:
         entries = sorted(os.listdir(d))
@@ -101364,7 +101497,7 @@ def _ca_private_files(cert_dir=None, deep=True):
         except OSError:
             continue
         if _stat.S_ISREG(st.st_mode):
-            files[f] = (st.st_size, st.st_mtime_ns)
+            files[f] = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
     password = ''
     if deep:
         try:
@@ -101380,7 +101513,9 @@ def _ca_private_files(cert_dir=None, deep=True):
             _CA_SCAN_DIRS.clear()
         if len(_CA_SCAN_FACTS) > 20000:         # snapshots come and go; do not grow without end
             _CA_SCAN_FACTS.clear()
-        ca_names, ca_pubs, leaf_pubs, leaf_stems = {'ca', 'root-ca'}, set(), set(), set()
+        # CA names from the listing: makeCert.sh `ca NAME` leaves NAME.crl, truststore-NAME.*
+        # and NAME-signing.*; the working slot and the root are `ca` and `root-ca`.
+        ca_names = {'ca', 'root-ca'}
         for f in files:
             low = f.lower()
             if low.endswith('.crl'):
@@ -101390,76 +101525,79 @@ def _ca_private_files(cert_dir=None, deep=True):
             m = _CA_NAME_LEFTOVER_RE.match(low)
             if m:
                 ca_names.add(m.group(1))
-        cert_facts = {}
+        verdict, facts, complete = {}, {}, True
+        ca_pubs, leaf_pubs, leaf_stems = set(), set(), set()
         for f, sig in files.items():
             low = f.lower()
-            if not deep or not low.endswith(_CA_CERT_EXTS):
-                continue
-            fact = _ca_cert_fact(os.path.join(d, f), sig)
-            cert_facts[f] = fact
-            is_ca, pub, cn, _has_key = fact
-            if not pub:
-                continue
-            stem = low.rsplit('.', 1)[0]
-            if stem.endswith('-trusted'):
-                stem = stem[:-len('-trusted')]
-            if is_ca:
-                ca_pubs.add(pub)
-                ca_names.add(stem)
-                if cn:
-                    ca_names.add(cn)
-            else:
-                leaf_pubs.add(pub)
-                leaf_stems.add(stem)
-        verdict = {}
-        for f, sig in files.items():
-            low = f.lower()
-            path = os.path.join(d, f)
             if _is_ca_private_material(f):
                 verdict[f] = 'ca'
-                continue
-            stem = _ca_key_stem(low)
-            if not stem and low.endswith(_CA_CERT_EXTS) and cert_facts.get(f, (0, 0, 0, False))[3]:
-                stem = low.rsplit('.', 1)[0]                # a certificate file with a key inside
-            if stem:
-                if stem in ca_names:
-                    verdict[f] = 'ca'
+            elif (_ca_key_stem(low) or low.endswith(_CA_KEYSTORE_EXTS)) and not low.startswith('truststore-') \
+                    and _ca_file_stem(low) in ca_names:
+                verdict[f] = 'ca'               # INTERMEDIATE-CA-01.key: by its name, never opened
+            elif deep:
+                fact = _ca_file_fact(os.path.join(d, f), sig, password, low)
+                if fact is None:
+                    verdict[f] = 'orphan'       # could not be judged: held back, and asked again next time
+                    complete = False
                     continue
-                if not deep:
-                    continue
-                pub = _ca_key_pub(path, sig, password)
-                if pub:
-                    if pub in ca_pubs:
-                        verdict[f] = 'ca'
-                    elif pub not in leaf_pubs:
-                        verdict[f] = 'orphan'
-                elif stem not in leaf_stems:
+                facts[f] = fact
+                if fact['cert'] and fact['cert'][1]:
+                    is_ca, pub, cn = fact['cert']
+                    # NAME-trusted.pem of a client holds the CA's certificate, not the client's
+                    # (makeCert.sh appends ca-trusted.pem to an empty file): it names nothing.
+                    named = low.endswith(_CA_CERT_EXTS) and not low.rsplit('.', 1)[0].endswith('-trusted')
+                    if is_ca:
+                        ca_pubs.add(pub)
+                        if cn:
+                            ca_names.add(cn)
+                    else:
+                        leaf_pubs.add(pub)
+                        if named:
+                            leaf_stems.add(low.rsplit('.', 1)[0])
+        for f, fact in facts.items():
+            low = f.lower()
+            stem = _ca_file_stem(low)
+            if (_ca_key_stem(low) or low.endswith(_CA_KEYSTORE_EXTS)) and not low.startswith('truststore-') \
+                    and stem in ca_names:
+                verdict[f] = 'ca'               # named after a CA only its certificate's CN shows
+            elif fact['ca_chain'] or any(k and k in ca_pubs for k in fact['keys']):
+                verdict[f] = 'ca'
+            elif fact['sealed'] or any(not k for k in fact['keys']):
+                if stem not in leaf_stems:      # cannot be looked into: only a known client's name passes
                     verdict[f] = 'orphan'
-                continue
-            if low.endswith(_CA_KEYSTORE_EXTS) and not low.startswith('truststore-'):
-                stem = low.rsplit('.', 1)[0]
-                if stem in ca_names:
-                    verdict[f] = 'ca'
-                elif deep and stem not in leaf_stems and not low.endswith('.jks'):
-                    # a keystore that is no known client's: look inside (openssl cannot read .jks)
-                    pub = _ca_key_pub(path, sig, password, p12=True)
-                    if pub and pub in ca_pubs:
-                        verdict[f] = 'ca'
-        _CA_SCAN_DIRS[(d, deep)] = (signature, verdict)
+            elif any(k not in leaf_pubs for k in fact['keys']):
+                verdict[f] = 'orphan'
+        if complete:
+            _CA_SCAN_DIRS[(d, deep)] = (signature, verdict)
         return verdict
 
 
-def _is_ca_private_file(filename, cert_dir=None):
+def _is_ca_private_file(filename, cert_dir=None, verdict=None):
     """True when the console must not hand `filename` (in the TAK certificate folder) to a
-    browser: CA private material, or a private key that matches no certificate there. If the
-    folder cannot be judged, every key and keystore is refused (fail closed)."""
+    browser: CA private material, or a file with a private key that matches no leaf certificate
+    there. `verdict` is a _ca_private_files() answer the caller already has (a listing asks
+    once, not once per file). If the folder cannot be judged, every file is refused (fail
+    closed)."""
     if _is_ca_private_material(filename):
         return True
+    if verdict is None:
+        try:
+            verdict = _ca_private_files(cert_dir)
+        except Exception:
+            return True
+    return filename in verdict
+
+
+def _ca_private_verdict_or_refuse_all(cert_dir):
+    """_ca_private_files(cert_dir) for a listing; a set-like that holds every name when the
+    folder cannot be judged (fail closed)."""
     try:
-        return filename in _ca_private_files(cert_dir)
+        return _ca_private_files(cert_dir)
     except Exception:
-        low = (filename or '').lower()
-        return bool(_ca_key_stem(low)) or low.endswith(_CA_KEYSTORE_EXTS)
+        class _All(dict):
+            def __contains__(self, _name):
+                return True
+        return _All()
 
 
 def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
@@ -101468,9 +101606,10 @@ def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
     Sets the file modes of the CA signing keystores (<CA>-signing.jks / .p12) and of every
     CA .key in the TAK certificate folder, whatever mode TAK's own scripts gave them.
 
-    Only CA private material is touched (_ca_private_files() == 'ca'): the signing keystores and
-    every CA .key. Client files keep their modes: Node-RED reads admin.pem/admin.key as uid 1000
-    through its bind mount (see _heal_nodered_cert_read_access), and the folder stays 0755.
+    Only CA private material is touched, found by file name alone (_ca_private_files(deep=False):
+    the signing keystores and every CA .key), so no file is opened. Client files keep their
+    modes: Node-RED reads admin.pem/admin.key as uid 1000 through its bind mount (see
+    _heal_nodered_cert_read_access), and the folder stays 0755. Only regular files are changed.
 
     Native TAK Server reads the keystore as `tak` (the owner makeCert.sh gives it): owner tak,
     mode 0600. A TAK container reads the bundle as its own uid or through group 0
@@ -101488,24 +101627,28 @@ def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
     keep = 0o770 if container else 0o700
 
     def _open_mode(path):
-        """The file's mode when it grants more than `keep`, else None (also when it is gone)."""
+        """The file's mode when it grants more than `keep`, else None (also when it is gone
+        or is not a regular file)."""
         try:
-            cur = _stat.S_IMODE(os.stat(path).st_mode)
+            st = os.lstat(path)
         except OSError:
             return None
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        cur = _stat.S_IMODE(st.st_mode)
         return cur if cur & ~keep & 0o777 else None
 
     try:
-        # The live folder gets the full look (it also finds a renamed copy of a CA key); a
-        # snapshot's copy is judged by file names, so no private key is read for it.
-        names = sorted(n for n, kind in _ca_private_files(d, deep=live).items()
-                       if kind == 'ca' and re.match(r'^[A-Za-z0-9._-]+$', n))
+        names = sorted(n for n, kind in _ca_private_files(d, deep=False).items() if kind == 'ca')
     except Exception as e:
         _say(f"⚠ could not read {d}: {str(e)[:120]}")
         return [], []
     names = [n for n in names if _open_mode(os.path.join(d, n)) is not None]
     if not names:
         return [], []
+    # A name with a character outside this set is not passed to a command: it is reported.
+    odd = [n for n in names if not re.match(r'^[A-Za-z0-9._-]+$', n)]
+    names = [n for n in names if n not in odd]
     tak_uid = cuid = cgid = None
     if container and live:
         try:
@@ -101526,14 +101669,25 @@ def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
         if cur is None:
             continue
         try:
-            st = os.stat(path)
-            if live and not container and tak_uid is not None and st.st_uid != tak_uid:
+            st = os.lstat(path)
+            if live and not container and st.st_uid != tak_uid:
                 # TAK Server (user tak) read this one through the group/other bits we remove.
-                subprocess.run(_sudo_wrap(['chown', 'tak:tak', path]), capture_output=True, timeout=20)
+                # Give it to tak first; if that does not take, the mode stays as it is.
+                if tak_uid is None:
+                    continue
+                subprocess.run(_sudo_wrap(['chown', '-h', 'tak:tak', path]), capture_output=True, timeout=20)
+                if os.lstat(path).st_uid != tak_uid:
+                    continue
             elif live and container and not ((st.st_uid == cuid and cur & 0o400)
                                              or (st.st_gid == cgid and cur & 0o040)):
                 # The container read it through the "other" bits: make it the container's own.
-                subprocess.run(_sudo_wrap(['chown', f'{cuid}:{cgid}', path]), capture_output=True, timeout=20)
+                subprocess.run(_sudo_wrap(['chown', '-h', f'{cuid}:{cgid}', path]),
+                               capture_output=True, timeout=20)
+                st = os.lstat(path)
+                if not (st.st_uid == cuid or st.st_gid == cgid):
+                    continue
+            if _open_mode(path) is None:        # replaced by something else meanwhile: leave it
+                continue
             subprocess.run(_sudo_wrap(['chmod', oct(cur & keep)[2:].zfill(3), path]),
                            capture_output=True, timeout=20)
         except Exception:
@@ -101563,6 +101717,7 @@ def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
             audit('ca_private_lockdown', f'dir={d} files={len(fixed)}')
         except Exception:
             pass
+    left += odd
     if left:
         _say(f"⚠ {len(left)} CA private key file(s) in {d} could not be set to the TAK Server "
              f"account only: {', '.join(left[:8])}")
@@ -101582,7 +101737,7 @@ def _tak_ca_private_lockdown_all(plog=None):
         labels = []
     for label in labels:
         snap_certs = os.path.join(SNAPSHOT_DIR, label, 'certs')
-        if label.startswith('.') or not os.path.isdir(snap_certs):
+        if label.startswith('.dl-') or not os.path.isdir(snap_certs):     # .dl-*: a download in progress
             continue
         f, l = _tak_ca_private_lockdown(plog, cert_dir=snap_certs, live=False)
         fixed += f
