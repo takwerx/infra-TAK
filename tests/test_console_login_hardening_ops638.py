@@ -97,7 +97,8 @@ def login_app(tmp_path):
         'os': os, 'json': json, 'datetime': datetime.datetime, 'ipaddress': ipaddress, 'time': __import__('time'),
         'CONFIG_DIR': str(cfg),
         'request': flask.request, 'session': flask.session, 'redirect': flask.redirect,
-        'url_for': flask.url_for,
+        'url_for': flask.url_for, 'jsonify': flask.jsonify,
+        'login_required': lambda f: f,
         'render_template': lambda tpl, **kw: 'page error=%s' % kw.get('error'),
         'load_auth': load_auth, 'save_auth': save_auth,
         'check_password_hash': werkzeug_security.check_password_hash,
@@ -111,11 +112,14 @@ def login_app(tmp_path):
         'print': lambda *a, **kw: printed.append(' '.join(str(x) for x in a)),
     }
     exec(_src({'_client_ip', '_safe_next_path', '_console_log_failed_login', '_note_password_length',
-               '_console_password_needs_change', 'login', 'index'},
+               '_console_password_needs_change', '_console_password_length_state',
+               'console_password_confirm_length', 'login', 'index'},
               {'CONSOLE_PASSWORD_MIN_LEN', 'CONSOLE_LOGIN_FAIL_LOG', 'CONSOLE_LOGIN_FAIL_LOG_MAX'}), g)
     app.add_url_rule('/login', 'login', g['login'], methods=['GET', 'POST'])
     app.add_url_rule('/', 'index', g['index'], methods=['GET', 'POST'])
     app.add_url_rule('/console', 'console_page', lambda: 'console')
+    app.add_url_rule('/api/console/password/confirm-length', 'cpw', g['console_password_confirm_length'],
+                     methods=['POST'])
     g.update(app=app, audits=audits, printed=printed, log=cfg / 'console-auth.log', auth_path=auth_path)
     return g
 
@@ -369,9 +373,47 @@ def test_help_form_and_banner_say_12():
     assert 'neu.length<12' in help_html and 'neu.length<8' not in help_html
     assert 'id="reset-console-password"' in help_html
     console = (REPO / 'templates' / 'console.html').read_text(encoding='utf-8')
-    assert '{% if console_password_needs_change %}' in console
+    assert "{% if console_password_length_state == 'short' %}" in console
+    assert "{% elif console_password_length_state == 'unknown' %}" in console
+    assert 'This one is shorter.' in console and 'cannot see its length' in console
     assert '/help#reset-console-password' in console
-    assert 'console_password_needs_change=_console_password_needs_change()' in _func_body('console_page')
+    assert 'console_password_length_state=_console_password_length_state()' in _func_body('console_page')
+
+
+# CORAZ 2026-11-15: an SSO-only box never logs in with the console password, so the
+# length stays unknown; the banner said "or it is shorter" about a long password.
+def test_unknown_length_is_not_called_short(login_app):
+    assert login_app['_console_password_length_state']() == 'unknown'
+    a = json.loads(login_app['auth_path'].read_text()); a['password_min_len_ok'] = False
+    login_app['auth_path'].write_text(json.dumps(a))
+    assert login_app['_console_password_length_state']() == 'short'
+    a['password_min_len_ok'] = True; login_app['auth_path'].write_text(json.dumps(a))
+    assert login_app['_console_password_length_state']() == 'ok'
+
+
+def test_confirm_length_records_yes_for_the_right_long_password(login_app):
+    c = login_app['app'].test_client()
+    r = c.post('/api/console/password/confirm-length', json={'password': RIGHT})
+    assert r.status_code == 200 and r.get_json() == {'ok': True, 'meets': True, 'min_len': 12}
+    assert login_app['_console_password_length_state']() == 'ok'
+    assert _lines(login_app['log']) == []
+
+
+def test_confirm_length_wrong_password_is_a_failed_login_and_changes_nothing(login_app):
+    c = login_app['app'].test_client()
+    r = c.post('/api/console/password/confirm-length', json={'password': 'wrong-password-123'})
+    assert r.status_code == 403 and r.get_json()['ok'] is False
+    assert login_app['_console_password_length_state']() == 'unknown'
+    assert len(_lines(login_app['log'])) == 1
+
+
+def test_confirm_length_short_password_says_short(login_app):
+    login_app['auth_path'].write_text(json.dumps(
+        {'password_hash': werkzeug_security.generate_password_hash('short1', method='pbkdf2:sha256')}))
+    c = login_app['app'].test_client()
+    r = c.post('/api/console/password/confirm-length', json={'password': 'short1'})
+    assert r.get_json()['meets'] is False
+    assert login_app['_console_password_length_state']() == 'short'
 
 
 bash = shutil.which('bash')
