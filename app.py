@@ -50405,6 +50405,12 @@ def cloudtak_uninstall():
             cfg['deployed'] = False
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
+            # ops #797: take the remote host's read entry out of this console's MediaMTX.
+            try:
+                if (cfg.get('target_mode') or '').strip().lower() == 'remote':
+                    _mediamtx_converge_cloudtak_read(cfg=settings['cloudtak_deployment'])
+            except Exception as _rd_e:
+                print(f"cloudtak uninstall: MediaMTX read entry warning (continuing): {_rd_e}", flush=True)
             cloudtak_deploy_log.clear()
             cloudtak_deploy_status.update({'running': False, 'complete': False, 'error': False})
             generate_caddyfile()
@@ -55342,6 +55348,11 @@ def run_cloudtak_deploy(cfg=None):
                 save_settings(settings)
             except Exception as _e:
                 plog(f"  ⚠ Could not persist deployment flag: {_e}")
+            # ops #797: and let the remote host's media server watch this console's MediaMTX.
+            try:
+                _mediamtx_converge_cloudtak_read(plog, cfg)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             # ops #631: no ufw/firewalld rule for 5000/5002 here. Who may reach the published
             # ports is set by the DOCKER-USER port guard above.
             # Probe /api/server (returns 200 even on unconfigured installs — see Step 6 comment).
@@ -56241,6 +56252,11 @@ def run_cloudtak_redeploy(cfg=None):
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #737: the console's own firewall, for the remote host's video calls (9997).
             _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
+            # ops #797: and the console's MediaMTX read entry for the remote host.
+            try:
+                _mediamtx_converge_cloudtak_read(plog, cfg)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
             _g_sh = ''
@@ -57268,6 +57284,11 @@ def run_cloudtak_update():
                 plog("  ⚠ Could not re-apply the CloudTAK port lock (the rules from the last Deploy stay in place)")
             # ops #737: the console's own firewall, for the remote host's video calls (9997).
             _cloudtak_console_video_fw(cfg, 'allow', log_fn=plog)
+            # ops #797: and the console's MediaMTX read entry for the remote host.
+            try:
+                _mediamtx_converge_cloudtak_read(plog, cfg)
+            except Exception as _ct_rd_e:
+                plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             # ops #216: the checkout reset TAK Portal's build edits on the remote host too.
             _cloudtak_remote_shield(remote_cfg, plog)
             # GH #384: and put back the tiles build's live-network test skip.
@@ -108265,29 +108286,116 @@ def _cloudtak_media_subnets():
     return sorted(set(subnets))
 
 
-def _mediamtx_converge_cloudtak_read(log=None):
-    """ops #193 (GH #256): keep the standalone MediaMTX's CloudTAK read entry matching the
-    CloudTAK media container's Docker network on this box. Runs at console start and after
-    a local MediaMTX or CloudTAK deploy/update (a `compose down` can hand CloudTAK a new
-    subnet). CloudTAK gone (no container, no ~/CloudTAK compose) → the entry is removed;
-    container missing mid-deploy, or Docker not answering → no change. Restarts MediaMTX
-    only when the file changed and the operator has not stopped it. Returns True if changed."""
+CLOUDTAK_REMOTE_EGRESS_KEY = 'cloudtak_remote_egress_ip'   # settings key: last address the remote host showed
+
+
+def _cloudtak_remote_egress_ip(remote_cfg):
+    """The address the internet (and so this console) sees the remote host at, asked on the
+    remote host itself. '' when it cannot be had. On a cloud box the remote reaches this
+    console by its public name, so MediaMTX sees the remote's PUBLIC address, not the private
+    one the console uses to log in to it (found the same way in ops #737)."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, 'curl -s --connect-timeout 5 https://ifconfig.me', timeout=20)
+    except Exception:
+        return ''
+    if not ok:
+        return ''
+    for tok in (out or '').split():
+        try:
+            return str(ipaddress.IPv4Address(tok.strip()))
+        except ValueError:
+            continue
+    return ''
+
+
+def _cloudtak_remote_read_ips(cfg, probe=True):
+    """ops #797: IPv4 addresses a remote CloudTAK's media server pulls streams from this
+    console's MediaMTX with: the host as configured (an address, or a name resolved here) and
+    the address it shows to the internet (asked on the host when `probe`, else the last one
+    seen). This box's own addresses and loopback are left out. None when nothing is known."""
+    remote = cfg.get('remote') or {}
+    host = (remote.get('host') or '').strip()
+    if not host:
+        return None
+    found = set()
+    try:
+        found.add(str(ipaddress.IPv4Address(host)))
+    except ValueError:
+        try:
+            found = {ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET)}
+        except OSError:
+            found = set()
+    egress = _cloudtak_remote_egress_ip(remote) if probe else ''
+    try:
+        s = load_settings()
+        if egress:
+            if s.get(CLOUDTAK_REMOTE_EGRESS_KEY) != egress:
+                s[CLOUDTAK_REMOTE_EGRESS_KEY] = egress
+                save_settings(s)
+        else:
+            egress = str(s.get(CLOUDTAK_REMOTE_EGRESS_KEY) or '')
+    except Exception:
+        pass
+    if egress:
+        try:
+            found.add(str(ipaddress.IPv4Address(egress)))
+        except ValueError:
+            pass
+    own = set(_list_local_ipv4s())
+    out = []
+    for ip in sorted(found):
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except ValueError:
+            continue
+        if a.is_loopback or a.is_unspecified or a.is_multicast or ip in own:
+            continue
+        out.append(ip)
+    return out or None
+
+
+def _mediamtx_converge_cloudtak_read(log=None, cfg=None, probe=True):
+    """ops #193 (GH #256): keep the standalone MediaMTX's CloudTAK read entry matching where
+    CloudTAK's media server pulls from. Local CloudTAK: its media container's Docker network
+    on this box. Remote CloudTAK (ops #797): the remote host's address, because its media
+    server pulls `rtsp://stream.<name>:8554/...` from this MediaMTX over the network and got
+    401 Unauthorized (the entry only knew a local container). Runs at console start and after
+    a local MediaMTX or CloudTAK deploy/update, and after a remote CloudTAK deploy/update/
+    remove (`cfg` is the deployment config; read from settings when not given). CloudTAK gone
+    (no container, no ~/CloudTAK compose; or remote and not deployed) → the entry is removed;
+    container missing mid-deploy, Docker not answering, or no remote address known → no
+    change. Restarts MediaMTX only when the file changed and the operator has not stopped it.
+    Returns True if changed."""
     _log = log or (lambda m: print(m, flush=True))
+    if cfg is None:
+        try:
+            cfg = _get_cloudtak_deployment_config(load_settings())
+        except Exception:
+            cfg = {}
+    remote_mode = (cfg.get('target_mode') or '').strip().lower() == 'remote'
     # ops #560: the media container's stream-name pin follows the standalone MediaMTX (installed
     # after CloudTAK, or CloudTAK updated from a release without the pin). A no-op when current.
-    try:
-        _cloudtak_refresh_override(_log)
-    except Exception as e:
-        _log(f"  ⚠ CloudTAK override refresh skipped (non-fatal): {e}")
+    # (A remote CloudTAK has no local media container to pin.)
+    if not remote_mode:
+        try:
+            _cloudtak_refresh_override(_log)
+        except Exception as e:
+            _log(f"  ⚠ CloudTAK override refresh skipped (non-fatal): {e}")
     cfg_path = '/usr/local/etc/mediamtx.yml'
     if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
         return False
-    subnets = _cloudtak_media_subnets()
-    if subnets is None:
-        return False
-    if not subnets and (os.path.exists(os.path.expanduser('~/CloudTAK/docker-compose.yml'))
-                        or os.path.exists(os.path.expanduser('~/CloudTAK/compose.yaml'))):
-        return False
+    if remote_mode:
+        # Wanted only while the remote CloudTAK is deployed; Remove clears the flag first.
+        subnets = (_cloudtak_remote_read_ips(cfg, probe=probe) if cfg.get('deployed') else [])
+        if subnets is None:
+            return False
+    else:
+        subnets = _cloudtak_media_subnets()
+        if subnets is None:
+            return False
+        if not subnets and (os.path.exists(os.path.expanduser('~/CloudTAK/docker-compose.yml'))
+                            or os.path.exists(os.path.expanduser('~/CloudTAK/compose.yaml'))):
+            return False
     try:
         with open(cfg_path) as _cf:
             cur = _cf.read()
@@ -108302,9 +108410,14 @@ def _mediamtx_converge_cloudtak_read(log=None):
     if (st.stdout or '').strip() != 'inactive':
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']),
                        capture_output=True, timeout=60)
-    if subnets:
+    if subnets and remote_mode:
+        _log(f"  ✓ MediaMTX: the remote CloudTAK host ({', '.join(subnets)}) may now watch "
+             "streams without a password (read only)")
+    elif subnets:
         _log(f"  ✓ MediaMTX: CloudTAK's media server ({', '.join(subnets)}) may now watch "
              "streams without a password (read only)")
+    elif remote_mode:
+        _log("  ✓ MediaMTX: CloudTAK read access removed (the remote CloudTAK is gone)")
     else:
         _log("  ✓ MediaMTX: CloudTAK read access removed (CloudTAK is not on this box)")
     return True
@@ -113118,7 +113231,8 @@ def _startup_migrations():
         # ops #193 (GH #256) — let CloudTAK's media container watch the standalone MediaMTX.
         # Last: it may restart mediamtx, after the converges above have settled it.
         try:
-            _mediamtx_converge_cloudtak_read(lambda m: print(f"Startup migration:{m}", flush=True))
+            _mediamtx_converge_cloudtak_read(lambda m: print(f"Startup migration:{m}", flush=True),
+                                            probe=False)   # ops #797: no remote login at console start
         except Exception as _mtx_ct_e:
             print(f"Startup migration: mediamtx CloudTAK-read converge error (non-fatal): {_mtx_ct_e}", flush=True)
 
