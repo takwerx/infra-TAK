@@ -19295,10 +19295,13 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.18.0'   # v10.2.8 W8: SECURITY — 4.14.0 carried GHSA-m23x (pre-auth heap
-# disclosure), GHSA-fvj6 (weak RNG) + five MEDIUM; all fixed by 4.17.0. Our flags include none of 4.18's
-# three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
-# defaults do not touch a cert-less UDP/TCP TURN.
+COTURN_IMAGE = 'coturn/coturn:4.19.1'   # ops #816: SECURITY — 4.19.0 fixes reads past a short key, a mismatched
+# realm accepted on connection-bind, a Redis reply offset and a blacklist race; 4.19.1 adds per-source DTLS half-open
+# limits, plaintext on a DTLS port, an oversize TCP/TLS frame and the admin HTTP server (no CVE published
+# at the time of the bump). Earlier: v10.2.8 W8 moved 4.14.0 -> 4.18.0
+# (GHSA-m23x pre-auth heap disclosure, GHSA-fvj6 weak RNG, five MEDIUM; fixed by 4.17.0). Our flags include none of
+# 4.18's three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
+# defaults do not touch a cert-less UDP/TCP TURN. 4.19.1's entrypoint still expands $(...) per argument.
 # Fleet constant (v10.0.7): standalone Remote-Assist CoTURN ALWAYS defaults to 3479,
 # never 3478 — 3478 is reserved for NetBird's TURN so the two can land on one box in
 # ANY install order with zero conflicts. RA clients are explicitly told URL+port by
