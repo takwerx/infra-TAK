@@ -5632,6 +5632,31 @@ def _no_retention_bar(settings):
             'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
 
 
+def _root_console_bar(settings):
+    """Spec for the "this console runs as root" bar, or None.
+
+    Fresh installs have been born non-root (takwerx @ /opt/infratak) since v10.0.5,
+    but an EXISTING root install stays root on every update — start.sh and Update
+    Now never flip it. The only way off root is the "Switch to non-root" button on
+    the Cyber Controls page, and nothing pointed a root operator at it, so legacy
+    boxes stayed root indefinitely (field report #523 hit a root-only ETL build
+    path). This bar is that pointer.
+
+    Dismissible like every notice bar; it clears by itself after the switch because
+    the console process is no longer uid 0. No I/O on the render path."""
+    try:
+        if os.getuid() != 0:
+            return None
+    except Exception:
+        return None
+    body = ('⚠ This console runs as root (an older install). Switch to the non-root console '
+            'for least privilege — one click, with automatic rollback. '
+            '<a href="/hardening#console-guard" style="color:inherit;text-decoration:underline">'
+            'Switch to non-root →</a>')
+    return {'cls': 'rootcon-banner', 'key': 'rootconsole', 'fg': '#eab308',
+            'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def _tak_cert_names_bar(settings):
     """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
 
@@ -5693,7 +5718,7 @@ def render_notice_bars(settings):
 
 def _render_notice_bars_inner(settings):
     specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
-                         _tak_cert_names_bar(settings)) if b]
+                         _tak_cert_names_bar(settings), _root_console_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
