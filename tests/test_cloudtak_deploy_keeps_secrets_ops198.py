@@ -205,6 +205,7 @@ def _remote_deploy(settings, remote_env, env_read_ok=True):
         _ssh_probe=_ssh_probe, _scp_to_host=_scp_to_host,
         _ensure_docker_log_limits_remote=lambda cfg, log_fn=None: None,
         _cloudtak_remote_media_bufs=lambda cfg, plog: None,
+        _remote_ensure_git=lambda cfg, plog=None: (True, ''),   # ops #796: the git step has its own test file
         _cloudtak_remote_reclone_sh=lambda tag: 'RECLONE',
         _cloudtak_remote_store_endpoint=lambda cfg: 'http://store:3900',
         _cloudtak_build_override_yml=lambda s: 'services: {}\n',

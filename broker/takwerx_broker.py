@@ -8151,15 +8151,45 @@ def _unit_point_at_root(unit_path=BROKER_UNIT, run=None):
     return True
 
 
+# v10.4.0 T&E (aws-arm, 2026-11-16 00:02:41Z): a restart signals the whole unit cgroup, so a
+# self-restart in the middle of a brokered command kills that command. The first root move
+# restarted 2 s after the broker came up, while the console's startup was running a CloudTAK
+# `docker compose up -d --force-recreate` through it:
+#     takwerx-broker.service: Killing process 824020 (docker) with signal SIGKILL.
+# cloudtak-api-1 was left removed until the next console start. So the self-restart waits for
+# nothing in flight first (the broker keeps serving meanwhile — the console only waits 30 s
+# for a missing socket), then unlinks the socket so new callers wait for the new broker,
+# serves what connected just before for `grace`, drains that, and only then restarts.
+SELF_RESTART_DRAIN_MAX_SECS = 900       # longer than any compose up/recreate the console runs
+SELF_RESTART_LATE_DRAIN_SECS = 20       # inside the console's 30 s missing-socket wait
+
+
+def _self_restart_when_idle(run, systemctl, drain=None, unlink=None, sleep=time.sleep,
+                            grace=RECYCLE_UNLINK_GRACE_SECS, log=None):
+    drain = drain or _drain
+    unlink = unlink or _unlink_socket
+    log = log or (lambda v, s: AUDIT and AUDIT.info(json.dumps(
+        {'op': 'self-restart', 'verdict': v, 'summary': s})))
+    if _inflight() > 0:
+        log('INFO', 'self-restart: waiting for %d request(s) in flight' % _inflight())
+    if not drain(max_secs=SELF_RESTART_DRAIN_MAX_SECS):
+        log('ERROR', 'self-restart: %d request(s) still running after %ds — restarting anyway'
+            % (_inflight(), SELF_RESTART_DRAIN_MAX_SECS))
+    unlink()
+    sleep(grace)
+    if not drain(max_secs=SELF_RESTART_LATE_DRAIN_SECS):
+        log('ERROR', 'self-restart: %d late request(s) still running after %ds — restarting anyway'
+            % (_inflight(), SELF_RESTART_LATE_DRAIN_SECS))
+    run([systemctl, '--no-block', 'restart', 'takwerx-broker'], capture_output=True,
+        timeout=30)
+
+
 def _restart_self_later(delay=2.0, run=None):
-    """Restart this broker after the reply went out (the restart kills this process)."""
+    """Restart this broker after the reply went out (the restart kills this process), once
+    nothing is in flight (see _self_restart_when_idle)."""
     run = run or subprocess.run
     systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
-
-    def _go():
-        run([systemctl, '--no-block', 'restart', 'takwerx-broker'], capture_output=True,
-            timeout=30)
-    t = threading.Timer(delay, _go)
+    t = threading.Timer(delay, _self_restart_when_idle, args=(run, systemctl))
     t.daemon = True
     t.start()
     return t
