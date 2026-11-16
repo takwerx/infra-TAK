@@ -7291,6 +7291,18 @@ def _console_password_needs_change():
     auth = load_auth()
     return bool(auth.get('password_hash')) and auth.get('password_min_len_ok') is not True
 
+
+def _console_password_length_state():
+    """'ok', 'short' (a password login showed it is under the floor) or 'unknown' (set
+    before ops #638 and never typed into a password login since — e.g. a box where the
+    operator only signs in through Authentik SSO, CORAZ 2026-11-15). The banner must not
+    call an unknown password short."""
+    auth = load_auth()
+    if not auth.get('password_hash'):
+        return 'ok'
+    v = auth.get('password_min_len_ok')
+    return 'ok' if v is True else ('short' if v is False else 'unknown')
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET' and _apply_authentik_session():
@@ -7402,6 +7414,7 @@ def console_page():
         takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
         srv_update_available=_srv_update, srv_latest=_srv_latest,
         console_password_needs_change=_console_password_needs_change(),
+        console_password_length_state=_console_password_length_state(),
         console_password_min_len=CONSOLE_PASSWORD_MIN_LEN)
     from flask import make_response
     r = make_response(resp)
@@ -105918,6 +105931,24 @@ def console_uninstall_all_validate():
     auth = load_auth()
     valid = bool(auth.get('password_hash') and check_password_hash(auth['password_hash'], password))
     return jsonify({'valid': valid})
+
+@app.route('/api/console/password/confirm-length', methods=['POST'])
+@login_required
+def console_password_confirm_length():
+    """The banner's "length unknown" case: the operator types the current console password
+    once; it is checked against the hash and only the yes/no (meets the floor) is kept, the
+    same as a password login does (_note_password_length). A wrong password counts as a
+    failed login for the fail2ban jail."""
+    password = (request.get_json(silent=True) or {}).get('password', '')
+    auth = load_auth()
+    if not password or not auth.get('password_hash') or \
+            not check_password_hash(auth['password_hash'], password):
+        _console_log_failed_login('password length check')
+        return jsonify({'ok': False, 'error': 'That is not the current console password'}), 403
+    _note_password_length(password)
+    meets = len(password) >= CONSOLE_PASSWORD_MIN_LEN
+    return jsonify({'ok': True, 'meets': meets, 'min_len': CONSOLE_PASSWORD_MIN_LEN})
+
 
 @app.route('/api/console/uninstall-all', methods=['POST'])
 @login_required
