@@ -46,3 +46,10 @@ def test_success_waits_for_the_restart_and_says_so():
     assert 'the console restarted' in body
     # the fields are cleared and masked again after success
     assert "i.value='';i.type='password'" in body
+
+
+def test_confirm_field_says_when_it_matches():
+    # operator, v10.4.0 T&E: the counter turned green, the confirm field gave no sign
+    assert 'id="reset-confirm-match"' in HELP
+    assert re.search(r'id="reset-confirm"[^>]*oninput="resetPwCount\(\)"', HELP)
+    assert "'✓ Matches'" in HELP and "'Does not match yet'" in HELP
