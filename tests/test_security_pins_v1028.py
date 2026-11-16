@@ -73,6 +73,14 @@ def test_coturn_pin_is_past_the_advisories():
     assert _v(pin) >= (4, 17, 0)
 
 
+def test_coturn_pin_has_the_4_19_security_fixes():
+    # ops #816: 4.19.0 (memory-safety and auth fixes) and 4.19.1 (DTLS half-open limits, admin server,
+    # oversize frame). The pin must be an exact tag, never a moving one.
+    pin = re.search(r"^COTURN_IMAGE = 'coturn/coturn:([^']+)'", APP, re.M).group(1)
+    assert _v(pin) >= (4, 19, 1)
+    assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
+
+
 def test_coturn_flags_avoid_the_ones_418_removed():
     # ops #201: the override is built in one place for install and the startup converge
     body = APP[APP.index('def _coturn_override_content('):]
