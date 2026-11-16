@@ -869,7 +869,8 @@ _UNIT_KEYS = {
         'MemoryMax', 'MemoryHigh', 'CPUQuota', 'TasksMax', 'IOSchedulingClass',
         'IOSchedulingPriority', 'OOMScoreAdjust', 'NoNewPrivileges', 'PrivateTmp',
         'ProtectSystem', 'ProtectHome', 'ReadOnlyPaths', 'ReadWritePaths',
-        'InaccessiblePaths', 'UMask', 'SELinuxContext'}),
+        'InaccessiblePaths', 'UMask', 'SELinuxContext',
+        'RuntimeDirectory', 'RuntimeDirectoryMode'}),
     'Timer': frozenset({
         'OnCalendar', 'OnBootSec', 'OnStartupSec', 'OnActiveSec', 'OnUnitActiveSec',
         'OnUnitInactiveSec', 'Persistent', 'RandomizedDelaySec', 'AccuracySec', 'Unit'}),
@@ -880,6 +881,10 @@ _UNIT_SECTIONS = {'.service': ('Unit', 'Service', 'Install'),
                   '.conf': ('Unit', 'Service', 'Install')}       # service drop-ins
 _UNIT_OUTPUTS = frozenset({'journal', 'null', 'inherit', 'journal+console', 'kmsg'})
 _UNIT_SELINUX = 'system_u:system_r:unconfined_service_t:s0'
+# ops #814: the only RuntimeDirectory= the console may ask for (Caddy's admin socket dir).
+_UNIT_RUNTIME_DIR_FILE = 'caddy.service.d/10-takwerx-boot.conf'
+_UNIT_RUNTIME_DIR = 'caddy'
+_UNIT_RUNTIME_DIR_MODES = frozenset({'0750', '0700'})
 _UNIT_PATH_DIRS = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
 # env names that change what a root process loads or runs
 _UNIT_ENV_DENY_RE = re.compile(
@@ -1191,6 +1196,15 @@ def _check_unit_write(path, content, mode):
         elif k == 'SELinuxContext':
             if v != _UNIT_SELINUX:
                 raise Denied(f'unit: SELinuxContext={v} not allowed')
+        elif k == 'RuntimeDirectory':
+            # ops #814: PID 1 creates /run/<value> and gives it to the unit's user. One
+            # fixed directory, for Caddy's admin socket, in the one drop-in that needs it.
+            if rel != _UNIT_RUNTIME_DIR_FILE or v != _UNIT_RUNTIME_DIR:
+                raise Denied(f'unit: RuntimeDirectory= is only allowed as {_UNIT_RUNTIME_DIR} '
+                             f'in {_UNIT_RUNTIME_DIR_FILE}')
+        elif k == 'RuntimeDirectoryMode':
+            if rel != _UNIT_RUNTIME_DIR_FILE or v not in _UNIT_RUNTIME_DIR_MODES:
+                raise Denied(f'unit: RuntimeDirectoryMode={v} not allowed')
         elif k == 'Unit' and sec == 'Timer':
             if not _unit_name_ok(v):
                 raise Denied(f'unit: timer Unit={v} is not an infra-TAK unit')

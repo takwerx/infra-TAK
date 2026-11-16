@@ -33768,6 +33768,361 @@ def _caddy_port_option_lines(settings=None):
     return out
 
 
+# ── ops #814: Caddy's admin API and the proxy-auth values are private ─────────────
+# Two things on a box with a domain name were open to every local account:
+#   * Caddy's admin API on 127.0.0.1:2019 (no login): it returns the running config and
+#     loads a new one;
+#   * the generated Caddyfile (0644), which held the value Caddy attaches after
+#     forward_auth.
+# The private layout:
+#   * the admin API is a unix socket in /run/caddy (a RuntimeDirectory, 0750 caddy:caddy)
+#     with mode 0220: root, `caddy` and group `caddy` (the console account) only. Caddy's
+#     default mode 0200 also refuses the console account, which would cost it its
+#     unforced reload (_caddy_reload_if_changed). /run, because on RHEL the SELinux policy
+#     lets Caddy (httpd_t) create a socket there and not in its home.
+#     https://caddyserver.com/docs/conventions#network-addresses
+#   * the Caddyfile holds `{file.<path>}` and the value is in a 0400 caddy:caddy file in
+#     Caddy's home. Caddy reads it on each request, so a rotation is a file swap with no
+#     reload, and neither `caddy adapt` nor the running config holds the value.
+#     https://caddyserver.com/docs/conventions#placeholders
+#     Not `{env.…}`: the environment is fixed at process start (a Caddy restart per
+#     rotation) and the packaged unit runs `caddy run --environ`, which prints it.
+# Measured on Caddy 2.11.9, 2026-11-16. `private` in .config/proxy_auth.json says the box
+# has been moved (_caddy_make_private). Until then generate_caddyfile() keeps the old
+# layout, so a Caddy with no /run/caddy yet never gets a config it cannot start with.
+CADDY_ADMIN_SOCKET = '/run/caddy/admin.sock'
+CADDY_ADMIN_SOCKET_MODE = '0220'
+_CADDY_MIN_FILE_PLACEHOLDER = (2, 8)
+_CADDY_PROXY_AUTH_FILES = {'console': 'infratak-proxy-auth-console',
+                           'atlas': 'infratak-proxy-auth-atlas'}
+_PROXY_AUTH_VALUE_RE = re.compile(r'^[0-9a-f]{64}$')
+CADDY_BOOT_DROPIN = '/etc/systemd/system/caddy.service.d/10-takwerx-boot.conf'
+CADDY_BOOT_DROPIN_TEXT = (
+    '[Unit]\n'
+    'After=network-online.target\n'
+    'Wants=network-online.target\n'
+    '\n'
+    '[Service]\n'
+    'Restart=on-failure\n'
+    'RestartSec=5s\n'
+    'RuntimeDirectory=caddy\n'
+    'RuntimeDirectoryMode=0750\n'
+)
+_caddy_private_lock = threading.Lock()
+
+
+def _caddy_private():
+    """True once this box runs the private layout (admin socket + value files)."""
+    try:
+        return bool(_proxy_auth_state().get('private'))
+    except Exception:
+        return False
+
+
+def _caddy_account():
+    """(home, uid, gid) of the `caddy` account, or None when there is none."""
+    try:
+        import pwd
+        pw = pwd.getpwnam('caddy')
+    except Exception:
+        return None
+    home = pw.pw_dir if (pw.pw_dir or '').startswith('/') and os.path.isdir(pw.pw_dir) else '/var/lib/caddy'
+    return home, pw.pw_uid, pw.pw_gid
+
+
+def _caddy_proxy_auth_path(kind):
+    acct = _caddy_account()
+    return os.path.join(acct[0] if acct else '/var/lib/caddy', _CADDY_PROXY_AUTH_FILES[kind])
+
+
+def _caddy_proxy_auth_token(kind, value):
+    """What generate_caddyfile() writes after `X-Infratak-Proxy-Auth`: the file placeholder
+    on a private box, the value itself on a box that has not been moved yet."""
+    if _caddy_private():
+        return '{file.' + _caddy_proxy_auth_path(kind) + '}'
+    return value
+
+
+def _caddy_write_proxy_auth_file(kind, value):
+    """Put `value` where Caddy reads it: 0400, owned by `caddy`, swapped in by rename so
+    Caddy never reads a half-written or root-owned file. Raises on any failure."""
+    if not _PROXY_AUTH_VALUE_RE.match(value or ''):
+        raise ValueError('proxy auth value is not 64 hex characters')
+    acct = _caddy_account()
+    if not acct:
+        raise RuntimeError('there is no caddy account on this server')
+    _home, uid, gid = acct
+    path = _caddy_proxy_auth_path(kind)
+    tmp = path + '.new'
+    if os.getuid() == 0 and not (_broker_should_route() and _broker_available()):
+        # Caddy's home belongs to `caddy`: never write through a link it could plant.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(value)
+            os.fchown(f.fileno(), uid, gid)
+            os.fchmod(f.fileno(), 0o400)
+        os.replace(tmp, path)
+        return path
+    _write_priv(tmp, value, perm=0o600)
+    r = _run_priv_chain([['chown', '%d:%d' % (uid, gid), tmp], ['chmod', '400', tmp],
+                         ['mv', '-f', tmp, path]], mode='and', timeout=30)
+    if r is None or r.returncode != 0:
+        detail = ((r.stderr or r.stdout or '') if r is not None else '').strip()[:160]
+        raise RuntimeError('could not install %s (%s)' % (path, detail or 'no output'))
+    return path
+
+
+def _caddy_read_proxy_auth_file(kind):
+    """The value Caddy is reading for `kind`, or '' when the file cannot be read."""
+    try:
+        return (_read_priv(_caddy_proxy_auth_path(kind)) or '').strip()
+    except Exception:
+        return ''
+
+
+def _caddy_boot_dropin_ensure():
+    """Write the Caddy drop-in (boot ordering, restart on failure, /run/caddy) when it
+    differs. Returns (in_place, changed). Never raises. A broker older than this release
+    refuses RuntimeDirectory=; the caller tries again on the next console start."""
+    try:
+        try:
+            with open(CADDY_BOOT_DROPIN) as f:
+                cur = f.read()
+        except Exception:
+            cur = ''
+        if cur.strip() == CADDY_BOOT_DROPIN_TEXT.strip():
+            return True, False
+        _makedirs_priv(os.path.dirname(CADDY_BOOT_DROPIN))
+        _write_priv(CADDY_BOOT_DROPIN, CADDY_BOOT_DROPIN_TEXT)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        return True, True
+    except Exception as e:
+        print('Caddy: could not write the boot drop-in (%s)' % str(e)[:160], flush=True)
+        return False, False
+
+
+def _caddyfile_is_private(text):
+    """True when the generated part of `text` puts the admin API on the socket and holds
+    no proxy-auth value."""
+    gen = (text or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    if ('admin unix/' + CADDY_ADMIN_SOCKET) not in gen:
+        return False
+    return not re.search(r'X-Infratak-Proxy-Auth\s+[0-9a-f]{16}', gen)
+
+
+def _caddy_tcp_admin_open(timeout=3):
+    """True when something answers on 127.0.0.1:2019, Caddy's old admin address."""
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex(('127.0.0.1', 2019)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _caddy_admin_config_text(timeout=10):
+    """Caddy's running config as text. Raises when the admin API cannot be asked."""
+    if _caddy_private():
+        import http.client
+        conn = http.client.HTTPConnection('localhost', timeout=timeout)
+        conn.sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        conn.sock.settimeout(timeout)
+        try:
+            conn.sock.connect(CADDY_ADMIN_SOCKET)
+            conn.request('GET', '/config/')
+            return conn.getresponse().read().decode('utf-8', 'replace')
+        finally:
+            conn.close()
+    import urllib.request
+    with urllib.request.urlopen('http://127.0.0.1:2019/config/', timeout=timeout) as resp:
+        return resp.read().decode('utf-8', 'replace')
+
+
+def _caddy_private_problem(state, wait=20, sleep=None, clock=None):
+    """'' when Caddy is up on the private layout, else what is wrong. Waits up to `wait`
+    seconds, because this runs right after a restart."""
+    import stat as _stat
+    sleep = sleep or time.sleep
+    clock = clock or time.time
+    deadline = clock() + wait
+    while True:
+        try:
+            act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']),
+                                 capture_output=True, text=True, timeout=15)
+            if (act.stdout or '').strip() != 'active':
+                why = 'Caddy is not running after the restart'
+            elif _caddy_tcp_admin_open():
+                why = 'the admin API still answers on 127.0.0.1:2019'
+            else:
+                why = ''
+                try:
+                    st = os.stat(CADDY_ADMIN_SOCKET)
+                    if not _stat.S_ISSOCK(st.st_mode):
+                        why = 'the admin socket path is not a socket'
+                    elif (st.st_mode & 0o777) & 0o557:
+                        why = 'the admin socket has mode %o' % (st.st_mode & 0o777)
+                except FileNotFoundError:
+                    why = 'Caddy did not create its admin socket'
+                except OSError:
+                    pass        # this account cannot look into /run/caddy: nothing to judge
+                if not why and any(v and _caddy_running_config_has(v) for v in (
+                        state.get('secret'), state.get('atlas_secret'), state.get('previous'))):
+                    why = 'the running Caddy config still holds a proxy auth value'
+                if not why:
+                    return ''
+        except Exception as e:
+            why = 'the check could not be run (%s)' % str(e)[:160]
+        if clock() >= deadline:
+            return why
+        sleep(2)
+
+
+def _caddy_make_private(plog=None):
+    """Move this box to the private layout (see the note above), and rotate the values,
+    because the old ones may have been read. Returns 'private' (moved now), 'already',
+    'skipped' (no Caddy-fronted console here), 'old-caddy' or 'failed' (the old config is
+    back in place; the next console start tries again). Never raises."""
+    def say(msg):
+        print('[caddy-private] ' + msg, flush=True)
+        if plog:
+            try:
+                plog('  ' + msg)
+            except Exception:
+                pass
+
+    if not _caddy_private_lock.acquire(blocking=False):
+        return 'failed'
+    try:
+        return _caddy_make_private_locked(say, plog)
+    except Exception as e:
+        say('⚠ SECURITY: Caddy admin API and proxy auth values NOT made private (%s). '
+            'Retries on the next console start.' % str(e)[:200])
+        return 'failed'
+    finally:
+        _caddy_private_lock.release()
+
+
+def _caddy_make_private_locked(say, plog=None):
+    settings = load_settings()
+    if not (settings.get('fqdn') or '').strip() or not os.path.exists(CADDYFILE_PATH) \
+            or not shutil.which('caddy') or not _caddy_account():
+        return 'skipped'
+    state = _proxy_auth_state(create=True)
+    try:
+        prev_caddyfile = _read_priv(CADDYFILE_PATH) or ''
+    except Exception as e:
+        say('⚠ SECURITY: could not read the Caddyfile (%s). Retries on the next console '
+            'start.' % str(e)[:120])
+        return 'failed'
+
+    if state.get('private') and _caddyfile_is_private(prev_caddyfile) and not _caddy_tcp_admin_open():
+        # Already moved. Heal what a hand edit or a restore may have undone.
+        _caddy_boot_dropin_ensure()
+        for kind, key in (('console', 'secret'), ('atlas', 'atlas_secret')):
+            want = (state.get(key) or '').strip()
+            if want and _caddy_read_proxy_auth_file(kind) != want:
+                _caddy_write_proxy_auth_file(kind, want)
+                say('Rewrote the %s proxy auth file for Caddy' % kind)
+        if state.get('atlas_pending'):
+            if not _proxy_auth_atlas_apply((state.get('atlas_secret') or '').strip(), plog):
+                state = dict(state)
+                state.pop('atlas_pending', None)
+                _save_proxy_auth_state(state)
+                say('ATLAS switched to its own proxy auth value')
+        return 'already'
+
+    ver = _caddy_version_tuple(refresh=True)
+    if not ver or ver < _CADDY_MIN_FILE_PLACEHOLDER:
+        say('⚠ SECURITY: Caddy %s is older than %s, so its admin API and the proxy auth '
+            'value stay readable by local accounts until Caddy is updated (Caddy page, Update).'
+            % ('.'.join(map(str, ver)) if ver else '(version unknown)',
+               '.'.join(map(str, _CADDY_MIN_FILE_PLACEHOLDER))))
+        return 'old-caddy'
+    in_place, _changed = _caddy_boot_dropin_ensure()
+    if not in_place:
+        say('⚠ SECURITY: the Caddy drop-in for /run/caddy could not be written. Retries on '
+            'the next console start.')
+        return 'failed'
+
+    old_state = dict(state)
+    old_state.pop('private', None)
+    old_secret = (old_state.get('secret') or '').strip()
+    new_state = dict(old_state)
+    new_state.update({'secret': secrets.token_hex(32), 'atlas_secret': secrets.token_hex(32),
+                      'private': True, 'rotated_at': int(time.time())})
+    new_state.pop('atlas_pending', None)
+    if old_secret:
+        new_state['previous'] = old_secret      # Caddy sends the old one until its restart
+
+    def put_back(reason):
+        say('⚠ SECURITY: Caddy admin API and proxy auth values NOT made private: %s. '
+            'Putting the old Caddy config back. Retries on the next console start.' % reason)
+        try:
+            _save_proxy_auth_state(old_state)
+        except Exception as e:
+            say('Restoring the secret file failed: %s' % str(e)[:120])
+        try:
+            if (_read_priv(CADDYFILE_PATH) or '') != prev_caddyfile:
+                _write_priv(CADDYFILE_PATH, prev_caddyfile)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                               capture_output=True, text=True, timeout=90)
+            if r.returncode != 0:
+                say('Caddy did not restart on the old config: %s'
+                    % ((r.stderr or r.stdout or '').strip()[:200] or 'rc=%d' % r.returncode))
+        except Exception as e:
+            say('Putting the old Caddy config back failed: %s' % str(e)[:160])
+        audit('caddy-private:failed', reason[:300], force=True)
+        return 'failed'
+
+    _caddy_write_proxy_auth_file('console', new_state['secret'])
+    _caddy_write_proxy_auth_file('atlas', new_state['atlas_secret'])
+    _save_proxy_auth_state(new_state)       # generate_caddyfile() reads `private` from here
+    try:
+        generate_caddyfile(settings)
+        written = _read_priv(CADDYFILE_PATH) or ''
+    except Exception as e:
+        return put_back('could not write the Caddyfile (%s)' % str(e)[:160])
+    if not _caddyfile_is_private(written):
+        return put_back('Caddy rejected the new Caddyfile (%s)' % (
+            _caddy_last_validate_error.get('err') or 'it has no admin socket line')[:200])
+    try:
+        # A restart, not a reload: /run/caddy only exists once the unit has started with the
+        # drop-in, and `caddy reload` would look for the running Caddy on the new address.
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                           capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        return put_back('the Caddy restart could not be run (%s)' % str(e)[:160])
+    if r.returncode != 0:
+        return put_back('Caddy did not restart (%s)' % (
+            (r.stderr or r.stdout or '').strip()[:200] or 'rc=%d' % r.returncode))
+    problem = _caddy_private_problem(new_state)
+    if problem:
+        return put_back(problem)
+
+    final_state = dict(new_state)
+    final_state.pop('previous', None)
+    errs = _proxy_auth_atlas_apply(new_state['atlas_secret'], plog)
+    if errs:
+        final_state['atlas_pending'] = True
+        say('⚠ ATLAS did not take its new proxy auth value (%s). Its admin page refuses '
+            'sign-in until the next console start tries again.' % '; '.join(errs)[:300])
+    _save_proxy_auth_state(final_state)
+    for stale in (_PROXY_AUTH_CADDYFILE_BACKUP, _PROXY_AUTH_BACKUP_FILE):
+        try:
+            os.remove(stale)                # they hold the values that were just retired
+        except OSError:
+            pass
+    audit('caddy-private:applied',
+          'Caddy admin API moved to a unix socket; proxy auth values moved out of the Caddyfile and rotated',
+          force=True)
+    say('Caddy admin API is now a unix socket, and the proxy auth values left the Caddyfile '
+        'and were rotated')
+    return 'private'
+
+
 def _caddy_global_options_lines(cfg=None, grpc_streams=False, settings=None):
     """The Caddyfile global options block. ALWAYS emitted, on every box.
 
@@ -33788,6 +34143,9 @@ def _caddy_global_options_lines(cfg=None, grpc_streams=False, settings=None):
     That is intended: the grace period is not opt-in.
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
+    if _caddy_private():
+        # ops #814: no admin API on 127.0.0.1:2019, where every local account could use it.
+        out.append(f'    admin unix/{CADDY_ADMIN_SOCKET}|{CADDY_ADMIN_SOCKET_MODE}')
     out += _caddy_port_option_lines(settings)
     out += _caddy_acme_inner_lines(cfg)
     out += _caddy_read_body_idle_lines(grpc_streams)
@@ -34752,9 +35110,7 @@ _proxy_auth_rotate_lock = threading.Lock()
 def _caddy_running_config_has(needle):
     """True/False when Caddy's admin API answers, None when it can't be asked."""
     try:
-        import urllib.request
-        with urllib.request.urlopen('http://127.0.0.1:2019/config/', timeout=10) as resp:
-            return needle in resp.read().decode('utf-8', 'replace')
+        return needle in _caddy_admin_config_text()
     except Exception:
         return None
 
@@ -34776,6 +35132,91 @@ def _proxy_auth_atlas_apply(secret, plog):
         return errs
     except Exception as e:
         return ['ATLAS: %s' % str(e)[:200]]
+
+
+def _rotate_proxy_auth_private(say, steps, old_state, caddyfile, plog=None):
+    """ops #814: rotation on a private box. Caddy reads each value from its own file on
+    every request, so the new values go live at the file swap: no Caddyfile change, no
+    reload. ATLAS gets its own new value. Any failure puts the files, the secret file and
+    ATLAS back. Called by _rotate_proxy_auth_secret(), which holds the lock."""
+    old_secret = (old_state.get('secret') or '').strip()
+    old_atlas = (old_state.get('atlas_secret') or '').strip()
+    if not caddyfile or not old_secret or \
+            _caddy_proxy_auth_token('console', old_secret) not in caddyfile:
+        return {'success': False, 'steps': steps,
+                'error': 'Caddy is not sending a proxy auth value right now (no Authentik sign-in in front of the console, or the Caddyfile is out of date), so nothing was changed. Press Reload on this page and try again.'}
+    try:
+        _write_private_file(_PROXY_AUTH_BACKUP_FILE, json.dumps(old_state))
+    except Exception as e:
+        return {'success': False, 'steps': steps,
+                'error': 'Could not write the backup, so nothing was changed: %s' % str(e)[:160]}
+    say('Backed up the current values')
+
+    new_state = dict(old_state)
+    new_state.update({'secret': secrets.token_hex(32), 'atlas_secret': secrets.token_hex(32),
+                      'previous': old_secret, 'rotated_at': int(time.time())})
+    new_state.setdefault('enforce', False)
+    new_state.pop('atlas_pending', None)
+    files_written = []
+    atlas_switched = [False]
+
+    def rollback(reason):
+        say('Failed: %s. Putting the old values back.' % reason)
+        problems = []
+        try:
+            _save_proxy_auth_state(old_state)
+        except Exception as e:
+            problems.append('restoring the secret file failed: %s' % str(e)[:120])
+        for kind, value in (('console', old_secret), ('atlas', old_atlas)):
+            if kind in files_written and value:
+                try:
+                    _caddy_write_proxy_auth_file(kind, value)
+                except Exception as e:
+                    problems.append('restoring the %s value file failed: %s' % (kind, str(e)[:120]))
+        if atlas_switched[0] and old_atlas:
+            problems.extend(_proxy_auth_atlas_apply(old_atlas, plog))
+        if problems:
+            say('Rollback problems: ' + '; '.join(problems))
+        else:
+            say('Rolled back. Nothing changed.')
+        audit('proxy-auth:rotate-failed', reason[:300], force=True)
+        return {'success': False, 'rolled_back': not problems, 'steps': steps,
+                'error': reason + ('' if not problems else
+                                   ' Rollback was incomplete: ' + '; '.join(problems))}
+
+    try:
+        _save_proxy_auth_state(new_state)
+    except Exception as e:
+        return rollback('could not save the new value: %s' % str(e)[:120])
+    say('New values saved; the console accepts old and new while Caddy switches')
+
+    for kind, key in (('console', 'secret'), ('atlas', 'atlas_secret')):
+        try:
+            files_written.append(kind)
+            _caddy_write_proxy_auth_file(kind, new_state[key])
+        except Exception as e:
+            return rollback('could not write the %s value file for Caddy: %s' % (kind, str(e)[:160]))
+        if _caddy_read_proxy_auth_file(kind) != new_state[key]:
+            return rollback('the %s value file for Caddy does not hold the new value' % kind)
+    say('Caddy now sends the new values (it reads them on each request, no reload)')
+
+    atlas_installed = bool(load_settings().get('atlas_enabled'))
+    errs = _proxy_auth_atlas_apply(new_state['atlas_secret'], plog)
+    atlas_switched[0] = True
+    if errs:
+        return rollback('ATLAS did not take the new value (%s)' % '; '.join(errs))
+    if atlas_installed:
+        say('ATLAS updated to its new value')
+
+    final_state = dict(new_state)
+    final_state.pop('previous', None)
+    try:
+        _save_proxy_auth_state(final_state)
+    except Exception as e:
+        say('Warning: could not drop the old value from the secret file: %s' % str(e)[:120])
+    audit('proxy-auth:rotated', 'X-Infratak-Proxy-Auth secret rotated', force=True)
+    say('Done. The old values no longer work.')
+    return {'success': True, 'steps': steps}
 
 
 def _rotate_proxy_auth_secret(plog=None):
@@ -34806,6 +35247,9 @@ def _rotate_proxy_auth_secret(plog=None):
         except Exception as e:
             prev_caddyfile = None
             say('Could not read the current Caddyfile: %s' % str(e)[:120])
+        if _caddy_private():
+            # ops #814: the values are in files Caddy reads on each request.
+            return _rotate_proxy_auth_private(say, steps, old_state, prev_caddyfile, plog)
         if not prev_caddyfile or not old_secret or old_secret not in prev_caddyfile:
             return {'success': False, 'steps': steps,
                     'error': 'Caddy is not sending a proxy auth value right now (no Authentik sign-in in front of the console, or the Caddyfile is out of date), so nothing was changed. Press Reload on this page and try again.'}
@@ -40792,9 +41236,12 @@ def generate_caddyfile(settings=None):
         # requires it alongside X-Authentik-Username once the gate is armed, so a
         # forged identity header alone is dead even if the client strip above ever
         # regresses on a future plain-proxy path.
+        # ops #814: on a private box this line names a file only Caddy reads, never the
+        # value (_caddy_proxy_auth_token).
         _pa_secret = (_proxy_auth_state(create=True).get('secret') or '').strip()
         if _pa_secret:
-            lines.append(f"        request_header @needs_sso X-Infratak-Proxy-Auth {_pa_secret}")
+            _pa_token = _caddy_proxy_auth_token('console', _pa_secret)
+            lines.append(f"        request_header @needs_sso X-Infratak-Proxy-Auth {_pa_token}")
         lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
         lines.append(f"            transport http {{")
         lines.append(f"                tls")
@@ -41324,9 +41771,15 @@ def generate_caddyfile(settings=None):
             # it. Its own peer check cannot help — Caddy runs on this host and
             # reaches the container through the bridge gateway, and so does every
             # other process here. This secret is what separates them.
-            _at_pa = (_proxy_auth_state(create=True).get('secret') or '').strip()
+            #
+            # ops #814: on a private box ATLAS has its own value (`atlas_secret`), so
+            # the container never holds the one that signs people in to the console.
+            _at_state = _proxy_auth_state(create=True)
+            _at_pa = ((_at_state.get('atlas_secret') if _caddy_private() else '')
+                      or _at_state.get('secret') or '').strip()
             if _at_pa:
-                lines.append(f"        request_header X-Infratak-Proxy-Auth {_at_pa}")
+                _at_token = _caddy_proxy_auth_token('atlas', _at_pa)
+                lines.append(f"        request_header X-Infratak-Proxy-Auth {_at_token}")
             lines.append(f"        reverse_proxy {at_up}")
             lines.append(f"    }}")
         else:
@@ -42681,6 +43134,14 @@ def run_caddy_deploy(domain):
         if not custom_mode:
             settings['ssl_mode'] = 'fqdn'
         save_settings(settings)
+
+        # ops #814: a new install gets the private layout now, not at the next console start.
+        _cp_res = _caddy_make_private(plog)
+        if _cp_res in ('private', 'already'):
+            plog("✓ Caddy admin API is a unix socket; proxy auth values are not in the Caddyfile")
+        elif _cp_res == 'failed':
+            plog("⚠ Caddy admin API and proxy auth values are not private yet (see the lines above). "
+                 "The console tries again each time it starts.")
 
         plog("")
         plog("=" * 50)
@@ -107134,17 +107595,8 @@ _startup_ensure_console_gunicorn_threads()
 # cloudtak-media 127.0.0.1:9997 publish); the bind is fatal and the stock unit
 # never retries, so every vhost stays dark until a manual start.
 def _startup_harden_caddy_boot():
-    dropin_dir = '/etc/systemd/system/caddy.service.d'
-    dropin = f'{dropin_dir}/10-takwerx-boot.conf'
-    dropin_content = (
-        '[Unit]\n'
-        'After=network-online.target\n'
-        'Wants=network-online.target\n'
-        '\n'
-        '[Service]\n'
-        'Restart=on-failure\n'
-        'RestartSec=5s\n'
-    )
+    # ops #814: one text for this drop-in (CADDY_BOOT_DROPIN_TEXT). It also gives Caddy
+    # /run/caddy for its admin socket; a running Caddy gets it at its next restart.
     sysctl_path = '/etc/sysctl.d/99-takwerx-nonlocal-bind.conf'
     sysctl_content = 'net.ipv4.ip_nonlocal_bind = 1\n'
 
@@ -107157,11 +107609,9 @@ def _startup_harden_caddy_boot():
 
     try:
         import shutil as _sh
-        if _sh.which('caddy') and _read(dropin).strip() != dropin_content.strip():
-            subprocess.run(_sudo_wrap(['mkdir', '-p', dropin_dir]), capture_output=True, timeout=10)
-            _write_priv(dropin, dropin_content)
-            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
-            print('Startup migration: Caddy boot drop-in installed (network-online ordering + Restart=on-failure; v10.1.7 WS6)')
+        if _sh.which('caddy') and _caddy_boot_dropin_ensure()[1]:
+            print('Startup migration: Caddy boot drop-in installed (network-online ordering + '
+                  'Restart=on-failure + /run/caddy; v10.1.7 WS6, ops #814)')
         if _read(sysctl_path).strip() != sysctl_content.strip():
             _write_priv(sysctl_path, sysctl_content)
             # Apply the runtime value with `sysctl -w <param>=<val>`, NOT `-p <file>`:
@@ -113541,6 +113991,19 @@ def _startup_migrations():
                     # defense; retry on the next restart. Loud on purpose.
                     print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
                           f"(strip-only defense until next restart): {_pa_err}", flush=True)
+
+        # ops #814 SECURITY (every start until applied, then a cheap self-check): Caddy's
+        # admin API moves from 127.0.0.1:2019 to a unix socket and the proxy-auth values
+        # leave the Caddyfile for files only Caddy reads, with new values. Runs after the
+        # gate above so a first arm is not mixed with this. Restarts Caddy once.
+        try:
+            _cp_res = _caddy_make_private()
+            if _cp_res == 'private':
+                print("Startup migration: Caddy admin API and proxy auth values are now private "
+                      "(unix socket, values out of the Caddyfile, rotated)", flush=True)
+        except Exception as _cp_e:
+            print(f"Startup migration: ⚠ SECURITY: Caddy private layout error (retries next "
+                  f"restart): {_cp_e}", flush=True)
 
         # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
         # generate_caddyfile does nothing until the file is regenerated, and a manual
