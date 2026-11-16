@@ -58410,7 +58410,7 @@ def _webodm_odm_limits(detected_cores, cfg):
 #                db/18. A 4.x database cannot be opened by 3.x, so Update dumps the 9.5 database
 #                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
 #                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
-WEBODM_VERSION = '4.0.0'
+WEBODM_VERSION = '4.0.1'   # 4.0.1 (ops #820): project permission checks hardened (upstream PR 2061); no DB migration
 # TAK overlay plugin (a personal GitHub account's repo, loaded INTO the WebODM container). ops #637:
 # pinned to a release tag and its commit. The clone is refused unless HEAD is exactly
 # WEBODM_OVERLAY_SHA. Reviewed whole-tree at this ref (module-scan). Bump both together after a
