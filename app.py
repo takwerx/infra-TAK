@@ -35987,6 +35987,35 @@ _REMOTE_DOCKER_GROUP_SH = (
 )
 
 
+_REMOTE_GIT_ENSURE_SH = (
+    # ops #792: a stock Rocky/RHEL 9 server image has no `git`, and the remote WebODM deploy runs
+    # `git clone` on the remote host. Install it with the host's own package manager, with `sudo -n`
+    # for a non-root SSH user (same rule as _docker_install_cmd(sudo_fallback=True)). Does nothing
+    # when git is already there (Ubuntu cloud images). NON-ROOT-COMMANDS: dnf, apt-get.
+    '{ command -v git >/dev/null 2>&1 || { '
+    'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+    'if command -v dnf >/dev/null 2>&1; then $S dnf install -y git; '
+    'elif command -v apt-get >/dev/null 2>&1; then '
+    '$S apt-get update && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y git; '
+    'else echo "no dnf or apt-get on this host: install git by hand"; false; fi; '
+    '} && git --version; } 2>&1'
+)
+
+
+def _remote_ensure_git(deploy_cfg, plog=None):
+    """Make sure the remote SSH target has `git` (no-op for local targets, the console has it).
+    Returns (ok, output)."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return True, ''
+    ok, out = _ssh_probe(deploy_cfg.get('remote', {}), _REMOTE_GIT_ENSURE_SH, timeout=300)
+    if plog:
+        if ok:
+            plog(f'  {((out or "").strip().splitlines() or ["git ready"])[-1]}')
+        else:
+            plog(f'✗ git is not on the remote host and could not be installed: {(out or "")[-300:]}')
+    return ok, out
+
+
 def _remote_docker_group(deploy_cfg, plog=None):
     """Make the remote SSH user able to run docker (no-op for root and local targets).
     Found by TEST-MATRIX-v10.3.0 row 5: a remote CloudTAK deploy as azureuser died at its
@@ -58520,6 +58549,11 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
 
     # Clone TAK overlay plugin on remote
     plog('━━━ Installing TAK overlay plugin (remote) ━━━')
+    # ops #792: stock Rocky/RHEL 9 images ship without git
+    ok, _ = _remote_ensure_git(deploy_cfg, plog)
+    if not ok:
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
     ok, out = _module_run(deploy_cfg,
         f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
         f'git clone --depth=1 --branch {WEBODM_OVERLAY_REF} {WEBODM_OVERLAY_REPO} '
