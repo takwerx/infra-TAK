@@ -70,7 +70,8 @@ if __name__ == '__main__':
 
 
 from flask import (Flask, render_template, request, jsonify,
-    redirect, url_for, session, send_from_directory, make_response)
+    redirect, url_for, session, send_from_directory, make_response,
+    g, has_request_context)
 # GH #137: the werkzeug pair is wrapped below (verify_password / hash_password, next to
 # load_auth) and the plain names re-bound to the wrappers, so every existing
 # check_password_hash() call site gets the fail-closed check without being touched.
@@ -214,6 +215,12 @@ app.session_interface = _ConsoleSessionInterface()
 # In-memory rate limiter (per-process). Good baseline protection without extra deps.
 _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
+# ops #815: a key used to stay for the life of the process, one per address that ever
+# posted. _RATE_EXPIRES holds the time each key's newest hit leaves its window; the sweep
+# (at most once a minute, under the lock) drops every key past it.
+_RATE_EXPIRES = {}               # key -> time its newest hit expires
+_RATE_SWEEP = {'next': 0.0}
+_RATE_SWEEP_EVERY = 60
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +976,23 @@ def _gd_render_older_broker(name, err):
     return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
 
 
+# ops #815: the health endpoint is the one Guard Dog script that is a long-running
+# service, not a timer job. A new copy on disk does nothing until the service restarts,
+# so a fix to it never reached a running box (until its next reboot). Both paths that
+# install the script restart the service when, and only when, the file changed.
+_GD_HEALTH_SCRIPT = 'tak-health-endpoint.py'
+
+
+def _gd_restart_health_endpoint():
+    """Load a changed health endpoint script (try-restart: a stopped or absent service
+    stays as it is). Never raises."""
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                       capture_output=True, timeout=20)
+    except Exception as e:
+        print(f"[guarddog] tak-health.service not restarted: {str(e)[:120]}", flush=True)
+
+
 def _gd_install_script(name, template, values, perm=0o755):
     """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
     file changed. A broker on the root-owned layout renders it from ITS copy of the
@@ -1358,17 +1382,40 @@ def _client_ip():
     return (request.remote_addr or 'unknown').strip()
 
 
+def _rate_limit_ip_key(ip):
+    """The rate-limit bucket for a client address (ops #815). One IPv6 customer line is a
+    whole /64, so a caller could take a new address for every request and never reach a
+    per-address limit: IPv6 is counted per /64. IPv4 (also IPv4-mapped IPv6) stays per
+    address. Anything that is not an address is returned unchanged. Only for rate-limit
+    keys: the fail2ban log keeps the real address."""
+    try:
+        addr = ipaddress.ip_address((ip or '').split('%')[0])
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network('%s/64' % addr, strict=False))
+    return str(addr)
+
+
 def _is_rate_limited(key, limit, window_seconds):
     """Return True when key exceeded limit within rolling window."""
     now = time.time()
     cutoff = now - window_seconds
     with _RATE_LOCK:
+        if now >= _RATE_SWEEP['next']:
+            _RATE_SWEEP['next'] = now + _RATE_SWEEP_EVERY
+            for stale in [k for k, exp in _RATE_EXPIRES.items() if exp <= now]:
+                _RATE_HITS.pop(stale, None)
+                _RATE_EXPIRES.pop(stale, None)
         q = _RATE_HITS[key]
         while q and q[0] < cutoff:
             q.popleft()
         if len(q) >= limit:
             return True
         q.append(now)
+        _RATE_EXPIRES[key] = now + window_seconds
         return False
 
 
@@ -1534,8 +1581,8 @@ def ensure_session_valid():
     case."""
     _drop_stale_session()
 
-    # Baseline rate limiting
-    ip = _client_ip()
+    # Baseline rate limiting (ops #815: IPv6 is counted per /64)
+    ip = _rate_limit_ip_key(_client_ip())
     if request.method == 'POST' and request.path in ('/login', '/'):
         if _is_rate_limited(f'login:{ip}', limit=12, window_seconds=300):
             return jsonify({'error': 'Too many login attempts. Please wait a few minutes.'}), 429
@@ -2963,11 +3010,22 @@ def verify_password(pwhash, password):
     if not pwhash:
         return False
     try:
-        return bool(_werkzeug_check_password_hash(pwhash, password or ''))
+        ok = bool(_werkzeug_check_password_hash(pwhash, password or ''))
     except Exception as e:
         print(f"[auth] password check denied: stored hash cannot be checked on this box "
               f"({type(e).__name__}: {str(e)[:120]})", flush=True)
         return False
+    if not ok and password:
+        # ops #815: a wrong console password typed into ANY form is a failed login, not
+        # only on the login page. The "confirm with your password" checks (uninstall,
+        # power, password change, ...) wrote nothing, so a caller holding a session could
+        # guess the password there with no trace and no ban. An empty password is a form
+        # sent without one, not a guess. Never raises, never changes the answer.
+        try:
+            _console_note_failed_password_check()
+        except Exception:
+            pass
+    return ok
 
 
 def hash_password(password):
@@ -4626,7 +4684,8 @@ def _apply_authentik_session():
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
     # itself. Of the three paths that establish an authenticated session, the password
-    # path at index() POST calls session.clear() first (so a stale value cannot survive),
+    # path at /login POST calls session.clear() first (so a stale value cannot survive;
+    # since ops #815 the one at index() does too, and both stamp the clock),
     # but THIS path and the other did not, leaving whatever the browser's cookie already
     # carried. A returning user whose cookie held a last_activity older than idle_max was
     # therefore re-authenticated by forward_auth and then, on the very next request, had
@@ -7222,6 +7281,9 @@ def _login_logo_url():
         return url_for('static', filename=LOGIN_LOGO_FILENAME)
     return None
 
+_SAFE_NEXT_PATH_RE = re.compile(r'/[A-Za-z0-9._~/-]*(?:\?[A-Za-z0-9._~/=&%-]*)?')
+
+
 def _safe_next_path():
     """A validated SAME-SITE path from ?next= (or the posted form) for the post-login
     redirect. Used by the setup-AP captive to deep-link straight to the light
@@ -7229,10 +7291,21 @@ def _safe_next_path():
     Local absolute paths only — never an off-site URL (open-redirect guard). Empty if
     absent/unsafe → caller falls back to the normal console page. The login form has no
     action= so it POSTs to the current URL, preserving ?next through the round-trip."""
-    nxt = (request.args.get('next') or request.form.get('next') or '').strip()
-    if nxt.startswith('/') and not nxt.startswith('//') and '://' not in nxt and '\\' not in nxt:
-        return nxt
-    return ''
+    nxt = request.args.get('next') or request.form.get('next') or ''
+    # ops #815: an allow-list of characters, not a list of bad ones. The old check let
+    # through a tab or a newline after the first slash; the URL parsers (Python's and the
+    # browser's) drop those, so the redirect went to another site. Nothing outside plain
+    # path characters is needed here, so nothing else is accepted: no whitespace or
+    # control character, no backslash, no "//" or ".." anywhere, no scheme, no host.
+    if not _SAFE_NEXT_PATH_RE.fullmatch(nxt) or '//' in nxt or '..' in nxt:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(nxt)
+    except ValueError:
+        return ''
+    if parts.scheme or parts.netloc:
+        return ''
+    return nxt
 
 # ops #638: the console password is the way in to a root service, so it has a floor, and
 # a wrong one leaves a trace. Every failed password login is written (with the real
@@ -7245,11 +7318,28 @@ CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
 CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
 
 
+def _console_note_failed_password_check():
+    """A wrong console password was checked during a request (called by verify_password,
+    ops #815). Outside a request (start-up, a script) there is no caller to record."""
+    if has_request_context():
+        _console_log_failed_login('password check on %s' % request.path)
+
+
 def _console_log_failed_login(where):
     """Record one failed console password login. The password is NEVER written. Never raises.
 
+    One line per request at most: verify_password records a wrong password itself
+    (ops #815), and the login routes still call this for the cases it does not see (an
+    empty password). fail2ban counts lines, so a second line would halve the limit.
+
     Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
     disk this file takes. fail2ban keeps reading the live file after a roll."""
+    try:
+        if g.get('console_pw_fail_logged'):
+            return
+        g.console_pw_fail_logged = True
+    except Exception:
+        pass
     try:
         ip = _client_ip()
         ipaddress.ip_address(ip)
@@ -7320,6 +7410,7 @@ def login():
             _note_password_length(request.form.get('password', ''))   # ops #638
             session.clear()
             session['authenticated'] = True
+            session['last_activity'] = int(time.time())   # ops #815: login is activity
             _stamp_session_login()   # ops #634
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
@@ -7331,6 +7422,12 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    # ops #815: /logout is a POST outside /api/, so the same-origin check in
+    # ensure_session_valid() did not cover it, and a page on another site of the same
+    # domain (the browser sends the console cookie there too) could end every admin
+    # session, over and over. Same rule as the API writes: same origin only.
+    if not _same_origin_ok():
+        return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
     audit('auth:logout', '')
     # ops #634: logout ends every console session, not just this browser's, so a
     # copied cookie dies with it. Only a logged-in caller may do that: /logout has no
@@ -7356,6 +7453,10 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
             _note_password_length(request.form.get('password', ''))   # ops #638
+            # ops #815: start from an empty session, as /login does. Without it an old
+            # authentik_username stayed in the cookie and the audit log named that person
+            # for what the password login did.
+            session.clear()
             session['authenticated'] = True
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             _stamp_session_login()   # ops #634
@@ -7531,10 +7632,27 @@ def _enforce_session_idle_lock():
         h = load_hardening()
         if (h.get('posture') or 'standard') != 'hardened':
             return
+    except Exception:
+        # The posture could not be read. Standard (no lock) is the default posture, and a
+        # box that is not Hardened must never be locked by this hook.
+        return
+    # ops #815: from here the box IS Hardened, and the lock fails CLOSED. It used to fail
+    # open on any error, and it only fired when the session carried a last_activity stamp,
+    # so a cookie with no stamp (a /login password session never stamped one) replayed
+    # with background GETs alone was never locked. Now: no stamp, or one that cannot be
+    # read, is an expired session; and an unexpected error refuses the request (a page
+    # load ends the session and the operator signs in again) instead of letting it through.
+    try:
         a = (h.get('applied') or {}).get('W2_session') or {}
-        idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        try:
+            idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        except (TypeError, ValueError):
+            idle_max = SESSION_IDLE_MAX_DEFAULT
         now = int(time.time())
-        last = session.get('last_activity')
+        try:
+            last = int(session.get('last_activity'))
+        except (TypeError, ValueError):
+            last = None
         # "Activity" must mean a real USER action, not the page's own background polling.
         # The console dashboard auto-refreshes /api/metrics every 5s, module cards every 8s,
         # etc. — if every request reset the clock, last_activity would never age past a few
@@ -7543,7 +7661,7 @@ def _enforce_session_idle_lock():
         # read-only GET to /api/* (a poll/data-fetch) does NOT count as activity; only a page
         # navigation (non-/api GET) or a state-changing call (POST/PUT/PATCH/DELETE) does.
         is_poll = request.path.startswith('/api/') and request.method == 'GET'
-        if last is not None and (now - int(last)) > idle_max:
+        if last is None or (now - last) > idle_max:
             if request.path.startswith('/api/'):
                 # Don't reset the clock or kill the SSO session on a background poll — just
                 # signal expiry. The true re-prompt fires on the next full-page navigation.
@@ -7565,9 +7683,16 @@ def _enforce_session_idle_lock():
             return redirect(url_for('login'))
         if not is_poll:
             session['last_activity'] = now
-    except Exception:
-        # A lock failure must never brick a request — fail open to the normal flow.
-        return
+    except Exception as e:
+        print(f"[auth] idle lock error, request refused: {type(e).__name__}: {str(e)[:120]}", flush=True)
+        if request.path.startswith('/api/'):
+            # As for an expired session above: a background call is only told to sign in.
+            return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+        try:
+            session.clear()
+        except Exception:
+            pass
+        return redirect(url_for('login'))
 
 # v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
 # It masked the real problem (and reload-looped when the Authentik proxy session lapsed
@@ -11805,7 +11930,10 @@ def console_restart_safe():
     browser driven (mirrors the localhost-only Guard Dog script endpoints), so
     it carries no @login_required — but it is restricted to loopback callers.
     """
-    if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
+    # ops #815: a request that came through a proxy on this box also arrives from loopback,
+    # but carries X-Forwarded-For. The timer script calls 127.0.0.1 directly and sends none.
+    if ((request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost')
+            or request.headers.get('X-Forwarded-For')):
         return jsonify({'error': 'forbidden'}), 403
 
     busy = _console_busy_reason()
@@ -30765,8 +30893,10 @@ def _guarddog_alert_recipient_warning(settings=None):
 
 @app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def guarddog_send_alert_email():
-    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email).
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     # settings.json is the SOURCE OF TRUTH for the recipient; the caller's `to` is a
@@ -31191,8 +31321,10 @@ def guarddog_test_sms():
 
 @app.route('/api/guarddog/send-sms', methods=['POST'])
 def guarddog_send_sms():
-    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo.
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     subj = (data.get('subject') or '')[:100]
@@ -31696,6 +31828,8 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        if _GD_HEALTH_SCRIPT in changed:
+            _gd_restart_health_endpoint()   # ops #815: `start` leaves a running one on the old code
         # v0.9.47: network/fanout metrics collector (always-on, like tak-health). Best-effort
         # start — a collector failure must never block the rest of the Guard Dog deploy.
         rmc = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, text=True, timeout=5)
@@ -106836,6 +106970,8 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+                if name == _GD_HEALTH_SCRIPT:
+                    _gd_restart_health_endpoint()   # ops #815
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
