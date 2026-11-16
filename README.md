@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.3.13-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.3.13-alpha)**
+**Current release: [v10.4.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.0-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,32 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.0-alpha — 2026-11-16 — ETL Runner: CloudTAK ETLs run on your server, no AWS account
+
+**Headline: CloudTAK ETLs (data feeds from other services onto the TAK map) now run on your own server, with no AWS account. This update also applies a PostgreSQL security fix, fixes video and installs on a remote CloudTAK, and sends people back to their app after a password reset. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.0-alpha))
+
+**ETL Runner (new).**
+- Turn on ETL in the "ETL — data feeds" card on the CloudTAK page. CloudTAK then runs its ETLs on this server, not in AWS.
+- Only reviewed ETLs from a signed catalog install. Each ETL runs in a locked-down container that cannot reach the server, its database or your local network.
+- Schedules, outgoing (two-way) ETLs and webhooks work. Install, Update and Remove show a spinner until they finish.
+- The ArcGIS ETL is on hold until its security review is done.
+
+**PostgreSQL security update.**
+- The TAK Server and ATLAS database containers are refreshed to the fixed PostgreSQL. Operators whose database runs on another machine (RDS, Azure, a split box) get a notice. A split box gets an "Update PostgreSQL" button on the database server card.
+
+**Remote servers.**
+- Remote CloudTAK: video plays, install works on plain Rocky 9 hosts, and Remove works for a non-root SSH user.
+- Remote Node-RED, WebODM and Authentik installs, and Docker log limits, work for a non-root SSH user.
+
+**Sign-in.**
+- After a password reset, people go back to the app they started from (TAK Portal if unknown), not the Authentik app list.
+
+**Console.**
+- Fail2ban shows "not installed" after Remove.
+- Help, Reset console password: show/hide on each field, a length counter, a match check, and the page waits for the restart.
+- The password banner no longer calls a password short when it cannot see its length. It asks you to confirm it once.
+- The root helper finishes the commands it is running before it restarts.
 
 ### v10.3.13-alpha — 2026-11-14 — TAK Portal Marketplace plugin installs work again
 
