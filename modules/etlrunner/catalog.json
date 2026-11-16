@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "serial": 202611142111,
+  "serial": 202611160342,
   "entries": [
     {
       "prefix": "etl-active911",
@@ -567,7 +567,8 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": null,
+      "note": "On hold: a security report sent to the COE on 2026-11-09 is still open. infra-TAK will offer this ETL again once it is fixed."
     },
     {
       "prefix": "etl-everywhere-hub",

@@ -146,6 +146,20 @@ def diff(old, new):
     return lines
 
 
+HOLDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'modules', 'etlrunner', 'holds.json')
+
+
+def apply_holds(entries, path=HOLDS):
+    """An ETL on hold (a security report still open upstream) stays unreviewed, so a box will
+    not install it, and its card says why. A later scan or sync must not quietly re-offer it."""
+    holds = (json.load(open(path)).get('holds') or {}) if os.path.exists(path) else {}
+    for e in entries:
+        if e.get('prefix') in holds:
+            e['reviewed'] = None
+            e['note'] = holds[e['prefix']]
+    return entries
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--check', action='store_true')
@@ -162,6 +176,7 @@ def main():
     for e in new:
         p = prev.get(e['prefix'])
         e['reviewed'] = p.get('reviewed') if p and p.get('sha') == e['sha'] else None
+    apply_holds(new)
     changes = diff(old, new)
     print('\n'.join(changes) if changes else 'catalog unchanged')
     if a.check:
