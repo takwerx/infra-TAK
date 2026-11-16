@@ -55211,6 +55211,12 @@ def run_cloudtak_deploy(cfg=None):
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
                 plog("  ⚠ Could not fetch latest release tag — using main branch")
+            # ops #796: a stock Rocky/RHEL 9 server image has no git and the repo prep below runs
+            # `git clone` on the remote host (same gap as the remote WebODM deploy, ops #792)
+            _git_ok, _ = _remote_ensure_git(cfg, plog)
+            if not _git_ok:
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             prep_cmd = _cloudtak_remote_reclone_sh(remote_release_tag)
             ok, out = _ssh_probe(remote_cfg, prep_cmd, timeout=600)
             if not ok:
