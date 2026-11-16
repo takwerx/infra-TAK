@@ -11133,8 +11133,9 @@ def set_update_channel():
     return jsonify({'ok': True, 'channel': channel})
 
 
-def _git_ls_remote(*patterns):
-    """{ref: sha} from `git ls-remote` on the public repo, or None on failure.
+def _git_ls_remote(*patterns, repo=None):
+    """{ref: sha} from `git ls-remote` on the public repo (or `repo`, owner/name), or None
+    on failure.
 
     Used when the GitHub REST API refuses us. The API is 60 calls/hour per IP
     unauthenticated and the console, Guard Dog's watcher and the version lookups all
@@ -11142,7 +11143,7 @@ def _git_ls_remote(*patterns):
     been clicked a few times. git's smart-HTTP endpoint is not part of that quota.
     """
     try:
-        r = subprocess.run(['git', 'ls-remote', f'https://github.com/{GITHUB_REPO}.git'] + list(patterns),
+        r = subprocess.run(['git', 'ls-remote', f'https://github.com/{repo or GITHUB_REPO}.git'] + list(patterns),
                            capture_output=True, text=True, timeout=10,
                            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
         if r.returncode != 0:
@@ -52226,9 +52227,16 @@ def _etlcat_refresh():
     try:
         rec = {'at': int(time.time()), 'ok': False}
         try:
-            meta = json.loads(_etlcat_fetch(
-                f'https://api.github.com/repos/{_etl.CATALOG_REPO}/commits/{_etl.CATALOG_BRANCH}', 512 * 1024))
-            sha = str(meta.get('sha') or '') if isinstance(meta, dict) else ''
+            # The branch's commit from git's smart-HTTP endpoint first: the REST API allows 60
+            # anonymous calls an hour per address and the console spends them elsewhere, so
+            # "Check now" showed "HTTP Error 403: rate limit exceeded" (v10.4.0 T&E, test12 and
+            # nuc). The API stays as the fallback. Either way the catalog's signature decides.
+            _ref = f'refs/heads/{_etl.CATALOG_BRANCH}'
+            sha = str((_git_ls_remote(_ref, repo=_etl.CATALOG_REPO) or {}).get(_ref) or '')
+            if not _etl.COMMIT_SHA_RE.fullmatch(sha):
+                meta = json.loads(_etlcat_fetch(
+                    f'https://api.github.com/repos/{_etl.CATALOG_REPO}/commits/{_etl.CATALOG_BRANCH}', 512 * 1024))
+                sha = str(meta.get('sha') or '') if isinstance(meta, dict) else ''
             if not _etl.COMMIT_SHA_RE.fullmatch(sha):
                 raise ValueError('GitHub returned no commit for the catalog')
             # both files at the same commit: a CDN never pairs a new catalog with an old signature

@@ -171,10 +171,17 @@ class Box:
         ns = {'os': os, 'json': json, 'time': time, '_etl': E(), '_ETLCAT_CACHE': str(self.cache),
               '_ETLCAT_REFRESH_LOCK': threading.Lock(), 'print': lambda *a, **k: None,
               'load_settings': lambda: json.loads(json.dumps(self.settings)),
-              'save_settings': self._save, '_etlcat_fetch': self._fetch}
+              'save_settings': self._save, '_etlcat_fetch': self._fetch,
+              '_git_ls_remote': self._ls_remote}
         for n in ('_etlrunner_cfg', '_etlcat_cache_write', '_etlcat_refresh', '_etlcat_refresh_due'):
             exec(compile(ast.get_source_segment(APP, _FNS[n]), 'app.py', 'exec'), ns)
         self.ns = ns
+
+    ls_remote = None                              # {ref: sha} the git endpoint answers, None = fails
+
+    def _ls_remote(self, *patterns, repo=None):
+        self.ls_calls = getattr(self, 'ls_calls', []) + [(patterns, repo)]
+        return self.ls_remote
 
     def _save(self, s):
         self.settings = s
@@ -280,3 +287,40 @@ def test_bundled_catalog_carries_the_signed_ops725_bumps():
         e = by[prefix]
         assert (e['version'], e['sha'], e['ref']) == (ver, sha, 'v' + ver), prefix
         assert e.get('reviewed', '').startswith('2026-11-13'), prefix
+
+
+# v10.4.0 T&E (test12, nuc): "Check now" failed with "HTTP Error 403: rate limit exceeded".
+# The commit now comes from git's smart-HTTP endpoint, which is not in the REST API quota.
+def test_refresh_takes_the_commit_from_git_ls_remote_and_skips_the_api(keys, tmp_path):
+    b = Box(tmp_path, keys)
+    raw = _cat(160)
+    sha = 'c' * 40
+    b.serve(raw, _sign(raw, keys['key'], tmp_path), sha=sha)
+    b.ls_remote = {'refs/heads/main': sha}
+    rec = b.refresh()
+    assert rec['ok'] and rec['serial'] == 160 and rec['commit'] == sha
+    assert b.ls_calls == [(('refs/heads/main',), 'takwerx/infratak-etl-catalog')]
+    assert not any('api.github.com' in u for u in b.urls)
+    assert all(u.startswith(f'https://raw.githubusercontent.com/takwerx/infratak-etl-catalog/{sha}/') for u in b.urls)
+
+
+def test_refresh_falls_back_to_the_api_when_git_fails_or_answers_junk(keys, tmp_path):
+    for answer in (None, {}, {'refs/heads/main': 'not-a-sha'}):
+        b = Box(tmp_path, keys)
+        raw = _cat(170)
+        b.serve(raw, _sign(raw, keys['key'], tmp_path))
+        b.ls_remote = answer
+        rec = b.refresh()
+        assert rec['ok'] and rec['commit'] == 'b' * 40
+        assert b.urls[0].startswith('https://api.github.com/repos/takwerx/infratak-etl-catalog/commits/main')
+
+
+def test_a_bad_signature_is_still_refused_when_the_commit_comes_from_git(keys, tmp_path):
+    b = Box(tmp_path, keys)
+    raw = _cat(180)
+    sha = 'd' * 40
+    b.serve(raw, 'AAAA' + _sign(raw, keys['key'], tmp_path)[4:], sha=sha)
+    b.ls_remote = {'refs/heads/main': sha}
+    rec = b.refresh()
+    assert rec['ok'] is False and rec['commit'] == sha
+    assert not (b.cache / 'catalog.json').exists()
