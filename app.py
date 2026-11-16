@@ -3022,7 +3022,7 @@ def verify_password(pwhash, password):
         # guess the password there with no trace and no ban. An empty password is a form
         # sent without one, not a guess. Never raises, never changes the answer.
         try:
-            _console_note_failed_password_check()
+            _console_note_failed_password_check(password)
         except Exception:
             pass
     return ok
@@ -7318,19 +7318,44 @@ CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
 CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
 
 
-def _console_note_failed_password_check():
+# ops #815: one wrong password is one failed login, however often the page sends it. The
+# uninstall dialog checks the typed password when the field loses focus, again when the
+# dialog opens, and once more on submit: three requests for one typo, and 10 lines ban the
+# address. So the same wrong value from the same address inside 10 minutes is recorded
+# once. A new guess is a new line. Only a keyed digest of the last wrong value per address
+# is kept, in memory, never on disk; the key is made new at every console start.
+_PW_FAIL_KEY = secrets.token_bytes(32)
+_PW_FAIL_SEEN = {}            # client address -> (digest of its last wrong password, time)
+_PW_FAIL_SEEN_MAX = 2048
+_PW_FAIL_SAME_WINDOW = 600
+
+
+def _console_note_failed_password_check(password):
     """A wrong console password was checked during a request (called by verify_password,
-    ops #815). Outside a request (start-up, a script) there is no caller to record."""
-    if has_request_context():
-        _console_log_failed_login('password check on %s' % request.path)
+    ops #815). Outside a request (start-up, a script) there is no caller to record. The
+    login routes record their own failures (every one, an empty password too)."""
+    if not has_request_context() or request.path in ('/login', '/'):
+        return
+    ip = _client_ip()
+    digest = hmac.new(_PW_FAIL_KEY, str(password).encode('utf-8', 'surrogatepass'),
+                      hashlib.sha256).digest()
+    now = time.time()
+    with _RATE_LOCK:
+        seen = _PW_FAIL_SEEN.get(ip)
+        if seen and hmac.compare_digest(seen[0], digest) and now - seen[1] < _PW_FAIL_SAME_WINDOW:
+            return
+        if len(_PW_FAIL_SEEN) >= _PW_FAIL_SEEN_MAX:
+            _PW_FAIL_SEEN.clear()
+        _PW_FAIL_SEEN[ip] = (digest, now)
+    _console_log_failed_login('password check on %s' % request.path)
 
 
 def _console_log_failed_login(where):
     """Record one failed console password login. The password is NEVER written. Never raises.
 
-    One line per request at most: verify_password records a wrong password itself
-    (ops #815), and the login routes still call this for the cases it does not see (an
-    empty password). fail2ban counts lines, so a second line would halve the limit.
+    One line per request at most: verify_password records a wrong password on the
+    "confirm with your password" forms itself (ops #815), and some of those routes also
+    call this. fail2ban counts lines, so a second line would halve the limit.
 
     Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
     disk this file takes. fail2ban keeps reading the live file after a roll."""
@@ -9296,6 +9321,10 @@ def hardening_apply():
         _hardening_history(h, 'apply', 'hardened')
         save_hardening(h)
         audit('hardening:apply', 'posture=hardened')
+        # ops #815: the idle clock only runs in Hardened posture, so the stamp in this
+        # session can be hours old (it is from the login). Pressing Apply is activity:
+        # without this the lock fired on the operator's very next request.
+        session['last_activity'] = int(time.time())
         return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
     except Exception as e:
         for c in reversed(applied_ok):

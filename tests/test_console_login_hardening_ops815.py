@@ -34,11 +34,14 @@ The contract pinned here, with the real functions from app.py in a small Flask a
 
 import ast
 import datetime
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import pathlib
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -65,13 +68,13 @@ _FUNCS = (
     '_client_ip', '_rate_limit_ip_key', '_is_rate_limited', '_effective_request_host',
     '_same_origin_ok', 'ensure_session_valid', 'verify_password',
     '_safe_next_path', '_console_note_failed_password_check', '_console_log_failed_login',
-    'login', 'logout', 'index', '_enforce_session_idle_lock',
+    'login', 'logout', 'index', '_enforce_session_idle_lock', 'hardening_apply',
     'console_restart_safe', 'console_power_api',
     'guarddog_send_alert_email', 'guarddog_send_sms',
 )
 _ASSIGNS = (
     '_RATE_LOCK', '_RATE_HITS', '_RATE_EXPIRES', '_RATE_SWEEP', '_RATE_SWEEP_EVERY',
-    '_SAFE_NEXT_PATH_RE',
+    '_SAFE_NEXT_PATH_RE', '_PW_FAIL_KEY', '_PW_FAIL_SEEN', '_PW_FAIL_SEEN_MAX', '_PW_FAIL_SAME_WINDOW',
     'CONSOLE_PASSWORD_MIN_LEN', 'CONSOLE_LOGIN_FAIL_LOG', 'CONSOLE_LOGIN_FAIL_LOG_MAX',
 )
 
@@ -119,6 +122,7 @@ def console(tmp_path):
     ns = {
         '__name__': 'ops815',
         'os': os, 'json': json, 're': re, 'urllib': urllib, 'ipaddress': ipaddress,
+        'hmac': hmac, 'hashlib': hashlib, 'secrets': secrets,
         'threading': threading, 'defaultdict': defaultdict, 'deque': deque,
         'datetime': datetime.datetime, 'time': clock,
         'CONFIG_DIR': str(cfg), 'VERSION': 'test',
@@ -131,6 +135,9 @@ def console(tmp_path):
         'load_auth': lambda: dict(auth), 'save_auth': lambda d: None,
         'load_settings': lambda: dict(state['settings']),
         'load_hardening': lambda: state['hardening'],
+        'save_hardening': lambda h: state.__setitem__('hardening', h),
+        '_hardening_registry': lambda: [],
+        '_hardening_history': lambda h, what, detail: None,
         '_upgrade_password_hash': lambda a, pw: None,
         '_note_password_length': lambda pw: None,
         'stored_hash_unusable': lambda h: None,
@@ -168,6 +175,7 @@ def console(tmp_path):
     app.add_url_rule('/', 'index', ns['index'], methods=['GET', 'POST'])
     app.add_url_rule('/api/console/restart-safe', 'restart_safe', ns['console_restart_safe'])
     app.add_url_rule('/api/console/power', 'power', ns['console_power_api'], methods=['POST'])
+    app.add_url_rule('/api/hardening/apply', 'hardening_apply', ns['hardening_apply'], methods=['POST'])
     app.add_url_rule('/api/guarddog/send-alert-email', 'gd_email',
                      ns['guarddog_send_alert_email'], methods=['POST'])
     app.add_url_rule('/api/guarddog/send-sms', 'gd_sms', ns['guarddog_send_sms'], methods=['POST'])
@@ -342,6 +350,21 @@ def test_a_bad_idle_setting_falls_back_to_the_default_not_to_no_lock(console):
     _login(console, c)
     assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
     console.clock.offset = 1900                     # past the 1800 s default
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 401
+
+
+def test_turning_hardened_on_does_not_lock_the_operator_who_did_it(console):
+    """The idle clock does not run in Standard posture, so the stamp is as old as the login."""
+    c = console.app.test_client()
+    _login(console, c)
+    console.clock.offset = 7200                     # two hours of work in Standard posture
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+    console.state['hardening'] = {'applied': {'W2_session': {'idle_max_seconds': 1800}}}
+    r = c.post('/api/hardening/apply', base_url=CONSOLE, headers={'Origin': CONSOLE})
+    assert r.status_code == 200 and console.state['hardening']['posture'] == 'hardened'
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+    assert c.get('/console', base_url=CONSOLE).status_code == 200
+    console.clock.offset = 7200 + 1900              # and the lock works from then on
     assert c.get('/api/metrics', base_url=CONSOLE).status_code == 401
 
 
@@ -537,6 +560,45 @@ def test_wrong_password_on_a_confirm_form_is_recorded_like_a_failed_login(consol
     assert console.state['power'] == []
 
 
+def test_the_same_wrong_password_sent_again_is_one_failed_login(console):
+    """The uninstall dialog sends one typed password up to three times (check, open, submit)."""
+    c = console.app.test_client()
+    _login(console, c)
+    for _ in range(4):
+        assert _power(c, 'wrong-guess-123').status_code == 403
+    assert len(_log_lines(console)) == 1
+    assert _power(c, 'wrong-guess-124').status_code == 403         # a new guess is a new line
+    assert _power(c, 'wrong-guess-123').status_code == 403         # and so is going back
+    assert len(_log_lines(console)) == 3
+    assert _power(c, 'wrong-guess-123', addr='203.0.113.8').status_code == 403     # per address
+    assert len(_log_lines(console)) == 4
+    console.clock.offset = 601                                      # after 10 minutes it counts again
+    assert _power(c, 'wrong-guess-123', addr='203.0.113.8').status_code == 403
+    assert len(_log_lines(console)) == 5
+    assert 'wrong-guess' not in console.log.read_text()
+    seen = console.ns['_PW_FAIL_SEEN']
+    assert all(isinstance(v[0], bytes) and len(v[0]) == 32 for v in seen.values())    # digests only
+
+
+def test_wrong_password_memory_stays_small(console):
+    note, seen = console.ns['_console_note_failed_password_check'], console.ns['_PW_FAIL_SEEN']
+    limit = console.ns['_PW_FAIL_SEEN_MAX']
+    for i in range(limit + 50):
+        with console.app.test_request_context('/api/console/power', method='POST',
+                                              environ_base={'REMOTE_ADDR': '10.%d.%d.1' % (i // 250, i % 250)}):
+            note('wrong-guess-123')
+    assert len(seen) <= limit
+
+
+@pytest.mark.parametrize('path', ['/login', '/'])
+def test_every_failed_login_on_the_login_page_is_still_recorded(console, path):
+    c = console.app.test_client()
+    for _ in range(3):
+        c.post(path, data={'password': 'wrong-guess-123'}, base_url=CONSOLE,
+               environ_base={'REMOTE_ADDR': '203.0.113.7'})
+    assert len(_log_lines(console)) == 3
+
+
 def test_right_or_empty_password_on_a_confirm_form_records_nothing(console):
     c = console.app.test_client()
     _login(console, c)
@@ -583,10 +645,12 @@ def health(monkeypatch):
     mod = types.ModuleType('tak_health_endpoint_ops815')
     exec(compile(HEALTH_SCRIPT.read_text(encoding='utf-8'), str(HEALTH_SCRIPT), 'exec'), mod.__dict__)
     calls = []
-    behaviour = {'hang': False}
+    behaviour = {'hang': False, 'delay': 0}
 
     def fake_run(cmd, **kw):
         calls.append(list(cmd))
+        if behaviour['delay']:
+            time.sleep(behaviour['delay'])
         if behaviour['hang']:
             if 'timeout' not in kw:
                 time.sleep(30)
@@ -661,8 +725,77 @@ def test_health_runs_the_checks_again_after_the_cache_time(health, monkeypatch):
     assert len(health.calls) == 2 * first
 
 
+def _closed_by_server(sock, within):
+    sock.settimeout(within)
+    try:
+        return sock.recv(100) == b''
+    except ConnectionResetError:
+        return True
+    except socket.timeout:
+        return False
+
+
+def test_health_ends_a_connection_that_sends_a_byte_now_and_then(health, monkeypatch):
+    """The socket timeout is per read; only a deadline for the whole request stops this."""
+    monkeypatch.setattr(health.mod, 'REQUEST_DEADLINE_S', 1, raising=False)
+    s = socket.create_connection(('127.0.0.1', health.port))
+    closed, started = False, time.time()
+    try:
+        while time.time() - started < 4 and not closed:
+            try:
+                s.sendall(b'G')
+            except OSError:
+                closed = True
+                break
+            closed = _closed_by_server(s, 0.3)
+    finally:
+        s.close()
+    assert closed, 'a slow caller held its connection for 4 s'
+    assert time.time() - started < 3
+
+
+def test_health_gives_the_last_answer_while_new_checks_run(health, monkeypatch):
+    monkeypatch.setattr(health.mod, 'CACHE_TTL_S', 0.2, raising=False)
+    assert _get_health(health.port)[0] == 200
+    time.sleep(0.3)
+    health.behaviour['delay'] = 0.5                 # the next set of checks takes 2 s
+    slow = threading.Thread(target=_get_health, args=(health.port, 8), daemon=True)
+    slow.start()
+    time.sleep(0.3)
+    started = time.time()
+    status, body = _get_health(health.port, timeout=3)
+    assert status == 200 and body['healthy'] is True
+    assert time.time() - started < 0.5, 'a caller waited for another caller\'s checks'
+    slow.join(8)
+
+
+def test_health_caps_the_connections_of_one_outside_address(health, monkeypatch):
+    monkeypatch.setattr(health.mod, '_is_loopback', lambda address: False, raising=False)
+    monkeypatch.setattr(health.mod, 'MAX_PER_ADDRESS', 1, raising=False)
+    first = socket.create_connection(('127.0.0.1', health.port))
+    time.sleep(0.2)
+    second = socket.create_connection(('127.0.0.1', health.port))
+    try:
+        assert _closed_by_server(second, 0.6), 'a second connection from the address was served'
+    finally:
+        second.close()
+        first.close()
+    time.sleep(1.3)
+    assert _get_health(health.port)[0] == 200
+    assert health.mod._slots == {'total': 0, 'by_address': {}} or _wait_slots_empty(health.mod)
+
+
+def _wait_slots_empty(mod, seconds=3):
+    end = time.time() + seconds
+    while time.time() < end:
+        if mod._slots == {'total': 0, 'by_address': {}}:
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def test_health_caps_the_connections_it_serves_at_once(health, monkeypatch):
-    monkeypatch.setattr(health.mod, '_slots', threading.BoundedSemaphore(2), raising=False)
+    monkeypatch.setattr(health.mod, 'MAX_CONNECTIONS', 2, raising=False)
     idle = [socket.create_connection(('127.0.0.1', health.port)) for _ in range(2)]
     time.sleep(0.2)
     extra = socket.create_connection(('127.0.0.1', health.port))
