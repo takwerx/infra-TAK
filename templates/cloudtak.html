@@ -367,10 +367,18 @@
   (function(){
     var list = document.getElementById('ct-etl-list'), stateEl = document.getElementById('ct-etl-state'),
         toggle = document.getElementById('ct-etl-toggle'), filter = document.getElementById('ct-etl-filter');
-    var entries = [], enabled = false, busy = false;
+    var entries = [], enabled = false, busy = false, working = null;   // working: {prefix, action} of the running job
     function el(tag, style, text){ var e = document.createElement(tag); if (style) e.style.cssText = style; if (text != null) e.textContent = text; return e; }
     function badge(text, color){ return el('span', 'font-size:10px;font-weight:600;color:'+color+';border:1px solid '+color+';border-radius:4px;padding:1px 6px;opacity:.85', text); }
     function btn(text, cls, fn){ var b = el('button', 'font-size:12px;padding:6px 12px', text); b.className = 'btn ' + cls; b.disabled = busy; b.onclick = fn; return b; }
+    var WORKING = {install: 'Installing…', remove: 'Uninstalling…', update: 'Updating…'};
+    // The button the operator pressed shows a spinner until its job ends (operator, v10.4.0 T&E:
+    // a dimmed "Install" during a several-minute build looked stuck).
+    function spin(b, e, action){
+      if (!(working && working.prefix === e.prefix && working.action === action)) return b;
+      b.textContent = ''; b.appendChild(el('span')).className = 'ct-btn-spinner'; b.appendChild(document.createTextNode(WORKING[action]));
+      b.style.opacity = '1'; b.setAttribute('aria-busy', 'true'); return b;
+    }
     var tab = 'all';
     var TABS = [['all','All'],['available','Available'],['installed','Installed'],['updates','Updates']];
     function renderTabs(){
@@ -431,11 +439,11 @@
         var foot = el('div', 'display:flex;flex-direction:column;gap:6px;margin-top:auto;padding-top:8px');
         var full = 'width:100%;font-size:13px;font-weight:600;padding:9px 12px';
         if (inst) {
-          if (e.update) { var u = btn('Update to v' + e.version, 'btn-primary', function(){ act('update', e); }); u.style.cssText = full; foot.appendChild(u); }
+          if (e.update) { var u = btn('Update to v' + e.version, 'btn-primary', function(){ act('update', e); }); u.style.cssText = full; foot.appendChild(spin(u, e, 'update')); }
           var r = btn('Uninstall', '', function(){ if (confirm('Uninstall ' + e.name + '? CloudTAK will refuse while a layer still uses it.')) act('remove', e); });
-          r.style.cssText = full + ';background:rgba(239,68,68,.85);color:#fff;border:none'; foot.appendChild(r);
+          r.style.cssText = full + ';background:rgba(239,68,68,.85);color:#fff;border:none'; foot.appendChild(spin(r, e, 'remove'));
         } else if (e.installable && enabled) {
-          var i = btn('Install', 'btn-primary', function(){ act('install', e); }); i.style.cssText = full; foot.appendChild(i);
+          var i = btn('Install', 'btn-primary', function(){ act('install', e); }); i.style.cssText = full; foot.appendChild(spin(i, e, 'install'));
         } else {
           foot.appendChild(el('div', full + ';text-align:center;border-radius:8px;background:rgba(234,179,8,.12);color:#eab308;border:1px solid rgba(234,179,8,.3)', enabled ? e.reason : 'Turn ETL on first'));
         }
@@ -493,14 +501,14 @@
         fetch(logUrl).then(function(r){ return r.json(); }).then(function(j){
           box.textContent = (j.log || []).join('\n') || 'Starting…'; box.scrollTop = box.scrollHeight;
           if (j.running) return setTimeout(poll, 2000);
-          busy = false; load();
+          busy = false; working = null; load();
         }).catch(function(){ setTimeout(poll, 4000); });
       })();
     }
     function act(action, e){
       fetch('/api/cloudtak/etl/catalog/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prefix: e.prefix})})
         .then(function(r){ return r.json().then(function(j){ return [r.ok, j]; }); })
-        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); follow('/api/cloudtak/etl/catalog/log', action + ' ' + e.name); });
+        .then(function(x){ if (!x[0]) return alert(x[1].error || 'Failed'); working = {prefix: e.prefix, action: action}; follow('/api/cloudtak/etl/catalog/log', action + ' ' + e.name); });
     }
     toggle.onclick = function(){
       var action = enabled ? 'disable' : 'enable';
