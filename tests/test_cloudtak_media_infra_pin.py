@@ -22,6 +22,10 @@ the on-box arm64 source build — which built CloudTAK's own tag, an image the o
 ran — both go. v9.9.0 also fixes HLS proxy playback dying at 10 minutes.
 
 v10.2.21: the pin moves to v9.12.1 (MediaMTX 1.21.2), still an amd64 + arm64 index (2026-10-19).
+
+ops #821: the pin moves to v9.14.0. v9.13.0 rebased the image on node:26-alpine (Node 26.13+), which
+closes the Brotli decoder CVE-2026-111497 that v9.12.1 (node:24) carried; v9.14.0 adds an AWS Elastic IP
+task that starts only when EIP_ALLOCATION_ID is set. Still an amd64 + arm64 index (2026-11-16).
 """
 
 import ast
@@ -38,7 +42,7 @@ def _func(name):
 
 
 def test_single_multiarch_pin():
-    assert "MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'" in APP
+    assert "MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.14.0'" in APP
     assert 'MEDIA_INFRA_MULTIARCH = True' in APP
     body = _func('_cloudtak_build_override_yml')
     assert 'media_image = MEDIA_INFRA_IMAGE' in body
@@ -56,7 +60,7 @@ def test_arm64_source_build_is_skipped_for_a_multiarch_pin():
         if isinstance(n, ast.FunctionDef) and n.name == '_cloudtak_build_arm64_media'))
     ran, logs = [], []
     ns = {'_host_arch': lambda: 'arm64', 'MEDIA_INFRA_MULTIARCH': True,
-          'MEDIA_INFRA_IMAGE': 'ghcr.io/dfpc-coe/media-infra:v9.12.1',
+          'MEDIA_INFRA_IMAGE': 'ghcr.io/dfpc-coe/media-infra:v9.14.0',
           'subprocess': types.SimpleNamespace(run=lambda *a, **k: ran.append(a))}
     exec(compile(src, 'app.py', 'exec'), ns)
     assert ns['_cloudtak_build_arm64_media']('/nonexistent', plog=logs.append) is False
@@ -73,3 +77,18 @@ def test_media_patch_still_replaces_upstream_hls_variant():
     apply = re.search(r"^_CT_MEDIA_APPLY_SH = r'''(.*?)'''", APP, re.S | re.M).group(1)
     assert '/^hlsVariant:/d' in apply
     assert apply.index('/^hlsVariant:/d') < apply.index('hlsVariant: mpegts')
+
+
+def test_pin_is_not_below_the_node_26_rebase_ops821():
+    """v9.12.1 runs Node 24 and carries the Brotli decoder bug (CVE-2026-111497); v9.13.0 is the first
+    media-infra on node:26-alpine. Fails on the old v9.12.1 pin, passes on v9.13.0 or newer."""
+    pin = re.search(r"^MEDIA_INFRA_IMAGE = 'ghcr\.io/dfpc-coe/media-infra:v(\d+)\.(\d+)\.(\d+)'", APP, re.M)
+    assert pin, 'MEDIA_INFRA_IMAGE is not a plain vMAJOR.MINOR.PATCH tag'
+    assert tuple(int(x) for x in pin.groups()) >= (9, 13, 0)
+
+
+def test_override_never_sets_the_elastic_ip_variable_ops821():
+    """media-infra v9.14.0 starts an AWS Elastic IP task when EIP_ALLOCATION_ID is set. It must stay
+    unset in the CloudTAK override, so the task never runs on our boxes."""
+    code = '\n'.join(l for l in APP.splitlines() if not l.lstrip().startswith('#'))
+    assert 'EIP_ALLOCATION_ID' not in code

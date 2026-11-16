@@ -51167,7 +51167,13 @@ MEDIA_PORT_SRT=18890
 # v10.2.21: security update — v9.12.1 (2026-10-15) embeds MediaMTX 1.21.2 (was 1.20.0).
 # Upstream diff from v9.11.0 is the MediaMTX + Go builder bump only; mediamtx.yml and the
 # lease code we patch (persist/payload) are unchanged. Still multi-arch (checked 2026-10-19).
-MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
+# ops #821: security update — v9.13.0 (2026-11-06) moves the image's Node base to node:26-alpine
+# (Node 26.13+), which closes the Brotli decoder CVE-2026-111497 that v9.12.1 (node:24) carried.
+# v9.14.0 adds lib/eip.ts, an AWS Elastic IP reconciler that starts ONLY when the container has
+# EIP_ALLOCATION_ID (the CloudTAK override never sets it, so it is inert on our boxes). Upstream
+# diff from v9.12.1 touches no mediamtx.yml, persist.ts or payload.ts. MediaMTX stays 1.21.2.
+# Still an amd64 + arm64 index (checked 2026-11-16).
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.14.0'
 MEDIA_INFRA_MULTIARCH = True
 
 # ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
