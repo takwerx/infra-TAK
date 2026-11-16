@@ -32,6 +32,8 @@ def main():
         for r in json.load(open(path)).get('results') or []:
             scans[r.get('prefix')] = r
     cat = json.load(open(CATALOG))
+    hp = os.path.join(os.path.dirname(CATALOG), 'holds.json')
+    holds = (json.load(open(hp)).get('holds') or {}) if os.path.exists(hp) else {}
     passed, failed, missing = [], [], []
     for e in cat['entries']:
         r = scans.get(e['prefix'])
@@ -39,6 +41,9 @@ def main():
             missing.append(e['prefix'])
             continue
         ok = r.get('verdict') == 'PASS' and r.get('sha') == e['sha'] and r.get('head_verified') is True
+        if e['prefix'] in holds:                 # an open upstream security report beats a PASS
+            ok = False
+            e['note'] = holds[e['prefix']]
         e['reviewed'] = f"{a.date} /module-scan" if ok else None
         (passed if ok else failed).append(e['prefix'])
     with open(CATALOG, 'w') as f:
