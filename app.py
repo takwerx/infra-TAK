@@ -46923,7 +46923,7 @@ def certs_page():
     if os.path.isdir(cert_dir):
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp) and not _is_ca_private_material(fn):  # v10.2.26 W6
+            if os.path.isfile(fp) and not _is_ca_private_file(fn, cert_dir):  # v10.2.26 W6, ops #831
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -89237,6 +89237,11 @@ def takserver_rotate_intca():
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
             log(f"✓ Intermediate CA {new_ca_name} created")
+            # ops #831: the new CA's key files are for the TAK Server account only.
+            try:
+                _tak_ca_private_lockdown(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _lk_e:
+                log(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
 
             log("")
             log("Step 3/7: Creating new server certificate...")
@@ -89836,6 +89841,11 @@ def takserver_rotate_rootca():
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_int_name}" 2>&1'):
                 raise Exception('Failed to create new Intermediate CA')
             log(f"✓ Intermediate CA {new_int_name} created")
+            # ops #831: the new CA's key files are for the TAK Server account only.
+            try:
+                _tak_ca_private_lockdown(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _lk_e:
+                log(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
 
             log("")
             log("Step 4/8: Creating new server certificate...")
@@ -94613,6 +94623,12 @@ def _tak_snapshot(label, plog=None):
             subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             plog("  snapshot: certs/ copied")
+            # ops #831: same file modes for the CA key files in the copy as in the live
+            # folder (a restore copies the modes back).
+            try:
+                _tak_ca_private_lockdown(lambda m: plog(f"  snapshot: {m}"), cert_dir=certs_dst, live=False)
+            except Exception as _lk_e:
+                plog(f"  snapshot: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  snapshot: certs copy failed: {e}")
     else:
@@ -94820,6 +94836,12 @@ def _tak_rollback(label, plog=None):
                 subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', '/opt/tak/certs/files']),
                                capture_output=True, timeout=15)
             plog("  rollback: certs/ restored")
+            # ops #831: a snapshot can carry older file modes. Set the CA key files of the
+            # restored folder again.
+            try:
+                _tak_ca_private_lockdown(lambda m: plog(f"  rollback: {m}"))
+            except Exception as _lk_e:
+                plog(f"  rollback: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
 
@@ -95438,6 +95460,8 @@ def console_stack_backup_download_api(label):
     try:
         subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
         subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+        # ops #831: owner-only before the copy goes in (it becomes console-owned below).
+        subprocess.run(_sudo_wrap(['chmod', '700', staging]), capture_output=True, check=True, timeout=30)
         # A multi-GB bundle copy outlives the broker's 600 s default (ops #160): tell it.
         subprocess.run(_sudo_wrap(['cp', '-rp', src, os.path.join(staging, label)]),
                        capture_output=True, check=True, timeout=1800, env=_tak58_long_env())
@@ -96097,17 +96121,29 @@ def takserver_snapshot_status_api():
     })
 
 
-@app.route('/api/takserver/snapshot/<label>/download')
+@app.route('/api/takserver/snapshot/<label>/download', methods=['POST'])
 @login_required
 def takserver_snapshot_download_api(label):
-    """Stream a .tar.gz of the snapshot directory directly to the client."""
+    """Stream a .tar.gz of the snapshot directory directly to the client.
+
+    ops #831: POST + console password, the same contract as the full-stack backup download.
+    A snapshot is a full backup of the server, certificate files included, and it has to
+    stay one (a restore needs every file)."""
     import subprocess
     ok, safe_label = _validate_snapshot_label(label)
     if not ok:
         return jsonify({'error': safe_label}), 400
+    denied = _require_admin_password({'password': request.form.get('admin_password') or ''})
+    if denied:
+        audit('tak_snapshot_download_refused', f'label={safe_label}')
+        return denied
     snap_path = os.path.join(SNAPSHOT_DIR, safe_label)
     if not os.path.isdir(snap_path):
         return jsonify({'error': 'Snapshot not found'}), 404
+    if request.form.get('check') == '1':
+        # The page asks this first, so a wrong password shows in its dialog and the real
+        # form post (which the browser turns into the file download) never navigates away.
+        return jsonify({'ok': True})
 
     # v10.0.5 non-root: the snapshot tree under /opt/tak/snapshots is root-owned
     # (config/keystores often 0600). tar run as takwerx would SILENTLY skip the
@@ -96122,6 +96158,9 @@ def takserver_snapshot_download_api(label):
         try:
             subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
             subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+            # ops #831: the staging folder is owner-only before the copy goes in (the copy
+            # becomes console-owned below).
+            subprocess.run(_sudo_wrap(['chmod', '700', staging]), capture_output=True, check=True, timeout=30)
             subprocess.run(_sudo_wrap(['cp', '-rp', snap_path, os.path.join(staging, safe_label)]),
                            capture_output=True, check=True, timeout=300)
             subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
@@ -96152,6 +96191,10 @@ def takserver_snapshot_download_api(label):
                 try: subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
                 except Exception: pass
 
+    try:
+        audit('tak_snapshot_download', f'label={safe_label}')
+    except Exception:
+        pass
     from flask import Response
     return Response(
         _stream(),
@@ -96292,6 +96335,12 @@ def takserver_snapshot_upload_api():
         snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
         s['tak_snapshots'] = snaps[:50]
         save_settings(s)
+
+        # ops #831: an uploaded archive can carry older file modes for the CA key files.
+        try:
+            _tak_ca_private_lockdown(cert_dir=os.path.join(extracted_path, 'certs'), live=False)
+        except Exception:
+            pass
 
         return jsonify({'ok': True, 'label': extracted_label, 'size_mb': size_mb})
     except Exception as e:
@@ -99004,6 +99053,11 @@ def _deploy_takserver_container(config):
         if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
                                           _certsh, log_step)[0]:
             log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
+        # ops #831: the CA key files are for the TAK Server account only.
+        try:
+            _tak_ca_private_lockdown(lambda m: log_step(f"  {m}"))
+        except Exception as _lk_e:
+            log_step(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
         log_step("✓ Certificates created and truststore built")
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
@@ -99872,6 +99926,11 @@ def run_takserver_deploy(config):
             run_cmd('systemctl stop takserver', check=False)
             deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
+        # ops #831: the CA key files are for the TAK Server account only.
+        try:
+            _tak_ca_private_lockdown(lambda m: log_step(f"  {m}"))
+        except Exception as _lk_e:
+            log_step(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
         # v10.3.5 W6: TAK Server's own trust list holds the intermediate only (a root in it
         # accepts any root-signed intermediate a client sends). makeCert.sh `ca` put the root
         # there; the truststore-<INT>.p12 it built for clients keeps it. The old "enrolled
@@ -101172,7 +101231,7 @@ def list_cert_files():
     files = []
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp) and not _is_ca_private_material(f):
+        if os.path.isfile(fp) and not _is_ca_private_file(f, cert_path):    # ops #831
             files.append({'name': f, 'size': os.path.getsize(fp),
                 'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
@@ -101183,9 +101242,12 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
-    if _is_ca_private_material(filename):
+    # ops #831: judged by what the file is (_ca_private_files), not only by its name. A
+    # private key that matches no certificate is refused as well.
+    if _is_ca_private_file(filename, '/opt/tak/certs/files'):
         audit('cert_download_refused', f'file={filename}')
-        return jsonify({'error': 'CA private keys are never downloaded from the console'}), 403
+        return jsonify({'error': 'CA private keys are never downloaded from the console. A private '
+                                 'key with no matching certificate in this folder is treated the same.'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
 
 
@@ -101196,6 +101258,337 @@ def _is_ca_private_material(filename):
     hand them to a browser, and whoever holds them can mint certs this server trusts."""
     f = (filename or '').lower()
     return 'do-not-share' in f or re.search(r'-signing\.(jks|p12|pem|key)$', f) is not None
+
+
+# ── ops #831: CA private material, judged by what the file is and not only by its name ───────
+# TAK's makeCert.sh keeps a CA's key under more than one file name, and each Rotate CA adds
+# files. The name rule above stays the first test; this adds the content of the folder.
+#
+# _ca_private_files() reads the folder and answers for every file:
+#   'ca'     — proven CA private material: the name rule above; a key or keystore named after a
+#              CA this box has made (a CA:TRUE certificate, its CN, or the NAME.crl /
+#              truststore-NAME / NAME-signing files makeCert.sh leaves behind); or a key whose
+#              public half is the public key of a CA:TRUE certificate in the folder.
+#   'orphan' — a private key that belongs to no certificate in the folder. It cannot be proven
+#              to be a client key, so it is not handed out either (fail closed).
+# Client keys (admin.key, a created client's key) and takserver.key have a leaf certificate with
+# the same public key beside them, so they are neither.
+_CA_SCAN_LOCK = threading.Lock()
+_CA_SCAN_FACTS = {}      # (kind, path, size, mtime_ns[, password hash]) -> fact
+_CA_SCAN_DIRS = {}       # cert_dir -> (signature, {name: 'ca' | 'orphan'})
+_CA_CERT_EXTS = ('.pem', '.crt', '.cer')
+_CA_KEYSTORE_EXTS = ('.p12', '.pfx', '.jks')
+_CA_NAME_LEFTOVER_RE = re.compile(r'^(.+)-(?:signing\.(?:jks|p12|pem|key)|do-not-share\.key)$')
+
+
+def _ca_cert_fact(path, sig):
+    """(is_ca, public key, CN lower-case, holds a private key) for the first certificate in a
+    certificate file. Cached on the file's size and mtime. (False, b'', '', False) when unreadable."""
+    ck = ('cert', path) + sig
+    hit = _CA_SCAN_FACTS.get(ck)
+    if hit is not None:
+        return hit
+    try:
+        data = _cert_file_bytes(path)
+    except Exception:
+        return (False, b'', '', False)          # not cached: the read may work next time
+    has_key = b'PRIVATE KEY-----' in data
+    is_ca, pub, cn = False, b'', ''
+    der = b'-----BEGIN' not in data
+    if data and (der or b'CERTIFICATE-----' in data):
+        try:
+            r = subprocess.run(['openssl', 'x509'] + (['-inform', 'DER'] if der else [])
+                               + ['-noout', '-subject', '-nameopt', 'RFC2253', '-pubkey', '-text'],
+                               input=data, capture_output=True, timeout=10)
+        except Exception:
+            return (False, b'', '', has_key)
+        if r.returncode == 0:
+            out = r.stdout
+            m = re.search(rb'-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----', out, re.S)
+            pub = m.group(0).strip() if m else b''
+            is_ca = b'CA:TRUE' in out
+            m = re.search(rb'^subject=.*?CN=([^,\n]+)', out, re.M)
+            cn = m.group(1).decode(errors='replace').strip().lower() if m else ''
+    fact = (is_ca, pub, cn, has_key)
+    _CA_SCAN_FACTS[ck] = fact
+    return fact
+
+
+def _ca_key_pub(path, sig, password, p12=False):
+    """Public half of the private key in a key file (PEM or DER) or a .p12, b'' when it cannot be
+    opened with the certificate password. Cached on size, mtime and the password."""
+    ck = ('p12' if p12 else 'key', path) + sig + (hashlib.sha256((password or '').encode()).hexdigest()[:16],)
+    hit = _CA_SCAN_FACTS.get(ck)
+    if hit is not None:
+        return hit
+    try:
+        data = _cert_file_bytes(path)
+    except Exception:
+        return b''                              # not cached: the read may work next time
+    pub = _private_key_pubkey(data, password, p12=p12) if data else b''
+    if not pub and data and not p12 and b'-----BEGIN' not in data:
+        try:                                    # an unencrypted DER key (NAME.key.pk8)
+            r = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-pubout'], input=data,
+                               capture_output=True, timeout=10)
+            pub = r.stdout.strip() if r.returncode == 0 else b''
+        except Exception:
+            pub = b''
+    _CA_SCAN_FACTS[ck] = pub
+    return pub
+
+
+def _ca_key_stem(low):
+    """'int-ca-01' for int-ca-01.key, int-ca-01.key.pk8 and int-ca-01.pk8; '' for anything else."""
+    for ext in ('.key.pk8', '.key', '.pk8'):
+        if low.endswith(ext):
+            return low[:-len(ext)]
+    return ''
+
+
+def _ca_private_files(cert_dir=None, deep=True):
+    """{file name: 'ca' | 'orphan'} for the TAK certificate folder (see the block comment above).
+    One listdir and one stat per file when nothing changed since the last call.
+
+    deep=False judges by file names alone (the name rule and the CA names makeCert.sh leaves
+    behind): no certificate is parsed, no private key is read, no 'orphan' answer. That is
+    enough to find the files whose modes need closing in a snapshot's copy of the folder."""
+    d = cert_dir or _CERT_FILES_DIR
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError:
+        return {}
+    files = {}
+    for f in entries:
+        try:
+            st = os.stat(os.path.join(d, f))
+        except OSError:
+            continue
+        if _stat.S_ISREG(st.st_mode):
+            files[f] = (st.st_size, st.st_mtime_ns)
+    password = ''
+    if deep:
+        try:
+            password = _get_tak_cert_password(load_settings()) or ''
+        except Exception:
+            password = ''
+    signature = (tuple(sorted(files.items())), hashlib.sha256(password.encode()).hexdigest()[:16])
+    with _CA_SCAN_LOCK:
+        hit = _CA_SCAN_DIRS.get((d, deep))
+        if hit and hit[0] == signature:
+            return hit[1]
+        if len(_CA_SCAN_DIRS) > 500:
+            _CA_SCAN_DIRS.clear()
+        if len(_CA_SCAN_FACTS) > 20000:         # snapshots come and go; do not grow without end
+            _CA_SCAN_FACTS.clear()
+        ca_names, ca_pubs, leaf_pubs, leaf_stems = {'ca', 'root-ca'}, set(), set(), set()
+        for f in files:
+            low = f.lower()
+            if low.endswith('.crl'):
+                ca_names.add(low[:-4])
+            elif low.startswith('truststore-') and low.endswith(('.jks', '.p12')):
+                ca_names.add(low[len('truststore-'):-4])
+            m = _CA_NAME_LEFTOVER_RE.match(low)
+            if m:
+                ca_names.add(m.group(1))
+        cert_facts = {}
+        for f, sig in files.items():
+            low = f.lower()
+            if not deep or not low.endswith(_CA_CERT_EXTS):
+                continue
+            fact = _ca_cert_fact(os.path.join(d, f), sig)
+            cert_facts[f] = fact
+            is_ca, pub, cn, _has_key = fact
+            if not pub:
+                continue
+            stem = low.rsplit('.', 1)[0]
+            if stem.endswith('-trusted'):
+                stem = stem[:-len('-trusted')]
+            if is_ca:
+                ca_pubs.add(pub)
+                ca_names.add(stem)
+                if cn:
+                    ca_names.add(cn)
+            else:
+                leaf_pubs.add(pub)
+                leaf_stems.add(stem)
+        verdict = {}
+        for f, sig in files.items():
+            low = f.lower()
+            path = os.path.join(d, f)
+            if _is_ca_private_material(f):
+                verdict[f] = 'ca'
+                continue
+            stem = _ca_key_stem(low)
+            if not stem and low.endswith(_CA_CERT_EXTS) and cert_facts.get(f, (0, 0, 0, False))[3]:
+                stem = low.rsplit('.', 1)[0]                # a certificate file with a key inside
+            if stem:
+                if stem in ca_names:
+                    verdict[f] = 'ca'
+                    continue
+                if not deep:
+                    continue
+                pub = _ca_key_pub(path, sig, password)
+                if pub:
+                    if pub in ca_pubs:
+                        verdict[f] = 'ca'
+                    elif pub not in leaf_pubs:
+                        verdict[f] = 'orphan'
+                elif stem not in leaf_stems:
+                    verdict[f] = 'orphan'
+                continue
+            if low.endswith(_CA_KEYSTORE_EXTS) and not low.startswith('truststore-'):
+                stem = low.rsplit('.', 1)[0]
+                if stem in ca_names:
+                    verdict[f] = 'ca'
+                elif deep and stem not in leaf_stems and not low.endswith('.jks'):
+                    # a keystore that is no known client's: look inside (openssl cannot read .jks)
+                    pub = _ca_key_pub(path, sig, password, p12=True)
+                    if pub and pub in ca_pubs:
+                        verdict[f] = 'ca'
+        _CA_SCAN_DIRS[(d, deep)] = (signature, verdict)
+        return verdict
+
+
+def _is_ca_private_file(filename, cert_dir=None):
+    """True when the console must not hand `filename` (in the TAK certificate folder) to a
+    browser: CA private material, or a private key that matches no certificate there. If the
+    folder cannot be judged, every key and keystore is refused (fail closed)."""
+    if _is_ca_private_material(filename):
+        return True
+    try:
+        return filename in _ca_private_files(cert_dir)
+    except Exception:
+        low = (filename or '').lower()
+        return bool(_ca_key_stem(low)) or low.endswith(_CA_KEYSTORE_EXTS)
+
+
+def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
+    """ops #831 — CA private key files are for the TAK Server account only.
+
+    Sets the file modes of the CA signing keystores (<CA>-signing.jks / .p12) and of every
+    CA .key in the TAK certificate folder, whatever mode TAK's own scripts gave them.
+
+    Only CA private material is touched (_ca_private_files() == 'ca'): the signing keystores and
+    every CA .key. Client files keep their modes: Node-RED reads admin.pem/admin.key as uid 1000
+    through its bind mount (see _heal_nodered_cert_read_access), and the folder stays 0755.
+
+    Native TAK Server reads the keystore as `tak` (the owner makeCert.sh gives it): owner tak,
+    mode 0600. A TAK container reads the bundle as its own uid or through group 0
+    (_container_own_tree): the group bits stay, the "other" bits go. Modes only ever get
+    tighter. `live=False` is for a snapshot's copy of the folder: same modes, no owner change
+    (a restore copies them back with `cp -rp`).
+
+    Returns (fixed, still_open): what changed, and what could not be set."""
+    d = cert_dir or _CERT_FILES_DIR
+
+    def _say(m):
+        (plog or (lambda x: print(f"CA key lockdown: {x}", flush=True)))(m)
+
+    container = _tak_is_container()
+    keep = 0o770 if container else 0o700
+
+    def _open_mode(path):
+        """The file's mode when it grants more than `keep`, else None (also when it is gone)."""
+        try:
+            cur = _stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            return None
+        return cur if cur & ~keep & 0o777 else None
+
+    try:
+        # The live folder gets the full look (it also finds a renamed copy of a CA key); a
+        # snapshot's copy is judged by file names, so no private key is read for it.
+        names = sorted(n for n, kind in _ca_private_files(d, deep=live).items()
+                       if kind == 'ca' and re.match(r'^[A-Za-z0-9._-]+$', n))
+    except Exception as e:
+        _say(f"⚠ could not read {d}: {str(e)[:120]}")
+        return [], []
+    names = [n for n in names if _open_mode(os.path.join(d, n)) is not None]
+    if not names:
+        return [], []
+    tak_uid = cuid = cgid = None
+    if container and live:
+        try:
+            cuid, cgid = (int(x) for x in _tak_container_ids())
+        except Exception:
+            cuid, cgid = 1000, 0
+    elif live:
+        try:
+            import pwd as _pwd831
+            tak_uid = _pwd831.getpwnam('tak').pw_uid
+        except Exception:
+            tak_uid = None
+
+    fixed = []
+    for n in names:
+        path = os.path.join(d, n)
+        cur = _open_mode(path)
+        if cur is None:
+            continue
+        try:
+            st = os.stat(path)
+            if live and not container and tak_uid is not None and st.st_uid != tak_uid:
+                # TAK Server (user tak) read this one through the group/other bits we remove.
+                subprocess.run(_sudo_wrap(['chown', 'tak:tak', path]), capture_output=True, timeout=20)
+            elif live and container and not ((st.st_uid == cuid and cur & 0o400)
+                                             or (st.st_gid == cgid and cur & 0o040)):
+                # The container read it through the "other" bits: make it the container's own.
+                subprocess.run(_sudo_wrap(['chown', f'{cuid}:{cgid}', path]), capture_output=True, timeout=20)
+            subprocess.run(_sudo_wrap(['chmod', oct(cur & keep)[2:].zfill(3), path]),
+                           capture_output=True, timeout=20)
+        except Exception:
+            pass
+        if _open_mode(path) is None:
+            fixed.append(f'{n} {oct(cur)[2:]}->{oct(cur & keep)[2:].zfill(3)}')
+    left = [n for n in names if _open_mode(os.path.join(d, n)) is not None]
+    if left and container:
+        # A host chmod on the bundle tree can report success and change nothing
+        # (_container_own_tree): do it as root inside the image, on the mounted folder.
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--user', '0',
+                                       '-v', f'{os.path.realpath(d)}:/mnt/cakeys',
+                                       '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+                                       'cd /mnt/cakeys && chmod o-rwx -- ' + shlex.join(left)]),
+                           capture_output=True, text=True, timeout=120)
+        except Exception:
+            pass
+        for n in list(left):
+            if _open_mode(os.path.join(d, n)) is None:
+                left.remove(n)
+                fixed.append(f'{n} o-rwx')
+    if fixed:
+        _say(f"{len(fixed)} CA private key file(s) in {d} set to the TAK Server account only: "
+             + '; '.join(fixed[:8]) + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+        try:
+            audit('ca_private_lockdown', f'dir={d} files={len(fixed)}')
+        except Exception:
+            pass
+    if left:
+        _say(f"⚠ {len(left)} CA private key file(s) in {d} could not be set to the TAK Server "
+             f"account only: {', '.join(left[:8])}")
+    return fixed, left
+
+
+def _tak_ca_private_lockdown_all(plog=None):
+    """The live certificate folder and every snapshot's copy of it (startup converge)."""
+    fixed, left = [], []
+    if os.path.isdir(_CERT_FILES_DIR):
+        f, l = _tak_ca_private_lockdown(plog)
+        fixed += f
+        left += l
+    try:
+        labels = sorted(os.listdir(SNAPSHOT_DIR))
+    except OSError:
+        labels = []
+    for label in labels:
+        snap_certs = os.path.join(SNAPSHOT_DIR, label, 'certs')
+        if label.startswith('.') or not os.path.isdir(snap_certs):
+            continue
+        f, l = _tak_ca_private_lockdown(plog, cert_dir=snap_certs, live=False)
+        fixed += f
+        left += l
+    return fixed, left
+
 
 @app.route('/api/deploy/log')
 @login_required
@@ -113309,6 +113702,15 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #831 — existing boxes: the CA key files (and each snapshot's copy of them) get
+        # the file modes a new deploy sets. Only CA private material; client files and the
+        # folder keep their modes (Node-RED reads admin.pem/admin.key through its bind
+        # mount). Idempotent: a stat per file when nothing needs a change.
+        try:
+            _tak_ca_private_lockdown_all(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _cal_e:
+            print(f"Startup migration: CA key lockdown error (non-fatal): {_cal_e}", flush=True)
 
         # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
         # One-shot per box; involves a takserver restart + live verification (minutes), so it

@@ -251,5 +251,15 @@ def test_create_refuses_names_that_would_overwrite_ca_files(client, name, monkey
 
 
 def test_the_download_route_still_refuses_signing_material():
+    # ops #831: the route asks the wider guard, and the wider guard asks the name rule first.
     body = _func('download_cert_file')
-    assert '_is_ca_private_material(filename)' in body
+    assert "_is_ca_private_file(filename, '/opt/tak/certs/files')" in body
+    guard = _func('_is_ca_private_file')
+    assert guard.index('_is_ca_private_material(filename)') < guard.index('_ca_private_files(')
+    ns = {'re': re}
+    exec(compile(_func('_is_ca_private_material'), 'app.py', 'exec'), ns)
+    exec(compile(_func('_ca_key_stem'), 'app.py', 'exec'), ns)
+    exec(compile(_func('_is_ca_private_file'), 'app.py', 'exec'), ns)
+    ns['_ca_private_files'] = lambda d=None: {}
+    for name in ('INT-CA-10-signing.p12', 'INT-CA-10-signing.jks', 'ca-do-not-share.key'):
+        assert ns['_is_ca_private_file'](name) is True
