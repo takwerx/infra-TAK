@@ -98,3 +98,16 @@ def test_build_cmd_is_the_broker_prefix_plus_argv():
     assert ns['_etl_build_cmd'](['docker', 'build', '.']) == PREFIX + ['docker', 'build', '.']
     ns = _ns(False, [])
     assert ns['_etl_build_cmd'](['docker', 'build', '.']) is None
+
+
+def test_non_root_console_runs_the_same_argv_as_before():
+    """Regression: a console that already routes through the broker (every fresh install, the
+    whole fleet) must run exactly what _sudo_wrap gave it before this fix."""
+    ns = {'os': os, '_sys': types.SimpleNamespace(executable='/usr/bin/python3'),
+          '_BROKER_CLIENT_PYFLAGS': ['-I', '-S'], '_BROKER_CLIENT': '/opt/infratak/broker/takwerx_brokerctl.py',
+          '_broker_should_route': lambda: True, '_broker_available': lambda: True,
+          '_broker_socket_present': lambda: True}
+    for name in ('_broker_client_prefix', '_sudo_wrap', '_etl_build_cmd'):
+        exec(compile(ast.get_source_segment(APP, _FNS[name]), 'app.py', 'exec'), ns)
+    argv = ['docker', 'build', '--network', 'cloudtak_etl', '--force-rm', '-t', 'x', '/src']
+    assert ns['_etl_build_cmd'](argv) == ns['_sudo_wrap'](argv)
