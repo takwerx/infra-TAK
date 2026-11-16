@@ -52811,6 +52811,16 @@ def _etlcat_gh_url(u):
     return u if re.fullmatch(r'https://(github\.com|raw\.githubusercontent\.com)/[A-Za-z0-9._/-]{1,300}', u) else ''
 
 
+def _etl_build_cmd(argv):
+    """argv wrapped for the root broker, or None when its socket is absent. The broker runs a
+    `docker build --network cloudtak_etl` with the classic builder (BuildKit cannot join a custom
+    network) and only after the W5 egress block is verified, so the build never runs another way,
+    whoever the console runs as."""
+    if not _broker_socket_present():
+        return None
+    return _broker_client_prefix() + list(argv)
+
+
 def _etlcat_build(e, log):
     """Build the pinned commit. Returns (ok, logo_data_url). Skips the build when the image is
     already there with this exact SHA label."""
@@ -52856,7 +52866,15 @@ def _etlcat_build(e, log):
                 '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
         if caps:
             args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
-        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600,
+        # ops #841 (infra-TAK #523): through the broker ALSO when the console runs as root.
+        # _sudo_wrap runs a root console's docker directly, which means BuildKit and "network mode
+        # cloudtak_etl not supported by buildkit", and no egress gate.
+        cmd = _etl_build_cmd(args + [src])
+        if cmd is None:
+            log("  ✗ the privileged broker is not running — ETL images build only through it "
+                "(it keeps the build behind the egress block). Restart takwerx-broker and retry.")
+            return False, ''
+        b = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
                            env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '3600'})   # ops #160: else killed at 600 s
         # BuildKit keeps ~1 GB of cache per build; nothing reuses it (PLAN W3)
         subprocess.run(_sudo_wrap(['docker', 'builder', 'prune', '-f']), capture_output=True, text=True, timeout=600)
