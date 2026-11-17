@@ -142,6 +142,7 @@ def console(tmp_path):
         '_note_password_length': lambda pw: None,
         'stored_hash_unusable': lambda h: None,
         '_apply_authentik_session': lambda: False,
+        '_sso_denied_message': lambda: None,   # ops #813: the sign-in page's "not an administrator" text
         '_login_logo_url': lambda: None,
         '_stamp_session_login': lambda: None,
         '_drop_stale_session': lambda: None,
