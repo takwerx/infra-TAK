@@ -255,3 +255,24 @@ def test_stash_runs_before_the_cert_scripts_in_the_function():
     src = _func('run_fedhub_remote_rotate_ca')
     assert src.index('_fedhub_rotate_stash_cmd(') < src.index('makeRootCa.sh')
     assert src.index('makeRootCa.sh') < src.index('_fedhub_rotate_unstash_cmd(')
+
+
+def _ui_yml(hub):
+    return (hub.fh / 'configs' / 'federation-hub-ui.yml').read_text(encoding='utf-8')
+
+
+def test_ui_truststore_name_keeps_its_jks_after_each_rotation(hub):
+    # Box test (Nov 17 2026): the old pattern turned truststore-X.jks into truststore-Y, no extension, so the hub
+    # UI config named a file that does not exist after the first Rotate CA.
+    hub.deploy_certs()
+    hub.rotate()
+    assert 'truststore: certs/files/truststore-FEDHUB-INT-CA-01.jks\n' == _ui_yml(hub), _ui_yml(hub)
+    assert (hub.files / 'truststore-FEDHUB-INT-CA-01.jks').exists()
+    hub.rotate()
+    assert 'truststore: certs/files/truststore-FEDHUB-INT-CA-02.jks\n' == _ui_yml(hub), _ui_yml(hub)
+
+
+def test_ui_truststore_name_left_without_jks_by_an_older_rotation_is_repaired(hub):
+    _write(hub.fh / 'configs' / 'federation-hub-ui.yml', 'truststore: certs/files/truststore-FEDHUB-INT-CA-01\nother: 1\n')
+    hub.rotate()
+    assert _ui_yml(hub) == 'truststore: certs/files/truststore-FEDHUB-INT-CA-01.jks\nother: 1\n', _ui_yml(hub)

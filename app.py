@@ -33287,7 +33287,10 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
 
         patch_cfg_cmd = (
             f'cd {fh_dir}/configs && '
-            f'sudo sed -i -E "s|truststore-[A-Za-z0-9._-]+|truststore-{safe_int}|g" federation-hub-ui.yml && '
+            # the name part only, and the .jks stays (the old pattern ate it: truststore-X.jks became truststore-Y and the
+            # hub no longer found its truststore). A name an earlier rotation left without .jks is repaired too (ops #865).
+            f'sudo sed -i -E "s#truststore-[A-Za-z0-9._-]+\\.jks#truststore-{safe_int}.jks#g; '
+            f's#truststore-[A-Za-z0-9_-]+([^A-Za-z0-9._-]|$)#truststore-{safe_int}.jks\\1#g" federation-hub-ui.yml && '
             f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
             f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
         )
