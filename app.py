@@ -1803,8 +1803,14 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # 0.81.4 distrusts the eMudhra CA keys. No config.yaml schema change; the store only gains
 # columns (peer MAC, cert posture, per-target access); the rollback drill checks 0.80.0 still
 # starts clean on a 0.81-migrated store.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
+# ops #819: 0.82.1 / v2.96.0 PROMOTED to VETTED (main), so fresh installs and main-channel boxes leave
+# 0.80.0. Evidence: 0.80.0 -> 0.82.1 Update with two peers kept and pinging over the relay (ops #884
+# row 8), 0.82.0 -> 0.82.1 update, rollback, embedded-IdP and Authentik logins, the x509 path and a
+# soak on three platforms (ops #819), and a fresh deploy straight onto this pair (ops #819, PR body).
+# Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.80.0 / v2.94.0; the pin-restore
+# heal converges boxes back on console boot (0.80.0 starts clean on a 0.82-migrated store, ops #819).
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.82.1"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # ops #427: 0.82.0 / v2.96.0 UNDER TRIAL on dev (T&E only, not promoted; 0.81.4 passed its 24 h
 # soak, ops #208, but stays unpromoted until the lead moves the vetted pin). 0.82.0: relay
 # negotiates the protocol version, new DB indexes, reverse-proxy access logs move to their own
