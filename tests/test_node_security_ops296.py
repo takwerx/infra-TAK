@@ -61,9 +61,9 @@ PS = (
     'eud-remote-assist-server-1|eud-remote-assist|server\n'
     'eud-remote-assist-web-1|eud-remote-assist|web\n'
 )
-FIXED = {'tak-portal': 'v22.23.4', 'tak-portal-worker': 'v22.23.4', 'cloudtak-api-1': 'v26.12.1',
-         'cloudtak-events-1': 'v26.12.1', 'nodered': 'v22.23.4',
-         'eud-remote-assist-server-1': 'v22.23.4',
+FIXED = {'tak-portal': 'v22.23.5', 'tak-portal-worker': 'v22.23.5', 'cloudtak-api-1': 'v26.13.1',
+         'cloudtak-events-1': 'v26.13.1', 'nodered': 'v22.23.4',   # nodered: upstream image, still 22.23.4 (ops #824)
+         'eud-remote-assist-server-1': 'v22.23.5',
          'cloudtak-media-1': 'v24.22.0'}   # upstream image: must never be looked at
 
 
@@ -103,8 +103,11 @@ def test_versions_below_the_fix_are_flagged_and_fixed_ones_are_not():
     n = _ns({})
     missing = n['_node_releases_missing']
     for v in ('v22.23.3', '22.23.0', 'v24.22.0', 'v24.21.9', 'v26.12.0', 'v26.11.9'):
-        assert [r['id'] for r in missing(v)] == ['CVE-2026-111497'], v
-    for v in ('v22.23.4', 'v22.24.0', 'v24.22.1', 'v26.12.1', 'v26.13.0'):
+        assert [r['id'] for r in missing(v)] == ['CVE-2026-111497', 'CVE-2026-123864'], v
+    # ops #824: the 2026-11-11 release is the only one a module on the previous fix is below
+    for v in ('v22.23.4', 'v24.22.1', 'v24.22.2', 'v26.12.1', 'v26.13.0'):
+        assert [r['id'] for r in missing(v)] == ['CVE-2026-123864'], v
+    for v in ('v22.23.5', 'v22.24.0', 'v24.22.3', 'v26.13.1', 'v26.14.0'):
         assert missing(v) == [], v
 
 
@@ -116,9 +119,34 @@ def test_unknown_major_or_unparseable_version_claims_nothing():
 
 def test_table_covers_the_fixed_versions_from_the_advisory():
     n = _ns({})
-    (rel,) = n['NODE_SECURITY_RELEASES']
-    assert rel['id'] == 'CVE-2026-111497'
-    assert rel['fixed'] == {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'}
+    old, new = n['NODE_SECURITY_RELEASES']
+    assert old['id'] == 'CVE-2026-111497'
+    assert old['fixed'] == {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'}
+    # ops #824: Node 22.23.5 / 24.22.3 / 26.13.1, 2026-11-11 (nodejs.org november-2026-security-releases)
+    assert new['id'] == 'CVE-2026-123864' and new['released'] == '2026-11-11'
+    assert new['fixed'] == {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'}
+
+
+def test_node_red_is_not_claimed_while_its_upstream_image_is_still_on_22_23_4():
+    # nodered/node-red:4.1.17-22 (pushed 2026-10-21) has no 22.23.5 rebuild; Update cannot clear
+    # the flag, so it must not be shown or mailed (ops #824). Other modules on 22.23.4 are.
+    n = _ns({})
+    assert n['_node_releases_missing']('v22.23.4', 'nodered') == []
+    assert [r['id'] for r in n['_node_releases_missing']('v22.23.4', 'takportal')] == ['CVE-2026-123864']
+    # still flagged for the older release it can fix
+    assert [r['id'] for r in n['_node_releases_missing']('v22.23.3', 'nodered')] == ['CVE-2026-111497']
+    assert n['_node_security_gaps']({'nodered': {'nodered': 'v22.23.4'}}) == {}
+
+
+def test_a_module_on_the_previous_fix_is_flagged_for_the_new_release():
+    # the proof test for ops #824: red on dev (22.23.4 was "fixed"), green with the new entry
+    n = _ns({})
+    gaps = n['_node_security_gaps']({'takportal': {'tak-portal': 'v22.23.4', 'tak-portal-worker': 'v22.23.4'},
+                                     'remote_assist': {'eud-remote-assist-server-1': 'v22.23.4'}})
+    assert sorted(gaps) == ['remote_assist', 'takportal']
+    items = n['_node_security_items']({'takportal': {'tak-portal': 'v22.23.4'}})
+    assert items[0]['identity'] == 'node-CVE-2026-123864'
+    assert 'Newer Node.js fixes CVE-2026-123864:' in items[0]['security'][0]
 
 
 # ── which containers are looked at ────────────────────────────────────────────
@@ -127,10 +155,10 @@ def test_only_the_node_containers_of_the_four_modules_are_probed():
     n = _ns(FIXED)
     got = n['_node_container_versions']()
     assert got == {
-        'takportal': {'tak-portal': 'v22.23.4', 'tak-portal-worker': 'v22.23.4'},
-        'cloudtak': {'cloudtak-api-1': 'v26.12.1', 'cloudtak-events-1': 'v26.12.1'},
+        'takportal': {'tak-portal': 'v22.23.5', 'tak-portal-worker': 'v22.23.5'},
+        'cloudtak': {'cloudtak-api-1': 'v26.13.1', 'cloudtak-events-1': 'v26.13.1'},
         'nodered': {'nodered': 'v22.23.4'},
-        'remote_assist': {'eud-remote-assist-server-1': 'v22.23.4'},
+        'remote_assist': {'eud-remote-assist-server-1': 'v22.23.5'},
     }
     # not Postgres, nginx, Authentik, or the CloudTAK media helper
     assert set(n['_execs']) == {'tak-portal', 'tak-portal-worker', 'cloudtak-api-1',
@@ -158,10 +186,10 @@ def test_old_node_makes_one_security_item_per_module():
     items = n['_node_security_items'](n['_node_container_versions']())
     assert [i['key'] for i in items] == ['node:cloudtak', 'node:nodered', 'node:takportal']
     tp = items[2]
-    assert tp['identity'] == 'node-CVE-2026-111497'
+    assert tp['identity'] == 'node-CVE-2026-111497+CVE-2026-123864'
     assert tp['summary'] == 'Node.js inside TAK Portal is out of date'
     assert tp['security'][0].startswith('TAK Portal is running Node.js v22.23.0. Newer Node.js fixes CVE-2026-111497:')
-    assert 'actively attacked' in tp['security'][0]
+    assert 'actively attacked' in tp['security'][0] and 'CVE-2026-123864' in tp['security'][0]
     assert tp['how'] == 'Open TAK Portal in infra-TAK and press Update.'
 
 
@@ -183,9 +211,10 @@ def test_identity_changes_when_the_next_node_release_ships():
     n['NODE_SECURITY_RELEASES'] = n['NODE_SECURITY_RELEASES'] + (
         {'id': 'CVE-2026-999999', 'released': '2026-12-01', 'fixed': {22: '22.24.0'}, 'reason': 'next one'},)
     b = n['_node_security_items'](versions)[0]['identity']
-    assert a == 'node-CVE-2026-111497' and b == 'node-CVE-2026-111497+CVE-2026-999999'
-    # a box that took the first fix but not the second is flagged for the second only
-    n2 = n['_node_security_items']({'takportal': {'tak-portal': 'v22.23.4'}})
+    assert a == 'node-CVE-2026-111497+CVE-2026-123864'
+    assert b == 'node-CVE-2026-111497+CVE-2026-123864+CVE-2026-999999'
+    # a box that took the first fixes but not the next is flagged for the next only
+    n2 = n['_node_security_items']({'takportal': {'tak-portal': 'v22.23.5'}})
     assert n2[0]['identity'] == 'node-CVE-2026-999999'
 
 
@@ -232,7 +261,48 @@ def test_box_on_old_node_gets_the_security_email():
     assert '  • Node.js inside TAK Portal is out of date' in body
     assert 'CVE-2026-111497' in body and 'v22.23.0' in body
     assert '      Fix it from the infra-TAK console: Open TAK Portal in infra-TAK and press Update.' in body
-    assert saved[-1] == {'node:takportal': 'node-CVE-2026-111497'}
+    assert saved[-1] == {'node:takportal': 'node-CVE-2026-111497+CVE-2026-123864'}
+
+
+def test_box_on_the_previous_fix_gets_the_email_for_the_new_release():
+    # ops #824: TAK Portal and Remote Assist on 22.23.4 (the fix before 22.23.5) are told to press Update
+    old = dict(FIXED, **{'tak-portal': 'v22.23.4', 'tak-portal-worker': 'v22.23.4',
+                         'eud-remote-assist-server-1': 'v22.23.4'})
+    r, sent, saved = _sweep(old, {})
+    assert r['emailed'] is True and len(sent) == 1
+    subj, body = sent[0]
+    assert subj == '🔒 Security update pending on tak-prod-1 — update this machine'
+    assert '  • Node.js inside TAK Portal is out of date' in body
+    assert '  • Node.js inside Remote Assist is out of date' in body
+    assert 'Newer Node.js fixes CVE-2026-123864:' in body and 'v22.23.4' in body
+    assert 'Open Remote Assist in infra-TAK and press Update.' in body
+    assert saved[-1] == {'node:remote_assist': 'node-CVE-2026-123864', 'node:takportal': 'node-CVE-2026-123864'}
+
+
+def test_node_red_on_22_23_4_gets_no_email_until_its_image_is_rebuilt():
+    r, sent, saved = _sweep(dict(FIXED, nodered='v22.23.4'), {})
+    assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
+
+
+PS_PRINT = PS + 'cloudtak-print|cloudtak|cloudtak-print\n'
+
+
+def test_print_plugin_on_node_24_22_2_is_not_flagged_for_the_new_release():
+    # ops #824: the CloudTAK card's Update never builds Print (its compose file is kept out of
+    # COMPOSE_FILE), so a CloudTAK flag for it would stay red after Update. Print is also plain HTTP.
+    n = _ns(dict(FIXED, **{'cloudtak-print': 'v24.22.2'}), ps=PS_PRINT)
+    versions = n['_node_container_versions']()
+    assert versions['cloudtak']['cloudtak-print'] == 'v24.22.2'
+    assert n['_node_security_gaps'](versions) == {}
+    assert n['_node_security_items'](versions) == []
+
+
+def test_print_plugin_on_an_older_node_24_is_still_flagged_for_the_earlier_release():
+    # the exclusion covers the 2026-11-11 release only; the earlier fix (24.22.1) still counts
+    n = _ns(dict(FIXED, **{'cloudtak-print': 'v24.22.0'}), ps=PS_PRINT)
+    gaps = n['_node_security_gaps'](n['_node_container_versions']())
+    assert list(gaps) == ['cloudtak']
+    assert [r['id'] for r in gaps['cloudtak']['releases']] == ['CVE-2026-111497']
 
 
 def test_box_on_fixed_node_gets_no_email():
