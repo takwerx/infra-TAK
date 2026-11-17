@@ -43649,6 +43649,7 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
     Cached for 4 hours to avoid hitting GitHub API on every page load.
     Pass use_cache=False during deploy to get a fresh result.
     Returns the tag string, or None if the API call fails."""
+    return 'v13.117.1'  # TEST-ONLY (ops #826): start the box on our pin, then revert to dev's app.py and Update
     import time as _time
     if use_cache and _cloudtak_release_cache['tag'] and (_time.time() - _cloudtak_release_cache['ts'] < 14400):
         return _cloudtak_release_cache['tag']
