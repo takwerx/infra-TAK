@@ -10077,7 +10077,9 @@ def _diag_section_box(settings):
 
 
 def _diag_section_console(settings):
-    out = [f"failed units: {_diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False) or 'none'}"]
+    _failed = _diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False)
+    out = [f"failed units: {_failed or 'none'}"]
+    out.extend(_diag_failed_unit_detail(_failed))
     j = _diag_cmd(['journalctl', '-u', 'takwerx-console', '--since', '2 hours ago', '--no-pager', '-q', '-n', '5000'], timeout=30)
     bad = [l for l in j.splitlines() if re.search(r'Traceback|\bERROR\b|CRITICAL|failed:', l)]
     out.append(f"console journal, last 2 h: {sum('Traceback' in l for l in bad)} traceback(s), {len(bad)} error-class line(s)")
@@ -10338,6 +10340,7 @@ def _diag_section_takserver(settings):
     for el in re.findall(r'<input\b[^>]*>', cc):
         out.append('<input> ' + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el)
                                          if a in ('_name', 'protocol', 'port', 'auth')))
+    out.extend(_diag_tak_api_ports(cc, _diag_cmd(['systemctl', 'is-active', 'takserver'], priv=False) == 'active'))
     try:
         uaf = _read_own_or_priv('/opt/tak/UserAuthenticationFile.xml') or ''
         in_flat = 'yes' if 'identifier="webadmin"' in uaf else 'no'
@@ -10395,6 +10398,48 @@ def _diag_section_takserver(settings):
         except Exception as e:
             out.append(f"cot schema_version: ({type(e).__name__}: {str(e)[:120]})")
     out.extend(_diag_tak_update_history())
+    return out
+
+
+def _diag_tak_api_ports(core_config_text, service_active, ss_text=None, holder=None):
+    """ops #902: is TAK Server's web API actually listening, and if not, who holds its ports?
+    The report used to show the connectors from CoreConfig and `service: active`, which read as
+    healthy on a box whose API had died on a port clash (field report, 2026-11-17)."""
+    required = _tak_api_required_ports(core_config_text)
+    up = _tak_listening_ports(ss_text if ss_text is not None else _diag_cmd(['ss', '-tlnH'], priv=False))
+    missing = [p for p in required if p not in up]
+    names = ', '.join(str(p) for p in required)
+    if not service_active:
+        return [f"TAK API web ports ({names}): not checked, the takserver service is not active"]
+    if not missing:
+        return [f"TAK API web ports ({names}): all listening"]
+    holder = holder or _tak_port_holder_now
+    out = [f"TAK API web ports ({names}): NOT listening on {', '.join(str(p) for p in missing)} "
+           "although the takserver service is active. The console, TAK Portal and CloudTAK cannot reach "
+           "TAK Server's API."]
+    for p in required:
+        if p in up:
+            out.append(f"  port {p} is held by: {holder(p) or '(could not tell)'}"
+                       "   <-- TAK's API opens its web ports together, so a listener here while another port is "
+                       "closed is not TAK's API")
+    return out
+
+
+def _diag_failed_unit_detail(failed_text, tail=6):
+    """Why each failed systemd unit failed: its result, exit status and last journal lines.
+    `systemctl --failed` alone names the unit and nothing else (ops #902: takrestartwatch.service)."""
+    units = []
+    for ln in (failed_text or '').splitlines():
+        parts = ln.replace('●', ' ').split()
+        if parts and re.fullmatch(r'[\w@.:\\-]+\.(service|timer|socket|mount|path)', parts[0]):
+            units.append(parts[0])
+    out = []
+    for u in units[:8]:
+        show = _diag_cmd(['systemctl', 'show', u, '-p', 'Result', '-p', 'ExecMainStatus',
+                          '-p', 'InactiveEnterTimestamp'], priv=False)
+        out.append(f"  {u}: " + '  '.join(l.strip() for l in show.splitlines() if l.strip()))
+        j = _diag_cmd(['journalctl', '-u', u, '-n', str(tail), '--no-pager', '-q', '-o', 'short-iso'], timeout=15)
+        out.extend('    ' + l[:220] for l in j.splitlines()[-tail:])
     return out
 
 
@@ -94294,6 +94339,124 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     return proc.returncode if proc.returncode is not None else 1
 
 
+# ── ops #902: "service active" and "PostgreSQL 18 serving" do not say the web API came up ──
+# Field (customer report, 2026-11-17): the 5.8 migration ended "ok", but TAK Server's API never
+# opened 8443. Its log said it could not bind 8446, and the thing answering on 8446 was a
+# Federation Hub certificate. TAK Portal then got "connection refused" on 8443 for hours. The
+# migration only read the PostgreSQL major, so nothing said any of it. TAK's API (Tomcat) opens
+# all its web ports together: if one cannot bind, none of them listen.
+def _tak_api_required_ports(core_config_text):
+    """Ports TAK Server's API opens for the console, TAK Portal and CloudTAK: the CoreConfig.xml
+    connectors named `https` (8443), `cert_https` (8446) and `LetsEncrypt` (the one infra-TAK
+    writes itself). 8446 is in the list so that a program sitting on it is named: that was the
+    field fault and the box-test fault (the API dies when it cannot bind 8446). Falls back to
+    8443 when CoreConfig has no such connector. The fed_https connector is left out on purpose:
+    it is not up on a box that does not federate (8444 is closed on a healthy fresh install)."""
+    ports = []
+    for el in re.findall(r'<connector\b[^>]*>', core_config_text or ''):
+        nm = re.search(r'\b_name="([^"]*)"', el)
+        pt = re.search(r'\bport="(\d+)"', el)
+        if nm and pt and nm.group(1) in ('https', 'cert_https', 'LetsEncrypt') and int(pt.group(1)) not in ports:
+            ports.append(int(pt.group(1)))
+    return ports or [8443]
+
+
+def _tak_listening_ports(ss_text):
+    """TCP ports in `ss -tlnH` output (any address, IPv4 or IPv6)."""
+    ports = set()
+    for ln in (ss_text or '').splitlines():
+        parts = ln.split()
+        if len(parts) > 3 and parts[3].rsplit(':', 1)[-1].isdigit():
+            ports.add(int(parts[3].rsplit(':', 1)[-1]))
+    return ports
+
+
+def _tak_port_holder(ss_p_text, cmdline=''):
+    """Who listens on a port, from `ss -tlnpH sport = :N` output, as one line: the process name
+    and pid, and a plain name when the command line says it is Federation Hub. '' when `ss`
+    named nobody (not root, or nothing listening)."""
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', ss_p_text or '')
+    if not m:
+        return ''
+    what = '%s (pid %s)' % (m.group(1), m.group(2))
+    cl = (cmdline or '').replace('\0', ' ')
+    if 'federation-hub' in cl.lower() or 'federationhub' in cl.lower():
+        what += ' = Federation Hub'
+    elif 'spring.profiles.active=api' in cl:
+        what += " = a TAK Server API process (an older copy that did not stop?)"
+    return what
+
+
+def _tak_port_holder_now(port):
+    """_tak_port_holder() for a live port. Read-only (`ss` is on the broker allow-list)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['ss', '-tlnpH', 'sport = :%d' % port]),
+                           capture_output=True, text=True, timeout=15)
+        out = r.stdout or ''
+        m = re.search(r'pid=(\d+)', out)
+        cmdline = ''
+        if m:
+            try:
+                with open('/proc/%s/cmdline' % m.group(1), 'rb') as f:
+                    cmdline = f.read().decode('utf-8', 'replace')
+            except OSError:
+                pass
+        return _tak_port_holder(out, cmdline)
+    except Exception:
+        return ''
+
+
+def _tak_api_wait_serving(required, timeout_s=600, poll_s=10, listening=None,
+                          holder=None, sleep=None, clock=None, stable_s=60):
+    """Wait until every port in `required` has a listener (TAK's API takes a few minutes on its
+    first start after a migration), and keeps it for `stable_s` seconds. The stable wait is real:
+    on a test box with 8446 held by another program, 8443 was seen listening once, a moment
+    before the API gave up and closed it (ops #902, box test). Returns {'ok', 'missing',
+    'listening', 'holders'}. On a timeout, `holders` names who listens on the required ports that
+    ARE up: TAK's API opens its web ports together, so a listener there while another port stays
+    closed is not TAK's API."""
+    listening = listening or (lambda: _tak_listening_ports(subprocess.run(
+        ['ss', '-tlnH'], capture_output=True, text=True, timeout=15).stdout))
+    holder = holder or _tak_port_holder_now
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    end = clock() + timeout_s
+    up_since = None
+    while True:
+        try:
+            up = listening()
+        except Exception:
+            up = set()
+        missing = [p for p in required if p not in up]
+        if not missing:
+            if up_since is None:
+                up_since = clock()
+            if clock() - up_since >= stable_s:
+                return {'ok': True, 'missing': [], 'listening': list(required), 'holders': {}}
+        else:
+            up_since = None           # it opened and closed again: start the stable wait over
+            if clock() >= end:
+                up_req = [p for p in required if p in up]
+                return {'ok': False, 'missing': missing, 'listening': up_req,
+                        'holders': {p: holder(p) for p in up_req}}
+        sleep(poll_s)
+
+
+def _tak_api_not_serving_lines(res):
+    """Plain-words lines for a failed _tak_api_wait_serving() result."""
+    out = ["TAK Server's web API is NOT listening on port %s. The console, TAK Portal and "
+           'CloudTAK cannot reach TAK Server until it does.' % ', '.join(str(p) for p in res['missing'])]
+    for p, who in sorted((res.get('holders') or {}).items()):
+        out.append('  Port %d is already in use by something else%s. TAK Server\'s API cannot start '
+                   'while that is so.' % (p, (': ' + who) if who else ' (could not tell what)'))
+    if res.get('listening'):
+        out.append('  Stop or move that program, then restart TAK Server (Guard Dog or the TAK '
+                   'Server page) and check port %s opens.' % ', '.join(str(p) for p in res['missing']))
+    else:
+        out.append('  Look at /opt/tak/logs/takserver-api.log for the reason it did not start.')
+    return out
+
+
 def run_takserver_58_migration(pkg_path, log=None, status=None):
     """Worker: the whole 5.8 + PG18 migration as one indivisible operation.
 
@@ -94622,6 +94785,20 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
                         % (running, TAK_PG_MAJOR), wedged=True)
         _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        # ops #902: the database is only half of "TAK Server is back". Wait for the web API to
+        # open its ports; otherwise say so and say who is in the way, instead of ending "ok".
+        _say('Waiting for the TAK Server web API to start (this can take a few minutes)…')
+        _api_ports = _tak_api_required_ports(_read_own_or_priv('/opt/tak/CoreConfig.xml') or '')
+        _api = _tak_api_wait_serving(_api_ports)
+        if not _api['ok']:
+            for _l in _tak_api_not_serving_lines(_api):
+                _say(_l)
+            _say('The database migration itself finished; your data is on PostgreSQL %d.' % TAK_PG_MAJOR)
+            _say('Backup kept at %s' % bk.get('snapshot_path'))
+            _status.update({'running': False, 'complete': False, 'error': True})
+            return
+        _say('  TAK Server web API is listening on port%s %s.'
+             % ('s' if len(_api_ports) > 1 else '', ', '.join(str(p) for p in _api_ports)))
         _say('')
         # Name the right rollback. On a managed database there IS no local PostgreSQL 15
         # cluster holding their data — the only local cluster is the vestigial one TAK's
