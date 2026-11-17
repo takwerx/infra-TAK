@@ -48385,7 +48385,8 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
 # EPEL + CRB for the general set (GH #56: genuine RHEL has no `epel-release` package, so fall
 # back to the Fedora EPEL rpm), core packages strictly, then ffmpeg from RPM Fusion
 # (EPEL/RHEL only ship `ffmpeg-free`, no libx264/libx265) with `ffmpeg-free` as the fallback.
-# A missing ffmpeg warns and does not fail: MediaMTX streams without it. `sudo -n` for a
+# `git` is in both lists: the web editor is cloned on the remote host, and a stock Rocky/RHEL 9 server
+# image has none (the same trap as ops #792, remote WebODM). A missing ffmpeg warns and does not fail: MediaMTX streams without it. `sudo -n` for a
 # non-root SSH user. NON-ROOT-COMMANDS: dnf, apt-get, rpm.
 _MEDIAMTX_REMOTE_DEPS_SH = (
     'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
@@ -48397,13 +48398,13 @@ _MEDIAMTX_REMOTE_DEPS_SH = (
     '$S dnf install -y dnf-plugins-core >/dev/null 2>&1; fi; '
     '$S dnf config-manager --set-enabled crb >/dev/null 2>&1 || '
     '$S dnf config-manager --set-enabled powertools >/dev/null 2>&1; '
-    '$S dnf install -y wget tar curl openssl python3 python3-pip 2>&1 || exit 1; '
+    '$S dnf install -y wget tar curl openssl python3 python3-pip git 2>&1 || exit 1; '
     '$S dnf install -y "https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$EL.noarch.rpm" >/dev/null 2>&1; '
     '$S dnf install -y ffmpeg >/dev/null 2>&1 || $S dnf install -y ffmpeg-free >/dev/null 2>&1 || '
     'echo "INFRATAK-FFMPEG-MISSING"; '
     'elif command -v apt-get >/dev/null 2>&1; then '
     '$S apt-get update -qq && '
-    '$S env DEBIAN_FRONTEND=noninteractive apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1; '
+    '$S env DEBIAN_FRONTEND=noninteractive apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip git 2>&1; '
     'else echo "no dnf or apt-get on this host"; false; fi'
 )
 
@@ -48642,7 +48643,7 @@ paths:
     _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
     # Web editor: clone on remote and install
     _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
+    ok, _clone_out = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
@@ -48677,6 +48678,10 @@ paths:
         except Exception:
             pass
         plog("✓ HLS URLs patched for HTTPS proxy")
+    else:
+        # ops #892: this branch did not exist, so a failed download left no editor file and the deploy still ended in success.
+        plog(f"⚠ The web editor could not be downloaded to the remote host (git clone failed): {(_clone_out or '')[-200:]}")
+        plog("  MediaMTX itself still works. Run Patch web editor on the MediaMTX page once the host can reach GitHub.")
     # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''

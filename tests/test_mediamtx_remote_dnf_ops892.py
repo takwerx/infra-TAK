@@ -79,7 +79,7 @@ def test_rocky_host_with_only_dnf_installs_the_packages_with_dnf(tmp_path):
     assert not any(c.startswith('apt-get') for c in calls)
     core = [c for c in calls if c.startswith('dnf install -y wget')]
     assert core, calls
-    for pkg in ('wget', 'tar', 'curl', 'openssl', 'python3', 'python3-pip'):
+    for pkg in ('wget', 'tar', 'curl', 'openssl', 'python3', 'python3-pip', 'git'):  # git: the editor is cloned on the host, stock Rocky has none
         assert pkg in core[0].split(), core[0]
     # full ffmpeg comes from RPM Fusion, never the apt package name list
     assert any('rpmfusion-free-release-9.noarch.rpm' in c for c in calls), calls
@@ -92,7 +92,7 @@ def test_ubuntu_host_with_only_apt_get_still_uses_apt_get(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(c.startswith('apt-get update') for c in calls)
     inst = [c for c in calls if 'apt-get install' in c]
-    assert inst and 'ffmpeg' in inst[0] and 'python3-pip' in inst[0], calls
+    assert inst and 'ffmpeg' in inst[0] and 'python3-pip' in inst[0] and 'git' in inst[0].split(), calls
     assert not any(c.startswith('dnf') for c in calls)
 
 
@@ -206,3 +206,12 @@ def test_deploy_relabels_before_daemon_reload_and_checks_mediamtx_is_up():
     i_ok = body.index('✓ Services started')
     assert i_relabel < i_reload < i_check < i_ok
     assert '✗ MediaMTX did not start on the remote host' in body
+
+
+def test_a_failed_editor_download_is_said_in_the_log_not_silently_skipped():
+    i0 = APP.index('\ndef _run_mediamtx_deploy_remote(')
+    body = APP[i0:APP.index('\ndef ', i0 + 1)]
+    i = body.index('_mediamtx_editor_clone_cmd(')
+    after = body[i:body.index('LDAP overlay: when Authentik is present locally')]
+    assert 'ok, _clone_out = _module_run(' in body
+    assert 'The web editor could not be downloaded to the remote host' in after
