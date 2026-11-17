@@ -89378,9 +89378,15 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     -signing keystores. Matching only the old/new CA names re-issued all of those as client
     certs, which appends a non-CA private key to the live enrollment signing keystore that
     CoreConfig's TAKServerCAConfig points at (ops #82, seen on test8 after nine rotations).
+
+    `takserver-le` is never a client either: it is the keystore behind the 8446 connector, built
+    from the box's public (Let's Encrypt or custom) certificate. On Docker TAK Server its
+    .p12/.jks sit in this folder, and `makeCert.sh client takserver-le` overwrote them with a
+    certificate from the TAK CA, so 8446 stopped serving the public certificate and CloudTAK
+    sign-in failed with INVALID_PURPOSE (ops #883). Native boxes keep it in a temp folder.
     """
     files = os.listdir(cert_dir)
-    cas = {'takserver', 'root-ca', 'ca'} | {s.lower() for s in skip if s}
+    cas = {'takserver', 'root-ca', 'ca', 'takserver-le'} | {s.lower() for s in skip if s}
     for f in files:
         if f.endswith('.crl'):
             cas.add(f[:-4].lower())
