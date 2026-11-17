@@ -124,6 +124,17 @@ Official: [nodered.org/docs](https://nodered.org/docs)
 - Function nodes cannot `require()` by default; declare modules in the node's `libs`.
 - Never `docker cp` a `flows.json` into a running container (it can persist an empty global context). `nodered/deploy.sh` stops the container first. Confirm `contextStorage` is `localfilesystem` in the file the container actually reads.
 
+## CoTURN (Remote Assist TURN relay)
+
+Official: [coturn releases](https://github.com/coturn/coturn/releases), [docker image](https://hub.docker.com/r/coturn/coturn)
+
+- **The image entrypoint expands each argument with `eval echo`, then runs turnserver.** That is why the relay address in our override is written as a command in `$$(...)` and still works (ops #212). The loop is the same in 4.18.0 and 4.19.1. ✅ verified 2026-11-16, test6 and test12 (4.19.1 entrypoint read from the image, every flag accepted).
+- **The `--version` string of the `coturn/coturn:4.19.1` image says `4.19.0`.** The image label `org.opencontainers.image.version` says `4.19.1-r0`, and `--dtls-half-open-timeout` (new in 4.19.1) is in its help. Judge the version by the label, not the binary's string. ✅ verified 2026-11-16, test12.
+- **Upstream release pages list pull request titles only.** 4.19.1 says "Security fixes" with no CVE or advisory text. Read the compare view and the new options before adopting. 📖 documented.
+- **A relay test with `turnutils_uclient` needs a peer on several ports.** `-e PEER -r PORT` sends to PORT, PORT+1 and onward, so run `turnutils_peer` on four consecutive ports and open them to the TURN box's address. Without that, packets are lost and it looks like a relay fault. `-y -m 2` tests two clients relaying to each other (the ops #212 case). Both tools ship in the coturn image: `docker run --rm --network host --entrypoint turnutils_uclient coturn/coturn:TAG ...`. ✅ verified 2026-11-16, test6 as relay, test12 as the outside client.
+- **A refused private peer shows as `channel bind: error 403` in the client.** An allowed one shows no error. ✅ verified 2026-11-16, 4.18.0 and 4.19.1.
+- **The console moves an existing CoTURN to a new pin about 3 minutes after the console restarts** (the startup migration runs late, in a thread). Wait for the journal line `Startup migration: CoTURN updated to ...` before testing. ✅ verified 2026-11-16, test6.
+
 ## Docker
 
 Official: [docs.docker.com](https://docs.docker.com/)
