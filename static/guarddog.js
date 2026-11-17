@@ -507,8 +507,8 @@ function gdRenderEmailChips(){
    render the field once at page load and then go quiet, so a typed value and a saved
    value looked identical — which is what made the baked-address bug invisible. */
 var gdSavedNotify={email:null,nickname:null};
-function gdEsc(t){return String(t).replace(/[<>&"]/g,function(c){
-  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];});}
+function gdEsc(t){return String(t).replace(/[<>&"']/g,function(c){
+  return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c];});}
 function gdNormEmails(v){
   return (v||'').split(/[,;\s]+/).filter(function(t){return t;}).join(',');
 }

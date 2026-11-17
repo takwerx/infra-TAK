@@ -44832,6 +44832,39 @@ def _get_netbird_version_info():
     return out
 
 
+# ops #827: a version string is read from a container's package.json, a remote host's package
+# database or a module's own files, so whoever controls that module chooses it. The console cards
+# show it, so only text that can be a version goes out: letters, digits and . _ + ~ : -, 128 at most.
+# A space and the middle dot are allowed too, because two cards join two versions into one label
+# ("MediaMTX v1.15.3 \u00b7 editor v2.4.0", "0.80.0 \u00b7 dash v2.14.0"). No character of HTML or script fits.
+_MODULE_VERSION_RE = re.compile('[0-9A-Za-z][0-9A-Za-z._+~: \u00b7-]{0,127}')
+_MODULE_VERSION_FIELDS = ('version', 'editor_version', 'latest', 'editor_latest', 'latest_tag', 'running',
+                          'vetted', 'vetted_release')
+
+
+def _safe_module_version(value):
+    """value when it can be a version (see _MODULE_VERSION_RE), else ''. Other types pass through."""
+    if not isinstance(value, str):
+        return value
+    v = value.strip()
+    return v if _MODULE_VERSION_RE.fullmatch(v) else ''
+
+
+def _safe_module_version_info(key, info):
+    """A copy of one module's version info with every version field checked (the helpers may cache
+    their dict, so the original is left alone). A refused value is logged once per poll."""
+    if not isinstance(info, dict):
+        return info
+    out = dict(info)
+    for field in _MODULE_VERSION_FIELDS:
+        if field in out and isinstance(out[field], str) and out[field].strip():
+            clean = _safe_module_version(out[field])
+            if not clean:
+                print(f"version-info: {key} {field} is not a version string, not shown", flush=True)
+            out[field] = clean
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards.
 
@@ -44912,7 +44945,8 @@ def get_all_module_versions():
                 result[key] = {**result[key], 'node_security': _node_card_flag(gap)}  # copy: helpers may cache
     except Exception as e:
         print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
-    return result
+    # ops #827: last step, so every module and every field goes through the same check.
+    return {key: _safe_module_version_info(key, info) for key, info in result.items()}
 
 
 @app.route('/api/modules/version')
@@ -66121,7 +66155,7 @@ window.ctCopyPluginLog = function(btn) {
 
 window.ctGenBootstrapCert = function(btn) {
   var out = document.getElementById('ct-bootstrap-cert-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var orig = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generating…';
   if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--text-dim)">Generating certificate + applying ROLE_ADMIN (this takes a few seconds)…</span>'; }
@@ -66159,7 +66193,7 @@ window.ctLoadConnectState = function(retries) {
   if (!st) return;
   var btn = document.getElementById('ct-connect-btn');
   var creds = document.getElementById('ct-connect-creds');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/connect-tak', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -66208,7 +66242,7 @@ window.ctLoadConnectState = function(retries) {
 
 window.ctConnectTak = function(btn) {
   var out = document.getElementById('ct-connect-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var body = {};
   if (window._ctConnectNeedsCreds) {
     body.username = (document.getElementById('ct-connect-user').value || '').trim();
@@ -66239,7 +66273,7 @@ window.ctConnectTak = function(btn) {
 };
 window.ctMakeAdmin = function(btn) {
   var out = document.getElementById('ct-connect-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var sel = document.getElementById('ct-make-admin-user');
   if (!sel || !sel.value) return;
   btn.disabled = true;
@@ -66269,7 +66303,7 @@ document.addEventListener('DOMContentLoaded', function() { window.ctLoadConnectS
 window.ctLoadCoreEventsIdentity = function() {
   var host = document.getElementById('ct-coreevents-identity');
   if (!host) return;
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/coreevents-identity', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -66306,7 +66340,7 @@ document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEven
 window.ctLoadBootstrapChannels = function() {
   var host = document.getElementById('ct-bootstrap-channels');
   if (!host) return;
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/bootstrap-channels', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {

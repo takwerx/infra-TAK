@@ -192,7 +192,7 @@ table.lanes{width:100%;border-collapse:collapse;font-size:12px}table.lanes th{fo
 </div>
 <script>
 const DEFAULT_CHANNEL = {{ default_channel|tojson }};
-function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function api(path, opts){ opts = opts||{}; opts.credentials='same-origin'; if(opts.body && !(opts.body instanceof FormData)){ opts.headers=Object.assign({'Content-Type':'application/json'}, opts.headers||{}); } return fetch(path, opts).then(r=>r.json().then(d=>({ok:r.ok,status:r.status,d:d})).catch(()=>({ok:false,status:r.status,d:{error:'bad response'}}))); }
 {% if not sim.get('installed') %}
 let polling=false;
@@ -219,8 +219,8 @@ function initCities(){ const s=document.getElementById('cityPick'); s.innerHTML=
 function loadScenarios(){ return api('/api/simulator/scenarios').then(r=>{ scenarios=(r.d.scenarios||[]); renderScenarios(); }); }
 function loadChannels(){ return api('/api/simulator/channels').then(r=>{ channels=(r.d.channels||[]); if(!channels.length) channels=[{name:DEFAULT_CHANNEL,channel:DEFAULT_CHANNEL.slice(4),is_simulation:true}]; renderLanes(); }); }
 function renderScenarios(){ const box=document.getElementById('scenList'); if(!scenarios.length){ box.innerHTML='<div class="note">No scenarios found. Rebuild the engine or upload one.</div>'; return; }
-  box.innerHTML=scenarios.map(s=>{ const bad=!s.valid; return '<div class="scen-card'+(selected===s.name?' sel':'')+(bad?' bad':'')+'" onclick="'+(bad?'':'selectScen(\''+esc(s.name)+'\')')+'">'+
-    (s.upload?'<button class="del" title="Delete upload" onclick="event.stopPropagation();deleteScenario(\''+esc(s.name)+'\')">✕</button>':'')+
+  box.innerHTML=scenarios.map(s=>{ const bad=!s.valid; return '<div class="scen-card'+(selected===s.name?' sel':'')+(bad?' bad':'')+'" onclick="'+(bad?'':'selectScen('+esc(JSON.stringify(String(s.name)))+')')+'">'+
+    (s.upload?'<button class="del" title="Delete upload" onclick="event.stopPropagation();deleteScenario('+esc(JSON.stringify(String(s.name)))+')">✕</button>':'')+
     '<h4>'+esc(s.title||s.name)+'</h4><p>'+esc(bad?('Invalid: '+(s.errors||[]).slice(0,2).join('; ')):(s.story||''))+'</p>'+
     (bad?'':'<div class="meta">'+esc(s.entities)+' entities · '+esc(s.events)+' events · '+Math.round(s.duration_s/60)+' min'+(s.loop?' · loop':'')+(s.video?' · video':'')+(s.sensors_detecting?' · '+esc(s.sensors_detecting)+' detecting':'')+(s.silent?' · '+esc(s.silent)+' silent':'')+(s.upload?' · upload':' · preset')+'</div>')+'</div>'; }).join('');
 }
