@@ -34064,17 +34064,12 @@ _CADDY_MIN_FILE_PLACEHOLDER = (2, 8)
 _CADDY_PROXY_AUTH_FILES = {'console': 'infratak-proxy-auth-console',
                            'atlas': 'infratak-proxy-auth-atlas'}
 _PROXY_AUTH_VALUE_RE = re.compile(r'^[0-9a-f]{64}$')
-CADDY_BOOT_DROPIN = '/etc/systemd/system/caddy.service.d/10-takwerx-boot.conf'
-CADDY_BOOT_DROPIN_TEXT_BASE = (
-    '[Unit]\n'
-    'After=network-online.target\n'
-    'Wants=network-online.target\n'
-    '\n'
+# /run/caddy comes from its own drop-in, not from 10-takwerx-boot.conf: a console of an
+# earlier release rewrites that file to its own text at every start, and after a rollback
+# Caddy must still get /run/caddy at boot, because the Caddyfile on disk names the socket.
+CADDY_RUN_DROPIN = '/etc/systemd/system/caddy.service.d/20-takwerx-run.conf'
+CADDY_RUN_DROPIN_TEXT = (
     '[Service]\n'
-    'Restart=on-failure\n'
-    'RestartSec=5s\n'
-)
-CADDY_BOOT_DROPIN_TEXT = CADDY_BOOT_DROPIN_TEXT_BASE + (
     'RuntimeDirectory=caddy\n'
     'RuntimeDirectoryMode=0750\n'
 )
@@ -34151,30 +34146,24 @@ def _caddy_read_proxy_auth_file(kind):
         return ''
 
 
-def _caddy_boot_dropin_ensure(runtime_dir=True):
-    """Write the Caddy drop-in (boot ordering, restart on failure, /run/caddy) when it
+def _caddy_run_dropin_ensure():
+    """Write the Caddy drop-in that gives it /run/caddy (for the admin socket) when it
     differs. Returns (in_place, changed). Never raises. A broker older than this release
-    refuses RuntimeDirectory=; the caller tries again on the next console start.
-
-    runtime_dir=False is for the step that runs before the broker has been brought up
-    to this release (_startup_harden_caddy_boot): it writes the text without /run/caddy,
-    which every broker accepts, and leaves a drop-in that already has /run/caddy alone.
-    _caddy_make_private() adds /run/caddy later in the same start."""
+    refuses RuntimeDirectory=; the caller tries again on the next console start."""
     try:
         try:
-            with open(CADDY_BOOT_DROPIN) as f:
+            with open(CADDY_RUN_DROPIN) as f:
                 cur = f.read()
         except Exception:
             cur = ''
-        want = CADDY_BOOT_DROPIN_TEXT if runtime_dir else CADDY_BOOT_DROPIN_TEXT_BASE
-        if cur.strip() in (CADDY_BOOT_DROPIN_TEXT.strip(), want.strip()):
+        if cur.strip() == CADDY_RUN_DROPIN_TEXT.strip():
             return True, False
-        _makedirs_priv(os.path.dirname(CADDY_BOOT_DROPIN))
-        _write_priv(CADDY_BOOT_DROPIN, want)
+        _makedirs_priv(os.path.dirname(CADDY_RUN_DROPIN))
+        _write_priv(CADDY_RUN_DROPIN, CADDY_RUN_DROPIN_TEXT)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         return True, True
     except Exception as e:
-        print('Caddy: could not write the boot drop-in (%s)' % str(e)[:160], flush=True)
+        print('Caddy: could not write the /run/caddy drop-in (%s)' % str(e)[:160], flush=True)
         return False, False
 
 
@@ -34296,7 +34285,7 @@ def _caddy_make_private_locked(say, plog=None):
 
     if state.get('private') and _caddyfile_is_private(prev_caddyfile) and not _caddy_tcp_admin_open():
         # Already moved. Heal what a hand edit or a restore may have undone.
-        _caddy_boot_dropin_ensure()
+        _caddy_run_dropin_ensure()
         for kind, key in (('console', 'secret'), ('atlas', 'atlas_secret')):
             want = (state.get(key) or '').strip()
             if want and _caddy_read_proxy_auth_file(kind) != want:
@@ -34317,7 +34306,7 @@ def _caddy_make_private_locked(say, plog=None):
             % ('.'.join(map(str, ver)) if ver else '(version unknown)',
                '.'.join(map(str, _CADDY_MIN_FILE_PLACEHOLDER))))
         return 'old-caddy'
-    in_place, _changed = _caddy_boot_dropin_ensure()
+    in_place, _changed = _caddy_run_dropin_ensure()
     if not in_place:
         say('⚠ SECURITY: the Caddy drop-in for /run/caddy could not be written. Retries on '
             'the next console start.')
@@ -107871,8 +107860,17 @@ _startup_ensure_console_gunicorn_threads()
 # cloudtak-media 127.0.0.1:9997 publish); the bind is fatal and the stock unit
 # never retries, so every vhost stays dark until a manual start.
 def _startup_harden_caddy_boot():
-    # ops #814: one text for this drop-in (CADDY_BOOT_DROPIN_TEXT). It also gives Caddy
-    # /run/caddy for its admin socket; a running Caddy gets it at its next restart.
+    dropin_dir = '/etc/systemd/system/caddy.service.d'
+    dropin = f'{dropin_dir}/10-takwerx-boot.conf'
+    dropin_content = (
+        '[Unit]\n'
+        'After=network-online.target\n'
+        'Wants=network-online.target\n'
+        '\n'
+        '[Service]\n'
+        'Restart=on-failure\n'
+        'RestartSec=5s\n'
+    )
     sysctl_path = '/etc/sysctl.d/99-takwerx-nonlocal-bind.conf'
     sysctl_content = 'net.ipv4.ip_nonlocal_bind = 1\n'
 
@@ -107885,13 +107883,11 @@ def _startup_harden_caddy_boot():
 
     try:
         import shutil as _sh
-        # A non-root console is still talking to the previous release's broker here (it
-        # is replaced later in this start), and that broker refuses RuntimeDirectory=. So
-        # this step asks for /run/caddy only on a root console or a box already moved.
-        _rt = _caddy_private() or not (_broker_should_route() and _broker_available())
-        if _sh.which('caddy') and _caddy_boot_dropin_ensure(runtime_dir=_rt)[1]:
-            print('Startup migration: Caddy boot drop-in installed (network-online ordering + '
-                  'Restart=on-failure%s; v10.1.7 WS6, ops #814)' % (' + /run/caddy' if _rt else ''))
+        if _sh.which('caddy') and _read(dropin).strip() != dropin_content.strip():
+            subprocess.run(_sudo_wrap(['mkdir', '-p', dropin_dir]), capture_output=True, timeout=10)
+            _write_priv(dropin, dropin_content)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=15)
+            print('Startup migration: Caddy boot drop-in installed (network-online ordering + Restart=on-failure; v10.1.7 WS6)')
         if _read(sysctl_path).strip() != sysctl_content.strip():
             _write_priv(sysctl_path, sysctl_content)
             # Apply the runtime value with `sysctl -w <param>=<val>`, NOT `-p <file>`:

@@ -1048,8 +1048,6 @@ Wants=network-online.target
 [Service]
 Restart=on-failure
 RestartSec=5s
-RuntimeDirectory=caddy
-RuntimeDirectoryMode=0750
 EOF
         systemctl daemon-reload
         echo -e "  ${GREEN}✓ Caddy boot hardening: waits for network-online, auto-restarts on failure${NC}"

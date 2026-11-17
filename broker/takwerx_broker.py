@@ -835,6 +835,7 @@ UNIT_FILES = frozenset({
     # drop-ins
     'takserver.service.d/soft-start.conf', 'takserver.service.d/jvm-pin.conf',
     'caddy.service.d/10-takwerx-boot.conf', 'caddy.service.d/10-takwerx-acme-eab.conf',
+    'caddy.service.d/20-takwerx-run.conf',      # ops #814: /run/caddy for Caddy's admin socket
     'mediamtx-webeditor.service.d/10-infratak-journal.conf',
     'mediamtx-webeditor.service.d/20-infratak-home.conf',
 })
@@ -882,7 +883,7 @@ _UNIT_SECTIONS = {'.service': ('Unit', 'Service', 'Install'),
 _UNIT_OUTPUTS = frozenset({'journal', 'null', 'inherit', 'journal+console', 'kmsg'})
 _UNIT_SELINUX = 'system_u:system_r:unconfined_service_t:s0'
 # ops #814: the only RuntimeDirectory= the console may ask for (Caddy's admin socket dir).
-_UNIT_RUNTIME_DIR_FILE = 'caddy.service.d/10-takwerx-boot.conf'
+_UNIT_RUNTIME_DIR_FILE = 'caddy.service.d/20-takwerx-run.conf'
 _UNIT_RUNTIME_DIR = 'caddy'
 _UNIT_RUNTIME_DIR_MODES = frozenset({'0750', '0700'})
 _UNIT_PATH_DIRS = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')

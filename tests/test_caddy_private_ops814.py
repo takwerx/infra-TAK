@@ -75,8 +75,8 @@ def _load(names, ns):
 
 
 _CONSTS = ['CADDY_ADMIN_SOCKET', 'CADDY_ADMIN_SOCKET_MODE', '_CADDY_MIN_FILE_PLACEHOLDER',
-           '_CADDY_PROXY_AUTH_FILES', '_PROXY_AUTH_VALUE_RE', 'CADDY_BOOT_DROPIN',
-           'CADDY_BOOT_DROPIN_TEXT_BASE', 'CADDY_BOOT_DROPIN_TEXT']
+           '_CADDY_PROXY_AUTH_FILES', '_PROXY_AUTH_VALUE_RE', 'CADDY_RUN_DROPIN',
+           'CADDY_RUN_DROPIN_TEXT']
 
 
 def _consts(extra=None):
@@ -287,7 +287,7 @@ class Box:
             '_save_proxy_auth_state': save_state,
             '_read_priv': lambda p: box.caddyfile, '_write_priv': write_priv,
             '_caddy_tcp_admin_open': lambda: box.tcp_open,
-            '_caddy_boot_dropin_ensure': lambda: (box.events.append('dropin'), (dropin_ok, dropin_ok))[1],
+            '_caddy_run_dropin_ensure': lambda: (box.events.append('dropin'), (dropin_ok, dropin_ok))[1],
             '_caddy_read_proxy_auth_file': lambda kind: box.files.get(kind, ''),
             '_caddy_write_proxy_auth_file': write_file,
             '_caddy_version_tuple': lambda refresh=False: version,
@@ -644,7 +644,7 @@ def _broker():
 
 
 B = _broker()
-DROPIN_TEXT = _consts()['CADDY_BOOT_DROPIN_TEXT']
+DROPIN_TEXT = _consts()['CADDY_RUN_DROPIN_TEXT']
 
 
 def _unit_write(rel, text):
@@ -654,15 +654,16 @@ def _unit_write(rel, text):
 
 def test_the_broker_accepts_the_drop_in_the_console_writes():
     assert 'RuntimeDirectory=caddy\n' in DROPIN_TEXT and 'RuntimeDirectoryMode=0750\n' in DROPIN_TEXT
-    assert _consts()['CADDY_BOOT_DROPIN'] == f'{B.UNIT_DIR}/caddy.service.d/10-takwerx-boot.conf'
-    v = _unit_write('caddy.service.d/10-takwerx-boot.conf', DROPIN_TEXT)
+    assert _consts()['CADDY_RUN_DROPIN'] == f'{B.UNIT_DIR}/caddy.service.d/20-takwerx-run.conf'
+    v = _unit_write('caddy.service.d/20-takwerx-run.conf', DROPIN_TEXT)
     assert v[0] != 'DENY', v
 
 
 @pytest.mark.parametrize('rel,text', [
-    ('caddy.service.d/10-takwerx-boot.conf', '[Service]\nRuntimeDirectory=systemd\n'),
-    ('caddy.service.d/10-takwerx-boot.conf', '[Service]\nRuntimeDirectory=caddy ../etc\n'),
-    ('caddy.service.d/10-takwerx-boot.conf', '[Service]\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0777\n'),
+    ('caddy.service.d/20-takwerx-run.conf', '[Service]\nRuntimeDirectory=systemd\n'),
+    ('caddy.service.d/20-takwerx-run.conf', '[Service]\nRuntimeDirectory=caddy ../etc\n'),
+    ('caddy.service.d/20-takwerx-run.conf', '[Service]\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0777\n'),
+    ('caddy.service.d/10-takwerx-boot.conf', '[Service]\nRuntimeDirectory=caddy\n'),
     ('caddy.service.d/10-takwerx-acme-eab.conf', '[Service]\nRuntimeDirectory=caddy\n'),
     ('takserver.service.d/soft-start.conf', '[Service]\nRuntimeDirectory=caddy\n'),
     ('takwerx-console.service', '[Service]\nUser=takwerx\nExecStart=/opt/infratak/x\nRuntimeDirectory=caddy\n'),
@@ -752,27 +753,32 @@ def test_the_broker_reload_reports_a_refusal(monkeypatch):
     assert B._do_caddy_reload({'op': 'caddy_reload'})['ok'] is False
 
 
-def test_start_sh_writes_the_same_drop_in():
+def test_the_boot_drop_in_is_left_as_every_release_writes_it():
+    """/run/caddy has its own drop-in. 10-takwerx-boot.conf keeps the text earlier
+    releases write, so a console that was rolled back does not take /run/caddy away
+    (the Caddyfile on disk still names the socket, and Caddy must start after a reboot)."""
+    boot = _segment('_startup_harden_caddy_boot')
+    assert 'RuntimeDirectory' not in boot and '10-takwerx-boot.conf' in boot
     sh = (REPO / 'start.sh').read_text(encoding='utf-8')
-    body = sh.split("10-takwerx-boot.conf << 'EOF'\n", 1)[1].split('\nEOF\n', 1)[0] + '\n'
-    assert body == DROPIN_TEXT
+    body = sh.split("10-takwerx-boot.conf << 'EOF'\n", 1)[1].split('\nEOF\n', 1)[0]
+    assert 'RuntimeDirectory' not in body
+    assert _consts()['CADDY_RUN_DROPIN'].endswith('/caddy.service.d/20-takwerx-run.conf')
+    assert DROPIN_TEXT == '[Service]\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0750\n'
 
 
 def test_startup_and_caddy_deploy_both_make_the_box_private():
     mig = _segment('_startup_migrations')
     assert mig.index("s.get('caddy_proxy_auth_gate_v1')") < mig.index('_caddy_make_private()')
     assert APP.count('_caddy_make_private(plog)') >= 1            # the Caddy deploy
-    assert '_caddy_boot_dropin_ensure(runtime_dir=_rt)' in _segment('_startup_harden_caddy_boot')
+    assert '_caddy_run_dropin_ensure()' in _segment('_caddy_make_private_locked')
 
 
-# ── the drop-in before and after the broker is brought up to this release ────
-
-def _dropin(cur, runtime_dir):
-    """Run _caddy_boot_dropin_ensure() against a drop-in holding `cur` (None = no file)."""
-    writes = []
+def _run_dropin(cur):
+    """Run _caddy_run_dropin_ensure() against a drop-in holding `cur` (None = no file)."""
+    writes, ran = [], []
 
     def fake_open(path, *a, **k):
-        assert path == _consts()['CADDY_BOOT_DROPIN']
+        assert path == _consts()['CADDY_RUN_DROPIN']
         if cur is None:
             raise FileNotFoundError(path)
         import io
@@ -780,44 +786,28 @@ def _dropin(cur, runtime_dir):
 
     ns = _consts({'open': fake_open,
                   '_makedirs_priv': lambda d: None,
-                  '_write_priv': lambda path, text, **kw: writes.append(text),
+                  '_write_priv': lambda path, text, **kw: writes.append((path, text)),
+                  '_sudo_wrap': lambda argv: argv,
+                  'subprocess': types.SimpleNamespace(run=lambda argv, **k: ran.append(argv))})
+    fn = _load(['_caddy_run_dropin_ensure'], ns)['_caddy_run_dropin_ensure']
+    return fn(), writes, ran
+
+
+def test_the_run_drop_in_is_written_once_and_then_left_alone():
+    path = _consts()['CADDY_RUN_DROPIN']
+    assert _run_dropin(None) == ((True, True), [(path, DROPIN_TEXT)], [['systemctl', 'daemon-reload']])
+    assert _run_dropin('[Service]\nRuntimeDirectory=other\n')[1] == [(path, DROPIN_TEXT)]
+    assert _run_dropin(DROPIN_TEXT) == ((True, False), [], [])
+
+
+def test_a_refused_run_drop_in_is_reported_not_raised():
+    def refuse(path, text, **kw):
+        raise RuntimeError('broker write denied: unit: key RuntimeDirectory= not allowed in [Service]')
+    ns = _consts({'open': lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()),
+                  '_makedirs_priv': lambda d: None, '_write_priv': refuse,
                   '_sudo_wrap': lambda argv: argv,
                   'subprocess': types.SimpleNamespace(run=lambda *a, **k: None)})
-    fn = _load(['_caddy_boot_dropin_ensure'], ns)['_caddy_boot_dropin_ensure']
-    return fn(runtime_dir=runtime_dir), writes
-
-
-BASE_TEXT = _consts()['CADDY_BOOT_DROPIN_TEXT_BASE']
-
-
-def test_the_early_step_writes_a_drop_in_every_broker_accepts():
-    """The first console start after an update still talks to the previous release's
-    broker, which refuses RuntimeDirectory=. That step must not ask for it."""
-    assert 'RuntimeDirectory' not in BASE_TEXT and DROPIN_TEXT.startswith(BASE_TEXT)
-    res, writes = _dropin(None, runtime_dir=False)
-    assert res == (True, True) and writes == [BASE_TEXT]
-    v = _unit_write('caddy.service.d/10-takwerx-boot.conf', BASE_TEXT)
-    assert v[0] != 'DENY', v
-
-
-@pytest.mark.parametrize('cur', [BASE_TEXT, DROPIN_TEXT])
-def test_the_early_step_leaves_a_good_drop_in_alone(cur):
-    """Never a write when the old text is there (the move upgrades it), and never a
-    step back from the text with /run/caddy."""
-    assert _dropin(cur, runtime_dir=False) == ((True, False), [])
-
-
-def test_the_move_adds_run_caddy_to_the_old_drop_in():
-    assert _dropin(BASE_TEXT, runtime_dir=True) == ((True, True), [DROPIN_TEXT])
-    assert _dropin(None, runtime_dir=True) == ((True, True), [DROPIN_TEXT])
-    assert _dropin(DROPIN_TEXT, runtime_dir=True) == ((True, False), [])
-
-
-def test_the_early_step_asks_for_run_caddy_only_when_it_cannot_be_refused():
-    seg = _segment('_startup_harden_caddy_boot')
-    assert '_rt = _caddy_private() or not (_broker_should_route() and _broker_available())' in seg
-    # the move itself (after the broker update) always asks for the full text
-    assert '_caddy_boot_dropin_ensure()' in _segment('_caddy_make_private_locked')
+    assert _load(['_caddy_run_dropin_ensure'], ns)['_caddy_run_dropin_ensure']() == (False, False)
 
 
 def test_nothing_in_the_product_talks_to_the_old_admin_address():
