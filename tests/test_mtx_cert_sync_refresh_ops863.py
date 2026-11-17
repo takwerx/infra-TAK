@@ -140,10 +140,16 @@ def test_every_template_placeholder_is_read_back_from_the_script():
         assert re.search(r'^%s="%s"$' % (var, ph), TEMPLATE, re.M), (var, ph)
 
 
-def test_the_startup_refresh_calls_it():
+def test_the_console_start_calls_it_outside_the_guard_dog_sync():
+    """_auto_update_guarddog returns early on a box with no TAK Server (/opt/tak). A console
+    with a remote MediaMTX and no local TAK Server still holds the cert-sync script, so the
+    refresh is its own call at module level, after the sync, not a line inside it (found on
+    a throwaway box: ops #863)."""
     body = re.search(r'^def _auto_update_guarddog\(.*?(?=^_auto_update_guarddog\(\))', APP, re.S | re.M).group(0)
     code = re.sub(r'#.*', '', body)
-    assert '_gd_refresh_mtx_cert_sync()' in code
+    assert "if not os.path.exists('/opt/tak'):\n        return" in code     # the early return this works around
+    assert '_gd_refresh_mtx_cert_sync' not in code
+    assert re.search(r'^_auto_update_guarddog\(\)\n(?:#.*\n)*_gd_refresh_mtx_cert_sync\(\)$', APP, re.M)
     # it stays an optional script: the generic loop still skips it
     assert 'name in _GD_OPTIONAL_SCRIPTS' in code
 

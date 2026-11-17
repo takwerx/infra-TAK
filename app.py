@@ -107184,10 +107184,13 @@ def _gd_refresh_mtx_cert_sync():
     if not baked:
         return False
     try:
-        return bool(_gd_install_script('mediamtx-cert-sync.sh', _gd_template('mediamtx-cert-sync.sh'), baked))
+        changed = bool(_gd_install_script('mediamtx-cert-sync.sh', _gd_template('mediamtx-cert-sync.sh'), baked))
     except Exception as e:
         print(f"Guard Dog: mediamtx-cert-sync.sh refresh skipped: {str(e)[:200]}", flush=True)
         return False
+    if changed:
+        print("Guard Dog: mediamtx-cert-sync.sh updated on console startup.", flush=True)
+    return changed
 
 
 def _auto_update_guarddog():
@@ -107281,10 +107284,6 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
-        # ops #863: the optional remote-MediaMTX cert sync is skipped above; refresh it here
-        # with the endpoint it already holds, so a template fix reaches the box on update.
-        if _gd_refresh_mtx_cert_sync():
-            updated += 1
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
@@ -107402,6 +107401,9 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+# ops #863: its own call, not part of the sync above, which stops on a box with no TAK Server
+# (/opt/tak): a console with a remote MediaMTX and no local TAK Server still has this script.
+_gd_refresh_mtx_cert_sync()
 
 # v10.1.63 W3: re-assert the TAK JVM pin on every console startup. Deliberately NOT inside
 # _auto_update_guarddog() — that returns early when /opt/tak-guarddog is absent, and a box
