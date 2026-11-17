@@ -45736,8 +45736,8 @@ TAKPORTAL_LOGOUT_BLOCK = (
 def _takportal_harden_logout_file(log_fn=None):
     """ops #879: put `set +e` at the top of the console user's existing ~/.bash_logout.
 
-    Only an existing regular file is touched (no file, nothing to fail: Rocky/RHEL accounts have
-    none), and only once (marker line). The rest of the file is kept byte for byte, with its mode.
+    Only an existing regular file is touched (no file, nothing to fail; Rocky 9's stock file is
+    one comment line and does not fail, it gets the same harmless line), and only once (marker). The rest of the file is kept byte for byte, with its mode.
     Idempotent. Returns 'changed' | 'current' | 'absent' | 'skipped' | 'error'; never raises."""
     def _say(m):
         if log_fn:

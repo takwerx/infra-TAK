@@ -164,9 +164,18 @@ def test_mode_is_kept_and_no_temp_file_is_left(harden):
 
 
 def test_no_file_is_not_created(harden):
-    """Rocky/RHEL accounts have no ~/.bash_logout: nothing fails, so nothing is written."""
+    """An account with no ~/.bash_logout has nothing that can fail, so nothing is written."""
     assert harden['_takportal_harden_logout_file']() == 'absent'
     assert not harden['_logout'].exists()
+    assert _exit_code(harden['_home']) == 0
+
+
+def test_rocky_stock_file_is_harmless_and_stays_harmless(harden):
+    """Rocky 9's /etc/skel/.bash_logout is one comment line (probed in rockylinux:9: rc 0 with
+    errexit). It gets the same marked line and still exits 0."""
+    harden['_logout'].write_text('# ~/.bash_logout\n')
+    assert _exit_code(harden['_home']) == 0
+    assert harden['_takportal_harden_logout_file']() == 'changed'
     assert _exit_code(harden['_home']) == 0
 
 
