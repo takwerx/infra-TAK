@@ -32,8 +32,9 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
+# Ends at the module-level call: the next call (_gd_refresh_mtx_cert_sync, ops #863) is its own step.
 STARTUP_SRC = APP[APP.index('def _auto_update_guarddog():'):
-                  APP.index('def _start_guarddog_background_at_boot(')]
+                  APP.index('\n_auto_update_guarddog()\n')]
 GD_HELPER_SRC = APP[APP.index('_GD_PLACEHOLDER_RE = re.compile('):APP.index('def _write_priv(')]
 GD = '/opt/tak-guarddog'
 SCRIPTS = REPO / 'scripts' / 'guarddog'
