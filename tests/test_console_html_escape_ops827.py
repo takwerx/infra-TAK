@@ -456,6 +456,8 @@ def test_server_drops_a_version_that_cannot_be_a_version():
         'nodered': {'version': bad, 'update_available': False},
         'fedhub': {'version': '5.8-RELEASE-12<script>', 'update_available': True, 'latest': None},
         'cloudtak': {'version': '13.119.0 onerror=x', 'latest': bad, 'vetted_release': bad},
+        'takportal': {'version': '2.0.36', 'beta_version': bad, 'upstream_latest': bad, 'dev_release': bad,
+                      'final_target': bad, 'upstream_url': 'https://example.org/releases/tag/v1'},
         'netbird': {'version': '0.80.0', 'vetted': bad, 'channel': 'dev'},
         'remote_assist': {'version': '1.4.0', 'running': bad, 'latest': '1.4.0', 'latest_tag': 'v1.4.0'},
     }
@@ -463,13 +465,17 @@ def test_server_drops_a_version_that_cannot_be_a_version():
     assert got['nodered'] == {'version': '', 'update_available': False, 'node_security': 'Node.js is out of date'}
     assert got['fedhub'] == {'version': '', 'update_available': True, 'latest': None}
     assert got['cloudtak'] == {'version': '', 'latest': '', 'vetted_release': ''}
+    # Every version field is checked; a field that is not a version (a link) is left as it is.
+    assert got['takportal'] == {'version': '2.0.36', 'beta_version': '', 'upstream_latest': '', 'dev_release': '',
+                                'final_target': '', 'upstream_url': 'https://example.org/releases/tag/v1'}
     assert got['netbird'] == {'version': '0.80.0', 'vetted': '', 'channel': 'dev'}
     assert got['remote_assist'] == {'version': '1.4.0', 'running': '', 'latest': '1.4.0', 'latest_tag': 'v1.4.0'}
     # The helpers cache their dict; the check works on a copy.
     assert infos['nodered']['version'] == bad
     for info in got.values():
-        for value in info.values():
-            assert not (isinstance(value, str) and re.search(r'[<>"\'&=()/]', value)), info
+        for field, value in info.items():
+            if field != 'upstream_url':
+                assert not (isinstance(value, str) and re.search(r'[<>"\'&=()/]', value)), info
 
 
 def test_server_keeps_every_real_version_shape():
@@ -492,12 +498,18 @@ def test_server_keeps_every_real_version_shape():
         'simulator': {'version': '10.4.2-alpha', 'latest': '10.4.2-alpha', 'update_available': False},
         'netbird': {'version': '0.80.0 · dash v2.14.0', 'update_available': False, 'latest': None,
                     'vetted': '0.80.0'},
-        'remote_assist': {'version': '1.4.0', 'update_available': False, 'latest': '1.4.0',
-                          'latest_tag': 'v1.4.0', 'running': '1.4.0', 'is_current': True},
+        'remote_assist': {'version': '3.4.1', 'update_available': False, 'latest': '3.4.1',
+                          'latest_tag': 'eud_3.4.1', 'running': '3.4.1', 'is_current': True},
     }
+    # Shapes a fleet box returned on Tue Nov 17, 2026: a -dev editor, a distro package version.
+    infos['mediamtx'].update(editor_version='2.1.16-dev', upstream_latest='1.21.4',
+                             upstream_url='https://github.com/bluenviron/mediamtx/releases/tag/v1.21.4')
+    infos['fail2ban']['latest'] = '1.0.2-3ubuntu0.1'
+    infos['netbird'].update(version='0.82.1 · dash 2.96.0', upstream_latest='0.83.1')
+    infos['authentik'].update(dev_release='2026.8.5', final_target='2026.8.5', env_tag='')
     got = _versions_from_server(infos)
     want = {k: dict(v) for k, v in infos.items()}
-    want['mediamtx']['version'] = 'MediaMTX v1.15.3 · editor v2.4.0'
+    want['mediamtx']['version'] = 'MediaMTX v1.15.3 · editor v2.1.16-dev'
     want['nodered']['node_security'] = 'Node.js is out of date'
     want['guarddog'] = {'version': '10.4.2-alpha', 'update_available': False, 'latest': None}
     assert got == want

@@ -44838,8 +44838,8 @@ def _get_netbird_version_info():
 # A space and the middle dot are allowed too, because two cards join two versions into one label
 # ("MediaMTX v1.15.3 \u00b7 editor v2.4.0", "0.80.0 \u00b7 dash v2.14.0"). No character of HTML or script fits.
 _MODULE_VERSION_RE = re.compile('[0-9A-Za-z][0-9A-Za-z._+~: \u00b7-]{0,127}')
-_MODULE_VERSION_FIELDS = ('version', 'editor_version', 'latest', 'editor_latest', 'latest_tag', 'running',
-                          'vetted', 'vetted_release')
+_MODULE_VERSION_FIELDS = ('version', 'editor_version', 'beta_version', 'latest', 'editor_latest', 'latest_tag',
+                          'upstream_latest', 'running', 'vetted', 'vetted_release', 'dev_release', 'final_target')
 
 
 def _safe_module_version(value):
