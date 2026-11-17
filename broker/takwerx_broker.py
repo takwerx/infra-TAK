@@ -5950,6 +5950,47 @@ def _do_certifi_upgrade(req):
             **({'error': '; '.join(errors)[-600:]} if errors else {})}
 
 
+# ── Caddy reload without --force (ops #814) ──────────────────────────────────
+# Caddy's admin API is a unix socket that admits root and `caddy` only, so the
+# console account cannot run `caddy reload` itself any more. `systemctl reload
+# caddy` is the packaged ExecReload, which passes --force and rebuilds every
+# server (it closes proxied WebSockets, GH #90). This is the same command without
+# --force: Caddy compares the file with what it runs and does nothing when they
+# match. Fixed argv, no field from the request, and it runs as `caddy`, the
+# account that owns the socket and already reads this file on every reload.
+CADDY_RELOAD_FILE = '/etc/caddy/Caddyfile'
+CADDY_RELOAD_USER = 'caddy'
+
+
+def _check_caddy_reload(req):
+    if set(req) - {'op', 'timeout'}:
+        raise Denied('caddy_reload: takes no fields')
+
+
+def _do_caddy_reload(req):
+    caddy = _sudoers_safe_binaries('caddy')
+    runuser = _sudoers_safe_binaries('runuser')
+    if not caddy or not runuser:
+        return {'ok': False, 'error': 'no root-owned caddy or runuser on this server'}
+    try:
+        home = pwd.getpwnam(CADDY_RELOAD_USER).pw_dir
+    except KeyError:
+        return {'ok': False, 'error': 'no caddy account on this server'}
+    argv = [runuser[0], '-u', CADDY_RELOAD_USER, '--', caddy[0], 'reload',
+            '--config', CADDY_RELOAD_FILE, '--adapter', 'caddyfile']
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, cwd='/',
+                           env={'PATH': BROKER_TRUSTED_PATH, 'HOME': home,
+                                'USER': CADDY_RELOAD_USER, 'LOGNAME': CADDY_RELOAD_USER})
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'caddy reload did not return in 60s'}
+    except OSError as e:
+        return {'ok': False, 'error': f'caddy reload could not be run: {e}'}
+    out = ((r.stdout or '') + (r.stderr or '')).strip()[-600:]
+    return {'ok': r.returncode == 0, 'rc': r.returncode,
+            **({} if r.returncode == 0 else {'error': out or f'rc={r.returncode}'})}
+
+
 # ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ──────
 # upgrade-db.sh runs pg_upgrade in COPY mode, so the 15 cluster stays on disk,
 # stopped, as the rollback. Nothing ever removes it: the reporter's sat at 15 GB for
@@ -6838,6 +6879,8 @@ def _evaluate(req):
             _check_gd_render(req)           # ops #645 W2 part 2a
         elif op == 'gd_remove':
             _check_gd_remove(req)           # ops #645 W2 part 2b
+        elif op == 'caddy_reload':
+            _check_caddy_reload(req)        # ops #814
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -6950,7 +6993,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove'):
+              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove', 'caddy_reload'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -6978,6 +7021,8 @@ def _dispatch(req, peer):
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]} keys={','.join(sorted(map(str, req.get('values') or {})))[:200]}"
         elif op == 'gd_remove':
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]}"
+        elif op == 'caddy_reload':
+            summary = CADDY_RELOAD_FILE
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -7015,6 +7060,8 @@ def _dispatch(req, peer):
             return _do_gd_render(req)
         if op == 'gd_remove':
             return _do_gd_remove(req)
+        if op == 'caddy_reload':
+            return _do_caddy_reload(req)
         return _do_pgminer_scan(req)
     if op == 'etl':
         # The console reaches the same verb on the main socket (status, uninstall

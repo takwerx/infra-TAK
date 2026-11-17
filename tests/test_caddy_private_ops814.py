@@ -24,7 +24,8 @@ What must hold on a box that has been moved (`private` in proxy_auth.json):
     config back when anything fails; it runs again when the live config was put back;
   - rotation is a file swap: no Caddyfile write, no reload, ATLAS gets its own value;
   - the broker lets the console write `RuntimeDirectory=caddy` in the Caddy drop-in and
-    nowhere else.
+    nowhere else, and runs the unforced `caddy reload` as `caddy` for a non-root console
+    (the socket admits root and `caddy` only).
 A box not moved yet (an old Caddy, or the move failed) keeps the old layout.
 
 app.py cannot be imported in a test, so the functions are cut out of it and run against
@@ -85,7 +86,7 @@ def _consts(extra=None):
 
 
 def _private_caddyfile(home='/var/lib/caddy'):
-    return ('{\n    grace_period 10s\n    admin unix//run/caddy/admin.sock|0220\n}\n'
+    return ('{\n    grace_period 10s\n    admin unix//run/caddy/admin.sock|0200\n}\n'
             'infratak.example.com {\n'
             '    request_header @needs_sso X-Infratak-Proxy-Auth {file.%s/infratak-proxy-auth-console}\n'
             '}\n%s\n' % (home, MARKER))
@@ -108,7 +109,7 @@ def _global_lines(private):
 
 def test_a_moved_box_puts_the_admin_api_on_the_socket():
     assert _global_lines(True) == ['{', '    grace_period 10s',
-                                   '    admin unix//run/caddy/admin.sock|0220', '}', '']
+                                   '    admin unix//run/caddy/admin.sock|0200', '}', '']
 
 
 def test_a_box_not_moved_yet_keeps_its_global_block():
@@ -151,7 +152,7 @@ def test_generate_caddyfile_only_writes_the_token():
 @pytest.mark.parametrize('text,want', [
     (_private_caddyfile(), True),
     (_old_caddyfile(), False),                                              # value in the file
-    (_private_caddyfile().replace('    admin unix//run/caddy/admin.sock|0220\n', ''), False),
+    (_private_caddyfile().replace('    admin unix//run/caddy/admin.sock|0200\n', ''), False),
     (_private_caddyfile() + 'x {\n  request_header X-Infratak-Proxy-Auth %s\n}\n' % OLD, True),  # below the marker: the operator's
     ('', False),
 ])
@@ -444,7 +445,7 @@ def test_make_private_never_raises_and_never_runs_twice_at_once():
 
 # ── the check after the restart ──────────────────────────────────────────────
 
-def _problem(*, active='active', tcp_open=False, sock_mode=stat.S_IFSOCK | 0o220, stat_exc=None,
+def _problem(*, active='active', tcp_open=False, sock_mode=stat.S_IFSOCK | 0o200, stat_exc=None,
              running_has=False):
     def os_stat(path):
         assert path == SOCK
@@ -466,7 +467,6 @@ def _problem(*, active='active', tcp_open=False, sock_mode=stat.S_IFSOCK | 0o220
 
 def test_check_passes_on_a_good_restart():
     assert _problem() == ''
-    assert _problem(sock_mode=stat.S_IFSOCK | 0o200) == ''
 
 
 @pytest.mark.parametrize('kw,want', [
@@ -475,7 +475,8 @@ def test_check_passes_on_a_good_restart():
     ({'stat_exc': FileNotFoundError()}, 'did not create its admin socket'),
     ({'sock_mode': stat.S_IFSOCK | 0o222}, 'mode 222'),
     ({'sock_mode': stat.S_IFSOCK | 0o660}, 'mode 660'),
-    ({'sock_mode': stat.S_IFREG | 0o220}, 'not a socket'),
+    ({'sock_mode': stat.S_IFREG | 0o200}, 'not a socket'),
+    ({'sock_mode': stat.S_IFSOCK | 0o220}, 'mode 220'),          # group caddy is not uniform across boxes
     ({'running_has': True}, 'still holds a proxy auth value'),
 ])
 def test_check_names_what_is_wrong(kw, want):
@@ -670,6 +671,85 @@ def test_the_broker_accepts_the_drop_in_the_console_writes():
 def test_the_broker_refuses_any_other_runtime_directory(rel, text):
     v = _unit_write(rel, text)
     assert v[0] == 'DENY' and 'RuntimeDirectory' in v[1], v
+
+
+# ── the unforced reload ──────────────────────────────────────────────────────
+
+def _reload(*, private, broker, resp=None, rc=0):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(('direct', argv))
+        return subprocess.CompletedProcess(argv, rc, '', '')
+
+    def broker_request(req, timeout=600):
+        calls.append(('broker', req))
+        if isinstance(resp, Exception):
+            raise resp
+        return resp if resp is not None else {'ok': True}
+
+    ns = {'subprocess': types.SimpleNamespace(run=run),
+          'shutil': types.SimpleNamespace(which=lambda n: '/usr/bin/caddy'),
+          'CADDYFILE_PATH': CF, 'CADDY_RELOAD_TIMEOUT': 45,
+          '_caddy_private': lambda: private,
+          '_broker_should_route': lambda: broker, '_broker_available': lambda: broker,
+          '_broker_request': broker_request,
+          '_caddy_reload_checked': lambda plog=None, timeout=None, restart_on_error=True: (
+              calls.append(('forced', restart_on_error)), (True, 'forced'))[1]}
+    fn = _load(['_caddy_reload_if_changed'], ns)['_caddy_reload_if_changed']
+    return fn(restart_on_error=False), calls
+
+
+def test_non_root_console_on_a_moved_box_reloads_through_the_broker():
+    """The socket refuses the console account, so running `caddy reload` itself would
+    fail every time and every reload would be a forced one (it closes WebSockets)."""
+    res, calls = _reload(private=True, broker=True)
+    assert res == (True, '') and calls == [('broker', {'op': 'caddy_reload'})]
+
+
+@pytest.mark.parametrize('resp', [{'ok': False, 'code': 'DENIED', 'error': 'unknown op: caddy_reload'},
+                                  {'ok': False, 'rc': 1, 'error': 'adapting config'},
+                                  RuntimeError('broker unreachable')])
+def test_a_broker_that_cannot_do_it_falls_back_to_the_forced_reload(resp):
+    res, calls = _reload(private=True, broker=True, resp=resp)
+    assert res == (True, 'forced')
+    assert [c[0] for c in calls] == ['broker', 'forced'] and calls[1] == ('forced', False)
+
+
+@pytest.mark.parametrize('private,broker', [(True, False), (False, True), (False, False)])
+def test_a_root_console_or_a_box_not_moved_reloads_directly(private, broker):
+    res, calls = _reload(private=private, broker=broker)
+    assert res == (True, '') and [c[0] for c in calls] == ['direct']
+    assert '--force' not in calls[0][1]
+
+
+def test_the_broker_reload_takes_nothing_from_the_caller(monkeypatch):
+    assert B._evaluate({'op': 'caddy_reload'}) == ('ALLOW', '')
+    assert B._evaluate({'op': 'caddy_reload', 'timeout': 60})[0] == 'ALLOW'
+    for extra in ({'config': '/tmp/x'}, {'argv': ['--force']}, {'path': '/etc/shadow'}, {'user': 'root'}):
+        v = B._evaluate(dict({'op': 'caddy_reload'}, **extra))
+        assert v[0] == 'DENY' and 'takes no fields' in v[1], v
+    ran = []
+    monkeypatch.setattr(B, '_sudoers_safe_binaries', lambda name: ['/usr/bin/' + name])
+    monkeypatch.setattr(B.pwd, 'getpwnam', lambda u: types.SimpleNamespace(pw_dir='/var/lib/caddy'))
+    monkeypatch.setattr(B.subprocess, 'run', lambda argv, **kw: (
+        ran.append((argv, kw)), subprocess.CompletedProcess(argv, 0, '', ''))[1])
+    assert B._do_caddy_reload({'op': 'caddy_reload', 'config': '/tmp/evil'}) == {'ok': True, 'rc': 0}
+    argv, kw = ran[0]
+    assert argv == ['/usr/bin/runuser', '-u', 'caddy', '--', '/usr/bin/caddy', 'reload',
+                    '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile']
+    assert '--force' not in argv and kw['env']['HOME'] == '/var/lib/caddy' and 'shell' not in kw
+
+
+def test_the_broker_reload_reports_a_refusal(monkeypatch):
+    monkeypatch.setattr(B, '_sudoers_safe_binaries', lambda name: ['/usr/bin/' + name])
+    monkeypatch.setattr(B.pwd, 'getpwnam', lambda u: types.SimpleNamespace(pw_dir='/var/lib/caddy'))
+    monkeypatch.setattr(B.subprocess, 'run', lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 1, '', 'Error: adapting config using caddyfile: unrecognized directive'))
+    res = B._do_caddy_reload({'op': 'caddy_reload'})
+    assert res['ok'] is False and res['rc'] == 1 and 'unrecognized directive' in res['error']
+    monkeypatch.setattr(B, '_sudoers_safe_binaries', lambda name: [])
+    assert B._do_caddy_reload({'op': 'caddy_reload'})['ok'] is False
 
 
 def test_start_sh_writes_the_same_drop_in():

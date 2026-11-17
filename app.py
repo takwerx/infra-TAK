@@ -700,9 +700,10 @@ def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on
     the reload when they match ("config is unchanged" — changeConfig() in caddy.go). That is
     the check we want, and Caddy makes it against its RUNNING config, not the file: a file
     that a previous reload refused still differs from what is running, so it is loaded (and
-    refused again, loudly) here. `caddy reload` only adapts and POSTs to the admin API on
-    localhost:2019, so it needs nothing privileged — unlike `caddy validate`, it never opens
-    the log files or certs that the console user cannot read.
+    refused again, loudly) here. `caddy reload` only adapts and POSTs to the admin API
+    — unlike `caddy validate`, it never opens the log files or certs that the console user
+    cannot read. On a private box (ops #814) the admin API is a unix socket for root and
+    `caddy`, so a non-root console runs it through the broker (op caddy_reload).
 
     ANY failure of the unforced attempt falls through to _caddy_reload_checked() with the
     caller's own arguments, so the outcome is never worse than calling that directly. Do not
@@ -712,11 +713,18 @@ def _caddy_reload_if_changed(plog=None, timeout=CADDY_RELOAD_TIMEOUT, restart_on
     # `{env.…}` placeholders verbatim and nothing is provisioned on this side.
     try:
         if shutil.which('caddy'):
-            r = subprocess.run(['caddy', 'reload', '--config', CADDYFILE_PATH,
-                                '--adapter', 'caddyfile'],
-                               capture_output=True, text=True, timeout=timeout)
-            if r.returncode == 0:
-                return True, ''
+            if _caddy_private() and _broker_should_route() and _broker_available():
+                # ops #814: the admin API is a unix socket for root and `caddy` only, so a
+                # non-root console asks the broker, which runs this same command as `caddy`.
+                # A broker from before this release answers "unknown op": forced reload below.
+                if _broker_request({'op': 'caddy_reload'}, timeout=timeout + 15).get('ok'):
+                    return True, ''
+            else:
+                r = subprocess.run(['caddy', 'reload', '--config', CADDYFILE_PATH,
+                                    '--adapter', 'caddyfile'],
+                                   capture_output=True, text=True, timeout=timeout)
+                if r.returncode == 0:
+                    return True, ''
     except Exception:
         pass                        # never raises — same contract as _caddy_reload_checked()
     return _caddy_reload_checked(plog=plog, timeout=timeout, restart_on_error=restart_on_error)
@@ -33776,10 +33784,11 @@ def _caddy_port_option_lines(settings=None):
 #     forward_auth.
 # The private layout:
 #   * the admin API is a unix socket in /run/caddy (a RuntimeDirectory, 0750 caddy:caddy)
-#     with mode 0220: root, `caddy` and group `caddy` (the console account) only. Caddy's
-#     default mode 0200 also refuses the console account, which would cost it its
-#     unforced reload (_caddy_reload_if_changed). /run, because on RHEL the SELinux policy
-#     lets Caddy (httpd_t) create a socket there and not in its home.
+#     with mode 0200, Caddy's default: root and `caddy` only. Not group `caddy`: whether
+#     the console account is in it differs from box to box (it is on test6, not on
+#     test12). A non-root console runs its unforced reload through the broker instead
+#     (_caddy_reload_if_changed). /run, because on RHEL the SELinux policy lets Caddy
+#     (httpd_t) create a socket there and not in its home.
 #     https://caddyserver.com/docs/conventions#network-addresses
 #   * the Caddyfile holds `{file.<path>}` and the value is in a 0400 caddy:caddy file in
 #     Caddy's home. Caddy reads it on each request, so a rotation is a file swap with no
@@ -33791,7 +33800,7 @@ def _caddy_port_option_lines(settings=None):
 # has been moved (_caddy_make_private). Until then generate_caddyfile() keeps the old
 # layout, so a Caddy with no /run/caddy yet never gets a config it cannot start with.
 CADDY_ADMIN_SOCKET = '/run/caddy/admin.sock'
-CADDY_ADMIN_SOCKET_MODE = '0220'
+CADDY_ADMIN_SOCKET_MODE = '0200'
 _CADDY_MIN_FILE_PLACEHOLDER = (2, 8)
 _CADDY_PROXY_AUTH_FILES = {'console': 'infratak-proxy-auth-console',
                            'atlas': 'infratak-proxy-auth-atlas'}
@@ -33962,7 +33971,7 @@ def _caddy_private_problem(state, wait=20, sleep=None, clock=None):
                     st = os.stat(CADDY_ADMIN_SOCKET)
                     if not _stat.S_ISSOCK(st.st_mode):
                         why = 'the admin socket path is not a socket'
-                    elif (st.st_mode & 0o777) & 0o557:
+                    elif (st.st_mode & 0o777) != 0o200:
                         why = 'the admin socket has mode %o' % (st.st_mode & 0o777)
                 except FileNotFoundError:
                     why = 'Caddy did not create its admin socket'
