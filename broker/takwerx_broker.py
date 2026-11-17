@@ -835,6 +835,7 @@ UNIT_FILES = frozenset({
     # drop-ins
     'takserver.service.d/soft-start.conf', 'takserver.service.d/jvm-pin.conf',
     'caddy.service.d/10-takwerx-boot.conf', 'caddy.service.d/10-takwerx-acme-eab.conf',
+    'caddy.service.d/20-takwerx-run.conf',      # ops #814: /run/caddy for Caddy's admin socket
     'mediamtx-webeditor.service.d/10-infratak-journal.conf',
     'mediamtx-webeditor.service.d/20-infratak-home.conf',
 })
@@ -869,7 +870,8 @@ _UNIT_KEYS = {
         'MemoryMax', 'MemoryHigh', 'CPUQuota', 'TasksMax', 'IOSchedulingClass',
         'IOSchedulingPriority', 'OOMScoreAdjust', 'NoNewPrivileges', 'PrivateTmp',
         'ProtectSystem', 'ProtectHome', 'ReadOnlyPaths', 'ReadWritePaths',
-        'InaccessiblePaths', 'UMask', 'SELinuxContext'}),
+        'InaccessiblePaths', 'UMask', 'SELinuxContext',
+        'RuntimeDirectory', 'RuntimeDirectoryMode'}),
     'Timer': frozenset({
         'OnCalendar', 'OnBootSec', 'OnStartupSec', 'OnActiveSec', 'OnUnitActiveSec',
         'OnUnitInactiveSec', 'Persistent', 'RandomizedDelaySec', 'AccuracySec', 'Unit'}),
@@ -880,6 +882,10 @@ _UNIT_SECTIONS = {'.service': ('Unit', 'Service', 'Install'),
                   '.conf': ('Unit', 'Service', 'Install')}       # service drop-ins
 _UNIT_OUTPUTS = frozenset({'journal', 'null', 'inherit', 'journal+console', 'kmsg'})
 _UNIT_SELINUX = 'system_u:system_r:unconfined_service_t:s0'
+# ops #814: the only RuntimeDirectory= the console may ask for (Caddy's admin socket dir).
+_UNIT_RUNTIME_DIR_FILE = 'caddy.service.d/20-takwerx-run.conf'
+_UNIT_RUNTIME_DIR = 'caddy'
+_UNIT_RUNTIME_DIR_MODES = frozenset({'0750', '0700'})
 _UNIT_PATH_DIRS = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
 # env names that change what a root process loads or runs
 _UNIT_ENV_DENY_RE = re.compile(
@@ -1191,6 +1197,15 @@ def _check_unit_write(path, content, mode):
         elif k == 'SELinuxContext':
             if v != _UNIT_SELINUX:
                 raise Denied(f'unit: SELinuxContext={v} not allowed')
+        elif k == 'RuntimeDirectory':
+            # ops #814: PID 1 creates /run/<value> and gives it to the unit's user. One
+            # fixed directory, for Caddy's admin socket, in the one drop-in that needs it.
+            if rel != _UNIT_RUNTIME_DIR_FILE or v != _UNIT_RUNTIME_DIR:
+                raise Denied(f'unit: RuntimeDirectory= is only allowed as {_UNIT_RUNTIME_DIR} '
+                             f'in {_UNIT_RUNTIME_DIR_FILE}')
+        elif k == 'RuntimeDirectoryMode':
+            if rel != _UNIT_RUNTIME_DIR_FILE or v not in _UNIT_RUNTIME_DIR_MODES:
+                raise Denied(f'unit: RuntimeDirectoryMode={v} not allowed')
         elif k == 'Unit' and sec == 'Timer':
             if not _unit_name_ok(v):
                 raise Denied(f'unit: timer Unit={v} is not an infra-TAK unit')
@@ -5110,11 +5125,20 @@ TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
 #             a dropped Docker Hub layer or 5xx (never on a 429). Fixed command, mktemp log it deletes,
 #             one digits-only env var. No new caller-controlled input or privilege. Reviewed by Security
 #             Fri Nov 6, 2026 (ops #538).
+#   d6e9238b… 2.0.33: 5996839d… plus one more phrase ("received unexpected HTTP status") in the
+#             pattern that decides whether a failed `docker compose` output is a dropped layer worth
+#             a retry. One regex word in a log check; no new command, path or input (ops #848).
+#   4dfeacd0… 2.0.34, 2.0.35, 2.0.36 (the same file): d6e9238b… plus a skip of any log line that
+#             names npmjs.org, so npm noise during an image build is not counted as a Docker Hub
+#             pull failure. Again only the log check changed; no new command, path or input
+#             (ops #848). Diff read by the ops worker Mon Nov 16, 2026; Security review: see ops #848.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
     '0eb07556d0d3618574ce4b135bf8866fca269c053c67f61c8e0ad97defa26cb6',
     '5996839d6d663e3f1c6230a7d64c8f2580e8776b6be1ee708e9f02eec8b86d58',
+    'd6e9238bbc09f6dda594f5e365b3daaf32a225a42f1bf0ad46201a4dc794ac04',
+    '4dfeacd03abfb6c3b41add51936255e48fdf370988891d0b65f66ac5db4234e3',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
@@ -5934,6 +5958,47 @@ def _do_certifi_upgrade(req):
             upgraded.append({'user': label, 'path': before['where'], 'removed': before['distrusted']})
     return {'ok': not errors, 'upgraded': upgraded, 'still_stale': still,
             **({'error': '; '.join(errors)[-600:]} if errors else {})}
+
+
+# ── Caddy reload without --force (ops #814) ──────────────────────────────────
+# Caddy's admin API is a unix socket that admits root and `caddy` only, so the
+# console account cannot run `caddy reload` itself any more. `systemctl reload
+# caddy` is the packaged ExecReload, which passes --force and rebuilds every
+# server (it closes proxied WebSockets, GH #90). This is the same command without
+# --force: Caddy compares the file with what it runs and does nothing when they
+# match. Fixed argv, no field from the request, and it runs as `caddy`, the
+# account that owns the socket and already reads this file on every reload.
+CADDY_RELOAD_FILE = '/etc/caddy/Caddyfile'
+CADDY_RELOAD_USER = 'caddy'
+
+
+def _check_caddy_reload(req):
+    if set(req) - {'op', 'timeout'}:
+        raise Denied('caddy_reload: takes no fields')
+
+
+def _do_caddy_reload(req):
+    caddy = _sudoers_safe_binaries('caddy')
+    runuser = _sudoers_safe_binaries('runuser')
+    if not caddy or not runuser:
+        return {'ok': False, 'error': 'no root-owned caddy or runuser on this server'}
+    try:
+        home = pwd.getpwnam(CADDY_RELOAD_USER).pw_dir
+    except KeyError:
+        return {'ok': False, 'error': 'no caddy account on this server'}
+    argv = [runuser[0], '-u', CADDY_RELOAD_USER, '--', caddy[0], 'reload',
+            '--config', CADDY_RELOAD_FILE, '--adapter', 'caddyfile']
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, cwd='/',
+                           env={'PATH': BROKER_TRUSTED_PATH, 'HOME': home,
+                                'USER': CADDY_RELOAD_USER, 'LOGNAME': CADDY_RELOAD_USER})
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'caddy reload did not return in 60s'}
+    except OSError as e:
+        return {'ok': False, 'error': f'caddy reload could not be run: {e}'}
+    out = ((r.stdout or '') + (r.stderr or '')).strip()[-600:]
+    return {'ok': r.returncode == 0, 'rc': r.returncode,
+            **({} if r.returncode == 0 else {'error': out or f'rc={r.returncode}'})}
 
 
 # ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ──────
@@ -6824,6 +6889,8 @@ def _evaluate(req):
             _check_gd_render(req)           # ops #645 W2 part 2a
         elif op == 'gd_remove':
             _check_gd_remove(req)           # ops #645 W2 part 2b
+        elif op == 'caddy_reload':
+            _check_caddy_reload(req)        # ops #814
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -6936,7 +7003,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove'):
+              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove', 'caddy_reload'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -6964,6 +7031,8 @@ def _dispatch(req, peer):
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]} keys={','.join(sorted(map(str, req.get('values') or {})))[:200]}"
         elif op == 'gd_remove':
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]}"
+        elif op == 'caddy_reload':
+            summary = CADDY_RELOAD_FILE
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -7001,6 +7070,8 @@ def _dispatch(req, peer):
             return _do_gd_render(req)
         if op == 'gd_remove':
             return _do_gd_remove(req)
+        if op == 'caddy_reload':
+            return _do_caddy_reload(req)
         return _do_pgminer_scan(req)
     if op == 'etl':
         # The console reaches the same verb on the main socket (status, uninstall
