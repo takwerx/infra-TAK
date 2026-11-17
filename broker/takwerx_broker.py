@@ -5110,11 +5110,20 @@ TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
 #             a dropped Docker Hub layer or 5xx (never on a 429). Fixed command, mktemp log it deletes,
 #             one digits-only env var. No new caller-controlled input or privilege. Reviewed by Security
 #             Fri Nov 6, 2026 (ops #538).
+#   d6e9238b… 2.0.33: 5996839d… plus one more phrase ("received unexpected HTTP status") in the
+#             pattern that decides whether a failed `docker compose` output is a dropped layer worth
+#             a retry. One regex word in a log check; no new command, path or input (ops #848).
+#   4dfeacd0… 2.0.34, 2.0.35, 2.0.36 (the same file): d6e9238b… plus a skip of any log line that
+#             names npmjs.org, so npm noise during an image build is not counted as a Docker Hub
+#             pull failure. Again only the log check changed; no new command, path or input
+#             (ops #848). Diff read by the ops worker Mon Nov 16, 2026; Security review: see ops #848.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
     '0eb07556d0d3618574ce4b135bf8866fca269c053c67f61c8e0ad97defa26cb6',
     '5996839d6d663e3f1c6230a7d64c8f2580e8776b6be1ee708e9f02eec8b86d58',
+    'd6e9238bbc09f6dda594f5e365b3daaf32a225a42f1bf0ad46201a4dc794ac04',
+    '4dfeacd03abfb6c3b41add51936255e48fdf370988891d0b65f66ac5db4234e3',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
