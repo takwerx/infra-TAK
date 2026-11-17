@@ -264,6 +264,26 @@ def test_box_on_old_node_gets_the_security_email():
     assert saved[-1] == {'node:takportal': 'node-CVE-2026-111497+CVE-2026-123864'}
 
 
+def test_box_on_the_previous_fix_gets_the_email_for_the_new_release():
+    # ops #824: TAK Portal and Remote Assist on 22.23.4 (the fix before 22.23.5) are told to press Update
+    old = dict(FIXED, **{'tak-portal': 'v22.23.4', 'tak-portal-worker': 'v22.23.4',
+                         'eud-remote-assist-server-1': 'v22.23.4'})
+    r, sent, saved = _sweep(old, {})
+    assert r['emailed'] is True and len(sent) == 1
+    subj, body = sent[0]
+    assert subj == '🔒 Security update pending on tak-prod-1 — update this machine'
+    assert '  • Node.js inside TAK Portal is out of date' in body
+    assert '  • Node.js inside Remote Assist is out of date' in body
+    assert 'Newer Node.js fixes CVE-2026-123864:' in body and 'v22.23.4' in body
+    assert 'Open Remote Assist in infra-TAK and press Update.' in body
+    assert saved[-1] == {'node:remote_assist': 'node-CVE-2026-123864', 'node:takportal': 'node-CVE-2026-123864'}
+
+
+def test_node_red_on_22_23_4_gets_no_email_until_its_image_is_rebuilt():
+    r, sent, saved = _sweep(dict(FIXED, nodered='v22.23.4'), {})
+    assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
+
+
 def test_box_on_fixed_node_gets_no_email():
     r, sent, saved = _sweep(FIXED, {})
     assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
