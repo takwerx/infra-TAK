@@ -29022,6 +29022,24 @@ NODE_SECURITY_RELEASES = (
      'fixed': {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'},
      'reason': 'a Brotli decoder memory-corruption bug that can lead to remote code execution, '
                'being actively attacked'},
+    # ops #824: the 2026-11-11 release (22.23.5 / 24.22.3 / 26.13.1). CVE-2026-123864 is the
+    # High one that reaches the 22 line: a zero-length TLS write leaks server memory into HTTPS
+    # responses. The same release fixes more HTTP/2 and TLS flaws (CVE-2026-123865, -123866,
+    # -123872 High). https://nodejs.org/en/blog/vulnerability/november-2026-security-releases
+    # `upstream_pending`: module keys whose image we cannot rebuild and whose upstream has not
+    # shipped the fix yet (nodered/node-red:4.1.17-22 is still on 22.23.4, last pushed
+    # 2026-10-21). They are left out of the flag and the email, because pressing Update could
+    # never clear them. Remove the key the day Node-RED ships a rebuilt tag and NODERED_IMAGE
+    # moves to it. A container name works too: `cloudtak-print` (Node 24, the TAK Portal
+    # Marketplace Print plugin) is left out for the same reason. The CloudTAK card's Update
+    # never builds it (its compose file is kept out of COMPOSE_FILE on purpose, see
+    # _CLOUDTAK_PRINT_PLUGIN_COMPOSE), so a red CloudTAK flag for it could never clear. Print
+    # also serves cleartext HTTP on a loopback port, which CVE-2026-123864 does not touch.
+    {'id': 'CVE-2026-123864', 'released': '2026-11-11',
+     'fixed': {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'},
+     'upstream_pending': ('nodered', 'cloudtak-print'),
+     'reason': 'several flaws in how Node.js handles HTTPS and HTTP/2, including one that can '
+               'leak server memory into web responses'},
 )
 
 # Node-based modules whose containers are checked: module key (as in /api/modules/version) →
@@ -29044,14 +29062,18 @@ def _node_version_tuple(v):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
-def _node_releases_missing(version):
+def _node_releases_missing(version, module=None, container=None):
     """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
-    that does not parse, or a major no entry lists, is not claimed."""
+    that does not parse, or a major no entry lists, is not claimed. An entry that lists
+    `module` or `container` under `upstream_pending` is not claimed for it (ops #824)."""
     ver = _node_version_tuple(version)
     if ver is None:
         return []
     out = []
     for rel in NODE_SECURITY_RELEASES:
+        pending = rel.get('upstream_pending', ())
+        if module in pending or container in pending:
+            continue
         fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
         if fixed is not None and ver < fixed:
             out.append(rel)
@@ -29097,7 +29119,7 @@ def _node_security_gaps(versions=None):
     for key, per_container in versions.items():
         outdated, rels = {}, {}
         for cname, ver in per_container.items():
-            missing = _node_releases_missing(ver)
+            missing = _node_releases_missing(ver, key, cname)
             if missing:
                 outdated[cname] = ver
                 rels.update({r['id']: r for r in missing})
@@ -44158,13 +44180,53 @@ def _netbird_docker_image_version(container_name):
     return ''
 
 
+def _netbird_image_ref_version(image_ref):
+    """Version in the tag of an image reference, or '' when the tag is not a version.
+
+    'netbirdio/netbird-server:0.82.1' -> '0.82.1'; 'netbirdio/dashboard:v2.96.0' -> '2.96.0'.
+    No tag, 'latest' or a digest pin gives '' (the caller then falls back to the label)."""
+    import re
+    ref = (image_ref or '').strip().split('@', 1)[0]
+    last = ref.rsplit('/', 1)[-1]
+    if ':' not in last:
+        return ''
+    tag = last.rsplit(':', 1)[-1].lstrip('vV')
+    return tag if re.match(r'^\d+\.\d+(\.\d+)?([.+-][0-9A-Za-z.+-]+)?$', tag) else ''
+
+
+def _netbird_server_image_version(container_name):
+    """Running NetBird server version (ops #853).
+
+    The netbirdio/netbird-server images carry only the org.opencontainers.image.version label of
+    their Ubuntu base image ('24.04'), so the label is not the server version. The real version
+    is the tag the container was created from (compose pins it, e.g. netbird-server:0.82.1).
+    The label is only a fallback, and only when it looks like a NetBird version ('0.x');
+    anything else gives '' so the card never shows a wrong number."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', container_name, '--format',
+                        '{{.Config.Image}}|{{index .Config.Labels "org.opencontainers.image.version"}}']),
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            img, _, label = r.stdout.strip().partition('|')
+            ver = _netbird_image_ref_version(img)
+            if ver:
+                return ver
+            label = label.strip().lstrip('vV')
+            if label.startswith('0.'):
+                return label
+    except Exception:
+        pass
+    return ''
+
+
 def _get_netbird_version_info():
     """Return {version, update_available, latest} for NetBird server + dashboard images."""
     out = {'version': '', 'update_available': False, 'latest': None}
     nb_dir = NETBIRD_INSTALL_DIR
     if not os.path.isfile(os.path.join(nb_dir, 'docker-compose.yml')):
         return out
-    mgmt_ver = _netbird_docker_image_version('netbird-server')
+    mgmt_ver = _netbird_server_image_version('netbird-server')
     dash_ver = _netbird_docker_image_version('netbird-dashboard')
     parts = []
     if mgmt_ver:
@@ -46494,16 +46556,16 @@ def takportal_ssh_status():
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
             # A TAK Portal that ships a helper infra-TAK has not pinned. It runs as root, so
             # infra-TAK keeps the pinned one it has until the new bytes are reviewed. Pinned
-            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.32 (apply-caddyfile validates as the caddy user,
-            # ops #340; 2.0.31/2.0.32 ops #538); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
-            # root-owned Caddyfile. A Portal NEWER than 2.0.32 waits for the next infra-TAK update.
+            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.36 (apply-caddyfile validates as the caddy user,
+            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.36 ops #848); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
+            # root-owned Caddyfile. A Portal NEWER than the last pinned one waits for the next infra-TAK update.
             if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
                 row('Marketplace helper', 'na', 'newer version not reviewed yet',
                     'This TAK Portal ships a marketplace helper that infra-TAK has not reviewed, '
                     'so infra-TAK keeps the older one. Marketplace steps that need the newer helper '
                     '(for example "Deploy To Caddy", which may fail with "Could not back up '
                     '/etc/caddy/Caddyfile") stay off. On TAK Portal 2.0.23 to 2.0.28, update TAK Portal '
-                    'to 2.0.29 or newer. On a Portal newer than 2.0.32 they wait for the next infra-TAK '
+                    'to 2.0.29 or newer. On a Portal newer than 2.0.36 they wait for the next infra-TAK '
                     'update, which adds the new helper after review. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
@@ -100896,6 +100958,58 @@ _mapsync_splitbox_logged = False
 _groupcache_splitbox_logged = False
 
 
+# ops #842: TAK Portal's CloudTAK Marketplace keeps its jobs in this file inside the portal
+# container (services/cloudtakMarketplace.store.js, DIR = ../data/cloudtak-marketplace).
+# A job is "busy" while its status is queued or running; the portal's own status route
+# reports the same thing as `busy` (hasBusyChangeJobs).
+_TAKPORTAL_MARKETPLACE_JOBS = '/usr/src/app/data/cloudtak-marketplace/jobs.json'
+_TAKPORTAL_MARKETPLACE_BUSY_STATES = ('queued', 'running')
+# A restart ends every busy job with "Interrupted by restart." and a batch can take about 45
+# minutes (the CloudTAK rebuild), so the map sync waits. A job record stuck on "running" must
+# not hold the map sync back for ever: after this many seconds it goes ahead.
+_MAPSYNC_MARKETPLACE_WAIT_MAX = 3 * 3600
+_MAPSYNC_MARKETPLACE_WAIT = {'since': None}
+
+
+def _takportal_marketplace_busy():
+    """ops #842: True when a TAK Portal CloudTAK Marketplace job is queued or running, i.e.
+    a restart of the portal right now would end it with "Interrupted by restart.".
+
+    Reads the portal's own jobs file the way the settings.json reads do (docker exec cat).
+    Anything we cannot read (no container, no file, bad JSON) is "not busy": the portal then
+    behaves as it did before this check existed, never worse."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', _TAKPORTAL_MARKETPLACE_JOBS]),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+        jobs = (json.loads(r.stdout or '{}') or {}).get('jobs') or []
+        return any(isinstance(j, dict) and str(j.get('status') or '') in _TAKPORTAL_MARKETPLACE_BUSY_STATES
+                   for j in jobs)
+    except Exception:
+        return False
+
+
+def _takportal_mapsync_wait_for_marketplace(_log):
+    """ops #842: True when the map sync must wait: a Marketplace job is running, and it has not
+    been waited on for more than _MAPSYNC_MARKETPLACE_WAIT_MAX seconds. The sync then leaves
+    the UAF and the portal alone and returns; the next watchdog tick (every 10 min) tries
+    again, so once the batch ends the channels are written and the portal restarted ONCE."""
+    wait = _MAPSYNC_MARKETPLACE_WAIT
+    if not _takportal_marketplace_busy():
+        wait['since'] = None
+        return False
+    now = time.time()
+    if wait['since'] is None:
+        wait['since'] = now
+    if now - wait['since'] > _MAPSYNC_MARKETPLACE_WAIT_MAX:
+        _log("a Marketplace job has been running for over 3 hours — restarting tak-portal anyway")
+        wait['since'] = None
+        return False
+    _log("a TAK Portal Marketplace job is running — channel sync and tak-portal restart wait until it ends")
+    return True
+
+
 def _takportal_sync_map_channels(plog=None):
     """Keep the TAK Portal map bridge user (the `admin` cert) enrolled in EVERY TAK
     channel, so the portal /map's single server-side CoT bridge receives all feeds on
@@ -100993,7 +101107,12 @@ def _takportal_sync_map_channels(plog=None):
             ET.SubElement(admin_el, ns + 'groupList').text = name
         changed = True
     if not changed:
+        _MAPSYNC_MARKETPLACE_WAIT['since'] = None
         _log(f"admin bridge (+bootstrap cert) already in {len(target)} channels — no change, no restart")
+        return
+    # ops #842: the restart below ends every running Marketplace job ("Interrupted by restart.")
+    # and leaves CloudTAK half rebuilt. Wait: nothing is written yet, so the next tick redoes this.
+    if _takportal_mapsync_wait_for_marketplace(_log):
         return
     import io as _io
     _buf = _io.StringIO()
@@ -107117,6 +107236,18 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+        # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
+        # above skips them. A box that already had SMS set up then kept the old sms_send.py
+        # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
+        # through every update. Refresh both when SMS is on and the script is on the box.
+        try:
+            if ((settings.get('guarddog_sms') or {}).get('provider')
+                    and os.path.exists('/opt/tak-guarddog/sms_send.py')):
+                for _sms_name in ('sms_send.py', 'sms_send.sh'):
+                    if _gd_install_script(_sms_name, _gd_template(_sms_name), {}):
+                        updated += 1
+        except Exception as _sms_e:
+            print(f"Guard Dog: SMS scripts not refreshed on startup: {_sms_e}", flush=True)
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
@@ -117569,10 +117700,29 @@ def _broker_converge_running_source(plog=None):
     return True
 
 
-try:
-    _broker_converge_running_source()
-except Exception as _e:
-    print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+def _startup_broker_converge():
+    """Converge the broker, then refresh Guard Dog again if the broker changed.
+
+    ops #845: _auto_update_guarddog() runs earlier in this file (module load), while root's
+    broker still holds the PREVIOUS commit's templates (gd_render fills a script from the
+    broker's own copy of the repo). So on the first restart after Update Now, every Guard
+    Dog script was rendered from the old release, and the new one landed only on the next
+    restart: a script fix needed two restarts to reach a box. Once the broker has installed
+    this checkout's commit, run the refresh again. It only rewrites a script whose
+    content differs, so it is a no-op when nothing changed."""
+    try:
+        changed = _broker_converge_running_source()
+    except Exception as _e:
+        print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+        return
+    if changed:
+        try:
+            _auto_update_guarddog()
+        except Exception as _e:
+            print(f"[startup] Guard Dog refresh after broker convergence skipped (non-fatal): {_e}", flush=True)
+
+
+_startup_broker_converge()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's
