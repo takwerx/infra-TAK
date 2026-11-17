@@ -110255,8 +110255,32 @@ _CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json
 _CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
     r'\bcompose\b.*\s(?:up|build|pull|create|down|stop|start|restart|rm|run)(?:\s|$)'
     r'|\bdocker\s+(?:buildx\s+)?build(?:\s|$)')
+# ops #850: TAK Portal's own helper is a second signal that a Marketplace job is changing the
+# stack. `marketplace-helper rebuild` builds, then recreates, inside one process; between those two
+# compose commands no compose process is running for a moment, and for the plugin copy and removal
+# verbs there is none at all.
+_CLOUDTAK_PORTAL_JOB_RE = re.compile(
+    r'tak-portal/marketplace-helper\s+(?:rebuild|install-plugin|rm-plugin|reclaim)(?:\s|$)')
+# ops #850: when a Marketplace job ends, repair at once instead of on Guard Dog's timer (its
+# two-strike check plus the api settle wait kept CloudTAK wrong for about 5 minutes).
+CLOUDTAK_JOBEND_POLL_S = 4       # how often the console looks at the process list
+CLOUDTAK_JOBEND_QUIET_S = 15     # the stack must stay quiet this long: TAK Portal waits for the api, then prunes
+CLOUDTAK_JOBEND_RETRY_S = 15     # the repair said "waiting" (console busy, a new run started): ask again
+CLOUDTAK_JOBEND_GIVEUP_S = 900   # ...for this long, then Guard Dog's timer is the only path left
 cloudtak_autorepair_status = {'running': False}   # *_status: _console_busy_reason() sees it
 _cloudtak_autorepair_lock = threading.Lock()
+
+
+def _cloudtak_stack_busy_procs():
+    """Process-list lines that show the CloudTAK stack being changed right now: a compose/build run
+    or TAK Portal's marketplace helper. None when the process list could not be read (never read
+    as "idle")."""
+    try:
+        ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return [l.strip() for l in (ps.stdout or '').splitlines()
+            if _CLOUDTAK_COMPOSE_BUSY_RE.search(l) or _CLOUDTAK_PORTAL_JOB_RE.search(l)]
 
 
 def _cloudtak_drift(ct_dir):
@@ -110320,7 +110344,7 @@ def _cloudtak_drift_summary(d):
     return '; '.join(parts) or 'nothing'
 
 
-def _cloudtak_autorepair_wait_reason(ct_dir):
+def _cloudtak_autorepair_wait_reason(ct_dir, settle_s=None):
     """Why the stack has not settled yet (so a repair now would fight whoever is changing it),
     as (reason, busy), or (None, False). TAK Portal's install is build → up --force-recreate api
     → wait for the api → image prune, all as separate commands, so: any compose/build process on
@@ -110328,15 +110352,14 @@ def _cloudtak_autorepair_wait_reason(ct_dir):
     CLOUDTAK_AUTOREPAIR_SETTLE_S ago. Those are `busy`: someone is working on the stack, and
     Guard Dog does not run its 30-min clock while they do (ops #230 — TAK Portal's --no-cache
     build alone took ~20 min on test6). An api that is not running is not busy: nothing is
-    moving, so that wait counts."""
+    moving, so that wait counts. settle_s (ops #850): the api age to wait for; the job-end hook
+    passes a short one, because it already knows TAK Portal's job is over."""
+    if settle_s is None:
+        settle_s = CLOUDTAK_AUTOREPAIR_SETTLE_S
     busy = _console_busy_reason()
     if busy:
         return f'console busy: {busy}', True
-    try:
-        ps = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, timeout=10)
-        run = [l.strip() for l in (ps.stdout or '').splitlines() if _CLOUDTAK_COMPOSE_BUSY_RE.search(l)]
-    except Exception:
-        run = []
+    run = _cloudtak_stack_busy_procs() or []
     if run:
         return f'a compose/build run is still going ({run[0][:120]})', True
     st = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.Status}} {{.State.StartedAt}}']) or '').split()
@@ -110346,8 +110369,8 @@ def _cloudtak_autorepair_wait_reason(ct_dir):
         import calendar
         age = time.time() - calendar.timegm(time.strptime(st[1][:19], '%Y-%m-%dT%H:%M:%S'))
     except ValueError:
-        age = CLOUDTAK_AUTOREPAIR_SETTLE_S
-    if age < CLOUDTAK_AUTOREPAIR_SETTLE_S:
+        age = settle_s
+    if age < settle_s:
         return f'cloudtak-api-1 started {int(max(age, 0))}s ago', True
     return None, False
 
@@ -110371,8 +110394,9 @@ def _cloudtak_autorepair_record_save(d):
         print(f"[cloudtak-autorepair] record write failed (non-fatal): {e}", flush=True)
 
 
-def _cloudtak_autorepair_request():
-    """Guard Dog saw CloudTAK drift twice in a row. Answer {'state', 'detail'}:
+def _cloudtak_autorepair_request(settle_s=None):
+    """Guard Dog saw CloudTAK drift twice in a row, or (ops #850) a TAK Portal Marketplace job just
+    ended (settle_s then replaces the long api settle wait). Answer {'state', 'detail'}:
       ok           — no drift from here (it cleared, or was never ours to fix)
       repairing    — a repair is running (just started, or still going)
       waiting      — not settled yet; ask again next check ('busy': someone is still working
@@ -110405,14 +110429,15 @@ def _cloudtak_autorepair_request():
         if len(tries) >= CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR:
             return {'state': 'rate_limited',
                     'detail': f'{len(tries)} automatic repairs in the last hour, so Guard Dog stopped trying'}
-        wait, busy = _cloudtak_autorepair_wait_reason(ct_dir)
+        wait, busy = _cloudtak_autorepair_wait_reason(ct_dir, settle_s)
         if wait:
             return {'state': 'waiting', 'detail': wait, 'busy': busy}
         rec['attempts'] = tries + [now]
         _cloudtak_autorepair_record_save(rec)
         detail = _cloudtak_drift_summary(drift)
         cloudtak_autorepair_status.update({'running': True, 'kind': drift['kind'], 'detail': detail, 'started': now})
-        print(f"[cloudtak-autorepair] Guard Dog drift: {detail} — repairing ({drift['kind']})", flush=True)
+        print(f"[cloudtak-autorepair] {'drift' if settle_s is None else 'drift after a TAK Portal job'}: "
+              f"{detail} — repairing ({drift['kind']})", flush=True)
         try:
             threading.Thread(target=_cloudtak_autorepair_run, args=(ct_dir, drift),
                              daemon=True, name='cloudtak-autorepair').start()
@@ -110510,6 +110535,75 @@ def guarddog_cloudtak_repair():
     if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     return jsonify(_cloudtak_autorepair_request())
+
+
+def _cloudtak_jobend_step(st, busy, now):
+    """One look at the stack (ops #850). busy: True while a compose/build run or TAK Portal's
+    helper is changing it, False when none is, None when that could not be read. Returns True when
+    the repair should be asked for now: the stack was busy and has now been quiet for
+    CLOUDTAK_JOBEND_QUIET_S (a Marketplace job just ended), or an earlier ask got "waiting" and
+    CLOUDTAK_JOBEND_RETRY_S passed (for at most CLOUDTAK_JOBEND_GIVEUP_S). st keeps the state
+    between looks."""
+    if busy is None:
+        return False
+    if busy:
+        st['active'], st['quiet_since'], st['pending_since'] = True, None, None
+        return False
+    if st.get('active'):
+        if st.get('quiet_since') is None:
+            st['quiet_since'] = now
+        if now - st['quiet_since'] < CLOUDTAK_JOBEND_QUIET_S:
+            return False
+        st['active'], st['quiet_since'] = False, None
+        st['pending_since'] = st['last_try'] = now
+        return True
+    if st.get('pending_since') is not None:
+        if now - st['pending_since'] >= CLOUDTAK_JOBEND_GIVEUP_S:
+            st['pending_since'] = None
+        elif now - st.get('last_try', 0) >= CLOUDTAK_JOBEND_RETRY_S:
+            st['last_try'] = now
+            return True
+    return False
+
+
+def _cloudtak_jobend_tick(st, now=None):
+    """Look once. When a TAK Portal Marketplace job has just ended, ask for the same repair that
+    Guard Dog's cloudtak-autorepair asks for (_cloudtak_autorepair_request: no drift means 'ok' and
+    nothing runs; one repair at a time through its lock). Returns that answer, or None when this
+    look did not ask. The ask changes nothing by itself: it is the one repair path, called sooner."""
+    if not os.path.isfile(os.path.join(os.path.expanduser('~/CloudTAK'), '.env')):
+        st.clear()
+        return None
+    now = time.time() if now is None else now
+    busy = _cloudtak_stack_busy_procs()
+    if not _cloudtak_jobend_step(st, None if busy is None else bool(busy), now):
+        return None
+    r = _cloudtak_autorepair_request(settle_s=CLOUDTAK_JOBEND_QUIET_S)
+    if r.get('state') != 'waiting':
+        st['pending_since'] = None
+    if r.get('state') != 'ok':
+        print(f"[cloudtak-autorepair] TAK Portal job ended: {r.get('state')} — {r.get('detail') or ''}", flush=True)
+    return r
+
+
+def _cloudtak_jobend_loop():
+    time.sleep(60)
+    st = {}
+    while True:
+        try:
+            _cloudtak_jobend_tick(st)
+        except Exception as e:
+            try:
+                print(f"[cloudtak-autorepair] job-end look failed (non-fatal): {e}", flush=True)
+            except Exception:
+                pass
+        time.sleep(CLOUDTAK_JOBEND_POLL_S)
+
+
+try:
+    threading.Thread(target=_cloudtak_jobend_loop, daemon=True, name='cloudtak-jobend-repair').start()
+except Exception:
+    pass
 
 
 def _fedhub_harden_ui_ports(cfg, settings):
