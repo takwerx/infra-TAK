@@ -44179,13 +44179,53 @@ def _netbird_docker_image_version(container_name):
     return ''
 
 
+def _netbird_image_ref_version(image_ref):
+    """Version in the tag of an image reference, or '' when the tag is not a version.
+
+    'netbirdio/netbird-server:0.82.1' -> '0.82.1'; 'netbirdio/dashboard:v2.96.0' -> '2.96.0'.
+    No tag, 'latest' or a digest pin gives '' (the caller then falls back to the label)."""
+    import re
+    ref = (image_ref or '').strip().split('@', 1)[0]
+    last = ref.rsplit('/', 1)[-1]
+    if ':' not in last:
+        return ''
+    tag = last.rsplit(':', 1)[-1].lstrip('vV')
+    return tag if re.match(r'^\d+\.\d+(\.\d+)?([.+-][0-9A-Za-z.+-]+)?$', tag) else ''
+
+
+def _netbird_server_image_version(container_name):
+    """Running NetBird server version (ops #853).
+
+    The netbirdio/netbird-server images carry only the org.opencontainers.image.version label of
+    their Ubuntu base image ('24.04'), so the label is not the server version. The real version
+    is the tag the container was created from (compose pins it, e.g. netbird-server:0.82.1).
+    The label is only a fallback, and only when it looks like a NetBird version ('0.x');
+    anything else gives '' so the card never shows a wrong number."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', container_name, '--format',
+                        '{{.Config.Image}}|{{index .Config.Labels "org.opencontainers.image.version"}}']),
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            img, _, label = r.stdout.strip().partition('|')
+            ver = _netbird_image_ref_version(img)
+            if ver:
+                return ver
+            label = label.strip().lstrip('vV')
+            if label.startswith('0.'):
+                return label
+    except Exception:
+        pass
+    return ''
+
+
 def _get_netbird_version_info():
     """Return {version, update_available, latest} for NetBird server + dashboard images."""
     out = {'version': '', 'update_available': False, 'latest': None}
     nb_dir = NETBIRD_INSTALL_DIR
     if not os.path.isfile(os.path.join(nb_dir, 'docker-compose.yml')):
         return out
-    mgmt_ver = _netbird_docker_image_version('netbird-server')
+    mgmt_ver = _netbird_server_image_version('netbird-server')
     dash_ver = _netbird_docker_image_version('netbird-dashboard')
     parts = []
     if mgmt_ver:
