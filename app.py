@@ -17353,6 +17353,32 @@ def _conn_wifi_netplan_file():
     return ''
 
 
+def _nmcli_terse_split(line):
+    """The fields of one `nmcli -t` line, as nmcli meant them.
+
+    Terse mode puts ':' between fields and writes a ':' or a '\\' INSIDE a value with a
+    backslash before it (nmcli(1), --escape, default yes; it does so for one field too).
+    A plain split(':') cut a name with a colon in two, and rsplit kept the backslashes, so
+    a network named `Ops: Truck 5` showed as `Ops\\: Truck 5`, was missing from the saved
+    list, and could not be picked or joined (ops #897).
+    https://networkmanager.dev/docs/api/latest/nmcli.html"""
+    fields, cur, i, n = [], [], 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == '\\' and i + 1 < n:
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if c == ':':
+            fields.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    fields.append(''.join(cur))
+    return fields
+
+
 def _conn_wifi_saved():
     """SSIDs the box already knows (from nmcli or the netplan file)."""
     out = []
@@ -17361,7 +17387,7 @@ def _conn_wifi_saved():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
                                capture_output=True, text=True, timeout=10)
             for line in (r.stdout or '').splitlines():
-                p = line.split(':')
+                p = _nmcli_terse_split(line)
                 if len(p) >= 2 and 'wireless' in p[1]:
                     out.append(p[0])
         except Exception:
@@ -17404,7 +17430,7 @@ def _conn_wifi_scan():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list']),
                                capture_output=True, text=True, timeout=20)
             for line in (r.stdout or '').splitlines():
-                p = line.rsplit(':', 1)
+                p = _nmcli_terse_split(line)
                 _add(p[0], p[1] if len(p) > 1 else '')
         except Exception:
             pass
@@ -17436,7 +17462,7 @@ def _conn_wifi_visible():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID', 'dev', 'wifi', 'list']),
                                capture_output=True, text=True, timeout=8)
             for ln in (r.stdout or '').splitlines():
-                s = ln.strip()
+                s = _nmcli_terse_split(ln)[0].strip()
                 if s:
                     seen.add(s)
         except Exception:
@@ -17689,7 +17715,7 @@ def _conn_wifi_current():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status']),
                                capture_output=True, text=True, timeout=8)
             for ln in (r.stdout or '').splitlines():
-                p = ln.split(':')
+                p = _nmcli_terse_split(ln)
                 if len(p) >= 4 and p[0] == iface and p[1] == 'wifi' and p[2] == 'connected':
                     name = ':'.join(p[3:]).strip()
                     if name and name != '--':
@@ -18223,7 +18249,7 @@ def _conn_join_best_saved():
                            capture_output=True, text=True, timeout=10)
         saved = []
         for ln in (r.stdout or '').splitlines():
-            parts = ln.rsplit(':', 1)
+            parts = _nmcli_terse_split(ln)
             if len(parts) == 2 and 'wireless' in parts[1] and parts[0] != 'takwerx-hotspot':
                 saved.append(parts[0])
     except Exception:
