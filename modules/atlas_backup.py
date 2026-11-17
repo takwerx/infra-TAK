@@ -179,7 +179,7 @@ def restore_steps(dirpath, project_flag, tag, backup_path):
     steps = [
         '%s stop api' % compose,
         '%s exec -T db psql -U %s -d postgres -c "DROP DATABASE %s WITH (FORCE)" '
-        '-c "CREATE DATABASE %s OWNER %s"' % (compose, DB_USER, DB_NAME, DB_NAME, DB_USER),
+        '-c "CREATE DATABASE %s OWNER %s" < /dev/null' % (compose, DB_USER, DB_NAME, DB_NAME, DB_USER),
         '%s exec -T db psql -U %s -d %s -q -v ON_ERROR_STOP=1 < %s'
         % (compose, DB_USER, DB_NAME, _q(backup_path)),
     ]

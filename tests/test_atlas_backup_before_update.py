@@ -243,6 +243,31 @@ def test_restore_steps_drop_recreate_load_check_out_and_rebuild():
     assert text.index('DROP DATABASE') < text.index('ON_ERROR_STOP') < text.index('checkout') < text.index('--build')
 
 
+def test_pasting_all_restore_steps_at_once_runs_every_step(tmp_path):
+    """The log prints the steps as a block, and an operator may paste the block into a terminal in one go.
+    `docker compose exec -T` reads stdin, so a step with no redirect swallows the lines pasted after it
+    (box test, ops #864: the loop stopped after the DROP step with the database empty)."""
+    import subprocess
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    calls = tmp_path / 'calls.txt'
+    for name in ('docker', 'git'):
+        f = bindir / name
+        # like the real docker, only `exec` reads stdin
+        f.write_text('#!/bin/bash\necho "%s $*" >> %s\ncase " $* " in *" exec "*) cat > /dev/null;; esac\n' % (name, calls))
+        f.chmod(0o755)
+    dump = tmp_path / 'b.sql'
+    dump.write_text('select 1;')
+    steps = ab.restore_steps(str(tmp_path / 'atlas'), '', 'v1.138.0', str(dump))
+
+    subprocess.run(['bash', '-s'], input=(chr(10).join(steps) + chr(10)).encode(), cwd=str(tmp_path),
+                   env={'PATH': '%s:/usr/bin:/bin' % bindir}, check=True, timeout=30)
+
+    seen = calls.read_text().splitlines()
+    assert len(seen) == len(steps), seen
+    assert seen[-1].endswith('up -d --build api')
+
+
 def test_restore_steps_for_an_agency_name_its_compose_project():
     steps = ab.restore_steps('/h/atlas/corona', '-p takmdm-corona', 'v1.138.0', '/h/b.sql')
 
