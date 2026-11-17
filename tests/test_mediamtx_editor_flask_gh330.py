@@ -217,7 +217,8 @@ def test_remote_install_gets_past_the_apt_owned_blinker(tmp_path):
         r = subprocess.run(['/bin/sh', '-c', cmd], capture_output=True, text=True,
                            env={'PATH': f'{tmp_path}:/usr/bin:/bin'})
         return r.returncode == 0, r.stdout
-    ns = {'_module_run': module_run, 'shlex': shlex,
+    # ops #890: the remote install now goes through _module_run_root; this stub plays a root host.
+    ns = {'_module_run': module_run, '_module_run_root': module_run, 'shlex': shlex,
           '_MEDIAMTX_EDITOR_PY_PKGS': ('Flask==3.1.3', 'ruamel.yaml==0.19.1', 'requests==2.32.5', 'psutil==7.2.2'),
           '_MEDIAMTX_EDITOR_CERTIFI': 'certifi==2026.10.23',
           '_MEDIAMTX_PIP_DISTRO_OWNED': 'Cannot uninstall',
