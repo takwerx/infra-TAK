@@ -1829,7 +1829,7 @@ MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_edit
 # Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
 # fails if either goes back to a branch name.
 MEDIAMTX_EDITOR_REF = "v2.1.16"
-MEDIAMTX_EDITOR_SHA = "d8fde95eb125745385df8df9d1e099ef9c78d89e"  # commit of tag v2.1.16 (v2.1.15 added hashed passwords + a random first login, ops #877)
+MEDIAMTX_EDITOR_SHA = "8d76bbec0c93804e0c7a5317cdeec18c28945f68"  # COMMIT of tag v2.1.16 (git rev-parse v2.1.16^{commit}; v2.1.16 is an annotated tag, so rev-parse v2.1.16 gives the tag object d8fde95 and raw.githubusercontent answers 404 for it). v2.1.15 added hashed passwords + a random first login (ops #877)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
