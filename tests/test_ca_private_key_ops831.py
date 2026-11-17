@@ -53,7 +53,8 @@ ADMIN_PASSWORD = 'console-password-831'
 # Functions this change adds. Where they do not exist, the route tests run the routes as
 # they are, so each test still answers for the behaviour it names.
 NEW_FUNCS = ('_ca_cert_fact', '_ca_pem_key_pubs', '_ca_der_key_pub', '_ca_p12_key_pubs', '_ca_jks_key_certs',
-             '_ca_file_fact', '_ca_key_stem', '_ca_file_stem', '_ca_private_files', '_is_ca_private_file',
+             '_ca_file_fact', '_ca_key_stem', '_ca_file_stem', '_ca_names_from_listing',
+             '_ca_private_files', '_is_ca_private_file',
              '_ca_private_verdict_or_refuse_all', '_tak_ca_private_lockdown', '_tak_ca_private_lockdown_all')
 OLD_FUNCS = ('_is_ca_private_material', '_cert_file_bytes', '_private_key_pubkey', '_send_cert_file_priv',
              '_validate_snapshot_label', '_require_admin_password',
