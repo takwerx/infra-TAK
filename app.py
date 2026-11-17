@@ -100957,6 +100957,58 @@ _mapsync_splitbox_logged = False
 _groupcache_splitbox_logged = False
 
 
+# ops #842: TAK Portal's CloudTAK Marketplace keeps its jobs in this file inside the portal
+# container (services/cloudtakMarketplace.store.js, DIR = ../data/cloudtak-marketplace).
+# A job is "busy" while its status is queued or running; the portal's own status route
+# reports the same thing as `busy` (hasBusyChangeJobs).
+_TAKPORTAL_MARKETPLACE_JOBS = '/usr/src/app/data/cloudtak-marketplace/jobs.json'
+_TAKPORTAL_MARKETPLACE_BUSY_STATES = ('queued', 'running')
+# A restart ends every busy job with "Interrupted by restart." and a batch can take about 45
+# minutes (the CloudTAK rebuild), so the map sync waits. A job record stuck on "running" must
+# not hold the map sync back for ever: after this many seconds it goes ahead.
+_MAPSYNC_MARKETPLACE_WAIT_MAX = 3 * 3600
+_MAPSYNC_MARKETPLACE_WAIT = {'since': None}
+
+
+def _takportal_marketplace_busy():
+    """ops #842: True when a TAK Portal CloudTAK Marketplace job is queued or running, i.e.
+    a restart of the portal right now would end it with "Interrupted by restart.".
+
+    Reads the portal's own jobs file the way the settings.json reads do (docker exec cat).
+    Anything we cannot read (no container, no file, bad JSON) is "not busy": the portal then
+    behaves as it did before this check existed, never worse."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', _TAKPORTAL_MARKETPLACE_JOBS]),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+        jobs = (json.loads(r.stdout or '{}') or {}).get('jobs') or []
+        return any(isinstance(j, dict) and str(j.get('status') or '') in _TAKPORTAL_MARKETPLACE_BUSY_STATES
+                   for j in jobs)
+    except Exception:
+        return False
+
+
+def _takportal_mapsync_wait_for_marketplace(_log):
+    """ops #842: True when the map sync must wait: a Marketplace job is running, and it has not
+    been waited on for more than _MAPSYNC_MARKETPLACE_WAIT_MAX seconds. The sync then leaves
+    the UAF and the portal alone and returns; the next watchdog tick (every 10 min) tries
+    again, so once the batch ends the channels are written and the portal restarted ONCE."""
+    wait = _MAPSYNC_MARKETPLACE_WAIT
+    if not _takportal_marketplace_busy():
+        wait['since'] = None
+        return False
+    now = time.time()
+    if wait['since'] is None:
+        wait['since'] = now
+    if now - wait['since'] > _MAPSYNC_MARKETPLACE_WAIT_MAX:
+        _log("a Marketplace job has been running for over 3 hours — restarting tak-portal anyway")
+        wait['since'] = None
+        return False
+    _log("a TAK Portal Marketplace job is running — channel sync and tak-portal restart wait until it ends")
+    return True
+
+
 def _takportal_sync_map_channels(plog=None):
     """Keep the TAK Portal map bridge user (the `admin` cert) enrolled in EVERY TAK
     channel, so the portal /map's single server-side CoT bridge receives all feeds on
@@ -101054,7 +101106,12 @@ def _takportal_sync_map_channels(plog=None):
             ET.SubElement(admin_el, ns + 'groupList').text = name
         changed = True
     if not changed:
+        _MAPSYNC_MARKETPLACE_WAIT['since'] = None
         _log(f"admin bridge (+bootstrap cert) already in {len(target)} channels — no change, no restart")
+        return
+    # ops #842: the restart below ends every running Marketplace job ("Interrupted by restart.")
+    # and leaves CloudTAK half rebuilt. Wait: nothing is written yet, so the next tick redoes this.
+    if _takportal_mapsync_wait_for_marketplace(_log):
         return
     import io as _io
     _buf = _io.StringIO()
