@@ -83,6 +83,10 @@ def test_required_ports_are_the_https_and_letsencrypt_connectors():
     assert n['_tak_api_required_ports'](CORE_CONFIG) == [8443, 8446]
     assert n['_tak_api_required_ports']('') == [8443]
     assert n['_tak_api_required_ports']('<connector port="8444" _name="fed_https"/>') == [8443]
+    # a stock 5.8 CoreConfig (the box test): https 8443 + cert_https 8446, fed_https 8444 left out
+    stock = ('<connector port="8443" _name="https"/><connector port="8444" useFederationTruststore="true" '
+             '_name="fed_https"/><connector port="8446" clientAuth="false" _name="cert_https"/>')
+    assert n['_tak_api_required_ports'](stock) == [8443, 8446]
 
 
 def test_listening_ports_reads_every_address_shape():
@@ -104,13 +108,13 @@ def test_wait_returns_when_the_port_opens_and_gives_up_naming_the_holder():
     wait = n['_tak_api_wait_serving']
     clock = {'t': 0.0}
     seen = iter([{8446}, {8446}, {8443, 8446}])
-    ok = wait([8443, 8446], timeout_s=60, poll_s=10, listening=lambda: next(seen),
+    ok = wait([8443, 8446], timeout_s=60, poll_s=10, stable_s=0, listening=lambda: next(seen),
               holder=lambda p: 'x', sleep=lambda s: clock.update(t=clock['t'] + s),
               clock=lambda: clock['t'])
     assert ok['ok'] and ok['missing'] == []
 
     clock['t'] = 0.0
-    bad = wait([8443, 8446], timeout_s=60, poll_s=10, listening=lambda: {8446},
+    bad = wait([8443, 8446], timeout_s=60, poll_s=10, stable_s=0, listening=lambda: {8446},
                holder=lambda p: 'java (pid 4242) = Federation Hub',
                sleep=lambda s: clock.update(t=clock['t'] + s), clock=lambda: clock['t'])
     assert not bad['ok'] and bad['missing'] == [8443]
@@ -118,6 +122,29 @@ def test_wait_returns_when_the_port_opens_and_gives_up_naming_the_holder():
     text = '\n'.join(n['_tak_api_not_serving_lines'](bad))
     assert 'NOT listening on port 8443' in text
     assert 'Port 8446 is already in use' in text and 'Federation Hub' in text
+
+
+def test_a_port_that_opens_and_closes_again_is_not_serving():
+    # Box test (ops #902): with 8446 held by another program, 8443 was seen listening once, then
+    # TAK's API gave up and closed it. The old check returned ok on that first sighting.
+    n = _load(*HELPERS)
+    wait = n['_tak_api_wait_serving']
+    clock = {'t': 0.0}
+    timeline = iter([set(), {8443}, set(), set(), set(), set(), set(), set(), set(), set()])
+    res = wait([8443], timeout_s=40, poll_s=10, stable_s=60, listening=lambda: next(timeline),
+               holder=lambda p: '', sleep=lambda s: clock.update(t=clock['t'] + s),
+               clock=lambda: clock['t'])
+    assert not res['ok'] and res['missing'] == [8443]
+    # and a port that opens and stays is ok only after the stable wait
+    clock['t'] = 0.0
+    steady = {'n': 0}
+
+    def up():
+        steady['n'] += 1
+        return {8443}
+    res = wait([8443], timeout_s=40, poll_s=10, stable_s=60, listening=up, holder=lambda p: '',
+               sleep=lambda s: clock.update(t=clock['t'] + s), clock=lambda: clock['t'])
+    assert res['ok'] and clock['t'] >= 60 and steady['n'] >= 7
 
 
 # ── PROOF TEST: the 5.8 migration may not end "ok" while the API is down ──────────────────
@@ -169,7 +196,7 @@ def _migrate(api_ports_up):
     if '_tak_api_wait_serving' in n:
         real_wait = n['_tak_api_wait_serving']
         n['_tak_api_wait_serving'] = lambda req, **k: real_wait(
-            req, timeout_s=0, poll_s=0, listening=lambda: set(api_ports_up),
+            req, timeout_s=0, poll_s=0, stable_s=0, listening=lambda: set(api_ports_up),
             holder=lambda p: 'java (pid 4242) = Federation Hub')
     exec(compile(_cut('run_takserver_58_migration'), 'app.py:run_takserver_58_migration', 'exec'), n)
     log, status = [], {}

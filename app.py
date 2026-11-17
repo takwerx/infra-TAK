@@ -94254,15 +94254,17 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
 # migration only read the PostgreSQL major, so nothing said any of it. TAK's API (Tomcat) opens
 # all its web ports together: if one cannot bind, none of them listen.
 def _tak_api_required_ports(core_config_text):
-    """Ports the console, TAK Portal and CloudTAK need from TAK Server's API: the CoreConfig.xml
-    connectors named `https` and `LetsEncrypt` (the latter is the one infra-TAK writes itself).
-    Falls back to 8443 when CoreConfig has no such connector. The fed_https connector is left
-    out on purpose: it is not up on a box that does not federate."""
+    """Ports TAK Server's API opens for the console, TAK Portal and CloudTAK: the CoreConfig.xml
+    connectors named `https` (8443), `cert_https` (8446) and `LetsEncrypt` (the one infra-TAK
+    writes itself). 8446 is in the list so that a program sitting on it is named: that was the
+    field fault and the box-test fault (the API dies when it cannot bind 8446). Falls back to
+    8443 when CoreConfig has no such connector. The fed_https connector is left out on purpose:
+    it is not up on a box that does not federate (8444 is closed on a healthy fresh install)."""
     ports = []
     for el in re.findall(r'<connector\b[^>]*>', core_config_text or ''):
         nm = re.search(r'\b_name="([^"]*)"', el)
         pt = re.search(r'\bport="(\d+)"', el)
-        if nm and pt and nm.group(1) in ('https', 'LetsEncrypt') and int(pt.group(1)) not in ports:
+        if nm and pt and nm.group(1) in ('https', 'cert_https', 'LetsEncrypt') and int(pt.group(1)) not in ports:
             ports.append(int(pt.group(1)))
     return ports or [8443]
 
@@ -94313,17 +94315,21 @@ def _tak_port_holder_now(port):
 
 
 def _tak_api_wait_serving(required, timeout_s=600, poll_s=10, listening=None,
-                          holder=None, sleep=None, clock=None):
+                          holder=None, sleep=None, clock=None, stable_s=60):
     """Wait until every port in `required` has a listener (TAK's API takes a few minutes on its
-    first start after a migration). Returns {'ok', 'missing', 'listening', 'holders'}. On a timeout,
-    `holders` names who listens on the required ports that ARE up: TAK's API opens its web ports
-    together, so a listener there while another port stays closed is not TAK's API."""
+    first start after a migration), and keeps it for `stable_s` seconds. The stable wait is real:
+    on a test box with 8446 held by another program, 8443 was seen listening once, a moment
+    before the API gave up and closed it (ops #902, box test). Returns {'ok', 'missing',
+    'listening', 'holders'}. On a timeout, `holders` names who listens on the required ports that
+    ARE up: TAK's API opens its web ports together, so a listener there while another port stays
+    closed is not TAK's API."""
     listening = listening or (lambda: _tak_listening_ports(subprocess.run(
         ['ss', '-tlnH'], capture_output=True, text=True, timeout=15).stdout))
     holder = holder or _tak_port_holder_now
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     end = clock() + timeout_s
+    up_since = None
     while True:
         try:
             up = listening()
@@ -94331,11 +94337,16 @@ def _tak_api_wait_serving(required, timeout_s=600, poll_s=10, listening=None,
             up = set()
         missing = [p for p in required if p not in up]
         if not missing:
-            return {'ok': True, 'missing': [], 'listening': list(required), 'holders': {}}
-        if clock() >= end:
-            up_req = [p for p in required if p in up]
-            return {'ok': False, 'missing': missing, 'listening': up_req,
-                    'holders': {p: holder(p) for p in up_req}}
+            if up_since is None:
+                up_since = clock()
+            if clock() - up_since >= stable_s:
+                return {'ok': True, 'missing': [], 'listening': list(required), 'holders': {}}
+        else:
+            up_since = None           # it opened and closed again: start the stable wait over
+            if clock() >= end:
+                up_req = [p for p in required if p in up]
+                return {'ok': False, 'missing': missing, 'listening': up_req,
+                        'holders': {p: holder(p) for p in up_req}}
         sleep(poll_s)
 
 
