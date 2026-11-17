@@ -17,19 +17,28 @@
 """An ETL on hold stays uninstallable (operator, v10.4.0 T&E, 2026-11-15).
 
 etl-arcgis: a security report sent to the COE on 2026-11-09 (ticket #979) is still open and
-7.33.0 only bumped dependencies. Held until fixed. A later sync or scan must not re-offer it."""
+7.33.0 only bumped dependencies. Held until fixed. A later sync or scan must not re-offer it.
+
+etl-cotrip-signs and etl-cotrip-weather (ops #833, 2026-11-16): their Dockerfile security report
+went to the COE the same day and is still open, so they are held the same way."""
 
 import importlib.util
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
+
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from modules import etlrunner as etl  # noqa: E402
 
 HOLDS = json.loads((REPO / 'modules' / 'etlrunner' / 'holds.json').read_text())['holds']
+HOLDS_FILE = REPO / 'modules' / 'etlrunner' / 'holds.json'
+# Every ETL held for the COE security report of 2026-11-09. Each must stay in holds.json.
+COE_HELD = ['etl-arcgis', 'etl-cotrip-signs', 'etl-cotrip-weather']
 
 
 def _load(name):
@@ -78,3 +87,54 @@ def test_review_tool_does_not_mark_a_held_entry_reviewed_on_a_pass(tmp_path, mon
     out = {e['prefix']: e for e in json.loads(cat.read_text())['entries']}
     assert out['etl-arcgis']['reviewed'] is None and out['etl-arcgis']['note'] == 'held'
     assert out['etl-geojson']['reviewed'] == '2026-11-16 /module-scan'
+
+
+# ── ops #833: etl-cotrip-signs and etl-cotrip-weather ───────────────────────────────────
+
+def test_every_coe_held_etl_is_in_holds_json_with_the_standard_reason():
+    for prefix in COE_HELD:
+        assert prefix in HOLDS, f'{prefix} must stay on hold'
+        assert HOLDS[prefix] == HOLDS['etl-arcgis']
+        assert 'security report sent to the COE on 2026-11-09 is still open' in HOLDS[prefix]
+
+
+@pytest.mark.parametrize('prefix', ['etl-cotrip-signs', 'etl-cotrip-weather'])
+def test_cotrip_signs_and_weather_are_in_the_bundle_and_not_installable(prefix):
+    e = next(x for x in etl.bundled_catalog()['entries'] if x['prefix'] == prefix)
+    assert prefix in HOLDS
+    assert e['reviewed'] is None
+    assert etl.installable(e) == (False, 'Waiting for security review')
+
+
+def test_the_other_cotrip_etls_are_not_held():
+    for prefix in ('etl-cotrip-incidents', 'etl-cotrip-plows', 'etl-cotrip-cameras'):
+        assert prefix not in HOLDS
+
+
+def test_sync_keeps_the_cotrip_etls_unreviewed_using_the_real_holds_file():
+    sync = _load('etl_catalog_sync')
+    reviewed = '2026-11-09 /module-scan'
+    ents = [{'prefix': p, 'reviewed': reviewed} for p in COE_HELD + ['etl-cotrip-incidents']]
+    sync.apply_holds(ents, path=str(HOLDS_FILE))
+    for e in ents[:-1]:
+        assert e['reviewed'] is None and e['note'] == HOLDS[e['prefix']]
+    assert ents[-1]['reviewed'] == reviewed and 'note' not in ents[-1]
+
+
+def test_review_tool_does_not_mark_the_cotrip_etls_reviewed_on_a_pass(tmp_path, monkeypatch):
+    rev = _load('etl_catalog_review')
+    prefixes = COE_HELD + ['etl-cotrip-incidents']
+    shutil.copy(HOLDS_FILE, tmp_path / 'holds.json')           # the real list, not a stand-in
+    cat = tmp_path / 'catalog.json'
+    cat.write_text(json.dumps({'schema': 1, 'serial': 1, 'entries': [
+        {'prefix': p, 'sha': 'a' * 40, 'reviewed': None} for p in prefixes]}))
+    res = tmp_path / 'scan.json'
+    res.write_text(json.dumps({'results': [
+        {'prefix': p, 'verdict': 'PASS', 'sha': 'a' * 40, 'head_verified': True} for p in prefixes]}))
+    monkeypatch.setattr(rev, 'CATALOG', str(cat))
+    monkeypatch.setattr(sys, 'argv', ['x', '--date', '2026-11-16', str(res)])
+    rev.main()
+    out = {e['prefix']: e for e in json.loads(cat.read_text())['entries']}
+    for p in COE_HELD:
+        assert out[p]['reviewed'] is None and out[p]['note'] == HOLDS[p]
+    assert out['etl-cotrip-incidents']['reviewed'] == '2026-11-16 /module-scan'

@@ -37,8 +37,10 @@ DEPLOY_SRC = APP[APP.index('def run_guarddog_deploy(alert_email):'):APP.index("@
 # From GUARDDOG_CONF_PATH: the sync writes guarddog.conf through _write_guarddog_conf() (#101).
 SYNC_SRC = APP[APP.index("GUARDDOG_CONF_PATH = '/opt/tak-guarddog/guarddog.conf'"):
                APP.index('def _remotedb_host_port_from_tak_settings(')]
+# Ends at the module-level call of _auto_update_guarddog(): the next module-level call
+# (_gd_refresh_mtx_cert_sync, ops #863) is its own startup step, not part of the sync under test.
 STARTUP_SRC = APP[APP.index('def _auto_update_guarddog():'):
-                  APP.index('def _start_guarddog_background_at_boot(')]
+                  APP.index('\n_auto_update_guarddog()\n')]
 # ops #645 W2 part 2a: every fill-in goes through _gd_install_script (old path: no broker).
 GD_HELPER_SRC = APP[APP.index('_GD_PLACEHOLDER_RE = re.compile('):APP.index('def _write_priv(')]
 GD = '/opt/tak-guarddog'

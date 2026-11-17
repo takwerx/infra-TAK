@@ -48,6 +48,13 @@ def test_mediamtx_fresh_install_pin_is_1_21_3_ops428():
     assert _v(pin) >= (1, 21, 3)
 
 
+def test_mediamtx_fresh_install_pin_is_1_21_4_ops817():
+    # ops #817: 1.21.4 caps RTSP-over-WebSocket messages and adds an idle timeout during tunnel
+    # detection (both before login), keeps passwords/tokens out of the debug log. Component check: ops #818.
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    assert _v(pin) >= (1, 21, 4)
+
+
 def test_mediamtx_checksum_grep_matches_upstream_line_format_ops428():
     # The remote deploy greps checksums.sha256 for `<64 hex> [ *]<tarball>` and fails closed;
     # upstream writes the binary-mode `<hash> *<file>` form (seen in the real 1.21.3 file).
@@ -73,6 +80,14 @@ def test_coturn_pin_is_past_the_advisories():
     assert _v(pin) >= (4, 17, 0)
 
 
+def test_coturn_pin_has_the_4_19_security_fixes():
+    # ops #816: 4.19.0 (memory-safety and auth fixes) and 4.19.1 (DTLS half-open limits, admin server,
+    # oversize frame). The pin must be an exact tag, never a moving one.
+    pin = re.search(r"^COTURN_IMAGE = 'coturn/coturn:([^']+)'", APP, re.M).group(1)
+    assert _v(pin) >= (4, 19, 1)
+    assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
+
+
 def test_coturn_flags_avoid_the_ones_418_removed():
     # ops #201: the override is built in one place for install and the startup converge
     body = APP[APP.index('def _coturn_override_content('):]
@@ -96,12 +111,12 @@ def test_netbird_vetted_and_dev_pins_are_past_the_relay_fix():
         assert ':latest' not in val and re.search(r':v?\d+\.\d+\.\d+$', val), name
 
 
-def test_netbird_dev_trial_pair_is_0_82_and_vetted_pair_is_unchanged():
-    # ops #427: 0.82.0 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
+def test_netbird_dev_trial_pair_is_0_82_1_and_vetted_pair_is_unchanged():
+    # ops #427, #819: 0.82.1 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
     # the gated T&E is green and the lead promotes it, so main boxes stay on 0.80.0 / v2.94.0.
     def pin(name):
         return re.search(rf'^{name} = "[^:"]+:v?([^"]+)"', APP, re.M).group(1)
-    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.0'
+    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.1'
     assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.96.0'
     assert pin('NETBIRD_SERVER_IMAGE') == '0.80.0'
     assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.94.0'

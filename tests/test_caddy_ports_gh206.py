@@ -52,7 +52,8 @@ def _load(settings):
     assert len(parts) == len(_WANT), 'a function under test was renamed or removed'
     ns = {'load_settings': lambda: settings, 'CADDY_GRACE_PERIOD': '10s',
           '_caddy_acme_inner_lines': lambda cfg=None: [],
-          '_caddy_read_body_idle_lines': lambda grpc: []}
+          '_caddy_read_body_idle_lines': lambda grpc: [],
+          '_caddy_private': lambda: False}    # ops #814: these boxes are not moved yet
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     return ns
 

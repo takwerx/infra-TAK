@@ -36,6 +36,7 @@ RETENTION_STALE_FACTOR=2   # oldest row older than N x the configured TTL
 FS_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.freespace"
 RET_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.retention"
 NOTTL_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.nottl"
+RET_PENDING_FILE="/var/lib/takguard/cotdb_retention_pending"   # ops #846: first look, not yet an alert
 
 # Check if two-server mode (remote DB)
 GD_CONF="/opt/tak-guarddog/guarddog.conf"
@@ -213,7 +214,7 @@ if [ "$RETENTION_SET" = "0" ]; then
   # Not a footnote: with no TTL, TAK Server never deletes a CoT row, so the
   # database grows without bound until the filesystem fills. That is the
   # 2026-08-10 failure in slow motion, and it is silent until the disk is gone.
-  rm -f "$RET_ALERT_FILE"          # can't be "stalled" if it was never configured
+  rm -f "$RET_ALERT_FILE" "$RET_PENDING_FILE"   # can't be "stalled" if it was never configured
   if cot_latch_ready "$NOTTL_ALERT_FILE"; then
     touch "$NOTTL_ALERT_FILE"
     send_cot_alert "TAK Server has NO CoT retention policy on $SERVER_IDENTIFIER" \
@@ -239,7 +240,20 @@ Guard Dog's 15-minute retention guard enforces whatever TTL you set there."
 elif [ -n "$STALL_AGE_SECS" ] && [ "$STALL_AGE_SECS" -gt "$STALL_SECS" ]; then
   rm -f "$NOTTL_ALERT_FILE"
   OLDEST_DAYS=$(( STALL_AGE_SECS / 86400 ))
-  if cot_latch_ready "$RET_ALERT_FILE"; then
+  # ops #846: a row's age counts from when it was received, not from when retention
+  # became allowed to delete it. A row whose mission was just removed can be days
+  # old the moment it turns deletable, and TAK's hourly job removes it within the
+  # hour. One look at that moment is not a stall (test8, Nov 16: Guard Dog's own
+  # cleanup found nothing old at 12:48, this watcher reported a 5-day-old row at
+  # 1:08, and it was gone by the next hourly run). A real stall is still there on
+  # the next look, so email only when the PREVIOUS look, at least an hour ago,
+  # saw the same thing.
+  if [ ! -f "$RET_PENDING_FILE" ]; then
+    touch "$RET_PENDING_FILE"
+    echo "$(date): CoT retention possibly stalled (oldest deletable row ${OLDEST_DAYS}d, retention ${RETENTION_HOURS}h); confirming on the next check before alerting" >> /var/log/takguard/restarts.log
+  elif [ -z "$(find "$RET_PENDING_FILE" -mmin +60 2>/dev/null)" ]; then
+    :   # seen less than an hour ago (a manual re-run): wait for a real second look
+  elif cot_latch_ready "$RET_ALERT_FILE"; then
     touch "$RET_ALERT_FILE"
     send_cot_alert "TAK Server CoT retention is not deleting on $SERVER_IDENTIFIER" \
 "TAK Server's CoT retention policy is not actually removing old data.
@@ -265,7 +279,7 @@ Run Retention Now (it also re-arms the timer)."
     echo "$(date): CoT retention-stalled alert sent (oldest row ${OLDEST_DAYS}d, retention ${RETENTION_HOURS}h)" >> /var/log/takguard/restarts.log
   fi
 else
-  rm -f "$RET_ALERT_FILE" "$NOTTL_ALERT_FILE"
+  rm -f "$RET_ALERT_FILE" "$RET_PENDING_FILE" "$NOTTL_ALERT_FILE"
 fi
 
 # ── Condition C: absolute database size (original behaviour, own latch) ────
