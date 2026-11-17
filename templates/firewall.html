@@ -110,7 +110,7 @@
 (function(){
   function dot(s){return '<span class="exp-dot exp-'+s+'"></span>';}
   var TIER={1:'Public',3:'Caddy-loopback',4:'Docker-internal',5:'Source-scoped'};
-  function esc(t){var d=document.createElement('div');d.textContent=(t==null?'':String(t));return d.innerHTML;}
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
   fetch('/api/firewall/exposure').then(function(r){return r.json();}).then(function(d){
     var badge=document.getElementById('exp-badge');
     var st=(d.summary&&d.summary.status)||'unknown';
