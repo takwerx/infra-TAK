@@ -84535,6 +84535,21 @@ def _self_heal_authentik_compose(_path=None):
         # the byte-equal check passes, there are no duplicates to heal.
         _write_stamp('no-op: file already canonical (no duplicate mapping keys)')
         return None
+    # ops #860: the bytes differ, but that alone is not damage. Our writers dump
+    # with different options (the pgbouncer install, the compose patches and the
+    # worker direct-pg step use width=200 + allow_unicode; the pool-size writer and
+    # this heal use PyYAML defaults), so a file one of them wrote reads as
+    # "not canonical" to the others. The old code then rewrote it and every caller
+    # recreated the LDAP outpost under a running TAK Server (users lost their
+    # groups over HTTPS until the repair ended). Only duplicate mapping keys are
+    # real damage here: docker compose refuses them, and the rewrite resolves them.
+    # With no duplicates the parsed data is identical either way, so leave the file
+    # and return None (callers recreate the outpost only on "normalized YAML").
+    _orig_valid, _ = _validate_authentik_compose(_orig)
+    if _orig_valid:
+        _write_stamp('no-op: only formatting differs (no duplicate mapping keys, '
+                     'same data) — file left as is')
+        return None
     _valid, _verr = _validate_authentik_compose(_renormalized)
     if not _valid:
         _msg = (f"compose self-heal: canonical YAML failed validation "
