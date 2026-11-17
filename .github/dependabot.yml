@@ -52,6 +52,16 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # The simulator base is python:3.12-slim, pinned by digest, and
+      # tests/test_node_pins_ops824.py pins the 3.12 line on purpose. Dependabot
+      # counts 3.12 to 3.15 as a minor bump, so ignore python minor and major
+      # bumps here and keep patch updates for the 3.12 line. The python line
+      # moves only by a deliberate change to that pin test and a box test
+      # (ops #885: PR 515 failed the pin test).
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
