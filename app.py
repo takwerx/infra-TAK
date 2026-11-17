@@ -55190,7 +55190,10 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         # @ts-nocheck (those marks are in untracked files, so they survive the checkout).
         api = os.path.join(ct_dir, 'api')
         cfg = os.path.join(api, 'eslint.config.js')
-        if os.path.isfile(cfg):
+        # CloudTAK 13.124.0 lints the api with OXLint, which reads .oxlintrc.json and not
+        # eslint.config.js. Older trees have only the ESLint file, newer ones only this one.
+        oxcfg = os.path.join(api, '.oxlintrc.json')
+        if os.path.isfile(cfg) or os.path.isfile(oxcfg):
             extras = set()
             routes = os.path.join(api, 'stateless', 'routes')
             if os.path.isdir(routes):
@@ -55206,6 +55209,7 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                         if n.endswith('.ts') and _cloudtak_has_ts_nocheck(p):
                             extras.add(os.path.relpath(p, api).replace(os.sep, '/'))
             patterns = ['stateless/routes/plugin-*.ts'] + sorted(extras)
+        if os.path.isfile(cfg):
             block = ('    /* cloudtak-marketplace-routes */\n    { ignores: ['
                      + ', '.join("'" + p.replace("'", '') + "'" for p in patterns) + '] },')
             with open(cfg, encoding='utf-8') as f:
@@ -55221,6 +55225,19 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
             if new != text:
                 _cloudtak_rewrite_in_place(cfg, new)
                 changed.append(os.path.relpath(cfg, ct_dir))
+        if os.path.isfile(oxcfg):
+            with open(oxcfg, encoding='utf-8') as f:
+                text = f.read()
+            data = json.loads(text)
+            have = list(data.get('ignorePatterns') or [])
+            add = [p for p in patterns if p not in have]
+            if add:
+                data['ignorePatterns'] = have + add
+                m = re.search(r'\n([ \t]+)"', text)
+                new = (json.dumps(data, indent=m.group(1) if m else 4, ensure_ascii=False)
+                       + ('\n' if text.endswith('\n') else ''))
+                _cloudtak_rewrite_in_place(oxcfg, new)
+                changed.append(os.path.relpath(oxcfg, ct_dir))
         if changed:
             plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
