@@ -117699,10 +117699,29 @@ def _broker_converge_running_source(plog=None):
     return True
 
 
-try:
-    _broker_converge_running_source()
-except Exception as _e:
-    print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+def _startup_broker_converge():
+    """Converge the broker, then refresh Guard Dog again if the broker changed.
+
+    ops #845: _auto_update_guarddog() runs earlier in this file (module load), while root's
+    broker still holds the PREVIOUS commit's templates (gd_render fills a script from the
+    broker's own copy of the repo). So on the first restart after Update Now, every Guard
+    Dog script was rendered from the old release, and the new one landed only on the next
+    restart: a script fix needed two restarts to reach a box. Once the broker has installed
+    this checkout's commit, run the refresh again. It only rewrites a script whose
+    content differs, so it is a no-op when nothing changed."""
+    try:
+        changed = _broker_converge_running_source()
+    except Exception as _e:
+        print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+        return
+    if changed:
+        try:
+            _auto_update_guarddog()
+        except Exception as _e:
+            print(f"[startup] Guard Dog refresh after broker convergence skipped (non-fatal): {_e}", flush=True)
+
+
+_startup_broker_converge()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's
