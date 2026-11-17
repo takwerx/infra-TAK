@@ -34039,11 +34039,8 @@ def _caddy_port_option_lines(settings=None):
 
 
 # ── ops #814: Caddy's admin API and the proxy-auth values are private ─────────────
-# Two things on a box with a domain name were open to every local account:
-#   * Caddy's admin API on 127.0.0.1:2019 (no login): it returns the running config and
-#     loads a new one;
-#   * the generated Caddyfile (0644), which held the value Caddy attaches after
-#     forward_auth.
+# The old layout: Caddy's admin API on 127.0.0.1:2019, and the value Caddy attaches
+# after forward_auth written in the generated Caddyfile.
 # The private layout:
 #   * the admin API is a unix socket in /run/caddy (a RuntimeDirectory, 0750 caddy:caddy)
 #     with mode 0200, Caddy's default: root and `caddy` only. Not group `caddy`: whether
@@ -34253,7 +34250,7 @@ def _caddy_private_problem(state, wait=20, sleep=None, clock=None):
 
 def _caddy_make_private(plog=None):
     """Move this box to the private layout (see the note above), and rotate the values,
-    because the old ones may have been read. Returns 'private' (moved now), 'already',
+    so the old ones stop working. Returns 'private' (moved now), 'already',
     'skipped' (no Caddy-fronted console here), 'old-caddy' or 'failed' (the old config is
     back in place; the next console start tries again). Never raises."""
     def say(msg):
@@ -34308,7 +34305,7 @@ def _caddy_make_private_locked(say, plog=None):
     ver = _caddy_version_tuple(refresh=True)
     if not ver or ver < _CADDY_MIN_FILE_PLACEHOLDER:
         say('⚠ SECURITY: Caddy %s is older than %s, so its admin API and the proxy auth '
-            'value stay readable by local accounts until Caddy is updated (Caddy page, Update).'
+            'value keep the old layout until Caddy is updated (Caddy page, Update).'
             % ('.'.join(map(str, ver)) if ver else '(version unknown)',
                '.'.join(map(str, _CADDY_MIN_FILE_PLACEHOLDER))))
         return 'old-caddy'
@@ -34415,7 +34412,7 @@ def _caddy_global_options_lines(cfg=None, grpc_streams=False, settings=None):
     """
     out = ['{', f'    grace_period {CADDY_GRACE_PERIOD}']
     if _caddy_private():
-        # ops #814: no admin API on 127.0.0.1:2019, where every local account could use it.
+        # ops #814: the admin API is a unix socket, not 127.0.0.1:2019.
         out.append(f'    admin unix/{CADDY_ADMIN_SOCKET}|{CADDY_ADMIN_SOCKET_MODE}')
     out += _caddy_port_option_lines(settings)
     out += _caddy_acme_inner_lines(cfg)
