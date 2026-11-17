@@ -46192,6 +46192,63 @@ def _takportal_install_caddy_validate_shim(log_fn=None):
         return 'error'
 
 
+# ops #879: TAK Portal's Marketplace "Deploy To Caddy" runs `bash -lc 'set -euo pipefail; ...;
+# exit 0'` over SSH. A login shell reads ~/.bash_logout when it exits, and errexit (set -e) is
+# still on there. Ubuntu's stock file ends with `[ -x /usr/bin/clear_console ] && clear_console -q`;
+# with no terminal clear_console exits 1, errexit fires, and the whole command exits 1 even though
+# the helper had already written and reloaded Caddy, so the Portal says it failed. Appending
+# `true` does not help (errexit stops the file at the failing line); `set +e` before it does.
+# Verified on Ubuntu 22.04 with a real sshd: stock file rc 1, `set +e` first rc 0.
+TAKPORTAL_LOGOUT_MARKER = 'infratak-portal-logout'
+TAKPORTAL_LOGOUT_BLOCK = (
+    '# ' + TAKPORTAL_LOGOUT_MARKER + ': TAK Portal runs its commands over SSH as\n'
+    "# `bash -lc 'set -e; ...'`, and errexit also applies to this file. Without this line a\n"
+    '# failing command below (clear_console with no terminal) makes the whole command exit 1.\n'
+    'set +e\n'
+)
+
+
+def _takportal_harden_logout_file(log_fn=None):
+    """ops #879: put `set +e` at the top of the console user's existing ~/.bash_logout.
+
+    Only an existing regular file is touched (no file, nothing to fail; Rocky 9's stock file is
+    one comment line and does not fail, it gets the same harmless line), and only once (marker). The rest of the file is kept byte for byte, with its mode.
+    Idempotent. Returns 'changed' | 'current' | 'absent' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        dest = os.path.expanduser('~/.bash_logout')
+        if os.path.islink(dest) or not os.path.exists(dest):
+            return 'absent'
+        if not os.path.isfile(dest):
+            return 'skipped'
+        with open(dest, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            have = f.read()
+        if TAKPORTAL_LOGOUT_MARKER in have:
+            return 'current'
+        mode = _stat.S_IMODE(os.stat(dest).st_mode)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix='.bash_logout-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                f.write(TAKPORTAL_LOGOUT_BLOCK + have)
+            os.chmod(tmp, mode)
+            os.replace(tmp, dest)
+            tmp = None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        _say(f"  \u2713 {dest}: added `set +e` so a failing logout line cannot make TAK Portal's "
+             "SSH commands exit 1 (Marketplace Deploy To Caddy said failed after it worked)")
+        return 'changed'
+    except Exception as e:
+        _say(f"  \u26a0 {os.path.expanduser('~/.bash_logout')} not changed (non-fatal): {e}")
+        return 'error'
+
+
 # ops #644: the portal key's line in the console user's authorized_keys is limited to what
 # TAK Portal needs. `restrict` turns off
 # port/agent/X11 forwarding, pty and ~/.ssh/rc; `from=` admits only the TAK Portal containers'
@@ -46463,6 +46520,9 @@ def _takportal_setup_ssh(log_fn=None):
 
         # ops #298: Marketplace Deploy To Caddy validates as this user.
         _takportal_install_caddy_validate_shim(log_fn=log_fn)
+
+        # ops #879: a failing ~/.bash_logout line must not turn the portal's SSH commands into exit 1.
+        _takportal_harden_logout_file(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -115631,6 +115691,17 @@ def _startup_migrations():
                 )
         except Exception as tp_shim_err:
             print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
+
+        # ops #879 — same for the console user's ~/.bash_logout: boxes that already run TAK Portal
+        # get `set +e` on the next console start, so Marketplace "Deploy To Caddy" stops saying
+        # failed after it worked. Idempotent; touches only an existing file.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_harden_logout_file(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_logout_err:
+            print(f"Startup migration: takportal logout file error (non-fatal): {tp_logout_err}")
 
         # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
         # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
