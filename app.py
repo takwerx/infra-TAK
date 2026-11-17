@@ -46715,16 +46715,16 @@ def takportal_ssh_status():
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
             # A TAK Portal that ships a helper infra-TAK has not pinned. It runs as root, so
             # infra-TAK keeps the pinned one it has until the new bytes are reviewed. Pinned
-            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.32 (apply-caddyfile validates as the caddy user,
-            # ops #340; 2.0.31/2.0.32 ops #538); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
-            # root-owned Caddyfile. A Portal NEWER than 2.0.32 waits for the next infra-TAK update.
+            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.36 (apply-caddyfile validates as the caddy user,
+            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.36 ops #848); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
+            # root-owned Caddyfile. A Portal NEWER than the last pinned one waits for the next infra-TAK update.
             if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
                 row('Marketplace helper', 'na', 'newer version not reviewed yet',
                     'This TAK Portal ships a marketplace helper that infra-TAK has not reviewed, '
                     'so infra-TAK keeps the older one. Marketplace steps that need the newer helper '
                     '(for example "Deploy To Caddy", which may fail with "Could not back up '
                     '/etc/caddy/Caddyfile") stay off. On TAK Portal 2.0.23 to 2.0.28, update TAK Portal '
-                    'to 2.0.29 or newer. On a Portal newer than 2.0.32 they wait for the next infra-TAK '
+                    'to 2.0.29 or newer. On a Portal newer than 2.0.36 they wait for the next infra-TAK '
                     'update, which adds the new helper after review. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
@@ -107397,6 +107397,18 @@ def _auto_update_guarddog():
                 updated += 1
                 if name == _GD_HEALTH_SCRIPT:
                     _gd_restart_health_endpoint()   # ops #815
+        # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
+        # above skips them. A box that already had SMS set up then kept the old sms_send.py
+        # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
+        # through every update. Refresh both when SMS is on and the script is on the box.
+        try:
+            if ((settings.get('guarddog_sms') or {}).get('provider')
+                    and os.path.exists('/opt/tak-guarddog/sms_send.py')):
+                for _sms_name in ('sms_send.py', 'sms_send.sh'):
+                    if _gd_install_script(_sms_name, _gd_template(_sms_name), {}):
+                        updated += 1
+        except Exception as _sms_e:
+            print(f"Guard Dog: SMS scripts not refreshed on startup: {_sms_e}", flush=True)
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
@@ -117849,10 +117861,29 @@ def _broker_converge_running_source(plog=None):
     return True
 
 
-try:
-    _broker_converge_running_source()
-except Exception as _e:
-    print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+def _startup_broker_converge():
+    """Converge the broker, then refresh Guard Dog again if the broker changed.
+
+    ops #845: _auto_update_guarddog() runs earlier in this file (module load), while root's
+    broker still holds the PREVIOUS commit's templates (gd_render fills a script from the
+    broker's own copy of the repo). So on the first restart after Update Now, every Guard
+    Dog script was rendered from the old release, and the new one landed only on the next
+    restart: a script fix needed two restarts to reach a box. Once the broker has installed
+    this checkout's commit, run the refresh again. It only rewrites a script whose
+    content differs, so it is a no-op when nothing changed."""
+    try:
+        changed = _broker_converge_running_source()
+    except Exception as _e:
+        print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+        return
+    if changed:
+        try:
+            _auto_update_guarddog()
+        except Exception as _e:
+            print(f"[startup] Guard Dog refresh after broker convergence skipped (non-fatal): {_e}", flush=True)
+
+
+_startup_broker_converge()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's
