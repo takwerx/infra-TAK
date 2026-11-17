@@ -3163,6 +3163,37 @@ def _distro_family():
         return 'rhel'
     return 'debian'
 
+# ops #852: repo ids that mean "CodeReady Builder / CRB" on the RHEL family:
+#   registered RHEL  codeready-builder-for-rhel-9-<arch>-rpms
+#   AWS RHUI RHEL    codeready-builder-for-rhel-9-rhui-rpms
+#   Rocky / Alma     crb
+_CRB_REPO_ID_RE = re.compile(r'^\[(codeready-builder[A-Za-z0-9._-]*-rpms|crb)\]\s*$')
+
+def _find_crb_repo_id(repos_dir='/etc/yum.repos.d'):
+    """Repo id of the CRB repo this RHEL-family box defines, or '' when there is none.
+
+    Reads the .repo files directly instead of asking dnf (`repolist --all`): on a
+    non-root console every dnf goes through the broker, and the broker's rulebook has
+    no `repolist` subcommand ("dnf subcommand not allowed: repolist"). A broker that
+    does not enforce yet logged WOULD-DENY there (Rocky 9, ops #852), and one that
+    enforces refused it, so CRB was never found. The .repo files are world-readable.
+    Source and debug repos are skipped, as the old `grep -vE 'source|debug'` did."""
+    try:
+        names = sorted(n for n in os.listdir(repos_dir) if n.endswith('.repo'))
+    except OSError:
+        return ''
+    for name in names:
+        try:
+            with open(os.path.join(repos_dir, name), errors='replace') as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = _CRB_REPO_ID_RE.match(line.strip())
+            if m and not re.search(r'source|debug', m.group(1)):
+                return m.group(1)
+    return ''
+
 def _tak_install_method():
     """'native' | 'container' — how TAK Server is (or will be) installed here.
 
@@ -13571,7 +13602,7 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'sudo dnf -y install epel-release 2>&1 || '
         f'sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-{el_ver}.noarch.rpm 2>&1 || true; '
         f'sudo dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-{el_ver}-{el_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1 || true; '
-        'sudo dnf -qy module disable postgresql 2>&1 || true; '
+        'sudo dnf -q -y module disable postgresql 2>&1 || true; '
         'sudo dnf -y install dnf-plugins-core 2>&1 || true; '
         '(sudo dnf config-manager --set-enabled crb 2>/dev/null || sudo dnf config-manager --set-enabled powertools 2>/dev/null || true); '
         # GH #56: verify EPEL actually landed — the DB rpm's postgis deps (hdf5,
@@ -15267,7 +15298,7 @@ def takserver_two_server_deploy_server_two():
         # to the Fedora EPEL rpm URL (no-op when the package name resolved above).
         run_cmd('rpm -q epel-release > /dev/null 2>&1 || dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm 2>&1', check=False, quiet=True)
         run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', check=False, quiet=True)
-        run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
+        run_cmd('dnf -q -y module disable postgresql 2>&1', check=False, quiet=True)
         run_cmd('dnf install -y java-17-openjdk-devel 2>&1', check=False, quiet=True)
         run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
         _core_ok = run_cmd(f'cd {UPLOAD_DIR} && dnf install -y ./{core_pkg} --setopt=clean_requirements_on_remove=false 2>&1', "Installing takserver-core (dnf)...")
@@ -96920,7 +96951,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         # already-installed box; powertools/CRB on Rocky, codeready-builder on RHEL).
         rc('dnf config-manager --set-enabled powertools 2>/dev/null; dnf config-manager --set-enabled crb 2>/dev/null; '
            'subscription-manager repos --enable codeready-builder-for-rhel-8-x86_64-rpms 2>/dev/null; '
-           'dnf -qy module disable postgresql 2>/dev/null; true')
+           'dnf -q -y module disable postgresql 2>/dev/null; true')
         # dnf install the new rpm — the guide's EXACT upgrade command (§5.2.1/5.2.2). The flag
         # --setopt=clean_requirements_on_remove=false is what PRESERVES the existing postgres DB +
         # deps when swapping the takserver rpm. NEVER use --allowerasing here (it would let dnf
@@ -97850,7 +97881,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         # Repo prereqs (idempotent on an already-installed box; powertools/CRB + module disable).
         rc('dnf config-manager --set-enabled powertools 2>/dev/null; dnf config-manager --set-enabled crb 2>/dev/null; '
            'subscription-manager repos --enable codeready-builder-for-rhel-8-x86_64-rpms 2>/dev/null; '
-           'dnf -qy module disable postgresql 2>/dev/null; true')
+           'dnf -q -y module disable postgresql 2>/dev/null; true')
 
         # ━━━ Step 1/5: Stop TAK Server ━━━
         ulog(""); ulog("━━━ Step 1/5: Stopping TAK Server ━━━")
@@ -99733,14 +99764,10 @@ def run_takserver_deploy(config):
             if _os_id.startswith('rhel'):
                 run_cmd(f'subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms 2>&1',
                         "Enabling CodeReady Builder (subscription-manager)...", check=False, quiet=True)
-            _crb_id = ''
+            # ops #852: read the .repo files, not `dnf repolist --all` (the broker's
+            # rulebook has no `repolist`; see _find_crb_repo_id).
             try:
-                _crb_id = subprocess.run(
-                    "dnf repolist --all 2>/dev/null | awk '{print $1}' | "
-                    "grep -E '^(codeready-builder[A-Za-z0-9._-]*-rpms|crb)$' | "
-                    "grep -vE 'source|debug' | head -1",
-                    shell=True, capture_output=True, text=True, timeout=120,
-                    env=_broker_shim_env()).stdout.strip()
+                _crb_id = _find_crb_repo_id()
             except Exception:
                 _crb_id = ''
             if _crb_id:
@@ -99754,7 +99781,7 @@ def run_takserver_deploy(config):
                 log_step(f"    subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms   # genuine RHEL only")
                 deploy_status.update({'error': True, 'running': False}); return
             run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-{_el_ver}-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
-            run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
+            run_cmd('dnf -q -y module disable postgresql 2>&1', check=False, quiet=True)
             run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
             # (the old blanket `--set-enabled crb` lived here; the discovery above
             #  already covers the clone case, and on RHUI it only ever errored)
