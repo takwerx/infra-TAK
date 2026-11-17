@@ -52352,9 +52352,10 @@ MEDIA_PORT_SRT=18890
 # (Node 26.13+), which closes the Brotli decoder CVE-2026-111497 that v9.12.1 (node:24) carried.
 # v9.14.0 adds lib/eip.ts, an AWS Elastic IP reconciler that starts ONLY when the container has
 # EIP_ALLOCATION_ID (the CloudTAK override never sets it, so it is inert on our boxes). Upstream
-# diff from v9.12.1 touches no mediamtx.yml, persist.ts or payload.ts. MediaMTX stays 1.21.2.
-# Still an amd64 + arm64 index (checked 2026-11-16).
-MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.14.0'
+# diff from v9.12.1 touches no mediamtx.yml, persist.ts or payload.ts. MediaMTX is 1.21.4 in v9.15.x.
+# NOT v9.13.0 to v9.15.0: those images lack libatomic, so Node 26 will not start and cloudtak-media-1
+# restarts with exit 127 (dfpc-coe/media-infra#63). v9.15.1 (2026-11-17) installs it. Still an amd64 + arm64 index.
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.15.1'
 MEDIA_INFRA_MULTIARCH = True
 
 # ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
