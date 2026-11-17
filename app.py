@@ -34248,8 +34248,9 @@ def _caddy_private_problem(state, wait=20, sleep=None, clock=None):
 def _caddy_make_private(plog=None):
     """Move this box to the private layout (see the note above), and rotate the values,
     so the old ones stop working. Returns 'private' (moved now), 'already',
-    'skipped' (no Caddy-fronted console here), 'old-caddy' or 'failed' (the old config is
-    back in place; the next console start tries again). Never raises."""
+    'skipped' (no Caddy-fronted console here), 'deferred' (the module registry is not
+    loaded yet; nothing was touched), 'old-caddy' or 'failed' (the old config is back in
+    place; the next console start tries again). Never raises."""
     def say(msg):
         print('[caddy-private] ' + msg, flush=True)
         if plog:
@@ -34275,6 +34276,10 @@ def _caddy_make_private_locked(say, plog=None):
     if not (settings.get('fqdn') or '').strip() or not os.path.exists(CADDYFILE_PATH) \
             or not shutil.which('caddy') or not _caddy_account():
         return 'skipped'
+    if not _CADDY_REGISTRY_READY.is_set():
+        # generate_caddyfile() does not write yet (GH #137): nothing can be moved, and
+        # nothing is touched. The call after the registry load does the work.
+        return 'deferred'
     state = _proxy_auth_state(create=True)
     try:
         prev_caddyfile = _read_priv(CADDYFILE_PATH) or ''
@@ -114298,19 +114303,6 @@ def _startup_migrations():
                     print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
                           f"(strip-only defense until next restart): {_pa_err}", flush=True)
 
-        # ops #814 SECURITY (every start until applied, then a cheap self-check): Caddy's
-        # admin API moves from 127.0.0.1:2019 to a unix socket and the proxy-auth values
-        # leave the Caddyfile for files only Caddy reads, with new values. Runs after the
-        # gate above so a first arm is not mixed with this. Restarts Caddy once.
-        try:
-            _cp_res = _caddy_make_private()
-            if _cp_res == 'private':
-                print("Startup migration: Caddy admin API and proxy auth values are now private "
-                      "(unix socket, values out of the Caddyfile, rotated)", flush=True)
-        except Exception as _cp_e:
-            print(f"Startup migration: ⚠ SECURITY: Caddy private layout error (retries next "
-                  f"restart): {_cp_e}", flush=True)
-
         # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
         # generate_caddyfile does nothing until the file is regenerated, and a manual
         # git pull + restart skips the Update-Now regen path — so converge here, the
@@ -118578,6 +118570,19 @@ _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 _caddy_registry_loaded()
+
+# ops #814 (every start until applied, then a cheap self-check): Caddy's admin API moves
+# from 127.0.0.1:2019 to a unix socket and the proxy-auth values leave the Caddyfile for
+# files Caddy reads, with new values. Restarts Caddy once. Here, not in
+# _startup_migrations(): until the module registry is loaded generate_caddyfile() does not
+# write (GH #137, above), and ATLAS takes its value through the registry.
+try:
+    if _caddy_make_private() == 'private':
+        print("Startup migration: Caddy admin API and proxy auth values are now private "
+              "(unix socket, values out of the Caddyfile, rotated)", flush=True)
+except Exception as _cp_e:
+    print(f"Startup migration: ⚠ SECURITY: Caddy private layout error (retries next "
+          f"restart): {_cp_e}", flush=True)
 
 
 # ── TAK Client Feed — the ONE public, token-authed route family (v10.1.76) ──

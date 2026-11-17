@@ -239,7 +239,7 @@ class Box:
 
     def __init__(self, *, fqdn='example.com', state=None, caddyfile=None, version=(2, 11, 9),
                  dropin_ok=True, generate_rejects=False, restart_rc=0, problem='',
-                 atlas_errs=None, tcp_open=False, files=None):
+                 atlas_errs=None, tcp_open=False, files=None, registry_ready=True):
         self.state = dict(state if state is not None else {'secret': OLD, 'enforce': True})
         self.caddyfile = _old_caddyfile() if caddyfile is None else caddyfile
         self.files = dict(files or {})
@@ -282,6 +282,7 @@ class Box:
             'subprocess': types.SimpleNamespace(run=run),
             '_sudo_wrap': lambda argv: argv,
             'load_settings': lambda: {'fqdn': fqdn},
+            '_CADDY_REGISTRY_READY': types.SimpleNamespace(is_set=lambda: registry_ready),
             '_caddy_account': lambda: ('/var/lib/caddy', 998, 999),
             '_proxy_auth_state': lambda create=False: dict(box.state),
             '_save_proxy_auth_state': save_state,
@@ -767,10 +768,22 @@ def test_the_boot_drop_in_is_left_as_every_release_writes_it():
 
 
 def test_startup_and_caddy_deploy_both_make_the_box_private():
-    mig = _segment('_startup_migrations')
-    assert mig.index("s.get('caddy_proxy_auth_gate_v1')") < mig.index('_caddy_make_private()')
+    """The start-up move runs right after the module registry is loaded, never inside
+    _startup_migrations(): until then generate_caddyfile() builds the file and does not
+    write it (GH #137), so a move there finds the old Caddyfile and gives up (seen on a
+    box with ATLAS: the update never moved it)."""
+    assert '_caddy_make_private' not in _segment('_startup_migrations')
+    tail = APP.split('\n_caddy_registry_loaded()\n', 1)[1]
+    assert tail.index('_caddy_make_private()') < 1200             # the next statement
     assert APP.count('_caddy_make_private(plog)') >= 1            # the Caddy deploy
     assert '_caddy_run_dropin_ensure()' in _segment('_caddy_make_private_locked')
+
+
+def test_before_the_registry_is_loaded_nothing_is_touched():
+    box = Box(registry_ready=False)
+    assert box.move() == 'deferred'
+    assert box.events == [] and box.says == [] and box.audits == []
+    assert box.state == {'secret': OLD, 'enforce': True} and box.files == {}
 
 
 def _run_dropin(cur):
