@@ -404,6 +404,9 @@ def runner(monkeypatch, tmp_path):
     monkeypatch.setattr(atlas, '_module_git', forbidden, raising=False)
     monkeypatch.setattr(atlas, '_compose', forbidden)
     monkeypatch.setattr(atlas, '_write_build_file', forbidden)
+    # ops #864: the backup before an update has its own tests (test_atlas_backup_before_update.py);
+    # these ones are about which release is chosen.
+    monkeypatch.setattr(atlas, 'backup_database', lambda *a, **k: None)
     monkeypatch.setattr(atlas, 'deployment_identity',
                         lambda c, i, s: {'name': 'corona',
                                          'dir': str(d).replace(chr(92), '/'),

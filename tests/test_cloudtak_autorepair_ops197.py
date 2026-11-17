@@ -197,6 +197,7 @@ class Box:
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
+                '_CLOUDTAK_PORTAL_JOB_RE',   # ops #850: TAK Portal's helper counts as a stack change
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
             + [_fn(n) for n in (
                 '_open_secret_w',   # ops #632: _cloudtak_env_set writes the .env through it
@@ -205,7 +206,8 @@ class Box:
                 '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
                 '_ct_docker_out', '_cloudtak_override_services', '_cloudtak_containers_without_override',
                 '_cloudtak_write_override_file', '_cloudtak_recreate_and_heal',
-                '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_autorepair_wait_reason',
+                '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_stack_busy_procs',
+                '_cloudtak_autorepair_wait_reason',
                 '_cloudtak_autorepair_record', '_cloudtak_autorepair_record_save',
                 '_cloudtak_autorepair_request', '_cloudtak_autorepair_run',
                 '_cloudtak_autorepair_notify')])

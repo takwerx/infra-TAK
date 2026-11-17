@@ -113,8 +113,8 @@ def test_old_4140_override_is_rewritten_and_only_coturn_recreated(tmp_path):
     n, calls, _ = _ns(tmp_path, SETTINGS)
     assert n['_coturn_converge_override']() == 'rewritten'
     new = p.read_text()
-    assert 'image: coturn/coturn:4.18.0' in new and '4.14.0' not in new
-    assert n['COTURN_IMAGE'] == 'coturn/coturn:4.18.0'
+    assert 'image: coturn/coturn:4.19.1' in new and '4.14.0' not in new
+    assert n['COTURN_IMAGE'] == 'coturn/coturn:4.19.1'
     # port, user, password, realm and external IP kept from the file
     for keep in ('"3479:3479/tcp"', '"3479:3479/udp"', '--listening-port=3479',
                  '--user=turnuser:s3cretPass9', '--realm=tak.example.com',
