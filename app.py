@@ -2963,6 +2963,15 @@ def _stamp_session_login():
     session[SESSION_TOKEN_KEY] = _session_auth_token()
 
 
+def _stamp_notice_login(fresh):
+    """Per-login id for notice bars that come back on every login (the root-console
+    bar). fresh=True on a password login: a new id, so a dismissal from the last
+    login no longer applies. The SSO path runs on EVERY request, so it only sets the
+    id when the session has none (a new SSO session, or after logout cleared it)."""
+    if fresh or not session.get('notice_login'):
+        session['notice_login'] = secrets.token_hex(6)
+
+
 def _drop_stale_session():
     if not session.get('authenticated'):
         return
@@ -4900,6 +4909,7 @@ def _apply_authentik_session():
     session['auth_via'] = 'password' if _had_password_session else 'sso'
     session['sso_ok_at'] = int(time.time())
     _stamp_session_login()   # ops #634
+    _stamp_notice_login(False)
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
@@ -5916,6 +5926,34 @@ def _no_retention_bar(settings):
             'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
 
 
+def _root_console_bar(settings):
+    """Spec for the "this console runs as root" bar, or None.
+
+    Fresh installs have been born non-root (takwerx @ /opt/infratak) since v10.0.5,
+    but an EXISTING root install stays root on every update — start.sh and Update
+    Now never flip it. The only way off root is the "Switch to non-root" button on
+    the Cyber Controls page, and nothing pointed a root operator at it, so legacy
+    boxes stayed root indefinitely (field report #523 hit a root-only ETL build
+    path). This bar is that pointer.
+
+    Dismissible, but it comes back on every login (operator decision 2026-11-16):
+    the dismissal key carries the per-login id from _stamp_notice_login(). It clears
+    by itself after the switch because the console process is no longer uid 0. No
+    I/O on the render path."""
+    try:
+        if os.getuid() != 0:
+            return None
+        login_id = str(session.get('notice_login') or '')
+    except Exception:
+        return None
+    body = ('⚠ This console runs as root (an older install). Switch to the non-root console '
+            'for least privilege — one click, with automatic rollback. '
+            '<a href="/hardening#console-guard" style="color:inherit;text-decoration:underline">'
+            'Switch to non-root →</a>')
+    return {'cls': 'rootcon-banner', 'key': 'rootconsole:' + login_id, 'fg': '#eab308',
+            'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def _tak_cert_names_bar(settings):
     """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
 
@@ -5977,7 +6015,7 @@ def render_notice_bars(settings):
 
 def _render_notice_bars_inner(settings):
     specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
-                         _tak_cert_names_bar(settings)) if b]
+                         _tak_cert_names_bar(settings), _root_console_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -7607,6 +7645,7 @@ def login():
             session['auth_via'] = 'password'   # ops #813
             session['last_activity'] = int(time.time())
             _stamp_session_login()   # ops #634
+            _stamp_notice_login(True)
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
@@ -7650,6 +7689,7 @@ def index():
             session['auth_via'] = 'password'
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             _stamp_session_login()   # ops #634
+            _stamp_notice_login(True)
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         _console_log_failed_login('/')   # ops #638
