@@ -29030,10 +29030,14 @@ NODE_SECURITY_RELEASES = (
     # shipped the fix yet (nodered/node-red:4.1.17-22 is still on 22.23.4, last pushed
     # 2026-10-21). They are left out of the flag and the email, because pressing Update could
     # never clear them. Remove the key the day Node-RED ships a rebuilt tag and NODERED_IMAGE
-    # moves to it.
+    # moves to it. A container name works too: `cloudtak-print` (Node 24, the TAK Portal
+    # Marketplace Print plugin) is left out for the same reason. The CloudTAK card's Update
+    # never builds it (its compose file is kept out of COMPOSE_FILE on purpose, see
+    # _CLOUDTAK_PRINT_PLUGIN_COMPOSE), so a red CloudTAK flag for it could never clear. Print
+    # also serves cleartext HTTP on a loopback port, which CVE-2026-123864 does not touch.
     {'id': 'CVE-2026-123864', 'released': '2026-11-11',
      'fixed': {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'},
-     'upstream_pending': ('nodered',),
+     'upstream_pending': ('nodered', 'cloudtak-print'),
      'reason': 'several flaws in how Node.js handles HTTPS and HTTP/2, including one that can '
                'leak server memory into web responses'},
 )
@@ -29058,16 +29062,17 @@ def _node_version_tuple(v):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
-def _node_releases_missing(version, module=None):
+def _node_releases_missing(version, module=None, container=None):
     """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
     that does not parse, or a major no entry lists, is not claimed. An entry that lists
-    `module` under `upstream_pending` is not claimed for that module (ops #824)."""
+    `module` or `container` under `upstream_pending` is not claimed for it (ops #824)."""
     ver = _node_version_tuple(version)
     if ver is None:
         return []
     out = []
     for rel in NODE_SECURITY_RELEASES:
-        if module in rel.get('upstream_pending', ()):
+        pending = rel.get('upstream_pending', ())
+        if module in pending or container in pending:
             continue
         fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
         if fixed is not None and ver < fixed:
@@ -29114,7 +29119,7 @@ def _node_security_gaps(versions=None):
     for key, per_container in versions.items():
         outdated, rels = {}, {}
         for cname, ver in per_container.items():
-            missing = _node_releases_missing(ver, key)
+            missing = _node_releases_missing(ver, key, cname)
             if missing:
                 outdated[cname] = ver
                 rels.update({r['id']: r for r in missing})

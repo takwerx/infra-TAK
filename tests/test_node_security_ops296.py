@@ -284,6 +284,27 @@ def test_node_red_on_22_23_4_gets_no_email_until_its_image_is_rebuilt():
     assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
 
 
+PS_PRINT = PS + 'cloudtak-print|cloudtak|cloudtak-print\n'
+
+
+def test_print_plugin_on_node_24_22_2_is_not_flagged_for_the_new_release():
+    # ops #824: the CloudTAK card's Update never builds Print (its compose file is kept out of
+    # COMPOSE_FILE), so a CloudTAK flag for it would stay red after Update. Print is also plain HTTP.
+    n = _ns(dict(FIXED, **{'cloudtak-print': 'v24.22.2'}), ps=PS_PRINT)
+    versions = n['_node_container_versions']()
+    assert versions['cloudtak']['cloudtak-print'] == 'v24.22.2'
+    assert n['_node_security_gaps'](versions) == {}
+    assert n['_node_security_items'](versions) == []
+
+
+def test_print_plugin_on_an_older_node_24_is_still_flagged_for_the_earlier_release():
+    # the exclusion covers the 2026-11-11 release only; the earlier fix (24.22.1) still counts
+    n = _ns(dict(FIXED, **{'cloudtak-print': 'v24.22.0'}), ps=PS_PRINT)
+    gaps = n['_node_security_gaps'](n['_node_container_versions']())
+    assert list(gaps) == ['cloudtak']
+    assert [r['id'] for r in gaps['cloudtak']['releases']] == ['CVE-2026-111497']
+
+
 def test_box_on_fixed_node_gets_no_email():
     r, sent, saved = _sweep(FIXED, {})
     assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
