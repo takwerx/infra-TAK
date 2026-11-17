@@ -74,6 +74,7 @@ Official: [docs.goauthentik.io](https://docs.goauthentik.io/), [LDAP provider](h
 - The outpost caches the directory (`bind_mode` and `search_mode` cached), so a group change in Authentik reaches TAK Server after the cache time plus TAK's own refresh. 📖
 - TAK Server binds as the service account `adm_ldapservice`. Besides that service account, the `tak_ROLE_ADMIN` group and the `webadmin` user are the only group and user infra-TAK creates itself. Every other `tak_*` group comes from TAK Portal.
 - After restarting `authentik-worker`, blueprints have to re-apply before LDAP queries work.
+- **Authentik does not limit the characters in a username or a group name.** Its API (`POST /api/v3/core/users/`, `POST /api/v3/core/groups/`) stored names with spaces, quotes, `<`, `>` and `&` exactly as sent. Treat every name that comes from Authentik as free text: escape it for the place it goes (a page, a shell command, an LDAP filter). ✅ verified 2026-11-17, test6, Authentik 2026.8.5 (ops #827).
 - Two things at once on one box can starve it. A first-time Authentik deploy next to a TAK Server, Node-RED and MediaMTX deploy has produced `127.0.0.1:9090: connection refused` (502) from Caddy. Space deploys out. 👁 observed.
 
 ## TAK Portal
