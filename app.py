@@ -107098,6 +107098,18 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+        # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
+        # above skips them. A box that already had SMS set up then kept the old sms_send.py
+        # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
+        # through every update. Refresh both when SMS is on and the script is on the box.
+        try:
+            if ((settings.get('guarddog_sms') or {}).get('provider')
+                    and os.path.exists('/opt/tak-guarddog/sms_send.py')):
+                for _sms_name in ('sms_send.py', 'sms_send.sh'):
+                    if _gd_install_script(_sms_name, _gd_template(_sms_name), {}):
+                        updated += 1
+        except Exception as _sms_e:
+            print(f"Guard Dog: SMS scripts not refreshed on startup: {_sms_e}", flush=True)
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
