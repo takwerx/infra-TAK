@@ -112066,7 +112066,7 @@ exit 0
 '''
 
 
-def _ensure_console_restart_timer():
+def _ensure_console_restart_timer(settings=None):
     """v0.9.44: install/repair the daily console-restart timer + idle-gate script.
 
     Recovers the wedged-worker failure mode (test6/test8, 2026-06-03): port 5001
@@ -112078,6 +112078,19 @@ def _ensure_console_restart_timer():
 
     Idempotent -- safe to call on every console boot from _startup_migrations.
     Returns a short status string for the boot log, or '' when nothing changed.
+
+    The owner's "off" is kept (takwerx/ops #834, infra-TAK #520: an agency that
+    moved its console and turned the nightly restart off had it come back on
+    every boot). The timer is NOT enabled again when either
+      * `console_restart_timer_off` is true in settings.json, or
+      * the timer unit already existed and systemd says it is disabled/masked
+        (the owner ran `systemctl disable` on it). That is recorded as
+        `console_restart_timer_off` so the owner's choice is written down.
+    A first install (no timer unit yet) still arms it. To arm it again the owner
+    runs `systemctl enable --now takconsolerestart.timer`; the flag then clears.
+    `settings` is the caller's loaded settings dict; this changes it in place and
+    the caller saves it (a second load/save here would be overwritten by the
+    caller's older copy).
     """
     try:
         script_path = '/usr/local/sbin/tak-console-restart.sh'
@@ -112109,6 +112122,17 @@ def _ensure_console_restart_timer():
         )
 
         changed = False
+        _off_flag = bool((settings or {}).get('console_restart_timer_off'))
+        _existed = os.path.exists(tmr_path)
+        _state_r = subprocess.run(
+            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
+            capture_output=True, text=True, timeout=5)
+        _state = (_state_r.stdout or '').strip()
+        _owner_off = _off_flag or (_existed and _state in ('disabled', 'masked', 'masked-runtime'))
+        if _state == 'enabled' and _off_flag and settings is not None:
+            # The owner armed it again by hand: the flag no longer applies.
+            settings.pop('console_restart_timer_off', None)
+            _off_flag = _owner_off = False
 
         def _write_if_changed(path, content, mode=None):
             cur = ''
@@ -112128,10 +112152,13 @@ def _ensure_console_restart_timer():
         changed |= _write_if_changed(svc_path, svc_content)
         changed |= _write_if_changed(tmr_path, tmr_content)
 
-        _enabled = subprocess.run(
-            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
-            capture_output=True, text=True, timeout=5)
-        if changed or 'enabled' not in (_enabled.stdout or ''):
+        if _owner_off:
+            if settings is not None and not _off_flag:
+                settings['console_restart_timer_off'] = True
+            if changed:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            return 'console-restart timer left off (owner turned it off)'
+        if changed or _state != 'enabled':
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takconsolerestart.timer']),
                            capture_output=True, text=True, timeout=10)
@@ -113302,7 +113329,10 @@ def _startup_migrations():
         # v0.9.44: ensure the daily console-restart timer exists (recovers a
         # wedged gunicorn worker; loads pulled code). Runs every boot, idempotent.
         try:
-            _crt_msg = _ensure_console_restart_timer()
+            _crt_before = s.get('console_restart_timer_off')
+            _crt_msg = _ensure_console_restart_timer(s)
+            if s.get('console_restart_timer_off') != _crt_before:
+                settings_dirty = True
             if _crt_msg:
                 print(f"Startup migration: {_crt_msg}", flush=True)
         except Exception as _crt_e:
