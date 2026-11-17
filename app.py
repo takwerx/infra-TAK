@@ -1807,7 +1807,9 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
 # keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
 # whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
 AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.0"  # UNDER TRIAL (ops #427)
+# ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
+# check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
 NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
 
 
