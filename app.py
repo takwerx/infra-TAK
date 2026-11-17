@@ -107144,6 +107144,52 @@ def _gd_baked_remote_values(path):
     return vals if vals.get('DB_HOST') else None
 
 
+# ops #863: mediamtx-cert-sync.sh is an optional script (the startup sync skips it), so
+# a fix to its template never reached a box until the owner deployed MediaMTX again.
+# Its endpoint is baked into the installed copy as VAR="value" lines; (variable in the
+# script, placeholder in the template).
+_GD_BAKED_MTX_KEYS = (
+    ('DOMAIN', 'MTX_DOMAIN_PLACEHOLDER'),
+    ('REMOTE_HOST', 'MTX_HOST_PLACEHOLDER'),
+    ('REMOTE_USER', 'MTX_USER_PLACEHOLDER'),
+    ('PORT', 'MTX_PORT_PLACEHOLDER'),
+    ('SSH_KEY', 'MTX_KEYFILE_PLACEHOLDER'),
+)
+
+
+def _gd_baked_mtx_values(path):
+    """The endpoint an installed mediamtx-cert-sync.sh was deployed with, read from its own
+    `VAR="value"` lines: {MTX_*_PLACEHOLDER: value}, or None when the script is absent or
+    was never filled in. The key file may be empty (the deploy found none)."""
+    try:
+        cur = _read_priv(path)
+    except Exception:
+        return None
+    vals = {}
+    for var, ph in _GD_BAKED_MTX_KEYS:
+        m = re.search(r'^%s="([^"\n]*)"$' % var, cur or '', re.M)
+        if not m or 'PLACEHOLDER' in m.group(1):
+            return None
+        vals[ph] = m.group(1)
+    if not all(vals[ph] for var, ph in _GD_BAKED_MTX_KEYS if var != 'SSH_KEY'):
+        return None
+    return vals
+
+
+def _gd_refresh_mtx_cert_sync():
+    """Render mediamtx-cert-sync.sh again from the current template, keeping the endpoint
+    it was deployed with. Does nothing on a box without a remote MediaMTX cert sync.
+    Returns True when the script changed. Root still checks every value (gd_render)."""
+    baked = _gd_baked_mtx_values('/opt/tak-guarddog/mediamtx-cert-sync.sh')
+    if not baked:
+        return False
+    try:
+        return bool(_gd_install_script('mediamtx-cert-sync.sh', _gd_template('mediamtx-cert-sync.sh'), baked))
+    except Exception as e:
+        print(f"Guard Dog: mediamtx-cert-sync.sh refresh skipped: {str(e)[:200]}", flush=True)
+        return False
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -107235,6 +107281,10 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+        # ops #863: the optional remote-MediaMTX cert sync is skipped above; refresh it here
+        # with the endpoint it already holds, so a template fix reaches the box on update.
+        if _gd_refresh_mtx_cert_sync():
+            updated += 1
         # v10.0.2: ensure the build-cache reclaim timer exists on a plain pull+restart
         # (the startup auto-update copies scripts but historically never installed new
         # timers — that gap left the daily reclaim un-scheduled until someone clicked
