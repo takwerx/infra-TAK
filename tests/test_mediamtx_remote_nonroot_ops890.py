@@ -31,6 +31,7 @@ TREE = ast.parse(APP)
 # Every remote MediaMTX code path that runs a command on the SSH target.
 REMOTE_MEDIAMTX_FUNCS = (
     '_run_mediamtx_deploy_remote',
+    '_mediamtx_remote_clear_staging',
     '_ensure_takwerx_system_user_remote',
     '_mediamtx_editor_remote_py_deps',
     'mediamtx_recovery',
@@ -236,3 +237,63 @@ def test_remote_deploy_step_one_still_passes_for_root(tmp_path):
     text = '\n'.join(plog_lines)
     assert '✓ Dependencies installed' in text, text
     assert 'sudo' not in log.read_text()
+
+
+# --------------------------------------------------------------------------- staging files in /tmp
+# Found on the real two-VM box: the deploy ran the tar extract as root in /tmp, which left a
+# root-owned mediamtx.yml (upstream's 39 KB default) and LICENSE behind, and the copy of our own
+# mediamtx.yml as the non-root SSH user then died at Step 4 with "Permission denied".
+
+def _const(name):
+    for node in TREE.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, 'id', None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f'{name} not found at module level in app.py')
+
+
+def test_step_three_extracts_only_the_binary():
+    src = _src('_run_mediamtx_deploy_remote')
+    assert 'tar -xzf {tarball} mediamtx &&' in src, \
+        'extract only the mediamtx binary: the tarball also holds mediamtx.yml and LICENSE, which a root run leaves in /tmp'
+    assert 'tar -xzf {tarball} &&' not in src
+
+
+def _tmp_copy_targets(fname):
+    targets = []
+    for call in _calls_to(_func(fname), {'_module_copy'}):
+        if len(call.args) > 2:
+            try:
+                t = ast.literal_eval(call.args[2])
+            except Exception:
+                continue
+            if isinstance(t, str) and t.startswith('/tmp/'):
+                targets.append(t)
+    return targets
+
+
+@pytest.mark.parametrize('fname', ('_run_mediamtx_deploy_remote', 'mediamtx_recovery'))
+def test_every_tmp_copy_target_is_cleared_first(fname):
+    staging = _const('_MEDIAMTX_REMOTE_STAGING')
+    targets = _tmp_copy_targets(fname)
+    assert targets, f'{fname} copies nothing to /tmp? the test lost its target list'
+    missing = [t for t in targets if t not in staging]
+    assert not missing, f'{fname} copies to {missing} in /tmp but _MEDIAMTX_REMOTE_STAGING does not clear them'
+
+
+@pytest.mark.parametrize('fname', ('_run_mediamtx_deploy_remote', 'mediamtx_recovery'))
+def test_staging_is_cleared_before_the_first_copy(fname):
+    src = _src(fname)
+    assert '_mediamtx_remote_clear_staging(' in src
+    assert src.index('_mediamtx_remote_clear_staging(') < src.index('_module_copy('), \
+        'clear the root-owned leftovers BEFORE the first copy into /tmp'
+
+
+def test_clear_staging_removes_every_name_as_root():
+    seen = []
+    ns = {'_module_run_root': lambda cfg, cmd, timeout=120, log_fn=None: seen.append(cmd) or (True, ''),
+          '_MEDIAMTX_REMOTE_STAGING': _const('_MEDIAMTX_REMOTE_STAGING')}
+    exec(compile(_src('_mediamtx_remote_clear_staging'), 'app.py', 'exec'), ns)
+    ns['_mediamtx_remote_clear_staging']({'target_mode': 'remote'})
+    assert len(seen) == 1 and seen[0].startswith('rm -f ')
+    for name in ns['_MEDIAMTX_REMOTE_STAGING']:
+        assert name in seen[0]
