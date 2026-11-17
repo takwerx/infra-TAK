@@ -144,6 +144,12 @@ Official: [docs.docker.com](https://docs.docker.com/)
 - Confirm what a container really runs with `docker inspect` (image digest, mounts, env, compose working directory label `com.docker.compose.project.working_dir`), not with the compose file. Do not guess where Authentik's compose project lives.
 - Container logs fill disks; Guard Dog caps them.
 
+## NetBird
+
+Official: [docs.netbird.io](https://docs.netbird.io/)
+
+- **The `netbirdio/netbird-server` images (0.80.0, 0.82.0, 0.82.1) carry the `org.opencontainers.image.version` label of their Ubuntu base image (`24.04`), not the NetBird version.** The dashboard image's label is right. To read the running server version, use the tag in `docker inspect --format '{{.Config.Image}}'`, which compose pins. The label is a fallback only when it starts with `0.`. ✅ verified 2026-11-16, Ubuntu 22.04 fresh-install box (ops #853).
+
 ## Shell scripts and systemd units that are rewritten while they run
 
 Official: [bash manual, shell scripts](https://www.gnu.org/software/bash/manual/html_node/Shell-Scripts.html), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
