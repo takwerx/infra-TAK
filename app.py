@@ -34065,7 +34065,7 @@ _CADDY_PROXY_AUTH_FILES = {'console': 'infratak-proxy-auth-console',
                            'atlas': 'infratak-proxy-auth-atlas'}
 _PROXY_AUTH_VALUE_RE = re.compile(r'^[0-9a-f]{64}$')
 CADDY_BOOT_DROPIN = '/etc/systemd/system/caddy.service.d/10-takwerx-boot.conf'
-CADDY_BOOT_DROPIN_TEXT = (
+CADDY_BOOT_DROPIN_TEXT_BASE = (
     '[Unit]\n'
     'After=network-online.target\n'
     'Wants=network-online.target\n'
@@ -34073,6 +34073,8 @@ CADDY_BOOT_DROPIN_TEXT = (
     '[Service]\n'
     'Restart=on-failure\n'
     'RestartSec=5s\n'
+)
+CADDY_BOOT_DROPIN_TEXT = CADDY_BOOT_DROPIN_TEXT_BASE + (
     'RuntimeDirectory=caddy\n'
     'RuntimeDirectoryMode=0750\n'
 )
@@ -34149,20 +34151,26 @@ def _caddy_read_proxy_auth_file(kind):
         return ''
 
 
-def _caddy_boot_dropin_ensure():
+def _caddy_boot_dropin_ensure(runtime_dir=True):
     """Write the Caddy drop-in (boot ordering, restart on failure, /run/caddy) when it
     differs. Returns (in_place, changed). Never raises. A broker older than this release
-    refuses RuntimeDirectory=; the caller tries again on the next console start."""
+    refuses RuntimeDirectory=; the caller tries again on the next console start.
+
+    runtime_dir=False is for the step that runs before the broker has been brought up
+    to this release (_startup_harden_caddy_boot): it writes the text without /run/caddy,
+    which every broker accepts, and leaves a drop-in that already has /run/caddy alone.
+    _caddy_make_private() adds /run/caddy later in the same start."""
     try:
         try:
             with open(CADDY_BOOT_DROPIN) as f:
                 cur = f.read()
         except Exception:
             cur = ''
-        if cur.strip() == CADDY_BOOT_DROPIN_TEXT.strip():
+        want = CADDY_BOOT_DROPIN_TEXT if runtime_dir else CADDY_BOOT_DROPIN_TEXT_BASE
+        if cur.strip() in (CADDY_BOOT_DROPIN_TEXT.strip(), want.strip()):
             return True, False
         _makedirs_priv(os.path.dirname(CADDY_BOOT_DROPIN))
-        _write_priv(CADDY_BOOT_DROPIN, CADDY_BOOT_DROPIN_TEXT)
+        _write_priv(CADDY_BOOT_DROPIN, want)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
         return True, True
     except Exception as e:
@@ -107877,9 +107885,13 @@ def _startup_harden_caddy_boot():
 
     try:
         import shutil as _sh
-        if _sh.which('caddy') and _caddy_boot_dropin_ensure()[1]:
+        # A non-root console is still talking to the previous release's broker here (it
+        # is replaced later in this start), and that broker refuses RuntimeDirectory=. So
+        # this step asks for /run/caddy only on a root console or a box already moved.
+        _rt = _caddy_private() or not (_broker_should_route() and _broker_available())
+        if _sh.which('caddy') and _caddy_boot_dropin_ensure(runtime_dir=_rt)[1]:
             print('Startup migration: Caddy boot drop-in installed (network-online ordering + '
-                  'Restart=on-failure + /run/caddy; v10.1.7 WS6, ops #814)')
+                  'Restart=on-failure%s; v10.1.7 WS6, ops #814)' % (' + /run/caddy' if _rt else ''))
         if _read(sysctl_path).strip() != sysctl_content.strip():
             _write_priv(sysctl_path, sysctl_content)
             # Apply the runtime value with `sysctl -w <param>=<val>`, NOT `-p <file>`:
