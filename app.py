@@ -1589,9 +1589,12 @@ def apply_security_headers(response):
     # v0.9.29 (security audit LOW): dropped 'unsafe-eval' — codebase has no
     # eval()/new Function()/string-form setTimeout. Inline scripts still
     # require 'unsafe-inline' (template surgery deferred to nonces).
+    # ops #897: script-src lost `https:`. No console page loads a script from another
+    # host (tests/test_console_csp_script_src_ops897.py keeps it so), and with `https:`
+    # a script injected into a page could load a second script from anywhere.
     csp = (
         "default-src 'self' https: data: blob:; "
-        "script-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline' https:; "
         "img-src 'self' data: https:; "
         "font-src 'self' data: https:; "
