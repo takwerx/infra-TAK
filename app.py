@@ -48379,6 +48379,35 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
     return 'on', failed
 
 
+# ops #892: Step 1 of the remote deploy ran a bare `apt-get`, so a Rocky/RHEL 9 remote host stopped
+# there ("apt install failed"). The same package set, branched on the REMOTE host's own package
+# manager (the console's distro says nothing about the target). Mirrors the local deploy:
+# EPEL + CRB for the general set (GH #56: genuine RHEL has no `epel-release` package, so fall
+# back to the Fedora EPEL rpm), core packages strictly, then ffmpeg from RPM Fusion
+# (EPEL/RHEL only ship `ffmpeg-free`, no libx264/libx265) with `ffmpeg-free` as the fallback.
+# A missing ffmpeg warns and does not fail: MediaMTX streams without it. `sudo -n` for a
+# non-root SSH user. NON-ROOT-COMMANDS: dnf, apt-get, rpm.
+_MEDIAMTX_REMOTE_DEPS_SH = (
+    'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+    'if command -v dnf >/dev/null 2>&1; then '
+    'EL=$(rpm -E %rhel 2>/dev/null); case "$EL" in ""|*[!0-9]*) EL=9;; esac; '
+    '$S dnf install -y epel-release dnf-plugins-core >/dev/null 2>&1; '
+    'if ! rpm -q epel-release >/dev/null 2>&1; then '
+    '$S dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$EL.noarch.rpm" >/dev/null 2>&1; '
+    '$S dnf install -y dnf-plugins-core >/dev/null 2>&1; fi; '
+    '$S dnf config-manager --set-enabled crb >/dev/null 2>&1 || '
+    '$S dnf config-manager --set-enabled powertools >/dev/null 2>&1; '
+    '$S dnf install -y wget tar curl openssl python3 python3-pip 2>&1 || exit 1; '
+    '$S dnf install -y "https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$EL.noarch.rpm" >/dev/null 2>&1; '
+    '$S dnf install -y ffmpeg >/dev/null 2>&1 || $S dnf install -y ffmpeg-free >/dev/null 2>&1 || '
+    'echo "INFRATAK-FFMPEG-MISSING"; '
+    'elif command -v apt-get >/dev/null 2>&1; then '
+    '$S apt-get update -qq && '
+    '$S env DEBIAN_FRONTEND=noninteractive apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1; '
+    'else echo "no dnf or apt-get on this host"; false; fi'
+)
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -48393,12 +48422,16 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 1: Dependencies
     plog("━━━ Step 1/7: Installing Dependencies (remote) ━━━")
-    ok, out = _module_run(deploy_cfg, 'apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1', timeout=300, log_fn=plog)
+    # ops #892: branches on the remote host's own package manager (Rocky/RHEL or Ubuntu).
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH, timeout=900, log_fn=plog)
     if not ok:
-        plog(f"✗ apt install failed: {(out or '')[-300:]}")
+        plog(f"✗ Installing packages on the remote host failed: {(out or '')[-300:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
+    if 'INFRATAK-FFMPEG-MISSING' in (out or ''):
+        plog("⚠ ffmpeg unavailable on the remote host — MediaMTX streaming OK, but recording / "
+             "MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
     # any chown / unit install happens. See `_ensure_takwerx_system_user`
