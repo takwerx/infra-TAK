@@ -2330,7 +2330,12 @@ def _proxy_auth_secret(ctx=None):
                 # file, so the direct read is the normal path; `_read_priv`
                 # covers a console whose config directory it cannot traverse
                 # as itself, and costs a broker round trip only when it must.
-                return (json.loads(reader(candidate)).get('secret') or '').strip()
+                # ops #814: ATLAS has its own value (`atlas_secret`) once the
+                # console has moved Caddy to the private layout. Before that
+                # there is only the console's.
+                state = json.loads(reader(candidate))
+                own = state.get('atlas_secret') if state.get('private') else ''
+                return (own or state.get('secret') or '').strip()
             except Exception:
                 continue
     return ''
