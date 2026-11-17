@@ -104,6 +104,18 @@ textarea.key{width:100%;height:110px;background:#050810;border:1px solid var(--b
     <div class="log-box" id="updateLog"></div>
   </div>
 
+  <!--
+    ops #864: the backup the Update button takes first. Filled by `loadBackups` and hidden until a
+    backup exists. It stays on the page after the update reloads it, which the update log does not.
+    Text only (textContent), so a path or version string can never become markup.
+  -->
+  <div class="card" id="backupCard" hidden>
+    <div class="card-title">Database backups</div>
+    <p class="note">Update saves a copy of the ATLAS database first. ATLAS 2.x cannot go back to
+      1.x without one. The newest three are kept for each deployment.</p>
+    <div id="backupList"></div>
+  </div>
+
   <div class="card" id="deployCard" {% if not deploy_running and not deploy_error %}style="display:none"{% endif %}>
     <div class="card-title">Deploy log</div>
     <!--
@@ -1693,6 +1705,47 @@ function loadLatest(){
   }).catch(() => { now.textContent = 'unknown'; });
 }
 
+// ops #864: where each deployment's database backups are, and the commands that restore the newest.
+function loadBackups(){
+  const card = document.getElementById('backupCard');
+  const list = document.getElementById('backupList');
+  if (!card || !list) return;
+  fetch('/api/atlas/backups', {credentials:'same-origin'}).then(r => r.json()).then(d => {
+    const nl = String.fromCharCode(10);
+    list.textContent = '';
+    let any = false;
+    Object.keys(d || {}).forEach(function(name){
+      const one = d[name];
+      if (!one || !one.backups || !one.backups.length) return;
+      any = true;
+      const head = document.createElement('div');
+      head.style.cssText = 'margin:12px 0 4px;font-weight:600';
+      head.textContent = name;
+      list.appendChild(head);
+      const files = document.createElement('div');
+      files.className = 'note';
+      files.textContent = one.backups.map(function(b){
+        return b.path + '  (from v' + b.version + ', ' + (b.size / 1048576).toFixed(1) + ' MB, ' +
+               new Date(b.mtime * 1000).toLocaleString() + ')';
+      }).join(nl);
+      files.style.whiteSpace = 'pre-wrap';
+      list.appendChild(files);
+      const how = document.createElement('div');
+      how.className = 'note';
+      how.style.marginTop = '8px';
+      how.textContent = 'To go back to the newest backup, run these on the server, in order. ' +
+        'Anything devices wrote after the backup is lost:';
+      list.appendChild(how);
+      const box = document.createElement('div');
+      box.className = 'log-box';
+      box.style.height = 'auto';
+      box.textContent = (one.restore || []).join(nl);
+      list.appendChild(box);
+    });
+    card.hidden = !any;
+  }).catch(function(){});
+}
+
 let updatePolling = null;
 
 function startUpdate(slug){
@@ -1780,7 +1833,7 @@ function pollUpdateAll(){
   }).catch(() => setTimeout(pollUpdateAll, 4000));
 }
 
-{% if installed %}loadLogs(); loadLatest();{% endif %}
+{% if installed %}loadLogs(); loadLatest(); loadBackups();{% endif %}
 refreshCapacity();
 {% if deploy_running %}polling = true; pollDeploy();{% endif %}
 {% if deploy_error %}(function(){ const e = document.getElementById('deployError'); if (e) e.style.display = ''; })();{% endif %}
