@@ -119,3 +119,20 @@ def test_rotate_uses_the_helper():
     body = _func('takserver_rotate_intca')
     assert '_rotate_client_cert_names(cert_dir, skip=(old_ca_name, new_ca_name))' in body
     assert "f.endswith('.p12')" not in body, 'rotate grew its own .p12 loop again'
+
+
+def test_the_8446_public_cert_keystore_is_not_reissued_as_a_client_ops883(rotated_many_times):
+    """Docker TAK Server keeps takserver-le.p12/.jks (the 8446 connector's keystore) in the cert
+    folder. Re-issuing it as a client replaced the public certificate with a TAK-CA one, so 8446
+    stopped serving it and CloudTAK sign-in failed with INVALID_PURPOSE."""
+    _client(rotated_many_times, 'takserver-le')
+    (rotated_many_times / 'takserver-le-trusted.pem').write_text('x')
+    got = _names(rotated_many_times, skip=('INT-CA-09', 'INT-CA-10'))
+    assert 'takserver-le' not in got, got
+    assert got == sorted(CLIENTS)
+
+
+def test_takserver_le_is_skipped_case_insensitively_ops883(tmp_path):
+    _client(tmp_path, 'TakServer-LE')
+    _client(tmp_path, 'admin')
+    assert _names(tmp_path) == ['admin']
