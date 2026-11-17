@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.0-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.0-alpha)**
+**Current release: [v10.4.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.1-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.1-alpha — 2026-11-17 — Security hardening: Caddy and console sign-in; ATLAS backs up before Update
+
+**Headline: Caddy's admin API moves to a private socket, console sign-in through Authentik is for administrators only, and ATLAS backs up its database before every Update. Also security updates for CoTURN, Node.js, MediaMTX and WebODM, and a set of fixes. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.1-alpha))
+
+**Security.**
+- Caddy's admin API listens on a private socket, and the proxy sign-in values are in locked files that Caddy reads, not in the Caddyfile. The console moves each box to this layout by itself (Caddy 2.8 or newer).
+- Console sign-in through Authentik opens the console only for console administrators. Others see why and can still use the console password. Console sessions last 12 hours and renew with use.
+- CoTURN 4.19.1, Node.js 22.23.5 for the ETL and simulator images, MediaMTX 1.21.4, WebODM 4.0.1.
+
+**ATLAS.**
+- Update backs up the database first. If the backup fails, nothing changes. A new "Database backups" card lists each backup and the steps to go back.
+
+**Fixes.**
+- TAK Server deploy on Rocky/RHEL, Federation Hub Rotate CA on a hub that already has certificates, CloudTAK repair after a TAK Portal Marketplace job, First Due ETL build on a root console, Guard Dog alert texts and retention emails, the NetBird card version, and the nightly console restart setting.
+- NetBird on the main channel stays on 0.80.0. 0.82.1 moves to main in the next release.
 
 ### v10.4.0-alpha — 2026-11-16 — ETL Runner: CloudTAK ETLs run on your server, no AWS account
 
