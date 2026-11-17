@@ -111,16 +111,18 @@ def test_netbird_vetted_and_dev_pins_are_past_the_relay_fix():
         assert ':latest' not in val and re.search(r':v?\d+\.\d+\.\d+$', val), name
 
 
-def test_netbird_dev_trial_pair_is_0_82_1_and_vetted_pair_is_unchanged():
-    # ops #427, #819: 0.82.1 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
-    # the gated T&E is green and the lead promotes it, so main boxes stay on 0.80.0 / v2.94.0.
+def test_netbird_vetted_pair_is_0_82_1_and_dev_pair_is_not_behind():
+    # ops #427, #819: 0.82.1 / v2.96.0 passed the gated T&E and is promoted to the vetted (main) pair,
+    # so a fresh install or a main-channel box no longer deploys 0.80.0 / v2.94.0. The dev pair must
+    # never be older than the vetted pair.
     def pin(name):
         return re.search(rf'^{name} = "[^:"]+:v?([^"]+)"', APP, re.M).group(1)
+    assert pin('NETBIRD_SERVER_IMAGE') == '0.82.1'
+    assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.96.0'
     assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.1'
     assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.96.0'
-    assert pin('NETBIRD_SERVER_IMAGE') == '0.80.0'
-    assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.94.0'
     assert _v(pin('NETBIRD_SERVER_DEV_IMAGE')) >= _v(pin('NETBIRD_SERVER_IMAGE'))
+    assert _v(pin('NETBIRD_DASHBOARD_DEV_IMAGE')) >= _v(pin('NETBIRD_DASHBOARD_IMAGE'))
 
 
 def test_netbird_never_configures_a_mysql_store():

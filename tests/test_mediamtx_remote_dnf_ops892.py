@@ -122,6 +122,31 @@ def test_non_root_ssh_user_goes_through_sudo_n(tmp_path):
         any(c.startswith('sudo') and 'wget' in c for c in calls), calls
 
 
+def test_step_one_still_works_inside_the_root_wrapper_ops890(tmp_path):
+    """The deploy sends Step 1 through `_as_root_sh` (ops #890: `sudo -n sh -c '<script>'` for a
+    non-root SSH user). The branching script must survive that quoting on a dnf-only host."""
+    import shlex
+    tree = ast.parse(APP)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_as_root_sh')
+    ns = {'shlex': shlex}
+    exec(compile(ast.get_source_segment(APP, node), 'app.py', 'exec'), ns)
+    wrapped = ns['_as_root_sh'](_deps_sh())
+    bindir, log = _host(tmp_path, ['dnf', 'rpm'], uid='1000')
+    basics = tmp_path / 'basics'
+    basics.mkdir()
+    for prog in ('sh', 'env', 'grep', 'cat', 'echo', 'printf', 'test'):
+        for d in ('/bin', '/usr/bin'):
+            src = pathlib.Path(d) / prog
+            if src.exists():
+                (basics / prog).symlink_to(src)
+                break
+    env = {'PATH': f'{bindir}:{basics}', 'HOME': str(tmp_path)}
+    r = subprocess.run(['/bin/sh', '-c', wrapped], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = log.read_text().splitlines()
+    assert any('dnf install -y wget tar curl openssl python3 python3-pip git' in c for c in calls), calls
+
+
 def test_host_with_neither_package_manager_says_so(tmp_path):
     r, calls = _run(tmp_path, [])
     assert r.returncode != 0
@@ -132,7 +157,7 @@ def test_remote_deploy_step_one_uses_the_branching_command_not_a_bare_apt_get():
     m = re.search(r'^def _run_mediamtx_deploy_remote\(.*?(?=^\S)', APP, re.S | re.M)
     body = m.group(0)
     step1 = body[body.index('Step 1/7'):body.index('Step 2/7')]
-    assert '_MEDIAMTX_REMOTE_DEPS_SH' in step1
+    assert '_module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH' in step1  # and as root (ops #890)
     assert 'apt-get' not in step1
 
 
@@ -213,5 +238,5 @@ def test_a_failed_editor_download_is_said_in_the_log_not_silently_skipped():
     body = APP[i0:APP.index('\ndef ', i0 + 1)]
     i = body.index('_mediamtx_editor_clone_cmd(')
     after = body[i:body.index('LDAP overlay: when Authentik is present locally')]
-    assert 'ok, _clone_out = _module_run(' in body
+    assert 'ok, _clone_out = _module_run_root(' in body  # ops #890: as root
     assert 'The web editor could not be downloaded to the remote host' in after

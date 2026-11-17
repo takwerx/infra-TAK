@@ -170,7 +170,8 @@ class Box:
             '_etl': _etl, '_etlrunner_sync_overlay': lambda d, log: False, 
             'os': os, 'json': json, 're': re, 'time': time, 'shlex': shlex, 'socket': socket,
             'datetime': datetime, 'threading': fake_threading,
-            'subprocess': types.SimpleNamespace(run=self.run, PIPE=-1, STDOUT=-2),
+            'subprocess': types.SimpleNamespace(run=self.run, PIPE=-1, STDOUT=-2,
+                                                TimeoutExpired=subprocess.TimeoutExpired),
             'print': lambda *a, **k: self.logs.append(' '.join(str(x) for x in a)),
             'CONFIG_DIR': str(self.home / '.config'),
             'load_settings': lambda: dict(self.settings),
@@ -196,6 +197,7 @@ class Box:
                 '_CLOUDTAK_TAKPORTAL_CSP_COMPOSE', '_CT_MEDIA_CHECK_SH', '_CT_NGINX_UPLOAD_CHECK_SH',
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
+                'CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S', '_CLOUDTAK_COMPOSE_UP_RE',   # ops #889
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
                 '_CLOUDTAK_PORTAL_JOB_RE',   # ops #850: TAK Portal's helper counts as a stack change
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
@@ -204,7 +206,7 @@ class Box:
                 '_cloudtak_env_read', '_cloudtak_env_set', '_cloudtak_compose_file_value',
                 '_cloudtak_ensure_custom_compose', '_ct_media_converged',
                 '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
-                '_ct_docker_out', '_cloudtak_override_services', '_cloudtak_containers_without_override',
+                '_ct_docker_out', '_ct_wait_compose_idle', '_cloudtak_override_services', '_cloudtak_containers_without_override',
                 '_cloudtak_write_override_file', '_cloudtak_recreate_and_heal',
                 '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_stack_busy_procs',
                 '_cloudtak_autorepair_wait_reason',

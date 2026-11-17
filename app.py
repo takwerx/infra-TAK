@@ -1803,8 +1803,14 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # 0.81.4 distrusts the eMudhra CA keys. No config.yaml schema change; the store only gains
 # columns (peer MAC, cert posture, per-target access); the rollback drill checks 0.80.0 still
 # starts clean on a 0.81-migrated store.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
+# ops #819: 0.82.1 / v2.96.0 PROMOTED to VETTED (main), so fresh installs and main-channel boxes leave
+# 0.80.0. Evidence: 0.80.0 -> 0.82.1 Update with two peers kept and pinging over the relay (ops #884
+# row 8), 0.82.0 -> 0.82.1 update, rollback, embedded-IdP and Authentik logins, the x509 path and a
+# soak on three platforms (ops #819), and a fresh deploy straight onto this pair (ops #819, PR body).
+# Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.80.0 / v2.94.0; the pin-restore
+# heal converges boxes back on console boot (0.80.0 starts clean on a 0.82-migrated store, ops #819).
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.82.1"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # ops #427: 0.82.0 / v2.96.0 UNDER TRIAL on dev (T&E only, not promoted; 0.81.4 passed its 24 h
 # soak, ops #208, but stays unpromoted until the lead moves the vetted pin). 0.82.0: relay
 # negotiates the protocol version, new DB indexes, reverse-proxy access logs move to their own
@@ -36896,6 +36902,29 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             return False, str(e)[:200]
 
 
+def _as_root_sh(cmd):
+    """Shell text that runs `cmd` as root on a remote SSH target (ops #890).
+
+    `_module_run` runs `cmd` as the SSH user. A cloud image's sudo user (azureuser, ubuntu, rocky)
+    is not root, so a bare `apt-get`, `mv /usr/local/bin/...`, `mkdir /opt/...` or `systemctl` dies
+    with "Permission denied". Root runs it as it is; any other user runs the WHOLE string under
+    `sudo -n sh -c`, so a `a && b && c` chain is root all the way through (a `$S a && b` prefix
+    would leave `b` and `c` unprivileged). `-n`: never sit at a password prompt.
+    NON-ROOT-COMMANDS: apt-get, systemctl, mv, mkdir, pip3, useradd."""
+    q = shlex.quote(cmd)
+    return f'if [ "$(id -u)" = 0 ]; then sh -c {q}; else sudo -n sh -c {q}; fi'
+
+
+def _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=None):
+    """Like `_module_run`, but a remote target runs `cmd` as root (see `_as_root_sh`). A local
+    target is unchanged: the console's own shim/broker path already handles its privilege."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return _module_run(deploy_cfg, cmd, timeout=timeout, log_fn=log_fn)
+    if log_fn:
+        log_fn(f"  [remote] {cmd[:80]}...")
+    return _module_run(deploy_cfg, _as_root_sh(cmd), timeout=timeout)
+
+
 _MODULE_FW_BACKEND_KEY = '_infratak_fw_backend'
 
 
@@ -46186,6 +46215,63 @@ def _takportal_install_caddy_validate_shim(log_fn=None):
         return 'error'
 
 
+# ops #879: TAK Portal's Marketplace "Deploy To Caddy" runs `bash -lc 'set -euo pipefail; ...;
+# exit 0'` over SSH. A login shell reads ~/.bash_logout when it exits, and errexit (set -e) is
+# still on there. Ubuntu's stock file ends with `[ -x /usr/bin/clear_console ] && clear_console -q`;
+# with no terminal clear_console exits 1, errexit fires, and the whole command exits 1 even though
+# the helper had already written and reloaded Caddy, so the Portal says it failed. Appending
+# `true` does not help (errexit stops the file at the failing line); `set +e` before it does.
+# Verified on Ubuntu 22.04 with a real sshd: stock file rc 1, `set +e` first rc 0.
+TAKPORTAL_LOGOUT_MARKER = 'infratak-portal-logout'
+TAKPORTAL_LOGOUT_BLOCK = (
+    '# ' + TAKPORTAL_LOGOUT_MARKER + ': TAK Portal runs its commands over SSH as\n'
+    "# `bash -lc 'set -e; ...'`, and errexit also applies to this file. Without this line a\n"
+    '# failing command below (clear_console with no terminal) makes the whole command exit 1.\n'
+    'set +e\n'
+)
+
+
+def _takportal_harden_logout_file(log_fn=None):
+    """ops #879: put `set +e` at the top of the console user's existing ~/.bash_logout.
+
+    Only an existing regular file is touched (no file, nothing to fail; Rocky 9's stock file is
+    one comment line and does not fail, it gets the same harmless line), and only once (marker). The rest of the file is kept byte for byte, with its mode.
+    Idempotent. Returns 'changed' | 'current' | 'absent' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        dest = os.path.expanduser('~/.bash_logout')
+        if os.path.islink(dest) or not os.path.exists(dest):
+            return 'absent'
+        if not os.path.isfile(dest):
+            return 'skipped'
+        with open(dest, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            have = f.read()
+        if TAKPORTAL_LOGOUT_MARKER in have:
+            return 'current'
+        mode = _stat.S_IMODE(os.stat(dest).st_mode)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix='.bash_logout-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                f.write(TAKPORTAL_LOGOUT_BLOCK + have)
+            os.chmod(tmp, mode)
+            os.replace(tmp, dest)
+            tmp = None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        _say(f"  \u2713 {dest}: added `set +e` so a failing logout line cannot make TAK Portal's "
+             "SSH commands exit 1 (Marketplace Deploy To Caddy said failed after it worked)")
+        return 'changed'
+    except Exception as e:
+        _say(f"  \u26a0 {os.path.expanduser('~/.bash_logout')} not changed (non-fatal): {e}")
+        return 'error'
+
+
 # ops #644: the portal key's line in the console user's authorized_keys is limited to what
 # TAK Portal needs. `restrict` turns off
 # port/agent/X11 forwarding, pty and ~/.ssh/rc; `from=` admits only the TAK Portal containers'
@@ -46457,6 +46543,9 @@ def _takportal_setup_ssh(log_fn=None):
 
         # ops #298: Marketplace Deploy To Caddy validates as this user.
         _takportal_install_caddy_validate_shim(log_fn=log_fn)
+
+        # ops #879: a failing ~/.bash_logout line must not turn the portal's SSH commands into exit 1.
+        _takportal_harden_logout_file(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -47874,7 +47963,7 @@ def mediamtx_control():
         if not (remote.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         cmd = f'systemctl {action} mediamtx mediamtx-webeditor 2>&1'
-        ok, _ = _ssh_probe(remote, cmd, timeout=30)
+        ok, _ = _ssh_probe(remote, _as_root_sh(cmd), timeout=30)   # ops #890: root, `sudo -n` if not root
         time.sleep(2)
         ok2, out = _ssh_probe(remote, 'systemctl is-active mediamtx 2>/dev/null', timeout=10)
         running = bool(ok2 and out and out.strip() == 'active')
@@ -47924,14 +48013,15 @@ def mediamtx_recovery():
             _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-            _module_run(
+            _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
+            _module_run_root(
                 deploy_cfg,
                 "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
                 timeout=90,
             )
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
             # is the only legitimate consumer; upstream defaults to 0.0.0.0).
-            _module_run(
+            _module_run_root(
                 deploy_cfg,
                 "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
                 "sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
@@ -47965,7 +48055,7 @@ def mediamtx_recovery():
                 except Exception:
                     pass
                 if copy_ok:
-                    _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
+                    _module_run_root(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
             try:
                 src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
@@ -47984,13 +48074,12 @@ def mediamtx_recovery():
                 with open(overlay_src) as _of:
                     _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
             elif os.path.exists(overlay_src):
-                _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-                _module_copy(
-                    deploy_cfg,
-                    overlay_src,
-                    '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py',
-                    timeout=20
-                )
+                # ops #890: scp runs as the SSH user and cannot write into root's /opt: stage in
+                # /tmp, then move into place as root (same two steps as the deploy).
+                _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+                _ov_ok, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', timeout=20)
+                if _ov_ok:
+                    _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
         except Exception:
             pass
         if _is_remote:
@@ -48049,7 +48138,7 @@ def mediamtx_recovery():
             f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
-        ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
+        ok_run, out = _module_run_root(deploy_cfg, cmd, timeout=25)   # ops #890: mv/sed/systemctl need root
         if not ok_run:
             return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
         # Check if web editor actually came up
@@ -48096,7 +48185,8 @@ def mediamtx_logs():
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
+        # ops #890: a non-root SSH user outside the adm/systemd-journal group reads no system journal.
+        ok, out = _ssh_probe(deploy_cfg['remote'], _as_root_sh(f'journalctl -u {unit} --no-pager -n {lines} 2>&1'), timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
     r = subprocess.run(['journalctl', '-u', unit, '--no-pager', '-n', str(lines)], capture_output=True, text=True, timeout=10)
@@ -48117,10 +48207,11 @@ def mediamtx_uninstall():
     if deploy_cfg.get('target_mode') == 'remote':
         remote = deploy_cfg.get('remote', {})
         if (remote.get('host') or '').strip():
-            ok, out = _ssh_probe(remote, 'systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', timeout=15)
-            _ssh_probe(remote, 'rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml', timeout=10)
-            _ssh_probe(remote, 'rm -rf /opt/mediamtx-webeditor', timeout=10)
-            _ssh_probe(remote, 'systemctl daemon-reload 2>/dev/null; true', timeout=10)
+            # ops #890: every step needs root; `sudo -n` when the SSH user is not root.
+            ok, out = _ssh_probe(remote, _as_root_sh('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true'), timeout=15)
+            _ssh_probe(remote, _as_root_sh('rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('rm -rf /opt/mediamtx-webeditor'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('systemctl daemon-reload 2>/dev/null; true'), timeout=10)
             steps.append('Stopped and removed MediaMTX on remote host')
         settings['mediamtx_deployment'] = dict(deploy_cfg)
         settings['mediamtx_deployment']['deployed'] = False
@@ -48302,6 +48393,62 @@ _MEDIAMTX_REMOTE_CERT_PERMS = (
 )
 
 
+# ops #891: the remote web editor runs as takwerx. At import it makes
+# /usr/local/etc/mediamtx_backups, and its saves run `sed -i` in /usr/local/etc, which is
+# root:root 755 on a fresh host. The remote deploy skipped the setup the local deploy does
+# (_mediamtx_grant_config_dir_write), so the editor died with PermissionError and crash-looped
+# on every remote host. Same shape as the local step, as one script for the SSH user
+# (root, or sudo -n). Prints EDITOR_PATHS_RC=0 when every step worked.
+_MEDIAMTX_REMOTE_EDITOR_PATHS_SH = (
+    _REMOTE_SUDO_SH +
+    'RC=0; '
+    '$S mkdir -p /usr/local/etc/mediamtx_backups || RC=1; '
+    '$S chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups /opt/mediamtx-webeditor || RC=1; '
+    '$S chown root:takwerx /usr/local/etc || RC=1; '
+    '$S chmod 775 /usr/local/etc || RC=1; '
+    'if [ -f /usr/local/etc/mediamtx.yml ]; then '
+    '$S chown -h takwerx:takwerx /usr/local/etc/mediamtx.yml || RC=1; fi; '
+    'echo "EDITOR_PATHS_RC=$RC"'
+)
+
+# After the start: the editor must stay up, not just be started once. A crash loop
+# (RestartSec=5) shows `activating` between runs, so look three times, 4 s apart, and
+# also ask for the listener on 5080. Prints EDITOR_OK=1 or EDITOR_OK=0 and the last journal
+# lines when it is down.
+_MEDIAMTX_REMOTE_EDITOR_CHECK_SH = (
+    _REMOTE_SUDO_SH +
+    'OK=1; for I in 1 2 3; do sleep 4; '
+    '[ "$(systemctl is-active mediamtx-webeditor 2>/dev/null)" = active ] || OK=0; done; '
+    '(ss -ltn 2>/dev/null | grep -q ":5080 ") || OK=0; '
+    'echo "EDITOR_OK=$OK"; '
+    '[ "$OK" = 1 ] || $S journalctl -u mediamtx-webeditor -n 4 --no-pager -o cat 2>/dev/null'
+)
+
+
+def _mediamtx_remote_editor_prepare(deploy_cfg, plog):
+    """Make the remote editor's paths writable for takwerx before it starts. ops #891."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_PATHS_SH, timeout=60)
+    if ok and 'EDITOR_PATHS_RC=0' in (out or ''):
+        plog("  ✓ Web editor writable paths ready on remote host (backups + editor folder + config folder)")
+        return True
+    plog(f"  ⚠ Could not set up the web editor's folders on the remote host: {(out or '')[-160:]}")
+    return False
+
+
+def _mediamtx_remote_editor_check(deploy_cfg, plog):
+    """Say whether the remote web editor is really up, never just that it was started."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_CHECK_SH, timeout=60)
+    if ok and 'EDITOR_OK=1' in (out or ''):
+        plog("✓ Web editor is running on the remote host (port 5080)")
+        return True
+    plog("✗ Web editor is NOT running on the remote host (port 5080 is not listening).")
+    plog("  Streaming still works. The MediaMTX web page will not load until this is fixed.")
+    tail = (out or '').replace('EDITOR_OK=0', '').strip()
+    if tail:
+        plog(f"  Last log lines: {tail[-300:]}")
+    return False
+
+
 # Remote MediaMTX firewall. Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890
 # (UDP; this opened 8890/tcp until v10.1.10). The API (9898) is loopback-only and denied
 # outright. The web editor (5080) and HLS (8888) bind 0.0.0.0 so Caddy on the CONSOLE can
@@ -48428,6 +48575,26 @@ _MEDIAMTX_REMOTE_ACTIVE_SH = (
 )
 
 
+# Files the console scp's into the remote /tmp as the SSH user, then moves into place as root
+# (ops #890). A root-owned file with the same name (a deploy that ran as root and stopped
+# part way) makes the next scp, as a non-root SSH user, die with "Permission denied": the
+# deploy and the recovery remove them first, as root.
+_MEDIAMTX_REMOTE_STAGING = (
+    '/tmp/mediamtx.yml', '/tmp/mediamtx.service', '/tmp/mediamtx-webeditor.service',
+    '/tmp/mediamtx-webeditor.env', '/tmp/mtx_hls_patcher.py', '/tmp/mtx_ldap_patcher.py',
+    '/tmp/mtx_endpoint_patch.py', '/tmp/mediamtx_ldap_overlay.py', '/tmp/mediamtx_stream.crt',
+    '/tmp/mediamtx_stream.key', '/tmp/ensure_overlay.py',
+)
+
+
+def _mediamtx_remote_clear_staging(deploy_cfg):
+    """Remove the fixed /tmp staging names (above) on the remote host, as root. Never raises."""
+    try:
+        _module_run_root(deploy_cfg, 'rm -f ' + ' '.join(_MEDIAMTX_REMOTE_STAGING), timeout=15)
+    except Exception:
+        pass
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -48443,9 +48610,12 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 1: Dependencies
     plog("━━━ Step 1/7: Installing Dependencies (remote) ━━━")
     # ops #892: branches on the remote host's own package manager (Rocky/RHEL or Ubuntu).
-    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH, timeout=900, log_fn=plog)
+    # ops #890: as root (`sudo -n` for a non-root SSH user), or the package manager dies on "Permission denied".
+    ok, out = _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH, timeout=900, log_fn=plog)
     if not ok:
         plog(f"✗ Installing packages on the remote host failed: {(out or '')[-300:]}")
+        if 'password is required' in (out or '') or 'sudo:' in (out or ''):
+            plog("  The SSH user needs passwordless sudo (sudo -n) on the remote host, or use root.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
@@ -48503,11 +48673,14 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         # Upstream writes binary-mode lines (`<hash> *<file>`): match either separator, or
         # the grep finds nothing and EVERY remote deploy refuses (shipped v10.1.34 → row 5).
         f'grep -E "^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$" checksums.sha256 | sha256sum --check --status && '
-        f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
+        # ops #890: extract ONLY the binary. The tarball also holds mediamtx.yml and LICENSE; run as
+        # root they were left behind in /tmp, root-owned, and the next scp of our own mediamtx.yml
+        # (as a non-root SSH user) died with "Permission denied" at Step 4.
+        f'tar -xzf {tarball} mediamtx && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
         f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
         f'rm -f {tarball} checksums.sha256'
     )
-    ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
+    ok, out = _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
         plog(f"✗ Download/verify/install failed (checksum mismatch aborts the install): {(out or '')[-200:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
@@ -48517,6 +48690,7 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 4: Config
     plog("")
     plog("━━━ Step 4/7: Writing Configuration (remote) ━━━")
+    _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before the first scp into /tmp
     hls_pass = _sec.token_hex(8)
     # apiAddress stays on 127.0.0.1 (webedit Flask calls it locally on the remote host).
     # hlsAddress is 0.0.0.0 so Caddy on the console can reverse-proxy HLS streams;
@@ -48618,9 +48792,12 @@ paths:
         plog("✗ Failed to copy config to remote")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    ok, _ = _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+    # ops #890: root:root in place, whoever the SSH user is (a plain `mv` kept the SSH user as owner).
+    ok, out = _module_run_root(deploy_cfg, 'install -D -m 644 -o root -g root /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml && rm -f /tmp/mediamtx.yml', timeout=10)
     if not ok:
-        _module_run(deploy_cfg, 'mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+        plog(f"✗ Could not write /usr/local/etc/mediamtx.yml on the remote host: {(out or '')[-200:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     plog("✓ Configuration written")
     plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
@@ -48640,15 +48817,16 @@ paths:
         plog("✗ Failed to copy systemd unit")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
-    # Web editor: clone on remote and install
-    _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _clone_out = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx.service /etc/systemd/system/mediamtx.service && rm -f /tmp/mediamtx.service', timeout=10)
+    # Web editor: clone on remote and install (ops #890: every step below that writes under /opt,
+    # /etc, /usr or starts a unit runs as root, `sudo -n` for a non-root SSH user)
+    _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+    ok, _clone_out = _module_run_root(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
-        _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
+        _module_run_root(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
         # Port 5080 will be UFW source-scoped to the console IP only (Step 6/7).
-        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+        _module_run_root(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
         # Patch HLS URLs to go through Caddy /hls-proxy/ instead of direct port 8888 (avoids mixed content)
         hls_patch_script = (
             "import re, sys\n"
@@ -48672,7 +48850,7 @@ paths:
         with open('/tmp/mtx_hls_patcher.py', 'w') as pf:
             pf.write(hls_patch_script)
         _module_copy(deploy_cfg, '/tmp/mtx_hls_patcher.py', '/tmp/mtx_hls_patcher.py', log_fn=plog)
-        _module_run(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
+        _module_run_root(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
         try:
             os.remove('/tmp/mtx_hls_patcher.py')
         except Exception:
@@ -48691,7 +48869,7 @@ paths:
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -48724,7 +48902,7 @@ paths:
                 with open('/tmp/mtx_ldap_patcher.py', 'w') as pf:
                     pf.write(patcher)
                 _module_copy(deploy_cfg, '/tmp/mtx_ldap_patcher.py', '/tmp/mtx_ldap_patcher.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_ldap_patcher.py')
                 except Exception:
@@ -48734,7 +48912,7 @@ paths:
                 with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
                     pf.write(MEDIAMTX_REMOTE_EP_PATCH_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_endpoint_patch.py')
                 except Exception:
@@ -48779,19 +48957,20 @@ paths:
             except OSError:
                 pass
         _dst = _MEDIAMTX_EDITOR_SECRET_ENV
-        _module_run(deploy_cfg,
-                    f'sudo install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst} 2>/dev/null'
-                    f' || install -m 600 /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
-                    timeout=10)
+        _module_run_root(deploy_cfg,
+                         f'install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
+                         timeout=10)
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx-webeditor.service /etc/systemd/system/ 2>/dev/null || mv /tmp/mediamtx-webeditor.service /etc/systemd/system/', timeout=10)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx-webeditor.service /etc/systemd/system/mediamtx-webeditor.service && rm -f /tmp/mediamtx-webeditor.service', timeout=10)
     try:
         os.remove('/tmp/mediamtx_webeditor_remote.service')
     except Exception:
         pass
     plog("✓ Services created")
+    # ops #891: the editor runs as takwerx and dies at import without these. Before the start.
+    _mediamtx_remote_editor_prepare(deploy_cfg, plog)
 
     # Step 6: Firewall, BEFORE the services start (ops #630). The editor binds 0.0.0.0:5080
     # and is meant for the console only. This step used to come after the
@@ -48808,20 +48987,23 @@ paths:
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     # ops #892: relabel what was moved in from /tmp (SELinux hosts), then start.
-    _module_run(deploy_cfg, _MEDIAMTX_REMOTE_RELABEL_SH, timeout=60)
-    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
-    # ops #892: "Services started" used to print whatever systemd said. Check MediaMTX itself.
-    _mtx_up, _mtx_out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_ACTIVE_SH, timeout=40)
+    _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_RELABEL_SH, timeout=60)
+    _module_run_root(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
+    # ops #892: "Services started" used to print whatever systemd said. Check MediaMTX itself
+    # (as root: a non-root SSH user cannot read the journal).
+    _mtx_up, _mtx_out = _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_ACTIVE_SH, timeout=40)
     if not _mtx_up:
         plog(f"✗ MediaMTX did not start on the remote host: {(_mtx_out or '')[-300:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Services started")
+    # ops #891: "started" is not "up". The editor crash-looped here and the log still said ok.
+    _mediamtx_remote_editor_check(deploy_cfg, plog)
 
     # Step 5b: Test video
     test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
     plog("  Downloading test video (truck_60.ts)...")
-    ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
+    ok_tv, _ = _module_run_root(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
     if ok_tv:
         plog("✓ Test video installed")
     else:
@@ -48867,7 +49049,7 @@ paths:
                 plog(f"  ⏳ {i * 2}s...")
             time.sleep(2)
         if _caddy_cert_pair_ready(cert_file, key_file):
-            _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
+            _module_run_root(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
             # Stage both files somewhere the console can read before copying: scp/copy2
             # open the SOURCE as takwerx and would fail on 0600 caddy:caddy.
             ok_cert = ok_key = False
@@ -48886,7 +49068,7 @@ paths:
             if ok_cert and ok_key:
                 # The unit runs User=takwerx: root:root 0600 made MediaMTX crash-loop on
                 # "open /etc/mediamtx/certs/stream.crt: permission denied" (TEST-MATRIX row 5).
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
                 remote_key  = '/etc/mediamtx/certs/stream.key'
                 yml_cmd = (
@@ -48899,8 +49081,8 @@ paths:
                     f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' /usr/local/etc/mediamtx.yml; "
                     f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' /usr/local/etc/mediamtx.yml"
                 )
-                _module_run(deploy_cfg, yml_cmd, timeout=15)
-                _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
+                _module_run_root(deploy_cfg, yml_cmd, timeout=15)
+                _module_run_root(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
                 plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
                 ssl_ok = True
                 # The Caddyfile's /hls-proxy reverse_proxy only switches to https when
@@ -72032,7 +72214,7 @@ def _ensure_takwerx_system_user_remote(deploy_cfg, plog=None):
             'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
             '-d /nonexistent -s /usr/sbin/nologin takwerx'
         )
-        _module_run(deploy_cfg, cmd, timeout=15)
+        _module_run_root(deploy_cfg, cmd, timeout=15)   # ops #890: groupadd/useradd need root
         ok2, out2 = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
         if ok2 and (out2 or '').strip():
             _log("✓ takwerx system user created on remote host")
@@ -89443,9 +89625,15 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     -signing keystores. Matching only the old/new CA names re-issued all of those as client
     certs, which appends a non-CA private key to the live enrollment signing keystore that
     CoreConfig's TAKServerCAConfig points at (ops #82, seen on test8 after nine rotations).
+
+    `takserver-le` is never a client either: it is the keystore behind the 8446 connector, built
+    from the box's public (Let's Encrypt or custom) certificate. On Docker TAK Server its
+    .p12/.jks sit in this folder, and `makeCert.sh client takserver-le` overwrote them with a
+    certificate from the TAK CA, so 8446 stopped serving the public certificate and CloudTAK
+    sign-in failed with INVALID_PURPOSE (ops #883). Native boxes keep it in a temp folder.
     """
     files = os.listdir(cert_dir)
-    cas = {'takserver', 'root-ca', 'ca'} | {s.lower() for s in skip if s}
+    cas = {'takserver', 'root-ca', 'ca', 'takserver-le'} | {s.lower() for s in skip if s}
     for f in files:
         if f.endswith('.crl'):
             cas.add(f[:-4].lower())
@@ -110902,24 +111090,40 @@ def _cloudtak_write_override_file(ct_dir):
         return False
 
 
-def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
+def _cloudtak_recreate_and_heal(ct_dir, log, pull=False, wait_s=0):
     """Force-recreate the whole CloudTAK stack, then re-apply the media patches the recreate
     wiped. A bare `docker compose` in the stack dir, so COMPOSE_FILE in .env decides the files:
     base + infra-TAK's override + TAK Portal's marketplace file + the operator's
     docker-compose.custom.yml (GH #261). The console-start hardening and Guard Dog's
     auto-repair (ops #197) both recreate through here. `pull` downloads the pinned postgis
     first, so `up` doesn't spend its 240 s on it. Returns 'ok', 'recreate' (the up failed)
-    or 'heal' (the media heal did not confirm)."""
+    or 'heal' (the media heal did not confirm).
+    wait_s (ops #889): the console gives up on `up` after 240 s, but the broker keeps running it,
+    and on a loaded box (test6: docker at 250 percent CPU, images still unpacking) it finishes
+    minutes later. With wait_s > 0 a timeout is not a failure: wait up to that long for the
+    running compose to end, then carry on to the heals, and let the caller's fresh drift check
+    judge. 0 (the console-start path, which runs before the web server is up) keeps the old
+    behaviour: the timeout is raised."""
     if pull:
         # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
         # Download it before the recreate so `up -d` doesn't spend its 240 s budget
         # on the pull — the stack keeps running meanwhile.
         _docker_compose_pull(None, ct_dir, log,
                              timeout=600, label='CloudTAK postgis', services=['postgis'])
-    r = subprocess.run(
-        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
-    )
-    if r.returncode != 0:
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+        )
+    except subprocess.TimeoutExpired:
+        if wait_s <= 0:
+            raise
+        log(f"CloudTAK recreate is still running after 240s (a loaded box) — waiting up to {int(wait_s // 60)} min for it")
+        if not _ct_wait_compose_idle(timeout=wait_s, log=log):
+            log(f"CloudTAK recreate warning: still running after {int(wait_s // 60)} min")
+            return 'recreate'
+        log("CloudTAK recreate finished after the wait")
+        r = None
+    if r is not None and r.returncode != 0:
         log(f"CloudTAK recreate warning: {(r.stdout or '')[:200]}")
         return 'recreate'
     log("CloudTAK recreated with hardened port bindings")
@@ -111080,6 +111284,7 @@ _startup_heal_cloudtak_media_hls()
 CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
+CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S = 900  # ops #889: the recreate outlasted the console's 240 s: wait for it this long
 _CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json')
 # Any compose step that changes the stack, or an image build (TAK Portal builds --no-cache first).
 _CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
@@ -111236,7 +111441,11 @@ def _cloudtak_autorepair_request(settle_s=None):
     ct_dir = os.path.expanduser('~/CloudTAK')
     with _cloudtak_autorepair_lock:
         if cloudtak_autorepair_status.get('running'):
-            return {'state': 'repairing', 'detail': cloudtak_autorepair_status.get('detail') or ''}
+            # ops #889: "still repairing" with how long, so a slow box reads as slow, not as failed.
+            _since = cloudtak_autorepair_status.get('started')
+            _mins = f" (running {max(int(time.time() - _since) // 60, 0)} min)" if _since else ''
+            return {'state': 'repairing',
+                    'detail': f"still repairing{_mins}: {cloudtak_autorepair_status.get('detail') or ''}".rstrip(': ')}
         settings = load_settings()
         try:
             if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
@@ -111298,7 +111507,7 @@ def _cloudtak_autorepair_run(ct_dir, drift):
             _cloudtak_ensure_custom_compose(ct_dir, _log)
             _patch_cloudtak_minio_registry(ct_dir)
             _patch_cloudtak_compose_ports(ct_dir)
-            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
+            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True, wait_s=CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S)
             why = {'recreate': 'docker compose up --force-recreate failed',
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
         elif drift['kind'] == 'media' or drift.get('hls') is False:
@@ -113947,10 +114156,11 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
                 f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
                 f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')
 
-    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    # ops #890: pip installs system-wide and `runuser` both need root (`sudo -n` for a non-root SSH user)
+    ok, out = _module_run_root(deploy_cfg, _pip('--break-system-packages'), timeout=240)
     if not ok and 'no such option' in (out or ''):
-        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
-    chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
+        ok, out = _module_run_root(deploy_cfg, _pip(''), timeout=240)
+    chk, chk_out = _module_run_root(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
     if chk:
         return True, out
     tail = ((chk_out or '') if ok else (out or '')).strip().splitlines()[-1:] or ['no output']
@@ -115669,6 +115879,17 @@ def _startup_migrations():
                 )
         except Exception as tp_shim_err:
             print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
+
+        # ops #879 — same for the console user's ~/.bash_logout: boxes that already run TAK Portal
+        # get `set +e` on the next console start, so Marketplace "Deploy To Caddy" stops saying
+        # failed after it worked. Idempotent; touches only an existing file.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_harden_logout_file(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_logout_err:
+            print(f"Startup migration: takportal logout file error (non-fatal): {tp_logout_err}")
 
         # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
         # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
