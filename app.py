@@ -215,6 +215,15 @@ app.session_interface = _ConsoleSessionInterface()
 _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
 
+# ops #813: how long a signed console session cookie is accepted after it was last
+# written. Flask checks the cookie's signed timestamp against this value for every
+# session, permanent or not, and its default is 31 days. The cookie is written again on
+# a sign-in, on a page that came through Authentik, and on a real user action (at most
+# once a minute, see _enforce_session_idle_lock), so a session in use does not end; one
+# that is left alone ends after this long. Fleet constant.
+CONSOLE_SESSION_LIFETIME_SECONDS = 12 * 3600
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(seconds=CONSOLE_SESSION_LIFETIME_SECONDS)
+
 
 # ---------------------------------------------------------------------------
 # Privileged broker client (v10.0.5 — non-root console migration, Option B)
@@ -1551,6 +1560,14 @@ def ensure_session_valid():
                                 '/api/guarddog/cloudtak-repair'):   # ops #197
             if not _same_origin_ok():
                 return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
+
+
+@app.before_request
+def ensure_sso_session_current():
+    """ops #813: end a session made by Authentik sign-in once Authentik no longer says
+    the person is a console administrator. See _sso_session_still_current()."""
+    if session.get('authenticated') and not _sso_session_still_current():
+        session.clear()
 
 
 @app.after_request
@@ -4591,6 +4608,207 @@ def _proxy_auth_state(create=False):
         _save_proxy_auth_state(state)
     return state
 
+# ops #813: who may hold a console session that Authentik sign-in made, and for how long.
+#
+# The console is root on the box, so an Authentik sign-in opens it only for a console
+# administrator: an ACTIVE Authentik user who is in the `authentik Admins` group (or is
+# an Authentik superuser, who can join that group at will). The Authentik application
+# policy says the same thing; the console checks it too, so neither depends on the other.
+#
+# Two sources, in this order:
+#   1. Authentik's user API, asked with the box's own token. It is the live answer, so a
+#      session also ends after the person is removed from the group or deactivated.
+#      (The outpost keeps the group list from sign-in time, and /api/* does not pass
+#      forward_auth, see generate_caddyfile.)
+#   2. When the API gives no answer (Authentik restarting, token unusable): the
+#      X-Authentik-Groups header on a request that passed forward_auth, and for a session
+#      that already exists, a short time limit since Authentik last confirmed it.
+# A clear "no" from the API always wins. No answer never lets a new person in without the
+# group header, and never keeps a session past SSO_UNCONFIRMED_MAX_SECONDS.
+#
+# Header format: https://docs.goauthentik.io/add-secure-apps/providers/proxy/
+# ("X-authentik-groups: foo|bar|baz ... separated by a pipe").
+CONSOLE_SSO_ADMIN_GROUP = 'authentik Admins'
+SSO_RECHECK_SECONDS = 60            # ask Authentik again at most this often per user
+SSO_UNKNOWN_RETRY_SECONDS = 20      # after no answer, wait this long before the next try
+SSO_UNCONFIRMED_MAX_SECONDS = 900   # a session with no confirmation for this long ends
+SSO_LOOKUP_TIMEOUT_SECONDS = 4      # one API call; a request never waits longer than this
+SSO_LOOKUP_WAIT_SECONDS = 5
+
+_sso_dir_lock = threading.Lock()
+_sso_dir_cache = {}       # username -> (verdict, time checked)
+_sso_dir_inflight = {}    # username -> Thread
+_sso_dir_last_admin = {}  # username -> time the API last said 'admin'
+_sso_dir_ctx = {'at': 0.0, 'url': None, 'headers': None}
+
+
+def _authentik_header_groups(raw):
+    """Group names from an X-Authentik-Groups header value (pipe separated)."""
+    return {p.strip() for p in str(raw or '').split('|') if p.strip()}
+
+
+def _sso_directory_ctx(drop=False):
+    """(api_url, headers) for the lookup below, cached for 5 minutes: on a remote
+    Authentik the token is read over SSH, which must not run on every lookup."""
+    if drop:
+        _sso_dir_ctx['at'] = 0.0
+        return (None, None)
+    now = time.time()
+    if not _sso_dir_ctx['url'] or now - _sso_dir_ctx['at'] > 300:
+        url, headers, _settings = _w1_ak_ctx()
+        _sso_dir_ctx.update(at=now, url=url, headers=headers)
+    return (_sso_dir_ctx['url'], _sso_dir_ctx['headers'])
+
+
+def _sso_directory_lookup(uname):
+    """Ask Authentik whether `uname` is a console administrator right now.
+    'admin', 'denied' (a clear no: unknown user, deactivated, or not in the group) or
+    'unknown' (no usable answer). Never raises."""
+    try:
+        ak_url, ak_headers = _sso_directory_ctx()
+        if not ak_url:
+            return 'unknown'
+
+        def _get(path):
+            r = urllib.request.Request(f'{ak_url}/api/v3/{path}', headers=ak_headers)
+            return json.loads(urllib.request.urlopen(
+                r, timeout=SSO_LOOKUP_TIMEOUT_SECONDS).read().decode())
+
+        # `username=` is an exact match; the result is still compared, because Authentik
+        # ignores a filter it does not know and would then return every user.
+        data = _get('core/users/?username=%s&include_groups=true'
+                    % urllib.parse.quote(uname, safe=''))
+        results = data.get('results') if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return 'unknown'
+        user = next((u for u in results
+                     if isinstance(u, dict) and u.get('username') == uname), None)
+        if user is None:
+            return 'denied'
+        if user.get('is_active') is not True:
+            return 'denied'
+        if user.get('is_superuser') is True:
+            return 'admin'
+        groups = user.get('groups_obj')
+        if not isinstance(groups, list):
+            full = _get('core/users/%s/' % int(user['pk']))
+            groups = full.get('groups_obj') if isinstance(full, dict) else None
+            if not isinstance(groups, list):
+                return 'unknown'   # this Authentik does not list groups here: not a "no"
+        names = {(g.get('name') or '') for g in groups if isinstance(g, dict)}
+        return 'admin' if CONSOLE_SSO_ADMIN_GROUP in names else 'denied'
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            _sso_directory_ctx(drop=True)   # the token may have changed: read it again
+        return 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _sso_directory_verdict(uname):
+    """Cached _sso_directory_lookup(). One lookup per user at a time; a request waits at
+    most SSO_LOOKUP_WAIT_SECONDS for it and gets 'unknown' when it is not back by then."""
+    if not uname:
+        return 'denied'
+    started = time.time()
+
+    def _run():
+        verdict = _sso_directory_lookup(uname)
+        with _sso_dir_lock:
+            if len(_sso_dir_cache) > 512:
+                _sso_dir_cache.clear()
+                _sso_dir_last_admin.clear()
+            _sso_dir_cache[uname] = (verdict, time.time())
+            if verdict == 'admin':
+                _sso_dir_last_admin[uname] = time.time()
+            elif verdict == 'denied':
+                _sso_dir_last_admin.pop(uname, None)
+            _sso_dir_inflight.pop(uname, None)
+
+    with _sso_dir_lock:
+        hit = _sso_dir_cache.get(uname)
+        if hit:
+            ttl = SSO_UNKNOWN_RETRY_SECONDS if hit[0] == 'unknown' else SSO_RECHECK_SECONDS
+            if 0 <= started - hit[1] < ttl:
+                return hit[0]
+        t = _sso_dir_inflight.get(uname)
+        if t is None:
+            t = threading.Thread(target=_run, daemon=True, name='sso-directory-lookup')
+            _sso_dir_inflight[uname] = t
+            t.start()
+    t.join(SSO_LOOKUP_WAIT_SECONDS)
+    with _sso_dir_lock:
+        hit = _sso_dir_cache.get(uname)
+        if hit and hit[1] >= started:
+            return hit[0]
+    return 'unknown'
+
+
+def _sso_user_is_console_admin(uname, groups_header):
+    """May this Authentik user, on a request that passed forward_auth, have a console
+    session? The API answer decides; with no answer, the group header does."""
+    verdict = _sso_directory_verdict(uname)
+    if verdict == 'admin':
+        return True
+    if verdict == 'denied':
+        return False
+    return CONSOLE_SSO_ADMIN_GROUP in _authentik_header_groups(groups_header)
+
+
+def _session_made_by_sso():
+    via = session.get('auth_via')
+    if via is None:
+        # A cookie from before ops #813 has no marker. One that names an Authentik user
+        # came from Authentik sign-in; treat it as such, so the update does not leave old
+        # Authentik sessions unchecked.
+        return bool(session.get('authentik_username'))
+    return via != 'password'
+
+
+def _sso_session_still_current():
+    """False when the session was made by Authentik sign-in and may no longer be used:
+    Authentik says the person is not a console administrator, or nothing has confirmed
+    the session for SSO_UNCONFIRMED_MAX_SECONDS. A password session is not touched.
+    Fails closed."""
+    try:
+        if not _session_made_by_sso():
+            return True
+        uname = session.get('authentik_username') or ''
+        verdict = _sso_directory_verdict(uname)
+        if verdict == 'admin':
+            return True
+        if verdict == 'unknown':
+            try:
+                seen = int(session.get('sso_ok_at') or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            with _sso_dir_lock:
+                seen = max(seen, int(_sso_dir_last_admin.get(uname) or 0))
+            if 0 <= int(time.time()) - seen <= SSO_UNCONFIRMED_MAX_SECONDS:
+                return True
+        audit('auth:sso-session-ended',
+              '%s: %s' % (uname or '(no user)',
+                          'not a console administrator in Authentik' if verdict == 'denied'
+                          else 'not confirmed by Authentik in time'))
+        return False
+    except Exception as e:
+        print(f"[auth] SSO session check failed, session ended: {str(e)[:120]}", flush=True)
+        return False
+
+
+def _sso_denied_message():
+    """Text for the sign-in page when Authentik sign-in worked but did not open the
+    console. None when that did not happen on this request."""
+    uname = request.environ.get('infratak.sso_denied')
+    if not uname:
+        return None
+    return ('You are signed in to Authentik as %s, but this account is not an infra-TAK '
+            'administrator, so the console did not open. An administrator can add the '
+            'account to the "%s" group in Authentik (Admin, Groups). If that was done '
+            'just now, sign out of Authentik and sign in again. You can also sign in '
+            'here with the console password.' % (uname, CONSOLE_SSO_ADMIN_GROUP))
+
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -4619,8 +4837,21 @@ def _apply_authentik_session():
                 hmac.compare_digest(_pa_sent, _pa_secret)
                 or (_pa_prev and hmac.compare_digest(_pa_sent, _pa_prev))):
             return False
+    # ops #813: passing forward_auth proves who the person is, not that they may run the
+    # console. Only a console administrator gets a session here.
+    _had_password_session = bool(session.get('authenticated')) and not _session_made_by_sso()
+    if not _sso_user_is_console_admin(uname, request.headers.get('X-Authentik-Groups')):
+        request.environ['infratak.sso_denied'] = uname
+        if session.get('authenticated') and not _had_password_session:
+            session.clear()   # an Authentik-made session of someone who is no longer an administrator
+        audit('auth:sso-denied', '%s: not a console administrator in Authentik' % uname)
+        return False
     session['authenticated'] = True
     session['authentik_username'] = uname
+    # A session the console password made stays a password session: the password is its
+    # own proof and does not depend on Authentik.
+    session['auth_via'] = 'password' if _had_password_session else 'sso'
+    session['sso_ok_at'] = int(time.time())
     _stamp_session_login()   # ops #634
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
     #
@@ -4654,6 +4885,12 @@ def login_required(f):
             # API routes: return 401 JSON so fetch gets JSON, not HTML redirect
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Unauthorized', 'login_required': True}), 401
+            # ops #813: signed in to Authentik but not a console administrator. Say so,
+            # instead of a bare password page that explains nothing.
+            _denied = _sso_denied_message()
+            if _denied:
+                return render_template('login.html', error=_denied, version=VERSION,
+                                       login_logo_url=_login_logo_url()), 403
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -7320,6 +7557,8 @@ def login():
             _note_password_length(request.form.get('password', ''))   # ops #638
             session.clear()
             session['authenticated'] = True
+            session['auth_via'] = 'password'   # ops #813
+            session['last_activity'] = int(time.time())
             _stamp_session_login()   # ops #634
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
@@ -7327,7 +7566,8 @@ def login():
         _console_log_failed_login('/login')   # ops #638
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
-    return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
+    return render_template('login.html', error=_sso_denied_message(),   # ops #813
+                           version=VERSION, login_logo_url=logo_url)
 
 @app.route('/logout', methods=['POST'])
 def logout():
@@ -7356,7 +7596,11 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
             _note_password_length(request.form.get('password', ''))   # ops #638
+            # ops #813: start clean, like /login does, so nothing from an earlier
+            # Authentik-made session (its user name, its marker) carries into this one.
+            session.clear()
             session['authenticated'] = True
+            session['auth_via'] = 'password'
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             _stamp_session_login()   # ops #634
             audit('auth:login-password', 'console password / break-glass')
@@ -7365,7 +7609,9 @@ def index():
         return render_template('login.html', error=stored_hash_unusable(auth['password_hash']) or 'Invalid password',
                                version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
-        return render_template('login.html', error=None, version=VERSION, login_logo_url=logo_url)
+        _denied = _sso_denied_message()   # ops #813
+        return render_template('login.html', error=_denied, version=VERSION,
+                               login_logo_url=logo_url), (403 if _denied else 200)
     return redirect(url_for('console_page'))
 
 @app.route('/api/forward-auth')
@@ -7530,6 +7776,19 @@ def _enforce_session_idle_lock():
             return  # not logged in — nothing to lock
         h = load_hardening()
         if (h.get('posture') or 'standard') != 'hardened':
+            # ops #813: no idle lock in Standard posture, but the session cookie now has
+            # a set lifetime (CONSOLE_SESSION_LIFETIME_SECONDS since it was last written).
+            # Write it again on a real user action, at most once a minute, so a session
+            # in use does not end mid-work. A background poll does not count, the same
+            # rule as the idle lock below.
+            if not (request.path.startswith('/api/') and request.method == 'GET'):
+                _now = int(time.time())
+                try:
+                    _last = int(session.get('last_activity') or 0)
+                except (TypeError, ValueError):
+                    _last = 0
+                if not 0 <= _now - _last < 60:
+                    session['last_activity'] = _now
             return
         a = (h.get('applied') or {}).get('W2_session') or {}
         idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
@@ -19036,10 +19295,13 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.18.0'   # v10.2.8 W8: SECURITY — 4.14.0 carried GHSA-m23x (pre-auth heap
-# disclosure), GHSA-fvj6 (weak RNG) + five MEDIUM; all fixed by 4.17.0. Our flags include none of 4.18's
-# three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
-# defaults do not touch a cert-less UDP/TCP TURN.
+COTURN_IMAGE = 'coturn/coturn:4.19.1'   # ops #816: SECURITY — 4.19.0 fixes reads past a short key, a mismatched
+# realm accepted on connection-bind, a Redis reply offset and a blacklist race; 4.19.1 adds per-source DTLS half-open
+# limits, plaintext on a DTLS port, an oversize TCP/TLS frame and the admin HTTP server (no CVE published
+# at the time of the bump). Earlier: v10.2.8 W8 moved 4.14.0 -> 4.18.0
+# (GHSA-m23x pre-auth heap disclosure, GHSA-fvj6 weak RNG, five MEDIUM; fixed by 4.17.0). Our flags include none of
+# 4.18's three removals (--drop-invalid-packets, --no-dtls, --no-cli); 4.17's DTLS-opt-in / stateless-nonce
+# defaults do not touch a cert-less UDP/TCP TURN. 4.19.1's entrypoint still expands $(...) per argument.
 # Fleet constant (v10.0.7): standalone Remote-Assist CoTURN ALWAYS defaults to 3479,
 # never 3478 — 3478 is reserved for NetBird's TURN so the two can land on one box in
 # ANY install order with zero conflicts. RA clients are explicitly told URL+port by
@@ -28760,6 +29022,24 @@ NODE_SECURITY_RELEASES = (
      'fixed': {22: '22.23.4', 24: '24.22.1', 26: '26.12.1'},
      'reason': 'a Brotli decoder memory-corruption bug that can lead to remote code execution, '
                'being actively attacked'},
+    # ops #824: the 2026-11-11 release (22.23.5 / 24.22.3 / 26.13.1). CVE-2026-123864 is the
+    # High one that reaches the 22 line: a zero-length TLS write leaks server memory into HTTPS
+    # responses. The same release fixes more HTTP/2 and TLS flaws (CVE-2026-123865, -123866,
+    # -123872 High). https://nodejs.org/en/blog/vulnerability/november-2026-security-releases
+    # `upstream_pending`: module keys whose image we cannot rebuild and whose upstream has not
+    # shipped the fix yet (nodered/node-red:4.1.17-22 is still on 22.23.4, last pushed
+    # 2026-10-21). They are left out of the flag and the email, because pressing Update could
+    # never clear them. Remove the key the day Node-RED ships a rebuilt tag and NODERED_IMAGE
+    # moves to it. A container name works too: `cloudtak-print` (Node 24, the TAK Portal
+    # Marketplace Print plugin) is left out for the same reason. The CloudTAK card's Update
+    # never builds it (its compose file is kept out of COMPOSE_FILE on purpose, see
+    # _CLOUDTAK_PRINT_PLUGIN_COMPOSE), so a red CloudTAK flag for it could never clear. Print
+    # also serves cleartext HTTP on a loopback port, which CVE-2026-123864 does not touch.
+    {'id': 'CVE-2026-123864', 'released': '2026-11-11',
+     'fixed': {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'},
+     'upstream_pending': ('nodered', 'cloudtak-print'),
+     'reason': 'several flaws in how Node.js handles HTTPS and HTTP/2, including one that can '
+               'leak server memory into web responses'},
 )
 
 # Node-based modules whose containers are checked: module key (as in /api/modules/version) →
@@ -28782,14 +29062,18 @@ def _node_version_tuple(v):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
-def _node_releases_missing(version):
+def _node_releases_missing(version, module=None, container=None):
     """NODE_SECURITY_RELEASES entries a Node `version` ('v22.23.0') is below. A version
-    that does not parse, or a major no entry lists, is not claimed."""
+    that does not parse, or a major no entry lists, is not claimed. An entry that lists
+    `module` or `container` under `upstream_pending` is not claimed for it (ops #824)."""
     ver = _node_version_tuple(version)
     if ver is None:
         return []
     out = []
     for rel in NODE_SECURITY_RELEASES:
+        pending = rel.get('upstream_pending', ())
+        if module in pending or container in pending:
+            continue
         fixed = _node_version_tuple(rel['fixed'].get(ver[0]))
         if fixed is not None and ver < fixed:
             out.append(rel)
@@ -28835,7 +29119,7 @@ def _node_security_gaps(versions=None):
     for key, per_container in versions.items():
         outdated, rels = {}, {}
         for cname, ver in per_container.items():
-            missing = _node_releases_missing(ver)
+            missing = _node_releases_missing(ver, key, cname)
             if missing:
                 outdated[cname] = ver
                 rels.update({r['id']: r for r in missing})
@@ -43895,13 +44179,53 @@ def _netbird_docker_image_version(container_name):
     return ''
 
 
+def _netbird_image_ref_version(image_ref):
+    """Version in the tag of an image reference, or '' when the tag is not a version.
+
+    'netbirdio/netbird-server:0.82.1' -> '0.82.1'; 'netbirdio/dashboard:v2.96.0' -> '2.96.0'.
+    No tag, 'latest' or a digest pin gives '' (the caller then falls back to the label)."""
+    import re
+    ref = (image_ref or '').strip().split('@', 1)[0]
+    last = ref.rsplit('/', 1)[-1]
+    if ':' not in last:
+        return ''
+    tag = last.rsplit(':', 1)[-1].lstrip('vV')
+    return tag if re.match(r'^\d+\.\d+(\.\d+)?([.+-][0-9A-Za-z.+-]+)?$', tag) else ''
+
+
+def _netbird_server_image_version(container_name):
+    """Running NetBird server version (ops #853).
+
+    The netbirdio/netbird-server images carry only the org.opencontainers.image.version label of
+    their Ubuntu base image ('24.04'), so the label is not the server version. The real version
+    is the tag the container was created from (compose pins it, e.g. netbird-server:0.82.1).
+    The label is only a fallback, and only when it looks like a NetBird version ('0.x');
+    anything else gives '' so the card never shows a wrong number."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', container_name, '--format',
+                        '{{.Config.Image}}|{{index .Config.Labels "org.opencontainers.image.version"}}']),
+            capture_output=True, text=True, timeout=8)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            img, _, label = r.stdout.strip().partition('|')
+            ver = _netbird_image_ref_version(img)
+            if ver:
+                return ver
+            label = label.strip().lstrip('vV')
+            if label.startswith('0.'):
+                return label
+    except Exception:
+        pass
+    return ''
+
+
 def _get_netbird_version_info():
     """Return {version, update_available, latest} for NetBird server + dashboard images."""
     out = {'version': '', 'update_available': False, 'latest': None}
     nb_dir = NETBIRD_INSTALL_DIR
     if not os.path.isfile(os.path.join(nb_dir, 'docker-compose.yml')):
         return out
-    mgmt_ver = _netbird_docker_image_version('netbird-server')
+    mgmt_ver = _netbird_server_image_version('netbird-server')
     dash_ver = _netbird_docker_image_version('netbird-dashboard')
     parts = []
     if mgmt_ver:
@@ -52812,6 +53136,16 @@ def _etlcat_gh_url(u):
     return u if re.fullmatch(r'https://(github\.com|raw\.githubusercontent\.com)/[A-Za-z0-9._/-]{1,300}', u) else ''
 
 
+def _etl_build_cmd(argv):
+    """argv wrapped for the root broker, or None when its socket is absent. The broker runs a
+    `docker build --network cloudtak_etl` with the classic builder (BuildKit cannot join a custom
+    network) and only after the W5 egress block is verified, so the build never runs another way,
+    whoever the console runs as."""
+    if not _broker_socket_present():
+        return None
+    return _broker_client_prefix() + list(argv)
+
+
 def _etlcat_build(e, log):
     """Build the pinned commit. Returns (ok, logo_data_url). Skips the build when the image is
     already there with this exact SHA label."""
@@ -52857,7 +53191,15 @@ def _etlcat_build(e, log):
                 '--label', f"{_etl.SHA_LABEL}={e['sha']}", '-t', tag]
         if caps:
             args[2:2] = ['--label', f'{_etl.CAP_LABEL}={caps}']
-        b = subprocess.run(_sudo_wrap(args + [src]), capture_output=True, text=True, timeout=3600,
+        # ops #841 (infra-TAK #523): through the broker ALSO when the console runs as root.
+        # _sudo_wrap runs a root console's docker directly, which means BuildKit and "network mode
+        # cloudtak_etl not supported by buildkit", and no egress gate.
+        cmd = _etl_build_cmd(args + [src])
+        if cmd is None:
+            log("  ✗ the privileged broker is not running — ETL images build only through it "
+                "(it keeps the build behind the egress block). Restart takwerx-broker and retry.")
+            return False, ''
+        b = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
                            env={**os.environ, 'TAKWERX_BROKER_TIMEOUT': '3600'})   # ops #160: else killed at 600 s
         # BuildKit keeps ~1 GB of cache per build; nothing reuses it (PLAN W3)
         subprocess.run(_sudo_wrap(['docker', 'builder', 'prune', '-f']), capture_output=True, text=True, timeout=600)
@@ -58149,7 +58491,7 @@ def _webodm_odm_limits(detected_cores, cfg):
 #                db/18. A 4.x database cannot be opened by 3.x, so Update dumps the 9.5 database
 #                first and puts 3.x back by itself if the upgrade fails (_run_webodm_update).
 #                https://github.com/OpenDroneMap/WebODM/blob/v4.0.0/db/db-upgrade-9-to-18
-WEBODM_VERSION = '4.0.0'
+WEBODM_VERSION = '4.0.1'   # 4.0.1 (ops #820): project permission checks hardened (upstream PR 2061); no DB migration
 # TAK overlay plugin (a personal GitHub account's repo, loaded INTO the WebODM container). ops #637:
 # pinned to a release tag and its commit. The clone is refused unless HEAD is exactly
 # WEBODM_OVERLAY_SHA. Reviewed whole-tree at this ref (module-scan). Bump both together after a
@@ -100675,6 +101017,58 @@ _mapsync_splitbox_logged = False
 _groupcache_splitbox_logged = False
 
 
+# ops #842: TAK Portal's CloudTAK Marketplace keeps its jobs in this file inside the portal
+# container (services/cloudtakMarketplace.store.js, DIR = ../data/cloudtak-marketplace).
+# A job is "busy" while its status is queued or running; the portal's own status route
+# reports the same thing as `busy` (hasBusyChangeJobs).
+_TAKPORTAL_MARKETPLACE_JOBS = '/usr/src/app/data/cloudtak-marketplace/jobs.json'
+_TAKPORTAL_MARKETPLACE_BUSY_STATES = ('queued', 'running')
+# A restart ends every busy job with "Interrupted by restart." and a batch can take about 45
+# minutes (the CloudTAK rebuild), so the map sync waits. A job record stuck on "running" must
+# not hold the map sync back for ever: after this many seconds it goes ahead.
+_MAPSYNC_MARKETPLACE_WAIT_MAX = 3 * 3600
+_MAPSYNC_MARKETPLACE_WAIT = {'since': None}
+
+
+def _takportal_marketplace_busy():
+    """ops #842: True when a TAK Portal CloudTAK Marketplace job is queued or running, i.e.
+    a restart of the portal right now would end it with "Interrupted by restart.".
+
+    Reads the portal's own jobs file the way the settings.json reads do (docker exec cat).
+    Anything we cannot read (no container, no file, bad JSON) is "not busy": the portal then
+    behaves as it did before this check existed, never worse."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', _TAKPORTAL_MARKETPLACE_JOBS]),
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+        jobs = (json.loads(r.stdout or '{}') or {}).get('jobs') or []
+        return any(isinstance(j, dict) and str(j.get('status') or '') in _TAKPORTAL_MARKETPLACE_BUSY_STATES
+                   for j in jobs)
+    except Exception:
+        return False
+
+
+def _takportal_mapsync_wait_for_marketplace(_log):
+    """ops #842: True when the map sync must wait: a Marketplace job is running, and it has not
+    been waited on for more than _MAPSYNC_MARKETPLACE_WAIT_MAX seconds. The sync then leaves
+    the UAF and the portal alone and returns; the next watchdog tick (every 10 min) tries
+    again, so once the batch ends the channels are written and the portal restarted ONCE."""
+    wait = _MAPSYNC_MARKETPLACE_WAIT
+    if not _takportal_marketplace_busy():
+        wait['since'] = None
+        return False
+    now = time.time()
+    if wait['since'] is None:
+        wait['since'] = now
+    if now - wait['since'] > _MAPSYNC_MARKETPLACE_WAIT_MAX:
+        _log("a Marketplace job has been running for over 3 hours — restarting tak-portal anyway")
+        wait['since'] = None
+        return False
+    _log("a TAK Portal Marketplace job is running — channel sync and tak-portal restart wait until it ends")
+    return True
+
+
 def _takportal_sync_map_channels(plog=None):
     """Keep the TAK Portal map bridge user (the `admin` cert) enrolled in EVERY TAK
     channel, so the portal /map's single server-side CoT bridge receives all feeds on
@@ -100772,7 +101166,12 @@ def _takportal_sync_map_channels(plog=None):
             ET.SubElement(admin_el, ns + 'groupList').text = name
         changed = True
     if not changed:
+        _MAPSYNC_MARKETPLACE_WAIT['since'] = None
         _log(f"admin bridge (+bootstrap cert) already in {len(target)} channels — no change, no restart")
+        return
+    # ops #842: the restart below ends every running Marketplace job ("Interrupted by restart.")
+    # and leaves CloudTAK half rebuilt. Wait: nothing is written yet, so the next tick redoes this.
+    if _takportal_mapsync_wait_for_marketplace(_log):
         return
     import io as _io
     _buf = _io.StringIO()
@@ -112352,7 +112751,7 @@ exit 0
 '''
 
 
-def _ensure_console_restart_timer():
+def _ensure_console_restart_timer(settings=None):
     """v0.9.44: install/repair the daily console-restart timer + idle-gate script.
 
     Recovers the wedged-worker failure mode (test6/test8, 2026-06-03): port 5001
@@ -112364,6 +112763,19 @@ def _ensure_console_restart_timer():
 
     Idempotent -- safe to call on every console boot from _startup_migrations.
     Returns a short status string for the boot log, or '' when nothing changed.
+
+    The owner's "off" is kept (takwerx/ops #834, infra-TAK #520: an agency that
+    moved its console and turned the nightly restart off had it come back on
+    every boot). The timer is NOT enabled again when either
+      * `console_restart_timer_off` is true in settings.json, or
+      * the timer unit already existed and systemd says it is disabled/masked
+        (the owner ran `systemctl disable` on it). That is recorded as
+        `console_restart_timer_off` so the owner's choice is written down.
+    A first install (no timer unit yet) still arms it. To arm it again the owner
+    runs `systemctl enable --now takconsolerestart.timer`; the flag then clears.
+    `settings` is the caller's loaded settings dict; this changes it in place and
+    the caller saves it (a second load/save here would be overwritten by the
+    caller's older copy).
     """
     try:
         script_path = '/usr/local/sbin/tak-console-restart.sh'
@@ -112395,6 +112807,17 @@ def _ensure_console_restart_timer():
         )
 
         changed = False
+        _off_flag = bool((settings or {}).get('console_restart_timer_off'))
+        _existed = os.path.exists(tmr_path)
+        _state_r = subprocess.run(
+            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
+            capture_output=True, text=True, timeout=5)
+        _state = (_state_r.stdout or '').strip()
+        _owner_off = _off_flag or (_existed and _state in ('disabled', 'masked', 'masked-runtime'))
+        if _state == 'enabled' and _off_flag and settings is not None:
+            # The owner armed it again by hand: the flag no longer applies.
+            settings.pop('console_restart_timer_off', None)
+            _off_flag = _owner_off = False
 
         def _write_if_changed(path, content, mode=None):
             cur = ''
@@ -112414,10 +112837,13 @@ def _ensure_console_restart_timer():
         changed |= _write_if_changed(svc_path, svc_content)
         changed |= _write_if_changed(tmr_path, tmr_content)
 
-        _enabled = subprocess.run(
-            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
-            capture_output=True, text=True, timeout=5)
-        if changed or 'enabled' not in (_enabled.stdout or ''):
+        if _owner_off:
+            if settings is not None and not _off_flag:
+                settings['console_restart_timer_off'] = True
+            if changed:
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            return 'console-restart timer left off (owner turned it off)'
+        if changed or _state != 'enabled':
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takconsolerestart.timer']),
                            capture_output=True, text=True, timeout=10)
@@ -113588,7 +114014,10 @@ def _startup_migrations():
         # v0.9.44: ensure the daily console-restart timer exists (recovers a
         # wedged gunicorn worker; loads pulled code). Runs every boot, idempotent.
         try:
-            _crt_msg = _ensure_console_restart_timer()
+            _crt_before = s.get('console_restart_timer_off')
+            _crt_msg = _ensure_console_restart_timer(s)
+            if s.get('console_restart_timer_off') != _crt_before:
+                settings_dirty = True
             if _crt_msg:
                 print(f"Startup migration: {_crt_msg}", flush=True)
         except Exception as _crt_e:
