@@ -48302,6 +48302,62 @@ _MEDIAMTX_REMOTE_CERT_PERMS = (
 )
 
 
+# ops #891: the remote web editor runs as takwerx. At import it makes
+# /usr/local/etc/mediamtx_backups, and its saves run `sed -i` in /usr/local/etc, which is
+# root:root 755 on a fresh host. The remote deploy skipped the setup the local deploy does
+# (_mediamtx_grant_config_dir_write), so the editor died with PermissionError and crash-looped
+# on every remote host. Same shape as the local step, as one script for the SSH user
+# (root, or sudo -n). Prints EDITOR_PATHS_RC=0 when every step worked.
+_MEDIAMTX_REMOTE_EDITOR_PATHS_SH = (
+    _REMOTE_SUDO_SH +
+    'RC=0; '
+    '$S mkdir -p /usr/local/etc/mediamtx_backups || RC=1; '
+    '$S chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups /opt/mediamtx-webeditor || RC=1; '
+    '$S chown root:takwerx /usr/local/etc || RC=1; '
+    '$S chmod 775 /usr/local/etc || RC=1; '
+    'if [ -f /usr/local/etc/mediamtx.yml ]; then '
+    '$S chown -h takwerx:takwerx /usr/local/etc/mediamtx.yml || RC=1; fi; '
+    'echo "EDITOR_PATHS_RC=$RC"'
+)
+
+# After the start: the editor must stay up, not just be started once. A crash loop
+# (RestartSec=5) shows `activating` between runs, so look three times, 4 s apart, and
+# also ask for the listener on 5080. Prints EDITOR_OK=1 or EDITOR_OK=0 and the last journal
+# lines when it is down.
+_MEDIAMTX_REMOTE_EDITOR_CHECK_SH = (
+    _REMOTE_SUDO_SH +
+    'OK=1; for I in 1 2 3; do sleep 4; '
+    '[ "$(systemctl is-active mediamtx-webeditor 2>/dev/null)" = active ] || OK=0; done; '
+    '(ss -ltn 2>/dev/null | grep -q ":5080 ") || OK=0; '
+    'echo "EDITOR_OK=$OK"; '
+    '[ "$OK" = 1 ] || $S journalctl -u mediamtx-webeditor -n 4 --no-pager -o cat 2>/dev/null'
+)
+
+
+def _mediamtx_remote_editor_prepare(deploy_cfg, plog):
+    """Make the remote editor's paths writable for takwerx before it starts. ops #891."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_PATHS_SH, timeout=60)
+    if ok and 'EDITOR_PATHS_RC=0' in (out or ''):
+        plog("  ✓ Web editor writable paths ready on remote host (backups + editor folder + config folder)")
+        return True
+    plog(f"  ⚠ Could not set up the web editor's folders on the remote host: {(out or '')[-160:]}")
+    return False
+
+
+def _mediamtx_remote_editor_check(deploy_cfg, plog):
+    """Say whether the remote web editor is really up, never just that it was started."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_CHECK_SH, timeout=60)
+    if ok and 'EDITOR_OK=1' in (out or ''):
+        plog("✓ Web editor is running on the remote host (port 5080)")
+        return True
+    plog("✗ Web editor is NOT running on the remote host (port 5080 is not listening).")
+    plog("  Streaming still works. The MediaMTX web page will not load until this is fixed.")
+    tail = (out or '').replace('EDITOR_OK=0', '').strip()
+    if tail:
+        plog(f"  Last log lines: {tail[-300:]}")
+    return False
+
+
 # Remote MediaMTX firewall. Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890
 # (UDP; this opened 8890/tcp until v10.1.10). The API (9898) is loopback-only and denied
 # outright. The web editor (5080) and HLS (8888) bind 0.0.0.0 so Caddy on the CONSOLE can
@@ -48735,6 +48791,8 @@ paths:
     except Exception:
         pass
     plog("✓ Services created")
+    # ops #891: the editor runs as takwerx and dies at import without these. Before the start.
+    _mediamtx_remote_editor_prepare(deploy_cfg, plog)
 
     # Step 6: Firewall, BEFORE the services start (ops #630). The editor binds 0.0.0.0:5080
     # and is meant for the console only. This step used to come after the
@@ -48752,6 +48810,8 @@ paths:
         return
     _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
     plog("✓ Services started")
+    # ops #891: "started" is not "up". The editor crash-looped here and the log still said ok.
+    _mediamtx_remote_editor_check(deploy_cfg, plog)
 
     # Step 5b: Test video
     test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
