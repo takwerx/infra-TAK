@@ -104,12 +104,12 @@ def test_netbird_vetted_and_dev_pins_are_past_the_relay_fix():
         assert ':latest' not in val and re.search(r':v?\d+\.\d+\.\d+$', val), name
 
 
-def test_netbird_dev_trial_pair_is_0_82_and_vetted_pair_is_unchanged():
-    # ops #427: 0.82.0 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
+def test_netbird_dev_trial_pair_is_0_82_1_and_vetted_pair_is_unchanged():
+    # ops #427, #819: 0.82.1 / v2.96.0 is the dev trial pair; the vetted (main) pair only moves after
     # the gated T&E is green and the lead promotes it, so main boxes stay on 0.80.0 / v2.94.0.
     def pin(name):
         return re.search(rf'^{name} = "[^:"]+:v?([^"]+)"', APP, re.M).group(1)
-    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.0'
+    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.1'
     assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.96.0'
     assert pin('NETBIRD_SERVER_IMAGE') == '0.80.0'
     assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.94.0'
