@@ -128,6 +128,17 @@ def test_a_successful_write_clears_the_missing_mission_flag(tmp_path):
     assert len(_mission_warns(again)) == 1
 
 
+def test_a_500_after_a_404_also_clears_the_flag_and_goes_to_the_uid_handling(tmp_path):
+    # Box check (test12): the mission was created, the first write then got a real 500
+    # (uids with no CoT). The mission exists, so the stale flag must go, and the 500 takes
+    # the normal adaptive-chunk path.
+    res = _run(tmp_path, LOG_ACTION, [_resp(404), _resp(500)], flow={'_putChunkSize': 2})
+    assert 'TFR' not in (res['flow'].get('_missionMissing') or {})
+    assert res['flow']['_putChunkSize'] == 1
+    assert any('now exists' in w for w in res['warns'])
+    assert any('shrinking PUT chunk 2 -> 1' in w for w in res['warns'])
+
+
 def test_a_404_for_one_mission_does_not_hide_another(tmp_path):
     other = 'https://h:8443/Marti/api/missions/OTHER%20ONE/contents'
     res = _run(tmp_path, LOG_ACTION, [_resp(404), _resp(404, url=other)])
