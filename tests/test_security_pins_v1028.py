@@ -48,6 +48,13 @@ def test_mediamtx_fresh_install_pin_is_1_21_3_ops428():
     assert _v(pin) >= (1, 21, 3)
 
 
+def test_mediamtx_fresh_install_pin_is_1_21_4_ops817():
+    # ops #817: 1.21.4 caps RTSP-over-WebSocket messages and adds an idle timeout during tunnel
+    # detection (both before login), keeps passwords/tokens out of the debug log. Component check: ops #818.
+    pin = re.search(r'^MEDIAMTX_VETTED_RELEASE = "([^"]+)"', APP, re.M).group(1)
+    assert _v(pin) >= (1, 21, 4)
+
+
 def test_mediamtx_checksum_grep_matches_upstream_line_format_ops428():
     # The remote deploy greps checksums.sha256 for `<64 hex> [ *]<tarball>` and fails closed;
     # upstream writes the binary-mode `<hash> *<file>` form (seen in the real 1.21.3 file).
