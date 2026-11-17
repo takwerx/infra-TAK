@@ -1,7 +1,6 @@
 {
   "_comment": "prefix -> reason. tools/etl_catalog_sync.py and tools/etl_catalog_review.py keep a held ETL unreviewed (a box will not install it) and show the reason on its card.",
   "holds": {
-    "etl-arcgis": "On hold: a security report sent to the COE on 2026-11-09 is still open. infra-TAK will offer this ETL again once it is fixed.",
     "etl-cotrip-signs": "On hold: a security report sent to the COE on 2026-11-09 is still open. infra-TAK will offer this ETL again once it is fixed.",
     "etl-cotrip-weather": "On hold: a security report sent to the COE on 2026-11-09 is still open. infra-TAK will offer this ETL again once it is fixed."
   }
