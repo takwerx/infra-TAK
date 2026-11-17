@@ -33129,6 +33129,40 @@ def _fedhub_next_numbered_ca_name(current_name, default_stem):
     return f'{name}-01'
 
 
+def _fedhub_rotate_stash_cmd(fh_dir, ts):
+    """Shell command: move the hub's old certificate files out of the way before new ones are made.
+
+    The vendor's makeRootCa.sh stops with "ca.pem file already exists!  Please delete it before
+    trying again" when certs/files/ca.pem is there (verified on TAK Server 5.x's script, ops #865),
+    so every Rotate CA on a hub that already has certificates failed at the first script. The old
+    folder goes into backups/ beside the tar backup, the same way TAK Server's own rotate starts
+    from a clean folder. The backups folder is made root-only: it now holds the old CA keys.
+    """
+    old = f'backups/pre-rotate-{ts}-files'
+    # The folder stays; only what is in it moves, so its owner and mode do not change.
+    return (
+        f'cd {fh_dir}/certs && '
+        f'sudo mkdir -p backups && sudo chmod 700 backups && '
+        f'if [ -d files ] && [ -n "$(sudo ls -A files 2>/dev/null)" ]; then '
+        f'sudo rm -rf {old} && sudo mkdir {old} && '
+        f'sudo find files -mindepth 1 -maxdepth 1 -exec mv {{}} {old}/ \\; ; '
+        f'fi'
+    )
+
+
+def _fedhub_rotate_unstash_cmd(fh_dir, ts):
+    """Shell command: put the old certificate files back when the new ones could not be made."""
+    old = f'backups/pre-rotate-{ts}-files'
+    return (
+        f'cd {fh_dir}/certs && '
+        f'if [ -d {old} ]; then '
+        f'sudo find files -mindepth 1 -maxdepth 1 -exec rm -rf {{}} \\; && '
+        f'sudo find {old} -mindepth 1 -maxdepth 1 -exec mv {{}} files/ \\; && '
+        f'sudo rmdir {old}; '
+        f'fi'
+    )
+
+
 def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
     def plog(msg):
         fedhub_rotate_log.append(msg)
@@ -33220,6 +33254,14 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         else:
             plog('✓ cert-metadata patched')
 
+        ok_stash, stash_out = _module_run(cfg, _fedhub_rotate_stash_cmd(fh_dir, ts), timeout=60)
+        if not ok_stash:
+            plog(f'✗ Could not move the old certificate files aside: {(stash_out or "")[:240]}')
+            plog('✗ Certificate rotation failed')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog(f'✓ Old certificate files moved to {fh_dir}/certs/backups/pre-rotate-{ts}-files')
+
         cert_cmds = (
             f'cd {fh_dir}/certs && '
             f'sudo chown -R tak:tak {fh_dir} && '
@@ -33232,6 +33274,12 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_out:
             plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
         if not ok_cert:
+            ok_back, back_out = _module_run(cfg, _fedhub_rotate_unstash_cmd(fh_dir, ts), timeout=60)
+            if ok_back:
+                plog('✓ Old certificate files put back, nothing changed')
+            else:
+                plog(f'⚠ Could not put the old files back: {(back_out or "")[:240]}')
+                plog(f'  They are in {fh_dir}/certs/backups/pre-rotate-{ts}-files')
             plog('✗ Certificate rotation failed')
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
             return
