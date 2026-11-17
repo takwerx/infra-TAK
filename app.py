@@ -36902,6 +36902,29 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             return False, str(e)[:200]
 
 
+def _as_root_sh(cmd):
+    """Shell text that runs `cmd` as root on a remote SSH target (ops #890).
+
+    `_module_run` runs `cmd` as the SSH user. A cloud image's sudo user (azureuser, ubuntu, rocky)
+    is not root, so a bare `apt-get`, `mv /usr/local/bin/...`, `mkdir /opt/...` or `systemctl` dies
+    with "Permission denied". Root runs it as it is; any other user runs the WHOLE string under
+    `sudo -n sh -c`, so a `a && b && c` chain is root all the way through (a `$S a && b` prefix
+    would leave `b` and `c` unprivileged). `-n`: never sit at a password prompt.
+    NON-ROOT-COMMANDS: apt-get, systemctl, mv, mkdir, pip3, useradd."""
+    q = shlex.quote(cmd)
+    return f'if [ "$(id -u)" = 0 ]; then sh -c {q}; else sudo -n sh -c {q}; fi'
+
+
+def _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=None):
+    """Like `_module_run`, but a remote target runs `cmd` as root (see `_as_root_sh`). A local
+    target is unchanged: the console's own shim/broker path already handles its privilege."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return _module_run(deploy_cfg, cmd, timeout=timeout, log_fn=log_fn)
+    if log_fn:
+        log_fn(f"  [remote] {cmd[:80]}...")
+    return _module_run(deploy_cfg, _as_root_sh(cmd), timeout=timeout)
+
+
 _MODULE_FW_BACKEND_KEY = '_infratak_fw_backend'
 
 
@@ -47940,7 +47963,7 @@ def mediamtx_control():
         if not (remote.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         cmd = f'systemctl {action} mediamtx mediamtx-webeditor 2>&1'
-        ok, _ = _ssh_probe(remote, cmd, timeout=30)
+        ok, _ = _ssh_probe(remote, _as_root_sh(cmd), timeout=30)   # ops #890: root, `sudo -n` if not root
         time.sleep(2)
         ok2, out = _ssh_probe(remote, 'systemctl is-active mediamtx 2>/dev/null', timeout=10)
         running = bool(ok2 and out and out.strip() == 'active')
@@ -47990,14 +48013,15 @@ def mediamtx_recovery():
             _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-            _module_run(
+            _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
+            _module_run_root(
                 deploy_cfg,
                 "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
                 timeout=90,
             )
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
             # is the only legitimate consumer; upstream defaults to 0.0.0.0).
-            _module_run(
+            _module_run_root(
                 deploy_cfg,
                 "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
                 "sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
@@ -48031,7 +48055,7 @@ def mediamtx_recovery():
                 except Exception:
                     pass
                 if copy_ok:
-                    _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
+                    _module_run_root(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
             try:
                 src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
@@ -48050,13 +48074,12 @@ def mediamtx_recovery():
                 with open(overlay_src) as _of:
                     _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
             elif os.path.exists(overlay_src):
-                _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-                _module_copy(
-                    deploy_cfg,
-                    overlay_src,
-                    '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py',
-                    timeout=20
-                )
+                # ops #890: scp runs as the SSH user and cannot write into root's /opt: stage in
+                # /tmp, then move into place as root (same two steps as the deploy).
+                _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+                _ov_ok, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', timeout=20)
+                if _ov_ok:
+                    _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
         except Exception:
             pass
         if _is_remote:
@@ -48115,7 +48138,7 @@ def mediamtx_recovery():
             f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
-        ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
+        ok_run, out = _module_run_root(deploy_cfg, cmd, timeout=25)   # ops #890: mv/sed/systemctl need root
         if not ok_run:
             return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
         # Check if web editor actually came up
@@ -48162,7 +48185,8 @@ def mediamtx_logs():
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
+        # ops #890: a non-root SSH user outside the adm/systemd-journal group reads no system journal.
+        ok, out = _ssh_probe(deploy_cfg['remote'], _as_root_sh(f'journalctl -u {unit} --no-pager -n {lines} 2>&1'), timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
     r = subprocess.run(['journalctl', '-u', unit, '--no-pager', '-n', str(lines)], capture_output=True, text=True, timeout=10)
@@ -48183,10 +48207,11 @@ def mediamtx_uninstall():
     if deploy_cfg.get('target_mode') == 'remote':
         remote = deploy_cfg.get('remote', {})
         if (remote.get('host') or '').strip():
-            ok, out = _ssh_probe(remote, 'systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', timeout=15)
-            _ssh_probe(remote, 'rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml', timeout=10)
-            _ssh_probe(remote, 'rm -rf /opt/mediamtx-webeditor', timeout=10)
-            _ssh_probe(remote, 'systemctl daemon-reload 2>/dev/null; true', timeout=10)
+            # ops #890: every step needs root; `sudo -n` when the SSH user is not root.
+            ok, out = _ssh_probe(remote, _as_root_sh('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true'), timeout=15)
+            _ssh_probe(remote, _as_root_sh('rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('rm -rf /opt/mediamtx-webeditor'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('systemctl daemon-reload 2>/dev/null; true'), timeout=10)
             steps.append('Stopped and removed MediaMTX on remote host')
         settings['mediamtx_deployment'] = dict(deploy_cfg)
         settings['mediamtx_deployment']['deployed'] = False
@@ -48445,6 +48470,26 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
     return 'on', failed
 
 
+# Files the console scp's into the remote /tmp as the SSH user, then moves into place as root
+# (ops #890). A root-owned file with the same name (a deploy that ran as root and stopped
+# part way) makes the next scp, as a non-root SSH user, die with "Permission denied": the
+# deploy and the recovery remove them first, as root.
+_MEDIAMTX_REMOTE_STAGING = (
+    '/tmp/mediamtx.yml', '/tmp/mediamtx.service', '/tmp/mediamtx-webeditor.service',
+    '/tmp/mediamtx-webeditor.env', '/tmp/mtx_hls_patcher.py', '/tmp/mtx_ldap_patcher.py',
+    '/tmp/mtx_endpoint_patch.py', '/tmp/mediamtx_ldap_overlay.py', '/tmp/mediamtx_stream.crt',
+    '/tmp/mediamtx_stream.key', '/tmp/ensure_overlay.py',
+)
+
+
+def _mediamtx_remote_clear_staging(deploy_cfg):
+    """Remove the fixed /tmp staging names (above) on the remote host, as root. Never raises."""
+    try:
+        _module_run_root(deploy_cfg, 'rm -f ' + ' '.join(_MEDIAMTX_REMOTE_STAGING), timeout=15)
+    except Exception:
+        pass
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -48459,9 +48504,12 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 1: Dependencies
     plog("━━━ Step 1/7: Installing Dependencies (remote) ━━━")
-    ok, out = _module_run(deploy_cfg, 'apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1', timeout=300, log_fn=plog)
+    # ops #890: as root (`sudo -n` for a non-root SSH user), or apt dies on "lists/lock: Permission denied".
+    ok, out = _module_run_root(deploy_cfg, 'apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1', timeout=300, log_fn=plog)
     if not ok:
         plog(f"✗ apt install failed: {(out or '')[-300:]}")
+        if 'password is required' in (out or '') or 'sudo:' in (out or ''):
+            plog("  The SSH user needs passwordless sudo (sudo -n) on the remote host, or use root.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
@@ -48516,11 +48564,14 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         # Upstream writes binary-mode lines (`<hash> *<file>`): match either separator, or
         # the grep finds nothing and EVERY remote deploy refuses (shipped v10.1.34 → row 5).
         f'grep -E "^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$" checksums.sha256 | sha256sum --check --status && '
-        f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
+        # ops #890: extract ONLY the binary. The tarball also holds mediamtx.yml and LICENSE; run as
+        # root they were left behind in /tmp, root-owned, and the next scp of our own mediamtx.yml
+        # (as a non-root SSH user) died with "Permission denied" at Step 4.
+        f'tar -xzf {tarball} mediamtx && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
         f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
         f'rm -f {tarball} checksums.sha256'
     )
-    ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
+    ok, out = _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
         plog(f"✗ Download/verify/install failed (checksum mismatch aborts the install): {(out or '')[-200:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
@@ -48530,6 +48581,7 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 4: Config
     plog("")
     plog("━━━ Step 4/7: Writing Configuration (remote) ━━━")
+    _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before the first scp into /tmp
     hls_pass = _sec.token_hex(8)
     # apiAddress stays on 127.0.0.1 (webedit Flask calls it locally on the remote host).
     # hlsAddress is 0.0.0.0 so Caddy on the console can reverse-proxy HLS streams;
@@ -48631,9 +48683,12 @@ paths:
         plog("✗ Failed to copy config to remote")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    ok, _ = _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+    # ops #890: root:root in place, whoever the SSH user is (a plain `mv` kept the SSH user as owner).
+    ok, out = _module_run_root(deploy_cfg, 'install -D -m 644 -o root -g root /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml && rm -f /tmp/mediamtx.yml', timeout=10)
     if not ok:
-        _module_run(deploy_cfg, 'mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+        plog(f"✗ Could not write /usr/local/etc/mediamtx.yml on the remote host: {(out or '')[-200:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     plog("✓ Configuration written")
     plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
@@ -48653,15 +48708,16 @@ paths:
         plog("✗ Failed to copy systemd unit")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
-    # Web editor: clone on remote and install
-    _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx.service /etc/systemd/system/mediamtx.service && rm -f /tmp/mediamtx.service', timeout=10)
+    # Web editor: clone on remote and install (ops #890: every step below that writes under /opt,
+    # /etc, /usr or starts a unit runs as root, `sudo -n` for a non-root SSH user)
+    _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+    ok, _ = _module_run_root(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
-        _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
+        _module_run_root(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
         # Port 5080 will be UFW source-scoped to the console IP only (Step 6/7).
-        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+        _module_run_root(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
         # Patch HLS URLs to go through Caddy /hls-proxy/ instead of direct port 8888 (avoids mixed content)
         hls_patch_script = (
             "import re, sys\n"
@@ -48685,7 +48741,7 @@ paths:
         with open('/tmp/mtx_hls_patcher.py', 'w') as pf:
             pf.write(hls_patch_script)
         _module_copy(deploy_cfg, '/tmp/mtx_hls_patcher.py', '/tmp/mtx_hls_patcher.py', log_fn=plog)
-        _module_run(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
+        _module_run_root(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
         try:
             os.remove('/tmp/mtx_hls_patcher.py')
         except Exception:
@@ -48700,7 +48756,7 @@ paths:
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -48733,7 +48789,7 @@ paths:
                 with open('/tmp/mtx_ldap_patcher.py', 'w') as pf:
                     pf.write(patcher)
                 _module_copy(deploy_cfg, '/tmp/mtx_ldap_patcher.py', '/tmp/mtx_ldap_patcher.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_ldap_patcher.py')
                 except Exception:
@@ -48743,7 +48799,7 @@ paths:
                 with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
                     pf.write(MEDIAMTX_REMOTE_EP_PATCH_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_endpoint_patch.py')
                 except Exception:
@@ -48788,14 +48844,13 @@ paths:
             except OSError:
                 pass
         _dst = _MEDIAMTX_EDITOR_SECRET_ENV
-        _module_run(deploy_cfg,
-                    f'sudo install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst} 2>/dev/null'
-                    f' || install -m 600 /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
-                    timeout=10)
+        _module_run_root(deploy_cfg,
+                         f'install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
+                         timeout=10)
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx-webeditor.service /etc/systemd/system/ 2>/dev/null || mv /tmp/mediamtx-webeditor.service /etc/systemd/system/', timeout=10)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx-webeditor.service /etc/systemd/system/mediamtx-webeditor.service && rm -f /tmp/mediamtx-webeditor.service', timeout=10)
     try:
         os.remove('/tmp/mediamtx_webeditor_remote.service')
     except Exception:
@@ -48816,13 +48871,13 @@ paths:
         plog("  user passwordless sudo, then deploy again.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
+    _module_run_root(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
     plog("✓ Services started")
 
     # Step 5b: Test video
     test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
     plog("  Downloading test video (truck_60.ts)...")
-    ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
+    ok_tv, _ = _module_run_root(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
     if ok_tv:
         plog("✓ Test video installed")
     else:
@@ -48868,7 +48923,7 @@ paths:
                 plog(f"  ⏳ {i * 2}s...")
             time.sleep(2)
         if _caddy_cert_pair_ready(cert_file, key_file):
-            _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
+            _module_run_root(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
             # Stage both files somewhere the console can read before copying: scp/copy2
             # open the SOURCE as takwerx and would fail on 0600 caddy:caddy.
             ok_cert = ok_key = False
@@ -48887,7 +48942,7 @@ paths:
             if ok_cert and ok_key:
                 # The unit runs User=takwerx: root:root 0600 made MediaMTX crash-loop on
                 # "open /etc/mediamtx/certs/stream.crt: permission denied" (TEST-MATRIX row 5).
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
                 remote_key  = '/etc/mediamtx/certs/stream.key'
                 yml_cmd = (
@@ -48900,8 +48955,8 @@ paths:
                     f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' /usr/local/etc/mediamtx.yml; "
                     f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' /usr/local/etc/mediamtx.yml"
                 )
-                _module_run(deploy_cfg, yml_cmd, timeout=15)
-                _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
+                _module_run_root(deploy_cfg, yml_cmd, timeout=15)
+                _module_run_root(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
                 plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
                 ssl_ok = True
                 # The Caddyfile's /hls-proxy reverse_proxy only switches to https when
@@ -72033,7 +72088,7 @@ def _ensure_takwerx_system_user_remote(deploy_cfg, plog=None):
             'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
             '-d /nonexistent -s /usr/sbin/nologin takwerx'
         )
-        _module_run(deploy_cfg, cmd, timeout=15)
+        _module_run_root(deploy_cfg, cmd, timeout=15)   # ops #890: groupadd/useradd need root
         ok2, out2 = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
         if ok2 and (out2 or '').strip():
             _log("✓ takwerx system user created on remote host")
@@ -113975,10 +114030,11 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
                 f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
                 f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')
 
-    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    # ops #890: pip installs system-wide and `runuser` both need root (`sudo -n` for a non-root SSH user)
+    ok, out = _module_run_root(deploy_cfg, _pip('--break-system-packages'), timeout=240)
     if not ok and 'no such option' in (out or ''):
-        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
-    chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
+        ok, out = _module_run_root(deploy_cfg, _pip(''), timeout=240)
+    chk, chk_out = _module_run_root(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
     if chk:
         return True, out
     tail = ((chk_out or '') if ok else (out or '')).strip().splitlines()[-1:] or ['no output']
