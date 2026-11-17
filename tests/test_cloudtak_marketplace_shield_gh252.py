@@ -176,6 +176,50 @@ def test_marked_api_lib_files_are_ignored_too(tmp_path):
     assert "'stateless/lib/retention/replay.ts'" in text and 'plain.ts' not in text
 
 
+# CloudTAK v13.124.0 moved the api from ESLint to OXLint: no api/eslint.config.js any more,
+# the lint is `oxlint --type-aware index.ts common/ stateful/ stateless/ test/`.
+API_OXLINT = json.dumps({'plugins': ['typescript'], 'categories': {'correctness': 'error'},
+                         'rules': {'typescript/ban-ts-comment': 'error'},
+                         'ignorePatterns': ['dist', 'coverage']}, indent=4) + '\n'
+
+
+def _oxlint_tree(tmp_path, plugins=()):
+    ct = _tree(tmp_path)
+    _git(ct, 'rm', '-q', 'api/eslint.config.js')
+    (ct / 'api' / '.oxlintrc.json').write_text(API_OXLINT)
+    _git(ct, 'add', '-A')
+    _git(ct, 'commit', '-qm', 'oxlint')
+    for p in plugins:
+        (ct / 'app' / 'plugins' / p).mkdir()
+        (ct / 'app' / 'plugins' / p / 'index.ts').write_text('export default {};\n')
+    return ct
+
+
+def test_oxlint_api_gets_the_same_skip(tmp_path):
+    ct = _oxlint_tree(tmp_path, ('sidebar-configurator',))
+    routes = ct / 'api' / 'stateless' / 'routes'
+    (routes / 'plugin-sidebar-config.ts').write_text('// @ts-nocheck\n/* eslint-disable */\nx\n')
+    (routes / 'helper-sync.ts').write_text('// @ts-nocheck\nx\n')
+    ns = _load()
+    log = _run(ns, ct)
+    text = (ct / 'api' / '.oxlintrc.json').read_text()
+    want = json.loads(API_OXLINT)
+    want['ignorePatterns'] += ['stateless/routes/plugin-*.ts', 'stateless/routes/helper-sync.ts']
+    assert text == json.dumps(want, indent=4) + '\n'          # nothing else in the file moved
+    assert not (ct / 'api' / 'eslint.config.js').exists()
+    assert len(log) == 1 and 'api/.oxlintrc.json' in log[0]
+    assert _run(ns, ct) == []                                  # second run is a no-op
+    assert (ct / 'api' / '.oxlintrc.json').read_text() == text
+    _git(ct, 'checkout', '--', '.')                            # what Update / revert does
+    assert (ct / 'api' / '.oxlintrc.json').read_text() == API_OXLINT
+
+
+def test_oxlint_config_untouched_without_foreign_plugins(tmp_path):
+    ct = _oxlint_tree(tmp_path, ('taksim',))
+    assert _run(_load(), ct) == []
+    assert (ct / 'api' / '.oxlintrc.json').read_text() == API_OXLINT
+
+
 def test_file_mode_is_kept(tmp_path):
     ct = _tree(tmp_path, ('udash',))
     (ct / 'app' / 'package.json').chmod(0o640)
