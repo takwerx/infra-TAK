@@ -155,3 +155,22 @@ def test_review_tool_does_not_mark_the_cotrip_etls_reviewed_on_a_pass(tmp_path, 
         assert out[p]['reviewed'] is None and out[p]['note'] == HOLDS[p]
     for p in ('etl-arcgis', 'etl-cotrip-incidents'):
         assert out[p]['reviewed'] == '2026-11-16 /module-scan' and 'note' not in out[p]
+
+
+# ── ops #899: an operator who has the old etl-arcgis installed hears about the new one ────────
+
+def test_guard_dog_tells_an_operator_with_the_old_arcgis_to_update():
+    catalog = etl.load_catalog()
+    items, _known = etl.notify_items(catalog, {'etl-arcgis': ['7.33.0']}, {'etl-arcgis'})
+    mine = [i for i in items if i['key'] == 'etl:etl-arcgis']
+    assert len(mine) == 1
+    assert mine[0]['installed'] == 'v7.33.0' and mine[0]['target'] == 'v7.35.1'
+    assert mine[0]['identity'] == ARCGIS_FIXED_SHA
+    assert 'Update' in mine[0]['how']
+
+
+def test_guard_dog_stays_quiet_about_the_held_cotrip_etls():
+    catalog = etl.load_catalog()
+    installed = {p: ['0.0.1'] for p in COE_HELD}
+    items, _known = etl.notify_items(catalog, installed, set(COE_HELD))
+    assert not [i for i in items if i['key'] in {f'etl:{p}' for p in COE_HELD}]
