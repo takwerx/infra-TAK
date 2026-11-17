@@ -93,9 +93,13 @@ def test_no_remote_mediamtx_command_runs_unprivileged_when_it_needs_root(fname):
 
 
 def test_step_one_apt_install_uses_the_root_wrapper():
+    # ops #892: Step 1 is now one command that picks dnf or apt-get on the remote host
+    # (_MEDIAMTX_REMOTE_DEPS_SH). It still runs through the root wrapper, and still holds the apt branch.
     src = _src('_run_mediamtx_deploy_remote')
-    assert re.search(r"_module_run_root\(deploy_cfg, 'apt-get update -qq && apt-get install -y", src), \
-        'the remote apt-get install must run through _module_run_root (ops #890)'
+    assert re.search(r"_module_run_root\(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH", src), \
+        'the remote package install must run through _module_run_root (ops #890)'
+    deps = _const('_MEDIAMTX_REMOTE_DEPS_SH')
+    assert 'apt-get update -qq' in deps and 'apt-get install -y' in deps
 
 
 # --------------------------------------------------------------------------- behaviour on a fake host
@@ -212,6 +216,7 @@ def _drive_remote_deploy_through_step_one(tmp_path, uid):
     ns.update({
         'mediamtx_deploy_status': {},
         '_ensure_takwerx_system_user_remote': _stop,   # Step 1b: not under test here
+        '_MEDIAMTX_REMOTE_DEPS_SH': _const('_MEDIAMTX_REMOTE_DEPS_SH'),   # Step 1 (ops #892)
         're': re,
     })
     exec(compile(_src('_run_mediamtx_deploy_remote'), 'app.py', 'exec'), ns)
