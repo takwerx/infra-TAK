@@ -60,6 +60,8 @@ Official: TAK Server Configuration Guide and release notes at [tak.gov](https://
 - `x509useGroupCacheRequiresExtKeyUsage="false"` in `<auth>` lets certificates made by `makeCert.sh` (no extended key usage) use channels. 📖 notes, carried from the field.
 - Mission API quirks (📖 from our notes, not re-proven): `PUT /Marti/api/missions/{name}/subscription?uid=X` assigns `defaultRole` even to an admin, so follow it with a role `PUT`. `PUT .../contents` needs the UID in the CoT cache first. `PUT .../role` needs the `group` to match the mission's group or TAK answers `FORBIDDEN: Illegal attempt to change Mission groups!`.
 - **`POST /Marti/api/missions/{name}/feed` (add a data feed to a mission) always answers HTTP 500 on TAK Server 5.8.** TAK's `MissionApi.java` maps two `POST` handlers, `addFeed` and `addFeedByGuid`, to the same pattern `/missions/{x:.+}/feed`, so Spring answers `Ambiguous handler methods mapped` for every call. `/missions/guid/<guid>/feed` is a 404. ✅ verified 2026-11-13, test6 (TAK Server 5.8-RELEASE84); cause read in the public source (5.7-RELEASE-14). Reported upstream: [TAK-Product-Center/Server#76](https://github.com/TAK-Product-Center/Server/issues/76). infra-TAK never calls this endpoint (Node-RED uses a mission's `changes`, `role` and `contents` paths). Also: `DELETE /Marti/api/datafeeds/<uuid>` answers 400 when the uuid has a hyphen; delete by feed name instead. ✅ verified 2026-11-13, test6.
+- **A new TAK Server 5.8 has no CoT retention at all.** `/opt/tak/conf/retention/retention-policy.yml` ships with `dataRetentionMap: cot: null`, and `retention-service.yml` ships with `cronExpression: "-"` (the retention job never runs). On a box where an operator set a policy in the Web Admin, the file reads `cot: 86400` (seconds) and the service file reads `cronExpression: 0 59 * * * *` (every hour at minute 59). infra-TAK reads these files and never writes them. ✅ verified 2026-11-16, Rocky 9 box with no policy and two Ubuntu boxes with `cot: 86400`, TAK Server 5.8.
+- **TAK's hourly retention job deletes by `servertime`, which is when the server received the row, not when the row became deletable.** A CoT row that belongs to a mission (`mission_uid`) is kept. When it stops belonging to one, it can be days old at that moment and is deleted by the next hourly run. A check that looks once, between those two moments, sees an old row that is not stuck. ✅ verified 2026-11-16, Ubuntu 22.04 split-database box and Ubuntu 24.04 box (retention logged 24 runs a day, 14,000 to 18,000 rows a day); ⚠ not proven: what made the rows deletable.
 - A user named `webadmin` in the flat-file `UserAuthenticationFile.xml` shadows an LDAP user of the same name. Do not create one in Authentik.
 - A Java heap that is too small can show up as HTTP 500 on CloudTAK sign-in. 👁 observed.
 
@@ -72,6 +74,7 @@ Official: [docs.goauthentik.io](https://docs.goauthentik.io/), [LDAP provider](h
 - The outpost caches the directory (`bind_mode` and `search_mode` cached), so a group change in Authentik reaches TAK Server after the cache time plus TAK's own refresh. 📖
 - TAK Server binds as the service account `adm_ldapservice`. Besides that service account, the `tak_ROLE_ADMIN` group and the `webadmin` user are the only group and user infra-TAK creates itself. Every other `tak_*` group comes from TAK Portal.
 - After restarting `authentik-worker`, blueprints have to re-apply before LDAP queries work.
+- **Authentik does not limit the characters in a username or a group name.** Its API (`POST /api/v3/core/users/`, `POST /api/v3/core/groups/`) stored names with spaces, quotes, `<`, `>` and `&` exactly as sent. Treat every name that comes from Authentik as free text: escape it for the place it goes (a page, a shell command, an LDAP filter). ✅ verified 2026-11-17, test6, Authentik 2026.8.5 (ops #827).
 - Two things at once on one box can starve it. A first-time Authentik deploy next to a TAK Server, Node-RED and MediaMTX deploy has produced `127.0.0.1:9090: connection refused` (502) from Caddy. Space deploys out. 👁 observed.
 
 ## TAK Portal
@@ -79,7 +82,7 @@ Official: [docs.goauthentik.io](https://docs.goauthentik.io/), [LDAP provider](h
 Official: [ValleyTacticalSolutions/TAK-Portal](https://github.com/ValleyTacticalSolutions/TAK-Portal) (our `TAKPORTAL_REPO`)
 
 - Its `settings.json` belongs to the operator. infra-TAK writes only the keys in `TAKPORTAL_AUTHORITATIVE_KEYS` (`AUTHENTIK_URL`, `AUTHENTIK_TOKEN`, and the email transport keys while Email Relay is configured) and seeds the rest once. One writer: `_takportal_merged_settings_json()` / `_takportal_write_settings_json()`. Never infer ownership from a value. See the hard stop in the project rules.
-- **"Deploy To Caddy" can report failure when Caddy reloaded fine.** TAK Portal runs `bash -lc '… ; exit 0'` over SSH. The default `~/.bash_logout` on a stock account runs `clear_console -q`, which fails, so the login shell exits 1 even though the command succeeded. The fix belongs in TAK Portal (do not call `exit` in a login shell). 👁 observed 2026-10-30.
+- **"Deploy To Caddy" can report failure when Caddy reloaded fine.** TAK Portal runs `bash -lc 'set -euo pipefail; …; exit 0'` over SSH (`deployPluginCaddy`, `services/cloudtakMarketplace.service.js`). A login shell reads `~/.bash_logout` on exit and **errexit is still on there**: Ubuntu's stock file ends with `[ -x /usr/bin/clear_console ] && /usr/bin/clear_console -q`, which fails with no terminal, so the whole command exits 1 after the helper had already written and reloaded Caddy, and the Portal shows the helper's own success text as the error. ✅ verified 2026-11-17 on Ubuntu 22.04 with a real sshd (bash 5.1): stock file rc 1; stock file plus `true` at the end rc 1 (errexit stops the file at the failing line, so the first idea, appending `true`, does not work); `set +e` as the first line rc 0; no file rc 0. Without `set -e` the same file does not change the exit code (that is why a plain `bash -lc 'exit 0'` probe shows rc 0). infra-TAK puts a marked `set +e` at the top of the console user's existing `~/.bash_logout` (`_takportal_harden_logout_file`, ops #879). An earlier note here said the fix belonged in TAK Portal and gave a different cause; 👁 first observed 2026-10-30. A change in TAK Portal (drop `set -e` for the login shell) would also fix it.
 - Upstream versions can lie: the 2.0.15 tag shipped a `package.json` whose `version` still said 2.0.14 (the real number was in `beta-version`). Read the field the release actually bumps. 👁 observed 2026-10-21 (GH #214).
 
 ## CloudTAK
@@ -141,6 +144,12 @@ Official: [docs.docker.com](https://docs.docker.com/)
 
 - Confirm what a container really runs with `docker inspect` (image digest, mounts, env, compose working directory label `com.docker.compose.project.working_dir`), not with the compose file. Do not guess where Authentik's compose project lives.
 - Container logs fill disks; Guard Dog caps them.
+
+## NetBird
+
+Official: [docs.netbird.io](https://docs.netbird.io/)
+
+- **The `netbirdio/netbird-server` images (0.80.0, 0.82.0, 0.82.1) carry the `org.opencontainers.image.version` label of their Ubuntu base image (`24.04`), not the NetBird version.** The dashboard image's label is right. To read the running server version, use the tag in `docker inspect --format '{{.Config.Image}}'`, which compose pins. The label is a fallback only when it starts with `0.`. ✅ verified 2026-11-16, Ubuntu 22.04 fresh-install box (ops #853).
 
 ## Shell scripts and systemd units that are rewritten while they run
 

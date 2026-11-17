@@ -1573,7 +1573,7 @@ function openIconPicker(classVal) {
     Object.keys(cat).sort().forEach(function(name) {
       var cnt = 0;
       Object.keys(cat[name].groups).forEach(function(g) { cnt += cat[name].groups[g].length; });
-      sel.innerHTML += '<option value="' + name + '">' + name + ' (' + cnt + ')</option>';
+      sel.innerHTML += '<option value="' + _esc(name) + '">' + _esc(name) + ' (' + cnt + ')</option>';
     });
     document.getElementById('iconPickerGroup').innerHTML = '<option value="">-- select iconset first --</option>';
     document.getElementById('iconGrid').innerHTML = '';
@@ -1593,7 +1593,7 @@ function renderIconGroups() {
   if (!setName || !state.iconCatalog[setName]) return;
   var groups = state.iconCatalog[setName].groups;
   Object.keys(groups).sort().forEach(function(g) {
-    grpSel.innerHTML += '<option value="' + g + '">' + g + ' (' + groups[g].length + ')</option>';
+    grpSel.innerHTML += '<option value="' + _esc(g) + '">' + _esc(g) + ' (' + groups[g].length + ')</option>';
   });
   renderIconGrid();
 }
@@ -1640,7 +1640,7 @@ function searchIcons() {
     });
   });
   document.getElementById('iconCountLabel').textContent = count + ' results';
-  if (count === 0) grid.innerHTML = '<div style="color:#888;font-size:0.85rem">No icons matching "' + q + '"</div>';
+  if (count === 0) grid.innerHTML = '<div style="color:#888;font-size:0.85rem">No icons matching "' + _esc(q) + '"</div>';
 }
 
 function pickIcon(iconsetpath, type2525b, label, b64) {
@@ -1731,7 +1731,7 @@ async function fetchClassValues() {
     renderClassMappings();
     document.getElementById('classStatus').innerHTML = '<div class="status ok">Found ' + vals.length + ' distinct values</div>';
   } catch(e) {
-    document.getElementById('classStatus').innerHTML = '<div class="status error">' + e.message + '</div>';
+    document.getElementById('classStatus').innerHTML = '<div class="status error">' + _esc(e.message) + '</div>';
   } finally {
     document.getElementById('btnClassLoad').disabled = false;
     updatePointStyleNoteVisibility();
@@ -1814,7 +1814,7 @@ function renderClassMappings() {
   if (state.classMappings._default) allKeys.push('_default');
   allKeys.forEach(function(v) {
     var m = state.classMappings[v] || {};
-    var ve = v.replace(/'/g, "\\'");
+    var ve = _jsArg(v);
     var label = v === '_default' ? 'Default (unmatched)' : v;
     var isOpen = (state._openClassPanel === v);
 
@@ -1823,10 +1823,10 @@ function renderClassMappings() {
     var styleChip;
     if (isPtCls) {
       var iconThumb = m.iconB64
-        ? '<img src="data:image/png;base64,' + m.iconB64 + '" style="width:22px;height:22px;object-fit:contain;vertical-align:middle">'
+        ? '<img src="data:image/png;base64,' + _esc(m.iconB64) + '" style="width:22px;height:22px;object-fit:contain;vertical-align:middle">'
         : '<span style="color:#555;font-size:0.75rem">no icon</span>';
       var colorDot = m.color
-        ? '<span title="' + m.color + '" style="display:inline-block;width:14px;height:14px;background:' + m.color + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
+        ? '<span title="' + _esc(m.color) + '" style="display:inline-block;width:14px;height:14px;background:' + _esc(m.color) + ';border-radius:50%;vertical-align:middle;border:1px solid #555"></span>'
         : '<span style="color:#555;font-size:0.7rem">none</span>';
       styleChip = (m.iconB64 ? iconThumb + ' ' : '') + colorDot;
     } else {
@@ -1835,13 +1835,13 @@ function renderClassMappings() {
       var sC = (m.strokeColor != null && m.strokeColor !== '') ? m.strokeColor : uStroke;
       if (gm === 'Polyline') {
         // a line is a line — a bordered box reads as a polygon and misleads
-        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:18px;height:0;border-top:3px solid ' + sC + ';vertical-align:middle"></span>';
+        styleChip = '<span title="stroke ' + _esc(sC) + '" style="display:inline-block;width:18px;height:0;border-top:3px solid ' + _esc(sC) + ';vertical-align:middle"></span>';
       } else {
-        styleChip = '<span title="stroke ' + sC + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + sC + ';border-radius:3px;vertical-align:middle"></span>';
+        styleChip = '<span title="stroke ' + _esc(sC) + '" style="display:inline-block;width:14px;height:14px;background:transparent;border:2px solid ' + _esc(sC) + ';border-radius:3px;vertical-align:middle"></span>';
       }
       if (gm === 'Polygon') {
         var fC = (m.fillColor != null && m.fillColor !== '') ? m.fillColor : uFill;
-        styleChip += ' <span title="fill ' + fC + '" style="display:inline-block;width:14px;height:14px;background:' + fC + ';opacity:0.6;border-radius:3px;vertical-align:middle"></span>';
+        styleChip += ' <span title="fill ' + _esc(fC) + '" style="display:inline-block;width:14px;height:14px;background:' + _esc(fC) + ';opacity:0.6;border-radius:3px;vertical-align:middle"></span>';
       }
     }
     // v10.1.56 W1-UI: name the geometry outright. A mixed-geometry config puts points,
@@ -1853,18 +1853,18 @@ function renderClassMappings() {
                  : (gm === 'Polyline' ? 'LINE' : (gm === 'Polygon' ? 'POLY' : gm.toUpperCase()));
       var gColor = gLabel === 'POINT' ? '#2ec4b6' : (gLabel === 'LINE' ? '#f59e0b' : '#94a3b8');
       geomTag = '<span style="font-size:0.62rem;font-weight:700;letter-spacing:0.05em;color:' + gColor +
-                ';border:1px solid ' + gColor + ';border-radius:3px;padding:1px 4px;flex-shrink:0">' + gLabel + '</span>';
+                ';border:1px solid ' + gColor + ';border-radius:3px;padding:1px 4px;flex-shrink:0">' + _esc(gLabel) + '</span>';
     }
     var rmkCount = (m.remarksFields && m.remarksFields.length) || 0;
     var summary = geomTag + ' ' + styleChip
-      + (m.customLabel ? ' <span style="color:#94a3b8;font-size:0.75rem">' + m.customLabel + '</span>' : '')
-      + (m.cotType ? ' <span style="color:#666;font-size:0.7rem">' + m.cotType + '</span>' : '')
+      + (m.customLabel ? ' <span style="color:#94a3b8;font-size:0.75rem">' + _esc(m.customLabel) + '</span>' : '')
+      + (m.cotType ? ' <span style="color:#666;font-size:0.7rem">' + _esc(m.cotType) + '</span>' : '')
       + (rmkCount ? ' <span style="color:#666;font-size:0.7rem">' + rmkCount + ' remarks</span>' : '');
 
     html += '<div style="border:1px solid ' + (isOpen ? '#2ec4b6' : '#1a1a4e') + ';border-radius:8px;margin-bottom:6px;background:#0d0d2b">';
-    html += '<div style="display:flex;align-items:center;gap:0.6rem;padding:8px 12px;cursor:pointer" onclick="toggleClassPanel(\'' + ve + '\')">';
-    html += '<input type="checkbox" ' + (m.enabled !== false ? 'checked' : '') + ' onclick="event.stopPropagation()" onchange="toggleClassEnabled(\'' + ve + '\', this.checked)">';
-    html += '<span style="font-weight:600;color:#eee;min-width:100px;flex-shrink:0;font-size:0.85rem" title="' + v + '">' + label + '</span>';
+    html += '<div style="display:flex;align-items:center;gap:0.6rem;padding:8px 12px;cursor:pointer" onclick="toggleClassPanel(' + ve + ')">';
+    html += '<input type="checkbox" ' + (m.enabled !== false ? 'checked' : '') + ' onclick="event.stopPropagation()" onchange="toggleClassEnabled(' + ve + ', this.checked)">';
+    html += '<span style="font-weight:600;color:#eee;min-width:100px;flex-shrink:0;font-size:0.85rem" title="' + _esc(v) + '">' + _esc(label) + '</span>';
     html += '<span style="flex:1;display:flex;align-items:center;gap:6px">' + summary + '</span>';
     html += '<span style="color:' + (isOpen ? '#2ec4b6' : '#666') + ';font-size:0.75rem">' + (isOpen ? '▼ close' : '▶ edit') + '</span>';
     html += '</div>';
@@ -1899,14 +1899,14 @@ function buildClassEditPanel(v, m, ve) {
   if (isPoint) {
     html += '<div>';
     html += '<label style="font-size:0.82rem">Icon</label><div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.3rem">';
-    if (m.iconB64) html += '<img src="data:image/png;base64,' + m.iconB64 + '" style="width:32px;height:32px;object-fit:contain;background:#16213e;border-radius:4px;padding:2px">';
-    html += '<button onclick="openIconPicker(\'' + ve + '\')" style="font-size:0.82rem;padding:4px 10px;cursor:pointer">' + (m.iconsetpath ? (m.iconLabel || 'Change icon') : 'Pick Icon') + '</button>';
+    if (m.iconB64) html += '<img src="data:image/png;base64,' + _esc(m.iconB64) + '" style="width:32px;height:32px;object-fit:contain;background:#16213e;border-radius:4px;padding:2px">';
+    html += '<button onclick="openIconPicker(' + ve + ')" style="font-size:0.82rem;padding:4px 10px;cursor:pointer">' + _esc(m.iconsetpath ? (m.iconLabel || 'Change icon') : 'Pick Icon') + '</button>';
     html += '</div></div>';
   }
 
   html += '<div>';
   html += '<label style="font-size:0.82rem">CoT Type</label>';
-  html += '<input type="text" value="' + (m.cotType || (isPoint ? 'a-u-G' : 'u-d-f')) + '" style="width:140px;font-size:0.82rem;margin-top:0.3rem" onchange="setClassCotType(\'' + ve + '\', this.value)">';
+  html += '<input type="text" value="' + _esc(m.cotType || (isPoint ? 'a-u-G' : 'u-d-f')) + '" style="width:140px;font-size:0.82rem;margin-top:0.3rem" onchange="setClassCotType(' + ve + ', this.value)">';
   html += '</div>';
 
   if (isPoint) {
@@ -1940,15 +1940,15 @@ function buildClassEditPanel(v, m, ve) {
 
       var curAlpha = hasAlpha ? m.fillAlpha : uAlpha;
       html += '<div>';
-      html += '<label style="font-size:0.82rem">Fill opacity <span id="clsAlphaVal" style="color:#2ec4b6">' + curAlpha + '%</span>' + (hasAlpha ? '' : inhTag) + '</label>';
-      html += '<input type="range" min="0" max="100" value="' + curAlpha + '" style="width:100%;margin-top:0.3rem" oninput="document.getElementById(\'clsAlphaVal\').textContent=this.value+\'%\'" onchange="setClassFillAlpha(\'' + ve + '\', this.value)">';
+      html += '<label style="font-size:0.82rem">Fill opacity <span id="clsAlphaVal" style="color:#2ec4b6">' + _esc(curAlpha) + '%</span>' + (hasAlpha ? '' : inhTag) + '</label>';
+      html += '<input type="range" min="0" max="100" value="' + _esc(curAlpha) + '" style="width:100%;margin-top:0.3rem" oninput="document.getElementById(\'clsAlphaVal\').textContent=this.value+\'%\'" onchange="setClassFillAlpha(' + ve + ', this.value)">';
       html += '</div>';
     }
 
     var curWeight = hasWeight ? String(m.strokeWeight) : String(uWeight);
     html += '<div>';
     html += '<label style="font-size:0.82rem">Line thickness' + (hasWeight ? '' : inhTag) + '</label>';
-    html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassStrokeWeight(\'' + ve + '\', this.value)">';
+    html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassStrokeWeight(' + ve + ', this.value)">';
     [['1', '1 — Thin'], ['2', '2 — Light'], ['3', '3 — Normal'], ['5', '5 — Medium'], ['8', '8 — Heavy']].forEach(function(o) {
       html += '<option value="' + o[0] + '"' + (curWeight === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
     });
@@ -1957,7 +1957,7 @@ function buildClassEditPanel(v, m, ve) {
     var curStyle = hasStyle ? String(m.strokeStyle) : String(uStyle);
     html += '<div>';
     html += '<label style="font-size:0.82rem">Line style' + (hasStyle ? '' : inhTag) + '</label>';
-    html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassStrokeStyle(\'' + ve + '\', this.value)">';
+    html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassStrokeStyle(' + ve + ', this.value)">';
     [['solid', 'Solid'], ['dashed', 'Dashed'], ['dotted', 'Dotted'], ['outlined', 'Outlined']].forEach(function(o) {
       html += '<option value="' + o[0] + '"' + (curStyle === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
     });
@@ -1975,32 +1975,32 @@ function buildClassEditPanel(v, m, ve) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:0.4rem">';
     fields.forEach(function(f) {
       var isOn = labelFields.indexOf(f.name) >= 0;
-      html += '<span onclick="toggleClassLabelField(\'' + ve + '\',\'' + f.name.replace(/'/g, "\\'") + '\')" '
+      html += '<span onclick="toggleClassLabelField(' + ve + ',' + _jsArg(f.name) + ')" '
         + 'class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
         + 'style="display:inline-block;padding:3px 10px;background:' + (isOn ? '#2ec4b6' : '#1a1a4e') + ';color:' + (isOn ? '#0d0d2b' : '#ccc') + ';border-radius:14px;font-size:0.78rem;cursor:pointer;font-weight:' + (isOn ? '600' : '400') + '">'
-        + f.name + '</span>';
+        + _esc(f.name) + '</span>';
     });
     html += '</div>';
   }
-  html += '<input type="text" value="' + (m.labelCustomText || '').replace(/"/g, '&quot;') + '" placeholder="Custom text to prepend (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
-    + 'onchange="setClassLabelCustomText(\'' + ve + '\', this.value)">';
+  html += '<input type="text" value="' + _esc(m.labelCustomText || '') + '" placeholder="Custom text to prepend (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
+    + 'onchange="setClassLabelCustomText(' + ve + ', this.value)">';
   if (labelFields.length > 0 || m.labelCustomText) {
     var preview = (m.labelCustomText || '') + (m.labelCustomText && labelFields.length ? ' ' : '') + labelFields.map(function(f) { return '{' + f + '}'; }).join(' | ');
-    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + preview + '</span></div>';
+    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + _esc(preview) + '</span></div>';
   }
   html += '</div>';
 
   html += '<div class="field-grid" style="margin-top:0.6rem;gap:1rem">';
   html += '<div>';
   html += '<label style="font-size:0.82rem">ALL CAPS</label>';
-  html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassUpperCase(\'' + ve + '\', this.value === \'true\')">';
+  html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassUpperCase(' + ve + ', this.value === \'true\')">';
   html += '<option value="false"' + (!m.labelUpperCase ? ' selected' : '') + '>No</option>';
   html += '<option value="true"' + (m.labelUpperCase ? ' selected' : '') + '>Yes</option>';
   html += '</select></div>';
 
   html += '<div>';
   html += '<label style="font-size:0.82rem">Show label on map</label>';
-  html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassLabelsOn(\'' + ve + '\', this.value === \'true\')">';
+  html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassLabelsOn(' + ve + ', this.value === \'true\')">';
   html += '<option value="true"' + (m.labelsOn ? ' selected' : '') + '>Yes</option>';
   html += '<option value="false"' + (m.labelsOn === false || m.labelsOn == null ? ' selected' : '') + '>No</option>';
   html += '</select></div>';
@@ -2012,19 +2012,19 @@ function buildClassEditPanel(v, m, ve) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:0.4rem">';
     fields.forEach(function(f) {
       var isOn = remarkFields.indexOf(f.name) >= 0;
-      html += '<span onclick="toggleClassRemarkField(\'' + ve + '\',\'' + f.name.replace(/'/g, "\\'") + '\')" '
+      html += '<span onclick="toggleClassRemarkField(' + ve + ',' + _jsArg(f.name) + ')" '
         + 'class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
         + 'style="display:inline-block;padding:3px 10px;background:' + (isOn ? '#2ec4b6' : '#1a1a4e') + ';color:' + (isOn ? '#0d0d2b' : '#ccc') + ';border-radius:14px;font-size:0.78rem;cursor:pointer;font-weight:' + (isOn ? '600' : '400') + '">'
-        + f.name + '</span>';
+        + _esc(f.name) + '</span>';
     });
     html += '</div>';
   }
-  html += '<input type="text" value="' + (m.remarksCustomText || '').replace(/"/g, '&quot;') + '" placeholder="Custom text to append (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
-    + 'onchange="setClassRemarksCustomText(\'' + ve + '\', this.value)">';
+  html += '<input type="text" value="' + _esc(m.remarksCustomText || '') + '" placeholder="Custom text to append (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
+    + 'onchange="setClassRemarksCustomText(' + ve + ', this.value)">';
   if (remarkFields.length > 0 || m.remarksCustomText) {
     var rmkPreview = remarkFields.map(function(f) { return f + ': {' + f + '}'; }).join(' | ')
       + (m.remarksCustomText ? (remarkFields.length ? ' | ' : '') + m.remarksCustomText : '');
-    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + rmkPreview + '</span></div>';
+    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + _esc(rmkPreview) + '</span></div>';
   }
   html += '</div>';
 
@@ -2034,22 +2034,22 @@ function buildClassEditPanel(v, m, ve) {
 function buildRemarksPickerForClass(classVal, m) {
   var fields = (state.layerFields && state.layerFields[classVal]) || state.fields || [];
   var curRemarks = (m.remarksFields || []).slice();
-  var ve = classVal.replace(/'/g, "\\'");
+  var ve = _jsArg(classVal);
   if (fields.length === 0) {
-    return '<input type="text" value="' + curRemarks.join(', ') + '" placeholder="field1, field2" style="width:120px;font-size:0.72rem;padding:2px 4px" '
-      + 'onchange="setClassRemarksRaw(\'' + ve + '\', this.value)">';
+    return '<input type="text" value="' + _esc(curRemarks.join(', ')) + '" placeholder="field1, field2" style="width:120px;font-size:0.72rem;padding:2px 4px" '
+      + 'onchange="setClassRemarksRaw(' + ve + ', this.value)">';
   }
   var pills = curRemarks.map(function(f) {
     return '<span style="display:inline-block;background:#2ec4b6;color:#0d0d2b;padding:1px 6px;border-radius:10px;font-size:0.7rem;cursor:pointer;margin:1px" '
-      + 'onclick="removeClassRemark(\'' + ve + '\',\'' + f.replace(/'/g, "\\'") + '\')" title="click to remove">' + f + ' &times;</span>';
+      + 'onclick="removeClassRemark(' + ve + ',' + _jsArg(f) + ')" title="click to remove">' + _esc(f) + ' &times;</span>';
   }).join('');
   var html = '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:2px;min-width:140px">' + pills
     + '<select style="font-size:0.7rem;padding:1px 2px;background:#1a1a2e;color:#ccc;border:1px solid #333;border-radius:4px;max-width:100px" '
-    + 'onchange="addClassRemark(\'' + ve + '\', this.value); this.value=\'\';">'
+    + 'onchange="addClassRemark(' + ve + ', this.value); this.value=\'\';">'
     + '<option value="">+ add</option>';
   fields.forEach(function(f) {
     if (curRemarks.indexOf(f.name) === -1) {
-      html += '<option value="' + f.name + '">' + f.name + '</option>';
+      html += '<option value="' + _esc(f.name) + '">' + _esc(f.name) + '</option>';
     }
   });
   html += '</select></div>';
@@ -2081,16 +2081,16 @@ function buildColorPicker(ve, curColor, setter, clearer) {
   var swatches = ATAK_COLORS.map(function(c) {
     var sel = curColor && curColor.toUpperCase() === c.hex.toUpperCase();
     var border = sel ? '2px solid #2ec4b6' : '2px solid ' + (c.hex === '#000000' ? '#555' : 'transparent');
-    return '<div onclick="' + setter + '(\'' + ve + '\', \'' + c.hex + '\')" title="' + c.name + '" style="width:16px;height:16px;background:' + c.hex + ';border:' + border + ';border-radius:3px;cursor:pointer;flex-shrink:0"></div>';
+    return '<div onclick="' + setter + '(' + ve + ', \'' + c.hex + '\')" title="' + c.name + '" style="width:16px;height:16px;background:' + c.hex + ';border:' + border + ';border-radius:3px;cursor:pointer;flex-shrink:0"></div>';
   }).join('');
 
   var customMatch = curColor && !ATAK_COLORS.some(function(c) { return c.hex.toUpperCase() === curColor.toUpperCase(); });
 
   var html = '<div style="display:flex;flex-wrap:wrap;gap:2px;align-items:center;max-width:210px">'
     + swatches
-    + '<input type="color" value="' + (curColor || '#FF0000') + '" style="width:34px;height:24px;padding:0;margin-left:3px;border:' + (customMatch ? '2px solid #2ec4b6' : '1px solid #888') + ';border-radius:4px;cursor:pointer;flex-shrink:0" title="Custom color picker — click for the full picker" oninput="' + setter + '(\'' + ve + '\', this.value)">'
-    + '<input type="text" value="' + (curColor || '') + '" placeholder="#hex" style="width:72px;font-size:0.72rem;margin-left:2px;flex-shrink:0" title="Type a custom hex color" onchange="' + setter + '(\'' + ve + '\', this.value)">'
-    + '<div onclick="' + clearer + '(\'' + ve + '\')" title="No color" style="width:16px;height:16px;border:' + (!curColor ? '2px solid #2ec4b6' : '2px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0;background:repeating-conic-gradient(#555 0% 25%, transparent 0% 50%) 50%/8px 8px"></div>'
+    + '<input type="color" value="' + _esc(curColor || '#FF0000') + '" style="width:34px;height:24px;padding:0;margin-left:3px;border:' + (customMatch ? '2px solid #2ec4b6' : '1px solid #888') + ';border-radius:4px;cursor:pointer;flex-shrink:0" title="Custom color picker — click for the full picker" oninput="' + setter + '(' + ve + ', this.value)">'
+    + '<input type="text" value="' + _esc(curColor || '') + '" placeholder="#hex" style="width:72px;font-size:0.72rem;margin-left:2px;flex-shrink:0" title="Type a custom hex color" onchange="' + setter + '(' + ve + ', this.value)">'
+    + '<div onclick="' + clearer + '(' + ve + ')" title="No color" style="width:16px;height:16px;border:' + (!curColor ? '2px solid #2ec4b6' : '2px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0;background:repeating-conic-gradient(#555 0% 25%, transparent 0% 50%) 50%/8px 8px"></div>'
     + '</div>';
   return html;
 }
@@ -2210,10 +2210,10 @@ function renderUniformLabelUI() {
   var html = '';
   fields.forEach(function(f) {
     var isOn = selected.indexOf(f.name) >= 0;
-    var esc = f.name.replace(/'/g, "\\'");
-    html += '<span onclick="toggleUniformLabelField(\'' + esc + '\')" class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
+    var esc = _jsArg(f.name);
+    html += '<span onclick="toggleUniformLabelField(' + esc + ')" class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
       + 'style="display:inline-block;padding:3px 10px;margin:2px;background:' + (isOn ? '#2ec4b6' : '#1a1a4e') + ';color:' + (isOn ? '#0d0d2b' : '#ccc') + ';border-radius:14px;font-size:0.78rem;cursor:pointer;font-weight:' + (isOn ? '600' : '400') + '">'
-      + f.name + '</span>';
+      + _esc(f.name) + '</span>';
   });
   container.innerHTML = html;
   refreshUniformLabelPreview();
@@ -2384,7 +2384,7 @@ function enable(n) {
 
 function status(id, msg, ok) {
   document.getElementById(id).innerHTML =
-    '<div class="status ' + (ok ? 'ok' : 'error') + '">' + msg + '</div>';
+    '<div class="status ' + (ok ? 'ok' : 'error') + '">' + _esc(msg) + '</div>';
 }
 
 function setLoading(btnId, loading) {
@@ -2422,10 +2422,10 @@ async function fetchService() {
       var gt = l.geometryType ? l.geometryType.replace('esriGeometry', '') : 'Table';
       var lbl = document.createElement('label');
       lbl.style.cssText = 'display:flex;align-items:center;gap:0.5rem;padding:0.35rem 0.5rem;cursor:pointer;border-bottom:1px solid #1a1a4e;font-size:0.85rem';
-      lbl.innerHTML = '<input type="checkbox" value="' + l.id + '" class="layerCb" onchange="onLayerCheck()"> '
-        + '<span style="color:#2ec4b6;min-width:28px">' + l.id + '</span> '
-        + '<span>' + l.name + '</span> '
-        + '<span class="badge badge-geom" style="font-size:0.7rem">' + gt + '</span>';
+      lbl.innerHTML = '<input type="checkbox" value="' + _esc(l.id) + '" class="layerCb" onchange="onLayerCheck()"> '
+        + '<span style="color:#2ec4b6;min-width:28px">' + _esc(l.id) + '</span> '
+        + '<span>' + _esc(l.name) + '</span> '
+        + '<span class="badge badge-geom" style="font-size:0.7rem">' + _esc(gt) + '</span>';
       cbDiv.appendChild(lbl);
     });
     document.getElementById('btnLoadLayers').disabled = false;
@@ -2620,8 +2620,8 @@ async function fetchSelectedLayers() {
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
       var isDate = (f.type === 'esriFieldTypeDate');
-      timeSel.innerHTML += '<option value="' + f.name + '"' + (isDate ? ' selected' : '') + '>'
-                           + f.name + ' (' + short + ')' + (isDate ? ' << Date' : '') + '</option>';
+      timeSel.innerHTML += '<option value="' + _esc(f.name) + '"' + (isDate ? ' selected' : '') + '>'
+                           + _esc(f.name) + ' (' + _esc(short) + ')' + (isDate ? ' << Date' : '') + '</option>';
     });
 
     populateIdFieldsPicker();
@@ -2632,14 +2632,14 @@ async function fetchSelectedLayers() {
     if (state.sampleFeatures.length) {
       var keys = Object.keys(state.sampleFeatures[0].attributes);
       var html = '<div class="sample-wrap"><table class="sample-table"><tr>';
-      keys.forEach(function(k) { html += '<th>' + k + '</th>'; });
+      keys.forEach(function(k) { html += '<th>' + _esc(k) + '</th>'; });
       html += '</tr>';
       state.sampleFeatures.forEach(function(f) {
         html += '<tr>';
         keys.forEach(function(k) {
           var v = f.attributes[k];
           if (v != null && String(v).length > 50) v = String(v).substring(0, 50) + '\u2026';
-          html += '<td>' + (v != null ? v : '') + '</td>';
+          html += '<td>' + _esc(v != null ? v : '') + '</td>';
         });
         html += '</tr>';
       });
@@ -2652,7 +2652,7 @@ async function fetchSelectedLayers() {
     filterSel.innerHTML = '<option value="">(none &mdash; no filter)</option>';
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
-      filterSel.innerHTML += '<option value="' + f.name + '">' + f.name + ' (' + short + ')' + '</option>';
+      filterSel.innerHTML += '<option value="' + _esc(f.name) + '">' + _esc(f.name) + ' (' + _esc(short) + ')' + '</option>';
     });
     document.getElementById('distinctValues').innerHTML = '';
     document.getElementById('filterPreview').textContent = '';
@@ -2664,16 +2664,16 @@ async function fetchSelectedLayers() {
     dedupSel.innerHTML = '<option value="">(none &mdash; keep all features)</option>';
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
-      dedupSel.innerHTML += '<option value="' + f.name + '">'
-        + f.name + ' (' + short + ')' + '</option>';
+      dedupSel.innerHTML += '<option value="' + _esc(f.name) + '">'
+        + _esc(f.name) + ' (' + _esc(short) + ')' + '</option>';
     });
 
     var entitySel = document.getElementById('entityIdField');
     entitySel.innerHTML = '<option value="">(none &mdash; UID from row ID fields)</option>';
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
-      entitySel.innerHTML += '<option value="' + f.name + '">'
-        + f.name + ' (' + short + ')' + '</option>';
+      entitySel.innerHTML += '<option value="' + _esc(f.name) + '">'
+        + _esc(f.name) + ' (' + _esc(short) + ')' + '</option>';
     });
 
     populateRemarksPicker();
@@ -2705,7 +2705,7 @@ async function fetchSelectedLayers() {
     state.fields.forEach(function(f) {
       var short = f.type.replace('esriFieldType', '');
       if (f.type === 'esriFieldTypeString' || f.type === 'esriFieldTypeSmallInteger' || f.type === 'esriFieldTypeInteger') {
-        classSel.innerHTML += '<option value="' + f.name + '">' + f.name + ' (' + short + ')</option>';
+        classSel.innerHTML += '<option value="' + _esc(f.name) + '">' + _esc(f.name) + ' (' + _esc(short) + ')</option>';
       }
     });
     document.getElementById('btnClassLoad').disabled = false;
@@ -2758,8 +2758,8 @@ function _lyrOpts(lyr, cur, types) {
   _lyrFieldsFor(lyr).forEach(function(f) {
     if (types && types.indexOf(f.type) === -1) return;
     var sel = (String(cur || '') === f.name) ? ' selected' : '';
-    out += '<option value="' + f.name + '"' + sel + '>' + f.name +
-           ' (' + f.type.replace('esriFieldType', '') + ')</option>';
+    out += '<option value="' + _esc(f.name) + '"' + sel + '>' + _esc(f.name) +
+           ' (' + _esc(String(f.type || '').replace('esriFieldType', '')) + ')</option>';
   });
   return out;
 }
@@ -2784,16 +2784,16 @@ function renderLayerSetup() {
     html +=
       '<div style="border:1px solid #1a1a4e;border-radius:8px;padding:0.8rem;margin-bottom:0.7rem;background:#0d0d2b">' +
         '<div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">' +
-          '<strong style="color:#2ec4b6">' + (lyr.layerName || ('Layer ' + lyr.layerId)) + '</strong>' +
-          '<span style="font-size:0.7rem;color:#64748b">layer ' + lyr.layerId + ' · ' + geom + '</span>' +
-          (dup ? '<span title="This layer ID is used by more than one entry — each with its own filter and class field. Created with the Duplicate button." style="font-size:0.7rem;color:#f59e0b">· shares layer ' + lyr.layerId + ' with another entry</span>' : '') +
+          '<strong style="color:#2ec4b6">' + _esc(lyr.layerName || ('Layer ' + lyr.layerId)) + '</strong>' +
+          '<span style="font-size:0.7rem;color:#64748b">layer ' + _esc(lyr.layerId) + ' · ' + _esc(geom) + '</span>' +
+          (dup ? '<span title="This layer ID is used by more than one entry — each with its own filter and class field. Created with the Duplicate button." style="font-size:0.7rem;color:#f59e0b">· shares layer ' + _esc(lyr.layerId) + ' with another entry</span>' : '') +
           '<span style="flex:1"></span>' +
           '<button onclick="dupLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem">Duplicate</button>' +
           (L.length > 1 ? '<button onclick="rmLayerEntry(' + i + ')" style="font-size:0.72rem;padding:0.25rem 0.6rem;background:#7f1d1d">Remove</button>' : '') +
         '</div>' +
         '<div class="field-grid">' +
           '<div><label>Entry name</label>' +
-            '<input type="text" value="' + String(lyr.layerName || '').replace(/"/g, '&quot;') + '" ' +
+            '<input type="text" value="' + _esc(lyr.layerName || '') + '" ' +
             'oninput="setLyr(' + i + ',\'layerName\',this.value)" ' +
             'title="Must be unique — it separates duplicate entries of the same layer in the UID"></div>' +
           '<div><label>Time field</label><select onchange="setLyr(' + i + ',\'timeField\',this.value)">' +
@@ -2807,12 +2807,12 @@ function renderLayerSetup() {
         '</div>' +
         '<div style="margin-top:0.5rem"><label>WHERE clause for this layer</label>' +
           '<input type="text" placeholder="(use config-level filter)" ' +
-          'value="' + String(lyr.where || '').replace(/"/g, '&quot;') + '" ' +
+          'value="' + _esc(lyr.where || '') + '" ' +
           'oninput="setLyr(' + i + ',\'where\',this.value)" style="width:100%;font-family:monospace;font-size:0.78rem"></div>' +
         '<div class="field-grid" style="margin-top:0.5rem">' +
           '<div><label>Deduplicate by</label>' +
             '<input type="text" placeholder="(none) — comma-separate for a composite key" ' +
-            'value="' + (Array.isArray(lyr.dedupField) ? lyr.dedupField.join(', ') : String(lyr.dedupField || '')).replace(/"/g, '&quot;') + '" ' +
+            'value="' + _esc(Array.isArray(lyr.dedupField) ? lyr.dedupField.join(', ') : String(lyr.dedupField || '')) + '" ' +
             'oninput="setLyrDedup(' + i + ',this.value)" style="width:100%"></div>' +
           '<div><label>Keep all rows at the winning timestamp</label>' +
             '<select onchange="setLyr(' + i + ',\'dedupKeepAll\',this.value===\'true\')">' +
@@ -3014,7 +3014,7 @@ async function fetchDistinct() {
       var display = (v == null || v === '') ? '(empty)' : (dv != null ? dv : v);
       html += '<label class="cb-item">' +
         '<input type="checkbox" autocomplete="off" onchange="filterToggle(this,' + i + ')">' +
-        '<span>' + display + '</span></label>';
+        '<span>' + _esc(display) + '</span></label>';
     });
     html += '</div>';
     document.getElementById('distinctValues').innerHTML = html;
@@ -3144,12 +3144,12 @@ function renderAllSelectedTags() {
   var html = '';
   state.selectedValues.forEach(function(v) {
     var dv = decodeVal(state.filterField, v);
-    html += '<span class="filter-tag">' + (dv != null ? dv : v) +
-      ' <span class="x" onclick="removeCheckboxFilter(\'' + v.replace(/'/g, "\\'") + '\')">&times;</span></span>';
+    html += '<span class="filter-tag">' + _esc(dv != null ? dv : v) +
+      ' <span class="x" onclick="removeCheckboxFilter(' + _jsArg(v) + ')">&times;</span></span>';
   });
   state.manualSources.forEach(function(v) {
-    html += '<span class="filter-tag">' + v +
-      ' <span class="x" onclick="removeManualFilter(\'' + v.replace(/'/g, "\\'") + '\')">&times;</span></span>';
+    html += '<span class="filter-tag">' + _esc(v) +
+      ' <span class="x" onclick="removeManualFilter(' + _jsArg(v) + ')">&times;</span></span>';
   });
   var el = document.getElementById('allSelectedTags');
   if (el) el.innerHTML = html || '<span style="color:#555">No sources selected</span>';
@@ -3162,8 +3162,8 @@ function populateRemarksPicker() {
   state.remarksFields = [];
   var html = '';
   state.fields.forEach(function(f) {
-    html += '<span class="remark-pill available" id="' + remarkPillId(f.name) + '" onclick="addRemarkField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
-      + f.name + '</span>';
+    html += '<span class="remark-pill available" id="' + _esc(remarkPillId(f.name)) + '" onclick="addRemarkField(' + _jsArg(f.name) + ')">'
+      + _esc(f.name) + '</span>';
   });
   var ra = document.getElementById(fieldUiId('remarksAvailable'));
   var rs = document.getElementById(fieldUiId('remarksSelected'));
@@ -3200,7 +3200,7 @@ function renderRemarksSelected() {
   var html = '';
   state.remarksFields.forEach(function(name, i) {
     html += '<span class="remark-pill selected" onclick="removeRemarkField(' + i + ')">'
-      + name + ' &times;</span>';
+      + _esc(name) + ' &times;</span>';
   });
   rs.innerHTML = html;
 }
@@ -3235,8 +3235,8 @@ function populateIdFieldsPicker() {
       var isId = (f.type === 'esriFieldTypeOID' || f.type === 'esriFieldTypeGlobalID')
         || /^(OBJECTID|GlobalID|globalid|FID)$/i.test(fn);
       var tag = isId ? ' << ID' : '';
-      htmlK += '<span class="remark-pill available" id="' + idPillId(fn) + '" onclick="addIdField(\'' + fn.replace(/'/g, "\\'") + '\')">'
-        + fn + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + '</span>';
+      htmlK += '<span class="remark-pill available" id="' + _esc(idPillId(fn)) + '" onclick="addIdField(' + _jsArg(fn) + ')">'
+        + _esc(fn) + ' <span style="opacity:.6;font-size:.7rem">(' + _esc(short) + ')</span>' + _esc(tag) + '</span>';
     });
     var elA = document.getElementById(fieldUiId('idFieldsAvailable'));
     if (elA) elA.innerHTML = htmlK;
@@ -3283,9 +3283,9 @@ function populateIdFieldsPicker() {
     var partial = multi && !inAll ? ' <span style="color:#c77;font-size:.7rem">(in ' + f.presentIn + '/' + totalLayers + ')</span>' : '';
     var style = multi && !inAll ? ' style="opacity:.55"' : '';
     var title = multi && !inAll ? ' title="Only in ' + f.presentIn + ' of ' + totalLayers + ' selected layers — other layers will hash as empty string for this field"' : '';
-    html += '<span class="remark-pill available" id="' + idPillId(f.name) + '"' + style + title
-      + ' onclick="addIdField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
-      + f.name + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + partial + '</span>';
+    html += '<span class="remark-pill available" id="' + _esc(idPillId(f.name)) + '"' + style + title
+      + ' onclick="addIdField(' + _jsArg(f.name) + ')">'
+      + _esc(f.name) + ' <span style="opacity:.6;font-size:.7rem">(' + _esc(short) + ')</span>' + _esc(tag) + partial + '</span>';
     if (isId && !autoPick && inAll) autoPick = f.name;
   });
   document.getElementById(fieldUiId('idFieldsAvailable')).innerHTML = html;
@@ -3322,7 +3322,7 @@ function renderIdFieldsSelected() {
   var html = '';
   state.idFields.forEach(function(name, i) {
     html += '<span class="remark-pill selected" onclick="removeIdField(' + i + ')">'
-      + name + ' &times;</span>';
+      + _esc(name) + ' &times;</span>';
   });
   el.innerHTML = html;
 }
@@ -3395,7 +3395,7 @@ async function refreshFeatureCounts() {
   }
   var big = total >= FEATURE_COUNT_WARN;
   el.innerHTML = '<div style="font-size:0.8rem;margin-top:0.5rem;color:' + (big ? '#f0b070' : '#2ec4b6') + '">'
-    + (big ? '⚠ ' : '') + parts.join(' · ')
+    + (big ? '⚠ ' : '') + _esc(parts.join(' · '))
     + (state.selectedLayers.length > 1 ? ' · <strong>total ' + total.toLocaleString() + '</strong>' : '')
     + (where ? ' <span style="color:#888">(with filter)</span>' : ' <span style="color:#888">(no filter — whole layer)</span>')
     + (big ? '<br>This feed will push every one of these to everyone who receives it. Consider a filter.' : '')
@@ -3669,10 +3669,15 @@ async function loadSavedConfigs() {
   hideSteps();
 }
 
+/* ops #897: escapes & < > " ' so a value is safe as text and inside a quoted attribute. */
 function _esc(s) {
   return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+/* ops #897: a value for an inline handler, e.g. onclick="pick(' + _jsArg(name) + ')". JSON makes it a
+   JavaScript string, _esc() then makes that string safe inside the quoted attribute. Never build a
+   handler argument with quotes and a replace: the browser decodes the attribute first. */
+function _jsArg(v) { return _esc(JSON.stringify(v == null ? '' : String(v))); }
 
 function takResolvedHostPort(settings) {
   var s = settings || {};
@@ -3740,7 +3745,7 @@ async function renderConfigList() {
       '<div><div class="cc-name">IPAWS / NWS Active Alerts' +
       '<span style="display:inline-block;margin-left:0.6rem;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.7rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80;vertical-align:middle">● ACTIVE</span>' +
       '</div>' +
-      '<div class="cc-detail">api.weather.gov | Poll: ' + (cfg.pollInterval || 1) + 'min | ' + _esc(stateList) + ' | Severity: ' + _esc(sevList) + '</div></div>' +
+      '<div class="cc-detail">api.weather.gov | Poll: ' + _esc(cfg.pollInterval || 1) + 'min | ' + _esc(stateList) + ' | Severity: ' + _esc(sevList) + '</div></div>' +
       '<div class="cc-actions"></div>' +
       '</div>';
   }
@@ -3754,12 +3759,12 @@ async function renderConfigList() {
     var ppNote = (pcfg.takDestinationLabel || '').trim();
     var ppLine = 'TAK: TCP CoT → ' + hp.host + ':' + ppPort;
     var ppIds = _esc(String(pcfg.agencyIds || '').substring(0, 60));
-    html += '<div class="config-card" onclick="openPpConfig(\'' + _esc(pcfg.id) + '\')" title="Click to edit PulsePoint config">' +
+    html += '<div class="config-card" onclick="openPpConfig(' + _jsArg(pcfg.id) + ')" title="Click to edit PulsePoint config">' +
       '<div><div class="cc-name"><img src="/pulsepoint-logo.png" alt="" width="22" height="22" style="width:22px;height:22px;border-radius:5px;vertical-align:middle;margin-right:0.35rem;object-fit:contain" loading="lazy">' +
       _esc(pcfg.configName || 'PulsePoint Agency') + ppAct + '</div>' +
-      '<div class="cc-detail">' + ppIds + ' | Poll: ' + (pcfg.pollIntervalSec || 120) + 's' +
+      '<div class="cc-detail">' + ppIds + ' | Poll: ' + _esc(pcfg.pollIntervalSec || 120) + 's' +
       '<br><span style="font-size:0.78rem;color:#64748b">' + _esc(ppLine + (ppNote ? ' · note: ' + ppNote : '')) + '</span></div></div>' +
-      '<div class="cc-actions"><button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deletePpConfig(\'' + _esc(pcfg.id) + '\')">Delete</button></div></div>';
+      '<div class="cc-actions"><button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deletePpConfig(' + _jsArg(pcfg.id) + ')">Delete</button></div></div>';
   });
   var tcConfigs = [];
   try {
@@ -3774,13 +3779,13 @@ async function renderConfigList() {
     var detail = (cfg.agencyUrl || '').replace(/^https?:\/\//, '').substring(0, 60);
     var id = cfg.id;
     var sum = feedTakRouteSummaryLine(cfg, takSnap);
-    html += '<div class="config-card" onclick="openTcConfig(\'' + _esc(id) + '\')" title="Click to edit Tablet Command config">' +
+    html += '<div class="config-card" onclick="openTcConfig(' + _jsArg(id) + ')" title="Click to edit Tablet Command config">' +
       '<div><div class="cc-name">🚒 ' + _esc(cfg.configName || 'TC Agency') + act + '</div>' +
-      '<div class="cc-detail">' + _esc(detail) + ' | Poll: ' + (cfg.pollInterval || 1) + 'min' +
+      '<div class="cc-detail">' + _esc(detail) + ' | Poll: ' + _esc(cfg.pollInterval || 1) + 'min' +
       (sum ? '<br><span style="font-size:0.78rem;color:#64748b">' + _esc(sum) + '</span>' : '') +
       '</div></div>' +
       '<div class="cc-actions">' +
-      '<button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deleteTcConfigById(\'' + _esc(id) + '\')">Delete</button>' +
+      '<button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deleteTcConfigById(' + _jsArg(id) + ')">Delete</button>' +
       '</div>' +
       '</div>';
   });
@@ -4476,15 +4481,15 @@ function tcRenderRemarks() {
   if (!avail || !sel) return;
   avail.innerHTML = TC_REMARK_FIELDS.map(function(f) {
     var on = _tcRemarksFields.indexOf(f.key) >= 0;
-    return '<span onclick="tcToggleRemarkField(\'' + f.key + '\')" style="cursor:pointer;padding:0.2rem 0.65rem;border-radius:12px;font-size:0.78rem;border:1px solid ' +
-      (on ? '#2ec4b6;background:#2ec4b6;color:#0d0d2b' : '#334155;background:#0d0d2b;color:#94a3b8') + '">' + f.label + '</span>';
+    return '<span onclick="tcToggleRemarkField(' + _jsArg(f.key) + ')" style="cursor:pointer;padding:0.2rem 0.65rem;border-radius:12px;font-size:0.78rem;border:1px solid ' +
+      (on ? '#2ec4b6;background:#2ec4b6;color:#0d0d2b' : '#334155;background:#0d0d2b;color:#94a3b8') + '">' + _esc(f.label) + '</span>';
   }).join('');
   if (_tcRemarksFields.length === 0) {
     sel.innerHTML = '<span style="color:#555;font-size:0.82rem">Click fields above to add</span>';
   } else {
     sel.innerHTML = _tcRemarksFields.map(function(k) {
       var lbl = (TC_REMARK_FIELDS.find(function(x){return x.key===k;})||{label:k}).label;
-      return '<span onclick="tcToggleRemarkField(\'' + k + '\')" style="display:inline-block;background:#2ec4b6;color:#0d0d2b;padding:1px 8px;border-radius:10px;font-size:0.78rem;cursor:pointer;margin:1px" title="click to remove">' + lbl + ' ×</span>';
+      return '<span onclick="tcToggleRemarkField(' + _jsArg(k) + ')" style="display:inline-block;background:#2ec4b6;color:#0d0d2b;padding:1px 8px;border-radius:10px;font-size:0.78rem;cursor:pointer;margin:1px" title="click to remove">' + _esc(lbl) + ' ×</span>';
     }).join('');
   }
   tcUpdateRemarksPreview();
@@ -4551,7 +4556,7 @@ function tcIconSelectHtml(selectedPath) {
   var optAmb  = '<option value="' + TC_DEF_ICON_AMB + '"' + (isAmb ? ' selected' : '') + '>Ambulance (OSM)</option>';
   var extra = '';
   if (isCustom) {
-    extra = '<option value="' + String(s).replace(/"/g, '&quot;') + '" selected>Custom (CSV)</option>';
+    extra = '<option value="' + _esc(s) + '" selected>Custom (CSV)</option>';
   }
   return '<select data-tc-icon style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;font-size:0.82rem;width:100%">' +
     optAuto + optFire + optAmb + extra + '</select>';
@@ -4562,8 +4567,8 @@ function tcAddUnitRow(radioName, callsign, cotType, iconsetpath) {
   var tr = document.createElement('tr');
   tr.style.borderBottom = '1px solid #0d0d2b';
   tr.innerHTML = [
-    '<td style="padding:0.2rem 0.4rem"><input type="text" value="' + (radioName||'') + '" placeholder="CA342" style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;width:100%;box-sizing:border-box;font-size:0.82rem"></td>',
-    '<td style="padding:0.2rem 0.4rem"><input type="text" value="' + (callsign||'') + '" placeholder="Corona Engine 42" style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;width:100%;box-sizing:border-box;font-size:0.82rem"></td>',
+    '<td style="padding:0.2rem 0.4rem"><input type="text" value="' + _esc(radioName||'') + '" placeholder="CA342" style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;width:100%;box-sizing:border-box;font-size:0.82rem"></td>',
+    '<td style="padding:0.2rem 0.4rem"><input type="text" value="' + _esc(callsign||'') + '" placeholder="Corona Engine 42" style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;width:100%;box-sizing:border-box;font-size:0.82rem"></td>',
     '<td style="padding:0.2rem 0.4rem"><select style="background:#0d0d2b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:0.2rem 0.4rem;font-size:0.82rem;width:100%">',
     '<option value="a-f-G-E-V-C"' + ((cotType||'a-f-G-E-V-C')==='a-f-G-E-V-C'?' selected':'') + '>Engine/Truck/Vehicle (a-f-G-E-V-C)</option>',
     '<option value="a-f-G-E-V-M"' + (cotType==='a-f-G-E-V-M'?' selected':'') + '>Medic/Ambulance (a-f-G-E-V-M)</option>',

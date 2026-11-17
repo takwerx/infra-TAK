@@ -233,7 +233,7 @@ async function loadGroups(){
   el.innerHTML='<span style="color:var(--text-dim)">Loading groups...</span>';
   try{
     var r=await fetch('/api/takserver/groups');var d=await r.json();
-    if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
+    if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+escapeHtml(d.error)+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
     if(!d.groups||d.groups.length===0){el.innerHTML='<span style="color:var(--text-dim)">No groups found. Groups are created in the TAK Server WebGUI or via LDAP.</span>';return;}
     var h='<div style="display:grid;grid-template-columns:auto auto auto 1fr;gap:4px 16px;align-items:center">';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">READ</div>';
@@ -241,11 +241,13 @@ async function loadGroups(){
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">BOTH</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
     for(var i=0;i<d.groups.length;i++){
-      var g=d.groups[i],n=g.name,safe=n.replace(/"/g,'&quot;');
+      // ops #827: a group name comes from Authentik or TAK Server, so somebody else can choose it.
+      // It goes into the page as text only: escaped for the attribute and for the label.
+      var g=d.groups[i],n=String(g.name==null?'':g.name),safe=escapeHtml(n);
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-read" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'read\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-write" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'write\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-both" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--accent)" onchange="ccGroupChanged(this,\'both\')"></div>';
-      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
+      h+='<div style="color:var(--text-secondary);padding:4px 0">'+safe+'</div>';
     }
     h+='</div>';
     el.innerHTML=h;
@@ -253,9 +255,15 @@ async function loadGroups(){
 }
 function ccGroupChanged(cb,type){
   var grp=cb.getAttribute('data-group');
-  var r=document.querySelector('.cc-grp-read[data-group="'+grp+'"]');
-  var w=document.querySelector('.cc-grp-write[data-group="'+grp+'"]');
-  var b=document.querySelector('.cc-grp-both[data-group="'+grp+'"]');
+  // ops #827: find the row's three boxes by comparing the attribute, not by building a selector
+  // from the name (a name with a quote or a backslash made the selector throw).
+  function pick(cls){
+    var all=document.querySelectorAll('.'+cls);
+    for(var i=0;i<all.length;i++){if(all[i].getAttribute('data-group')===grp)return all[i];}
+    return null;
+  }
+  var r=pick('cc-grp-read'),w=pick('cc-grp-write'),b=pick('cc-grp-both');
+  if(!r||!w||!b)return;
   if(type==='both'){
     if(cb.checked){r.checked=true;w.checked=true;}else{r.checked=false;w.checked=false;}
   }else{
@@ -1173,7 +1181,8 @@ async function togglePkgLock(){
     btn.style.opacity='1';
     if(d&&d.success) renderPkgLock();
 }
-function escapeHtml(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+/* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function renderPkgLock(){
     var btn=document.getElementById('pkg-lock-btn');
     var label=document.getElementById('pkg-lock-status-label');

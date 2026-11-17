@@ -108,7 +108,8 @@ def _reload_if_changed(run, have_caddy=True):
 
     ns = _load(['_caddy_reload_if_changed'],
                {'subprocess': _Sub, 'shutil': _Shutil, 'CADDYFILE_PATH': '/etc/caddy/Caddyfile',
-                'CADDY_RELOAD_TIMEOUT': 45, '_caddy_reload_checked': _checked})
+                'CADDY_RELOAD_TIMEOUT': 45, '_caddy_reload_checked': _checked,
+                '_caddy_private': lambda: False})     # ops #814: tests/test_caddy_private_ops814.py covers a moved box
     return ns['_caddy_reload_if_changed'], fallback
 
 

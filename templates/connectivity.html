@@ -334,7 +334,12 @@ async function pollDetect(){
     }
   }catch(e){}
 }
-function esc(s){ const d = document.createElement('div'); d.textContent = (s==null?'':String(s)); return d.innerHTML; }
+/* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* ops #827: a value for an inline handler, e.g. onclick="pick(' + jsArg(name) + ')". JSON makes it a
+   JavaScript string, esc() then makes that string safe inside the quoted attribute (& included, so an
+   entity in a name stays text). */
+function jsArg(v){ return esc(JSON.stringify(v==null?'':String(v))); }
 function renderResult(res){
   document.getElementById('result-card').style.display = 'block';
   const badge = document.getElementById('class-badge');
@@ -750,7 +755,7 @@ async function refreshWifiSaved(){
       html += ordered.map(s => {
         const isCur = (s === cur);
         const inRange = isCur || apMode || scanEmpty || visible.indexOf(s) !== -1;
-        const j = JSON.stringify(s).replace(/"/g,'&quot;');
+        const j = jsArg(s);
         const badge = isCur
           ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
           : ((apMode || scanEmpty)
@@ -799,7 +804,7 @@ async function loadReach(){
       const label = (isWifi ? 'WiFi · ' : 'Ethernet · ') + esc(x.iface);
       const here = x.current ? '<span style="color:var(--green);font-size:11px;margin-left:8px">← you are here</span>' : '';
       const hint = (isWifi && !x.current) ? '<div style="font-size:11px;color:var(--text-dim);margin-top:3px">↳ use this after you unplug Ethernet</div>' : '';
-      const jurl = JSON.stringify(x.url).replace(/"/g,'&quot;');
+      const jurl = jsArg(x.url);
       return '<div style="padding:10px 12px;background:var(--bg-deep);border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
         + '<div style="display:flex;align-items:center;gap:10px">'
         + '<span class="dot" style="background:' + (isWifi ? 'var(--accent)' : 'var(--green)') + ';flex-shrink:0"></span>'
@@ -844,7 +849,7 @@ async function scanWifi(){
     const nets = (d.networks || []).filter(n => n.ssid);
     if(!nets.length){ st.textContent = 'No networks found (or scanning not supported here — type the name below).'; }
     list.innerHTML = nets.map(n =>
-      '<button type="button" class="control-btn" style="font-size:12px;padding:6px 12px" onclick="pickWifi(' + JSON.stringify(n.ssid).replace(/"/g,'&quot;') + ')">'
+      '<button type="button" class="control-btn" style="font-size:12px;padding:6px 12px" onclick="pickWifi(' + jsArg(n.ssid) + ')">'
       + esc(n.ssid) + (n.signal ? ' <span style="color:var(--text-dim)">· ' + esc(n.signal) + '</span>' : '') + '</button>').join('');
   }catch(e){ st.textContent = 'Scan failed.'; }
   btn.disabled = false; btn.textContent = 'Scan for networks';
