@@ -134,3 +134,75 @@ def test_remote_deploy_step_one_uses_the_branching_command_not_a_bare_apt_get():
     step1 = body[body.index('Step 1/7'):body.index('Step 2/7')]
     assert '_MEDIAMTX_REMOTE_DEPS_SH' in step1
     assert 'apt-get' not in step1
+
+
+# ── second cause (found on the Rocky 9 box, SELinux enforcing): files moved from /tmp keep the tmp label ──
+
+def _const(name):
+    tree = ast.parse(APP)
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            consts[node.targets[0].id] = node.value
+    def ev(n):
+        if isinstance(n, ast.Name):
+            return ev(consts[n.id])
+        if isinstance(n, ast.BinOp):
+            return ev(n.left) + ev(n.right)
+        return ast.literal_eval(n)
+    return ev(consts[name])
+
+
+def _fake_bin(tmp_path, programs):
+    b = tmp_path / 'fb'
+    b.mkdir()
+    log = tmp_path / 'fcalls.log'
+    log.write_text('')
+    for name, body in programs.items():
+        _write(b / name, f'#!/bin/sh\necho "{name} $*" >> "{log}"\n{body}\n')
+    basics = tmp_path / 'fbasics'
+    basics.mkdir()
+    for prog in ('sh', 'sleep', 'echo', 'id', 'true'):
+        for d in ('/bin', '/usr/bin'):
+            if (pathlib.Path(d) / prog).exists():
+                (basics / prog).symlink_to(pathlib.Path(d) / prog)
+                break
+    return {'PATH': f'{b}:{basics}'}, log
+
+
+def test_relabel_runs_restorecon_on_everything_the_deploy_moves_in(tmp_path):
+    env, log = _fake_bin(tmp_path, {'restorecon': 'exit 0', 'sudo': 'shift; exec "$@"'})
+    r = subprocess.run(['/bin/sh', '-c', _const('_MEDIAMTX_REMOTE_RELABEL_SH')], capture_output=True, text=True, env=env)
+    assert r.returncode == 0
+    call = log.read_text()
+    for path in ('/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml', '/etc/systemd/system/mediamtx.service',
+                 '/etc/systemd/system/mediamtx-webeditor.service', '/opt/mediamtx-webeditor'):
+        assert path in call, path
+
+
+def test_relabel_is_harmless_on_a_host_without_restorecon(tmp_path):
+    env, log = _fake_bin(tmp_path, {})
+    r = subprocess.run(['/bin/sh', '-c', _const('_MEDIAMTX_REMOTE_RELABEL_SH')], capture_output=True, text=True, env=env)
+    assert r.returncode == 0
+
+
+def test_active_check_passes_for_a_running_service_and_fails_for_a_dead_one(tmp_path):
+    env, _ = _fake_bin(tmp_path, {'systemctl': 'exit 0'})
+    sh = _const('_MEDIAMTX_REMOTE_ACTIVE_SH')
+    assert subprocess.run(['/bin/sh', '-c', sh], capture_output=True, text=True, env=env, timeout=30).returncode == 0
+    env2, _ = _fake_bin(tmp_path / 'dead', {'systemctl': 'echo inactive; exit 3', 'journalctl': 'echo "Failed to open mediamtx.service: Permission denied"'}) \
+        if (tmp_path / 'dead').mkdir() is None else (None, None)
+    r = subprocess.run(['/bin/sh', '-c', sh], capture_output=True, text=True, env=env2, timeout=30)
+    assert r.returncode == 1
+    assert 'Permission denied' in r.stdout
+
+
+def test_deploy_relabels_before_daemon_reload_and_checks_mediamtx_is_up():
+    i0 = APP.index('\ndef _run_mediamtx_deploy_remote(')
+    body = APP[i0:APP.index('\ndef ', i0 + 1)]
+    i_relabel = body.index('_MEDIAMTX_REMOTE_RELABEL_SH')
+    i_reload = body.index('systemctl daemon-reload')
+    i_check = body.index('_MEDIAMTX_REMOTE_ACTIVE_SH')
+    i_ok = body.index('✓ Services started')
+    assert i_relabel < i_reload < i_check < i_ok
+    assert '✗ MediaMTX did not start on the remote host' in body

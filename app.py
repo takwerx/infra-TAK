@@ -48408,6 +48408,25 @@ _MEDIAMTX_REMOTE_DEPS_SH = (
 )
 
 
+# ops #892 (second cause, found on a Rocky 9 host with SELinux enforcing): the config, the two unit
+# files and the editor folder arrive by `mv` from /tmp and keep SELinux's tmp label, so systemd
+# answers "Failed to open /etc/systemd/system/mediamtx.service: Permission denied" and neither
+# service starts, while the deploy said "Services started". restorecon gives them their real
+# labels; a host without restorecon (Ubuntu) does nothing. NON-ROOT-COMMANDS: restorecon.
+_MEDIAMTX_REMOTE_RELABEL_SH = (
+    _REMOTE_SUDO_SH +
+    '$S restorecon -R /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml /usr/local/etc/mediamtx-webeditor.env '
+    '/etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service '
+    '/opt/mediamtx-webeditor >/dev/null 2>&1; true'
+)
+
+# MediaMTX itself must be running after the start (it gets a few seconds); prints systemd's own reason if not.
+_MEDIAMTX_REMOTE_ACTIVE_SH = (
+    'for i in 1 2 3 4 5 6 7 8; do systemctl is-active --quiet mediamtx && exit 0; sleep 1; done; '
+    'systemctl is-active mediamtx 2>&1; journalctl -u mediamtx -n 5 --no-pager 2>&1; exit 1'
+)
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -48783,7 +48802,15 @@ paths:
         plog("  user passwordless sudo, then deploy again.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
+    # ops #892: relabel what was moved in from /tmp (SELinux hosts), then start.
+    _module_run(deploy_cfg, _MEDIAMTX_REMOTE_RELABEL_SH, timeout=60)
     _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
+    # ops #892: "Services started" used to print whatever systemd said. Check MediaMTX itself.
+    _mtx_up, _mtx_out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_ACTIVE_SH, timeout=40)
+    if not _mtx_up:
+        plog(f"✗ MediaMTX did not start on the remote host: {(_mtx_out or '')[-300:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     plog("✓ Services started")
 
     # Step 5b: Test video
