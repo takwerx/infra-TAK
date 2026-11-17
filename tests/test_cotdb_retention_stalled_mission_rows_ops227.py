@@ -200,6 +200,14 @@ def watch(tmp_path):
         r = subprocess.run(['bash', str(sp)], env=env, capture_output=True, text=True, timeout=60)
         mail = tmp_path / 'mail'
         return r, mail.read_text() if mail.exists() else '', (tmp_path / 'sql').read_text()
+
+    def age_pending(minutes):
+        """Pretend the first look happened `minutes` ago."""
+        p = tmp_path / 'state' / 'cotdb_retention_pending'
+        t = time.time() - minutes * 60
+        os.utime(p, (t, t))
+    run.state = tmp_path / 'state'
+    run.age_pending = age_pending
     return run
 
 
@@ -211,6 +219,12 @@ def test_watch_does_not_email_for_mission_rows(watch):
 
 
 def test_watch_still_emails_for_old_non_mission_rows(watch):
+    # ops #846: the first look only notes it; the second look, an hour or more
+    # later, sends the email.
+    r, mail, _sql = watch(_model(OLD_POSITION))
+    assert r.returncode == 0, r.stderr
+    assert 'retention is not deleting' not in mail
+    watch.age_pending(6 * 60)
     r, mail, _sql = watch(_model(OLD_POSITION))
     assert r.returncode == 0, r.stderr
     assert 'CoT retention is not deleting' in mail
@@ -218,9 +232,49 @@ def test_watch_still_emails_for_old_non_mission_rows(watch):
 
 
 def test_watch_failed_lookup_keeps_the_alert(watch):
+    watch(_model(fail_expirable=True))
+    watch.age_pending(6 * 60)
     r, mail, _sql = watch(_model(fail_expirable=True))
     assert r.returncode == 0, r.stderr
     assert 'CoT retention is not deleting' in mail
+
+
+def test_watch_one_look_at_a_row_that_just_turned_deletable_sends_nothing(watch):
+    # ops #846 (test8, Nov 16): a 5-day-old row became deletable (its mission went
+    # away) minutes before the watcher ran; TAK's hourly job deleted it. One look
+    # must not email.
+    r, mail, _sql = watch(_model(OLD_POSITION))
+    assert r.returncode == 0, r.stderr
+    assert 'retention is not deleting' not in mail
+    assert (watch.state / 'cotdb_retention_pending').exists()
+    assert not (watch.state / 'cotdb_alert_sent.retention').exists()
+    # next look: retention has deleted it. Nothing sent, and the first look is forgotten,
+    # so a later one-off starts counting again.
+    watch.age_pending(6 * 60)
+    r, mail, _sql = watch(_model())
+    assert r.returncode == 0, r.stderr
+    assert 'retention is not deleting' not in mail
+    assert not (watch.state / 'cotdb_retention_pending').exists()
+    r, mail, _sql = watch(_model(OLD_POSITION))
+    assert 'retention is not deleting' not in mail
+
+
+def test_watch_second_look_inside_an_hour_does_not_count(watch):
+    # a manual re-run right after the first look is not a confirmation
+    watch(_model(OLD_POSITION))
+    watch.age_pending(5)
+    r, mail, _sql = watch(_model(OLD_POSITION))
+    assert r.returncode == 0, r.stderr
+    assert 'retention is not deleting' not in mail
+
+
+def test_watch_sends_the_stall_email_once_a_day_after_confirming(watch):
+    watch(_model(OLD_POSITION))
+    watch.age_pending(6 * 60)
+    watch(_model(OLD_POSITION))
+    watch.age_pending(6 * 60)
+    r, mail, _sql = watch(_model(OLD_POSITION))      # third look, latch still fresh
+    assert mail.count('SUBJECT TAK Server CoT retention is not deleting') == 1
 
 
 # ── One definition of "expired" ─────────────────────────────────────────────────
