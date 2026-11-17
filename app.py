@@ -110837,24 +110837,40 @@ def _cloudtak_write_override_file(ct_dir):
         return False
 
 
-def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
+def _cloudtak_recreate_and_heal(ct_dir, log, pull=False, wait_s=0):
     """Force-recreate the whole CloudTAK stack, then re-apply the media patches the recreate
     wiped. A bare `docker compose` in the stack dir, so COMPOSE_FILE in .env decides the files:
     base + infra-TAK's override + TAK Portal's marketplace file + the operator's
     docker-compose.custom.yml (GH #261). The console-start hardening and Guard Dog's
     auto-repair (ops #197) both recreate through here. `pull` downloads the pinned postgis
     first, so `up` doesn't spend its 240 s on it. Returns 'ok', 'recreate' (the up failed)
-    or 'heal' (the media heal did not confirm)."""
+    or 'heal' (the media heal did not confirm).
+    wait_s (ops #889): the console gives up on `up` after 240 s, but the broker keeps running it,
+    and on a loaded box (test6: docker at 250 percent CPU, images still unpacking) it finishes
+    minutes later. With wait_s > 0 a timeout is not a failure: wait up to that long for the
+    running compose to end, then carry on to the heals, and let the caller's fresh drift check
+    judge. 0 (the console-start path, which runs before the web server is up) keeps the old
+    behaviour: the timeout is raised."""
     if pull:
         # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
         # Download it before the recreate so `up -d` doesn't spend its 240 s budget
         # on the pull — the stack keeps running meanwhile.
         _docker_compose_pull(None, ct_dir, log,
                              timeout=600, label='CloudTAK postgis', services=['postgis'])
-    r = subprocess.run(
-        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
-    )
-    if r.returncode != 0:
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+        )
+    except subprocess.TimeoutExpired:
+        if wait_s <= 0:
+            raise
+        log(f"CloudTAK recreate is still running after 240s (a loaded box) — waiting up to {int(wait_s // 60)} min for it")
+        if not _ct_wait_compose_idle(timeout=wait_s, log=log):
+            log(f"CloudTAK recreate warning: still running after {int(wait_s // 60)} min")
+            return 'recreate'
+        log("CloudTAK recreate finished after the wait")
+        r = None
+    if r is not None and r.returncode != 0:
         log(f"CloudTAK recreate warning: {(r.stdout or '')[:200]}")
         return 'recreate'
     log("CloudTAK recreated with hardened port bindings")
@@ -111015,6 +111031,7 @@ _startup_heal_cloudtak_media_hls()
 CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
+CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S = 900  # ops #889: the recreate outlasted the console's 240 s: wait for it this long
 _CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json')
 # Any compose step that changes the stack, or an image build (TAK Portal builds --no-cache first).
 _CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
@@ -111171,7 +111188,11 @@ def _cloudtak_autorepair_request(settle_s=None):
     ct_dir = os.path.expanduser('~/CloudTAK')
     with _cloudtak_autorepair_lock:
         if cloudtak_autorepair_status.get('running'):
-            return {'state': 'repairing', 'detail': cloudtak_autorepair_status.get('detail') or ''}
+            # ops #889: "still repairing" with how long, so a slow box reads as slow, not as failed.
+            _since = cloudtak_autorepair_status.get('started')
+            _mins = f" (running {max(int(time.time() - _since) // 60, 0)} min)" if _since else ''
+            return {'state': 'repairing',
+                    'detail': f"still repairing{_mins}: {cloudtak_autorepair_status.get('detail') or ''}".rstrip(': ')}
         settings = load_settings()
         try:
             if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
@@ -111233,7 +111254,7 @@ def _cloudtak_autorepair_run(ct_dir, drift):
             _cloudtak_ensure_custom_compose(ct_dir, _log)
             _patch_cloudtak_minio_registry(ct_dir)
             _patch_cloudtak_compose_ports(ct_dir)
-            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
+            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True, wait_s=CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S)
             why = {'recreate': 'docker compose up --force-recreate failed',
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
         elif drift['kind'] == 'media' or drift.get('hls') is False:
