@@ -60,6 +60,8 @@ Official: TAK Server Configuration Guide and release notes at [tak.gov](https://
 - `x509useGroupCacheRequiresExtKeyUsage="false"` in `<auth>` lets certificates made by `makeCert.sh` (no extended key usage) use channels. 📖 notes, carried from the field.
 - Mission API quirks (📖 from our notes, not re-proven): `PUT /Marti/api/missions/{name}/subscription?uid=X` assigns `defaultRole` even to an admin, so follow it with a role `PUT`. `PUT .../contents` needs the UID in the CoT cache first. `PUT .../role` needs the `group` to match the mission's group or TAK answers `FORBIDDEN: Illegal attempt to change Mission groups!`.
 - **`POST /Marti/api/missions/{name}/feed` (add a data feed to a mission) always answers HTTP 500 on TAK Server 5.8.** TAK's `MissionApi.java` maps two `POST` handlers, `addFeed` and `addFeedByGuid`, to the same pattern `/missions/{x:.+}/feed`, so Spring answers `Ambiguous handler methods mapped` for every call. `/missions/guid/<guid>/feed` is a 404. ✅ verified 2026-11-13, test6 (TAK Server 5.8-RELEASE84); cause read in the public source (5.7-RELEASE-14). Reported upstream: [TAK-Product-Center/Server#76](https://github.com/TAK-Product-Center/Server/issues/76). infra-TAK never calls this endpoint (Node-RED uses a mission's `changes`, `role` and `contents` paths). Also: `DELETE /Marti/api/datafeeds/<uuid>` answers 400 when the uuid has a hyphen; delete by feed name instead. ✅ verified 2026-11-13, test6.
+- **A new TAK Server 5.8 has no CoT retention at all.** `/opt/tak/conf/retention/retention-policy.yml` ships with `dataRetentionMap: cot: null`, and `retention-service.yml` ships with `cronExpression: "-"` (the retention job never runs). On a box where an operator set a policy in the Web Admin, the file reads `cot: 86400` (seconds) and the service file reads `cronExpression: 0 59 * * * *` (every hour at minute 59). infra-TAK reads these files and never writes them. ✅ verified 2026-11-16, Rocky 9 box with no policy and two Ubuntu boxes with `cot: 86400`, TAK Server 5.8.
+- **TAK's hourly retention job deletes by `servertime`, which is when the server received the row, not when the row became deletable.** A CoT row that belongs to a mission (`mission_uid`) is kept. When it stops belonging to one, it can be days old at that moment and is deleted by the next hourly run. A check that looks once, between those two moments, sees an old row that is not stuck. ✅ verified 2026-11-16, Ubuntu 22.04 split-database box and Ubuntu 24.04 box (retention logged 24 runs a day, 14,000 to 18,000 rows a day); ⚠ not proven: what made the rows deletable.
 - A user named `webadmin` in the flat-file `UserAuthenticationFile.xml` shadows an LDAP user of the same name. Do not create one in Authentik.
 - A Java heap that is too small can show up as HTTP 500 on CloudTAK sign-in. 👁 observed.
 
@@ -123,6 +125,17 @@ Official: [nodered.org/docs](https://nodered.org/docs)
 
 - Function nodes cannot `require()` by default; declare modules in the node's `libs`.
 - Never `docker cp` a `flows.json` into a running container (it can persist an empty global context). `nodered/deploy.sh` stops the container first. Confirm `contextStorage` is `localfilesystem` in the file the container actually reads.
+
+## CoTURN (Remote Assist TURN relay)
+
+Official: [coturn releases](https://github.com/coturn/coturn/releases), [docker image](https://hub.docker.com/r/coturn/coturn)
+
+- **The image entrypoint expands each argument with `eval echo`, then runs turnserver.** That is why the relay address in our override is written as a command in `$$(...)` and still works (ops #212). The loop is the same in 4.18.0 and 4.19.1. ✅ verified 2026-11-16, test6 and test12 (4.19.1 entrypoint read from the image, every flag accepted).
+- **The `--version` string of the `coturn/coturn:4.19.1` image says `4.19.0`.** The image label `org.opencontainers.image.version` says `4.19.1-r0`, and `--dtls-half-open-timeout` (new in 4.19.1) is in its help. Judge the version by the label, not the binary's string. ✅ verified 2026-11-16, test12.
+- **Upstream release pages list pull request titles only.** 4.19.1 says "Security fixes" with no CVE or advisory text. Read the compare view and the new options before adopting. 📖 documented.
+- **A relay test with `turnutils_uclient` needs a peer on several ports.** `-e PEER -r PORT` sends to PORT, PORT+1 and onward, so run `turnutils_peer` on four consecutive ports and open them to the TURN box's address. Without that, packets are lost and it looks like a relay fault. `-y -m 2` tests two clients relaying to each other (the ops #212 case). Both tools ship in the coturn image: `docker run --rm --network host --entrypoint turnutils_uclient coturn/coturn:TAG ...`. ✅ verified 2026-11-16, test6 as relay, test12 as the outside client.
+- **A refused private peer shows as `channel bind: error 403` in the client.** An allowed one shows no error. ✅ verified 2026-11-16, 4.18.0 and 4.19.1.
+- **The console moves an existing CoTURN to a new pin about 3 minutes after the console restarts** (the startup migration runs late, in a thread). Wait for the journal line `Startup migration: CoTURN updated to ...` before testing. ✅ verified 2026-11-16, test6.
 
 ## Docker
 

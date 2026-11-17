@@ -148,8 +148,8 @@ def _images(compose):
 def test_pins_move_to_webodm_4_and_postgres_18_by_digest():
     _, ns = _run(Box(pg='18'))
     imgs = ns['WEBODM_IMAGES']
-    assert ns['WEBODM_VERSION'] == '4.0.0'
-    assert imgs['wo_webapp'] == imgs['wo_worker'] == 'webodm/webodm_webapp:4.0.0'
+    assert ns['WEBODM_VERSION'] == '4.0.1'
+    assert imgs['wo_webapp'] == imgs['wo_worker'] == 'webodm/webodm_webapp:4.0.1'
     assert re.fullmatch(r'webodm/webodm_db:18@sha256:[0-9a-f]{64}', imgs['wo_db'])
 
 
