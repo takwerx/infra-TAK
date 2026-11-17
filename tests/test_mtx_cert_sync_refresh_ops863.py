@@ -165,3 +165,39 @@ def test_root_accepts_the_values_read_back_from_an_installed_script():
     for ph, value in baked.items():
         assert B._GD_VALUE_RES[ph].match(value), (ph, value)
         assert not B._GD_UNSAFE_RE.search(value), (ph, value)
+
+
+def _converge(converge, refresh, cert_sync):
+    """The real _startup_broker_converge from app.py, with its three callees stubbed."""
+    start = APP.index('def _startup_broker_converge():')
+    ns = {'_broker_converge_running_source': converge, '_auto_update_guarddog': refresh,
+          '_gd_refresh_mtx_cert_sync': cert_sync}
+    exec(APP[start:APP.index('\n_startup_broker_converge()', start)], ns)
+    return ns['_startup_broker_converge']
+
+
+def test_cert_sync_is_rendered_again_once_the_broker_changed():
+    """ops #845 pattern: at module load root's broker still holds the previous release's
+    templates and gd_render fills from them, so the first restart after Update Now would
+    keep the old cert-sync script. Once the broker has the new commit, refresh it again."""
+    calls = []
+    _converge(lambda: True, lambda: calls.append('guarddog'), lambda: calls.append('cert-sync'))()
+    assert calls == ['guarddog', 'cert-sync']
+
+
+def test_no_second_cert_sync_pass_when_the_broker_did_not_change():
+    calls = []
+    _converge(lambda: False, lambda: calls.append('guarddog'), lambda: calls.append('cert-sync'))()
+    assert calls == []
+
+
+def test_a_failed_second_pass_never_stops_startup_and_each_pass_is_independent(capsys):
+    calls = []
+
+    def boom():
+        raise RuntimeError('gd_render refused')
+
+    _converge(lambda: True, boom, lambda: calls.append('cert-sync'))()      # guarddog pass fails
+    assert calls == ['cert-sync']
+    _converge(lambda: True, lambda: None, boom)()                           # cert-sync pass fails
+    assert 'cert-sync refresh after broker convergence skipped' in capsys.readouterr().out

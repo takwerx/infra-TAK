@@ -117771,6 +117771,12 @@ def _startup_broker_converge():
             _auto_update_guarddog()
         except Exception as _e:
             print(f"[startup] Guard Dog refresh after broker convergence skipped (non-fatal): {_e}", flush=True)
+        # ops #863: the cert-sync refresh is its own startup call (see above), so it needs the
+        # same second pass: gd_render fills it from the broker's copy of the repo too.
+        try:
+            _gd_refresh_mtx_cert_sync()
+        except Exception as _e:
+            print(f"[startup] cert-sync refresh after broker convergence skipped (non-fatal): {_e}", flush=True)
 
 
 _startup_broker_converge()
