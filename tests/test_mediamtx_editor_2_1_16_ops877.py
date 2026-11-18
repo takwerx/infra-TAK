@@ -88,10 +88,12 @@ def api_share_links_revoke():
 '''
 
 
-def test_editor_pin_is_v2_1_16_and_its_commit_not_the_tag_object_ops877():
-    assert _const('MEDIAMTX_EDITOR_REF') == 'v2.1.16'
+def test_editor_pin_is_a_commit_not_a_tag_object_ops877():
+    # The exact version is asserted in test_mediamtx_editor_2_1_17_ops937.py; this test keeps the
+    # ops #877 rule that the pin is the COMMIT of the tag (a full 40-hex sha), never the tag object.
+    assert re.fullmatch(r'v\d+\.\d+\.\d+', _const('MEDIAMTX_EDITOR_REF'))
     sha = _const('MEDIAMTX_EDITOR_SHA')
-    assert sha == '8d76bbec0c93804e0c7a5317cdeec18c28945f68'
+    assert re.fullmatch(r'[0-9a-f]{40}', sha)
     # the annotated tag object of v2.1.16: the clone check (`rev-parse HEAD` == SHA) can never pass with it
     assert sha != 'd8fde95eb125745385df8df9d1e099ef9c78d89e'
 
