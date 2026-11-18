@@ -547,13 +547,13 @@
       "name": "Esri ArcGIS",
       "description": "Synchronizes features with Esri ArcGIS: ingests ArcGIS Feature and Map Server layers to the map on a schedule and optionally pushes map features back out to ArcGIS.",
       "source": "dfpc-coe/etl-arcgis",
-      "ref": "v7.33.0",
-      "sha": "90bc0ecb3979bf613c19eb7e005b135acacd3e07",
-      "version": "7.33.0",
+      "ref": "v7.35.1",
+      "sha": "7c99969125671cef4256e98100a614fc841a3c59",
+      "version": "7.35.1",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/90bc0ecb3979bf613c19eb7e005b135acacd3e07/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/90bc0ecb3979bf613c19eb7e005b135acacd3e07/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-arcgis",
       "compute": {
         "memory": 1024,
@@ -567,8 +567,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": null,
-      "note": "On hold: a security report sent to the COE on 2026-11-09 is still open. infra-TAK will offer this ETL again once it is fixed."
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-everywhere-hub",

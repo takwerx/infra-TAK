@@ -96,6 +96,9 @@ class Host:
             'audit': lambda ev, detail='', force=False: host.audits.append(ev),
             'mod_registry': types.SimpleNamespace(atlas=atlas_mod, get_ctx=lambda: {}),
             '_write_private_file': lambda path, content: host.files.__setitem__(path, content),
+            # ops #814: this file covers a box not moved to the private layout yet;
+            # tests/test_caddy_private_ops814.py covers rotation on a moved box.
+            '_caddy_private': lambda: False,
         }
         exec(compile("_PROXY_AUTH_BACKUP_FILE = '/cfg/proxy_auth.pre-rotate.json'\n"
                      "_PROXY_AUTH_CADDYFILE_BACKUP = '/cfg/Caddyfile.pre-rotate'\n"

@@ -514,7 +514,8 @@ async function toggleUU(cb){
         else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+/* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=80)return 'var(--red)';if(n>=50)return '#eab308';return 'var(--green)';}
 function normCpu(rawPct,vcpus){return vcpus>1?rawPct/vcpus:rawPct;}
@@ -599,7 +600,7 @@ async function fetchRetry(url,opts,tries){
    Power-Off treatment: password re-confirm plus the operator types the exact LV,
    which is what the API's confirm_lv echo is for. */
 var _diskLayout=null,_diskBusy=false;
-function _diskEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function _diskEsc(s){return escapeHtml(s);}
 function _diskEl(id){return document.getElementById(id);}
 function diskLayoutRefresh(){
     if(_diskBusy)return;
@@ -775,14 +776,15 @@ function refreshModuleVersions(){
             if(!el)continue;
             var d=data[key];
             var s='';
-            if(d.version)s=(key==='mediamtx'?'':'v')+d.version;
+            // ops #827: every version string is text from a container or a remote host. Escape it.
+            if(d.version)s=(key==='mediamtx'?'':'v')+escapeHtml(d.version);
             if(key==='authentik'&&d.channel==='dev'){
-                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+escapeHtml(d.vetted_release)+'">· main: v'+escapeHtml(d.vetted_release)+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
                 }
             }else if(key==='netbird'&&d.channel==='dev'){
-                if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted+'">· main: v'+d.vetted+'</span>';
+                if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+escapeHtml(d.vetted)+'">· main: v'+escapeHtml(d.vetted)+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
                 }
@@ -798,11 +800,11 @@ function refreshModuleVersions(){
             }else if(d.update_available){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
-                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+escapeHtml(d.vetted_release)+') — not yet validated on main channel">! unvetted</span>';
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
             }
-            if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+d.node_security.replace(/"/g,'&quot;')+'">🔒 Node.js out of date — press Update</span>';
+            if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+escapeHtml(d.node_security)+'">🔒 Node.js out of date — press Update</span>';
             el.innerHTML=s;if(s)el.style.display='';
         }
     }).catch(function(){});

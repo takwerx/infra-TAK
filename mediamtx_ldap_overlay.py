@@ -30,6 +30,7 @@ import re
 import json
 import urllib.request
 import urllib.error
+from html import escape as _html_escape
 from flask import session, request, redirect, jsonify, Response
 
 AK_URL = os.environ.get('AUTHENTIK_API_URL', 'http://127.0.0.1:9090')
@@ -324,6 +325,13 @@ def apply_ldap_overlay(app):
                     return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
             else:
                 return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
+        # ops #900: the player must start INSIDE the playlist. The box's MediaMTX keeps
+        # hlsSegmentCount: 3 (app.py), and MediaMTX drops the oldest listed segment about
+        # one segment after it listed it. hls.js with liveSyncDurationCount >= 3 starts at
+        # that oldest segment, so a viewer on a slow link got 404 on it, no video, and
+        # Stream Offline. liveSyncDurationCount 2 starts one segment in; a network error
+        # that is not fatal restarts the load, as CloudTAK's player does. The same two
+        # values are in the Watch popup (watchStream) below.
         hls_url = f'/hls-proxy/{stream_name}/index.m3u8'
         title = f'{stream_name} - Live'
         html = f'''<!DOCTYPE html>
@@ -340,10 +348,10 @@ z-index:100;justify-content:center;align-items:center;flex-direction:column;text
 <script>
 var video=document.getElementById("v"),err=document.getElementById("err"),url="{hls_url}";
 function start(){{
-if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
+if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7}});
 hls.loadSource(url);hls.attachMedia(video);
 hls.on(Hls.Events.MANIFEST_PARSED,function(){{err.style.display="none";video.play().catch(function(){{}});}});
-hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
+hls.on(Hls.Events.ERROR,function(ev,data){{if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();}}if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
 }}else if(video.canPlayType("application/vnd.apple.mpegurl")){{video.src=url;video.addEventListener("loadedmetadata",function(){{video.play().catch(function(){{}});}});}}
 }}
 start();
@@ -362,6 +370,9 @@ start();
         'headerTitle': 'MediaMTX Configuration Editor',
         'subtitle': 'Brought to you by TAKWERX',
     }
+
+    # A CSS colour as the theme editor saves it (#hex), or a colour name / rgb() / hsl() form.
+    _THEME_COLOUR_RE = re.compile(r'^(#[0-9A-Fa-f]{3,8}|[A-Za-z]{3,30}|(?:rgb|hsl)a?\([0-9.,%/ a-z-]{1,60}\))$')
 
     def _load_theme():
         try:
@@ -383,18 +394,30 @@ start();
             return redirect('/')
         theme = _load_theme()
         logo = _logo_exists()
+        # ops #897: every value is written into the page as text. The title and subtitle are
+        # the admin's, the username is the Authentik one (X-Authentik-Username), and the editor's
+        # own pages already show the title and subtitle as text (Jinja autoescape). A colour
+        # that is not a plain CSS colour falls back to the default, because it lands in <style>.
+        # The username goes in last so that no text in it is read as a placeholder.
+        def _text(v):
+            return _html_escape(str(v if v is not None else ''), quote=True)
+
+        def _colour(key):
+            v = str(theme.get(key) or '').strip()
+            return v if _THEME_COLOUR_RE.match(v) else _THEME_DEFAULTS[key]
+
         html = ACTIVE_STREAMS_VIEWER_HTML
-        html = html.replace('{{HEADER_COLOR}}', theme.get('headerColor', '#1e3a8a'))
-        html = html.replace('{{HEADER_COLOR_END}}', theme.get('headerColorEnd', '#1e293b'))
-        html = html.replace('{{ACCENT_COLOR}}', theme.get('accentColor', '#3b82f6'))
-        html = html.replace('{{HEADER_TITLE}}', theme.get('headerTitle', 'MediaMTX Configuration Editor'))
+        html = html.replace('{{HEADER_COLOR}}', _colour('headerColor'))
+        html = html.replace('{{HEADER_COLOR_END}}', _colour('headerColorEnd'))
+        html = html.replace('{{ACCENT_COLOR}}', _colour('accentColor'))
+        html = html.replace('{{LOGO_DISPLAY}}', 'block' if logo else 'none')
         sub = theme.get('subtitle', 'Brought to you by TAKWERX')
         if sub:
-            html = html.replace('{{SUBTITLE}}', sub)
+            html = html.replace('{{SUBTITLE}}', _text(sub))
         else:
             html = html.replace('<div class="subtitle">{{SUBTITLE}}</div>', '')
-        html = html.replace('{{LOGO_DISPLAY}}', 'block' if logo else 'none')
-        html = html.replace('{{USERNAME}}', session.get('username', ''))
+        html = html.replace('{{HEADER_TITLE}}', _text(theme.get('headerTitle', 'MediaMTX Configuration Editor')))
+        html = html.replace('{{USERNAME}}', _text(session.get('username', '')))
         return Response(html, content_type='text/html')
 
     # v10.2.6: /api/viewer/hlscred is gone. It handed the hlsviewer credential — read on
@@ -767,7 +790,11 @@ td{padding:12px;border-top:1px solid #333}
   </div>
 </div>
 <script>
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+/* ops #897: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* ops #897: a value for an inline handler, e.g. onclick="watchStream(' + jsArg(name) + ')". JSON makes
+   it a JavaScript string, escapeHtml() then makes that string safe inside the quoted attribute. */
+function jsArg(v){return escapeHtml(JSON.stringify(v==null?'':String(v)));}
 
 function streamPath(name){return name.split('/').map(encodeURIComponent).join('/');}
 
@@ -793,10 +820,10 @@ function watchStream(name){
     +'var url="'+hlsUrl+'";'
     +'function start(){'
     +'if(Hls.isSupported()){'
-    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7});'
+    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7});'
     +'hls.loadSource(url);hls.attachMedia(video);'
     +'hls.on(Hls.Events.MANIFEST_PARSED,function(){err.style.display="none";video.play().catch(function(){})});'
-    +'hls.on(Hls.Events.ERROR,function(ev,data){if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
+    +'hls.on(Hls.Events.ERROR,function(ev,data){if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){hls.startLoad()}if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
     +'}else if(video.canPlayType("application/vnd.apple.mpegurl")){'
     +'video.src=url;video.addEventListener("loadedmetadata",function(){video.play().catch(function(){})});'
     +'}}'
@@ -858,8 +885,8 @@ function shareStream(name,vis,btn){
       html+='</td>';
       html+='<td style="text-align:center;color:#888">—</td>';
       html+='<td style="text-align:center;white-space:nowrap">';
-      html+='<button class="btn btn-watch" onclick="watchStream(\''+escapeHtml(name).replace(/'/g,"\\'")+'\')"><span style="font-size:16px">&#x25B6;&#xFE0F;</span> Watch</button>';
-      html+='<button class="btn btn-share" onclick="shareStream(\''+escapeHtml(name).replace(/'/g,"\\'")+'\',\''+vis+'\',this)">&#x1F517; Share</button>';
+      html+='<button class="btn btn-watch" onclick="watchStream('+jsArg(name)+')"><span style="font-size:16px">&#x25B6;&#xFE0F;</span> Watch</button>';
+      html+='<button class="btn btn-share" onclick="shareStream('+jsArg(name)+','+jsArg(vis)+',this)">&#x1F517; Share</button>';
       html+='</td></tr>';
     }
     html+='</tbody></table>';
@@ -1115,24 +1142,24 @@ function renderTable() {
     h += '<td>' + esc(u.name || '\u2014') + '</td>';
     h += '<td style="color:var(--text-dim)">' + esc(u.email || '\u2014') + '</td>';
     const isAdmin = u.role === 'admin';
-    h += '<td><span class="role-badge ' + (isAdmin ? 'role-admin' : 'role-viewer') + '"' + (adminGroupPk ? ' onclick="toggleRole(this,\'' + u.pk + '\',' + isAdmin + ')"' : '') + '>' + (isAdmin ? 'Admin' : 'Viewer') + '</span></td>';
+    h += '<td><span class="role-badge ' + (isAdmin ? 'role-admin' : 'role-viewer') + '"' + (adminGroupPk ? ' onclick="toggleRole(this,' + jsArg(u.pk) + ',' + (isAdmin ? 'true' : 'false') + ')"' : '') + '>' + (isAdmin ? 'Admin' : 'Viewer') + '</span></td>';
     h += '<td><span class="' + (u.is_active ? 'status-enabled' : 'status-disabled') + '">' + (u.is_active ? 'Enabled' : 'Disabled') + '</span></td>';
     h += '<td><div class="groups-cell">';
     for (const g of availableGroups) {
       const on = u.groups.includes(g);
-      h += '<span class="gbadge ' + (on ? 'on' : 'off') + ' ' + g + '" onclick="toggleGroup(this,\'' + u.pk + '\',\'' + g + '\',' + on + ')">';
-      h += '<span class="material-symbols-outlined">' + (on ? 'check_circle' : 'add_circle_outline') + '</span>' + g.replace('vid_','');
+      h += '<span class="gbadge ' + (on ? 'on' : 'off') + ' ' + esc(g) + '" onclick="toggleGroup(this,' + jsArg(u.pk) + ',' + jsArg(g) + ',' + (on ? 'true' : 'false') + ')">';
+      h += '<span class="material-symbols-outlined">' + (on ? 'check_circle' : 'add_circle_outline') + '</span>' + esc(g.replace('vid_',''));
       h += '</span>';
     }
     h += '</div></td>';
     h += '<td><div class="actions">';
-    h += '<button class="btn btn-edit" onclick="openEdit(\'' + u.pk + '\')">Edit</button>';
+    h += '<button class="btn btn-edit" onclick="openEdit(' + jsArg(u.pk) + ')">Edit</button>';
     if (u.is_active) {
-      h += '<button class="btn btn-disable" onclick="toggleActive(\'' + u.pk + '\',false)">Disable</button>';
+      h += '<button class="btn btn-disable" onclick="toggleActive(' + jsArg(u.pk) + ',false)">Disable</button>';
     } else {
-      h += '<button class="btn btn-enable" onclick="toggleActive(\'' + u.pk + '\',true)">Enable</button>';
+      h += '<button class="btn btn-enable" onclick="toggleActive(' + jsArg(u.pk) + ',true)">Enable</button>';
     }
-    h += '<button class="btn btn-delete" onclick="openDelete(\'' + u.pk + '\')">Delete</button>';
+    h += '<button class="btn btn-delete" onclick="openDelete(' + jsArg(u.pk) + ')">Delete</button>';
     h += '</div></td></tr>';
   }
   h += '</tbody></table>';
@@ -1252,7 +1279,10 @@ function toast(msg,type) {
   t.textContent = msg; t.className = 'toast ' + type + ' show';
   setTimeout(()=>t.classList.remove('show'), 3000);
 }
-function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+/* ops #897: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function esc(s) { return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+/* ops #897: a value for an inline handler: a JavaScript string, made safe for the quoted attribute */
+function jsArg(v) { return esc(JSON.stringify(v==null?'':String(v))); }
 
 loadUsers();
 </script>

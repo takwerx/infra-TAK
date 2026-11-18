@@ -38,8 +38,9 @@ def _func():
     return APP[start:end]
 
 
-def _load(converge, refresh):
-    ns = {'_broker_converge_running_source': converge, '_auto_update_guarddog': refresh}
+def _load(converge, refresh, cert_sync=lambda: False):
+    ns = {'_broker_converge_running_source': converge, '_auto_update_guarddog': refresh,
+          '_gd_refresh_mtx_cert_sync': cert_sync}     # ops #863: second pass for cert-sync too
     exec(_func(), ns)
     return ns['_startup_broker_converge']
 
