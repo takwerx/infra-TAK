@@ -69,6 +69,7 @@ def console(tmp_path):
         'CONFIG_DIR': str(cfg),
         'load_settings': lambda: json.loads((cfg / 'settings.json').read_text()),
         '_client_ip': lambda: '127.0.0.1', '_is_rate_limited': lambda *a, **k: False,
+        '_rate_limit_ip_key': lambda ip: ip,   # ops #815
         '_same_origin_ok': lambda: True,
     }
     exec(compile(_cookie_setup_region(), 'app.py:cookie-setup', 'exec'), ns)
