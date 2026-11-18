@@ -145,6 +145,7 @@ def console(tmp_path):
         '_sso_denied_message': lambda: None,   # ops #813: the sign-in page's "not an administrator" text
         '_login_logo_url': lambda: None,
         '_stamp_session_login': lambda: None,
+        '_stamp_notice_login': lambda fresh: None,   # root-console bar (PR 525) calls it on every login
         '_drop_stale_session': lambda: None,
         '_end_all_sessions': lambda: state.__setitem__('ended_all', state['ended_all'] + 1),
         '_widle_sso_logout_active': lambda h: False,
