@@ -271,22 +271,58 @@ def test_refresh_only_while_runner_is_on():
     assert "action == 'refresh'" in route and "get('enabled')" in route
 
 
-def test_bundled_catalog_carries_the_signed_ops725_bumps():
-    """The bundled copy must not be older than the signed public catalog (serial 202611142111).
+def test_bundled_catalog_carries_the_signed_ops911_bumps():
+    """The bundled copy must not be older than the signed public catalog (serial 202611181508).
     A box on this release reads the bundled file when the fetch fails, and a lower bundled serial
-    would also put these three ETLs back on their old, already-superseded versions."""
+    would put these 37 ETLs back on their old, already-superseded versions (ops #911; the 3 bumps
+    of ops #725 are inside this list at their newer versions)."""
     d = etl.bundled_catalog()
-    assert etl.catalog_serial(d) >= 202611142111
+    assert etl.catalog_serial(d) >= 202611181508
     by = {e['prefix']: e for e in d['entries']}
     want = {
-        'etl-caic': ('3.18.1', '070fc4da97cc7a7918daf972396be7c3e771545c'),
-        'etl-central-square': ('1.12.0', '7f272ef98fc20814645d54e135577e933abed190'),
-        'etl-nasa-acero': ('1.10.0', '1af7110924bbf72baed2cc2bd2b8e48d5a5c9104'),
+        'etl-active911': ('4.13.0', '68b546bd992e80e980657c71e2d9acc13fa52923'),
+        'etl-adsbx': ('5.19.0', '037125b214373c6c122651ed04f3f67dfe10e9e2'),
+        'etl-air-data': ('2.16.0', '73169bd65ce591c62433789f095e62cb85142cc5'),
+        'etl-AlertWest': ('2.5.0', '8ad42a8c3a10416f810ec3e1dfb0f8aec17a0818'),
+        'etl-axon': ('1.20.0', 'dadda43de514128e831d4cc7f01026bdd4aa41be'),
+        'etl-brinc': ('1.10.0', 'b88e318a06a36856922f1d9ca33a31b513036050'),
+        'etl-buddi': ('1.16.0', '7cf935f6af3d48c212a4ae036637cf6412e8a789'),
+        'etl-caic': ('3.20.0', '43137e8b1e243834ebac44fc278cccb665b1d521'),
+        'etl-caltopo': ('5.21.0', '22e3083b3ac4b847727b455b40dc2a557cc59ef2'),
+        'etl-cellping': ('1.5.0', '06929a1825759a0d4da566a92262c4cb992e10d6'),
+        'etl-central-square': ('1.14.0', '9fb475fd7b5ae20999d6f9efc6a10670b71de47d'),
+        'etl-cot': ('1.6.0', '4d730d985c89e79682b069d47ba392e3bc722abf'),
+        'etl-cotrip-cameras': ('2.17.0', '1cacdb7d5e87025cea5e4a83b7f8b791fc2918ba'),
+        'etl-cotrip-incidents': ('5.16.0', '484793886100b592b9468b48200a8249d50fa632'),
+        'etl-cotrip-plows': ('4.16.0', '604add5ef167707c5a11b102242a7ebe379579d1'),
+        'etl-dji-flight-hub': ('1.10.0', 'a713bb336c52aaf5614aadb36014c99c440bb9ce'),
+        'etl-drone-sense': ('2.17.0', '54ffa3510d5ad5d73124c333a4d280196ea3473f'),
+        'etl-ensurity': ('1.10.0', '6b8642a37ea0f0f2d328887b66ae98277b70bce7'),
+        'etl-everywhere-hub': ('1.16.0', '725254f0342a5cc7eb3dfd95a38f123fa933d88f'),
+        'etl-first-due': ('1.5.0', '70d42918384c69aa7c5b29aba714889ddabd4ce7'),
+        'etl-geojson': ('2.16.0', '4cebe08b1ad2b500ba12bbc4fc030349747a40bc'),
+        'etl-geotab': ('3.14.0', '5cd08fc1e21c8e2e5b3276052d79974037c67c3a'),
+        'etl-inreach': ('6.5.0', '07b7fbf78daf8eaa2d696f926808960f895739d6'),
+        'etl-jeffcom': ('1.22.0', '8f8ac489408a73f5c36b2192f04d0f708ff3dde4'),
+        'etl-nasa-acero': ('1.12.0', 'e8977853631aba0fc6fd3cee81b16885cb0c26d4'),
+        'etl-optimus': ('1.21.0', '450dd991401df479f6a71facfa685c124aab1471'),
+        'etl-santa': ('2.14.0', 'f5218580dcf529e640d6e3a93cfda8fe3f15bfdc'),
+        'etl-shotover': ('2.15.0', '281a07bddf186dc83ad8d43dabbf513e7230f90f'),
+        'etl-skydio': ('1.5.0', '81a1d77bb5af9be4ac5639499b1ffd18572c85bc'),
+        'etl-skymira': ('2.14.0', 'dd26df4ebf4843c79ae051bdc62186637303d03e'),
+        'etl-slack-bsar': ('1.16.0', 'f8ffa0a948ab87db5324f21a684edf76bbb61605'),
+        'etl-spider-tracks': ('2.14.0', '6b962ade07d9407fff64c7b6b12eb92fe869185f'),
+        'etl-spot': ('3.13.0', '1d623bfc3163343ecde33bf5b8f0a9e9ceb9698e'),
+        'etl-usgs-gauges': ('1.7.0', 'b96ff6dcdc6a222ebf11cea3da01ea6d8fd07ecd'),
+        'etl-verkada': ('1.22.0', '14c11fd608cb8cb1bf3c09630d833c96daf07b3f'),
+        'etl-waze': ('1.4.0', 'cc6cf82c76b3f5c36339b3cd5352919a0099b096'),
+        'etl-wildweb': ('4.16.0', 'acec1934aa5b31fc040eb9be5993bc9903549634'),
     }
+    assert len(want) == 37
     for prefix, (ver, sha) in want.items():
         e = by[prefix]
         assert (e['version'], e['sha'], e['ref']) == (ver, sha, 'v' + ver), prefix
-        assert e.get('reviewed', '').startswith('2026-11-13'), prefix
+        assert e.get('reviewed', '').startswith('2026-11-17'), prefix
 
 
 # v10.4.0 T&E (test12, nuc): "Check now" failed with "HTTP Error 403: rate limit exceeded".
