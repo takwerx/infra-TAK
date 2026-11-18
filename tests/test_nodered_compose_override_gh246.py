@@ -106,7 +106,7 @@ def _deploy(home, rec, pulls, exists=False):
         '_preflight_port_conflicts': lambda m: [], '_ensure_docker_log_limits': lambda plog: None,
         '_docker_compose_pull': lambda yml, cwd, plog, **kw: pulls.append((yml, cwd)) or True,
         '_nodered_container_exists': lambda: exists, '_nodered_container_running': lambda: True,
-        'NODERED_IMAGE': 'nodered/node-red:4.1.17-22', 'BASE_DIR': str(home / 'no-repo'),
+        'NODERED_IMAGE': 'nodered/node-red:4.1.18-22', 'BASE_DIR': str(home / 'no-repo'),
     }
     exec(compile(_fn('run_nodered_deploy'), 'app.py', 'exec'), ns)
     ns['run_nodered_deploy']()
@@ -132,7 +132,7 @@ def test_deploy_runs_compose_without_f_and_keeps_override_files(home):
     # the from-scratch rewrite is docker-compose.yml only; overrides are byte-identical
     for name, body in OVERRIDES.items():
         assert (home / 'node-red' / name).read_text() == body
-    assert 'image: nodered/node-red:4.1.17-22' in (home / 'node-red' / 'docker-compose.yml').read_text()
+    assert 'image: nodered/node-red:4.1.18-22' in (home / 'node-red' / 'docker-compose.yml').read_text()
 
 
 def test_deploy_name_conflict_retry_also_keeps_the_override(home):

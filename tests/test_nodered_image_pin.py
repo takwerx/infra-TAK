@@ -18,7 +18,9 @@
 
 The 4.0 tag carried jsonata 2.0.5 (CVE-2026-77413/14/15), multer 1.4.5-lts.1 and
 ws 7.5.10 (CVE-2026-48779). 4.1.16-22 is Node-RED 4.1.16 on Node 22.23.3;
-4.1.17-22 (2026-10-21) moved to Node 22.23.4, Node's October 2026 security release.
+4.1.17-22 (2026-10-21) moved to Node 22.23.4, Node's October 2026 security release;
+4.1.18-22 (2026-11-17) moved to Node 22.23.5, Node's November 2026 security release, and is a
+Node-RED hardening release (ops #935).
 """
 
 import pathlib
@@ -48,8 +50,10 @@ def test_pin_is_exact_and_past_the_advisories():
     # exact Node-RED version + Node major, never a moving tag like 4.1 or latest
     m = re.fullmatch(r'(\d+\.\d+\.\d+)-(\d+)', tag)
     assert m, tag
-    # 4.1.17-22 is the first 4.1.x-22 build on Node 22.23.4
-    assert _v(m.group(1)) >= (4, 1, 17)
+    # 4.1.18-22 is the first 4.1.x-22 build on Node 22.23.5 (and the first with the editor
+    # comms session check, Projects path checks and package/SSH key name validation).
+    # ops #935: red on 4.1.17-22, which runs Node 22.23.4.
+    assert _v(m.group(1)) >= (4, 1, 18)
     assert int(m.group(2)) >= 22
 
 
