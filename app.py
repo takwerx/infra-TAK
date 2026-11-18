@@ -70,7 +70,8 @@ if __name__ == '__main__':
 
 
 from flask import (Flask, render_template, request, jsonify,
-    redirect, url_for, session, send_from_directory, make_response)
+    redirect, url_for, session, send_from_directory, make_response,
+    g, has_request_context)
 # GH #137: the werkzeug pair is wrapped below (verify_password / hash_password, next to
 # load_auth) and the plain names re-bound to the wrappers, so every existing
 # check_password_hash() call site gets the fail-closed check without being touched.
@@ -214,6 +215,12 @@ app.session_interface = _ConsoleSessionInterface()
 # In-memory rate limiter (per-process). Good baseline protection without extra deps.
 _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
+# ops #815: a key used to stay for the life of the process, one per address that ever
+# posted. _RATE_EXPIRES holds the time each key's newest hit leaves its window; the sweep
+# (at most once a minute, under the lock) drops every key past it.
+_RATE_EXPIRES = {}               # key -> time its newest hit expires
+_RATE_SWEEP = {'next': 0.0}
+_RATE_SWEEP_EVERY = 60
 
 # ops #813: how long a signed console session cookie is accepted after it was last
 # written. Flask checks the cookie's signed timestamp against this value for every
@@ -986,6 +993,23 @@ def _gd_render_older_broker(name, err):
     return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
 
 
+# ops #815: the health endpoint is the one Guard Dog script that is a long-running
+# service, not a timer job. A new copy on disk does nothing until the service restarts,
+# so a fix to it never reached a running box (until its next reboot). Both paths that
+# install the script restart the service when, and only when, the file changed.
+_GD_HEALTH_SCRIPT = 'tak-health-endpoint.py'
+
+
+def _gd_restart_health_endpoint():
+    """Load a changed health endpoint script (try-restart: a stopped or absent service
+    stays as it is). Never raises."""
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                       capture_output=True, timeout=20)
+    except Exception as e:
+        print(f"[guarddog] tak-health.service not restarted: {str(e)[:120]}", flush=True)
+
+
 def _gd_install_script(name, template, values, perm=0o755):
     """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
     file changed. A broker on the root-owned layout renders it from ITS copy of the
@@ -1375,17 +1399,40 @@ def _client_ip():
     return (request.remote_addr or 'unknown').strip()
 
 
+def _rate_limit_ip_key(ip):
+    """The rate-limit bucket for a client address (ops #815). One IPv6 customer line is a
+    whole /64, so a caller could take a new address for every request and never reach a
+    per-address limit: IPv6 is counted per /64. IPv4 (also IPv4-mapped IPv6) stays per
+    address. Anything that is not an address is returned unchanged. Only for rate-limit
+    keys: the fail2ban log keeps the real address."""
+    try:
+        addr = ipaddress.ip_address((ip or '').split('%')[0])
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network('%s/64' % addr, strict=False))
+    return str(addr)
+
+
 def _is_rate_limited(key, limit, window_seconds):
     """Return True when key exceeded limit within rolling window."""
     now = time.time()
     cutoff = now - window_seconds
     with _RATE_LOCK:
+        if now >= _RATE_SWEEP['next']:
+            _RATE_SWEEP['next'] = now + _RATE_SWEEP_EVERY
+            for stale in [k for k, exp in _RATE_EXPIRES.items() if exp <= now]:
+                _RATE_HITS.pop(stale, None)
+                _RATE_EXPIRES.pop(stale, None)
         q = _RATE_HITS[key]
         while q and q[0] < cutoff:
             q.popleft()
         if len(q) >= limit:
             return True
         q.append(now)
+        _RATE_EXPIRES[key] = now + window_seconds
         return False
 
 
@@ -1551,8 +1598,8 @@ def ensure_session_valid():
     case."""
     _drop_stale_session()
 
-    # Baseline rate limiting
-    ip = _client_ip()
+    # Baseline rate limiting (ops #815: IPv6 is counted per /64)
+    ip = _rate_limit_ip_key(_client_ip())
     if request.method == 'POST' and request.path in ('/login', '/'):
         if _is_rate_limited(f'login:{ip}', limit=12, window_seconds=300):
             return jsonify({'error': 'Too many login attempts. Please wait a few minutes.'}), 429
@@ -2996,11 +3043,22 @@ def verify_password(pwhash, password):
     if not pwhash:
         return False
     try:
-        return bool(_werkzeug_check_password_hash(pwhash, password or ''))
+        ok = bool(_werkzeug_check_password_hash(pwhash, password or ''))
     except Exception as e:
         print(f"[auth] password check denied: stored hash cannot be checked on this box "
               f"({type(e).__name__}: {str(e)[:120]})", flush=True)
         return False
+    if not ok and password:
+        # ops #815: a wrong console password typed into ANY form is a failed login, not
+        # only on the login page. The "confirm with your password" checks (uninstall,
+        # power, password change, ...) wrote nothing, so a caller holding a session could
+        # guess the password there with no trace and no ban. An empty password is a form
+        # sent without one, not a guess. Never raises, never changes the answer.
+        try:
+            _console_note_failed_password_check(password)
+        except Exception:
+            pass
+    return ok
 
 
 def hash_password(password):
@@ -4904,7 +4962,8 @@ def _apply_authentik_session():
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
     # itself. Of the three paths that establish an authenticated session, the password
-    # path at index() POST calls session.clear() first (so a stale value cannot survive),
+    # path at /login POST calls session.clear() first (so a stale value cannot survive;
+    # since ops #815 the one at index() does too, and both stamp the clock),
     # but THIS path and the other did not, leaving whatever the browser's cookie already
     # carried. A returning user whose cookie held a last_activity older than idle_max was
     # therefore re-authenticated by forward_auth and then, on the very next request, had
@@ -7506,6 +7565,9 @@ def _login_logo_url():
         return url_for('static', filename=LOGIN_LOGO_FILENAME)
     return None
 
+_SAFE_NEXT_PATH_RE = re.compile(r'/[A-Za-z0-9._~/-]*(?:\?[A-Za-z0-9._~/=&%-]*)?')
+
+
 def _safe_next_path():
     """A validated SAME-SITE path from ?next= (or the posted form) for the post-login
     redirect. Used by the setup-AP captive to deep-link straight to the light
@@ -7513,10 +7575,21 @@ def _safe_next_path():
     Local absolute paths only — never an off-site URL (open-redirect guard). Empty if
     absent/unsafe → caller falls back to the normal console page. The login form has no
     action= so it POSTs to the current URL, preserving ?next through the round-trip."""
-    nxt = (request.args.get('next') or request.form.get('next') or '').strip()
-    if nxt.startswith('/') and not nxt.startswith('//') and '://' not in nxt and '\\' not in nxt:
-        return nxt
-    return ''
+    nxt = request.args.get('next') or request.form.get('next') or ''
+    # ops #815: an allow-list of characters, not a list of bad ones. The old check let
+    # through a tab or a newline after the first slash; the URL parsers (Python's and the
+    # browser's) drop those, so the redirect went to another site. Nothing outside plain
+    # path characters is needed here, so nothing else is accepted: no whitespace or
+    # control character, no backslash, no "//" or ".." anywhere, no scheme, no host.
+    if not _SAFE_NEXT_PATH_RE.fullmatch(nxt) or '//' in nxt or '..' in nxt:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(nxt)
+    except ValueError:
+        return ''
+    if parts.scheme or parts.netloc:
+        return ''
+    return nxt
 
 # ops #638: the console password is the way in to a root service, so it has a floor, and
 # a wrong one leaves a trace. Every failed password login is written (with the real
@@ -7529,11 +7602,53 @@ CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
 CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
 
 
+# ops #815: one wrong password is one failed login, however often the page sends it. The
+# uninstall dialog checks the typed password when the field loses focus, again when the
+# dialog opens, and once more on submit: three requests for one typo, and 10 lines ban the
+# address. So the same wrong value from the same address inside 10 minutes is recorded
+# once. A new guess is a new line. Only a keyed digest of the last wrong value per address
+# is kept, in memory, never on disk; the key is made new at every console start.
+_PW_FAIL_KEY = secrets.token_bytes(32)
+_PW_FAIL_SEEN = {}            # client address -> (digest of its last wrong password, time)
+_PW_FAIL_SEEN_MAX = 2048
+_PW_FAIL_SAME_WINDOW = 600
+
+
+def _console_note_failed_password_check(password):
+    """A wrong console password was checked during a request (called by verify_password,
+    ops #815). Outside a request (start-up, a script) there is no caller to record. The
+    login routes record their own failures (every one, an empty password too)."""
+    if not has_request_context() or request.path in ('/login', '/'):
+        return
+    ip = _client_ip()
+    digest = hmac.new(_PW_FAIL_KEY, str(password).encode('utf-8', 'surrogatepass'),
+                      hashlib.sha256).digest()
+    now = time.time()
+    with _RATE_LOCK:
+        seen = _PW_FAIL_SEEN.get(ip)
+        if seen and hmac.compare_digest(seen[0], digest) and now - seen[1] < _PW_FAIL_SAME_WINDOW:
+            return
+        if len(_PW_FAIL_SEEN) >= _PW_FAIL_SEEN_MAX:
+            _PW_FAIL_SEEN.clear()
+        _PW_FAIL_SEEN[ip] = (digest, now)
+    _console_log_failed_login('password check on %s' % request.path)
+
+
 def _console_log_failed_login(where):
     """Record one failed console password login. The password is NEVER written. Never raises.
 
+    One line per request at most: verify_password records a wrong password on the
+    "confirm with your password" forms itself (ops #815), and some of those routes also
+    call this. fail2ban counts lines, so a second line would halve the limit.
+
     Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
     disk this file takes. fail2ban keeps reading the live file after a roll."""
+    try:
+        if g.get('console_pw_fail_logged'):
+            return
+        g.console_pw_fail_logged = True
+    except Exception:
+        pass
     try:
         ip = _client_ip()
         ipaddress.ip_address(ip)
@@ -7605,7 +7720,7 @@ def login():
             session.clear()
             session['authenticated'] = True
             session['auth_via'] = 'password'   # ops #813
-            session['last_activity'] = int(time.time())
+            session['last_activity'] = int(time.time())   # ops #815: login is activity
             _stamp_session_login()   # ops #634
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
@@ -7618,6 +7733,12 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    # ops #815: /logout is a POST outside /api/, so the same-origin check in
+    # ensure_session_valid() did not cover it, and a page on another site of the same
+    # domain (the browser sends the console cookie there too) could end every admin
+    # session, over and over. Same rule as the API writes: same origin only.
+    if not _same_origin_ok():
+        return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
     audit('auth:logout', '')
     # ops #634: logout ends every console session, not just this browser's, so a
     # copied cookie dies with it. Only a logged-in caller may do that: /logout has no
@@ -7643,8 +7764,10 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
             _note_password_length(request.form.get('password', ''))   # ops #638
-            # ops #813: start clean, like /login does, so nothing from an earlier
-            # Authentik-made session (its user name, its marker) carries into this one.
+            # ops #813, #815: start from an empty session, as /login does, so nothing
+            # from an earlier Authentik-made session (its user name, its marker) carries
+            # into this one. Without it an old authentik_username stayed in the cookie
+            # and the audit log named that person for what the password login did.
             session.clear()
             session['authenticated'] = True
             session['auth_via'] = 'password'
@@ -7837,10 +7960,27 @@ def _enforce_session_idle_lock():
                 if not 0 <= _now - _last < 60:
                     session['last_activity'] = _now
             return
+    except Exception:
+        # The posture could not be read. Standard (no lock) is the default posture, and a
+        # box that is not Hardened must never be locked by this hook.
+        return
+    # ops #815: from here the box IS Hardened, and the lock fails CLOSED. It used to fail
+    # open on any error, and it only fired when the session carried a last_activity stamp,
+    # so a cookie with no stamp (a /login password session never stamped one) replayed
+    # with background GETs alone was never locked. Now: no stamp, or one that cannot be
+    # read, is an expired session; and an unexpected error refuses the request (a page
+    # load ends the session and the operator signs in again) instead of letting it through.
+    try:
         a = (h.get('applied') or {}).get('W2_session') or {}
-        idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        try:
+            idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        except (TypeError, ValueError):
+            idle_max = SESSION_IDLE_MAX_DEFAULT
         now = int(time.time())
-        last = session.get('last_activity')
+        try:
+            last = int(session.get('last_activity'))
+        except (TypeError, ValueError):
+            last = None
         # "Activity" must mean a real USER action, not the page's own background polling.
         # The console dashboard auto-refreshes /api/metrics every 5s, module cards every 8s,
         # etc. — if every request reset the clock, last_activity would never age past a few
@@ -7849,7 +7989,7 @@ def _enforce_session_idle_lock():
         # read-only GET to /api/* (a poll/data-fetch) does NOT count as activity; only a page
         # navigation (non-/api GET) or a state-changing call (POST/PUT/PATCH/DELETE) does.
         is_poll = request.path.startswith('/api/') and request.method == 'GET'
-        if last is not None and (now - int(last)) > idle_max:
+        if last is None or (now - last) > idle_max:
             if request.path.startswith('/api/'):
                 # Don't reset the clock or kill the SSO session on a background poll — just
                 # signal expiry. The true re-prompt fires on the next full-page navigation.
@@ -7871,9 +8011,16 @@ def _enforce_session_idle_lock():
             return redirect(url_for('login'))
         if not is_poll:
             session['last_activity'] = now
-    except Exception:
-        # A lock failure must never brick a request — fail open to the normal flow.
-        return
+    except Exception as e:
+        print(f"[auth] idle lock error, request refused: {type(e).__name__}: {str(e)[:120]}", flush=True)
+        if request.path.startswith('/api/'):
+            # As for an expired session above: a background call is only told to sign in.
+            return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+        try:
+            session.clear()
+        except Exception:
+            pass
+        return redirect(url_for('login'))
 
 # v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
 # It masked the real problem (and reload-looped when the Authentik proxy session lapsed
@@ -9477,6 +9624,10 @@ def hardening_apply():
         _hardening_history(h, 'apply', 'hardened')
         save_hardening(h)
         audit('hardening:apply', 'posture=hardened')
+        # ops #815: the idle clock only runs in Hardened posture, so the stamp in this
+        # session can be hours old (it is from the login). Pressing Apply is activity:
+        # without this the lock fired on the operator's very next request.
+        session['last_activity'] = int(time.time())
         return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
     except Exception as e:
         for c in reversed(applied_ok):
@@ -10077,7 +10228,9 @@ def _diag_section_box(settings):
 
 
 def _diag_section_console(settings):
-    out = [f"failed units: {_diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False) or 'none'}"]
+    _failed = _diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False)
+    out = [f"failed units: {_failed or 'none'}"]
+    out.extend(_diag_failed_unit_detail(_failed))
     j = _diag_cmd(['journalctl', '-u', 'takwerx-console', '--since', '2 hours ago', '--no-pager', '-q', '-n', '5000'], timeout=30)
     bad = [l for l in j.splitlines() if re.search(r'Traceback|\bERROR\b|CRITICAL|failed:', l)]
     out.append(f"console journal, last 2 h: {sum('Traceback' in l for l in bad)} traceback(s), {len(bad)} error-class line(s)")
@@ -10338,6 +10491,7 @@ def _diag_section_takserver(settings):
     for el in re.findall(r'<input\b[^>]*>', cc):
         out.append('<input> ' + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el)
                                          if a in ('_name', 'protocol', 'port', 'auth')))
+    out.extend(_diag_tak_api_ports(cc, _diag_cmd(['systemctl', 'is-active', 'takserver'], priv=False) == 'active'))
     try:
         uaf = _read_own_or_priv('/opt/tak/UserAuthenticationFile.xml') or ''
         in_flat = 'yes' if 'identifier="webadmin"' in uaf else 'no'
@@ -10395,6 +10549,48 @@ def _diag_section_takserver(settings):
         except Exception as e:
             out.append(f"cot schema_version: ({type(e).__name__}: {str(e)[:120]})")
     out.extend(_diag_tak_update_history())
+    return out
+
+
+def _diag_tak_api_ports(core_config_text, service_active, ss_text=None, holder=None):
+    """ops #902: is TAK Server's web API actually listening, and if not, who holds its ports?
+    The report used to show the connectors from CoreConfig and `service: active`, which read as
+    healthy on a box whose API had died on a port clash (field report, 2026-11-17)."""
+    required = _tak_api_required_ports(core_config_text)
+    up = _tak_listening_ports(ss_text if ss_text is not None else _diag_cmd(['ss', '-tlnH'], priv=False))
+    missing = [p for p in required if p not in up]
+    names = ', '.join(str(p) for p in required)
+    if not service_active:
+        return [f"TAK API web ports ({names}): not checked, the takserver service is not active"]
+    if not missing:
+        return [f"TAK API web ports ({names}): all listening"]
+    holder = holder or _tak_port_holder_now
+    out = [f"TAK API web ports ({names}): NOT listening on {', '.join(str(p) for p in missing)} "
+           "although the takserver service is active. The console, TAK Portal and CloudTAK cannot reach "
+           "TAK Server's API."]
+    for p in required:
+        if p in up:
+            out.append(f"  port {p} is held by: {holder(p) or '(could not tell)'}"
+                       "   <-- TAK's API opens its web ports together, so a listener here while another port is "
+                       "closed is not TAK's API")
+    return out
+
+
+def _diag_failed_unit_detail(failed_text, tail=6):
+    """Why each failed systemd unit failed: its result, exit status and last journal lines.
+    `systemctl --failed` alone names the unit and nothing else (ops #902: takrestartwatch.service)."""
+    units = []
+    for ln in (failed_text or '').splitlines():
+        parts = ln.replace('●', ' ').split()
+        if parts and re.fullmatch(r'[\w@.:\\-]+\.(service|timer|socket|mount|path)', parts[0]):
+            units.append(parts[0])
+    out = []
+    for u in units[:8]:
+        show = _diag_cmd(['systemctl', 'show', u, '-p', 'Result', '-p', 'ExecMainStatus',
+                          '-p', 'InactiveEnterTimestamp'], priv=False)
+        out.append(f"  {u}: " + '  '.join(l.strip() for l in show.splitlines() if l.strip()))
+        j = _diag_cmd(['journalctl', '-u', u, '-n', str(tail), '--no-pager', '-q', '-o', 'short-iso'], timeout=15)
+        out.extend('    ' + l[:220] for l in j.splitlines()[-tail:])
     return out
 
 
@@ -12111,7 +12307,10 @@ def console_restart_safe():
     browser driven (mirrors the localhost-only Guard Dog script endpoints), so
     it carries no @login_required — but it is restricted to loopback callers.
     """
-    if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
+    # ops #815: a request that came through a proxy on this box also arrives from loopback,
+    # but carries X-Forwarded-For. The timer script calls 127.0.0.1 directly and sends none.
+    if ((request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost')
+            or request.headers.get('X-Forwarded-For')):
         return jsonify({'error': 'forbidden'}), 403
 
     busy = _console_busy_reason()
@@ -31122,8 +31321,10 @@ def _guarddog_alert_recipient_warning(settings=None):
 
 @app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def guarddog_send_alert_email():
-    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email).
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     # settings.json is the SOURCE OF TRUTH for the recipient; the caller's `to` is a
@@ -31548,8 +31749,10 @@ def guarddog_test_sms():
 
 @app.route('/api/guarddog/send-sms', methods=['POST'])
 def guarddog_send_sms():
-    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo.
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     subj = (data.get('subject') or '')[:100]
@@ -32053,6 +32256,8 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        if _GD_HEALTH_SCRIPT in changed:
+            _gd_restart_health_endpoint()   # ops #815: `start` leaves a running one on the old code
         # v0.9.47: network/fanout metrics collector (always-on, like tak-health). Best-effort
         # start — a collector failure must never block the rest of the Guard Dog deploy.
         rmc = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, text=True, timeout=5)
@@ -94301,6 +94506,124 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     return proc.returncode if proc.returncode is not None else 1
 
 
+# ── ops #902: "service active" and "PostgreSQL 18 serving" do not say the web API came up ──
+# Field (customer report, 2026-11-17): the 5.8 migration ended "ok", but TAK Server's API never
+# opened 8443. Its log said it could not bind 8446, and the thing answering on 8446 was a
+# Federation Hub certificate. TAK Portal then got "connection refused" on 8443 for hours. The
+# migration only read the PostgreSQL major, so nothing said any of it. TAK's API (Tomcat) opens
+# all its web ports together: if one cannot bind, none of them listen.
+def _tak_api_required_ports(core_config_text):
+    """Ports TAK Server's API opens for the console, TAK Portal and CloudTAK: the CoreConfig.xml
+    connectors named `https` (8443), `cert_https` (8446) and `LetsEncrypt` (the one infra-TAK
+    writes itself). 8446 is in the list so that a program sitting on it is named: that was the
+    field fault and the box-test fault (the API dies when it cannot bind 8446). Falls back to
+    8443 when CoreConfig has no such connector. The fed_https connector is left out on purpose:
+    it is not up on a box that does not federate (8444 is closed on a healthy fresh install)."""
+    ports = []
+    for el in re.findall(r'<connector\b[^>]*>', core_config_text or ''):
+        nm = re.search(r'\b_name="([^"]*)"', el)
+        pt = re.search(r'\bport="(\d+)"', el)
+        if nm and pt and nm.group(1) in ('https', 'cert_https', 'LetsEncrypt') and int(pt.group(1)) not in ports:
+            ports.append(int(pt.group(1)))
+    return ports or [8443]
+
+
+def _tak_listening_ports(ss_text):
+    """TCP ports in `ss -tlnH` output (any address, IPv4 or IPv6)."""
+    ports = set()
+    for ln in (ss_text or '').splitlines():
+        parts = ln.split()
+        if len(parts) > 3 and parts[3].rsplit(':', 1)[-1].isdigit():
+            ports.add(int(parts[3].rsplit(':', 1)[-1]))
+    return ports
+
+
+def _tak_port_holder(ss_p_text, cmdline=''):
+    """Who listens on a port, from `ss -tlnpH sport = :N` output, as one line: the process name
+    and pid, and a plain name when the command line says it is Federation Hub. '' when `ss`
+    named nobody (not root, or nothing listening)."""
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', ss_p_text or '')
+    if not m:
+        return ''
+    what = '%s (pid %s)' % (m.group(1), m.group(2))
+    cl = (cmdline or '').replace('\0', ' ')
+    if 'federation-hub' in cl.lower() or 'federationhub' in cl.lower():
+        what += ' = Federation Hub'
+    elif 'spring.profiles.active=api' in cl:
+        what += " = a TAK Server API process (an older copy that did not stop?)"
+    return what
+
+
+def _tak_port_holder_now(port):
+    """_tak_port_holder() for a live port. Read-only (`ss` is on the broker allow-list)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['ss', '-tlnpH', 'sport = :%d' % port]),
+                           capture_output=True, text=True, timeout=15)
+        out = r.stdout or ''
+        m = re.search(r'pid=(\d+)', out)
+        cmdline = ''
+        if m:
+            try:
+                with open('/proc/%s/cmdline' % m.group(1), 'rb') as f:
+                    cmdline = f.read().decode('utf-8', 'replace')
+            except OSError:
+                pass
+        return _tak_port_holder(out, cmdline)
+    except Exception:
+        return ''
+
+
+def _tak_api_wait_serving(required, timeout_s=600, poll_s=10, listening=None,
+                          holder=None, sleep=None, clock=None, stable_s=60):
+    """Wait until every port in `required` has a listener (TAK's API takes a few minutes on its
+    first start after a migration), and keeps it for `stable_s` seconds. The stable wait is real:
+    on a test box with 8446 held by another program, 8443 was seen listening once, a moment
+    before the API gave up and closed it (ops #902, box test). Returns {'ok', 'missing',
+    'listening', 'holders'}. On a timeout, `holders` names who listens on the required ports that
+    ARE up: TAK's API opens its web ports together, so a listener there while another port stays
+    closed is not TAK's API."""
+    listening = listening or (lambda: _tak_listening_ports(subprocess.run(
+        ['ss', '-tlnH'], capture_output=True, text=True, timeout=15).stdout))
+    holder = holder or _tak_port_holder_now
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    end = clock() + timeout_s
+    up_since = None
+    while True:
+        try:
+            up = listening()
+        except Exception:
+            up = set()
+        missing = [p for p in required if p not in up]
+        if not missing:
+            if up_since is None:
+                up_since = clock()
+            if clock() - up_since >= stable_s:
+                return {'ok': True, 'missing': [], 'listening': list(required), 'holders': {}}
+        else:
+            up_since = None           # it opened and closed again: start the stable wait over
+            if clock() >= end:
+                up_req = [p for p in required if p in up]
+                return {'ok': False, 'missing': missing, 'listening': up_req,
+                        'holders': {p: holder(p) for p in up_req}}
+        sleep(poll_s)
+
+
+def _tak_api_not_serving_lines(res):
+    """Plain-words lines for a failed _tak_api_wait_serving() result."""
+    out = ["TAK Server's web API is NOT listening on port %s. The console, TAK Portal and "
+           'CloudTAK cannot reach TAK Server until it does.' % ', '.join(str(p) for p in res['missing'])]
+    for p, who in sorted((res.get('holders') or {}).items()):
+        out.append('  Port %d is already in use by something else%s. TAK Server\'s API cannot start '
+                   'while that is so.' % (p, (': ' + who) if who else ' (could not tell what)'))
+    if res.get('listening'):
+        out.append('  Stop or move that program, then restart TAK Server (Guard Dog or the TAK '
+                   'Server page) and check port %s opens.' % ', '.join(str(p) for p in res['missing']))
+    else:
+        out.append('  Look at /opt/tak/logs/takserver-api.log for the reason it did not start.')
+    return out
+
+
 def run_takserver_58_migration(pkg_path, log=None, status=None):
     """Worker: the whole 5.8 + PG18 migration as one indivisible operation.
 
@@ -94629,6 +94952,20 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
                         % (running, TAK_PG_MAJOR), wedged=True)
         _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        # ops #902: the database is only half of "TAK Server is back". Wait for the web API to
+        # open its ports; otherwise say so and say who is in the way, instead of ending "ok".
+        _say('Waiting for the TAK Server web API to start (this can take a few minutes)…')
+        _api_ports = _tak_api_required_ports(_read_own_or_priv('/opt/tak/CoreConfig.xml') or '')
+        _api = _tak_api_wait_serving(_api_ports)
+        if not _api['ok']:
+            for _l in _tak_api_not_serving_lines(_api):
+                _say(_l)
+            _say('The database migration itself finished; your data is on PostgreSQL %d.' % TAK_PG_MAJOR)
+            _say('Backup kept at %s' % bk.get('snapshot_path'))
+            _status.update({'running': False, 'complete': False, 'error': True})
+            return
+        _say('  TAK Server web API is listening on port%s %s.'
+             % ('s' if len(_api_ports) > 1 else '', ', '.join(str(p) for p in _api_ports)))
         _say('')
         # Name the right rollback. On a managed database there IS no local PostgreSQL 15
         # cluster holding their data — the only local cluster is the vestigial one TAK's
@@ -108168,6 +108505,8 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+                if name == _GD_HEALTH_SCRIPT:
+                    _gd_restart_health_endpoint()   # ops #815
         # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
         # above skips them. A box that already had SMS set up then kept the old sms_send.py
         # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)

@@ -325,6 +325,13 @@ def apply_ldap_overlay(app):
                     return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
             else:
                 return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
+        # ops #900: the player must start INSIDE the playlist. The box's MediaMTX keeps
+        # hlsSegmentCount: 3 (app.py), and MediaMTX drops the oldest listed segment about
+        # one segment after it listed it. hls.js with liveSyncDurationCount >= 3 starts at
+        # that oldest segment, so a viewer on a slow link got 404 on it, no video, and
+        # Stream Offline. liveSyncDurationCount 2 starts one segment in; a network error
+        # that is not fatal restarts the load, as CloudTAK's player does. The same two
+        # values are in the Watch popup (watchStream) below.
         hls_url = f'/hls-proxy/{stream_name}/index.m3u8'
         title = f'{stream_name} - Live'
         html = f'''<!DOCTYPE html>
@@ -341,10 +348,10 @@ z-index:100;justify-content:center;align-items:center;flex-direction:column;text
 <script>
 var video=document.getElementById("v"),err=document.getElementById("err"),url="{hls_url}";
 function start(){{
-if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
+if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7}});
 hls.loadSource(url);hls.attachMedia(video);
 hls.on(Hls.Events.MANIFEST_PARSED,function(){{err.style.display="none";video.play().catch(function(){{}});}});
-hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
+hls.on(Hls.Events.ERROR,function(ev,data){{if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();}}if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
 }}else if(video.canPlayType("application/vnd.apple.mpegurl")){{video.src=url;video.addEventListener("loadedmetadata",function(){{video.play().catch(function(){{}});}});}}
 }}
 start();
@@ -813,10 +820,10 @@ function watchStream(name){
     +'var url="'+hlsUrl+'";'
     +'function start(){'
     +'if(Hls.isSupported()){'
-    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7});'
+    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7});'
     +'hls.loadSource(url);hls.attachMedia(video);'
     +'hls.on(Hls.Events.MANIFEST_PARSED,function(){err.style.display="none";video.play().catch(function(){})});'
-    +'hls.on(Hls.Events.ERROR,function(ev,data){if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
+    +'hls.on(Hls.Events.ERROR,function(ev,data){if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){hls.startLoad()}if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
     +'}else if(video.canPlayType("application/vnd.apple.mpegurl")){'
     +'video.src=url;video.addEventListener("loadedmetadata",function(){video.play().catch(function(){})});'
     +'}}'

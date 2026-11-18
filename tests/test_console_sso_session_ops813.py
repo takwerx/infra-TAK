@@ -178,6 +178,7 @@ class Console:
             'CONFIG_DIR': str(cfg), 'VERSION': 'test',
             'load_settings': lambda: {'fqdn': 'example.com'},
             '_client_ip': lambda: '127.0.0.1', '_is_rate_limited': lambda *a, **k: False,
+            '_rate_limit_ip_key': lambda ip: ip,   # ops #815: IPv6 is counted per /64
             '_same_origin_ok': lambda: True,
             'audit': lambda event, detail='', force=False: self.audit.append((event, detail)),
             '_w1_ak_ctx': lambda: self.ak_ctx(),
