@@ -36,7 +36,7 @@
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon material-symbols-outlined" style="font-size:24px">shield_toggle</span><span>Cyber Controls</span></h1>
   <p>Flip this assembled stack from the default <strong>Standard</strong> posture into <strong>Hardened</strong> — eliminating the on-sight disqualifiers a security reviewer fails a system for, then self-documenting what it did. Reversible, idempotent, with an on-box break-glass recovery path.</p></div>
 
-  <div class="card">
+  <div class="card" id="console-guard">
     <div class="card-title">Console Security Guard</div>
     <p id="broker-desc" style="font-size:12px;color:var(--text-dim);margin-bottom:10px">A built-in security <strong>guard</strong> sits between the web console and the system &mdash; the console can't make powerful changes (installs, restarts, config edits) except through the guard, and every action is recorded. Press <strong>Run self-test</strong> to check it's working.</p>
     <div id="broker-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:12px">Loading…</div>
@@ -91,7 +91,7 @@
   </div>
 </div>
 <script>
-function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function setBusy(b){document.getElementById('apply-btn').disabled=b;document.getElementById('revert-btn').disabled=b;}
 function renderStatus(d){
   var hardened=(d.posture==='hardened');

@@ -178,6 +178,7 @@ class Console:
             'CONFIG_DIR': str(cfg), 'VERSION': 'test',
             'load_settings': lambda: {'fqdn': 'example.com'},
             '_client_ip': lambda: '127.0.0.1', '_is_rate_limited': lambda *a, **k: False,
+            '_rate_limit_ip_key': lambda ip: ip,   # ops #815: IPv6 is counted per /64
             '_same_origin_ok': lambda: True,
             'audit': lambda event, detail='', force=False: self.audit.append((event, detail)),
             '_w1_ak_ctx': lambda: self.ak_ctx(),
@@ -209,6 +210,7 @@ class Console:
             exec(lifetime.group(0), ns)
         for name in ('load_auth', 'save_auth', '_session_auth_token', '_stamp_session_login',
                      '_drop_stale_session', '_end_all_sessions', '_save_proxy_auth_state',
+                     '_stamp_notice_login',
                      '_proxy_auth_state', '_authentik_header_groups', '_sso_directory_ctx',
                      '_sso_directory_lookup', '_sso_directory_verdict',
                      '_sso_user_is_console_admin', '_session_made_by_sso',

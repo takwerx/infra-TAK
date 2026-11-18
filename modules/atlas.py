@@ -62,6 +62,7 @@ from . import register_module, job_log, job_state, get_ctx
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
+from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
 from . import atlas_tak_cas
@@ -2329,7 +2330,12 @@ def _proxy_auth_secret(ctx=None):
                 # file, so the direct read is the normal path; `_read_priv`
                 # covers a console whose config directory it cannot traverse
                 # as itself, and costs a broker round trip only when it must.
-                return (json.loads(reader(candidate)).get('secret') or '').strip()
+                # ops #814: ATLAS has its own value (`atlas_secret`) once the
+                # console has moved Caddy to the private layout. Before that
+                # there is only the console's.
+                state = json.loads(reader(candidate))
+                own = state.get('atlas_secret') if state.get('private') else ''
+                return (own or state.get('secret') or '').strip()
             except Exception:
                 continue
     return ''
@@ -5197,6 +5203,11 @@ def _run_update(ctx, inst=None):
             plog('⚠ The source is already at v' + target + ', but ' + unfinished)
             plog('  Finishing the update that was interrupted.')
 
+        # ops #864: a database backup BEFORE anything changes. ATLAS 2.x migrates forward only, so
+        # without a dump an update that goes wrong has no way back. No backup, no update.
+        plog('━━━ Backing up the database first ━━━')
+        backup_database(ctx, inst, current, plog)
+
         tag = 'v' + target
         plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')
         # ⚠️ **Checked as an install is (W415, ATLAS audit H3).** This path
@@ -5330,6 +5341,93 @@ def tak_ca_changed(ctx, log):
 #: The compose service of an ATLAS deployment's PostgreSQL (container `takmdm-db-1`,
 #: `takmdm-<slug>-db-1` for an agency). ops #755.
 PG_DB_SERVICE = 'db'
+
+
+def _db_container(project):
+    """Id of the running database container of one compose project, or ''."""
+    rc, out = _run_root(['docker', 'ps', '-q',
+                         '--filter', 'label=com.docker.compose.project=' + project,
+                         '--filter', 'label=com.docker.compose.service=' + PG_DB_SERVICE])
+    ids = (out or '').split() if rc == 0 else []
+    return ids[0] if ids else ''
+
+
+def _run_pg_dump(cid):
+    """(returncode, stdout bytes, stderr text) of `pg_dump` inside the database container."""
+    try:
+        p = subprocess.run(atlas_backup.dump_argv(cid), capture_output=True, timeout=1800)
+    except Exception as exc:
+        return 1, b'', str(exc)
+    return p.returncode, p.stdout or b'', (p.stderr or b'').decode('utf-8', 'replace')
+
+
+def backup_paths(ctx, inst):
+    """(folder holding this deployment's dumps, compose `-p` flag or '')."""
+    paths = instance_paths(ctx, inst)
+    folder = atlas_backup.backup_dir(install_base(ctx), paths['name'])
+    flag = ('-p ' + paths['compose_project']) if paths['slug'] else ''
+    return folder, flag
+
+
+def backup_database(ctx, inst, version, plog):
+    """ops #864: dump this deployment's database to a file before ATLAS Update changes anything.
+
+    Raises RuntimeError when no verified backup was made: the update then stops with the
+    deployment exactly as it was. ⚠️ **Refusing is the point.** ATLAS 2.x opens a database 1.x
+    cannot read, so an update with no backup has no way back. Keeps the newest 3 per deployment.
+    """
+    paths = instance_paths(ctx, inst)
+    folder, flag = backup_paths(ctx, inst)
+    project = paths['compose_project']
+    try:
+        cid = _db_container(project)
+        if not cid:
+            # An operator stopped it, or it crashed. The update would start it anyway; start only
+            # the database so there is something to dump.
+            plog('  the database container is not running: starting it for the backup')
+            r = _compose(ctx, 'up -d --no-deps ' + PG_DB_SERVICE, timeout=240, inst=inst)
+            if r.returncode != 0:
+                raise atlas_backup.BackupError(compose_error(r, 'starting the database'))
+            end = time.time() + 90
+            while time.time() < end:
+                cid = _db_container(project)
+                if cid and _run_root(['docker', 'exec', cid, 'pg_isready', '-q'], timeout=10)[0] == 0:
+                    break
+                cid = ''
+                time.sleep(3)
+            if not cid:
+                raise atlas_backup.BackupError('the database did not accept connections in 90 s')
+
+        path = atlas_backup.take(folder, version or 'unknown', lambda: _run_pg_dump(cid), plog)
+    except atlas_backup.BackupError as exc:
+        raise RuntimeError(
+            'The database backup failed, so nothing was changed: %s. ATLAS 2.x cannot go back '
+            'to 1.x without a backup.' % exc)
+    size = os.path.getsize(path)
+    plog('✓ Database backed up (%.1f MB) before the update' % (size / 1048576.0))
+    for line in atlas_backup.describe(paths['dir'], flag, path, version or ''):
+        plog(line)
+    return path
+
+
+def backups_payload(ctx):
+    """For the page: every deployment's backups and the commands that restore the newest.
+    {deployment name: {'folder', 'backups': [...], 'restore': [commands] or []}}"""
+    out = {}
+    projects = compose_projects_present(ctx)
+    for inst in load_instances(ctx):
+        if not instance_is_built(ctx, inst, projects):
+            continue
+        paths = instance_paths(ctx, inst)
+        folder, flag = backup_paths(ctx, inst)
+        found = atlas_backup.list_backups(folder)
+        restore = []
+        if found:
+            ver = found[0]['version']
+            restore = atlas_backup.restore_steps(paths['dir'], flag, 'v' + ver if ver != 'unknown' else '',
+                                                 found[0]['path'])
+        out[paths['name']] = {'folder': folder, 'backups': found, 'restore': restore}
+    return out
 
 
 def _pg_ver(text):
@@ -6687,6 +6785,8 @@ def register(ctx):
             {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
              'endpoint': f'{KEY}_instance_remove_status',
              'view': instance_remove_status_view},
+            {'url': f'/api/{KEY}/backups', 'methods': ['GET'],
+             'endpoint': f'{KEY}_backups', 'view': lambda: jsonify(backups_payload(ctx))},
             {'url': f'/api/{KEY}/drift', 'methods': ['GET'],
              'endpoint': f'{KEY}_drift', 'view': lambda: jsonify(version_drift(ctx))},
             {'url': f'/api/{KEY}/update-status', 'methods': ['GET'],

@@ -40,10 +40,10 @@ TVR_BRANCH = 'main'
 # downloads its own (v1.19.2 at TVR_SHA); patch_dockerfile() replaces that step with this
 # release, for the host's arch, and checks the tarball against these hashes (from the
 # release's checksums.sha256) before unpacking it.
-TVR_MEDIAMTX_VERSION = 'v1.21.2'
+TVR_MEDIAMTX_VERSION = 'v1.21.4'  # ops #817: was v1.21.2
 TVR_MEDIAMTX_SHA256 = {
-    'amd64': '121be6e00397e473a95d83c75f4fcd3819a6af3b0e1a50889cba43ab4fab6a27',
-    'arm64': '180a235374a548d9133cdd5e20f5dbd8b01317be1c86e0d7e66df585dc42ed6f',
+    'amd64': 'be0c05d9c8af8338116977e7f1c3fcb409fbf882075e5ab075cf8baad76a59d2',
+    'arm64': '47784081da54c0608ea4dc359f5cfb19880209434769c532b3ed3a67ea99c29d',
 }
 
 # Security update — the Python packages inside the TVR image. Upstream's requirements.txt
