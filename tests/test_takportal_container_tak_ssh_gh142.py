@@ -74,6 +74,7 @@ def _setup_ssh(monkeypatch, tmp_path, container, probe='direct'):
         '_takportal_push_settings': lambda restart=False: None,
         '_takportal_install_sudoers': lambda log_fn=None: (True, 'skipped'),
         '_takportal_install_caddy_validate_shim': lambda log_fn=None: 'skipped',
+        '_takportal_harden_logout_file': lambda log_fn=None: 'absent',
         '_takportal_ssh_probe': _probe,
         '_tak_is_container': lambda: container,
     }

@@ -91,7 +91,7 @@
   </div>
 </div>
 <script>
-function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function setBusy(b){document.getElementById('apply-btn').disabled=b;document.getElementById('revert-btn').disabled=b;}
 function renderStatus(d){
   var hardened=(d.posture==='hardened');

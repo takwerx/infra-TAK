@@ -28,6 +28,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import types
 
 import pytest
@@ -97,7 +98,8 @@ class Box:
                                           sleep=lambda s: clock.__setitem__(0, clock[0] + s))
         ns = {
             'os': os, 'json': json, 're': re, 'time': fake_time,
-            'subprocess': types.SimpleNamespace(run=self.run, PIPE=-1, STDOUT=-2),
+            'subprocess': types.SimpleNamespace(run=self.run, PIPE=-1, STDOUT=-2,
+                                                TimeoutExpired=subprocess.TimeoutExpired),
             'print': lambda *a, **k: self.logs.append(' '.join(str(x) for x in a)),
             'load_settings': lambda: {},
             '_cloudtak_build_override_yml': lambda s: OVERRIDE,
