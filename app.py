@@ -36352,6 +36352,44 @@ CADDY_APT_TIMEOUT = 900       # seconds for one apt-get line of the Caddy deploy
 CADDY_APT_LOCK_WAIT = 300     # seconds to wait for the apt lock before each apt line
 
 
+CADDY_FETCH_TRIES = 5
+CADDY_FETCH_DELAY = 10
+# 5 tries x (30 s limit + 10 s wait) with room to spare; the plain 120 s shell limit is too short.
+CADDY_FETCH_TIMEOUT = 300
+
+
+def _caddy_fetch_shell(url, sink, tries=CADDY_FETCH_TRIES, delay=CADDY_FETCH_DELAY):
+    """Shell text that downloads `url` and feeds it to `sink` (a command reading stdin), trying
+    up to `tries` times, `delay` seconds apart (ops #947).
+
+    The Caddy repo key and sources list came from a one-shot `curl -f ... | gpg`. When Cloudsmith
+    answered badly for a moment (seen in the 10.4.2 Ubuntu 22.04 update test), `curl -f` hid the
+    HTTP status and gpg printed only "no valid OpenPGP data found", the install failed with no
+    retry, and every later module failed with it. Here the status is read with `-w` and printed
+    on every failed try, and the last line says how many tries were made. A download that
+    arrives (HTTP 200) but that `sink` rejects (a cut-off body) is tried again too.
+    `url` and `sink` are fixed literals from this file, never user input."""
+    return (
+        f'# fetch {url}\n'
+        't=$(mktemp) || exit 1\n'
+        'n=0; rc=1\n'
+        f'while [ "$n" -lt {int(tries)} ]; do\n'
+        '  n=$((n+1))\n'
+        f'  code=$(curl -1sL --connect-timeout 10 --max-time 30 -o "$t" -w "%{{http_code}}" "{url}")\n'
+        '  if [ "$code" = 200 ]; then\n'
+        f'    if {sink} < "$t"; then rc=0; break; fi\n'
+        f'    echo "try $n of {int(tries)}: got HTTP 200 but could not use the file" >&2\n'
+        '  else\n'
+        f'    echo "try $n of {int(tries)}: HTTP ${{code:-none}} from {url}" >&2\n'
+        '  fi\n'
+        f'  if [ "$n" -lt {int(tries)} ]; then sleep {int(delay)}; fi\n'
+        'done\n'
+        'rm -f "$t"\n'
+        f'if [ "$rc" != 0 ]; then echo "gave up after {int(tries)} tries: {url}" >&2; fi\n'
+        'exit $rc\n'
+    )
+
+
 def _caddy_apt_shell(cmd, plog, timeout=None):
     """Run one shell string of the Caddy apt-repo setup. apt-get lines wait (bounded) for the apt
     lock first, get the slow-mirror limit and are retried once if apt still lost the race for the
@@ -36481,21 +36519,20 @@ def _caddy_ensure_apt_repo(log_fn=None):
             # literals rather than a loop variable so no variable is ever handed to
             # shell=True — same commands run by run_caddy_deploy()'s Step 1.
             _key = subprocess.run(
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" '
-                '| gpg --batch --yes --dearmor '
-                '-o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120, env=env)
+                ['sh', '-c', _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/gpg.key',
+                                                'gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1')],
+                capture_output=True, text=True, timeout=CADDY_FETCH_TIMEOUT, env=env)
             if _key.returncode != 0:
                 _log(f'could not fetch the Caddy signing key: '
-                     f'{(_key.stderr or _key.stdout).strip()[:200]}')
+                     f'{(_key.stderr or _key.stdout).strip()[-300:]}')
                 return False
             _src = subprocess.run(
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" '
-                '| tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120, env=env)
+                ['sh', '-c', _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt',
+                                                'tee /etc/apt/sources.list.d/caddy-stable.list 2>&1')],
+                capture_output=True, text=True, timeout=CADDY_FETCH_TIMEOUT, env=env)
             if _src.returncode != 0:
                 _log(f'could not write the Caddy sources list: '
-                     f'{(_src.stderr or _src.stdout).strip()[:200]}')
+                     f'{(_src.stderr or _src.stdout).strip()[-300:]}')
                 return False
         _apt_wait_for_lock(log_fn=log_fn)
         subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
@@ -43883,8 +43920,10 @@ def run_caddy_deploy(domain):
             plog("  Adding Caddy repository...")
             cmds = [
                 'apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>&1',
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" | tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
+                _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/gpg.key',
+                                   'gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1'),
+                _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt',
+                                   'tee /etc/apt/sources.list.d/caddy-stable.list 2>&1'),
                 'apt-get update -qq 2>&1',
             ]
             for cmd in cmds:
@@ -43892,9 +43931,10 @@ def run_caddy_deploy(domain):
                 # the non-root console routes their privileged binaries through the
                 # broker via the shim PATH (env). No-op env as root. ops #605: apt lines
                 # wait for the apt lock and get a slow-mirror limit (_caddy_apt_shell).
-                r = _caddy_apt_shell(cmd, plog)
+                r = _caddy_apt_shell(cmd, plog,
+                                     timeout=CADDY_FETCH_TIMEOUT if cmd.startswith('# fetch ') else None)
                 if r.returncode != 0:
-                    err = (r.stderr.strip() or r.stdout.strip())[:300]
+                    err = (r.stderr.strip() or r.stdout.strip())[-300:]
                     plog(f"✗ Caddy install failed at: {cmd[:60]}")
                     plog(f"  Error: {err}")
                     caddy_deploy_status.update({'running': False, 'error': True})
