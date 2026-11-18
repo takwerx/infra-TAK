@@ -38442,6 +38442,10 @@ def _mediamtx_editor_unhash_for_rollback(settings):
     'none': no editor accounts, or none hashed (nothing to do). 'fail': could not tell or could
     not save: the caller must stop, since going on would lock the accounts out. For `admin`,
     the new password is kept for the MediaMTX page to show once (same place as the first one)."""
+    # No MediaMTX on this box (most boxes): no editor, nothing to reset, and no reason to
+    # refuse the rollback because a script that has nothing to run on could not run.
+    if not detect_modules().get('mediamtx', {}).get('installed'):
+        return {'state': 'none', 'count': 0}
     out = _mediamtx_editor_run_users_script(settings, _MEDIAMTX_EDITOR_UNHASH_SCRIPT)
     lines = [ln.strip() for ln in out.splitlines() if ln.startswith('MTXRESET ')]
     if 'MTXRESET none' in lines:
