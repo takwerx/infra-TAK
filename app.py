@@ -55188,9 +55188,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                     changed.append(os.path.relpath(overlay, ct_dir))
         # The api's own lint covers plugin server routes, and the marketplace files it marked
         # @ts-nocheck (those marks are in untracked files, so they survive the checkout).
+        # CloudTAK up to 13.123.x lints the api with ESLint (api/eslint.config.js); 13.124.0
+        # moved it to OXLint (api/.oxlintrc.json), which never reads eslint.config.js, so
+        # the ESLint skip alone no longer protects the build (GH #563, #565).
         api = os.path.join(ct_dir, 'api')
         cfg = os.path.join(api, 'eslint.config.js')
-        if os.path.isfile(cfg):
+        oxc = os.path.join(api, '.oxlintrc.json')
+        if os.path.isfile(cfg) or os.path.isfile(oxc):
             extras = set()
             routes = os.path.join(api, 'stateless', 'routes')
             if os.path.isdir(routes):
@@ -55206,6 +55210,7 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                         if n.endswith('.ts') and _cloudtak_has_ts_nocheck(p):
                             extras.add(os.path.relpath(p, api).replace(os.sep, '/'))
             patterns = ['stateless/routes/plugin-*.ts'] + sorted(extras)
+        if os.path.isfile(cfg):
             block = ('    /* cloudtak-marketplace-routes */\n    { ignores: ['
                      + ', '.join("'" + p.replace("'", '') + "'" for p in patterns) + '] },')
             with open(cfg, encoding='utf-8') as f:
@@ -55221,6 +55226,26 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
             if new != text:
                 _cloudtak_rewrite_in_place(cfg, new)
                 changed.append(os.path.relpath(cfg, ct_dir))
+        if os.path.isfile(oxc):
+            # OXLint's own skip list: ignorePatterns, relative to the config file. Upstream's
+            # entries stay; ours are added once each, so a second run changes nothing.
+            with open(oxc, encoding='utf-8') as f:
+                text = f.read()
+            try:
+                data = json.loads(text)
+                have = data.get('ignorePatterns')
+                have = list(have) if isinstance(have, list) else []
+                want = have + [p for p in patterns if p not in have]
+                if want != have or not isinstance(data.get('ignorePatterns'), list):
+                    data['ignorePatterns'] = want
+                    m = re.search(r'\n([ \t]+)"', text)
+                    new = (json.dumps(data, indent=m.group(1) if m else 4, ensure_ascii=False)
+                           + ('\n' if text.endswith('\n') else ''))
+                    _cloudtak_rewrite_in_place(oxc, new)
+                    changed.append(os.path.relpath(oxc, ct_dir))
+            except ValueError:
+                plog("  ⚠ api/.oxlintrc.json is not plain JSON, so the build was not set to skip "
+                     "non-infra-TAK plugins for OXLint (non-fatal)")
         if changed:
             plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
