@@ -88,12 +88,14 @@ def api_share_links_revoke():
 '''
 
 
-def test_editor_pin_is_v2_1_16_and_its_commit_not_the_tag_object_ops877():
-    assert _const('MEDIAMTX_EDITOR_REF') == 'v2.1.16'
-    sha = _const('MEDIAMTX_EDITOR_SHA')
-    assert sha == '8d76bbec0c93804e0c7a5317cdeec18c28945f68'
-    # the annotated tag object of v2.1.16: the clone check (`rev-parse HEAD` == SHA) can never pass with it
-    assert sha != 'd8fde95eb125745385df8df9d1e099ef9c78d89e'
+def test_editor_pin_is_a_commit_not_the_tag_object_ops877():
+    # The ref moves with each editor release (v2.1.17: tests/test_mediamtx_editor_2_1_17_ops940.py).
+    # What stays true for every pin: it is the COMMIT sha, never the annotated tag object.
+    assert re.fullmatch(r'v\d+\.\d+\.\d+', _const('MEDIAMTX_EDITOR_REF'))
+    assert re.fullmatch(r'[0-9a-f]{40}', _const('MEDIAMTX_EDITOR_SHA'))
+    # the annotated tag objects of v2.1.16 and v2.1.17: the clone check (`rev-parse HEAD` == SHA) can never pass with them
+    assert _const('MEDIAMTX_EDITOR_SHA') not in (
+        'd8fde95eb125745385df8df9d1e099ef9c78d89e', 'abf12812242a89a7550bbfce57371b54d5736252')
 
 
 def test_endpoint_patch_stamps_each_share_endpoint_once_ops877():
