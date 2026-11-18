@@ -38399,6 +38399,8 @@ def _mediamtx_editor_ref_lacks_hashing(ref):
 def _console_release_editor_ref(console_dir, tag):
     """The MEDIAMTX_EDITOR_REF that console release `tag` pins, read from that release's own
     app.py ('' when the release has none or git cannot read it)."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return ''   # never let a stored value reach git as an option
     try:
         r = subprocess.run(
             ['git', '-c', f'safe.directory={console_dir}', 'grep', '-h', '-E',

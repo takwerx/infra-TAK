@@ -213,6 +213,9 @@ def test_the_pin_is_read_from_the_old_releases_own_app_py_not_from_the_checkout(
     _git(repo, 'commit', '-q', '-a', '-m', 'no pin')
     assert g['_console_release_editor_ref'](str(repo), 'HEAD') == ''
     assert g['_console_release_editor_ref'](str(repo), 'no-such-release') == ''
+    # A stored value that looks like a git option never reaches git.
+    for bad in ('--help', '-p', '', None, 'a b', 'x;y'):
+        assert g['_console_release_editor_ref'](str(repo), bad) == ''
 
 
 # --------------------------------------------------------------------------- #
