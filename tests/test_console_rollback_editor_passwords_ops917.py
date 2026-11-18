@@ -223,10 +223,12 @@ def test_the_pin_is_read_from_the_old_releases_own_app_py_not_from_the_checkout(
 # --------------------------------------------------------------------------- #
 
 
-def _unhash(output):
+def _unhash(output, installed=True):
     state = {}
+    ran = state.setdefault('ran', [])
     g = _ns('_mediamtx_editor_unhash_for_rollback',
-            _mediamtx_editor_run_users_script=lambda settings, script: output,
+            detect_modules=lambda: {'mediamtx': {'installed': installed}},
+            _mediamtx_editor_run_users_script=lambda settings, script: (ran.append(1), output)[1],
             _MEDIAMTX_EDITOR_UNHASH_SCRIPT='SCRIPT',
             _mediamtx_editor_login_load=lambda: dict(state.get('login', {})),
             _mediamtx_editor_login_target=lambda settings: 'local',
@@ -249,6 +251,14 @@ def test_other_accounts_only_are_reset_without_a_reveal():
 
 def test_nothing_to_reset_is_not_an_error():
     assert _unhash('MTXRESET none\n')[0] == {'state': 'none', 'count': 0}
+
+
+def test_a_box_without_mediamtx_never_runs_the_script_and_is_never_blocked():
+    # Most boxes have no MediaMTX: the script has nothing to run on there (no account, no folder),
+    # and "no answer" is a failure that stops the rollback. It must not even be tried.
+    res, state = _unhash('', installed=False)
+    assert res == {'state': 'none', 'count': 0}
+    assert state['ran'] == []
 
 
 @pytest.mark.parametrize('out', ['', 'MTXRESET fail OSError\n', 'garbage', 'MTXRESET admin x\n'])
