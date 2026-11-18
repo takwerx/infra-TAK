@@ -787,6 +787,19 @@ window.takDbRefreshStart=function(){
 <div id="tak-uninstall-progress" class="uninstall-progress-row" style="display:none;margin-top:10px" aria-live="polite"></div>
 </div>
 </div>
+<div class="modal-overlay" id="snap-dl-modal">
+<div class="modal">
+<h3>⬇ Download snapshot</h3>
+<p>Snapshot <span id="snap-dl-name" style="font-family:JetBrains Mono,monospace"></span> is a full backup of this TAK Server, certificates included. Enter the console password to download it, and keep the file in a safe place.</p>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="snap-dl-password" type="password" placeholder="Confirm your password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doDownloadSnapshot()">
+<div class="modal-actions">
+<button type="button" class="control-btn" onclick="document.getElementById('snap-dl-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="control-btn" onclick="doDownloadSnapshot()">Download</button>
+</div>
+<div id="snap-dl-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div>
+</div>
 <footer class="footer"></footer>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>
@@ -830,7 +843,7 @@ function loadSnapshots(fromBtn){
         +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
         +'<td style="padding:6px 8px;white-space:nowrap">'
 +'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
-+'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
++'<button onclick="downloadSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">⬇ Download</button>'
 +'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
         +'</td></tr>';
     }).join('');
@@ -904,6 +917,42 @@ function restoreSnapshot(label){
         if(prog){prog.style.color='var(--red)';prog.textContent='Error: '+(d.error||'failed');}
       }
     }).catch(function(){if(prog){prog.style.color='var(--red)';prog.textContent='Network error';}});
+}
+
+// ops #831: the download asks for the console password (POST, like the full-stack backup
+// download). A refusal is shown in the dialog, without leaving the page.
+// (No hidden frame: every console response carries X-Frame-Options DENY. The password is
+// checked first with check=1, which streams nothing; then the real form starts the download.)
+var _snapDlLabel='',_snapDlBusy=false;
+function downloadSnapshot(label){
+  _snapDlLabel=label;
+  var m=document.getElementById('snap-dl-modal'),p=document.getElementById('snap-dl-password'),e=document.getElementById('snap-dl-msg'),n=document.getElementById('snap-dl-name');
+  if(n)n.textContent=label;
+  if(e)e.textContent='';
+  if(p)p.value='';
+  if(m)m.classList.add('open');
+  if(p)p.focus();
+}
+function doDownloadSnapshot(){
+  var p=document.getElementById('snap-dl-password'),e=document.getElementById('snap-dl-msg'),pw=p?p.value:'';
+  if(!pw){if(e)e.textContent='Enter the console password';if(p)p.focus();return;}
+  if(_snapDlBusy)return;
+  _snapDlBusy=true;
+  if(e){e.style.color='var(--text-dim)';e.textContent='Checking…';}
+  var url='/api/takserver/snapshot/'+encodeURIComponent(_snapDlLabel)+'/download';
+  function fail(msg){_snapDlBusy=false;if(e){e.style.color='var(--red)';e.textContent=String(msg||'Download refused').slice(0,200);}}
+  fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+             body:'check=1&admin_password='+encodeURIComponent(pw)})
+    .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};},function(){return {ok:false,d:{error:'Download refused ('+r.status+')'}};});})
+    .then(function(x){
+      if(!x.ok||!x.d.ok){fail(x.d.error);if(p){p.value='';p.focus();}return;}
+      var f=document.createElement('form');f.method='POST';f.action=url;f.style.display='none';
+      var i=document.createElement('input');i.type='hidden';i.name='admin_password';i.value=pw;f.appendChild(i);
+      document.body.appendChild(f);f.submit();document.body.removeChild(f);
+      if(p)p.value='';
+      var m=document.getElementById('snap-dl-modal');if(m)m.classList.remove('open');
+      setTimeout(function(){_snapDlBusy=false;},3000);
+    }).catch(function(){fail('Network error');});
 }
 
 function deleteSnapshot(label){

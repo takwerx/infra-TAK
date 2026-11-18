@@ -210,6 +210,7 @@ class Console:
             exec(lifetime.group(0), ns)
         for name in ('load_auth', 'save_auth', '_session_auth_token', '_stamp_session_login',
                      '_drop_stale_session', '_end_all_sessions', '_save_proxy_auth_state',
+                     '_stamp_notice_login',
                      '_proxy_auth_state', '_authentik_header_groups', '_sso_directory_ctx',
                      '_sso_directory_lookup', '_sso_directory_verdict',
                      '_sso_user_is_console_admin', '_session_made_by_sso',

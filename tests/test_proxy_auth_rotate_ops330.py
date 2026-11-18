@@ -293,6 +293,7 @@ def _apply(state, headers):
     ns = {'request': _Req(headers), 'session': session, 'hmac': hmac, 'time': __import__('time'),
           '_proxy_auth_state': lambda create=False: state,
           '_stamp_session_login': lambda: session.__setitem__('login_token', 't'),   # ops #634
+          '_stamp_notice_login': lambda fresh: None,   # PR 525: per-login id for the root-console bar
           # ops #813: who may have a session is a later check with its own tests
           # (test_console_sso_session_ops813.py). Here the person is an administrator, so
           # these tests stay about the proxy-auth secret alone.

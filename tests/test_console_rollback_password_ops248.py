@@ -41,9 +41,11 @@ sys.path.insert(0, str(REPO))
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 
 _FUNCS = {'verify_password', 'hash_password', '_hash_method_error', 'stored_hash_unusable',
-          '_require_admin_password', 'console_rollback_api'}
+          '_require_admin_password', 'console_rollback_api',
+          # ops #917: the route now looks at the release's web editor pin before the checkout
+          '_mediamtx_editor_ref_lacks_hashing', '_console_release_editor_ref'}
 _ASSIGNS = {'PASSWORD_HASH_METHOD', '_HASH_METHOD_ERRORS', 'check_password_hash',
-            'generate_password_hash'}
+            'generate_password_hash', '_MEDIAMTX_EDITOR_HASHING_SINCE'}
 
 
 def _load():
@@ -96,7 +98,7 @@ def box():
     g = {
         'jsonify': flask.jsonify, 'request': flask.request, 'os': __import__('os'),
         'subprocess': subprocess, '__file__': str(REPO / 'app.py'),
-        'hashlib': __import__('hashlib'),
+        'hashlib': __import__('hashlib'), 're': re,
         '_werkzeug_check_password_hash': werkzeug_security.check_password_hash,
         '_werkzeug_generate_password_hash': werkzeug_security.generate_password_hash,
         'load_auth': lambda: state['auth'],

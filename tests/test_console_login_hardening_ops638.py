@@ -108,6 +108,7 @@ def login_app(tmp_path):
         '_apply_authentik_session': lambda: False,
         '_login_logo_url': lambda: None,
         '_stamp_session_login': lambda: None,   # session stamp from a parallel login change, if present
+        '_stamp_notice_login': lambda fresh: None,   # per-login id for the root-console bar (PR 525)
         'audit': lambda ev, detail='': audits.append((ev, detail)),
         'VERSION': 'test',
         'print': lambda *a, **kw: printed.append(' '.join(str(x) for x in a)),
