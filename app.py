@@ -12780,6 +12780,17 @@ def console_rollback_api():
             cwd=console_dir, capture_output=True, text=True, timeout=60,
             env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
         )
+        # ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
+        # on its "Patch web editor", put back an editor that cannot read hashed passwords. Give
+        # the accounts plain-text passwords first (the editor's own rollback does the same).
+        # Done before the checkout so a failure here leaves the console as it was.
+        editor_reset = {'state': 'none', 'count': 0}
+        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, prev_tag)):
+            editor_reset = _mediamtx_editor_unhash_for_rollback(s)
+            if editor_reset['state'] == 'fail':
+                return jsonify({'ok': False, 'error': (
+                    'Rollback stopped: the MediaMTX web editor passwords could not be changed '
+                    'for the older version. Nothing was changed.')}), 500
         checkout_r = subprocess.run(
             git_cfg + ['checkout', '--force', prev_tag],
             cwd=console_dir, capture_output=True, text=True, timeout=30,
@@ -12792,9 +12803,16 @@ def console_rollback_api():
         s['console_rollback'] = {'available': False}
         save_settings(s)
         _detached_console_restart()
+        message = f'Rolled back to {prev_tag}. Console is restarting.'
+        if editor_reset['state'] == 'reset':
+            message += (' The MediaMTX web editor in that version cannot read the new password '
+                        'format, so its accounts got new passwords. The admin password is on '
+                        'the MediaMTX page. All of them are in '
+                        '/opt/mediamtx-webeditor/initial_admin_password.txt on the editor box.')
         return jsonify({
             'ok': True, 'tag': prev_tag,
-            'message': f'Rolled back to {prev_tag}. Console is restarting.'
+            'message': message,
+            'editor_passwords_reset': editor_reset['count'],
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
@@ -38350,6 +38368,149 @@ def _mediamtx_editor_secure_login(settings, log_fn=None):
     _log(f"  ✗ Web editor login could not be checked ({res or 'no answer'}). The web console")
     _log("    stays closed (503) until it is. Deploy MediaMTX again to retry.")
     return 'fail'
+
+
+# ops #917: web editor 2.1.15 and later keep passwords as hashes; 2.1.14 and earlier compare
+# what was typed with the stored text, so a hash locks every account out. Rolling the CONSOLE
+# back to a release that pins an older editor leaves the newer editor file in place, and the
+# older console's "Patch web editor" then downloads the old one. That older console cannot be
+# changed, so the rollback (this code, still the newer release) does what the editor's own
+# rollback does (mediamtx-installer ops #646): every hashed account gets a new random
+# password first. Plain text works in every editor version; the newer one hashes it again at
+# the next sign-in. Run as `python3 -I - <users.json path>` like the login script above.
+_MEDIAMTX_EDITOR_HASHING_SINCE = (2, 1, 15)
+_MEDIAMTX_EDITOR_UNHASH_SCRIPT = r'''
+import json, os, re, secrets, sys
+F = sys.argv[1]
+HASH = re.compile(r'^(scrypt|pbkdf2):[^$]+\$[^$]+\$[0-9a-f]+$')
+PWF = os.path.join(os.path.dirname(F), 'initial_admin_password.txt')
+try:
+    try:
+        with open(F) as f:
+            users = json.load(f)
+        st = os.stat(F)
+    except FileNotFoundError:
+        print('MTXRESET none')
+        sys.exit(0)
+    if not isinstance(users, list):
+        raise ValueError('users.json is not a list')
+    hit = []
+    for u in users:
+        if isinstance(u, dict) and isinstance(u.get('password'), str) and HASH.match(u['password']):
+            new = secrets.token_urlsafe(12)
+            u['password'] = new
+            hit.append((str(u.get('username', '')), new))
+    if not hit:
+        print('MTXRESET none')
+        sys.exit(0)
+    # The new passwords are saved FIRST (root/account only); users.json changes only after.
+    fd = os.open(PWF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('# MediaMTX web editor: new passwords after a console rollback to an older version. '
+                'Sign in, then change this password (Account tab).\n')
+        f.write('# This file is deleted when the password is changed.\n')
+        for name, pw in hit:
+            f.write(name + ': ' + pw + '\n')
+    if os.geteuid() == 0:
+        os.chown(PWF, st.st_uid, st.st_gid)
+    tmp = F + '.infratak-tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(users, f, indent=2)
+    if os.geteuid() == 0:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, F)
+    print('MTXRESET reset ' + json.dumps([n for n, _p in hit]))
+    for n, p in hit:
+        if n == 'admin':
+            print('MTXRESET admin ' + p)
+except SystemExit:
+    raise
+except Exception as e:
+    print('MTXRESET fail ' + type(e).__name__)
+'''
+
+
+def _mediamtx_editor_ref_lacks_hashing(ref):
+    """True when a pinned editor ref (`v2.1.14`) is older than password hashing (2.1.15).
+    A ref that is not a plain version (a branch name, empty) says nothing: False."""
+    m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (ref or '').strip())
+    return bool(m) and tuple(int(x) for x in m.groups()) < _MEDIAMTX_EDITOR_HASHING_SINCE
+
+
+def _console_release_editor_ref(console_dir, tag):
+    """The MEDIAMTX_EDITOR_REF that console release `tag` pins, read from that release's own
+    app.py ('' when the release has none or git cannot read it)."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return ''   # never let a stored value reach git as an option
+    try:
+        r = subprocess.run(
+            ['git', '-c', f'safe.directory={console_dir}', 'grep', '-h', '-E',
+             r'^MEDIAMTX_EDITOR_REF[[:space:]]*=', tag, '--', 'app.py'],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return ''
+    m = re.search(r'''MEDIAMTX_EDITOR_REF\s*=\s*["']([^"']+)["']''', r.stdout or '')
+    return m.group(1) if m else ''
+
+
+def _mediamtx_editor_run_users_script(settings, script):
+    """Run `script` where the editor runs, on its users.json, as the account that owns it.
+    Same routing as _mediamtx_editor_run_login_script. Returns the script's stdout ('' when it
+    could not run)."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    path = _MEDIAMTX_EDITOR_USERS_FILE
+    if _mediamtx_editor_login_target(settings) != 'local':
+        b64 = _b64.b64encode(script.encode()).decode()
+        ok, out = _module_run(cfg, _REMOTE_SUDO_SH + f'echo {b64} | base64 -d | $S python3 -I - {path}',
+                              timeout=45)
+        return out or ''
+    argv = ['python3', '-I', '-', path]
+    if _mediamtx_owner() == _MEDIAMTX_RUN_USER:
+        argv = _sudo_wrap(['runuser', '-u', _MEDIAMTX_RUN_USER, '--'] + argv)
+    elif not os.access(os.path.dirname(path), os.W_OK):
+        argv = ['sudo', '-n'] + argv
+    try:
+        r = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=45)
+        return r.stdout or ''
+    except Exception:
+        return ''
+
+
+def _mediamtx_editor_unhash_for_rollback(settings):
+    """ops #917: give every hashed web editor account a new random password, so an older
+    editor build can read them. Returns {'state': 'none'|'reset'|'fail', 'count': N}.
+    'none': no editor accounts, or none hashed (nothing to do). 'fail': could not tell or could
+    not save: the caller must stop, since going on would lock the accounts out. For `admin`,
+    the new password is kept for the MediaMTX page to show once (same place as the first one)."""
+    # No MediaMTX on this box (most boxes): no editor, nothing to reset, and no reason to
+    # refuse the rollback because a script that has nothing to run on could not run.
+    if not detect_modules().get('mediamtx', {}).get('installed'):
+        return {'state': 'none', 'count': 0}
+    out = _mediamtx_editor_run_users_script(settings, _MEDIAMTX_EDITOR_UNHASH_SCRIPT)
+    lines = [ln.strip() for ln in out.splitlines() if ln.startswith('MTXRESET ')]
+    if 'MTXRESET none' in lines:
+        return {'state': 'none', 'count': 0}
+    reset = next((ln for ln in lines if ln.startswith('MTXRESET reset ')), '')
+    if not reset:
+        return {'state': 'fail', 'count': 0}
+    try:
+        count = len(json.loads(reset[len('MTXRESET reset '):]))
+    except Exception:
+        count = 0
+    admin_pw = next((ln[len('MTXRESET admin '):] for ln in lines if ln.startswith('MTXRESET admin ')), '')
+    if admin_pw:
+        try:
+            st = _mediamtx_editor_login_load()
+            target = _mediamtx_editor_login_target(settings)
+            if st.get('target') != target:
+                st = {'target': target}
+            st.update({'ok': True, 'user': 'admin', 'reveal': admin_pw, 'set': int(time.time())})
+            _mediamtx_editor_login_save(st)
+        except Exception:
+            pass   # the password is also in initial_admin_password.txt on the editor's box
+    return {'state': 'reset', 'count': count}
 
 
 def _mediamtx_vhost_is_safe(generated):
