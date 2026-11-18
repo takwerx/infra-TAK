@@ -285,6 +285,21 @@ def test_remote_shield_does_what_the_local_one_does(tmp_path):
     assert r.stdout.splitlines() == log
 
 
+def test_remote_shield_sets_oxlint_ignore_patterns(tmp_path):
+    """GH #563 / #565: CloudTAK 13.124.0 lints the api with OXLint (api/.oxlintrc.json); the
+    remote host must get the same skip, run by the remote python3."""
+    ct = _tree(tmp_path, ('sidebar-configurator', 'taksim'))
+    (ct / 'api' / 'eslint.config.js').unlink()
+    rc = ct / 'api' / '.oxlintrc.json'
+    rc.write_text(json.dumps({'rules': {'typescript/ban-ts-comment': 'error'},
+                              'ignorePatterns': ['dist', 'coverage']}, indent=4) + '\n')
+    (ct / 'api' / 'stateless' / 'routes' / 'plugin-sidebar-config.ts').write_text('// @ts-nocheck\nx\n')
+    r = _remote_run(_remote_ns()['_cloudtak_remote_shield_sh'](), tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(rc.read_text())['ignorePatterns'] == ['dist', 'coverage', 'stateless/routes/plugin-*.ts']
+    assert 'api/.oxlintrc.json' in r.stdout
+
+
 def test_remote_shield_only_our_plugins_changes_nothing(tmp_path):
     ct = _tree(tmp_path, ('taksim',))
     r = _remote_run(_remote_ns()['_cloudtak_remote_shield_sh'](), tmp_path)

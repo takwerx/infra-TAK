@@ -42,6 +42,16 @@ APP_PKG = json.dumps({'name': '@tak-ps/cloudtak', 'version': '13.112.3', 'script
 API_ESLINT = ("import eslint from '@eslint/js';\nimport tseslint from 'typescript-eslint';\n\n"
               "export default tseslint.config(\n    eslint.configs.recommended,\n"
               "    ...tseslint.configs.recommended,\n);\n")
+# CloudTAK v13.124.0 lints the api with OXLint: api/.oxlintrc.json (shortened, the keys that
+# matter here verbatim) and no api/eslint.config.js.
+API_OXLINTRC = json.dumps({
+    '$schema': './node_modules/oxlint/configuration_schema.json',
+    'plugins': ['typescript', 'unicorn', 'oxc'],
+    'categories': {'correctness': 'error'},
+    'rules': {'typescript/ban-ts-comment': 'error', 'typescript/no-explicit-any': 'error'},
+    'ignorePatterns': ['dist', 'coverage'],
+    'overrides': [{'files': ['test/flight.ts'], 'rules': {'typescript/no-explicit-any': 'off'}}],
+}, indent=4) + '\n'
 OVERLAY = ('{\n  "extends": "./tsconfig.json",\n  "exclude": [\n    "plugins",\n'
            '    "node_modules",\n    "dist"\n  ]\n}\n')
 
@@ -81,8 +91,9 @@ def _git(ct, *args):
                    check=True, capture_output=True)
 
 
-def _tree(tmp_path, plugins=()):
-    """A stock CloudTAK 13.112.3-shaped checkout (committed), plus untracked plugin dirs."""
+def _tree(tmp_path, plugins=(), oxlint=False):
+    """A stock CloudTAK 13.112.3-shaped checkout (committed), plus untracked plugin dirs.
+    oxlint=True: the 13.124.0 api, linted by OXLint (.oxlintrc.json, no eslint.config.js)."""
     ct = tmp_path / 'CloudTAK'
     (ct / 'app' / 'src').mkdir(parents=True)
     (ct / 'app' / 'plugins').mkdir()
@@ -90,7 +101,10 @@ def _tree(tmp_path, plugins=()):
     (ct / 'app' / 'package.json').write_text(APP_PKG)
     (ct / 'api' / 'stateless' / 'routes').mkdir(parents=True)
     (ct / 'api' / 'stateless' / 'routes' / 'basemap.ts').write_text('export default 1;\n')
-    (ct / 'api' / 'eslint.config.js').write_text(API_ESLINT)
+    if oxlint:
+        (ct / 'api' / '.oxlintrc.json').write_text(API_OXLINTRC)
+    else:
+        (ct / 'api' / 'eslint.config.js').write_text(API_ESLINT)
     _git(ct, 'init', '-q')
     _git(ct, 'add', '-A')
     _git(ct, 'commit', '-qm', 'stock')
@@ -197,6 +211,63 @@ def test_legacy_api_web_layout(tmp_path):
     _run(_load(), ct)
     s = json.loads((ct / 'api' / 'web' / 'package.json').read_text())['scripts']
     assert s['lint'] == 'eslint --config eslint.config.js ./src/ ./public/'
+
+
+def _ox(ct):
+    return json.loads((ct / 'api' / '.oxlintrc.json').read_text())
+
+
+def test_oxlint_api_gets_the_plugin_skip(tmp_path):
+    """GH #563 / #565: CloudTAK 13.124.0 lints the api with OXLint, which never reads
+    eslint.config.js, so a marketplace route file (// @ts-nocheck) failed the Update build."""
+    ct = _tree(tmp_path, ('sidebar-configurator', 'taksim'), oxlint=True)
+    routes = ct / 'api' / 'stateless' / 'routes'
+    (routes / 'plugin-sidebar-config.ts').write_text('// @ts-nocheck\n/* eslint-disable */\nx\n')
+    (routes / 'helper-sync.ts').write_text('// @ts-nocheck\nx\n')
+    (routes / 'plain.ts').write_text('x\n')
+    log = _run(_load(), ct)
+    ox = _ox(ct)
+    assert ox['ignorePatterns'] == ['dist', 'coverage', 'stateless/routes/plugin-*.ts',
+                                    'stateless/routes/helper-sync.ts']
+    assert ox['rules'] == json.loads(API_OXLINTRC)['rules']          # upstream rules untouched
+    assert ox['overrides'] == json.loads(API_OXLINTRC)['overrides']
+    assert not (ct / 'api' / 'eslint.config.js').exists()            # none invented
+    assert len(log) == 1 and 'sidebar-configurator' in log[0] and 'api/.oxlintrc.json' in log[0]
+
+
+def test_oxlint_second_run_is_a_noop(tmp_path):
+    ct = _tree(tmp_path, ('incident-manager',), oxlint=True)
+    ns = _load()
+    _run(ns, ct)
+    cfg = ct / 'api' / '.oxlintrc.json'
+    before = cfg.read_text()
+    assert _run(ns, ct) == []
+    assert cfg.read_text() == before
+
+
+def test_oxlint_only_our_plugins_changes_nothing(tmp_path):
+    ct = _tree(tmp_path, ('taksim',), oxlint=True)
+    assert _run(_load(), ct) == []
+    assert (ct / 'api' / '.oxlintrc.json').read_text() == API_OXLINTRC
+
+
+def test_oxlint_without_ignore_patterns_gets_the_key(tmp_path):
+    ct = _tree(tmp_path, ('udash',), oxlint=True)
+    cfg = ct / 'api' / '.oxlintrc.json'
+    data = json.loads(API_OXLINTRC)
+    del data['ignorePatterns']
+    cfg.write_text(json.dumps(data, indent=4) + '\n')
+    _run(_load(), ct)
+    assert _ox(ct)['ignorePatterns'] == ['stateless/routes/plugin-*.ts']
+
+
+def test_oxlint_config_that_is_not_json_is_left_alone(tmp_path):
+    ct = _tree(tmp_path, ('udash',), oxlint=True)
+    cfg = ct / 'api' / '.oxlintrc.json'
+    cfg.write_text('{ // a comment\n  "ignorePatterns": ["dist"] }\n')
+    log = _run(_load(), ct)
+    assert cfg.read_text() == '{ // a comment\n  "ignorePatterns": ["dist"] }\n'
+    assert any('not plain JSON' in ln for ln in log)
 
 
 def test_runs_before_every_build():
