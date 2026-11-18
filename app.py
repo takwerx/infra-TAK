@@ -1889,8 +1889,8 @@ MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_edit
 # The tag picks the release; MEDIAMTX_EDITOR_SHA is what every fetch is checked against.
 # Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
 # fails if either goes back to a branch name.
-MEDIAMTX_EDITOR_REF = "v2.1.14"
-MEDIAMTX_EDITOR_SHA = "8d39e26d81601e107873ca8c81b4a8076bb2e028"  # commit of tag v2.1.14 (was main's tip)
+MEDIAMTX_EDITOR_REF = "v2.1.16"
+MEDIAMTX_EDITOR_SHA = "8d76bbec0c93804e0c7a5317cdeec18c28945f68"  # COMMIT of tag v2.1.16 (git rev-parse v2.1.16^{commit}; v2.1.16 is an annotated tag, so rev-parse v2.1.16 gives the tag object d8fde95 and raw.githubusercontent answers 404 for it). v2.1.15 added hashed passwords + a random first login (ops #877)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
@@ -37629,7 +37629,14 @@ def _get_cloudtak_upstreams(settings):
 
 
 def _mediamtx_editor_endpoint_patch(src):
-    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source."""
+    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source.
+
+    Safe to run twice on the same file (ops #877). "Patch web editor" runs this on the editor file
+    already on the box when the fresh download fails; the old window-based version then stamped an
+    UNRELATED route next to the share-links ones (v2.1.x puts /api/playback-mode inside the window)
+    with a duplicate endpoint, and Flask refused the app: the editor crash-looped. Same two rules
+    as MEDIAMTX_ENSURE_OVERLAY_SCRIPT step 4: skip an endpoint that is already stamped anywhere, and
+    look only at the def's own decorator block (a miss is safe, a wrong stamp is not)."""
     import re
     lines = src.splitlines(keepends=True)
     changed = False
@@ -37640,32 +37647,27 @@ def _mediamtx_editor_endpoint_patch(src):
             (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
             (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
     ):
+        if ("endpoint='" + endpoint_val + "'") in ''.join(lines):
+            continue
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
                 continue
+            block = []
             j = i - 1
-            while j >= 0 and j >= i - 20:
-                line = lines[j]
-                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
-                    if line.rstrip().endswith(')'):
-                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                    else:
-                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                    changed = True
-                    break
+            while j >= 0 and lines[j].lstrip().startswith('@'):
+                block.append(j)
                 j -= 1
-            else:
-                j = i - 1
-                while j >= 0 and j >= i - 20:
-                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
-                        l = lines[j]
-                        if l.rstrip().endswith(')'):
-                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                        else:
-                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                        changed = True
-                        break
-                    j -= 1
+            route_js = [k for k in block if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]
+            hinted = [k for k in route_js if any(h in lines[k] for h in route_hints)]
+            pick = hinted or route_js
+            if pick:
+                k = pick[0]
+                l = lines[k]
+                if l.rstrip().endswith(')'):
+                    lines[k] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                else:
+                    lines[k] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                changed = True
             break
     return ''.join(lines) if changed else src
 
