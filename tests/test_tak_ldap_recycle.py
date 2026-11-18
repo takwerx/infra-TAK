@@ -141,6 +141,7 @@ class Box:
         # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
+        self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
 
     # ── TAK's HTTPS side, as a throwaway leaf cert for a user ──
     def leaf_cert(self, cn, workdir):
@@ -391,6 +392,10 @@ class Box:
                   '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S'):
             ns[c] = _const(c)
+        for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S'):   # GH #549
+            if re.search(r'^%s = \d+' % c, APP, re.M):
+                ns[c] = _const(c)
+        ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
@@ -847,23 +852,124 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
     assert box.workdirs == []
 
 
-def test_ops316_https_broken_with_grouped_clients_connected_never_restarts_tak():
+def test_ops316_https_broken_with_grouped_clients_connected_does_not_restart_tak_at_once():
     # test6 2026-10-30: all 8 clients had their groups, TAK's API gave the check user none
-    # for 182 s, and the heal restarted TAK (dropping all 8). Now TAK is left running: the
-    # full wait, then a ✗ line saying what to do, and no restart.
+    # for 182 s, and the heal restarted TAK (dropping all 8). Now TAK is left running on the
+    # first finding: the full wait, then a ✗ line, and no restart. GH #549: but it stays
+    # pending and is checked again (see the gh549 tests below).
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
     assert box.recycle() is False
     assert box.restarts() == [] and box.drops() == []
     assert box.t - box.first_login >= _const('_TAK_API_CHECK_WAIT_S')       # no stuck shortcut
     assert not any('not waiting the rest of the' in l or 'falling back to restarting' in l for l in box.log)
     [line] = [l for l in box.log if l.startswith('  ✗ TAK LDAP recycle:')]
-    assert re.search(r'TAK Server NOT restarted: \d+ connected client\(s\) have their groups', line)
-    assert 'restart TAK Server at a quiet moment' in line
+    assert re.search(r'TAK Server NOT restarted yet: \d+ connected client\(s\) have their groups', line)
     st = box.settings['tak_ldap_recycle']
-    assert st['last_outcome'] == 'clients fine, no restart (HTTPS still broken, clients kept)'
-    assert 'pending' not in st and abs(st['healed_ldap_start'] - (T0 - HOUR)) < 1
-    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False   # not again
-    assert box.restarts() == []
+    assert st['last_outcome'] == 'clients fine, no restart (HTTPS still broken, clients kept, re-checking)'
+    assert box.alerts == []
+
+
+# ── GH #549: TAK's HTTPS side that stays broken with clients connected ───────────────
+# Field, v10.4.0 Update Now: the heal found groups/all empty for 5 min with 11 grouped 8089
+# clients, logged "restart at a quiet moment", stored the outpost start as healed and never
+# looked again. ATAK's Data Sync feed was "removed" for 2.5 h until a manual TAK restart.
+
+def _ticks_until_restart(box, most=4):
+    for n in range(1, most + 1):
+        box.t += 600                                   # the console's 10-min monitor
+        box.recycle(trigger='periodic LDAP outage check', final=False)
+        if box.restarts():
+            return n
+    return None
+
+
+def test_gh549_https_still_broken_is_rechecked_every_tick_and_tak_restarts_after_15_min():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    assert box.recycle() is False and box.restarts() == []
+    st = box.settings['tak_ldap_recycle']
+    assert 'healed_ldap_start' not in st                  # the outage is NOT marked healed
+    assert st['pending'] and st['https_broken_since'] >= T0
+    since = st['https_broken_since']
+    n = _ticks_until_restart(box)
+    assert n is not None and n <= 2, box.log
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    restart_at = box.tak_start
+    assert restart_at - since >= _const('_TAK_HTTPS_BROKEN_RESTART_S')
+    assert any('still gives users no groups after' in l and 'restarting TAK Server' in l for l in box.log)
+    assert any('✓ TAK LDAP recycle: after the restart: HTTPS as' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'restarted'
+    assert 'pending' not in st and 'https_broken_since' not in st
+    [(at, args, kw)] = box.alerts                         # Guard Dog says it, once
+    assert 'restarted' in args[1] and 'groups' in args[2]
+    # healed for good: the next ticks touch nothing
+    calls = len(box.calls)
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']] and len(box.alerts) == 1
+
+
+def test_gh549_https_that_recovers_by_itself_before_15_min_never_restarts_tak():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    box.recycle()
+    box.https = 'ok'
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.restarts() == [] and box.alerts == []
+    st = box.settings['tak_ldap_recycle']
+    assert 'pending' not in st and 'https_broken_since' not in st
+    assert abs(st['healed_ldap_start'] - (T0 - HOUR)) < 1
+    n = len(box.api)
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert len(box.api) == n                               # healed: silent
+
+
+def test_gh549_restart_that_does_not_fix_https_is_alerted_and_not_repeated():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      https_after_restart='no_groups')
+    box.recycle()
+    assert _ticks_until_restart(box) is not None
+    assert len(box.restarts()) == 1
+    [(at, args, kw)] = box.alerts
+    assert 'still' in args[1].lower()
+    for _ in range(3):
+        box.t += 600
+        box.recycle(trigger='periodic LDAP outage check', final=False)
+    assert len(box.restarts()) == 1 and len(box.alerts) == 1
+
+
+def test_gh549_tak_that_booted_with_authentik_and_has_no_https_groups_is_found():
+    # Known gap: at box boot TAK and the outpost start together, so the outpost test never
+    # fires, and a TAK that came up while Authentik answered 502 kept no groups on HTTPS.
+    for gap in (-60, 0, 90):
+        box = healthy_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + gap, https='no_groups',
+                          outpost='others')
+        assert box.recycle(trigger='periodic LDAP outage check', final=False) is False, gap
+        assert box.restarts() == []                    # clients connected: not at once
+        assert any('started together with Authentik' in l for l in box.log), gap
+        st = box.settings['tak_ldap_recycle']
+        assert st['pending'] and st['https_broken_since'] and st['boot_checked_tak_start'] == T0 - 20 * 60
+        assert _ticks_until_restart(box) is not None, gap
+    box = idle_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + 30, https='no_groups')
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is True   # nobody to drop
+
+
+def test_gh549_healthy_boot_is_checked_once_per_tak_start_and_quietly():
+    box = healthy_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + 30)
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.restarts() == [] and box.drops() == [] and box.reauths() == []
+    assert [m for _, m, _ in box.user_api][:1] == ['GET']         # one HTTPS check was made
+    assert box.settings['tak_ldap_recycle']['boot_checked_tak_start'] == T0 - 20 * 60
+    n = len(box.user_api)
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert len(box.user_api) == n                                  # once per TAK start
+    # too soon after TAK started, or during a console update: not yet
+    for kw in ({'tak_start': T0 - 5 * 60}, {'tak_start': T0 - 20 * 60, 'update_in_progress': True}):
+        box = healthy_box(ldap_start=kw['tak_start'] + 30, **kw)
+        box.recycle(trigger='periodic LDAP outage check', final=False)
+        assert box.user_api == [] and 'boot_checked_tak_start' not in box.settings.get('tak_ldap_recycle', {})
 
 
 def test_ops316_https_broken_after_an_8089_heal_never_restarts_tak():
@@ -872,7 +978,7 @@ def test_ops316_https_broken_after_an_8089_heal_never_restarts_tak():
     assert box.recycle() is False
     assert box.restarts() == [] and box.drops() == ['tls:16']
     assert box.settings['tak_ldap_recycle']['last_outcome'] == \
-        'clients healed, no restart (HTTPS still broken, clients kept)'
+        'clients healed, no restart (HTTPS still broken, clients kept, re-checking)'
 
 
 def test_ops158_tak_that_never_asks_ldap_for_the_user_is_restarted_early():
@@ -1845,6 +1951,84 @@ def test_update_run_heals_last_with_the_outpost_check():
     call = APP[i:i + 300]
     assert 'check_outpost=True' in call and 'final=True' in call
     assert APP.index('print("Post-update: auto-deploy complete")') > i
+
+
+def test_gh549_update_waits_for_authentik_to_settle_before_its_final_heal():
+    i = APP.index("_tak_recycle_after_ldap_outage(lambda m: print(f\"Post-update:{m}\"")
+    before = APP[:i]
+    w = before.rindex('_ak_ldap_path_wait_settled(')
+    assert w > before.rindex('_post_update_service_recovery_sweep(')
+
+
+def test_gh549_authentik_database_refresh_runs_before_the_authentik_reconfigure():
+    run = APP[APP.index('        def _run_post_update():'):APP.index('        def _run_post_update_guarded():')]
+    early = run.index('_postgres_compose_converge(')
+    assert early < run.index('            _auto_authentik()\n')
+    assert "k == 'authentik'" in run[early - 400:early + 300]
+
+
+class SettleBox:
+    """docker inspect for the Authentik containers; `starts` = {name: [epoch, ...]} the
+    container's start time from each moment on (a restart appends a later one)."""
+
+    def __init__(self, starts, health=None, missing=()):
+        self.t = T0
+        self.starts, self.health, self.missing = starts, dict(health or {}), set(missing)
+        self.log = []
+
+    def run(self, cmd, **kw):
+        name = cmd[-1]
+        if name in self.missing or name not in self.starts:
+            return subprocess.CompletedProcess(cmd, 1, stdout='', stderr='No such object')
+        start = max([x for x in self.starts[name] if x <= self.t] or [None]) if self.starts[name] else None
+        if start is None:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f'false {_rfc3339(BOOT)} \n', stderr='')
+        h = self.health.get(name, 'healthy')
+        if callable(h):
+            h = h(self.t)
+        return subprocess.CompletedProcess(cmd, 0, stdout=f'true {_rfc3339(start)} {h}\n', stderr='')
+
+    def settle(self):
+        ns = {'subprocess': types.SimpleNamespace(run=self.run), '_sudo_wrap': lambda c: c, 're': re,
+              'datetime': datetime.datetime,
+              'time': types.SimpleNamespace(time=lambda: self.t, sleep=lambda s: setattr(self, 't', self.t + s))}
+        for c in ('_AK_SETTLE_STABLE_S', '_AK_SETTLE_TIMEOUT_S'):
+            ns[c] = _const(c)
+        for name in ('_epoch_from_rfc3339', '_ak_ldap_path_wait_settled'):
+            exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
+        return ns['_ak_ldap_path_wait_settled'](self.log.append)
+
+
+AK = ('authentik-postgresql-1', 'authentik-server-1', 'authentik-ldap-1')
+
+
+def test_gh549_settle_returns_at_once_when_nothing_restarted_lately():
+    box = SettleBox({c: [T0 - HOUR] for c in AK})
+    assert box.settle() is True and box.t == T0 and box.log == []
+
+
+def test_gh549_settle_waits_out_the_knock_on_restart_of_a_database_recreate():
+    # field: the DB was recreated at 4:49:32, server and outpost restarted 97 s later
+    stable = _const('_AK_SETTLE_STABLE_S')
+    box = SettleBox({'authentik-postgresql-1': [T0 - 10], 'authentik-server-1': [T0 - HOUR, T0 + 87],
+                     'authentik-ldap-1': [T0 - HOUR, T0 + 97]},
+                    health={'authentik-server-1': lambda t: 'starting' if t < T0 + 150 else 'healthy'})
+    assert box.settle() is True
+    assert box.t >= T0 + 97 + stable and box.t <= T0 + 97 + stable + 30
+    assert any('waiting for Authentik' in l for l in box.log)
+    assert any('settled' in l for l in box.log)
+
+
+def test_gh549_settle_is_bounded_and_says_so():
+    box = SettleBox({c: [T0 - HOUR] for c in AK}, health={'authentik-server-1': 'unhealthy'})
+    assert box.settle() is False
+    assert box.t - T0 <= _const('_AK_SETTLE_TIMEOUT_S') + 30
+    assert any('not settled' in l for l in box.log)
+
+
+def test_gh549_settle_with_remote_authentik_does_not_wait():
+    box = SettleBox({}, missing=AK)
+    assert box.settle() is True and box.t == T0
 
 
 def test_same_version_start_only_carries_out_pending_requests():
