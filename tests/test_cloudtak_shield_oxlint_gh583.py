@@ -111,17 +111,22 @@ def _hint_text(lines):
     return '\n'.join(ns['_cloudtak_build_failure_hint'](lines))
 
 
-# shape of the reporter's log (GH #583, CloudTAK 13.123.2 -> 13.124.0)
+# shape of the reporter's log (GH #583, CloudTAK 13.123.2 -> 13.124.0). The finding blocks are
+# real oxlint 1.94.0 output (default format) on a CloudTAK v13.124.0 tree, behind BuildKit's
+# "#58 12.3" prefix; the summary line is the one in the report.
 OXLINT_FAIL = [
     '#58 [api stage-2 21/22] RUN npm run lint     && npm run build',
     '#58 > @tak-ps/CloudTAK.api@13.124.0 lint',
     '#58 > oxlint --type-aware index.ts common/ stateful/ stateless/ test/',
-    '#58 7.1   x typescript-eslint(ban-ts-comment): Do not use "@ts-nocheck"',
-    '#58 7.1    ,-[stateless/routes/replay.ts:1:1]',
-    '#58 7.1   x typescript-eslint(await-thenable): Unexpected `await` of a non-Promise value.',
-    '#58 7.1    ,-[stateless/lib/replay-player.ts:40:9]',
-    '#58 7.1   x typescript-eslint(ban-ts-comment): Do not use "@ts-nocheck"',
-    '#58 7.1    ,-[stateless/routes/plugin-qpd.ts:1:1]',
+    '#58 12.1   x typescript(ban-ts-comment): Do not use @ts-nocheck because it alters compilation errors.',
+    '#58 12.1    ,-[stateless/routes/replay.ts:1:3]',
+    '#58 12.1  1 | // @ts-nocheck',
+    '#58 12.1    :   ^^^^^^^^^^^^',
+    '#58 12.1    `----',
+    '#58 12.1   x typescript(await-thenable): Unexpected `await` of a non-Promise (non-"Thenable") value.',
+    '#58 12.1    ,-[stateless/lib/replay-player.ts:2:35]',
+    '#58 12.1   x typescript(ban-ts-comment): Do not use @ts-nocheck because it alters compilation errors.',
+    '#58 12.1    ,-[stateless/routes/plugin-qpd.ts:1:3]',
     '#58 Found 0 warnings and 17 errors.',
     STEP_API,
 ]
